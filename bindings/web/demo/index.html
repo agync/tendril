@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tendril Web WASM E2E</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #fafafa;
+      --card: #ffffff;
+      --ink: #111111;
+      --muted: #555555;
+      --line: #d4d4d8;
+      --accent: #18181b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0c0c0e;
+        --card: #16161a;
+        --ink: #f4f4f5;
+        --muted: #a1a1aa;
+        --line: #2e2e36;
+        --accent: #e4e4e7;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.45;
+    }
+    main { max-width: 720px; margin: 0 auto; display: grid; gap: 14px; }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    h1 { font-size: 1.2rem; margin: 0 0 6px; }
+    h2 { font-size: 1rem; margin: 0 0 10px; }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-top: 8px; }
+    input, textarea {
+      width: 100%;
+      margin-top: 4px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: inherit;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.85rem;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    button {
+      padding: 8px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--accent);
+      color: var(--bg);
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: transparent;
+      color: var(--ink);
+    }
+    pre, .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.8rem;
+      word-break: break-all;
+    }
+    .sas {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 10px;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      margin-top: 10px;
+      text-align: center;
+    }
+    #log {
+      max-height: 240px;
+      overflow: auto;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section>
+      <h1>Tendril Web WASM Client</h1>
+      <div class="mono" id="status">Initializing WASM core...</div>
+      <div class="mono" id="device-id"></div>
+      <div class="row">
+        <button id="reset-btn" class="secondary" type="button">Reset Identity &amp; Roster</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>1. Browser Argon2id (64 MiB, t=3, p=1) Benchmark</h2>
+      <div class="row">
+        <button id="bench-main-btn" type="button">Run Main-Thread Benchmark (3x)</button>
+        <button id="bench-worker-btn" class="secondary" type="button">Run Web Worker Benchmark (3x)</button>
+      </div>
+      <pre id="bench-out">Not run yet.</pre>
+    </section>
+
+    <section>
+      <h2>2. Pair via Relay (Gate #9)</h2>
+      <label>Relay URL
+        <input id="relay-url" placeholder="wss://host/v1/relay" />
+      </label>
+      <label>Pairing URI (optional tendril://pair?...)</label>
+      <input id="pair-uri" placeholder="tendril://pair?v=1&..." />
+      <label>Host Mailbox Pub (b64url signing_pub)
+        <input id="target-pub" placeholder="b64url 32-byte Ed25519 key" />
+      </label>
+      <label>Target Host ID
+        <input id="target-host-id" value="tendril-host" />
+      </label>
+      <label>Pairing Code (3-group)
+        <input id="pair-code" placeholder="XXXX-XXXX-XXXX" />
+      </label>
+      <label>Device Name
+        <input id="device-name" value="phone-browser" />
+      </label>
+      <div class="row">
+        <button id="pair-btn" type="button">Pair</button>
+      </div>
+      <div class="sas" id="sas-box">SAS: -</div>
+      <div class="mono" id="pair-meta"></div>
+    </section>
+
+    <section>
+      <h2>3. Authenticated Session &amp; Fall-Up Test</h2>
+      <label>Signed Grant JSON (optional)
+        <textarea id="grant-json" rows="3" placeholder='{"v":1,...}'></textarea>
+      </label>
+      <div class="row">
+        <button id="connect-btn" type="button">Connect</button>
+        <button id="reconnect-btn" class="secondary" type="button">Reconnect (Network Switch)</button>
+        <button id="rekey-btn" class="secondary" type="button">Rekey</button>
+        <button id="ping-btn" class="secondary" type="button">Ping</button>
+        <button id="close-btn" class="secondary" type="button">Close</button>
+      </div>
+      <label>Send Plaintext Data
+        <input id="msg-input" value="hello from mobile web" />
+      </label>
+      <div class="row">
+        <button id="send-btn" type="button">Send Data</button>
+      </div>
+      <pre id="log"></pre>
+    </section>
+  </main>
+  <script type="module" src="/demo/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "name": "@tendril/web",
+  "version": "0.1.0",
+  "description": "Browser WebAssembly and WebSocket relay SDK for Tendril.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./relay": "./src/relay.js"
+  },
+  "types": "./index.d.ts",
+  "files": [
+    "src/",
+    "pkg/",
+    "demo/",
+    "index.d.ts"
+  ]
+}
