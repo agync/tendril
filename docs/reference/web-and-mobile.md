@@ -34,9 +34,9 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 ### `@tendril/web` (`bindings/web`)
 
 - `bindings/web/src/relay.js` implements the `spec/relay-v1.md` client WebSocket handshake (`challenge`, `dial`, `ready`) and binary frame bounds (`65,521` bytes max).
-- `bindings/web/src/index.js` dynamically imports `./iroh.js`, which in turn lazily imports `bindings/web/pkg-p2p/` on demand when `iroh://` or opt-in P2P helpers (`initTendrilP2p`, `parseP2pEndpoint`, `dialIrohStream`) are used, keeping default page loads strictly on the sans-I/O bundle without fetching P2P WASM or glue assets.
+- `bindings/web/src/index.js` dynamically imports `./iroh.js`, which in turn lazily imports `bindings/web/pkg-p2p/` on demand when `iroh://` or opt-in P2P helpers (`initTendrilP2p`, `parseP2pEndpoint`, `dialIrohStream`) are used, keeping default page loads strictly on the sans-I/O bundle without fetching P2P WASM or glue assets; `pair()` and `connect()` warm `initTendrilP2p()` before starting the handshake `timeoutMs` clock for `iroh://` targets.
 - `bindings/web/src/worker.js` and `computeCodeMacWorker` move Argon2id pairing-code proof computation off the UI thread.
-- `bindings/web/demo/` provides an interactive pairing/session web page supporting both `wss://.../v1/relay` and `iroh://...` endpoints (`?endpoint=iroh://...` or `demo-config.json`), plus a Node HTTP/WebSocket `/v1/relay` reverse-proxy server (`server.mjs`) with zero third-party npm runtime dependencies.
+- `bindings/web/demo/` provides an interactive pairing/session web page supporting both `wss://.../v1/relay` and `iroh://...` endpoints (`?endpoint=iroh://...` or `demo-config.json`), plus a Node HTTP/WebSocket `/v1/relay` reverse-proxy server (`server.mjs`) with gzip response compression (`node:zlib`) and zero third-party npm runtime dependencies.
 - `bindings/web/test/browser_e2e.mjs` runs all four helper `spec/vectors/` files, `parseP2pEndpoint` validation, and a live Noise handshake, encrypted data exchange, `rekey`, `ping`/`pong`, `authorize`, `revoke`, and `close` flow in headless Chrome against `tendril-relay` and `tendril-conformance-peer` (plus live `iroh://` browser-to-host E2E over n0 public relays when `TENDRIL_WEB_P2P_LIVE=1`).
 
 ## Android Kotlin JNI (`bindings/kotlin`)
@@ -73,7 +73,9 @@ Measured via `benchmarkArgon2` (`t=3, m=64 MiB, p=1`) in headless desktop Google
 | Mobile phone browser (main thread) | 3 | 153.8 | 155.8 | 171.7 | Physical phone run against hosted demo (`useWorker: false`) |
 | Mobile phone browser (Web Worker) | 3 | 402.6 | 665.7 | 1030.9 | Includes worker spawn and WASM init per call (`useWorker: true`) |
 
-## Gate #9 real-device relay pairing and reconnect baseline
+## Gate #9 real-device pairing and reconnect baselines
+
+### WebSocket relay baseline (physical phone)
 
 Observed between a physical mobile browser and the desktop Rust `tendril` CLI host over the WebSocket relay demo (`< 30 s` pairing target):
 
@@ -81,6 +83,15 @@ Observed between a physical mobile browser and the desktop Rust `tendril` CLI ho
 - **Authenticated session connect:** `332.1 ms` initial Noise XX handshake over relay (`164.5 ms` repeat connect).
 - **Encrypted control and data round-trip:** `27 ms` encrypted `0x05 PING` -> `0x06 PONG`, followed by `0x04 REKEY` and verified plaintext delivery (`21` bytes) decoded on the Rust host.
 - **Disconnect and reconnect recovery:** Re-established authenticated relay sessions in `526.5 ms`, `520.4 ms`, and `418.0 ms` across manual reconnect and connectivity restoration tests.
+
+### Zero-setup `iroh://` baseline (physical phone, Tailscale OFF)
+
+Observed between a physical mobile browser (Tailscale OFF, zero self-hosted Tendril relay) and `tendril serve --p2p --issue-code remote` over bare `iroh://` routed via public `n0` relay (`euc1-1.relay.n0.iroh.link.`):
+
+- **Warm remote pairing:** `0.87 s` with verified 16-character SAS match and host `tendril confirm` (a cold first tap timed out while downloading the uncompressed `3.93 MiB` `pkg-p2p` bundle inside the shared `15 s` timeout, motivating `initTendrilP2p()` pre-warming and gzip compression in `demo/server.mjs`).
+- **Authenticated session connect (`provider: P2p`):** `634.9 ms` initial Noise XX QUIC establish.
+- **Encrypted control and data round-trip:** `63 ms`, `67 ms`, and post-rekey `69 ms` `0x05 PING` -> `0x06 PONG` RTTs, followed by `0x04 REKEY` and `21`-byte plaintext verified on the Rust host.
+- **Disconnect and reconnect recovery:** Clean session close (`code=1000`, `reason="reconnect"`) and re-establishment in `392.9 ms` over `provider: P2p`.
 
 ## Verification commands
 
