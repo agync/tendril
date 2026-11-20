@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::{
     b64url_decode_array, b64url_encode, compute_code_mac as core_compute_code_mac,
     device_id as core_device_id, fingerprint_device as core_fingerprint_device,
@@ -21,17 +20,26 @@ use tendril_core::pairing::{
 };
 use tendril_core::policy::ProviderId;
 use tendril_core::roster::Roster;
-use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer,
-    PathDialer, PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream,
-    RelayDialer, RelayListener, SessionDriver, SessionEvent, StateStore, drive_pair_initiator,
-    drive_pair_responder_with_options, peek_exact,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, InboundRouter,
+    LocalDialer, PathDialer, PathListener, PathStream, RelayDialer, RelayListener, SessionDriver,
+    SessionEvent, StateStore, drive_pair_initiator, drive_pair_responder_with_options,
 };
 use tokio::runtime::Runtime;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
+
+fn persist_store_roster(
+    store: Option<&Arc<StateStore>>,
+    roster: &Arc<StdMutex<Roster>>,
+) -> PyResult<()> {
+    if let Some(s) = store {
+        let guard = roster.lock().expect("roster mutex poisoned");
+        s.save_roster(&guard)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
+    Ok(())
+}
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -168,45 +176,12 @@ struct Endpoint {
     identity: Arc<EndpointIdentity>,
     roster: Arc<StdMutex<Roster>>,
     pair_mgr: Arc<StdMutex<PairingManager>>,
-    rate_limiter: PreAuthRateLimiter,
-    accepted_tx: mpsc::Sender<Box<dyn PathStream>>,
-    accepted_rx: Arc<AsyncMutex<mpsc::Receiver<Box<dyn PathStream>>>>,
-    listener_tasks: StdMutex<Vec<JoinHandle<()>>>,
+    router: Arc<InboundRouter>,
 }
 
 impl Endpoint {
-    fn persist_roster(&self, roster: &Roster) -> PyResult<()> {
-        if let Some(store) = &self.store {
-            store
-                .save_roster(roster)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-        Ok(())
-    }
-
-    fn spawn_listener(&self, mut listener: Box<dyn PathListener>) {
-        let tx = self.accepted_tx.clone();
-        let handle = self.rt.spawn(async move {
-            while let Ok(stream) = listener.accept().await {
-                if tx.send(stream).await.is_err() {
-                    break;
-                }
-            }
-        });
-        self.listener_tasks
-            .lock()
-            .expect("listener_tasks mutex poisoned")
-            .push(handle);
-    }
-}
-
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        if let Ok(mut tasks) = self.listener_tasks.lock() {
-            for h in tasks.drain(..) {
-                h.abort();
-            }
-        }
+    fn spawn_listener(&self, listener: Box<dyn PathListener>) {
+        self.router.spawn_listener(self.rt.handle(), listener);
     }
 }
 
@@ -214,47 +189,47 @@ impl Drop for Endpoint {
 impl Endpoint {
     #[new]
     #[pyo3(signature = (state_dir=None, host_id=None))]
-    fn new(state_dir: Option<&str>, host_id: Option<&str>) -> PyResult<Self> {
-        let rt = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        );
-        let (store, identity, roster) = if let Some(dir) = state_dir {
-            let store = Arc::new(
-                StateStore::open_or_create(dir)
+    fn new(py: Python<'_>, state_dir: Option<&str>, host_id: Option<&str>) -> PyResult<Self> {
+        let dir_owned = state_dir.filter(|s| !s.is_empty()).map(ToOwned::to_owned);
+        let host_owned = host_id.map(ToOwned::to_owned);
+        py.detach(move || {
+            let rt = Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
             );
-            let identity = store
-                .load_or_generate_identity(host_id)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let roster = store
-                .load_roster()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            (Some(store), identity, roster)
-        } else {
-            let mut identity =
-                EndpointIdentity::generate().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            if let Some(h) = host_id
-                && !h.is_empty()
-            {
-                identity = identity.with_host_id(h);
-            }
-            (None, identity, Roster::new())
-        };
+            let (store, identity, roster) = if let Some(dir) = dir_owned {
+                let store = Arc::new(
+                    StateStore::open_or_create(dir)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                );
+                let identity = store
+                    .load_or_generate_identity(host_owned.as_deref())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let roster = store
+                    .load_roster()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                (Some(store), identity, roster)
+            } else {
+                let mut identity = EndpointIdentity::generate()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                if let Some(h) = host_owned.as_deref()
+                    && !h.is_empty()
+                {
+                    identity = identity.with_host_id(h);
+                }
+                (None, identity, Roster::new())
+            };
 
-        let (accepted_tx, accepted_rx) = mpsc::channel(32);
-        Ok(Self {
-            rt,
-            store,
-            identity: Arc::new(identity),
-            roster: Arc::new(StdMutex::new(roster)),
-            pair_mgr: Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default()))),
-            rate_limiter: PreAuthRateLimiter::new(PreAuthConfig::default()),
-            accepted_tx,
-            accepted_rx: Arc::new(AsyncMutex::new(accepted_rx)),
-            listener_tasks: StdMutex::new(Vec::new()),
+            Ok(Self {
+                rt,
+                store,
+                identity: Arc::new(identity),
+                roster: Arc::new(StdMutex::new(roster)),
+                pair_mgr: Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default()))),
+                router: Arc::new(InboundRouter::new()),
+            })
         })
     }
 
@@ -302,14 +277,23 @@ impl Endpoint {
     }
 
     #[pyo3(signature = (kind="lan"))]
-    fn issue_code(&self, kind: &str) -> PyResult<String> {
+    fn issue_code(&self, py: Python<'_>, kind: &str) -> PyResult<String> {
         let pk = match kind {
+            "" | "lan" => PairingCodeKind::Lan2Group,
             "remote" => PairingCodeKind::Remote3Group,
-            _ => PairingCodeKind::Lan2Group,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "invalid pairing code kind '{other}'"
+                )));
+            }
         };
-        let mut mgr = self.pair_mgr.lock().expect("pair_mgr mutex poisoned");
-        mgr.issue_code(pk, now_unix())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        let mgr = Arc::clone(&self.pair_mgr);
+        py.detach(move || {
+            let mut guard = mgr.lock().expect("pair_mgr mutex poisoned");
+            guard
+                .issue_code(pk, now_unix())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
     }
 
     #[pyo3(signature = (endpoint, code, relay_host=None, name="py-device", kind="python"))]
@@ -324,174 +308,189 @@ impl Endpoint {
     ) -> PyResult<String> {
         let rt = Arc::clone(&self.rt);
         let identity = Arc::clone(&self.identity);
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
         let ep_s = endpoint.to_owned();
         let rh_s = relay_host.map(ToOwned::to_owned);
         let code_s = code.to_owned();
         let name_s = name.to_owned();
         let kind_s = kind.to_owned();
 
-        let res = py.detach(move || {
-            rt.block_on(async move {
+        py.detach(move || {
+            let res = rt.block_on(async move {
                 let mut stream = dial_endpoint(&ep_s, rh_s.as_deref())
                     .await
                     .map_err(PyRuntimeError::new_err)?;
                 drive_pair_initiator(stream.as_mut(), &identity, name_s, kind_s, code_s, None)
                     .await
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            })
-        })?;
+            })?;
 
-        match res.outcome {
-            PairOutcome::InitiatorPending {
-                device_id,
-                host_id,
-                host_static_pub,
-                host_signing_pub,
-                host_rotation_seq,
-                pairing_sas,
-            } => {
-                let mut roster = self.roster.lock().expect("roster mutex poisoned");
-                roster
-                    .insert_pinned_host(
-                        host_id.clone(),
-                        host_id.clone(),
-                        host_static_pub,
-                        Some(host_signing_pub),
-                        host_rotation_seq,
-                        Vec::new(),
-                    )
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                self.persist_roster(&roster)?;
-                Ok(serde_json::json!({
-                    "device_id": device_id,
-                    "host_id": host_id,
-                    "sas": pairing_sas,
-                })
-                .to_string())
+            match res.outcome {
+                PairOutcome::InitiatorPending {
+                    device_id,
+                    host_id,
+                    host_static_pub,
+                    host_signing_pub,
+                    host_rotation_seq,
+                    pairing_sas,
+                } => {
+                    {
+                        let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+                        roster
+                            .insert_pinned_host(
+                                host_id.clone(),
+                                host_id.clone(),
+                                host_static_pub,
+                                Some(host_signing_pub),
+                                host_rotation_seq,
+                                Vec::new(),
+                            )
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    }
+                    persist_store_roster(store.as_ref(), &roster_arc)?;
+                    Ok(serde_json::json!({
+                        "device_id": device_id,
+                        "host_id": host_id,
+                        "sas": pairing_sas,
+                    })
+                    .to_string())
+                }
+                PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
+                PairOutcome::ResponderPending { .. } => {
+                    Err(PyRuntimeError::new_err("unexpected responder outcome"))
+                }
             }
-            PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
-            PairOutcome::ResponderPending { .. } => {
-                Err(PyRuntimeError::new_err("unexpected responder outcome"))
-            }
-        }
+        })
     }
 
     #[pyo3(signature = (timeout_ms=5000))]
     fn pair_accept(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<String> {
         let rt = Arc::clone(&self.rt);
-        let rx_arc = Arc::clone(&self.accepted_rx);
+        let router = Arc::clone(&self.router);
         let identity = Arc::clone(&self.identity);
         let pair_mgr = Arc::clone(&self.pair_mgr);
         let roster_arc = Arc::clone(&self.roster);
-        let limiter = self.rate_limiter.clone();
-        let wait = Duration::from_millis(timeout_ms.max(1));
+        let store = self.store.clone();
+        let wait = Duration::from_millis(timeout_ms);
 
-        let res = py.detach(move || {
-            rt.block_on(async move {
-                let mut rx = rx_arc.lock().await;
-                let mut stream = match timeout(wait, rx.recv()).await {
-                    Ok(Some(s)) => s,
+        py.detach(move || {
+            let roster_in = Arc::clone(&roster_arc);
+            let res = rt.block_on(async move {
+                let (mut stream, guard) = match router.recv_pair(wait).await {
+                    Ok(Some(pair)) => pair,
                     Ok(None) => return Err(PyRuntimeError::new_err("listener closed")),
-                    Err(_) => return Err(PyRuntimeError::new_err("timed out accepting pair")),
+                    Err(()) => return Err(PyRuntimeError::new_err("timed out accepting pair")),
                 };
-                drop(rx);
 
-                let guard = limiter
-                    .try_acquire(stream.peer_ip())
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let peeked = timeout(
-                    DEFAULT_PRE_AUTH_TIMEOUT,
-                    peek_exact(stream.as_mut(), PREAMBLE_LEN),
-                )
-                .await
-                .map_err(|_| PyRuntimeError::new_err("preamble read timed out"))?
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let preamble = Preamble::decode(&peeked[..PREAMBLE_LEN])
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                if preamble.intent != Intent::Pair {
-                    return Err(PyRuntimeError::new_err("expected pair preamble"));
-                }
-                let mut wrapped = PrefixedPathStream::new(stream, peeked);
-                let path_kind = if wrapped.provider_id() == ProviderId::Relay {
+                let path_kind = if stream.provider_id() == ProviderId::Relay {
                     PairingPathKind::Remote
                 } else {
                     PairingPathKind::Lan
                 };
                 drive_pair_responder_with_options(
-                    &mut wrapped,
+                    stream.as_mut(),
                     &identity,
                     &pair_mgr,
-                    &roster_arc,
+                    &roster_in,
                     path_kind,
                     now_unix(),
-                    Some(&limiter),
+                    Some(router.rate_limiter()),
                     Some(guard),
                     DEFAULT_PRE_AUTH_TIMEOUT,
                 )
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            })
-        })?;
+            })?;
 
-        match res.outcome {
-            PairOutcome::ResponderPending {
-                device_id,
-                pairing_sas,
-                name,
-                kind,
-                ..
-            } => {
-                let roster = self.roster.lock().expect("roster mutex poisoned");
-                self.persist_roster(&roster)?;
-                Ok(serde_json::json!({
-                    "device_id": device_id,
-                    "sas": pairing_sas,
-                    "name": name,
-                    "kind": kind,
-                })
-                .to_string())
+            match res.outcome {
+                PairOutcome::ResponderPending {
+                    device_id,
+                    pairing_sas,
+                    name,
+                    kind,
+                    ..
+                } => {
+                    persist_store_roster(store.as_ref(), &roster_arc)?;
+                    Ok(serde_json::json!({
+                        "device_id": device_id,
+                        "sas": pairing_sas,
+                        "name": name,
+                        "kind": kind,
+                    })
+                    .to_string())
+                }
+                PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
+                PairOutcome::InitiatorPending { .. } => {
+                    Err(PyRuntimeError::new_err("unexpected initiator outcome"))
+                }
             }
-            PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
-            PairOutcome::InitiatorPending { .. } => {
-                Err(PyRuntimeError::new_err("unexpected initiator outcome"))
-            }
-        }
+        })
     }
 
     #[pyo3(signature = (peer_id, sas=None))]
-    fn confirm_peer(&self, peer_id: &str, sas: Option<&str>) -> PyResult<()> {
-        let mut roster = self.roster.lock().expect("roster mutex poisoned");
-        roster
-            .confirm_peer(peer_id, sas)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        self.persist_roster(&roster)
+    fn confirm_peer(&self, py: Python<'_>, peer_id: &str, sas: Option<&str>) -> PyResult<()> {
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let pid = peer_id.to_owned();
+        let sas_owned = sas.map(ToOwned::to_owned);
+        py.detach(move || {
+            {
+                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+                roster
+                    .confirm_peer(&pid, sas_owned.as_deref())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+            persist_store_roster(store.as_ref(), &roster_arc)
+        })
     }
 
     #[pyo3(signature = (peer_id, caps, ttl_secs=3600))]
-    fn mint_grant(&self, peer_id: &str, caps: Vec<String>, ttl_secs: u64) -> PyResult<String> {
-        let nonce = random_bytes::<16>().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mut roster = self.roster.lock().expect("roster mutex poisoned");
-        let now = now_unix();
-        let grant = roster
-            .mint_grant(
-                &self.identity,
-                peer_id,
-                caps,
-                now,
-                now.saturating_add(ttl_secs),
-                nonce,
-            )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        self.persist_roster(&roster)?;
-        serde_json::to_string(&grant).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    fn mint_grant(
+        &self,
+        py: Python<'_>,
+        peer_id: &str,
+        caps: Vec<String>,
+        ttl_secs: u64,
+    ) -> PyResult<String> {
+        let roster_arc = Arc::clone(&self.roster);
+        let identity = Arc::clone(&self.identity);
+        let store = self.store.clone();
+        let pid = peer_id.to_owned();
+        py.detach(move || {
+            let nonce = random_bytes::<16>().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let grant = {
+                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+                let now = now_unix();
+                roster
+                    .mint_grant(
+                        &identity,
+                        &pid,
+                        caps,
+                        now,
+                        now.saturating_add(ttl_secs),
+                        nonce,
+                    )
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            };
+            persist_store_roster(store.as_ref(), &roster_arc)?;
+            serde_json::to_string(&grant).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
     }
 
-    fn revoke_peer(&self, peer_id: &str) -> PyResult<()> {
-        let mut roster = self.roster.lock().expect("roster mutex poisoned");
-        roster
-            .revoke_peer(peer_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        self.persist_roster(&roster)
+    fn revoke_peer(&self, py: Python<'_>, peer_id: &str) -> PyResult<()> {
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let pid = peer_id.to_owned();
+        py.detach(move || {
+            {
+                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+                roster
+                    .revoke_peer(&pid)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+            persist_store_roster(store.as_ref(), &roster_arc)
+        })
     }
 
     #[pyo3(signature = (endpoint, target_host_id, grant_json=None, relay_host=None))]
@@ -512,12 +511,14 @@ impl Endpoint {
         let rt = Arc::clone(&self.rt);
         let identity = Arc::clone(&self.identity);
         let roster = Arc::clone(&self.roster);
+        let store = self.store.clone();
         let ep_s = endpoint.to_owned();
         let rh_s = relay_host.map(ToOwned::to_owned);
         let target_s = target_host_id.to_owned();
 
         let driver = py.detach(move || {
-            rt.block_on(async move {
+            let roster_in = Arc::clone(&roster);
+            let res = rt.block_on(async move {
                 let stream = dial_endpoint(&ep_s, rh_s.as_deref())
                     .await
                     .map_err(PyRuntimeError::new_err)?;
@@ -526,12 +527,27 @@ impl Endpoint {
                     &identity,
                     &target_s,
                     grant,
-                    &roster,
+                    &roster_in,
                     now_unix(),
                 )
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            })
+            });
+            match res {
+                Ok(drv) => {
+                    persist_store_roster(store.as_ref(), &roster)?;
+                    Ok(drv)
+                }
+                Err(err) => {
+                    if let Err(pe) = persist_store_roster(store.as_ref(), &roster) {
+                        Err(PyRuntimeError::new_err(format!(
+                            "{err} (roster persist error: {pe})"
+                        )))
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
         })?;
 
         Ok(Session {
@@ -545,31 +561,25 @@ impl Endpoint {
     #[pyo3(signature = (timeout_ms=5000))]
     fn accept_session(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Session> {
         let rt = Arc::clone(&self.rt);
-        let rx_arc = Arc::clone(&self.accepted_rx);
+        let router = Arc::clone(&self.router);
         let identity = Arc::clone(&self.identity);
         let roster = Arc::clone(&self.roster);
-        let limiter = self.rate_limiter.clone();
-        let wait = Duration::from_millis(timeout_ms.max(1));
+        let wait = Duration::from_millis(timeout_ms);
 
         let driver = py.detach(move || {
             rt.block_on(async move {
-                let mut rx = rx_arc.lock().await;
-                let stream = match timeout(wait, rx.recv()).await {
-                    Ok(Some(s)) => s,
+                let (stream, guard) = match router.recv_session(wait).await {
+                    Ok(Some(pair)) => pair,
                     Ok(None) => return Err(PyRuntimeError::new_err("listener closed")),
-                    Err(_) => return Err(PyRuntimeError::new_err("timed out accepting session")),
+                    Err(()) => return Err(PyRuntimeError::new_err("timed out accepting session")),
                 };
-                drop(rx);
 
-                let guard = limiter
-                    .try_acquire(stream.peer_ip())
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 SessionDriver::accept_locked(
                     stream,
                     &identity,
                     &roster,
                     now_unix(),
-                    Some(&limiter),
+                    Some(router.rate_limiter()),
                     Some(guard),
                     DEFAULT_PRE_AUTH_TIMEOUT,
                 )
@@ -586,12 +596,9 @@ impl Endpoint {
         })
     }
 
-    fn close(&self) {
-        if let Ok(mut tasks) = self.listener_tasks.lock() {
-            for h in tasks.drain(..) {
-                h.abort();
-            }
-        }
+    fn close(&self, py: Python<'_>) {
+        let router = Arc::clone(&self.router);
+        py.detach(move || router.close());
     }
 }
 
@@ -626,7 +633,7 @@ impl Session {
         let drv = Arc::clone(&self.driver);
         let roster = Arc::clone(&self.roster);
         let store = self.store.clone();
-        let wait = Duration::from_millis(timeout_ms.max(1));
+        let wait = Duration::from_millis(timeout_ms);
 
         py.detach(move || {
             rt.block_on(async move {
@@ -650,10 +657,7 @@ impl Session {
                                 "grant": g,
                             }),
                             SessionEvent::RevocationUpdated { issuer, seq } => {
-                                if let Some(s) = store {
-                                    let rg = roster.lock().expect("roster mutex poisoned");
-                                    let _ = s.save_roster(&rg);
-                                }
+                                persist_store_roster(store.as_ref(), &roster)?;
                                 serde_json::json!({
                                     "status": "event",
                                     "event": "revocation_updated",
@@ -681,7 +685,13 @@ impl Session {
                         Ok(json.to_string())
                     }
                     Ok(Ok(None)) => Ok(serde_json::json!({ "status": "eof" }).to_string()),
-                    Ok(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+                    Ok(Err(e)) => {
+                        if let Err(pe) = persist_store_roster(store.as_ref(), &roster) {
+                            Err(PyRuntimeError::new_err(format!("{e} ({pe})")))
+                        } else {
+                            Err(PyRuntimeError::new_err(e.to_string()))
+                        }
+                    }
                     Err(_) => Ok(serde_json::json!({ "status": "would_block" }).to_string()),
                 }
             })

@@ -2,9 +2,19 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use tendril_core::crypto::b64url_encode;
+use tempfile::TempDir;
+use tendril_core::MAX_FRAME_LEN;
+use tendril_core::PREAMBLE_LEN;
+use tendril_core::crypto::{SigningKeypair, StaticKeypair, b64url_encode};
+use tendril_core::grants::{Grant, RevocationListUnsigned, sign_crl};
+use tendril_core::identity::sign_rotation;
+use tendril_core::roster::PeerState;
+use tendril_core::wire::{
+    HostHello, Intent, NOISE_PATTERN, Preamble, ResumableFrameReader, encode_frame,
+};
 use tendril_ffi::{
     TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_PROTOCOL, TENDRIL_OK, TENDRIL_WOULD_BLOCK,
     tendril_compute_code_mac, tendril_device_id, tendril_endpoint_confirm_peer,
@@ -16,6 +26,10 @@ use tendril_ffi::{
     tendril_session_connect, tendril_session_free, tendril_session_poll_event,
     tendril_session_rekey, tendril_session_send_data, tendril_string_free,
     tendril_verify_grant_json, tendril_verify_rotation_chain_json,
+};
+use tendril_runtime::{
+    DirectListener, PathListener, PathStream, PrefixedPathStream, SessionDriver, StateStore,
+    peek_exact, recv_tendril_frame,
 };
 
 unsafe fn take_cstr(ptr: *mut c_char) -> String {
@@ -232,6 +246,25 @@ fn ffi_full_lifecycle_and_session_outlives_endpoint() {
     let cli_ep = unsafe { tendril_endpoint_new(ptr::null(), ptr::null()) };
     assert!(!host_ep.is_null() && !cli_ep.is_null());
 
+    let mut info_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(host_ep, &raw mut info_ptr) },
+        TENDRIL_OK
+    );
+    let info: Value = serde_json::from_str(&unsafe { take_cstr(info_ptr) }).unwrap();
+    assert_eq!(info["host_id"], "ffi-host");
+    assert!(info["device_id"].as_str().unwrap().starts_with("dev_"));
+    assert!(!info["static_pub"].as_str().unwrap().is_empty());
+    assert!(!info["signing_pub"].as_str().unwrap().is_empty());
+
+    let bad_kind = CString::new("bluetooth").unwrap();
+    let mut bad_code_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, bad_kind.as_ptr(), &raw mut bad_code_ptr) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(bad_code_ptr.is_null());
+
     let mut listen_ep_ptr: *mut c_char = ptr::null_mut();
     assert_eq!(
         unsafe { tendril_endpoint_serve_direct(host_ep, ptr::null(), &raw mut listen_ep_ptr) },
@@ -361,6 +394,11 @@ fn ffi_full_lifecycle_and_session_outlives_endpoint() {
         unsafe { tendril_session_send_data(cli_sess, msg.as_ptr(), msg.len()) },
         TENDRIL_OK
     );
+    // Null out_event_json must fail immediately without losing the queued event.
+    assert_eq!(
+        unsafe { tendril_session_poll_event(host_sess, 500, ptr::null_mut()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
     assert_eq!(
         unsafe { tendril_session_poll_event(host_sess, 2_000, &raw mut ev_ptr) },
         TENDRIL_OK
@@ -397,4 +435,375 @@ fn ffi_full_lifecycle_and_session_outlives_endpoint() {
         tendril_session_free(host_sess);
         tendril_endpoint_free(host_ep);
     }
+}
+
+fn current_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn pair_and_mint_c(host_dir: &str, cli_dir: &str, host_name_str: &str, caps_json: &str) -> String {
+    let hd = CString::new(host_dir).unwrap();
+    let cd = CString::new(cli_dir).unwrap();
+    let hn = CString::new(host_name_str).unwrap();
+
+    let host_ep = unsafe { tendril_endpoint_new(hd.as_ptr(), hn.as_ptr()) };
+    let cli_ep = unsafe { tendril_endpoint_new(cd.as_ptr(), ptr::null()) };
+    assert!(!host_ep.is_null() && !cli_ep.is_null());
+
+    let mut ep_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, ptr::null(), &raw mut ep_ptr) },
+        TENDRIL_OK
+    );
+    let endpoint_str = unsafe { take_cstr(ep_ptr) };
+
+    let mut code_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, ptr::null(), &raw mut code_ptr) },
+        TENDRIL_OK
+    );
+    let code_str = unsafe { take_cstr(code_ptr) };
+
+    let ep_usize = host_ep as usize;
+    let accept_thr = thread::spawn(move || {
+        let mut out_ptr: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_accept(
+                ep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out_ptr,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK, "pair accept failed: {}", read_last_err());
+        unsafe { take_cstr(out_ptr) }
+    });
+
+    let ep_c = CString::new(endpoint_str).unwrap();
+    let code_c = CString::new(code_str).unwrap();
+    let mut cli_pair_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_initiate(
+                cli_ep,
+                ep_c.as_ptr(),
+                ptr::null(),
+                code_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &raw mut cli_pair_ptr,
+            )
+        },
+        TENDRIL_OK
+    );
+    let cli_pair: Value = serde_json::from_str(&unsafe { take_cstr(cli_pair_ptr) }).unwrap();
+    let host_pair: Value = serde_json::from_str(&accept_thr.join().unwrap()).unwrap();
+    assert_eq!(cli_pair["sas"], host_pair["sas"]);
+
+    let peer_c = CString::new(host_pair["device_id"].as_str().unwrap()).unwrap();
+    let sas_c = CString::new(host_pair["sas"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, peer_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+
+    let caps_c = CString::new(caps_json).unwrap();
+    let mut grant_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                peer_c.as_ptr(),
+                caps_c.as_ptr(),
+                3600,
+                &raw mut grant_ptr,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_str = unsafe { take_cstr(grant_ptr) };
+
+    unsafe {
+        tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
+    grant_str
+}
+
+#[test]
+fn ffi_persists_host_rotation_and_fork_revocation_across_restart() {
+    let host_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+
+    let host_path = host_dir.path().to_str().unwrap().to_owned();
+    let cli_path = cli_dir.path().to_str().unwrap().to_owned();
+
+    let _ = pair_and_mint_c(&host_path, &cli_path, "rot-host", "[\"fs.read\"]");
+
+    let host_store = StateStore::open_or_create(host_dir.path()).unwrap();
+    let mut host_id = host_store.load_or_generate_identity(None).unwrap();
+
+    let now = current_unix();
+    host_id
+        .rotate(
+            StaticKeypair::generate().unwrap(),
+            SigningKeypair::generate().unwrap(),
+            now,
+        )
+        .unwrap();
+    host_store.save_identity(&host_id).unwrap();
+    drop(host_store);
+
+    // 1. Client connects to legitimately rotated host (no grant needed) -> seq=1 persists.
+    let hd_c = CString::new(host_path).unwrap();
+    let cd_c = CString::new(cli_path).unwrap();
+    let host_name_c = CString::new("rot-host").unwrap();
+
+    let host_ep2 = unsafe { tendril_endpoint_new(hd_c.as_ptr(), ptr::null()) };
+    let cli_ep2 = unsafe { tendril_endpoint_new(cd_c.as_ptr(), ptr::null()) };
+    assert!(!host_ep2.is_null() && !cli_ep2.is_null());
+
+    let mut ep2_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep2, ptr::null(), &raw mut ep2_ptr) },
+        TENDRIL_OK
+    );
+    let ep2_str = unsafe { take_cstr(ep2_ptr) };
+    let ep2_c = CString::new(ep2_str).unwrap();
+
+    let host_ep2_usize = host_ep2 as usize;
+    let accept_thr2 = thread::spawn(move || unsafe {
+        let sess =
+            tendril_session_accept(host_ep2_usize as *mut tendril_ffi::TendrilEndpoint, 5_000);
+        assert!(
+            !sess.is_null(),
+            "rotated session accept failed: {}",
+            read_last_err()
+        );
+        sess as usize
+    });
+    let cli_sess2 = unsafe {
+        tendril_session_connect(
+            cli_ep2,
+            ep2_c.as_ptr(),
+            ptr::null(),
+            host_name_c.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(
+        !cli_sess2.is_null(),
+        "rotated connect failed: {}",
+        read_last_err()
+    );
+    let host_sess2 = accept_thr2.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess2.is_null());
+
+    unsafe {
+        tendril_session_close(cli_sess2, 1000, ptr::null());
+        tendril_session_free(cli_sess2);
+        tendril_session_free(host_sess2);
+        tendril_endpoint_free(cli_ep2);
+        tendril_endpoint_free(host_ep2);
+    }
+
+    let persisted_after_rot = StateStore::open_or_create(cli_dir.path())
+        .unwrap()
+        .load_roster()
+        .unwrap();
+    let rot_entry = persisted_after_rot.get("rot-host").expect("rot-host entry");
+    assert_eq!(rot_entry.rotation_seq, 1);
+    assert_eq!(rot_entry.state, PeerState::Active);
+
+    // 2. Host key at seq=1 signs two diverging seq=2 rotation records -> client detects fork & persists Revoked.
+    let key_a_stat = StaticKeypair::generate().unwrap();
+    let key_a_sig = SigningKeypair::generate().unwrap();
+    let key_b_stat = StaticKeypair::generate().unwrap();
+    let key_b_sig = SigningKeypair::generate().unwrap();
+    let seq1_signing = host_id.signing_key().signing_key();
+    let rec_2a = sign_rotation(
+        2,
+        &seq1_signing,
+        key_a_sig.public_bytes(),
+        key_a_stat.public_bytes(),
+        now + 10,
+    )
+    .unwrap();
+    let rec_2b = sign_rotation(
+        2,
+        &seq1_signing,
+        key_b_sig.public_bytes(),
+        key_b_stat.public_bytes(),
+        now + 11,
+    )
+    .unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (fep_str, fork_srv) = rt.block_on(async {
+        let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let ep = listener.local_endpoint();
+        let handle = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let peeked = peek_exact(stream.as_mut(), PREAMBLE_LEN).await.unwrap();
+            let mut wrapped = PrefixedPathStream::new(stream, peeked[PREAMBLE_LEN..].to_vec());
+            let mut reader = ResumableFrameReader::new();
+            let msg1 = recv_tendril_frame(&mut wrapped, &mut reader).await.unwrap();
+            let mut hs = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+                .local_private_key(key_a_stat.secret_bytes())
+                .unwrap()
+                .prologue(&Preamble::v1(Intent::Session).encode())
+                .unwrap()
+                .build_responder()
+                .unwrap();
+            let mut pt = vec![0u8; MAX_FRAME_LEN];
+            hs.read_message(&msg1, &mut pt).unwrap();
+            let hello = serde_json::to_vec(&HostHello {
+                host_id: "rot-host".to_owned(),
+                proto_version: 1,
+                rotation: vec![rec_2a, rec_2b],
+            })
+            .unwrap();
+            let mut ct = vec![0u8; MAX_FRAME_LEN];
+            let n2 = hs.write_message(&hello, &mut ct).unwrap();
+            wrapped
+                .send_chunk(&encode_frame(&ct[..n2]).unwrap())
+                .await
+                .unwrap();
+            let _ = wrapped.close().await;
+        });
+        (ep, handle)
+    });
+
+    let fep_c = CString::new(fep_str).unwrap();
+    let cd_c2 = cd_c.clone();
+    let hname_c2 = host_name_c.clone();
+    let cli_thr = thread::spawn(move || {
+        let cli_ep3 = unsafe { tendril_endpoint_new(cd_c2.as_ptr(), ptr::null()) };
+        assert!(!cli_ep3.is_null());
+        let cli_sess_fork = unsafe {
+            tendril_session_connect(
+                cli_ep3,
+                fep_c.as_ptr(),
+                ptr::null(),
+                hname_c2.as_ptr(),
+                ptr::null(),
+            )
+        };
+        assert!(cli_sess_fork.is_null(), "forked host must be rejected");
+        assert!(read_last_err().contains("fork"));
+        unsafe { tendril_endpoint_free(cli_ep3) };
+    });
+    rt.block_on(fork_srv).unwrap();
+    cli_thr.join().unwrap();
+
+    let persisted_after_fork = StateStore::open_or_create(cli_dir.path())
+        .unwrap()
+        .load_roster()
+        .unwrap();
+    assert_eq!(
+        persisted_after_fork.get("rot-host").unwrap().state,
+        PeerState::Revoked
+    );
+}
+
+#[test]
+fn ffi_persists_session_terminating_crl_across_restart() {
+    let host_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+    let host_path = host_dir.path().to_str().unwrap().to_owned();
+    let cli_path = cli_dir.path().to_str().unwrap().to_owned();
+
+    let grant_str = pair_and_mint_c(&host_path, &cli_path, "crl-host", "[\"fs.read\"]");
+    let grant: Grant = serde_json::from_str(&grant_str).unwrap();
+    let host_store = StateStore::open_or_create(host_dir.path()).unwrap();
+    let host_id = host_store.load_or_generate_identity(None).unwrap();
+    let mut host_roster = host_store.load_roster().unwrap();
+
+    let crl_ts = grant.not_before.clone();
+    let revoked_nonce = grant.nonce.clone();
+    let expected_nonce = revoked_nonce.clone();
+    // Bring up raw runtime host listener so we can push a signed 0x03 REVOCATION revoking the active grant.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (ep_str, accept_handle) = rt.block_on(async {
+        let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let ep = listener.local_endpoint();
+        let h_id = host_id.clone();
+        let handle = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let now = current_unix();
+            let mut drv = SessionDriver::accept(stream, &h_id, &mut host_roster, now, None)
+                .await
+                .unwrap();
+            let crl = sign_crl(
+                RevocationListUnsigned {
+                    v: 1,
+                    issuer: h_id.host_id().to_owned(),
+                    seq: 1,
+                    revoked_devices: Vec::new(),
+                    revoked_nonces: vec![revoked_nonce],
+                    ts: crl_ts,
+                },
+                &h_id.signing_key().signing_key(),
+            )
+            .unwrap();
+            drv.send_revocation(&crl).await.unwrap();
+            drv
+        });
+        (ep, handle)
+    });
+
+    let cd_c = CString::new(cli_path).unwrap();
+    let ep_c = CString::new(ep_str).unwrap();
+    let host_name_c = CString::new("crl-host").unwrap();
+    let grant_c = CString::new(grant_str).unwrap();
+
+    let ep_c2 = ep_c.clone();
+    let hname_c2 = host_name_c.clone();
+    let g_c2 = grant_c.clone();
+    let cd_c2 = cd_c.clone();
+    let cli_thr = thread::spawn(move || {
+        let cli_ep = unsafe { tendril_endpoint_new(cd_c2.as_ptr(), ptr::null()) };
+        assert!(!cli_ep.is_null());
+        let sess = unsafe {
+            tendril_session_connect(
+                cli_ep,
+                ep_c2.as_ptr(),
+                ptr::null(),
+                hname_c2.as_ptr(),
+                g_c2.as_ptr(),
+            )
+        };
+        assert!(!sess.is_null(), "connect failed: {}", read_last_err());
+        let mut out_ptr: *mut c_char = ptr::null_mut();
+        let rc = unsafe { tendril_session_poll_event(sess, 2_000, &raw mut out_ptr) };
+        assert_eq!(rc, TENDRIL_ERR_PROTOCOL);
+        assert!(out_ptr.is_null());
+        unsafe {
+            tendril_session_free(sess);
+            tendril_endpoint_free(cli_ep);
+        }
+    });
+
+    let _srv_drv = rt.block_on(accept_handle).unwrap();
+    cli_thr.join().unwrap();
+
+    let persisted = StateStore::open_or_create(cli_dir.path())
+        .unwrap()
+        .load_roster()
+        .unwrap();
+    let crl = persisted.crl("crl-host").expect("persisted CRL on error");
+    assert_eq!(crl.seq, 1);
+    assert_eq!(crl.revoked_nonces, vec![expected_nonce]);
 }

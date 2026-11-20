@@ -1,3 +1,4 @@
+/* Manually maintained C ABI header kept in lockstep with crates/tendril-ffi/src/lib.rs. */
 #ifndef TENDRIL_H
 #define TENDRIL_H
 
@@ -17,7 +18,6 @@ enum TendrilResult {
     TENDRIL_EOF = 2,
     TENDRIL_ERR_INVALID_ARG = -1,
     TENDRIL_ERR_NOT_FOUND = -2,
-    TENDRIL_ERR_BUFFER_TOO_SMALL = -3,
     TENDRIL_ERR_CLOSED = -5,
     TENDRIL_ERR_PROTOCOL = -6,
     TENDRIL_ERR_INTERNAL = -7

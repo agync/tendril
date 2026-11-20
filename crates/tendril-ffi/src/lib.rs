@@ -10,7 +10,6 @@ use std::ptr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::{
     b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
     fingerprint_host, pairing_sas, random_bytes,
@@ -22,16 +21,12 @@ use tendril_core::pairing::{
 };
 use tendril_core::policy::ProviderId;
 use tendril_core::roster::Roster;
-use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer,
-    PathDialer, PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream,
-    RelayDialer, RelayListener, SessionDriver, SessionEvent, StateStore, drive_pair_initiator,
-    drive_pair_responder_with_options, peek_exact,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, InboundRouter,
+    LocalDialer, PathDialer, PathListener, PathStream, RelayDialer, RelayListener, SessionDriver,
+    SessionEvent, StateStore, drive_pair_initiator, drive_pair_responder_with_options,
 };
 use tokio::runtime::Runtime;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
-use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 pub const TENDRIL_OK: i32 = 0;
@@ -39,7 +34,6 @@ pub const TENDRIL_WOULD_BLOCK: i32 = 1;
 pub const TENDRIL_EOF: i32 = 2;
 pub const TENDRIL_ERR_INVALID_ARG: i32 = -1;
 pub const TENDRIL_ERR_NOT_FOUND: i32 = -2;
-pub const TENDRIL_ERR_BUFFER_TOO_SMALL: i32 = -3;
 pub const TENDRIL_ERR_CLOSED: i32 = -5;
 pub const TENDRIL_ERR_PROTOCOL: i32 = -6;
 pub const TENDRIL_ERR_INTERNAL: i32 = -7;
@@ -134,6 +128,17 @@ unsafe fn write_out_cstring(out: *mut *mut c_char, val: &str) -> i32 {
     TENDRIL_OK
 }
 
+fn persist_store_roster(
+    store: Option<&Arc<StateStore>>,
+    roster: &Arc<StdMutex<Roster>>,
+) -> Result<(), String> {
+    if let Some(s) = store {
+        let guard = roster.lock().expect("roster mutex poisoned");
+        s.save_roster(&guard).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Opaque endpoint handle owning a Tokio runtime, identity, roster, and background listeners.
 pub struct TendrilEndpoint {
     rt: Arc<Runtime>,
@@ -141,10 +146,7 @@ pub struct TendrilEndpoint {
     identity: EndpointIdentity,
     roster: Arc<StdMutex<Roster>>,
     pair_mgr: StdMutex<PairingManager>,
-    rate_limiter: PreAuthRateLimiter,
-    accepted_tx: mpsc::Sender<Box<dyn PathStream>>,
-    accepted_rx: AsyncMutex<mpsc::Receiver<Box<dyn PathStream>>>,
-    listener_tasks: StdMutex<Vec<JoinHandle<()>>>,
+    router: InboundRouter,
 }
 
 impl TendrilEndpoint {
@@ -155,29 +157,8 @@ impl TendrilEndpoint {
         Ok(())
     }
 
-    fn spawn_listener(&self, mut listener: Box<dyn PathListener>) {
-        let tx = self.accepted_tx.clone();
-        let handle = self.rt.spawn(async move {
-            while let Ok(stream) = listener.accept().await {
-                if tx.send(stream).await.is_err() {
-                    break;
-                }
-            }
-        });
-        self.listener_tasks
-            .lock()
-            .expect("listener_tasks mutex poisoned")
-            .push(handle);
-    }
-}
-
-impl Drop for TendrilEndpoint {
-    fn drop(&mut self) {
-        if let Ok(mut tasks) = self.listener_tasks.lock() {
-            for h in tasks.drain(..) {
-                h.abort();
-            }
-        }
+    fn spawn_listener(&self, listener: Box<dyn PathListener>) {
+        self.router.spawn_listener(self.rt.handle(), listener);
     }
 }
 
@@ -260,6 +241,10 @@ pub unsafe extern "C" fn tendril_device_id(
     out_str: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
+        if out_str.is_null() {
+            set_last_error("null output string pointer");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
         let Ok(key) = (unsafe { read_bytes32(static_pub_32, "static_pub_32") }) else {
             return TENDRIL_ERR_INVALID_ARG;
         };
@@ -277,6 +262,10 @@ pub unsafe extern "C" fn tendril_fingerprint_host(
     out_str: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
+        if out_str.is_null() {
+            set_last_error("null output string pointer");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
         let Ok(key) = (unsafe { read_bytes32(static_pub_32, "static_pub_32") }) else {
             return TENDRIL_ERR_INVALID_ARG;
         };
@@ -294,6 +283,10 @@ pub unsafe extern "C" fn tendril_fingerprint_device(
     out_str: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
+        if out_str.is_null() {
+            set_last_error("null output string pointer");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
         let Ok(key) = (unsafe { read_bytes32(static_pub_32, "static_pub_32") }) else {
             return TENDRIL_ERR_INVALID_ARG;
         };
@@ -311,6 +304,10 @@ pub unsafe extern "C" fn tendril_pairing_sas(
     out_str: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
+        if out_str.is_null() {
+            set_last_error("null output string pointer");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
         let Ok(hh) = (unsafe { read_bytes32(handshake_hash_32, "handshake_hash_32") }) else {
             return TENDRIL_ERR_INVALID_ARG;
         };
@@ -437,7 +434,7 @@ pub unsafe extern "C" fn tendril_verify_grant_json(
     expected_subject: *const c_char,
     expected_root_issuer: *const c_char,
     requested_cap: *const c_char,
-    now_unix_secs: u64,
+    now_unix: u64,
     crl_json_opt: *const c_char,
     out_allowed: *mut u8,
 ) -> i32 {
@@ -504,7 +501,7 @@ pub unsafe extern "C" fn tendril_verify_grant_json(
             subj_s,
             root_s,
             cap_s,
-            now_unix_secs,
+            now_unix,
             crl.as_ref(),
             |issuer| key_map.get(issuer).copied(),
         );
@@ -546,7 +543,7 @@ pub unsafe extern "C" fn tendril_endpoint_new(
             }
         };
 
-        let (store, identity, roster) = if let Some(dir) = dir_opt {
+        let (store, identity, roster) = if let Some(dir) = dir_opt.filter(|d| !d.is_empty()) {
             let store = match StateStore::open_or_create(dir) {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
@@ -585,17 +582,13 @@ pub unsafe extern "C" fn tendril_endpoint_new(
             (None, identity, Roster::new())
         };
 
-        let (accepted_tx, accepted_rx) = mpsc::channel(32);
         Box::into_raw(Box::new(TendrilEndpoint {
             rt,
             store,
             identity,
             roster: Arc::new(StdMutex::new(roster)),
             pair_mgr: StdMutex::new(PairingManager::new(PairingConfig::default())),
-            rate_limiter: PreAuthRateLimiter::new(PreAuthConfig::default()),
-            accepted_tx,
-            accepted_rx: AsyncMutex::new(accepted_rx),
-            listener_tasks: StdMutex::new(Vec::new()),
+            router: InboundRouter::new(),
         }))
     })
 }
@@ -623,8 +616,8 @@ pub unsafe extern "C" fn tendril_endpoint_info_json(
     out_json: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
-        if ep.is_null() {
-            set_last_error("null endpoint");
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
             return TENDRIL_ERR_INVALID_ARG;
         }
         let ep = unsafe { &*ep };
@@ -649,8 +642,8 @@ pub unsafe extern "C" fn tendril_endpoint_serve_direct(
     out_endpoint: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
-        if ep.is_null() {
-            set_last_error("null endpoint");
+        if ep.is_null() || out_endpoint.is_null() {
+            set_last_error("null endpoint or out_endpoint");
             return TENDRIL_ERR_INVALID_ARG;
         }
         let addr_opt = match unsafe { opt_cstr_to_str(listen_addr, "listen_addr") } {
@@ -691,8 +684,8 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay(
     out_endpoint: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
-        if ep.is_null() {
-            set_last_error("null endpoint");
+        if ep.is_null() || out_endpoint.is_null() {
+            set_last_error("null endpoint or out_endpoint");
             return TENDRIL_ERR_INVALID_ARG;
         }
         let url = match unsafe { cstr_to_str(relay_url, "relay_url") } {
@@ -735,8 +728,8 @@ pub unsafe extern "C" fn tendril_endpoint_issue_code(
     out_code: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
-        if ep.is_null() {
-            set_last_error("null endpoint");
+        if ep.is_null() || out_code.is_null() {
+            set_last_error("null endpoint or out_code");
             return TENDRIL_ERR_INVALID_ARG;
         }
         let kind_opt = match unsafe { opt_cstr_to_str(kind, "kind") } {
@@ -744,8 +737,12 @@ pub unsafe extern "C" fn tendril_endpoint_issue_code(
             Err(rc) => return rc,
         };
         let pk = match kind_opt {
+            None | Some("" | "lan") => PairingCodeKind::Lan2Group,
             Some("remote") => PairingCodeKind::Remote3Group,
-            _ => PairingCodeKind::Lan2Group,
+            Some(other) => {
+                set_last_error(format!("invalid pairing code kind '{other}'"));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
         };
         let ep = unsafe { &*ep };
         let mut mgr = ep.pair_mgr.lock().expect("pair_mgr mutex poisoned");
@@ -774,8 +771,8 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
     out_json: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
-        if ep.is_null() {
-            set_last_error("null endpoint");
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
             return TENDRIL_ERR_INVALID_ARG;
         }
         let Ok(endpoint_s) = (unsafe { cstr_to_str(endpoint, "endpoint") }) else {
@@ -872,51 +869,34 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
     out_json: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
-        if ep.is_null() {
-            set_last_error("null endpoint");
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
             return TENDRIL_ERR_INVALID_ARG;
         }
         let ep = unsafe { &*ep };
-        let wait = Duration::from_millis(timeout_ms.max(1));
+        let wait = Duration::from_millis(timeout_ms);
         let res = ep.rt.block_on(async {
-            let mut rx = ep.accepted_rx.lock().await;
-            let mut stream = match timeout(wait, rx.recv()).await {
-                Ok(Some(s)) => s,
+            let (mut stream, guard) = match ep.router.recv_pair(wait).await {
+                Ok(Some(pair)) => pair,
                 Ok(None) => return Err((TENDRIL_ERR_CLOSED, "listener closed".to_owned())),
-                Err(_) => return Err((TENDRIL_WOULD_BLOCK, "timed out accepting pair".to_owned())),
+                Err(()) => {
+                    return Err((TENDRIL_WOULD_BLOCK, "timed out accepting pair".to_owned()));
+                }
             };
-            drop(rx);
 
-            let guard = ep
-                .rate_limiter
-                .try_acquire(stream.peer_ip())
-                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
-            let peeked = timeout(
-                DEFAULT_PRE_AUTH_TIMEOUT,
-                peek_exact(stream.as_mut(), PREAMBLE_LEN),
-            )
-            .await
-            .map_err(|_| (TENDRIL_ERR_PROTOCOL, "preamble read timed out".to_owned()))?
-            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
-            let preamble = Preamble::decode(&peeked[..PREAMBLE_LEN])
-                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
-            if preamble.intent != Intent::Pair {
-                return Err((TENDRIL_ERR_PROTOCOL, "expected pair preamble".to_owned()));
-            }
-            let mut wrapped = PrefixedPathStream::new(stream, peeked);
-            let path_kind = if wrapped.provider_id() == ProviderId::Relay {
+            let path_kind = if stream.provider_id() == ProviderId::Relay {
                 PairingPathKind::Remote
             } else {
                 PairingPathKind::Lan
             };
             drive_pair_responder_with_options(
-                &mut wrapped,
+                stream.as_mut(),
                 &ep.identity,
                 &ep.pair_mgr,
                 &ep.roster,
                 path_kind,
                 now_unix(),
-                Some(&ep.rate_limiter),
+                Some(ep.router.rate_limiter()),
                 Some(guard),
                 DEFAULT_PRE_AUTH_TIMEOUT,
             )
@@ -1011,8 +991,8 @@ pub unsafe extern "C" fn tendril_endpoint_mint_grant(
     out_grant_json: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
-        if ep.is_null() {
-            set_last_error("null endpoint");
+        if ep.is_null() || out_grant_json.is_null() {
+            set_last_error("null endpoint or out_grant_json");
             return TENDRIL_ERR_INVALID_ARG;
         }
         let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
@@ -1150,14 +1130,24 @@ pub unsafe extern "C" fn tendril_session_connect(
         });
 
         match res {
-            Ok(driver) => Box::into_raw(Box::new(TendrilSession {
-                rt: Arc::clone(&ep.rt),
-                store: ep.store.clone(),
-                roster: Arc::clone(&ep.roster),
-                driver,
-            })),
+            Ok(driver) => {
+                if let Err(e) = persist_store_roster(ep.store.as_ref(), &ep.roster) {
+                    set_last_error(e);
+                    return ptr::null_mut();
+                }
+                Box::into_raw(Box::new(TendrilSession {
+                    rt: Arc::clone(&ep.rt),
+                    store: ep.store.clone(),
+                    roster: Arc::clone(&ep.roster),
+                    driver,
+                }))
+            }
             Err(e) => {
-                set_last_error(e);
+                if let Err(pe) = persist_store_roster(ep.store.as_ref(), &ep.roster) {
+                    set_last_error(format!("{e} (roster persist error: {pe})"));
+                } else {
+                    set_last_error(e);
+                }
                 ptr::null_mut()
             }
         }
@@ -1179,26 +1169,20 @@ pub unsafe extern "C" fn tendril_session_accept(
             return ptr::null_mut();
         }
         let ep = unsafe { &*ep };
-        let wait = Duration::from_millis(timeout_ms.max(1));
+        let wait = Duration::from_millis(timeout_ms);
         let res = ep.rt.block_on(async {
-            let mut rx = ep.accepted_rx.lock().await;
-            let stream = match timeout(wait, rx.recv()).await {
-                Ok(Some(s)) => s,
+            let (stream, guard) = match ep.router.recv_session(wait).await {
+                Ok(Some(pair)) => pair,
                 Ok(None) => return Err("listener closed".to_owned()),
-                Err(_) => return Err("timed out accepting session".to_owned()),
+                Err(()) => return Err("timed out accepting session".to_owned()),
             };
-            drop(rx);
 
-            let guard = ep
-                .rate_limiter
-                .try_acquire(stream.peer_ip())
-                .map_err(|e| e.to_string())?;
             SessionDriver::accept_locked(
                 stream,
                 &ep.identity,
                 &ep.roster,
                 now_unix(),
-                Some(&ep.rate_limiter),
+                Some(ep.router.rate_limiter()),
                 Some(guard),
                 DEFAULT_PRE_AUTH_TIMEOUT,
             )
@@ -1276,12 +1260,12 @@ pub unsafe extern "C" fn tendril_session_poll_event(
     out_event_json: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
-        if sess.is_null() {
-            set_last_error("null session");
+        if sess.is_null() || out_event_json.is_null() {
+            set_last_error("null session or out_event_json");
             return TENDRIL_ERR_INVALID_ARG;
         }
         let sess = unsafe { &mut *sess };
-        let wait = Duration::from_millis(timeout_ms.max(1));
+        let wait = Duration::from_millis(timeout_ms);
         let roster_ref = Arc::clone(&sess.roster);
 
         match sess.rt.block_on(async {
@@ -1302,9 +1286,9 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                         "grant": g,
                     }),
                     SessionEvent::RevocationUpdated { issuer, seq } => {
-                        if let Some(store) = &sess.store {
-                            let guard = sess.roster.lock().expect("roster mutex poisoned");
-                            let _ = store.save_roster(&guard);
+                        if let Err(e) = persist_store_roster(sess.store.as_ref(), &sess.roster) {
+                            set_last_error(e);
+                            return TENDRIL_ERR_INTERNAL;
                         }
                         serde_json::json!({
                             "event": "revocation_updated",
@@ -1330,7 +1314,11 @@ pub unsafe extern "C" fn tendril_session_poll_event(
             }
             Ok(Ok(None)) => TENDRIL_EOF,
             Ok(Err(e)) => {
-                set_last_error(e.to_string());
+                if let Err(pe) = persist_store_roster(sess.store.as_ref(), &sess.roster) {
+                    set_last_error(format!("{e} (roster persist error: {pe})"));
+                } else {
+                    set_last_error(e.to_string());
+                }
                 TENDRIL_ERR_PROTOCOL
             }
             Err(_) => TENDRIL_WOULD_BLOCK,

@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	tendril "tendril.dev/bindings/go"
@@ -340,6 +342,131 @@ func TestLiveInteropWithConformancePeer(t *testing.T) {
 		t.Fatalf("Go Authorize after revoke expected false: allowed=%v err=%v", allowed, err)
 	}
 	peer2.call(t, map[string]any{"op": "shutdown"})
+}
+
+func TestConcurrencyLifetimeRekeyAndWouldBlock(t *testing.T) {
+	hostEp, err := tendril.NewEndpoint("", "go-race-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint host: %v", err)
+	}
+	defer hostEp.Close()
+
+	info, err := hostEp.Info()
+	if err != nil || info.HostID != "go-race-host" || info.DeviceID == "" {
+		t.Fatalf("unexpected Info: %+v err=%v", info, err)
+	}
+
+	addr, err := hostEp.ServeDirect("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	code, err := hostEp.IssueCode("lan")
+	if err != nil {
+		t.Fatalf("IssueCode: %v", err)
+	}
+
+	if _, err := hostEp.PairAccept(0); !errors.Is(err, tendril.ErrWouldBlock) {
+		t.Fatalf("expected ErrWouldBlock on PairAccept(0), got %v", err)
+	}
+
+	cliEp, err := tendril.NewEndpoint("", "go-race-cli")
+	if err != nil {
+		t.Fatalf("NewEndpoint cli: %v", err)
+	}
+	defer cliEp.Close()
+
+	var wg sync.WaitGroup
+	var key [32]byte
+	key[0] = 0x11
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := tendril.DeviceID(key); err != nil {
+				t.Errorf("concurrent DeviceID: %v", err)
+			}
+			if _, err := hostEp.Info(); err != nil {
+				t.Errorf("concurrent Info: %v", err)
+			}
+		}()
+	}
+
+	pairCh := make(chan tendril.PairAcceptResult, 1)
+	pairErrCh := make(chan error, 1)
+	go func() {
+		res, err := hostEp.PairAccept(5000)
+		if err != nil {
+			pairErrCh <- err
+			return
+		}
+		pairCh <- res
+	}()
+
+	cliPair, err := cliEp.PairInitiate(addr, "", code, "go-dev", "go")
+	if err != nil {
+		t.Fatalf("PairInitiate: %v", err)
+	}
+	select {
+	case err := <-pairErrCh:
+		t.Fatalf("PairAccept failed: %v", err)
+	case acc := <-pairCh:
+		if acc.SAS != cliPair.SAS {
+			t.Fatalf("SAS mismatch: %s vs %s", acc.SAS, cliPair.SAS)
+		}
+		if err := hostEp.ConfirmPeer(acc.DeviceID, acc.SAS); err != nil {
+			t.Fatalf("ConfirmPeer: %v", err)
+		}
+		grant, err := hostEp.MintGrant(acc.DeviceID, []string{"fs.read"}, 3600)
+		if err != nil {
+			t.Fatalf("MintGrant: %v", err)
+		}
+		sessCh := make(chan *tendril.Session, 1)
+		sessErrCh := make(chan error, 1)
+		go func() {
+			s, err := hostEp.AcceptSession(5000)
+			if err != nil {
+				sessErrCh <- err
+				return
+			}
+			sessCh <- s
+		}()
+
+		cliSess, err := cliEp.Connect(addr, "", "go-race-host", grant)
+		if err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		defer cliSess.Close()
+
+		var hostSess *tendril.Session
+		select {
+		case err := <-sessErrCh:
+			t.Fatalf("AcceptSession failed: %v", err)
+		case hostSess = <-sessCh:
+		}
+		defer hostSess.Close()
+
+		// Free client endpoint before using cliSess to confirm lifetime independence.
+		_ = cliEp.Close()
+
+		if _, err := hostSess.PollEvent(0); !errors.Is(err, tendril.ErrWouldBlock) {
+			t.Fatalf("expected ErrWouldBlock on PollEvent(0), got %v", err)
+		}
+		if err := cliSess.Rekey(); err != nil {
+			t.Fatalf("Rekey: %v", err)
+		}
+		ev, err := hostSess.PollEvent(2000)
+		if err != nil || ev.Event != "rekeyed" {
+			t.Fatalf("expected rekeyed event, got %+v err=%v", ev, err)
+		}
+		if err := cliSess.SendData([]byte("post-rekey-go")); err != nil {
+			t.Fatalf("SendData after Rekey: %v", err)
+		}
+		ev2, err := hostSess.PollEvent(2000)
+		if err != nil || ev2.Event != "data" {
+			t.Fatalf("expected data event, got %+v err=%v", ev2, err)
+		}
+	}
+	wg.Wait()
 }
 
 func BenchmarkFFIOverhead(b *testing.B) {

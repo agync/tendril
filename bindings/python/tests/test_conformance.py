@@ -3,6 +3,7 @@ import json
 import pathlib
 import subprocess
 import threading
+import time
 import unittest
 
 import tendril
@@ -126,9 +127,37 @@ class TendrilPythonTests(unittest.TestCase):
         )
 
     def test_multithreaded_gil_release_and_interop_with_peer(self) -> None:
-        # 1. Two Python threads running pair_accept / pair_initiate simultaneously prove GIL release.
+        # 1a. Concurrent heartbeat ticks freely while another Python thread runs Argon2 compute_code_mac.
+        stop_argon = threading.Event()
+        ticks = 0
+
+        def heartbeat() -> None:
+            nonlocal ticks
+            while not stop_argon.is_set():
+                ticks += 1
+                time.sleep(0.005)
+
+        def argon_worker() -> None:
+            try:
+                for i in range(4):
+                    mac = tendril.compute_code_mac("4829-1704", bytes([i]) * 32)
+                    self.assertEqual(len(mac), 32)
+            finally:
+                stop_argon.set()
+
+        hb_thr = threading.Thread(target=heartbeat)
+        ag_thr = threading.Thread(target=argon_worker)
+        hb_thr.start()
+        ag_thr.start()
+        ag_thr.join(timeout=10)
+        hb_thr.join(timeout=5)
+        self.assertGreaterEqual(ticks, 5)
+
+        # 1b. Two Python threads running pair_accept / pair_initiate simultaneously prove GIL release.
         host_ep = tendril.Endpoint(None, "py-host")
         cli_ep = tendril.Endpoint(None, "py-cli")
+        with self.assertRaises(ValueError):
+            host_ep.issue_code("invalid")
         addr = host_ep.serve_direct("127.0.0.1:0")
         code = host_ep.issue_code("lan")
         accepted_holder: dict = {}
@@ -194,8 +223,12 @@ class TendrilPythonTests(unittest.TestCase):
             ev2 = peer.call({"op": "recv", "timeout_ms": 2000})
             self.assertEqual(ev2["data_utf8"], "from-python")
 
+            s.rekey()
+            ev_rk = json.loads(s.poll_event(2000))
+            self.assertEqual(ev_rk["event"], "rekeyed")
             peer.call({"op": "send", "data_utf8": "back-to-python"})
             ev_py = json.loads(s.poll_event(2000))
+            self.assertEqual(ev_py["event"], "data")
             b64 = ev_py["data_b64"]
             decoded = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
             self.assertEqual(decoded, b"back-to-python")
@@ -205,6 +238,74 @@ class TendrilPythonTests(unittest.TestCase):
             peer.call({"op": "shutdown"})
         finally:
             peer.close()
+
+        # 3. Direction 2 live interop: Rust peer client -> Python host.
+        peer2 = PeerProc()
+        py_host = tendril.Endpoint(None, "py-interop-host")
+        try:
+            host_info = json.loads(py_host.info_json())
+            self.assertEqual(host_info["host_id"], "py-interop-host")
+            self.assertTrue(host_info["device_id"].startswith("dev_"))
+
+            host_addr = py_host.serve_direct("127.0.0.1:0")
+            host_code = py_host.issue_code("lan")
+            peer2.call({"op": "init", "host_id": "rust-cli"})
+
+            peer2.send(
+                {
+                    "op": "pair",
+                    "endpoint": host_addr,
+                    "code": host_code,
+                    "name": "rust-cli",
+                }
+            )
+            acc = json.loads(py_host.pair_accept(5000))
+            p2_pair = peer2.recv()
+            self.assertEqual(p2_pair["sas"], acc["sas"])
+
+            py_host.confirm_peer(acc["device_id"], acc["sas"])
+            grant_str = py_host.mint_grant(acc["device_id"], ["fs.read"], 3600)
+
+            peer2.send(
+                {
+                    "op": "connect",
+                    "endpoint": host_addr,
+                    "target_host_id": "py-interop-host",
+                    "grant": json.loads(grant_str),
+                }
+            )
+            py_host_sess = py_host.accept_session(5000)
+            self.assertTrue(peer2.recv()["ok"])
+            self.assertTrue(py_host_sess.authorize("fs.read"))
+            self.assertFalse(py_host_sess.authorize("shell.exec"))
+
+            peer2.call({"op": "send", "data_utf8": "hello-to-py-host"})
+            ev_h = json.loads(py_host_sess.poll_event(2000))
+            self.assertEqual(ev_h["event"], "data")
+            b64_h = ev_h["data_b64"]
+            self.assertEqual(
+                base64.urlsafe_b64decode(b64_h + "=" * (-len(b64_h) % 4)),
+                b"hello-to-py-host",
+            )
+
+            py_host_sess.rekey()
+            ev_rk_local = json.loads(py_host_sess.poll_event(2000))
+            self.assertEqual(ev_rk_local["event"], "rekeyed")
+            ev_rk_peer = peer2.call({"op": "recv", "timeout_ms": 2000})
+            self.assertEqual(ev_rk_peer["event"], "rekeyed")
+
+            py_host_sess.send_data(b"reply-from-py-host")
+            ev_p2 = peer2.call({"op": "recv", "timeout_ms": 2000})
+            self.assertEqual(ev_p2["data_utf8"], "reply-from-py-host")
+
+            py_host.revoke_peer(acc["device_id"])
+            self.assertFalse(py_host_sess.authorize("fs.read"))
+
+            py_host_sess.close()
+            peer2.call({"op": "shutdown"})
+        finally:
+            py_host.close()
+            peer2.close()
 
 
 if __name__ == "__main__":

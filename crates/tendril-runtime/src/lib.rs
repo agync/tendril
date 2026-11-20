@@ -5,6 +5,7 @@ pub mod error;
 pub mod provider;
 pub mod providers;
 pub mod rate_limit;
+pub mod router;
 pub mod store;
 
 pub use driver::{
@@ -20,4 +21,5 @@ pub use providers::{
     DirectDialer, DirectListener, LocalDialer, LocalListener, RelayDialer, RelayListener,
 };
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
+pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
 pub use store::StateStore;

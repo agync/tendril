@@ -130,10 +130,33 @@ test("Node binding reproduces all v1 conformance vectors", async () => {
   );
 });
 
-test("Node N-API live async interop with Rust tendril-conformance-peer", async () => {
+test("Node N-API keeps JS event loop responsive during Argon2 computeCodeMac", async () => {
+  let ticks = 0;
+  const timer = setInterval(() => {
+    ticks += 1;
+  }, 5);
+  try {
+    const macs = await Promise.all(
+      [0, 1, 2, 3].map((i) => tendril.computeCodeMac("4829-1704", Buffer.alloc(32, i)))
+    );
+    for (const mac of macs) {
+      assert.equal(mac.length, 32);
+    }
+  } finally {
+    clearInterval(timer);
+  }
+  assert.ok(ticks >= 2, `expected event loop ticks during Argon2, got ${ticks}`);
+});
+
+test("Node N-API bidirectional async interop with Rust tendril-conformance-peer", async () => {
   const peer = spawnPeer();
   const hostEp = new tendril.Endpoint(null, "node-host");
   try {
+    const info = JSON.parse(hostEp.infoJson());
+    assert.equal(info.host_id, "node-host");
+    assert.ok(info.device_id.startsWith("dev_"));
+    assert.throws(() => hostEp.issueCode("invalid"));
+
     const addr = await hostEp.serveDirect("127.0.0.1:0");
     const code = hostEp.issueCode("lan");
     await peer.call({ op: "init", host_id: "rust-cli" });
@@ -167,6 +190,12 @@ test("Node N-API live async interop with Rust tendril-conformance-peer", async (
     assert.equal(ev.event, "data");
     assert.equal(Buffer.from(ev.data_b64, "base64url").toString("utf8"), "hello-to-node");
 
+    await hostSess.rekey();
+    const rkLocal = JSON.parse(await hostSess.pollEvent(2000));
+    assert.equal(rkLocal.event, "rekeyed");
+    const rkPeer = await peer.call({ op: "recv", timeout_ms: 2000 });
+    assert.equal(rkPeer.event, "rekeyed");
+
     await hostSess.sendData(Buffer.from("reply-from-node", "utf8"));
     const peerEv = await peer.call({ op: "recv", timeout_ms: 2000 });
     assert.equal(peerEv.data_utf8, "reply-from-node");
@@ -179,5 +208,58 @@ test("Node N-API live async interop with Rust tendril-conformance-peer", async (
   } finally {
     hostEp.close();
     peer.close();
+  }
+
+  // Direction 2: Node client -> Rust conformance peer host.
+  const peer2 = spawnPeer();
+  const cliEp = new tendril.Endpoint(null, "node-cli");
+  try {
+    await peer2.call({ op: "init", host_id: "rust-host" });
+    const srv = await peer2.call({ op: "serve_direct" });
+    const code2 = (await peer2.call({ op: "issue_code", kind: "lan" })).code;
+
+    const [pairRaw, peerPair2] = await Promise.all([
+      cliEp.pairInitiate(srv.endpoint, code2, null, "node-dev", "node"),
+      peer2.call({ op: "pair" }),
+    ]);
+    const pairRes = JSON.parse(pairRaw);
+    assert.equal(pairRes.sas, peerPair2.sas);
+
+    await peer2.call({ op: "confirm", peer_id: peerPair2.device_id, sas: pairRes.sas });
+    const grantObj2 = (
+      await peer2.call({
+        op: "mint",
+        peer_id: peerPair2.device_id,
+        caps: ["fs.read"],
+      })
+    ).grant;
+
+    const [cliSess, hostConn] = await Promise.all([
+      cliEp.connect(srv.endpoint, "rust-host", JSON.stringify(grantObj2)),
+      peer2.call({ op: "connect" }),
+    ]);
+    assert.equal(hostConn.ok, true);
+
+    await cliSess.sendData(Buffer.from("hello-from-node-client", "utf8"));
+    const hostRecv = await peer2.call({ op: "recv", timeout_ms: 2000 });
+    assert.equal(hostRecv.data_utf8, "hello-from-node-client");
+
+    await cliSess.rekey();
+    const rkCli = JSON.parse(await cliSess.pollEvent(2000));
+    assert.equal(rkCli.event, "rekeyed");
+
+    await peer2.call({ op: "send", data_utf8: "back-to-node-client" });
+    const cliEv = JSON.parse(await cliSess.pollEvent(2000));
+    assert.equal(cliEv.event, "data");
+    assert.equal(
+      Buffer.from(cliEv.data_b64, "base64url").toString("utf8"),
+      "back-to-node-client"
+    );
+
+    await cliSess.close(1000, "done");
+    await peer2.call({ op: "shutdown" });
+  } finally {
+    cliEp.close();
+    peer2.close();
   }
 });

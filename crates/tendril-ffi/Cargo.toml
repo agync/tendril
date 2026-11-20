@@ -16,6 +16,10 @@ tendril-core.workspace = true
 tendril-runtime.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+snow.workspace = true
+tempfile.workspace = true
+
 [lints.rust]
 unsafe_code = "allow"
 

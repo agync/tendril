@@ -778,3 +778,56 @@ async fn relay_listener_verifies_url_host_even_when_expected_host_is_none() {
     drop(listener);
     h_match.stop().await.expect("stop");
 }
+
+#[tokio::test]
+async fn inbound_router_separates_pair_and_session_and_wakes_on_close() {
+    use std::sync::Arc;
+    use tendril_core::wire::{Intent, Preamble};
+    use tendril_runtime::{DirectDialer, DirectListener, InboundRouter};
+
+    let listener = DirectListener::bind("127.0.0.1:0".parse().expect("addr"), None)
+        .await
+        .expect("bind direct");
+    let ep = listener.local_endpoint();
+    let router = Arc::new(InboundRouter::new());
+    router.spawn_listener(&tokio::runtime::Handle::current(), Box::new(listener));
+
+    assert!(matches!(router.recv_pair(Duration::ZERO).await, Err(())));
+    assert!(matches!(router.recv_session(Duration::ZERO).await, Err(())));
+
+    let dialer = DirectDialer::new();
+    let mut sess_conn = dialer.dial(&ep).await.expect("dial session first");
+    sess_conn
+        .send_chunk(&Preamble::v1(Intent::Session).encode())
+        .await
+        .expect("send session preamble");
+
+    let mut pair_conn = dialer.dial(&ep).await.expect("dial pair second");
+    pair_conn
+        .send_chunk(&Preamble::v1(Intent::Pair).encode())
+        .await
+        .expect("send pair preamble");
+
+    // recv_pair must receive the Pair stream even though Session arrived first.
+    let (_pair_stream, _pair_guard) = router
+        .recv_pair(Duration::from_secs(2))
+        .await
+        .expect("pair wait ok")
+        .expect("pair stream");
+    let (_sess_stream, _sess_guard) = router
+        .recv_session(Duration::from_secs(2))
+        .await
+        .expect("session wait ok")
+        .expect("session stream");
+
+    // close() must wake a blocked waiter far before the long timeout elapses.
+    let r2 = Arc::clone(&router);
+    let waiter = tokio::spawn(async move { r2.recv_pair(Duration::from_secs(30)).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    router.close();
+    let woke = tokio::time::timeout(Duration::from_millis(500), waiter)
+        .await
+        .expect("waiter must wake promptly on close")
+        .expect("join");
+    assert!(matches!(woke, Ok(None)));
+}

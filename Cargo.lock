@@ -1097,6 +1097,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "snow",
+ "tempfile",
  "tendril-core",
  "tendril-runtime",
  "tokio",

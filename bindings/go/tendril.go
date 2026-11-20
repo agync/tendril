@@ -58,6 +58,7 @@ type SessionEvent struct {
 	Cookie    uint64          `json:"cookie,omitempty"`
 	Code      uint16          `json:"code,omitempty"`
 	Reason    string          `json:"reason,omitempty"`
+	Audit     json.RawMessage `json:"audit,omitempty"`
 }
 
 func lastError() string {
@@ -102,6 +103,8 @@ func takeOutCStr(p *C.char) string {
 
 // DeviceID computes the dev_<hex16> identifier for a 32-byte X25519 static public key.
 func DeviceID(staticPub [32]byte) (string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	var out *C.char
 	rc := C.tendril_device_id((*C.uint8_t)(unsafe.Pointer(&staticPub[0])), &out)
 	if rc != C.TENDRIL_OK {
@@ -112,6 +115,8 @@ func DeviceID(staticPub [32]byte) (string, error) {
 
 // FingerprintHost computes the base32 host fingerprint for a 32-byte public key.
 func FingerprintHost(staticPub [32]byte) (string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	var out *C.char
 	rc := C.tendril_fingerprint_host((*C.uint8_t)(unsafe.Pointer(&staticPub[0])), &out)
 	if rc != C.TENDRIL_OK {
@@ -122,6 +127,8 @@ func FingerprintHost(staticPub [32]byte) (string, error) {
 
 // FingerprintDevice computes the uppercase hex device fingerprint for a 32-byte public key.
 func FingerprintDevice(staticPub [32]byte) (string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	var out *C.char
 	rc := C.tendril_fingerprint_device((*C.uint8_t)(unsafe.Pointer(&staticPub[0])), &out)
 	if rc != C.TENDRIL_OK {
@@ -132,6 +139,8 @@ func FingerprintDevice(staticPub [32]byte) (string, error) {
 
 // PairingSAS derives the 4x4 pairing SAS from a 32-byte handshake hash.
 func PairingSAS(handshakeHash [32]byte) (string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	var out *C.char
 	rc := C.tendril_pairing_sas((*C.uint8_t)(unsafe.Pointer(&handshakeHash[0])), &out)
 	if rc != C.TENDRIL_OK {
@@ -142,6 +151,8 @@ func PairingSAS(handshakeHash [32]byte) (string, error) {
 
 // ComputeCodeMAC computes Argon2id + HMAC-SHA256 pairing proof via tendril-ffi.
 func ComputeCodeMAC(code string, handshakeHash [32]byte) ([32]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	var mac [32]byte
 	ccode := C.CString(code)
 	defer C.free(unsafe.Pointer(ccode))
@@ -162,6 +173,8 @@ func VerifyRotationChainJSON(
 	pinnedSeq uint64,
 	chainJSON, curStaticB64, curSigningB64 string,
 ) (uint64, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	cpsig := C.CString(pinnedSigningB64)
 	cpstat := C.CString(pinnedStaticB64)
 	cchain := C.CString(chainJSON)
@@ -191,6 +204,8 @@ func VerifyGrantJSON(
 	nowUnix uint64,
 	crlJSON string,
 ) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	cgrant := C.CString(grantJSON)
 	ckeys := C.CString(issuerKeysJSON)
 	csubj := C.CString(expectedSubject)
@@ -225,6 +240,8 @@ type Endpoint struct {
 
 // NewEndpoint creates a new endpoint backed by stateDir (or ephemeral in-memory when empty).
 func NewEndpoint(stateDir, hostID string) (*Endpoint, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	var raw *C.TendrilEndpoint
 	withOptCStr(stateDir, func(cd *C.char) {
 		withOptCStr(hostID, func(ch *C.char) {
@@ -252,6 +269,8 @@ func (ep *Endpoint) Close() error {
 }
 
 func (ep *Endpoint) withHandle(fn func(*C.TendrilEndpoint) error) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	ep.mu.RLock()
 	defer ep.mu.RUnlock()
 	defer runtime.KeepAlive(ep)
@@ -488,6 +507,8 @@ func (s *Session) Close() error {
 }
 
 func (s *Session) withHandle(fn func(*C.TendrilSession) error) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer runtime.KeepAlive(s)
@@ -499,6 +520,7 @@ func (s *Session) withHandle(fn func(*C.TendrilSession) error) error {
 
 // SendData sends encrypted 0x01 DATA over the session.
 func (s *Session) SendData(payload []byte) error {
+	defer runtime.KeepAlive(payload)
 	return s.withHandle(func(h *C.TendrilSession) error {
 		var ptr *C.uint8_t
 		if len(payload) > 0 {

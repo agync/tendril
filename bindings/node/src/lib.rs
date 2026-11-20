@@ -7,7 +7,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::{
     b64url_decode_array, b64url_encode, compute_code_mac as core_compute_code_mac,
     device_id as core_device_id, fingerprint_device as core_fingerprint_device,
@@ -20,16 +19,24 @@ use tendril_core::pairing::{
 };
 use tendril_core::policy::ProviderId;
 use tendril_core::roster::Roster;
-use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer,
-    PathDialer, PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream,
-    RelayDialer, RelayListener, SessionDriver, SessionEvent, StateStore, drive_pair_initiator,
-    drive_pair_responder_with_options, peek_exact,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, InboundRouter,
+    LocalDialer, PathDialer, PathListener, PathStream, RelayDialer, RelayListener, SessionDriver,
+    SessionEvent, StateStore, drive_pair_initiator, drive_pair_responder_with_options,
 };
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
+
+fn persist_store_roster(
+    store: Option<&Arc<StateStore>>,
+    roster: &Arc<StdMutex<Roster>>,
+) -> Result<()> {
+    if let Some(s) = store {
+        let guard = roster.lock().expect("roster mutex poisoned");
+        s.save_roster(&guard).map_err(to_generic_err)?;
+    }
+    Ok(())
+}
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -176,10 +183,7 @@ pub struct Endpoint {
     identity: Arc<EndpointIdentity>,
     roster: Arc<StdMutex<Roster>>,
     pair_mgr: Arc<StdMutex<PairingManager>>,
-    rate_limiter: PreAuthRateLimiter,
-    accepted_tx: mpsc::Sender<Box<dyn PathStream>>,
-    accepted_rx: Arc<AsyncMutex<mpsc::Receiver<Box<dyn PathStream>>>>,
-    listener_tasks: StdMutex<Vec<JoinHandle<()>>>,
+    router: InboundRouter,
 }
 
 impl Endpoint {
@@ -190,29 +194,9 @@ impl Endpoint {
         Ok(())
     }
 
-    fn spawn_listener(&self, mut listener: Box<dyn PathListener>) {
-        let tx = self.accepted_tx.clone();
-        let handle = tokio::spawn(async move {
-            while let Ok(stream) = listener.accept().await {
-                if tx.send(stream).await.is_err() {
-                    break;
-                }
-            }
-        });
-        self.listener_tasks
-            .lock()
-            .expect("listener_tasks mutex poisoned")
-            .push(handle);
-    }
-}
-
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        if let Ok(mut tasks) = self.listener_tasks.lock() {
-            for h in tasks.drain(..) {
-                h.abort();
-            }
-        }
+    fn spawn_listener(&self, listener: Box<dyn PathListener>) {
+        self.router
+            .spawn_listener(&tokio::runtime::Handle::current(), listener);
     }
 }
 
@@ -221,7 +205,7 @@ impl Endpoint {
     #[napi(constructor)]
     pub fn new(state_dir: Option<String>, host_id: Option<String>) -> Result<Self> {
         let host_opt = host_id.as_deref();
-        let (store, identity, roster) = if let Some(dir) = state_dir {
+        let (store, identity, roster) = if let Some(dir) = state_dir.filter(|s| !s.is_empty()) {
             let store = Arc::new(StateStore::open_or_create(dir).map_err(to_generic_err)?);
             let identity = store
                 .load_or_generate_identity(host_opt)
@@ -238,16 +222,12 @@ impl Endpoint {
             (None, identity, Roster::new())
         };
 
-        let (accepted_tx, accepted_rx) = mpsc::channel(32);
         Ok(Self {
             store,
             identity: Arc::new(identity),
             roster: Arc::new(StdMutex::new(roster)),
             pair_mgr: Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default()))),
-            rate_limiter: PreAuthRateLimiter::new(PreAuthConfig::default()),
-            accepted_tx,
-            accepted_rx: Arc::new(AsyncMutex::new(accepted_rx)),
-            listener_tasks: StdMutex::new(Vec::new()),
+            router: InboundRouter::new(),
         })
     }
 
@@ -295,8 +275,14 @@ impl Endpoint {
     #[napi]
     pub fn issue_code(&self, kind: Option<String>) -> Result<String> {
         let pk = match kind.as_deref() {
+            None | Some("" | "lan") => PairingCodeKind::Lan2Group,
             Some("remote") => PairingCodeKind::Remote3Group,
-            _ => PairingCodeKind::Lan2Group,
+            Some(other) => {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("invalid pairing code kind '{other}'"),
+                ));
+            }
         };
         let mut mgr = self.pair_mgr.lock().expect("pair_mgr mutex poisoned");
         mgr.issue_code(pk, now_unix()).map_err(to_generic_err)
@@ -362,44 +348,26 @@ impl Endpoint {
 
     #[napi]
     pub async fn pair_accept(&self, timeout_ms: Option<u32>) -> Result<String> {
-        let wait = Duration::from_millis(u64::from(timeout_ms.unwrap_or(5000).max(1)));
-        let mut rx = self.accepted_rx.lock().await;
-        let mut stream = match timeout(wait, rx.recv()).await {
-            Ok(Some(s)) => s,
+        let wait = Duration::from_millis(u64::from(timeout_ms.unwrap_or(5000)));
+        let (mut stream, guard) = match self.router.recv_pair(wait).await {
+            Ok(Some(pair)) => pair,
             Ok(None) => return Err(to_generic_err("listener closed")),
-            Err(_) => return Err(to_generic_err("timed out accepting pair")),
+            Err(()) => return Err(to_generic_err("timed out accepting pair")),
         };
-        drop(rx);
 
-        let guard = self
-            .rate_limiter
-            .try_acquire(stream.peer_ip())
-            .map_err(to_generic_err)?;
-        let peeked = timeout(
-            DEFAULT_PRE_AUTH_TIMEOUT,
-            peek_exact(stream.as_mut(), PREAMBLE_LEN),
-        )
-        .await
-        .map_err(|_| to_generic_err("preamble read timed out"))?
-        .map_err(to_generic_err)?;
-        let preamble = Preamble::decode(&peeked[..PREAMBLE_LEN]).map_err(to_generic_err)?;
-        if preamble.intent != Intent::Pair {
-            return Err(to_generic_err("expected pair preamble"));
-        }
-        let mut wrapped = PrefixedPathStream::new(stream, peeked);
-        let path_kind = if wrapped.provider_id() == ProviderId::Relay {
+        let path_kind = if stream.provider_id() == ProviderId::Relay {
             PairingPathKind::Remote
         } else {
             PairingPathKind::Lan
         };
         let res = drive_pair_responder_with_options(
-            &mut wrapped,
+            stream.as_mut(),
             &self.identity,
             &self.pair_mgr,
             &self.roster,
             path_kind,
             now_unix(),
-            Some(&self.rate_limiter),
+            Some(self.router.rate_limiter()),
             Some(guard),
             DEFAULT_PRE_AUTH_TIMEOUT,
         )
@@ -414,8 +382,7 @@ impl Endpoint {
                 kind,
                 ..
             } => {
-                let roster = self.roster.lock().expect("roster mutex poisoned");
-                self.persist_roster(&roster)?;
+                persist_store_roster(self.store.as_ref(), &self.roster)?;
                 Ok(serde_json::json!({
                     "device_id": device_id,
                     "sas": pairing_sas,
@@ -487,7 +454,7 @@ impl Endpoint {
         let stream = dial_endpoint(&endpoint, relay_host.as_deref())
             .await
             .map_err(to_generic_err)?;
-        let driver = SessionDriver::connect_locked(
+        let driver = match SessionDriver::connect_locked(
             stream,
             &self.identity,
             &target_host_id,
@@ -496,7 +463,18 @@ impl Endpoint {
             now_unix(),
         )
         .await
-        .map_err(to_generic_err)?;
+        {
+            Ok(drv) => {
+                persist_store_roster(self.store.as_ref(), &self.roster)?;
+                drv
+            }
+            Err(e) => {
+                if let Err(pe) = persist_store_roster(self.store.as_ref(), &self.roster) {
+                    return Err(Error::new(Status::GenericFailure, format!("{e} ({pe})")));
+                }
+                return Err(to_generic_err(e));
+            }
+        };
 
         Ok(Session {
             store: self.store.clone(),
@@ -507,25 +485,19 @@ impl Endpoint {
 
     #[napi]
     pub async fn accept_session(&self, timeout_ms: Option<u32>) -> Result<Session> {
-        let wait = Duration::from_millis(u64::from(timeout_ms.unwrap_or(5000).max(1)));
-        let mut rx = self.accepted_rx.lock().await;
-        let stream = match timeout(wait, rx.recv()).await {
-            Ok(Some(s)) => s,
+        let wait = Duration::from_millis(u64::from(timeout_ms.unwrap_or(5000)));
+        let (stream, guard) = match self.router.recv_session(wait).await {
+            Ok(Some(pair)) => pair,
             Ok(None) => return Err(to_generic_err("listener closed")),
-            Err(_) => return Err(to_generic_err("timed out accepting session")),
+            Err(()) => return Err(to_generic_err("timed out accepting session")),
         };
-        drop(rx);
 
-        let guard = self
-            .rate_limiter
-            .try_acquire(stream.peer_ip())
-            .map_err(to_generic_err)?;
         let driver = SessionDriver::accept_locked(
             stream,
             &self.identity,
             &self.roster,
             now_unix(),
-            Some(&self.rate_limiter),
+            Some(self.router.rate_limiter()),
             Some(guard),
             DEFAULT_PRE_AUTH_TIMEOUT,
         )
@@ -541,11 +513,7 @@ impl Endpoint {
 
     #[napi]
     pub fn close(&self) {
-        if let Ok(mut tasks) = self.listener_tasks.lock() {
-            for h in tasks.drain(..) {
-                h.abort();
-            }
-        }
+        self.router.close();
     }
 }
 
@@ -569,7 +537,7 @@ impl Session {
 
     #[napi]
     pub async fn poll_event(&self, timeout_ms: Option<u32>) -> Result<String> {
-        let wait = Duration::from_millis(u64::from(timeout_ms.unwrap_or(5000).max(1)));
+        let wait = Duration::from_millis(u64::from(timeout_ms.unwrap_or(5000)));
         let mut guard = self.driver.lock().await;
         match timeout(wait, guard.next_event_locked(now_unix(), &self.roster)).await {
             Ok(Ok(Some(ev))) => {
@@ -590,10 +558,7 @@ impl Session {
                         "grant": g,
                     }),
                     SessionEvent::RevocationUpdated { issuer, seq } => {
-                        if let Some(s) = &self.store {
-                            let rg = self.roster.lock().expect("roster mutex poisoned");
-                            let _ = s.save_roster(&rg);
-                        }
+                        persist_store_roster(self.store.as_ref(), &self.roster)?;
                         serde_json::json!({
                             "status": "event",
                             "event": "revocation_updated",
@@ -621,7 +586,13 @@ impl Session {
                 Ok(json.to_string())
             }
             Ok(Ok(None)) => Ok(serde_json::json!({ "status": "eof" }).to_string()),
-            Ok(Err(e)) => Err(to_generic_err(e)),
+            Ok(Err(e)) => {
+                if let Err(pe) = persist_store_roster(self.store.as_ref(), &self.roster) {
+                    Err(Error::new(Status::GenericFailure, format!("{e} ({pe})")))
+                } else {
+                    Err(to_generic_err(e))
+                }
+            }
             Err(_) => Ok(serde_json::json!({ "status": "would_block" }).to_string()),
         }
     }
