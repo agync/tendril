@@ -6,12 +6,13 @@ OKF_WIKI ?= $(HOME)/.agents/skills/okf-wiki
 DOCS := docs
 KIND ?= Update
 FMT_HOOKS := trailing-whitespace end-of-file-fixer mixed-line-ending
+SHLIB_EXT := $(if $(filter Darwin,$(shell uname -s)),dylib,so)
 
 # Pass free-text messages via the environment so quotes and backticks survive shell expansion.
 override MSG := $(value MSG)
 export MSG
 
-.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check docs/check docs/build docs/serve docs/log hooks/require hooks/update
+.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check bindings/go bindings/python bindings/node bindings/check docs/check docs/build docs/serve docs/log hooks/require hooks/update
 
 ##@ Bootstrap
 
@@ -29,6 +30,10 @@ test: ## Run the workspace test suite
 rust/lint: ## Run rustfmt check and clippy with warnings denied
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo fmt --manifest-path bindings/python/Cargo.toml -- --check
+	cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets -- -D warnings
+	cargo fmt --manifest-path bindings/node/Cargo.toml -- --check
+	cargo clippy --manifest-path bindings/node/Cargo.toml --all-targets -- -D warnings
 
 lint: hooks/require rust/lint docs/check ## Run all linters, hooks, and docs checks
 	pre-commit run --all-files
@@ -38,20 +43,48 @@ lint/staged: hooks/require ## Run pre-commit hooks on staged files only
 
 fmt: hooks/require ## Format Rust sources and fix whitespace and line endings
 	cargo fmt --all
+	cargo fmt --manifest-path bindings/python/Cargo.toml
+	cargo fmt --manifest-path bindings/node/Cargo.toml
 	@for hook in $(FMT_HOOKS); do pre-commit run "$$hook" --all-files || true; done
 
 fmt/check: ## Fail if Rust formatting differs from rustfmt output
 	cargo fmt --all -- --check
+	cargo fmt --manifest-path bindings/python/Cargo.toml -- --check
+	cargo fmt --manifest-path bindings/node/Cargo.toml -- --check
 
 vectors/check: ## Verify canonical conformance vectors in Rust and Go
 	cargo test -p tendril-core --test vectors
 	cd spec/vectors/verify_go && go test ./...
 
-check: lint test vectors/check ## Full quality gate
+check: lint test vectors/check bindings/check ## Full quality gate
 	@printf 'check: ok\n'
 
 clean: ## Remove build artifacts
 	cargo clean
+	cargo clean --manifest-path bindings/python/Cargo.toml
+	cargo clean --manifest-path bindings/node/Cargo.toml
+	rm -f bindings/python/tendril/_tendril.so bindings/node/index.node
+
+##@ Bindings
+
+bindings/go: ## Build tendril-ffi and run Go cgo tests with -race
+	cargo build -p tendril-ffi --lib
+	cargo build -p tendril-cli --bin tendril-conformance-peer
+	cd bindings/go && go vet ./... && go test -race ./...
+
+bindings/python: ## Build PyO3 extension and run Python conformance tests
+	cargo build -p tendril-cli --bin tendril-conformance-peer
+	cargo build --manifest-path bindings/python/Cargo.toml
+	cp -f bindings/python/target/debug/lib_tendril.$(SHLIB_EXT) bindings/python/tendril/_tendril.so
+	cd bindings/python && python3 -m unittest discover -s tests -v
+
+bindings/node: ## Build N-API addon and run Node conformance tests
+	cargo build -p tendril-cli --bin tendril-conformance-peer
+	cargo build --manifest-path bindings/node/Cargo.toml
+	cp -f bindings/node/target/debug/libtendril_node.$(SHLIB_EXT) bindings/node/index.node
+	cd bindings/node && node --test
+
+bindings/check: bindings/go bindings/python bindings/node ## Verify Go, Python, and Node bindings and conformance suites
 
 ##@ Docs
 
