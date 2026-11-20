@@ -2,7 +2,7 @@
 type: Decision
 title: "0001 One core, hostile paths"
 description: Single Rust core with thin bindings, untrusted path providers, and separated pairing confirmation and capability grants.
-status: draft
+status: stable
 tags: [adr, architecture, security]
 ---
 
