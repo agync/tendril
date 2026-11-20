@@ -125,7 +125,7 @@ fn validate_iroh_relay_url_wasm(url_str: &str) -> Result<Url, String> {
     {
         return Err("cloud metadata hostname is not permitted".to_owned());
     }
-    if let Ok(ip) = bare.parse::<IpAddr>()
+    if let Ok(ip) = bare.trim_end_matches('.').parse::<IpAddr>()
         && is_metadata_or_link_local_ip(ip)
     {
         return Err(format!(
@@ -181,8 +181,8 @@ fn parse_p2p_endpoint_filtered(
                     addrs.push(TransportAddr::Ip(sock));
                 }
                 "relay" => {
-                    validate_iroh_relay_url_wasm(val)?;
-                    let url = RelayUrl::from_str(val)
+                    let validated = validate_iroh_relay_url_wasm(val)?;
+                    let url = RelayUrl::from_str(validated.as_str())
                         .map_err(|err| format!("invalid iroh relay URL '{val}': {err}"))?;
                     addrs.push(TransportAddr::Relay(url));
                 }
@@ -230,14 +230,20 @@ impl WasmIrohStream {
         let budget =
             Duration::from_millis(u64::from(timeout_ms.unwrap_or(15_000).clamp(100, 120_000)));
         let addr = parse_p2p_endpoint_filtered(&endpoint, false).map_err(to_js_err)?;
+        if relay_url_override
+            .as_deref()
+            .is_some_and(|raw| raw.chars().any(char::is_control))
+        {
+            return Err(to_js_err("iroh relay URL contains control characters"));
+        }
         let builder = match relay_url_override
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
             Some(url_str) => {
-                validate_iroh_relay_url_wasm(url_str).map_err(to_js_err)?;
-                let url = RelayUrl::from_str(url_str)
+                let validated = validate_iroh_relay_url_wasm(url_str).map_err(to_js_err)?;
+                let url = RelayUrl::from_str(validated.as_str())
                     .map_err(|e| to_js_err(format!("invalid relay URL '{url_str}': {e}")))?;
                 Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(url.into()))
             }
@@ -384,6 +390,8 @@ mod tests {
         assert!(validate_iroh_relay_url_wasm("http://[::1]:8080/").is_ok());
         assert!(validate_iroh_relay_url_wasm("http://evil.example/").is_err());
         assert!(validate_iroh_relay_url_wasm("https://169.254.169.254/").is_err());
+        assert!(validate_iroh_relay_url_wasm("https://169.254.169.254./").is_err());
+        assert!(validate_iroh_relay_url_wasm("https://169.254.169.254../").is_err());
         assert!(validate_iroh_relay_url_wasm("https://metadata.google.internal./").is_err());
         assert!(validate_iroh_relay_url_wasm("javascript:alert(1)").is_err());
         assert!(validate_iroh_relay_url_wasm("https://user@relay.example/").is_err());

@@ -197,13 +197,8 @@ impl RelayListener {
         signing_key: SigningKey,
         write_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
-        let relay_url = relay_url.into();
-        let parsed = super::validate_ws_url(&relay_url, false)?;
-        if !matches!(parsed.scheme(), "ws" | "wss") {
-            return Err(RuntimeError::Protocol(format!(
-                "relay URL must use ws:// or wss://: '{relay_url}'"
-            )));
-        }
+        let parsed = super::validate_ws_url(&relay_url.into(), false)?;
+        let relay_url = parsed.as_str().to_owned();
         let (mut control_ws, challenge_host, nonce) =
             connect_and_verify_challenge(&relay_url, expected_host.as_deref()).await?;
         let (pub_b64, sig_b64) = sign_relay_register(&signing_key, &challenge_host, &nonce);
@@ -413,13 +408,8 @@ impl RelayDialer {
         target_signing_pub: &[u8; 32],
     ) -> Result<Box<dyn PathStream>, RuntimeError> {
         let parsed = super::validate_ws_url(relay_url, self.allow_insecure_ws)?;
-        if !matches!(parsed.scheme(), "ws" | "wss") {
-            return Err(RuntimeError::Protocol(format!(
-                "relay URL must use ws:// or wss://: '{relay_url}'"
-            )));
-        }
         let (mut ws, _host, _nonce) =
-            connect_and_verify_challenge(relay_url, self.expected_host.as_deref()).await?;
+            connect_and_verify_challenge(parsed.as_str(), self.expected_host.as_deref()).await?;
         let conn_id_bytes = random_bytes::<16>()?;
         let conn_id_b64 = b64url_encode(&conn_id_bytes);
         let target_b64 = b64url_encode(target_signing_pub);

@@ -168,17 +168,21 @@ async fn dial_endpoint(
     p2p_relay: Option<&str>,
     no_pkarr: bool,
 ) -> Result<Box<dyn PathStream>, Box<dyn std::error::Error>> {
+    let relay_spec = p2p_relay
+        .or(relay_host)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://")
         && (p2p_local
-            || p2p_relay.is_some()
+            || relay_spec.is_some()
             || no_pkarr
             || std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"))
     {
         let mode = if p2p_local
-            || (p2p_relay.is_none() && std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"))
+            || (relay_spec.is_none() && std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"))
         {
             P2pRelayMode::Disabled
-        } else if let Some(spec) = p2p_relay {
+        } else if let Some(spec) = relay_spec {
             parse_p2p_relay_mode(Some(spec))?
         } else {
             P2pRelayMode::Default

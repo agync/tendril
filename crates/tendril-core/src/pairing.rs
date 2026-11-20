@@ -583,13 +583,6 @@ fn is_valid_host_port_hint(target: &str) -> bool {
         || trimmed_host
             .parse::<IpAddr>()
             .is_ok_and(is_disallowed_hint_ip)
-    {
-        return false;
-    }
-    if host.is_empty()
-        || host
-            .trim_end_matches('.')
-            .eq_ignore_ascii_case("metadata.google.internal")
         || host.contains([':', '/', '?', '#', '@'])
         || !host
             .bytes()

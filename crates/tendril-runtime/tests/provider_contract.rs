@@ -2138,6 +2138,42 @@ async fn batch2a_sec14_url_ssrf_and_filtered_p2p_addrs() {
             .await,
         Err(RuntimeError::Protocol(msg)) if msg.contains("metadata hostname")
     ));
+    for bad_broker_url in [
+        "broker+wss://169.254.169.254./ws",
+        "broker+wss://169.254.169.254../ws",
+        "broker+wss://0xa9fea9fe/ws",
+        "broker+wss://2852039166/ws",
+        "broker+wss://metadata%2egoogle.internal/ws",
+        "broker+wss://169.254.169%2e254/ws",
+        "broker+ws://0xa9fea9fe/ws",
+        "BROKER+WSS://0xa9fea9fe/ws",
+        "broker+http://example.com/ws",
+        "broker+ws:169.254.169.254/ws",
+    ] {
+        assert!(
+            matches!(
+                BrokerDialer::new().dial(bad_broker_url).await,
+                Err(RuntimeError::Protocol(_))
+            ),
+            "default BrokerDialer must reject {bad_broker_url}"
+        );
+        assert!(
+            matches!(
+                BrokerDialer::new()
+                    .with_allow_insecure_ws(true)
+                    .dial(bad_broker_url)
+                    .await,
+                Err(RuntimeError::Protocol(_))
+            ),
+            "opt-in BrokerDialer must reject {bad_broker_url}"
+        );
+    }
+    assert!(matches!(
+        RelayDialer::new()
+            .dial(&format!("broker+wss://relay.example/v1/relay#{target_b64}"))
+            .await,
+        Err(RuntimeError::Protocol(_))
+    ));
 
     #[cfg(feature = "p2p-iroh")]
     {
@@ -2145,6 +2181,8 @@ async fn batch2a_sec14_url_ssrf_and_filtered_p2p_addrs() {
 
         assert!(parse_p2p_relay_mode(Some("http://relay.example/")).is_err());
         assert!(parse_p2p_relay_mode(Some("https://169.254.169.254/")).is_err());
+        assert!(parse_p2p_relay_mode(Some("https://169.254.169.254../")).is_err());
+        assert!(parse_p2p_relay_mode(Some("https://relay.example/\n")).is_err());
         assert!(parse_p2p_relay_mode(Some("http://127.0.0.1:8080/")).is_ok());
         assert!(parse_p2p_relay_mode(Some("https://relay.example/")).is_ok());
 

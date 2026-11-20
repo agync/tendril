@@ -473,7 +473,7 @@ fn validate_url_host_safety(parsed: &url::Url) -> Result<&str, RuntimeError> {
             "cloud metadata hostname is not permitted".into(),
         ));
     }
-    if let Ok(ip) = bare.parse::<IpAddr>()
+    if let Ok(ip) = bare.trim_end_matches('.').parse::<IpAddr>()
         && is_metadata_or_link_local_ip(ip)
     {
         return Err(RuntimeError::Protocol(format!(
@@ -483,7 +483,7 @@ fn validate_url_host_safety(parsed: &url::Url) -> Result<&str, RuntimeError> {
     Ok(bare)
 }
 
-/// Validates a WebSocket relay or broker URL (`ws`, `wss`, `broker+ws`, `broker+wss`).
+/// Validates a WebSocket relay URL (`ws` or `wss`).
 pub(crate) fn validate_ws_url(
     url_str: &str,
     allow_insecure_ws: bool,
@@ -498,8 +498,8 @@ pub(crate) fn validate_ws_url(
         RuntimeError::Protocol(format!("invalid websocket URL '{url_str}': {err}"))
     })?;
     let is_cleartext = match parsed.scheme() {
-        "wss" | "broker+wss" => false,
-        "ws" | "broker+ws" => true,
+        "wss" => false,
+        "ws" => true,
         other => {
             return Err(RuntimeError::Protocol(format!(
                 "unsupported websocket scheme '{other}'"
@@ -514,6 +514,38 @@ pub(crate) fn validate_ws_url(
         )));
     }
     Ok(parsed)
+}
+
+/// Validates a broker WebSocket URL (`broker+ws(s)://` or `ws(s)://`) and returns the normalized `ws(s)://` URL.
+pub(crate) fn validate_broker_ws_url(
+    url_str: &str,
+    allow_insecure_ws: bool,
+) -> Result<url::Url, RuntimeError> {
+    if url_str.chars().any(char::is_control) {
+        return Err(RuntimeError::Protocol(
+            "websocket URL contains control characters".into(),
+        ));
+    }
+    let trimmed = url_str.trim();
+    if trimmed
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("broker+"))
+    {
+        let rest = &trimmed[7..];
+        let is_ws = rest
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case("ws://"))
+            || rest
+                .get(..6)
+                .is_some_and(|s| s.eq_ignore_ascii_case("wss://"));
+        if !is_ws {
+            return Err(RuntimeError::Protocol(format!(
+                "broker endpoint must use broker+ws(s):// or ws(s)://: '{url_str}'"
+            )));
+        }
+        return validate_ws_url(rest, allow_insecure_ws);
+    }
+    validate_ws_url(trimmed, allow_insecure_ws)
 }
 
 /// Validates an `iroh` custom relay URL (`https://` anywhere, or `http://` only on loopback).

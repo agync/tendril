@@ -224,15 +224,21 @@ impl Drop for EndpointGuard {
 
 /// Parses an optional P2P relay mode selector (`"default"`, `"disabled"`/`"local"`, or `http(s)://...`).
 pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeError> {
+    if mode.is_some_and(|raw| raw.chars().any(char::is_control)) {
+        return Err(RuntimeError::Protocol(
+            "iroh relay URL contains control characters".into(),
+        ));
+    }
     match mode.map(str::trim) {
         None | Some("" | "default") => Ok(P2pRelayMode::Default),
         Some("disabled" | "local") => Ok(P2pRelayMode::Disabled),
         Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
-            super::validate_iroh_relay_url(url)?;
-            let _ = RelayUrl::from_str(url).map_err(|err| {
+            let validated = super::validate_iroh_relay_url(url)?;
+            let canonical = validated.as_str().to_owned();
+            let _ = RelayUrl::from_str(&canonical).map_err(|err| {
                 RuntimeError::Protocol(format!("invalid iroh relay URL '{url}': {err}"))
             })?;
-            Ok(P2pRelayMode::Custom(url.to_owned()))
+            Ok(P2pRelayMode::Custom(canonical))
         }
         Some(other) => Err(RuntimeError::Protocol(format!(
             "invalid p2p relay mode '{other}' (expected default, disabled, local, or relay URL)"
@@ -248,8 +254,8 @@ async fn build_iroh_endpoint(
     let mut builder = match &options.relay_mode {
         P2pRelayMode::Default => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Default),
         P2pRelayMode::Custom(url_str) => {
-            super::validate_iroh_relay_url(url_str)?;
-            let url = RelayUrl::from_str(url_str).map_err(|err| {
+            let validated = super::validate_iroh_relay_url(url_str)?;
+            let url = RelayUrl::from_str(validated.as_str()).map_err(|err| {
                 RuntimeError::Protocol(format!("invalid iroh relay URL '{url_str}': {err}"))
             })?;
             Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(url.into()))
@@ -350,8 +356,8 @@ pub fn parse_p2p_endpoint_filtered(
                     addrs.push(TransportAddr::Ip(sock));
                 }
                 "relay" => {
-                    super::validate_iroh_relay_url(val)?;
-                    let url = RelayUrl::from_str(val).map_err(|err| {
+                    let validated = super::validate_iroh_relay_url(val)?;
+                    let url = RelayUrl::from_str(validated.as_str()).map_err(|err| {
                         RuntimeError::Protocol(format!("invalid iroh relay URL '{val}': {err}"))
                     })?;
                     addrs.push(TransportAddr::Relay(url));
