@@ -1092,6 +1092,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tendril-ffi"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tendril-core",
+ "tendril-runtime",
+ "tokio",
+]
+
+[[package]]
 name = "tendril-relay"
 version = "0.1.0"
 dependencies = [

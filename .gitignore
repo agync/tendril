@@ -46,6 +46,8 @@ node_modules/
 dist/
 pkg/
 *.node
+bindings/*/target/
+bindings/python/tendril/_tendril.*
 
 # Mobile and native build artifacts
 .gradle/

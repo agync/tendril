@@ -1,0 +1,1421 @@
+//! Callback-free polled C ABI over `tendril-core` and `tendril-runtime`.
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ffi::{CStr, CString, c_char};
+use std::net::SocketAddr;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ptr;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tendril_core::PREAMBLE_LEN;
+use tendril_core::crypto::{
+    b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
+    fingerprint_host, pairing_sas, random_bytes,
+};
+use tendril_core::grants::{Grant, RevocationList, authorize_grant};
+use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
+use tendril_core::pairing::{
+    PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PairingPathKind,
+};
+use tendril_core::policy::ProviderId;
+use tendril_core::roster::Roster;
+use tendril_core::wire::{Intent, Preamble};
+use tendril_runtime::{
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer,
+    PathDialer, PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream,
+    RelayDialer, RelayListener, SessionDriver, SessionEvent, StateStore, drive_pair_initiator,
+    drive_pair_responder_with_options, peek_exact,
+};
+use tokio::runtime::Runtime;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+pub const TENDRIL_OK: i32 = 0;
+pub const TENDRIL_WOULD_BLOCK: i32 = 1;
+pub const TENDRIL_EOF: i32 = 2;
+pub const TENDRIL_ERR_INVALID_ARG: i32 = -1;
+pub const TENDRIL_ERR_NOT_FOUND: i32 = -2;
+pub const TENDRIL_ERR_BUFFER_TOO_SMALL: i32 = -3;
+pub const TENDRIL_ERR_CLOSED: i32 = -5;
+pub const TENDRIL_ERR_PROTOCOL: i32 = -6;
+pub const TENDRIL_ERR_INTERNAL: i32 = -7;
+
+thread_local! {
+    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn set_last_error(msg: impl Into<String>) {
+    let s = msg.into();
+    LAST_ERROR.with(|cell| {
+        *cell.borrow_mut() = s;
+    });
+}
+
+fn clear_last_error() {
+    LAST_ERROR.with(|cell| {
+        cell.borrow_mut().clear();
+    });
+}
+
+fn ffi_i32<F: FnOnce() -> i32>(f: F) -> i32 {
+    clear_last_error();
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(rc) => rc,
+        Err(_) => {
+            set_last_error("unexpected panic inside tendril-ffi");
+            TENDRIL_ERR_INTERNAL
+        }
+    }
+}
+
+fn ffi_ptr<T, F: FnOnce() -> *mut T>(f: F) -> *mut T {
+    clear_last_error();
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(p) => p,
+        Err(_) => {
+            set_last_error("unexpected panic inside tendril-ffi");
+            ptr::null_mut()
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+unsafe fn cstr_to_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, i32> {
+    if ptr.is_null() {
+        set_last_error(format!("null pointer for {name}"));
+        return Err(TENDRIL_ERR_INVALID_ARG);
+    }
+    unsafe { CStr::from_ptr(ptr) }.to_str().map_err(|_| {
+        set_last_error(format!("invalid UTF-8 in {name}"));
+        TENDRIL_ERR_INVALID_ARG
+    })
+}
+
+unsafe fn opt_cstr_to_str<'a>(ptr: *const c_char, name: &str) -> Result<Option<&'a str>, i32> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    unsafe { cstr_to_str(ptr, name) }.map(Some)
+}
+
+unsafe fn read_bytes32(ptr: *const u8, name: &str) -> Result<[u8; 32], i32> {
+    if ptr.is_null() {
+        set_last_error(format!("null 32-byte pointer for {name}"));
+        return Err(TENDRIL_ERR_INVALID_ARG);
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, 32) };
+    let mut out = [0u8; 32];
+    out.copy_from_slice(slice);
+    Ok(out)
+}
+
+unsafe fn write_out_cstring(out: *mut *mut c_char, val: &str) -> i32 {
+    if out.is_null() {
+        set_last_error("null output string pointer");
+        return TENDRIL_ERR_INVALID_ARG;
+    }
+    let Ok(cs) = CString::new(val) else {
+        set_last_error("string contains interior NUL byte");
+        return TENDRIL_ERR_INTERNAL;
+    };
+    unsafe {
+        *out = cs.into_raw();
+    }
+    TENDRIL_OK
+}
+
+/// Opaque endpoint handle owning a Tokio runtime, identity, roster, and background listeners.
+pub struct TendrilEndpoint {
+    rt: Arc<Runtime>,
+    store: Option<Arc<StateStore>>,
+    identity: EndpointIdentity,
+    roster: Arc<StdMutex<Roster>>,
+    pair_mgr: StdMutex<PairingManager>,
+    rate_limiter: PreAuthRateLimiter,
+    accepted_tx: mpsc::Sender<Box<dyn PathStream>>,
+    accepted_rx: AsyncMutex<mpsc::Receiver<Box<dyn PathStream>>>,
+    listener_tasks: StdMutex<Vec<JoinHandle<()>>>,
+}
+
+impl TendrilEndpoint {
+    fn persist_roster(&self, roster: &Roster) -> Result<(), String> {
+        if let Some(store) = &self.store {
+            store.save_roster(roster).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn spawn_listener(&self, mut listener: Box<dyn PathListener>) {
+        let tx = self.accepted_tx.clone();
+        let handle = self.rt.spawn(async move {
+            while let Ok(stream) = listener.accept().await {
+                if tx.send(stream).await.is_err() {
+                    break;
+                }
+            }
+        });
+        self.listener_tasks
+            .lock()
+            .expect("listener_tasks mutex poisoned")
+            .push(handle);
+    }
+}
+
+impl Drop for TendrilEndpoint {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = self.listener_tasks.lock() {
+            for h in tasks.drain(..) {
+                h.abort();
+            }
+        }
+    }
+}
+
+/// Opaque authenticated session handle sharing the endpoint's Tokio runtime and roster state.
+pub struct TendrilSession {
+    rt: Arc<Runtime>,
+    store: Option<Arc<StateStore>>,
+    roster: Arc<StdMutex<Roster>>,
+    driver: SessionDriver,
+}
+
+async fn dial_endpoint(
+    endpoint: &str,
+    relay_host: Option<&str>,
+) -> Result<Box<dyn PathStream>, String> {
+    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        let mut dialer = RelayDialer::new();
+        if let Some(host) = relay_host {
+            dialer = dialer.with_expected_host(host);
+        }
+        dialer.dial(endpoint).await.map_err(|e| e.to_string())
+    } else if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
+        LocalDialer::new()
+            .dial(endpoint)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        DirectDialer::new()
+            .dial(endpoint)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Copies the last thread-local FFI error string into `buf`.
+///
+/// # Safety
+/// `buf` must be null (to query needed length) or point to `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_last_error(buf: *mut c_char, cap: usize) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        LAST_ERROR.with(|cell| {
+            let msg = cell.borrow();
+            let bytes = msg.as_bytes();
+            let needed = bytes.len() + 1;
+            if buf.is_null() || cap == 0 {
+                return i32::try_from(needed).unwrap_or(i32::MAX);
+            }
+            let copy_len = bytes.len().min(cap - 1);
+            unsafe {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), copy_len);
+                *buf.add(copy_len) = 0;
+            }
+            i32::try_from(needed).unwrap_or(i32::MAX)
+        })
+    }))
+    .unwrap_or(-1)
+}
+
+/// Frees a NUL-terminated string returned by `tendril-ffi`.
+///
+/// # Safety
+/// `ptr` must be null or a pointer previously allocated by `tendril-ffi` and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_string_free(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            drop(CString::from_raw(ptr));
+        }));
+    }
+}
+
+/// Computes the `dev_<hex16>` identifier for a 32-byte X25519 public key.
+///
+/// # Safety
+/// `static_pub_32` must point to 32 readable bytes; `out_str` must be a valid non-null out pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_device_id(
+    static_pub_32: *const u8,
+    out_str: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        let Ok(key) = (unsafe { read_bytes32(static_pub_32, "static_pub_32") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        unsafe { write_out_cstring(out_str, &device_id(&key)) }
+    })
+}
+
+/// Computes the base32 host fingerprint for a 32-byte static public key.
+///
+/// # Safety
+/// `static_pub_32` must point to 32 readable bytes; `out_str` must be a valid non-null out pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_fingerprint_host(
+    static_pub_32: *const u8,
+    out_str: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        let Ok(key) = (unsafe { read_bytes32(static_pub_32, "static_pub_32") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        unsafe { write_out_cstring(out_str, &fingerprint_host(&key)) }
+    })
+}
+
+/// Computes the uppercase hex device fingerprint for a 32-byte static public key.
+///
+/// # Safety
+/// `static_pub_32` must point to 32 readable bytes; `out_str` must be a valid non-null out pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_fingerprint_device(
+    static_pub_32: *const u8,
+    out_str: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        let Ok(key) = (unsafe { read_bytes32(static_pub_32, "static_pub_32") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        unsafe { write_out_cstring(out_str, &fingerprint_device(&key)) }
+    })
+}
+
+/// Derives the 4x4 pairing SAS from a 32-byte Noise handshake hash.
+///
+/// # Safety
+/// `handshake_hash_32` must point to 32 readable bytes; `out_str` must be a valid non-null out pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_pairing_sas(
+    handshake_hash_32: *const u8,
+    out_str: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        let Ok(hh) = (unsafe { read_bytes32(handshake_hash_32, "handshake_hash_32") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        unsafe { write_out_cstring(out_str, &pairing_sas(&hh)) }
+    })
+}
+
+/// Computes the Argon2id + HMAC-SHA256 pairing proof for `code` and `handshake_hash_32`.
+///
+/// # Safety
+/// `code` must be a valid NUL-terminated UTF-8 string; `handshake_hash_32` and `out_mac_32` must be 32-byte valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_compute_code_mac(
+    code: *const c_char,
+    handshake_hash_32: *const u8,
+    out_mac_32: *mut u8,
+) -> i32 {
+    ffi_i32(|| {
+        if out_mac_32.is_null() {
+            set_last_error("null out_mac_32");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(code_s) = (unsafe { cstr_to_str(code, "code") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(hh) = (unsafe { read_bytes32(handshake_hash_32, "handshake_hash_32") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        match compute_code_mac(code_s, &hh) {
+            Ok(mac) => {
+                unsafe {
+                    ptr::copy_nonoverlapping(mac.as_ptr(), out_mac_32, 32);
+                }
+                TENDRIL_OK
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                TENDRIL_ERR_PROTOCOL
+            }
+        }
+    })
+}
+
+/// Verifies a JSON rotation record chain against pinned keys.
+///
+/// # Safety
+/// All string arguments must be valid NUL-terminated UTF-8 C strings; `out_final_seq` may be null or writable `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_verify_rotation_chain_json(
+    pinned_signing_b64: *const c_char,
+    pinned_static_b64: *const c_char,
+    pinned_seq: u64,
+    chain_json: *const c_char,
+    cur_static_b64: *const c_char,
+    cur_signing_b64: *const c_char,
+    out_final_seq: *mut u64,
+) -> i32 {
+    ffi_i32(|| {
+        let Ok(psig_s) = (unsafe { cstr_to_str(pinned_signing_b64, "pinned_signing_b64") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(pstat_s) = (unsafe { cstr_to_str(pinned_static_b64, "pinned_static_b64") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(chain_s) = (unsafe { cstr_to_str(chain_json, "chain_json") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(cstat_s) = (unsafe { cstr_to_str(cur_static_b64, "cur_static_b64") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(csig_s) = (unsafe { cstr_to_str(cur_signing_b64, "cur_signing_b64") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+
+        let Ok(psig) = b64url_decode_array::<32>(psig_s) else {
+            set_last_error("invalid pinned_signing_b64");
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(pstat) = b64url_decode_array::<32>(pstat_s) else {
+            set_last_error("invalid pinned_static_b64");
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(cstat) = b64url_decode_array::<32>(cstat_s) else {
+            set_last_error("invalid cur_static_b64");
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(csig) = b64url_decode_array::<32>(csig_s) else {
+            set_last_error("invalid cur_signing_b64");
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let chain: Vec<RotationRecord> = match serde_json::from_str(chain_s) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(format!("invalid chain_json: {e}"));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+
+        match verify_rotation_chain(&psig, &pstat, pinned_seq, &chain, &cstat, &csig) {
+            Ok(final_seq) => {
+                if !out_final_seq.is_null() {
+                    unsafe {
+                        *out_final_seq = final_seq;
+                    }
+                }
+                TENDRIL_OK
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                TENDRIL_ERR_PROTOCOL
+            }
+        }
+    })
+}
+
+/// Evaluates a JSON capability grant and optional CRL against `requested_cap`.
+///
+/// # Safety
+/// Non-optional string arguments must be valid NUL-terminated UTF-8 C strings; `crl_json_opt` may be null; `out_allowed` must be non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_verify_grant_json(
+    grant_json: *const c_char,
+    issuer_keys_json: *const c_char,
+    expected_subject: *const c_char,
+    expected_root_issuer: *const c_char,
+    requested_cap: *const c_char,
+    now_unix_secs: u64,
+    crl_json_opt: *const c_char,
+    out_allowed: *mut u8,
+) -> i32 {
+    ffi_i32(|| {
+        if out_allowed.is_null() {
+            set_last_error("null out_allowed");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(grant_s) = (unsafe { cstr_to_str(grant_json, "grant_json") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(keys_s) = (unsafe { cstr_to_str(issuer_keys_json, "issuer_keys_json") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(subj_s) = (unsafe { cstr_to_str(expected_subject, "expected_subject") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(root_s) = (unsafe { cstr_to_str(expected_root_issuer, "expected_root_issuer") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(cap_s) = (unsafe { cstr_to_str(requested_cap, "requested_cap") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(crl_opt_s) = (unsafe { opt_cstr_to_str(crl_json_opt, "crl_json_opt") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+
+        let grant: Grant = match serde_json::from_str(grant_s) {
+            Ok(g) => g,
+            Err(e) => {
+                set_last_error(format!("invalid grant_json: {e}"));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let key_map_raw: HashMap<String, String> = match serde_json::from_str(keys_s) {
+            Ok(m) => m,
+            Err(e) => {
+                set_last_error(format!("invalid issuer_keys_json: {e}"));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let mut key_map: HashMap<String, [u8; 32]> = HashMap::with_capacity(key_map_raw.len());
+        for (id, b64) in key_map_raw {
+            let Ok(k) = b64url_decode_array::<32>(&b64) else {
+                set_last_error(format!("invalid signing key for issuer '{id}'"));
+                return TENDRIL_ERR_INVALID_ARG;
+            };
+            key_map.insert(id, k);
+        }
+        let crl: Option<RevocationList> = match crl_opt_s {
+            Some(s) if !s.is_empty() => match serde_json::from_str(s) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    set_last_error(format!("invalid crl_json_opt: {e}"));
+                    return TENDRIL_ERR_INVALID_ARG;
+                }
+            },
+            _ => None,
+        };
+
+        let (res, _audit) = authorize_grant(
+            Some(&grant),
+            subj_s,
+            root_s,
+            cap_s,
+            now_unix_secs,
+            crl.as_ref(),
+            |issuer| key_map.get(issuer).copied(),
+        );
+        if let Err(ref err) = res {
+            set_last_error(err.to_string());
+        }
+        unsafe {
+            *out_allowed = u8::from(res.is_ok());
+        }
+        TENDRIL_OK
+    })
+}
+
+/// Creates an endpoint handle backed by `state_dir` or an ephemeral in-memory store.
+///
+/// # Safety
+/// `state_dir` and `host_id` must be null or valid NUL-terminated UTF-8 C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_new(
+    state_dir: *const c_char,
+    host_id: *const c_char,
+) -> *mut TendrilEndpoint {
+    ffi_ptr(|| {
+        let Ok(dir_opt) = (unsafe { opt_cstr_to_str(state_dir, "state_dir") }) else {
+            return ptr::null_mut();
+        };
+        let Ok(host_opt) = (unsafe { opt_cstr_to_str(host_id, "host_id") }) else {
+            return ptr::null_mut();
+        };
+
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => Arc::new(rt),
+            Err(e) => {
+                set_last_error(format!("failed to create tokio runtime: {e}"));
+                return ptr::null_mut();
+            }
+        };
+
+        let (store, identity, roster) = if let Some(dir) = dir_opt {
+            let store = match StateStore::open_or_create(dir) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return ptr::null_mut();
+                }
+            };
+            let identity = match store.load_or_generate_identity(host_opt) {
+                Ok(id) => id,
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return ptr::null_mut();
+                }
+            };
+            let roster = match store.load_roster() {
+                Ok(r) => r,
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return ptr::null_mut();
+                }
+            };
+            (Some(store), identity, roster)
+        } else {
+            let mut identity = match EndpointIdentity::generate() {
+                Ok(id) => id,
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return ptr::null_mut();
+                }
+            };
+            if let Some(h) = host_opt
+                && !h.is_empty()
+            {
+                identity = identity.with_host_id(h);
+            }
+            (None, identity, Roster::new())
+        };
+
+        let (accepted_tx, accepted_rx) = mpsc::channel(32);
+        Box::into_raw(Box::new(TendrilEndpoint {
+            rt,
+            store,
+            identity,
+            roster: Arc::new(StdMutex::new(roster)),
+            pair_mgr: StdMutex::new(PairingManager::new(PairingConfig::default())),
+            rate_limiter: PreAuthRateLimiter::new(PreAuthConfig::default()),
+            accepted_tx,
+            accepted_rx: AsyncMutex::new(accepted_rx),
+            listener_tasks: StdMutex::new(Vec::new()),
+        }))
+    })
+}
+
+/// Frees a [`TendrilEndpoint`] handle previously returned by [`tendril_endpoint_new`].
+///
+/// # Safety
+/// `ep` must be null or an unfreed pointer returned by [`tendril_endpoint_new`], with no concurrent calls using `ep`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_free(ep: *mut TendrilEndpoint) {
+    if !ep.is_null() {
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            drop(Box::from_raw(ep));
+        }));
+    }
+}
+
+/// Serializes the endpoint's public identity metadata as JSON.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer and `out_json` must be a valid out pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_info_json(
+    ep: *const TendrilEndpoint,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let ep = unsafe { &*ep };
+        let info = serde_json::json!({
+            "host_id": ep.identity.host_id(),
+            "device_id": ep.identity.device_id(),
+            "static_pub": b64url_encode(ep.identity.static_key().public_bytes()),
+            "signing_pub": b64url_encode(ep.identity.signing_key().public_bytes()),
+        });
+        unsafe { write_out_cstring(out_json, &info.to_string()) }
+    })
+}
+
+/// Binds a direct TCP listener on `listen_addr` (defaulting to `127.0.0.1:0` when null).
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer; `listen_addr` may be null or UTF-8; `out_endpoint` must be non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_serve_direct(
+    ep: *mut TendrilEndpoint,
+    listen_addr: *const c_char,
+    out_endpoint: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let addr_opt = match unsafe { opt_cstr_to_str(listen_addr, "listen_addr") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let addr: SocketAddr = match addr_opt.unwrap_or("127.0.0.1:0").parse() {
+            Ok(a) => a,
+            Err(e) => {
+                set_last_error(format!("invalid listen_addr: {e}"));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let ep = unsafe { &*ep };
+        match ep.rt.block_on(DirectListener::bind(addr, None)) {
+            Ok(listener) => {
+                let local_ep = listener.local_endpoint();
+                ep.spawn_listener(Box::new(listener));
+                unsafe { write_out_cstring(out_endpoint, &local_ep) }
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                TENDRIL_ERR_PROTOCOL
+            }
+        }
+    })
+}
+
+/// Registers this endpoint's mailbox on a Tendril v1 WebSocket relay.
+///
+/// # Safety
+/// `ep` and `relay_url` must be valid; `expected_host` may be null or UTF-8; `out_endpoint` must be non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_serve_relay(
+    ep: *mut TendrilEndpoint,
+    relay_url: *const c_char,
+    expected_host: *const c_char,
+    out_endpoint: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let url = match unsafe { cstr_to_str(relay_url, "relay_url") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let exp_host = match unsafe { opt_cstr_to_str(expected_host, "expected_host") } {
+            Ok(v) => v.map(ToOwned::to_owned),
+            Err(rc) => return rc,
+        };
+        let ep = unsafe { &*ep };
+        let signing_key = ep.identity.signing_key().signing_key();
+        match ep.rt.block_on(RelayListener::bind(
+            url,
+            exp_host,
+            signing_key,
+            DEFAULT_WRITE_TIMEOUT,
+        )) {
+            Ok(listener) => {
+                let local_ep = listener.local_endpoint();
+                ep.spawn_listener(Box::new(listener));
+                unsafe { write_out_cstring(out_endpoint, &local_ep) }
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                TENDRIL_ERR_PROTOCOL
+            }
+        }
+    })
+}
+
+/// Issues a one-time pairing code (`"lan"` or `"remote"`, defaults to `"lan"`).
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer; `kind` may be null; `out_code` must be non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_issue_code(
+    ep: *mut TendrilEndpoint,
+    kind: *const c_char,
+    out_code: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let kind_opt = match unsafe { opt_cstr_to_str(kind, "kind") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let pk = match kind_opt {
+            Some("remote") => PairingCodeKind::Remote3Group,
+            _ => PairingCodeKind::Lan2Group,
+        };
+        let ep = unsafe { &*ep };
+        let mut mgr = ep.pair_mgr.lock().expect("pair_mgr mutex poisoned");
+        match mgr.issue_code(pk, now_unix()) {
+            Ok(code) => unsafe { write_out_cstring(out_code, &code) },
+            Err(e) => {
+                set_last_error(e.to_string());
+                TENDRIL_ERR_INTERNAL
+            }
+        }
+    })
+}
+
+/// Initiates a pairing handshake toward `endpoint` using `code`.
+///
+/// # Safety
+/// `ep`, `endpoint`, `code`, and `out_json` must be non-null valid pointers; optional strings may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
+    ep: *mut TendrilEndpoint,
+    endpoint: *const c_char,
+    relay_host: *const c_char,
+    code: *const c_char,
+    name: *const c_char,
+    kind: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(endpoint_s) = (unsafe { cstr_to_str(endpoint, "endpoint") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(relay_host_s) = (unsafe { opt_cstr_to_str(relay_host, "relay_host") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(code_s) = (unsafe { cstr_to_str(code, "code") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(name_s) = (unsafe { opt_cstr_to_str(name, "name") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(kind_s) = (unsafe { opt_cstr_to_str(kind, "kind") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+
+        let ep = unsafe { &*ep };
+        let res = ep.rt.block_on(async {
+            let mut stream = dial_endpoint(endpoint_s, relay_host_s)
+                .await
+                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e))?;
+            drive_pair_initiator(
+                stream.as_mut(),
+                &ep.identity,
+                name_s.unwrap_or("ffi-device").to_owned(),
+                kind_s.unwrap_or("ffi").to_owned(),
+                code_s.to_owned(),
+                None,
+            )
+            .await
+            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
+        });
+
+        match res {
+            Ok(pair_res) => match pair_res.outcome {
+                PairOutcome::InitiatorPending {
+                    device_id,
+                    host_id,
+                    host_static_pub,
+                    host_signing_pub,
+                    host_rotation_seq,
+                    pairing_sas,
+                } => {
+                    let mut roster = ep.roster.lock().expect("roster mutex poisoned");
+                    if let Err(e) = roster.insert_pinned_host(
+                        host_id.clone(),
+                        host_id.clone(),
+                        host_static_pub,
+                        Some(host_signing_pub),
+                        host_rotation_seq,
+                        Vec::new(),
+                    ) {
+                        set_last_error(e.to_string());
+                        return TENDRIL_ERR_PROTOCOL;
+                    }
+                    if let Err(e) = ep.persist_roster(&roster) {
+                        set_last_error(e);
+                        return TENDRIL_ERR_INTERNAL;
+                    }
+                    let out = serde_json::json!({
+                        "device_id": device_id,
+                        "host_id": host_id,
+                        "sas": pairing_sas,
+                    });
+                    unsafe { write_out_cstring(out_json, &out.to_string()) }
+                }
+                PairOutcome::Rejected { error } => {
+                    set_last_error(error);
+                    TENDRIL_ERR_PROTOCOL
+                }
+                PairOutcome::ResponderPending { .. } => {
+                    set_last_error("unexpected responder outcome");
+                    TENDRIL_ERR_INTERNAL
+                }
+            },
+            Err((rc, msg)) => {
+                set_last_error(msg);
+                rc
+            }
+        }
+    })
+}
+
+/// Accepts the next incoming pairing connection within `timeout_ms`.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer and `out_json` must be non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_pair_accept(
+    ep: *mut TendrilEndpoint,
+    timeout_ms: u64,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let ep = unsafe { &*ep };
+        let wait = Duration::from_millis(timeout_ms.max(1));
+        let res = ep.rt.block_on(async {
+            let mut rx = ep.accepted_rx.lock().await;
+            let mut stream = match timeout(wait, rx.recv()).await {
+                Ok(Some(s)) => s,
+                Ok(None) => return Err((TENDRIL_ERR_CLOSED, "listener closed".to_owned())),
+                Err(_) => return Err((TENDRIL_WOULD_BLOCK, "timed out accepting pair".to_owned())),
+            };
+            drop(rx);
+
+            let guard = ep
+                .rate_limiter
+                .try_acquire(stream.peer_ip())
+                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
+            let peeked = timeout(
+                DEFAULT_PRE_AUTH_TIMEOUT,
+                peek_exact(stream.as_mut(), PREAMBLE_LEN),
+            )
+            .await
+            .map_err(|_| (TENDRIL_ERR_PROTOCOL, "preamble read timed out".to_owned()))?
+            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
+            let preamble = Preamble::decode(&peeked[..PREAMBLE_LEN])
+                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
+            if preamble.intent != Intent::Pair {
+                return Err((TENDRIL_ERR_PROTOCOL, "expected pair preamble".to_owned()));
+            }
+            let mut wrapped = PrefixedPathStream::new(stream, peeked);
+            let path_kind = if wrapped.provider_id() == ProviderId::Relay {
+                PairingPathKind::Remote
+            } else {
+                PairingPathKind::Lan
+            };
+            drive_pair_responder_with_options(
+                &mut wrapped,
+                &ep.identity,
+                &ep.pair_mgr,
+                &ep.roster,
+                path_kind,
+                now_unix(),
+                Some(&ep.rate_limiter),
+                Some(guard),
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
+            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
+        });
+
+        match res {
+            Ok(pair_res) => match pair_res.outcome {
+                PairOutcome::ResponderPending {
+                    device_id,
+                    pairing_sas,
+                    name,
+                    kind,
+                    ..
+                } => {
+                    let roster = ep.roster.lock().expect("roster mutex poisoned");
+                    if let Err(e) = ep.persist_roster(&roster) {
+                        set_last_error(e);
+                        return TENDRIL_ERR_INTERNAL;
+                    }
+                    let out = serde_json::json!({
+                        "device_id": device_id,
+                        "sas": pairing_sas,
+                        "name": name,
+                        "kind": kind,
+                    });
+                    unsafe { write_out_cstring(out_json, &out.to_string()) }
+                }
+                PairOutcome::Rejected { error } => {
+                    set_last_error(error);
+                    TENDRIL_ERR_PROTOCOL
+                }
+                PairOutcome::InitiatorPending { .. } => {
+                    set_last_error("unexpected initiator outcome");
+                    TENDRIL_ERR_INTERNAL
+                }
+            },
+            Err((rc, msg)) => {
+                set_last_error(msg);
+                rc
+            }
+        }
+    })
+}
+
+/// Promotes a pending paired peer to `Active` (`pair.confirm`), optionally asserting SAS match.
+///
+/// # Safety
+/// `ep` and `peer_id` must be non-null valid pointers; `sas` may be null or UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_confirm_peer(
+    ep: *mut TendrilEndpoint,
+    peer_id: *const c_char,
+    sas: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(sas_opt) = (unsafe { opt_cstr_to_str(sas, "sas") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let ep = unsafe { &*ep };
+        let mut roster = ep.roster.lock().expect("roster mutex poisoned");
+        if let Err(e) = roster.confirm_peer(peer_s, sas_opt) {
+            set_last_error(e.to_string());
+            return TENDRIL_ERR_PROTOCOL;
+        }
+        if let Err(e) = ep.persist_roster(&roster) {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
+        TENDRIL_OK
+    })
+}
+
+/// Mints a signed capability grant JSON object for an active peer (`pair.mint`).
+///
+/// # Safety
+/// `ep`, `peer_id`, `caps_json`, and `out_grant_json` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_mint_grant(
+    ep: *mut TendrilEndpoint,
+    peer_id: *const c_char,
+    caps_json: *const c_char,
+    ttl_secs: u64,
+    out_grant_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(caps_s) = (unsafe { cstr_to_str(caps_json, "caps_json") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let caps: Vec<String> = match serde_json::from_str(caps_s) {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(format!("invalid caps_json: {e}"));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let nonce = match random_bytes::<16>() {
+            Ok(n) => n,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return TENDRIL_ERR_INTERNAL;
+            }
+        };
+        let ep = unsafe { &*ep };
+        let mut roster = ep.roster.lock().expect("roster mutex poisoned");
+        let now = now_unix();
+        let grant = match roster.mint_grant(
+            &ep.identity,
+            peer_s,
+            caps,
+            now,
+            now.saturating_add(ttl_secs),
+            nonce,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return TENDRIL_ERR_PROTOCOL;
+            }
+        };
+        if let Err(e) = ep.persist_roster(&roster) {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
+        let json = serde_json::to_string(&grant).expect("serialize grant");
+        unsafe { write_out_cstring(out_grant_json, &json) }
+    })
+}
+
+/// Marks `peer_id` as `Revoked` and clears its stored grants (`pair.revoke`).
+///
+/// # Safety
+/// `ep` and `peer_id` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_revoke_peer(
+    ep: *mut TendrilEndpoint,
+    peer_id: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let ep = unsafe { &*ep };
+        let mut roster = ep.roster.lock().expect("roster mutex poisoned");
+        if let Err(e) = roster.revoke_peer(peer_s) {
+            set_last_error(e.to_string());
+            return TENDRIL_ERR_NOT_FOUND;
+        }
+        if let Err(e) = ep.persist_roster(&roster) {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
+        TENDRIL_OK
+    })
+}
+
+/// Opens an authenticated Noise XX session toward `target_host_id` via `endpoint`.
+///
+/// # Safety
+/// `ep`, `endpoint`, and `target_host_id` must be valid non-null pointers; `relay_host` and `grant_json` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_connect(
+    ep: *mut TendrilEndpoint,
+    endpoint: *const c_char,
+    relay_host: *const c_char,
+    target_host_id: *const c_char,
+    grant_json: *const c_char,
+) -> *mut TendrilSession {
+    ffi_ptr(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return ptr::null_mut();
+        }
+        let Ok(ep_s) = (unsafe { cstr_to_str(endpoint, "endpoint") }) else {
+            return ptr::null_mut();
+        };
+        let Ok(relay_host_s) = (unsafe { opt_cstr_to_str(relay_host, "relay_host") }) else {
+            return ptr::null_mut();
+        };
+        let Ok(target_s) = (unsafe { cstr_to_str(target_host_id, "target_host_id") }) else {
+            return ptr::null_mut();
+        };
+        let Ok(grant_opt) = (unsafe { opt_cstr_to_str(grant_json, "grant_json") }) else {
+            return ptr::null_mut();
+        };
+        let grant: Option<Grant> = match grant_opt {
+            Some(g) if !g.is_empty() => match serde_json::from_str(g) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    set_last_error(format!("invalid grant_json: {e}"));
+                    return ptr::null_mut();
+                }
+            },
+            _ => None,
+        };
+
+        let ep = unsafe { &*ep };
+        let res = ep.rt.block_on(async {
+            let stream = dial_endpoint(ep_s, relay_host_s)
+                .await
+                .map_err(|e| e.to_string())?;
+            SessionDriver::connect_locked(
+                stream,
+                &ep.identity,
+                target_s,
+                grant,
+                &ep.roster,
+                now_unix(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+
+        match res {
+            Ok(driver) => Box::into_raw(Box::new(TendrilSession {
+                rt: Arc::clone(&ep.rt),
+                store: ep.store.clone(),
+                roster: Arc::clone(&ep.roster),
+                driver,
+            })),
+            Err(e) => {
+                set_last_error(e);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Accepts and authenticates the next inbound session stream within `timeout_ms`.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_accept(
+    ep: *mut TendrilEndpoint,
+    timeout_ms: u64,
+) -> *mut TendrilSession {
+    ffi_ptr(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return ptr::null_mut();
+        }
+        let ep = unsafe { &*ep };
+        let wait = Duration::from_millis(timeout_ms.max(1));
+        let res = ep.rt.block_on(async {
+            let mut rx = ep.accepted_rx.lock().await;
+            let stream = match timeout(wait, rx.recv()).await {
+                Ok(Some(s)) => s,
+                Ok(None) => return Err("listener closed".to_owned()),
+                Err(_) => return Err("timed out accepting session".to_owned()),
+            };
+            drop(rx);
+
+            let guard = ep
+                .rate_limiter
+                .try_acquire(stream.peer_ip())
+                .map_err(|e| e.to_string())?;
+            SessionDriver::accept_locked(
+                stream,
+                &ep.identity,
+                &ep.roster,
+                now_unix(),
+                Some(&ep.rate_limiter),
+                Some(guard),
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+
+        match res {
+            Ok(driver) => Box::into_raw(Box::new(TendrilSession {
+                rt: Arc::clone(&ep.rt),
+                store: ep.store.clone(),
+                roster: Arc::clone(&ep.roster),
+                driver,
+            })),
+            Err(e) => {
+                set_last_error(e);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Frees a [`TendrilSession`] returned by `tendril_session_connect` or `tendril_session_accept`.
+///
+/// # Safety
+/// `sess` must be null or an unfreed valid session pointer with no concurrent active calls.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_free(sess: *mut TendrilSession) {
+    if !sess.is_null() {
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            drop(Box::from_raw(sess));
+        }));
+    }
+}
+
+/// Sends an encrypted `0x01 DATA` payload over an established session.
+///
+/// # Safety
+/// `sess` must be a valid mutable session pointer; if `len > 0`, `data` must point to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_send_data(
+    sess: *mut TendrilSession,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    ffi_i32(|| {
+        if sess.is_null() || (data.is_null() && len > 0) {
+            set_last_error("invalid session or data pointer");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let slice = if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(data, len) }
+        };
+        let sess = unsafe { &mut *sess };
+        match sess.rt.block_on(sess.driver.send_data(slice)) {
+            Ok(()) => TENDRIL_OK,
+            Err(e) => {
+                set_last_error(e.to_string());
+                TENDRIL_ERR_PROTOCOL
+            }
+        }
+    })
+}
+
+/// Polls the next decrypted session event as JSON (`0=event`, `1=would_block`, `2=eof`).
+///
+/// # Safety
+/// `sess` must be a valid mutable session pointer; `out_event_json` must be non-null when events are returned.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_poll_event(
+    sess: *mut TendrilSession,
+    timeout_ms: u64,
+    out_event_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if sess.is_null() {
+            set_last_error("null session");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let sess = unsafe { &mut *sess };
+        let wait = Duration::from_millis(timeout_ms.max(1));
+        let roster_ref = Arc::clone(&sess.roster);
+
+        match sess.rt.block_on(async {
+            timeout(wait, sess.driver.next_event_locked(now_unix(), &roster_ref)).await
+        }) {
+            Ok(Ok(Some(ev))) => {
+                let val = match ev {
+                    SessionEvent::AppData(data) => serde_json::json!({
+                        "event": "data",
+                        "data_b64": b64url_encode(&data),
+                    }),
+                    SessionEvent::Rekeyed { direction } => serde_json::json!({
+                        "event": "rekeyed",
+                        "direction": format!("{direction:?}"),
+                    }),
+                    SessionEvent::GrantUpdated(g) => serde_json::json!({
+                        "event": "grant_updated",
+                        "grant": g,
+                    }),
+                    SessionEvent::RevocationUpdated { issuer, seq } => {
+                        if let Some(store) = &sess.store {
+                            let guard = sess.roster.lock().expect("roster mutex poisoned");
+                            let _ = store.save_roster(&guard);
+                        }
+                        serde_json::json!({
+                            "event": "revocation_updated",
+                            "issuer": issuer,
+                            "seq": seq,
+                        })
+                    }
+                    SessionEvent::PongReceived(cookie) => serde_json::json!({
+                        "event": "pong",
+                        "cookie": cookie,
+                    }),
+                    SessionEvent::Audit(audit) => serde_json::json!({
+                        "event": "audit",
+                        "audit": audit,
+                    }),
+                    SessionEvent::Closed { code, reason } => serde_json::json!({
+                        "event": "closed",
+                        "code": code,
+                        "reason": reason,
+                    }),
+                };
+                unsafe { write_out_cstring(out_event_json, &val.to_string()) }
+            }
+            Ok(Ok(None)) => TENDRIL_EOF,
+            Ok(Err(e)) => {
+                set_last_error(e.to_string());
+                TENDRIL_ERR_PROTOCOL
+            }
+            Err(_) => TENDRIL_WOULD_BLOCK,
+        }
+    })
+}
+
+/// Evaluates default-deny capability authorization (`out_allowed = 1` when permitted).
+///
+/// # Safety
+/// `sess`, `cap`, and `out_allowed` must be non-null valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_authorize(
+    sess: *const TendrilSession,
+    cap: *const c_char,
+    out_allowed: *mut u8,
+) -> i32 {
+    ffi_i32(|| {
+        if sess.is_null() || out_allowed.is_null() {
+            set_last_error("null argument");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(cap_s) = (unsafe { cstr_to_str(cap, "cap") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let sess = unsafe { &*sess };
+        let roster = sess.roster.lock().expect("roster mutex poisoned");
+        let (res, _audit) = sess.driver.authorize(cap_s, now_unix(), &roster);
+        unsafe {
+            *out_allowed = u8::from(res.is_ok());
+        }
+        TENDRIL_OK
+    })
+}
+
+/// Initiates a Noise `0x04 REKEY` ratchet on the outgoing session cipher state.
+///
+/// # Safety
+/// `sess` must be a valid mutable session pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_rekey(sess: *mut TendrilSession) -> i32 {
+    ffi_i32(|| {
+        if sess.is_null() {
+            set_last_error("null session");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let sess = unsafe { &mut *sess };
+        match sess.rt.block_on(sess.driver.send_rekey()) {
+            Ok(()) => TENDRIL_OK,
+            Err(e) => {
+                set_last_error(e.to_string());
+                TENDRIL_ERR_PROTOCOL
+            }
+        }
+    })
+}
+
+/// Sends an encrypted `0x07 CLOSE` frame and closes the underlying transport stream.
+///
+/// # Safety
+/// `sess` must be a valid mutable session pointer; `reason` may be null or UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_close(
+    sess: *mut TendrilSession,
+    code: u16,
+    reason: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if sess.is_null() {
+            set_last_error("null session");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(reason_opt) = (unsafe { opt_cstr_to_str(reason, "reason") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let sess = unsafe { &mut *sess };
+        match sess
+            .rt
+            .block_on(sess.driver.send_close(code, reason_opt.unwrap_or("normal")))
+        {
+            Ok(()) => TENDRIL_OK,
+            Err(e) => {
+                set_last_error(e.to_string());
+                TENDRIL_ERR_PROTOCOL
+            }
+        }
+    })
+}

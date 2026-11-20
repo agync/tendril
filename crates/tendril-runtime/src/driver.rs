@@ -209,6 +209,11 @@ pub struct SessionDriver {
     _half_open: Option<HalfOpenGuard>,
 }
 
+enum RosterRef<'a> {
+    Direct(&'a mut Roster),
+    Locked(&'a Mutex<Roster>),
+}
+
 impl SessionDriver {
     /// Initiates and completes a Noise XX session handshake over `stream`.
     pub async fn connect(
@@ -220,6 +225,54 @@ impl SessionDriver {
         now_unix: u64,
     ) -> Result<Self, RuntimeError> {
         let crl_seq = roster.crl(target_host_id).map(|c| c.seq);
+        Self::connect_with_roster(
+            stream,
+            local_identity,
+            target_host_id,
+            initial_grant,
+            crl_seq,
+            RosterRef::Direct(roster),
+            now_unix,
+        )
+        .await
+    }
+
+    /// Initiates and completes a Noise XX session handshake using a mutex-guarded roster
+    /// without holding the lock across `.await`.
+    pub async fn connect_locked(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        initial_grant: Option<Grant>,
+        roster: &Mutex<Roster>,
+        now_unix: u64,
+    ) -> Result<Self, RuntimeError> {
+        let crl_seq = roster
+            .lock()
+            .expect("roster mutex poisoned")
+            .crl(target_host_id)
+            .map(|c| c.seq);
+        Self::connect_with_roster(
+            stream,
+            local_identity,
+            target_host_id,
+            initial_grant,
+            crl_seq,
+            RosterRef::Locked(roster),
+            now_unix,
+        )
+        .await
+    }
+
+    async fn connect_with_roster(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        initial_grant: Option<Grant>,
+        crl_seq: Option<u64>,
+        mut roster: RosterRef<'_>,
+        now_unix: u64,
+    ) -> Result<Self, RuntimeError> {
         let mut machine = SessionMachine::new_initiator(
             local_identity,
             target_host_id,
@@ -238,7 +291,7 @@ impl SessionDriver {
         };
         driver.apply_actions(start_actions).await?;
         driver
-            .drive_until_established(now_unix, roster, None, Some(DEFAULT_PRE_AUTH_TIMEOUT))
+            .drive_until_established(now_unix, &mut roster, None, Some(DEFAULT_PRE_AUTH_TIMEOUT))
             .await?;
         Ok(driver)
     }
@@ -274,6 +327,52 @@ impl SessionDriver {
         existing_guard: Option<HalfOpenGuard>,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        Self::accept_with_roster(
+            stream,
+            local_identity,
+            RosterRef::Direct(roster),
+            now_unix,
+            rate_limiter,
+            existing_guard,
+            handshake_timeout,
+        )
+        .await
+    }
+
+    /// Accepts an inbound Noise XX session handshake using a mutex-guarded roster
+    /// without holding the lock across `.await`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn accept_locked(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        roster: &Mutex<Roster>,
+        now_unix: u64,
+        rate_limiter: Option<&PreAuthRateLimiter>,
+        existing_guard: Option<HalfOpenGuard>,
+        handshake_timeout: Duration,
+    ) -> Result<Self, RuntimeError> {
+        Self::accept_with_roster(
+            stream,
+            local_identity,
+            RosterRef::Locked(roster),
+            now_unix,
+            rate_limiter,
+            existing_guard,
+            handshake_timeout,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_with_roster(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        mut roster: RosterRef<'_>,
+        now_unix: u64,
+        rate_limiter: Option<&PreAuthRateLimiter>,
+        existing_guard: Option<HalfOpenGuard>,
+        handshake_timeout: Duration,
+    ) -> Result<Self, RuntimeError> {
         let half_open = match existing_guard {
             Some(g) => Some(g),
             None => rate_limiter
@@ -290,7 +389,7 @@ impl SessionDriver {
             _half_open: half_open,
         };
         driver
-            .drive_until_established(now_unix, roster, rate_limiter, Some(handshake_timeout))
+            .drive_until_established(now_unix, &mut roster, rate_limiter, Some(handshake_timeout))
             .await?;
         Ok(driver)
     }
@@ -385,6 +484,26 @@ impl SessionDriver {
         now_unix: u64,
         roster: &mut Roster,
     ) -> Result<Option<SessionEvent>, RuntimeError> {
+        self.next_event_with_roster(now_unix, RosterRef::Direct(roster))
+            .await
+    }
+
+    /// Returns the next semantic event using a mutex-guarded roster without holding the lock
+    /// across `.await`.
+    pub async fn next_event_locked(
+        &mut self,
+        now_unix: u64,
+        roster: &Mutex<Roster>,
+    ) -> Result<Option<SessionEvent>, RuntimeError> {
+        self.next_event_with_roster(now_unix, RosterRef::Locked(roster))
+            .await
+    }
+
+    async fn next_event_with_roster(
+        &mut self,
+        now_unix: u64,
+        mut roster: RosterRef<'_>,
+    ) -> Result<Option<SessionEvent>, RuntimeError> {
         loop {
             if let Some(ev) = self.pending_events.pop_front() {
                 return Ok(Some(ev));
@@ -398,7 +517,7 @@ impl SessionDriver {
             }
             let now_ms = self.elapsed_ms();
             let chunk = self.recv_buf[..n].to_vec();
-            let actions = self.machine.feed_bytes(&chunk, now_unix, now_ms, roster)?;
+            let actions = self.feed_with_roster(&chunk, now_unix, now_ms, &mut roster)?;
             self.apply_actions(actions).await?;
         }
     }
@@ -406,7 +525,7 @@ impl SessionDriver {
     async fn drive_until_established(
         &mut self,
         now_unix: u64,
-        roster: &mut Roster,
+        roster: &mut RosterRef<'_>,
         rate_limiter: Option<&PreAuthRateLimiter>,
         handshake_timeout: Option<Duration>,
     ) -> Result<(), RuntimeError> {
@@ -434,7 +553,7 @@ impl SessionDriver {
             }
             let now_ms = self.elapsed_ms();
             let chunk = self.recv_buf[..n].to_vec();
-            let actions = self.machine.feed_bytes(&chunk, now_unix, now_ms, roster)?;
+            let actions = self.feed_with_roster(&chunk, now_unix, now_ms, roster)?;
             self.apply_actions(actions).await?;
         }
 
@@ -445,6 +564,24 @@ impl SessionDriver {
             rl.check_peer(peer_id)?;
         }
         Ok(())
+    }
+
+    fn feed_with_roster(
+        &mut self,
+        chunk: &[u8],
+        now_unix: u64,
+        now_ms: u64,
+        roster: &mut RosterRef<'_>,
+    ) -> Result<Vec<SessionAction>, RuntimeError> {
+        let actions = match roster {
+            RosterRef::Direct(r) => self.machine.feed_bytes(chunk, now_unix, now_ms, r)?,
+            RosterRef::Locked(m) => {
+                let mut guard = m.lock().expect("roster mutex poisoned");
+                self.machine
+                    .feed_bytes(chunk, now_unix, now_ms, &mut guard)?
+            }
+        };
+        Ok(actions)
     }
 
     async fn apply_actions(&mut self, actions: Vec<SessionAction>) -> Result<(), RuntimeError> {

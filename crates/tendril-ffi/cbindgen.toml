@@ -1,0 +1,6 @@
+language = "C"
+include_guard = "TENDRIL_H"
+cpp_compat = true
+tab_width = 4
+documentation = true
+documentation_style = "c"

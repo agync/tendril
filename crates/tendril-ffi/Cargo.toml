@@ -1,0 +1,23 @@
+[package]
+name = "tendril-ffi"
+description = "Callback-free polled C ABI over tendril-core and tendril-runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tendril-core.workspace = true
+tendril-runtime.workspace = true
+tokio.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
