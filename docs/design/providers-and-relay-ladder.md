@@ -25,11 +25,13 @@ Tendril treats every transport path as an untrusted byte pipe below Noise XX (`N
 
 ## Zero-setup P2P (`p2p-iroh` feature)
 
-Enabling `p2p-iroh` on `tendril-runtime` (enabled by default in `tendril-cli`) compiles `crates/tendril-runtime/src/providers/p2p.rs` over `iroh` 1.5 (`tls-ring`, `portmapper`):
+Enabling `p2p-iroh` on `tendril-runtime` (enabled by default in `tendril-cli` and `tendril-ffi`, and opt-in on `tendril-wasm`) compiles `crates/tendril-runtime/src/providers/p2p.rs` (native) or `crates/tendril-wasm/src/p2p.rs` (browser WASM) over `iroh` 1.5 (`tls-ring`, plus `portmapper` on native targets):
 
-- **Relay modes (`P2pRelayMode`):** `Default` uses `iroh::endpoint::presets::N0` for zero-configuration public relay homing and peer discovery, `Custom(url)` targets a self-hosted `iroh-relay`, and `Disabled` binds local UDP sockets using `presets::Minimal` without contacting public infrastructure.
-- **Stream instantiation (`TENDRIL_P2P_ALPN = "tendril/p2p/v1"`):** Because QUIC bidirectional streams created by `open_bi()` are only surfaced on the remote `accept_bi()` after initial bytes arrive, `P2pDialer` sends a `1`-byte stream opener (`0x54`) immediately after `open_bi()`, and `P2pListener` validates it under a bounded timeout before admitting the stream.
-- **Connection lifetime:** `P2pListener`, `P2pDialer`, and `P2pStream` share an `Arc<EndpointGuard>` and keep closing `Connection` handles alive briefly on drop (`250 ms` cap after `send.finish()`) so final flushed frames and QUIC `FIN` deliver cleanly.
+- **Relay modes (`P2pRelayMode`):** `Default` uses `iroh::endpoint::presets::N0` for zero-configuration public relay homing and peer discovery, `Custom(url)` targets a self-hosted `iroh-relay`, and `Disabled` binds local UDP sockets using `presets::Minimal` without contacting public infrastructure. On `wasm32-unknown-unknown` browsers, `iroh-relay` switches automatically to `ws_stream_wasm` WebSockets and `PkarrResolver::n0_dns()` over HTTPS `fetch`.
+- **Deterministic P2P routing key:** Host listeners derive their `iroh::SecretKey` deterministically via single-block HKDF-SHA256 from `EndpointIdentity::static_key` (`derive_p2p_identity_seed`, label `"tendril/p2p/iroh-identity/v1"`) rather than persisting a second key file or regenerating an ephemeral `EndpointId` on every reboot. The P2P key rotates automatically whenever the static Noise key rotates, and remains routing metadata only (never an authorization input).
+- **Transport PeerID pre-auth rate limiting:** `P2pStream` surfaces the remote transport `EndpointId` via `PathStream::peer_transport_id()`, so `PreAuthRateLimiter::try_acquire_for_peer` and `InboundRouter` rate-limit pre-Noise P2P handshakes per remote PeerID instead of starving unrelated peers behind a shared relay IP.
+- **Stream instantiation (`TENDRIL_P2P_ALPN = "tendril/p2p/v1"`):** Because QUIC bidirectional streams created by `open_bi()` are only surfaced on the remote `accept_bi()` after initial bytes arrive, dialers send a `1`-byte stream opener (`0x54`) immediately after `open_bi()`, and `P2pListener` validates it under a bounded timeout before admitting the stream.
+- **Connection lifetime:** `P2pListener`, `P2pDialer`, and `P2pStream` share an `Arc<EndpointGuard>` with explicit `close_now()` teardown in `P2pStream::close()` and `P2pDialer::close()` so flushed QUIC frames and `FIN` deliver cleanly before runtime shutdown.
 
 ## Relay ladder and zero-re-pair migration
 
@@ -46,6 +48,7 @@ Applications can move between public relays, self-hosted `tendril-relay` contain
 
 ## Verification status
 
-- `tendril-runtime` verifies the 6-point provider contract and full Noise XX pairing/confirm/mint/data/rekey/revoke lifecycle across all six rungs (`local`, `direct`, `overlay`, `p2p`, `relay`, `broker`), `select_overlay_mode` + scoped Unix helper IPC, broker rejection paths, `p2p` cold-delay policy failover, and `public -> self-hosted -> embedded` `relay_hints` migration.
-- `tendril-cli` verifies live subprocess `tendril serve --embedded-relay --p2p-local --overlay --broker` pairing over `iroh` P2P and dialing across `P2p`, `Overlay`, `Broker`, and `Relay` (`EmbeddedRelay`).
+- `tendril-runtime` verifies the 6-point provider contract, deterministic HKDF-derived `P2pListener` `EndpointId` persistence and rotation, `peer_transport_id` pre-auth rate limiting, and full Noise XX pairing/confirm/mint/data/rekey/revoke lifecycle across all six rungs (`local`, `direct`, `overlay`, `p2p`, `relay`, `broker`), `select_overlay_mode` + scoped Unix helper IPC, broker rejection paths, `p2p` cold-delay policy failover, and `public -> self-hosted -> embedded` `relay_hints` migration.
+- `tendril-cli` verifies live subprocess `tendril serve --embedded-relay --p2p-local --overlay --broker` pairing over `iroh` P2P, identical `iroh://<endpoint_id>` across host restarts, clean client endpoint shutdown, and dialing across `P2p`, `Overlay`, `Broker`, and `Relay` (`EmbeddedRelay`).
+- `bindings/web` (`TENDRIL_WEB_P2P_LIVE=1 node bindings/web/test/browser_e2e.mjs`) verifies headless Chrome WASM (`WasmIrohStream` over `ws_stream_wasm` + `PkarrResolver::n0_dns()`) pairing and dialing a live `tendril serve --p2p` host using a bare `iroh://<endpoint_id>` URI over public `iroh-relay` WebSockets.
 - Physical 30-minute mobile battery draw (`Gate #11`) requires dedicated iOS/Android hardware runs outside headless Linux CI.

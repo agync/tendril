@@ -33,7 +33,7 @@ Host app (Go / Python / Node.js)
 |---|---|---|
 | Status & cleanup | `tendril_last_error`, `tendril_string_free` | Negative `TendrilResult` populates thread-local error buffer; heap strings returned via `char **` must be released with `tendril_string_free` |
 | Vector & core helpers | `tendril_device_id`, `tendril_fingerprint_host`, `tendril_fingerprint_device`, `tendril_pairing_sas`, `tendril_compute_code_mac`, `tendril_verify_rotation_chain_json`, `tendril_verify_grant_json` | Pure delegation to `tendril-core` with early out-pointer validation and `catch_unwind` panic boundaries |
-| Endpoint lifecycle | `tendril_endpoint_new`, `tendril_endpoint_free`, `tendril_endpoint_info_json`, `tendril_endpoint_serve_direct`, `tendril_endpoint_serve_relay`, `tendril_endpoint_issue_code`, `tendril_endpoint_pair_initiate`, `tendril_endpoint_pair_accept`, `tendril_endpoint_confirm_peer`, `tendril_endpoint_mint_grant`, `tendril_endpoint_revoke_peer` | Opaque `TendrilEndpoint *`; NULL or empty `state_dir` selects ephemeral in-memory operation |
+| Endpoint lifecycle | `tendril_endpoint_new`, `tendril_endpoint_free`, `tendril_endpoint_info_json`, `tendril_endpoint_serve_direct`, `tendril_endpoint_serve_relay`, `tendril_endpoint_serve_p2p`, `tendril_endpoint_issue_code`, `tendril_endpoint_pair_initiate`, `tendril_endpoint_pair_accept`, `tendril_endpoint_confirm_peer`, `tendril_endpoint_mint_grant`, `tendril_endpoint_revoke_peer` | Opaque `TendrilEndpoint *`; NULL or empty `state_dir` selects ephemeral in-memory operation; `tendril_endpoint_serve_p2p` binds a deterministic HKDF-derived `iroh` listener (`"default"`, `"disabled"`/`"local"`, or relay URL) when compiled with `p2p-iroh` |
 | Session lifecycle & polling | `tendril_session_connect`, `tendril_session_accept`, `tendril_session_free`, `tendril_session_send_data`, `tendril_session_poll_event`, `tendril_session_authorize`, `tendril_session_rekey`, `tendril_session_close` | Opaque `TendrilSession *` remains valid after `tendril_endpoint_free`; `tendril_session_poll_event` validates `out_event_json` before polling and returns `TENDRIL_OK` (`0`), `TENDRIL_WOULD_BLOCK` (`1`), or `TENDRIL_EOF` (`2`) |
 
 ### `TendrilResult` status codes
@@ -47,18 +47,18 @@ Host app (Go / Python / Node.js)
 
 ### Go (`bindings/go`)
 
-- Exposes typed wrappers (`Endpoint`, `Session`, `EndpointInfo`, `PairInitiateResult`, `PairAcceptResult`, `SessionEvent` including `Audit`, `ErrWouldBlock`) and pure helper functions (`DeviceID`, `FingerprintHost`, `FingerprintDevice`, `PairingSAS`, `ComputeCodeMAC`, `VerifyRotationChainJSON`, `VerifyGrantJSON`).
+- Exposes typed wrappers (`Endpoint`, `Session`, `EndpointInfo`, `PairInitiateResult`, `PairAcceptResult`, `SessionEvent` including `Audit`, `ErrWouldBlock`), `ServeDirect`, `ServeRelay`, `ServeP2p`, and pure helper functions (`DeviceID`, `FingerprintHost`, `FingerprintDevice`, `PairingSAS`, `ComputeCodeMAC`, `VerifyRotationChainJSON`, `VerifyGrantJSON`).
 - Guards `Endpoint` with `sync.RWMutex` and `Session` with `sync.Mutex`, pairs pointer and byte-slice reads with `runtime.KeepAlive`, and pins OS threads via `runtime.LockOSThread()` / `runtime.UnlockOSThread()` around cgo calls and `tendril_last_error()` reads so goroutine migration cannot lose or cross-contaminate thread-local errors under `go test -race`.
 
 ### Python (`bindings/python`)
 
-- Exposes `Endpoint`, `Session`, `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, and `verify_grant_json` from `tendril`.
+- Exposes `Endpoint` (including `serve_direct`, `serve_relay`, `serve_p2p`, and unified `dial_endpoint` for `iroh://`, `overlay://`, `broker+ws(s)://`, `ws(s)://`, local, and direct targets), `Session`, `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, and `verify_grant_json` from `tendril`.
 - `compute_code_mac` and all blocking, mutex-acquiring, or disk-persisting `Endpoint` and `Session` methods release the GIL via `py.detach`, verified by a multi-threaded heartbeat test during concurrent `compute_code_mac` Argon2 execution and concurrent handshake threads.
 
 ### Node.js (`bindings/node`)
 
-- Exposes `Endpoint`, `Session` (non-constructible directly via `private constructor()` in `bindings/node/index.d.ts`), synchronous hash/verifier helpers (`deviceId`, `fingerprintHost`, `fingerprintDevice`, `pairingSas`, `verifyRotationChainJson`, `verifyGrantJson`), and async `Promise` methods (`computeCodeMac`, `serveDirect`, `serveRelay`, `pairInitiate`, `pairAccept`, `connect`, `acceptSession`, `sendData`, `pollEvent`, `authorize`, `rekey`, `close`).
-- Verified by a `setInterval` timer responsiveness test running alongside concurrent `computeCodeMac` Argon2 promises.
+- Exposes `Endpoint`, `Session` (non-constructible directly via `private constructor()` in `bindings/node/index.d.ts`), synchronous hash/verifier helpers (`deviceId`, `fingerprintHost`, `fingerprintDevice`, `pairingSas`, `verifyRotationChainJson`, `verifyGrantJson`), and async `Promise` methods (`computeCodeMac`, `serveDirect`, `serveRelay`, `serveP2p`, `pairInitiate`, `pairAccept`, `connect`, `acceptSession`, `sendData`, `pollEvent`, `authorize`, `rekey`, `close`).
+- Verified by a `setInterval` timer responsiveness test running alongside concurrent `computeCodeMac` Argon2 promises and local P2P (`serveP2p("disabled")`) loopback conformance tests.
 
 ## Gate #7 baselines (Linux `x86_64` release)
 

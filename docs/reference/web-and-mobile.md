@@ -14,28 +14,30 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 
 | Target | Bridge Crate / Layer | Transport Path | Secure Storage & Platform Integration |
 |---|---|---|---|
-| Browser (`bindings/web`) | `crates/tendril-wasm` (`#![forbid(unsafe_code)]`, `wasm-bindgen = "=0.2.130"`) | Browser `WebSocket` (`spec/relay-v1.md`) | `TendrilWebClient`, `computeCodeMacWorker` Web Worker Argon2 offload |
-| Android (`bindings/kotlin`) | JNI C shim (`bindings/kotlin/jni/tendril_jni.c`) -> `libtendril_ffi.so` | Rust `RelayDialer` / `DirectDialer` | `KeystoreStateCipher` (`AndroidKeyStore` AES-256-GCM), `TendrilForegroundService` (`NetworkCallback`) |
-| Apple (`bindings/swift`) | SwiftPM C target (`CTendril`) -> `libtendril_ffi` | Rust `RelayDialer` / `DirectDialer` | `TendrilKeychainStore` (`Security` Keychain + `CryptoKit` AES-GCM) |
+| Browser (`bindings/web`) | `crates/tendril-wasm` (`#![forbid(unsafe_code)]`, `wasm-bindgen = "=0.2.130"`, opt-in `p2p-iroh` feature) | Browser `WebSocket` (`spec/relay-v1.md`) and opt-in `iroh` over `ws_stream_wasm` + `n0_dns` | `TendrilWebClient`, `dialIrohStream`, `computeCodeMacWorker` Web Worker Argon2 offload |
+| Android (`bindings/kotlin`) | JNI C shim (`bindings/kotlin/jni/tendril_jni.c`) -> `libtendril_ffi.so` | Rust `P2pListener` / `RelayDialer` / `DirectDialer` (`serveP2p` via `p2p-iroh`) | `KeystoreStateCipher` (`AndroidKeyStore` AES-256-GCM), `TendrilForegroundService` (`NetworkCallback`) |
+| Apple (`bindings/swift`) | SwiftPM C target (`CTendril`) -> `libtendril_ffi` | Rust `P2pListener` / `RelayDialer` / `DirectDialer` (`serveP2p` via `p2p-iroh`) | `TendrilKeychainStore` (`Security` Keychain + `CryptoKit` AES-GCM) |
 
 ## WebAssembly core and browser SDK
 
 ### `crates/tendril-wasm`
 
-`crates/tendril-wasm` compiles cleanly for `wasm32-unknown-unknown` using `.cargo/config.toml` (`getrandom_backend="wasm_js"`) and exports four stateful types plus eight helper functions:
+`crates/tendril-wasm` compiles cleanly for `wasm32-unknown-unknown` using `.cargo/config.toml` (`getrandom_backend="wasm_js"`). Its default build (`bindings/web/pkg`) remains strictly sans-I/O and exports four stateful types plus eight helper functions; enabling the opt-in `p2p-iroh` feature (`bindings/web/pkg-p2p`) adds `WasmIrohStream` and `parse_p2p_endpoint_json` over `iroh` 1.5 (`ws_stream_wasm` + `ring`):
 
 - `WasmIdentity`: generates, exports, and restores client Ed25519 signing and X25519 static keys without touching host storage directly.
 - `WasmRoster`: serializes pinned hosts, pairing state, and verified CRL sequence tracking.
 - `WasmPairInitiator`: sans-I/O `Intent::Pair` handshake state machine outputting raw wire frames (`start`, `feed_bytes`).
 - `WasmSessionClient`: sans-I/O `Intent::Session` initiator supporting encrypted `send_data`, `send_ping`, `send_rekey`, `send_close`, `tick`, and `authorize`.
 - Vector and verification helpers: `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, `verify_grant_json`, and `parse_pairing_uri_json`.
+- Opt-in browser P2P (`p2p-iroh` feature): `WasmIrohStream` (`dial`, `send_chunk`, `recv_chunk`, `close`) and `parse_p2p_endpoint_json`.
 
 ### `@tendril/web` (`bindings/web`)
 
 - `bindings/web/src/relay.js` implements the `spec/relay-v1.md` client WebSocket handshake (`challenge`, `dial`, `ready`) and binary frame bounds (`65,521` bytes max).
+- `bindings/web/src/iroh.js` lazy-loads `bindings/web/pkg-p2p/` on demand for `iroh://` endpoints (`dialIrohStream`, `parseP2pEndpoint`), keeping default page loads on the smaller sans-I/O bundle unless `iroh://` is used.
 - `bindings/web/src/worker.js` and `computeCodeMacWorker` move Argon2id pairing-code proof computation off the UI thread.
-- `bindings/web/demo/` provides an interactive pairing/session web page and a Node HTTP/WebSocket `/v1/relay` reverse-proxy server (`server.mjs`) with zero third-party npm runtime dependencies.
-- `bindings/web/test/browser_e2e.mjs` runs all four helper `spec/vectors/` files plus a full live Noise handshake, encrypted data exchange, `rekey`, `ping`/`pong`, `authorize`, `revoke`, and `close` flow in headless Chrome against `tendril-relay` and `tendril-conformance-peer`.
+- `bindings/web/demo/` provides an interactive pairing/session web page supporting both `wss://.../v1/relay` and `iroh://...` endpoints (`?endpoint=iroh://...` or `demo-config.json`), plus a Node HTTP/WebSocket `/v1/relay` reverse-proxy server (`server.mjs`) with zero third-party npm runtime dependencies.
+- `bindings/web/test/browser_e2e.mjs` runs all four helper `spec/vectors/` files, `parseP2pEndpoint` validation, and a live Noise handshake, encrypted data exchange, `rekey`, `ping`/`pong`, `authorize`, `revoke`, and `close` flow in headless Chrome against `tendril-relay` and `tendril-conformance-peer` (plus live `iroh://` browser-to-host E2E over n0 public relays when `TENDRIL_WEB_P2P_LIVE=1`).
 
 ## Android Kotlin JNI (`bindings/kotlin`)
 
@@ -54,8 +56,10 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 
 | Artifact | Target | Raw Size | Stripped / Compressed | Measurement Method |
 |---|---|---|---|---|
-| `bindings/web/pkg/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`) | 782,671 bytes (764.3 KiB) | 293,230 bytes (286.4 KiB) gzipped | `wasm-bindgen --target web` after release build |
-| `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26) | 3,412,800 bytes | 3,412,472 bytes (3.25 MiB) stripped | `stat -c%s` before and after `llvm-strip` |
+| `bindings/web/pkg/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, default sans-I/O) | 782,671 bytes (764.3 KiB) | 293,229 bytes (286.4 KiB) gzipped | `wasm-bindgen --target web` after release build |
+| `bindings/web/pkg-p2p/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, `--features p2p-iroh`) | 4,111,913 bytes (3.92 MiB) | 1,522,618 bytes (1.45 MiB) gzipped | `wasm-bindgen --target web` after release build with `p2p-iroh` |
+| `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26, `--no-default-features`) | 3,434,576 bytes | 3,434,248 bytes (3.28 MiB) stripped | `stat -c%s` before and after `llvm-strip` |
+| `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26, default `p2p-iroh`) | 12,291,992 bytes | 12,291,664 bytes (11.72 MiB) stripped | `stat -c%s` before and after `llvm-strip` |
 | `aarch64-apple-ios` static archive | `aarch64-apple-ios` | Not measured on Linux | Not measured on Linux | Requires Apple Xcode toolchain |
 
 ## Gate #8 WASM Argon2id timings
@@ -81,8 +85,10 @@ Observed between a physical mobile browser and the desktop Rust `tendril` CLI ho
 ## Verification commands
 
 ```bash
-make bindings/wasm      # Build release WASM and generate bindings/web/pkg
+make bindings/wasm      # Build sans-I/O release WASM and generate bindings/web/pkg
+make bindings/wasm-p2p  # Build opt-in p2p-iroh WASM and generate bindings/web/pkg-p2p
 make bindings/web       # Run headless Chrome vector + benchmark + live relay E2E suite
+TENDRIL_WEB_P2P_LIVE=1 node bindings/web/test/browser_e2e.mjs  # Also run live bare iroh:// Chrome E2E
 make bindings/jni       # Compile libtendril_jni.so and run JVM vector + interop tests
 make bindings/android   # Cross-compile release libtendril_ffi.so for aarch64-linux-android
 make bindings/check     # Run Go, Python, Node, Web WASM, and Kotlin JNI suites
