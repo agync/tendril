@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
     P2P_IDENTITY_HKDF_LABEL, SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode,
-    hkdf_sha256_32,
+    hkdf_sha256_32, is_valid_ed25519_public_key, is_valid_x25519_public_key,
 };
 use crate::error::CoreError;
 use zeroize::Zeroizing;
@@ -64,9 +64,11 @@ impl EndpointIdentity {
         if host_id.is_empty() {
             return Err(CoreError::IncompletePin("empty host_id".to_string()));
         }
-        if static_key.public_bytes() == &[0u8; 32] {
+        if !is_valid_x25519_public_key(static_key.public_bytes())
+            || !is_valid_ed25519_public_key(signing_key.public_bytes())
+        {
             return Err(CoreError::IncompletePin(
-                "zero static public key".to_string(),
+                "invalid or low-order public key".to_string(),
             ));
         }
         if rotation_chain.is_empty() {
@@ -184,6 +186,7 @@ impl EndpointIdentity {
 
 /// One signed link in a peer's key-rotation chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RotationRecord {
     pub seq: u64,
     pub prev_signing_pub: String,
@@ -268,6 +271,14 @@ pub fn verify_rotation_record(record: &RotationRecord) -> Result<VerifiedRotatio
     let prev_signing_pub: [u8; 32] = b64url_decode_array(&record.prev_signing_pub)?;
     let new_signing_pub: [u8; 32] = b64url_decode_array(&record.new_signing_pub)?;
     let new_static_pub: [u8; 32] = b64url_decode_array(&record.new_static_pub)?;
+    if !is_valid_x25519_public_key(&new_static_pub) {
+        return Err(CoreError::IncompletePin(
+            "invalid or low-order rotated static key".to_string(),
+        ));
+    }
+    if !is_valid_ed25519_public_key(&new_signing_pub) {
+        return Err(CoreError::InvalidSignature);
+    }
     let sig_bytes: [u8; 64] = b64url_decode_array(&record.sig)?;
     let ts_unix = parse_rfc3339_utc(&record.ts)?;
 

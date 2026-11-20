@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use snow::params::NoiseParams;
-use snow::{Builder, HandshakeState, TransportState};
+use snow::{HandshakeState, TransportState};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
     CODE_ALPHABET, b64url_decode_array, b64url_encode, compute_code_mac, device_id,
-    fingerprint_device, pairing_sas, random_bytes, verify_code_mac,
+    fingerprint_device, is_valid_ed25519_public_key, is_valid_x25519_public_key, new_noise_builder,
+    pairing_sas, random_bytes, verify_code_mac,
 };
 use crate::error::CoreError;
 use crate::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
@@ -279,9 +280,22 @@ pub struct PairingUri {
     pub host_static_pub: [u8; 32],
     pub host_signing_pub: [u8; 32],
     pub endpoints: Vec<String>,
+    pub host_id: Option<String>,
+    pub rotation_seq: Option<u64>,
 }
 
 impl PairingUri {
+    /// Converts this URI's out-of-band cryptographic pin into a [`PinnedHost`].
+    #[must_use]
+    pub fn to_pinned_host(&self) -> PinnedHost {
+        PinnedHost {
+            host_id: self.host_id.clone(),
+            static_pub: self.host_static_pub,
+            signing_pub: self.host_signing_pub,
+            rotation_seq: self.rotation_seq.unwrap_or(0),
+        }
+    }
+
     /// Encodes this pairing payload as a `tendril://pair?v=1&...` URI.
     #[must_use]
     pub fn encode(&self) -> String {
@@ -298,6 +312,15 @@ impl PairingUri {
             b64url_encode(&self.host_static_pub),
             b64url_encode(&self.host_signing_pub),
         );
+        if let Some(ref host_id) = self.host_id
+            && !host_id.is_empty()
+        {
+            out.push_str("&id=");
+            out.push_str(&pct_encode(host_id));
+        }
+        if let Some(seq) = self.rotation_seq {
+            out.push_str(&format!("&seq={seq}"));
+        }
         if !ep_joined.is_empty() {
             out.push_str("&ep=");
             out.push_str(&ep_joined);
@@ -343,17 +366,45 @@ impl PairingUri {
             .get("k")
             .ok_or_else(|| CoreError::InvalidPairingUri("missing host static key k".into()))?;
         let host_static_pub: [u8; 32] = b64url_decode_array(k_raw)?;
-        if host_static_pub == [0u8; 32] {
-            return Err(CoreError::InvalidPairingUri("zero host static key".into()));
+        if !is_valid_x25519_public_key(&host_static_pub) {
+            return Err(CoreError::InvalidPairingUri(
+                "invalid or low-order host static key".into(),
+            ));
         }
 
         let s_raw = params
             .get("s")
             .ok_or_else(|| CoreError::InvalidPairingUri("missing host signing key s".into()))?;
         let host_signing_pub: [u8; 32] = b64url_decode_array(s_raw)?;
-        if host_signing_pub == [0u8; 32] {
-            return Err(CoreError::InvalidPairingUri("zero host signing key".into()));
+        if !is_valid_ed25519_public_key(&host_signing_pub) {
+            return Err(CoreError::InvalidPairingUri(
+                "invalid host signing key".into(),
+            ));
         }
+
+        let host_id = match params.get("id").copied() {
+            None => None,
+            Some(id_raw) => {
+                let dec = pct_decode(id_raw)?;
+                if dec.is_empty() {
+                    return Err(CoreError::InvalidPairingUri("empty id parameter".into()));
+                }
+                Some(dec)
+            }
+        };
+
+        let rotation_seq = match params.get("seq").copied() {
+            None => None,
+            Some(seq_raw) => {
+                if seq_raw.is_empty() || !seq_raw.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(CoreError::InvalidPairingUri("invalid seq parameter".into()));
+                }
+                let seq = seq_raw
+                    .parse::<u64>()
+                    .map_err(|_| CoreError::InvalidPairingUri("seq parameter overflow".into()))?;
+                Some(seq)
+            }
+        };
 
         let endpoints = match params.get("ep").copied() {
             None | Some("") => Vec::new(),
@@ -378,6 +429,8 @@ impl PairingUri {
             host_static_pub,
             host_signing_pub,
             endpoints,
+            host_id,
+            rotation_seq,
         })
     }
 }
@@ -530,7 +583,8 @@ impl PairingInitiator {
         fixed_ephemeral: Option<[u8; 32]>,
     ) -> Result<Self, CoreError> {
         if let Some(ref pin) = pinned_host
-            && (pin.static_pub == [0u8; 32] || pin.signing_pub == [0u8; 32])
+            && (!is_valid_x25519_public_key(&pin.static_pub)
+                || !is_valid_ed25519_public_key(&pin.signing_pub))
         {
             return Err(CoreError::IncompletePin(
                 pin.host_id
@@ -542,7 +596,7 @@ impl PairingInitiator {
             .parse()
             .map_err(|err| CoreError::Noise(format!("{err}")))?;
         let preamble = Preamble::v1(Intent::Pair).encode();
-        let mut builder = Builder::new(params)
+        let mut builder = new_noise_builder(params)
             .local_private_key(identity.static_key().secret_bytes())
             .map_err(|err| CoreError::Noise(format!("{err}")))?
             .prologue(&preamble)
@@ -644,6 +698,9 @@ impl PairingInitiator {
                     ))?
                     .try_into()
                     .map_err(|_| CoreError::ProtocolViolation("invalid responder static length"))?;
+                if !is_valid_x25519_public_key(&remote_static) {
+                    return Err(CoreError::HostKeyUnverified);
+                }
 
                 let mut expected_signing_pub = None;
                 let mut verified_seq = None;
@@ -663,14 +720,32 @@ impl PairingInitiator {
                         b64url_decode_array(&last.new_signing_pub)
                             .map_err(|_| CoreError::HostKeyUnverified)?
                     };
-                    match verify_rotation_chain(
-                        &pin.signing_pub,
-                        &pin.static_pub,
-                        pin.rotation_seq,
-                        &host_hello.rotation,
-                        &remote_static,
-                        &presented_signing,
-                    ) {
+                    let verify_res = if pin.rotation_seq == 0
+                        && !host_hello.rotation.is_empty()
+                        && host_hello.rotation[0].seq == 1
+                        && remote_static == pin.static_pub
+                        && presented_signing == pin.signing_pub
+                    {
+                        let last_seq = host_hello.rotation.last().map_or(0, |r| r.seq);
+                        verify_rotation_chain(
+                            &pin.signing_pub,
+                            &pin.static_pub,
+                            last_seq,
+                            &host_hello.rotation,
+                            &remote_static,
+                            &presented_signing,
+                        )
+                    } else {
+                        verify_rotation_chain(
+                            &pin.signing_pub,
+                            &pin.static_pub,
+                            pin.rotation_seq,
+                            &host_hello.rotation,
+                            &remote_static,
+                            &presented_signing,
+                        )
+                    };
+                    match verify_res {
                         Ok(seq) => {
                             expected_signing_pub = Some(presented_signing);
                             verified_seq = Some(seq);
@@ -747,7 +822,7 @@ impl PairingInitiator {
                             ));
                         }
                         let host_signing: [u8; 32] = b64url_decode_array(&host_signing_pub)?;
-                        if host_signing == [0u8; 32] {
+                        if !is_valid_ed25519_public_key(&host_signing) {
                             return Err(CoreError::IncompletePin(host_id));
                         }
                         if let Some(expected) = expected_signing_pub
@@ -842,7 +917,7 @@ impl PairingResponder {
             .parse()
             .map_err(|err| CoreError::Noise(format!("{err}")))?;
         let preamble = Preamble::v1(Intent::Pair).encode();
-        let mut builder = Builder::new(params)
+        let mut builder = new_noise_builder(params)
             .local_private_key(identity.static_key().secret_bytes())
             .map_err(|err| CoreError::Noise(format!("{err}")))?
             .prologue(&preamble)
@@ -980,6 +1055,11 @@ impl PairingResponder {
                     ))?
                     .try_into()
                     .map_err(|_| CoreError::ProtocolViolation("invalid initiator static length"))?;
+                if !is_valid_x25519_public_key(&peer_static) {
+                    return Err(CoreError::ProtocolViolation(
+                        "invalid or low-order initiator static key",
+                    ));
+                }
 
                 let mut transport = hs
                     .into_transport_mode()
@@ -1104,6 +1184,8 @@ mod tests {
                 "direct:192.168.1.10:7000".to_string(),
                 "relay:wss://relay.example/v1/relay".to_string(),
             ],
+            host_id: None,
+            rotation_seq: None,
         };
         let encoded = uri.encode();
         let parsed = PairingUri::parse(&encoded).unwrap();

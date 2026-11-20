@@ -257,6 +257,7 @@ fn validate_inner_payload(kind: InnerFrameType, payload: &[u8]) -> Result<(), Co
 
 /// Encrypted `msg2` payload (`responder -> initiator`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostHello {
     pub host_id: String,
     pub proto_version: u8,
@@ -266,6 +267,7 @@ pub struct HostHello {
 
 /// Encrypted `msg3` payload for `intent = session` (`initiator -> responder`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionHello {
     pub device_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,6 +278,7 @@ pub struct SessionHello {
 
 /// Encrypted `msg3` payload for `intent = pair` (`initiator -> responder`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PairClaim {
     pub name: String,
     pub kind: String,
@@ -284,7 +287,7 @@ pub struct PairClaim {
 
 /// Encrypted post-handshake response frame for `intent = pair` (`responder -> initiator`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum PairResponse {
     Success {
         device_id: String,

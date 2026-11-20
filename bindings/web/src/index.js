@@ -282,11 +282,15 @@ export class TendrilWebClient {
     let pairCode = code;
     let hostStaticPin = null;
     let hostSigningPin = null;
+    let hostIdPin = null;
+    let hostRotationSeqPin = null;
     if (pairingUri) {
       const parsed = parsePairingUri(pairingUri);
       pairCode = parsed.code;
       hostStaticPin = parsed.host_static_pub_b64;
       hostSigningPin = parsed.host_signing_pub_b64;
+      hostIdPin = parsed.host_id ?? null;
+      hostRotationSeqPin = parsed.rotation_seq ?? null;
     }
     if (!pairCode) {
       throw new Error("pairing code or pairingUri is required");
@@ -300,7 +304,9 @@ export class TendrilWebClient {
       deviceKind,
       pairCode,
       hostStaticPin,
-      hostSigningPin
+      hostSigningPin,
+      hostIdPin,
+      hostRotationSeqPin
     );
     let stream = null;
     try {

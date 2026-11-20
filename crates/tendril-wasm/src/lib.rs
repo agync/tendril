@@ -154,6 +154,8 @@ pub fn parse_pairing_uri_json(uri: &str) -> Result<String, JsValue> {
         "host_static_pub_b64": b64url_encode(&parsed.host_static_pub),
         "host_signing_pub_b64": b64url_encode(&parsed.host_signing_pub),
         "endpoints": parsed.endpoints,
+        "host_id": parsed.host_id,
+        "rotation_seq": parsed.rotation_seq.and_then(|s| u64_to_f64(s).ok()),
     })
     .to_string())
 }
@@ -339,6 +341,7 @@ pub struct WasmPairInitiator {
 }
 
 impl WasmPairInitiator {
+    #[allow(clippy::too_many_arguments)]
     fn new_inner(
         identity: &WasmIdentity,
         device_name: &str,
@@ -346,14 +349,22 @@ impl WasmPairInitiator {
         code: &str,
         host_static_pub_b64: Option<&str>,
         host_signing_pub_b64: Option<&str>,
+        host_id: Option<&str>,
+        host_rotation_seq: Option<f64>,
     ) -> Result<Self, String> {
         let pinned = match (host_static_pub_b64, host_signing_pub_b64) {
-            (Some(st), Some(sg)) if !st.is_empty() && !sg.is_empty() => Some(PinnedHost {
-                host_id: None,
-                static_pub: b64url_decode_array::<32>(st).map_err(|e| e.to_string())?,
-                signing_pub: b64url_decode_array::<32>(sg).map_err(|e| e.to_string())?,
-                rotation_seq: 0,
-            }),
+            (Some(st), Some(sg)) if !st.is_empty() && !sg.is_empty() => {
+                let seq = match host_rotation_seq {
+                    Some(v) => f64_to_u64(v, "host_rotation_seq")?,
+                    None => 0,
+                };
+                Some(PinnedHost {
+                    host_id: host_id.filter(|h| !h.is_empty()).map(ToOwned::to_owned),
+                    static_pub: b64url_decode_array::<32>(st).map_err(|e| e.to_string())?,
+                    signing_pub: b64url_decode_array::<32>(sg).map_err(|e| e.to_string())?,
+                    rotation_seq: seq,
+                })
+            }
             (None | Some(""), None | Some("")) => None,
             _ => {
                 return Err(
@@ -438,6 +449,7 @@ impl WasmPairInitiator {
 #[wasm_bindgen]
 impl WasmPairInitiator {
     #[wasm_bindgen(constructor)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: &WasmIdentity,
         device_name: &str,
@@ -445,6 +457,8 @@ impl WasmPairInitiator {
         code: &str,
         host_static_pub_b64: Option<String>,
         host_signing_pub_b64: Option<String>,
+        host_id: Option<String>,
+        host_rotation_seq: Option<f64>,
     ) -> Result<WasmPairInitiator, JsValue> {
         Self::new_inner(
             identity,
@@ -453,6 +467,8 @@ impl WasmPairInitiator {
             code,
             host_static_pub_b64.as_deref(),
             host_signing_pub_b64.as_deref(),
+            host_id.as_deref(),
+            host_rotation_seq,
         )
         .map_err(to_js_err)
     }
@@ -694,9 +710,17 @@ mod tests {
         assert_eq!(cli_id.info_string(), cli_reloaded.info_string());
 
         let mut cli_roster = WasmRoster::new();
-        let mut pair_init =
-            WasmPairInitiator::new_inner(&cli_reloaded, "web", "browser", &code, None, None)
-                .unwrap();
+        let mut pair_init = WasmPairInitiator::new_inner(
+            &cli_reloaded,
+            "web",
+            "browser",
+            &code,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let mut pair_resp = PairingResponder::new(&host_id, PairingPathKind::Remote, None).unwrap();
 
         let init_m1: Vec<u8> = match pair_init.inner.start().unwrap().pop().unwrap() {

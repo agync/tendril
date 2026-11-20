@@ -129,9 +129,11 @@ code_mac = HMAC-SHA256(key = K, msg = "tendril-pair-v1" || h)
 ## 6. Pairing URI Scheme
 
 ```text
-tendril://pair?v=1&host=<url_encoded_name>&code=<code>&k=<b64url_host_static>&s=<b64url_host_signing>&ep=<csv>
+tendril://pair?v=1&host=<url_encoded_name>&code=<code>&k=<b64url_host_static>&s=<b64url_host_signing>[&id=<url_encoded_host_id>][&seq=<u64>][&ep=<csv>]
 ```
 
-- `k` pins the host's 32-byte X25519 static public key prior to `msg1`.
-- `s` pins the host's 32-byte Ed25519 signing public key as the rotation chain root.
+- `k` pins the host's valid full-order 32-byte X25519 static public key prior to `msg1` (small-subgroup points MUST be rejected).
+- `s` pins the host's valid 32-byte Ed25519 signing public key as the rotation chain root (or current key at `seq`).
+- `id` optionally pins the host's expected `host_id` carried in `HostHello`.
+- `seq` optionally carries the host's current `rotation_seq` corresponding to `(k, s)`. When `seq` is omitted on a legacy URI for an already-rotated host presenting a contiguous chain from `seq == 1` ending at `(k, s)`, initiators MAY verify that chain and initialize the pin at `last.seq`.
 - `ep` carries comma-separated endpoint hints (`<provider>:<addr>`), which are dialing hints only and never grant authorization.

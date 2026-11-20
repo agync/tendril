@@ -170,6 +170,8 @@ fn full_pair_confirm_mint_data_rekey_rotate_delegate_revoke_close_lifecycle() {
         host_static_pub: *host_id.static_key().public_bytes(),
         host_signing_pub: *host_id.signing_key().public_bytes(),
         endpoints: vec!["direct:192.168.1.50:7000".to_string()],
+        host_id: None,
+        rotation_seq: None,
     };
     let parsed_uri = PairingUri::parse(&uri.encode()).unwrap();
     assert_eq!(parsed_uri, uri);
@@ -1437,4 +1439,548 @@ fn path_policy_end_to_end_concurrent_winners_and_exhaustion() {
             .iter()
             .any(|a| matches!(a, PlannerAction::AllCandidatesExhausted))
     );
+}
+
+#[test]
+fn batch1_sec09_rejects_low_order_curve25519_and_non_contributory_dh() {
+    use tendril_core::crypto::{is_valid_x25519_public_key, random_bytes};
+    use tendril_core::identity::sign_rotation;
+    use tendril_core::wire::encode_frame;
+
+    // Canonical small-order Curve25519 points must be rejected.
+    let low_order_points: [[u8; 32]; 5] = [
+        [0u8; 32],
+        [
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ],
+        [
+            0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
+            0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
+            0x5f, 0x49, 0xb8, 0x00,
+        ],
+        [
+            0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83,
+            0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd,
+            0xd0, 0x9f, 0x11, 0x57,
+        ],
+        [
+            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ],
+    ];
+    let legit = mk_identity(71);
+    assert!(is_valid_x25519_public_key(
+        legit.static_key().public_bytes()
+    ));
+
+    let mut roster = Roster::new();
+    for (idx, pt) in low_order_points.iter().enumerate() {
+        assert!(!is_valid_x25519_public_key(pt), "accepted low-order {idx}");
+        assert!(matches!(
+            roster.insert_pinned_host(
+                format!("bad-{idx}"),
+                "Bad".into(),
+                *pt,
+                Some(*legit.signing_key().public_bytes()),
+                0,
+                vec![],
+            ),
+            Err(CoreError::IncompletePin(_))
+        ));
+        assert!(matches!(
+            roster.record_pending_pair(*pt, None, "Bad".into(), "cli".into(), "aaaa".into()),
+            Err(CoreError::IncompletePin(_))
+        ));
+        assert!(matches!(
+            roster.lookup_active_by_static(pt),
+            Err(CoreError::IncompletePin(_))
+        ));
+
+        let bad_uri = format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={}&s={}",
+            b64url_encode(pt),
+            b64url_encode(legit.signing_key().public_bytes()),
+        );
+        assert!(matches!(
+            PairingUri::parse(&bad_uri),
+            Err(CoreError::InvalidPairingUri(_))
+        ));
+
+        let rot = sign_rotation(
+            1,
+            &legit.signing_key().signing_key(),
+            legit.signing_key().public_bytes(),
+            pt,
+            NOW_UNIX,
+        )
+        .unwrap();
+        assert!(matches!(
+            tendril_core::identity::verify_rotation_record(&rot),
+            Err(CoreError::IncompletePin(_))
+        ));
+
+        // Craft raw Noise msg1 carrying a low-order ephemeral public key and verify SessionResponder
+        // rejects it via TendrilCryptoResolver contributory check (never emits msg2).
+        let mut resp = SessionMachine::new_responder(&legit, None).unwrap();
+        let mut raw_msg1 = Preamble::v1(Intent::Session).encode().to_vec();
+        raw_msg1.extend_from_slice(&encode_frame(pt).unwrap());
+        let err = resp
+            .feed_bytes(&raw_msg1, NOW_UNIX, 0, &mut roster)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Noise(_)), "got {err:?}");
+    }
+    let _ = random_bytes::<16>().unwrap();
+}
+
+#[test]
+fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
+    use tendril_core::grants::{
+        Grant, GrantUnsigned, RevocationList, RevocationListUnsigned, authorize_grant, sign_crl,
+        verify_grant_with_chain,
+    };
+
+    let root = mk_identity(80);
+    let del = mk_identity(81);
+    let rogue = mk_identity(82);
+    let root_id = root.host_id().to_string();
+    let del_dev = del.device_id();
+    let del_alias = "del-alias".to_string();
+
+    let g_root = sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: root_id.clone(),
+            subject: del_alias.clone(),
+            caps: vec!["pair.mint".into(), "fs.read:*".into()],
+            not_before: "2026-11-20T00:00:00Z".into(),
+            not_after: "2026-12-20T00:00:00Z".into(),
+            nonce: "n_root_01".into(),
+            delegated_from: vec![],
+            uses: None,
+            machine: None,
+        },
+        &root.signing_key().signing_key(),
+    )
+    .unwrap();
+    let g_leaf = sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: del_alias.clone(),
+            subject: "dev_leaf_88".into(),
+            caps: vec!["fs.read:/a".into()],
+            not_before: "2026-11-20T00:00:00Z".into(),
+            not_after: "2026-12-20T00:00:00Z".into(),
+            nonce: "n_leaf_01".into(),
+            delegated_from: vec![g_root.clone()],
+            uses: None,
+            machine: None,
+        },
+        &del.signing_key().signing_key(),
+    )
+    .unwrap();
+
+    let mut roster = Roster::new();
+    roster
+        .insert_pinned_host(
+            root_id.clone(),
+            "Root".into(),
+            *root.static_key().public_bytes(),
+            Some(*root.signing_key().public_bytes()),
+            0,
+            vec![],
+        )
+        .unwrap();
+    roster
+        .insert_pinned_host(
+            del_alias.clone(),
+            "Delegate".into(),
+            *del.static_key().public_bytes(),
+            Some(*del.signing_key().public_bytes()),
+            0,
+            vec![],
+        )
+        .unwrap();
+    roster
+        .record_pending_pair(
+            *del.static_key().public_bytes(),
+            None,
+            "Delegate".into(),
+            "cli".into(),
+            "sas".into(),
+        )
+        .unwrap();
+    roster.confirm_peer(&del_dev, None).unwrap();
+
+    let lookup = |id: &str| roster.lookup_active_signing_key(id);
+
+    // SEC-02: unsigned / forged / wrong-version / wrong-issuer CRLs must fail closed.
+    let valid_crl = sign_crl(
+        RevocationListUnsigned {
+            v: 1,
+            issuer: root_id.clone(),
+            seq: 1,
+            revoked_devices: vec![],
+            revoked_nonces: vec![],
+            ts: "2026-11-22T00:00:00Z".into(),
+        },
+        &root.signing_key().signing_key(),
+    )
+    .unwrap();
+    assert!(
+        verify_grant_with_chain(
+            &g_leaf,
+            "dev_leaf_88",
+            &root_id,
+            NOW_UNIX + 100,
+            Some(&valid_crl),
+            lookup
+        )
+        .is_ok()
+    );
+
+    let mut unsigned_crl = valid_crl.clone();
+    unsigned_crl.sig.clear();
+    assert!(
+        authorize_grant(
+            Some(&g_leaf),
+            "dev_leaf_88",
+            &root_id,
+            "fs.read:/a",
+            NOW_UNIX + 100,
+            Some(&unsigned_crl),
+            lookup,
+        )
+        .0
+        .is_err()
+    );
+
+    let rogue_signed_crl = sign_crl(
+        RevocationListUnsigned {
+            v: 1,
+            issuer: root_id.clone(),
+            seq: 1,
+            revoked_devices: vec![],
+            revoked_nonces: vec![],
+            ts: "2026-11-22T00:00:00Z".into(),
+        },
+        &rogue.signing_key().signing_key(),
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_grant_with_chain(
+            &g_leaf,
+            "dev_leaf_88",
+            &root_id,
+            NOW_UNIX + 100,
+            Some(&rogue_signed_crl),
+            lookup,
+        ),
+        Err(CoreError::InvalidSignature)
+    ));
+
+    let wrong_ver_crl = sign_crl(
+        RevocationListUnsigned {
+            v: 99,
+            issuer: root_id.clone(),
+            seq: 1,
+            revoked_devices: vec![],
+            revoked_nonces: vec![],
+            ts: "2026-11-22T00:00:00Z".into(),
+        },
+        &root.signing_key().signing_key(),
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_grant_with_chain(
+            &g_leaf,
+            "dev_leaf_88",
+            &root_id,
+            NOW_UNIX + 100,
+            Some(&wrong_ver_crl),
+            lookup,
+        ),
+        Err(CoreError::CrlUnsupportedVersion(99))
+    ));
+
+    let wrong_issuer_crl = sign_crl(
+        RevocationListUnsigned {
+            v: 1,
+            issuer: del_dev.clone(),
+            seq: 1,
+            revoked_devices: vec![],
+            revoked_nonces: vec![],
+            ts: "2026-11-22T00:00:00Z".into(),
+        },
+        &root.signing_key().signing_key(),
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_grant_with_chain(
+            &g_leaf,
+            "dev_leaf_88",
+            &root_id,
+            NOW_UNIX + 100,
+            Some(&wrong_issuer_crl),
+            lookup,
+        ),
+        Err(CoreError::CrlIssuerMismatch { .. })
+    ));
+
+    // SEC-12: revoking `dev_xxx` immediately invalidates sibling alias `del-alias`,
+    // and inserting a new active alias sharing the revoked keys still returns `None`.
+    roster.revoke_peer(&del_dev).unwrap();
+    assert_eq!(roster.lookup_active_signing_key(&del_dev), None);
+    assert_eq!(roster.lookup_active_signing_key("del-alias"), None);
+    roster
+        .insert_pinned_host(
+            "del-alias-2".into(),
+            "Delegate Clone".into(),
+            *del.static_key().public_bytes(),
+            Some(*del.signing_key().public_bytes()),
+            0,
+            vec![],
+        )
+        .unwrap();
+    assert_eq!(roster.lookup_active_signing_key("del-alias-2"), None);
+    assert!(matches!(
+        verify_grant_with_chain(
+            &g_leaf,
+            "dev_leaf_88",
+            &root_id,
+            NOW_UNIX + 100,
+            Some(&valid_crl),
+            |id| roster.lookup_active_signing_key(id),
+        ),
+        Err(CoreError::GrantDenied(_))
+    ));
+
+    // SEC-12 CRL path: active delegate revoked only via ingested CRL must also return `None`.
+    let del_crl_only = mk_identity(83);
+    let mut crl_roster = Roster::new();
+    crl_roster
+        .insert_pinned_host(
+            root_id.clone(),
+            "Root".into(),
+            *root.static_key().public_bytes(),
+            Some(*root.signing_key().public_bytes()),
+            0,
+            vec![],
+        )
+        .unwrap();
+    crl_roster
+        .insert_pinned_host(
+            del_crl_only.device_id(),
+            "CrlDelegate".into(),
+            *del_crl_only.static_key().public_bytes(),
+            Some(*del_crl_only.signing_key().public_bytes()),
+            0,
+            vec![],
+        )
+        .unwrap();
+    let del_crl = sign_crl(
+        RevocationListUnsigned {
+            v: 1,
+            issuer: root_id.clone(),
+            seq: 2,
+            revoked_devices: vec![del_crl_only.device_id()],
+            revoked_nonces: vec![],
+            ts: "2026-11-22T00:00:00Z".into(),
+        },
+        &root.signing_key().signing_key(),
+    )
+    .unwrap();
+    crl_roster
+        .ingest_crl(del_crl, &root_id, root.signing_key().public_bytes())
+        .unwrap();
+    assert_eq!(
+        crl_roster.lookup_active_signing_key(&del_crl_only.device_id()),
+        None
+    );
+
+    // SEC-19: deny_unknown_fields and reject explicit empty/null optional keys.
+    let mut g_val = serde_json::to_value(&g_root).unwrap();
+    g_val
+        .as_object_mut()
+        .unwrap()
+        .insert("smuggled".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<Grant>(g_val).is_err());
+
+    let mut g_empty_del = serde_json::to_value(&g_root).unwrap();
+    g_empty_del
+        .as_object_mut()
+        .unwrap()
+        .insert("delegated_from".into(), serde_json::json!([]));
+    assert!(serde_json::from_value::<Grant>(g_empty_del).is_err());
+
+    let mut g_null_uses = serde_json::to_value(&g_root).unwrap();
+    g_null_uses
+        .as_object_mut()
+        .unwrap()
+        .insert("uses".into(), serde_json::Value::Null);
+    assert!(serde_json::from_value::<Grant>(g_null_uses).is_err());
+
+    let mut g_null_machine = serde_json::to_value(&g_root).unwrap();
+    g_null_machine
+        .as_object_mut()
+        .unwrap()
+        .insert("machine".into(), serde_json::Value::Null);
+    assert!(serde_json::from_value::<Grant>(g_null_machine).is_err());
+
+    let mut c_val = serde_json::to_value(&valid_crl).unwrap();
+    c_val
+        .as_object_mut()
+        .unwrap()
+        .insert("extra".into(), serde_json::json!(1));
+    assert!(serde_json::from_value::<RevocationList>(c_val).is_err());
+}
+
+#[test]
+fn batch1_sec10_rekey_does_not_desync_on_oversized_payload() {
+    use tendril_core::wire::MAX_APP_DATA_LEN;
+
+    let host = mk_identity(91);
+    let cli = mk_identity(92);
+    let mut host_roster = Roster::new();
+    let mut cli_roster = Roster::new();
+    host_roster
+        .record_pending_pair(
+            *cli.static_key().public_bytes(),
+            None,
+            "Cli".into(),
+            "cli".into(),
+            "sas".into(),
+        )
+        .unwrap();
+    host_roster.confirm_peer(&cli.device_id(), None).unwrap();
+    cli_roster
+        .insert_pinned_host(
+            host.host_id().to_string(),
+            "Host".into(),
+            *host.static_key().public_bytes(),
+            Some(*host.signing_key().public_bytes()),
+            0,
+            vec![],
+        )
+        .unwrap();
+
+    let mut init = SessionMachine::new_initiator(&cli, host.host_id(), None, None, None).unwrap();
+    init.set_rekey_thresholds(1, REKEY_MAX_AGE_MS);
+    let mut resp = SessionMachine::new_responder(&host, None).unwrap();
+    connect_session(
+        &mut init,
+        &mut resp,
+        &mut cli_roster,
+        &mut host_roster,
+        NOW_UNIX,
+        10,
+        64,
+    )
+    .unwrap();
+
+    // Send 1 valid frame to reach frames_sent == rekey_max_frames (1).
+    let f1 = collect_session_writes(&init.send_data(b"first", 20).unwrap());
+    let ev1 = relay_session_bytes(&f1, &mut resp, &mut host_roster, NOW_UNIX, 20, 64).unwrap();
+    assert!(matches!(ev1.as_slice(), [SessionAction::AppData(d)] if d == b"first"));
+
+    // Next call carries oversized payload while rekey threshold is due -> must fail BEFORE rekey!
+    let oversized = vec![b'x'; MAX_APP_DATA_LEN + 1];
+    assert!(matches!(
+        init.send_data(&oversized, 30),
+        Err(CoreError::FrameTooLarge { .. })
+    ));
+
+    // Following valid send must now emit REKEY + DATA and decrypt cleanly on responder.
+    let acts = init.send_data(b"second", 40).unwrap();
+    assert!(
+        acts.iter()
+            .any(|a| matches!(a, SessionAction::Rekeyed { .. }))
+    );
+    let f2 = collect_session_writes(&acts);
+    let ev2 = relay_session_bytes(&f2, &mut resp, &mut host_roster, NOW_UNIX, 40, 64).unwrap();
+    assert!(ev2.iter().any(|a| matches!(
+        a,
+        SessionAction::Rekeyed {
+            direction: RekeyDirection::Incoming
+        }
+    )));
+    assert!(
+        ev2.iter()
+            .any(|a| matches!(a, SessionAction::AppData(d) if d == b"second"))
+    );
+}
+
+#[test]
+fn batch1_sec11_qr_pinned_pairing_works_after_host_rotation() {
+    use tendril_core::crypto::{SigningKeypair, StaticKeypair};
+
+    let mut host = mk_identity(95);
+    let cli = mk_identity(96);
+    host.rotate(
+        StaticKeypair::from_scalar([0x71; 32]),
+        SigningKeypair::from_seed([0x72; 32]),
+        NOW_UNIX + 10,
+    )
+    .unwrap();
+    host.rotate(
+        StaticKeypair::from_scalar([0x73; 32]),
+        SigningKeypair::from_seed([0x74; 32]),
+        NOW_UNIX + 20,
+    )
+    .unwrap();
+    assert_eq!(host.rotation_seq(), 2);
+
+    // 1. Both explicit seq PairingUri and legacy PairingUri without seq must succeed!
+    for include_meta in [true, false] {
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr
+            .issue_code_with_entropy(PairingCodeKind::Lan2Group, NOW_UNIX + 30, &[3u8; 32])
+            .unwrap();
+        let uri = PairingUri {
+            host_name: "Rotated Host".into(),
+            code,
+            host_static_pub: *host.static_key().public_bytes(),
+            host_signing_pub: *host.signing_key().public_bytes(),
+            endpoints: vec!["direct:127.0.0.1:7000".into()],
+            host_id: include_meta.then(|| host.host_id().to_string()),
+            rotation_seq: include_meta.then(|| host.rotation_seq()),
+        };
+        let parsed = PairingUri::parse(&uri.encode()).unwrap();
+        assert_eq!(parsed, uri);
+
+        let mut p_init = PairingInitiator::new(
+            &cli,
+            "Phone",
+            "ios",
+            &parsed.code,
+            Some(parsed.to_pinned_host()),
+            None,
+        )
+        .unwrap();
+        let mut p_resp = PairingResponder::new(&host, PairingPathKind::Lan, None).unwrap();
+        let mut host_roster = Roster::new();
+        let (init_ev, _) = run_pair_exchange(
+            &mut p_init,
+            &mut p_resp,
+            &mut mgr,
+            &mut host_roster,
+            NOW_UNIX + 31,
+            64,
+        );
+        let outcome = init_ev
+            .iter()
+            .find_map(|a| match a {
+                PairAction::Completed(o @ PairOutcome::InitiatorPending { .. }) => Some(o.clone()),
+                _ => None,
+            })
+            .expect("paired pending");
+        let PairOutcome::InitiatorPending {
+            host_rotation_seq, ..
+        } = outcome
+        else {
+            unreachable!()
+        };
+        assert_eq!(host_rotation_seq, 2);
+    }
 }

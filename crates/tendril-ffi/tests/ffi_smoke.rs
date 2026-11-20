@@ -237,6 +237,45 @@ fn ffi_verifies_all_spec_vectors_and_error_paths() {
         TENDRIL_OK
     );
     assert_eq!(allowed, 0);
+
+    // Valid CRL passes; tampered/forged CRL must be denied fail-closed.
+    let valid_crl_c = CString::new(serde_json::to_string(&gv["revocation_list"]).unwrap()).unwrap();
+    assert_eq!(
+        unsafe {
+            tendril_verify_grant_json(
+                valid_grant_c.as_ptr(),
+                keys_c.as_ptr(),
+                subj_c.as_ptr(),
+                root_c.as_ptr(),
+                cap_c.as_ptr(),
+                now,
+                valid_crl_c.as_ptr(),
+                &raw mut allowed,
+            )
+        },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed, 1);
+
+    let mut forged_crl = gv["revocation_list"].clone();
+    forged_crl["revoked_devices"] = serde_json::json!([]);
+    let forged_crl_c = CString::new(serde_json::to_string(&forged_crl).unwrap()).unwrap();
+    assert_eq!(
+        unsafe {
+            tendril_verify_grant_json(
+                valid_grant_c.as_ptr(),
+                keys_c.as_ptr(),
+                subj_c.as_ptr(),
+                root_c.as_ptr(),
+                cap_c.as_ptr(),
+                now,
+                forged_crl_c.as_ptr(),
+                &raw mut allowed,
+            )
+        },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed, 0, "forged CRL must fail closed");
 }
 
 #[test]

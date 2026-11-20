@@ -3,9 +3,11 @@
 use std::fmt;
 
 use snow::params::NoiseParams;
-use snow::{Builder, HandshakeState, TransportState};
+use snow::{HandshakeState, TransportState};
 
-use crate::crypto::{b64url_decode_array, device_id};
+use crate::crypto::{
+    b64url_decode_array, device_id, is_valid_x25519_public_key, new_noise_builder,
+};
 use crate::error::CoreError;
 use crate::grants::{AuditEvent, Grant, RevocationList, authorize_grant, verify_grant_with_chain};
 use crate::identity::EndpointIdentity;
@@ -459,6 +461,11 @@ impl SessionMachine {
                 reason: "session closed".to_string(),
             });
         }
+        if !matches!(self.phase, SessionPhase::Transport(_)) {
+            return Err(CoreError::NotReady("session not in transport mode"));
+        }
+        // Validate and encode the requested frame BEFORE mutating outgoing rekey state.
+        let inner = encode_inner_frame(kind, payload)?;
         let SessionPhase::Transport(ref mut tx) = self.phase else {
             return Err(CoreError::NotReady("session not in transport mode"));
         };
@@ -478,7 +485,7 @@ impl SessionMachine {
         let SessionPhase::Transport(ref mut tx) = self.phase else {
             return Err(CoreError::NotReady("session not in transport mode"));
         };
-        let frame = encrypt_inner(tx, kind, payload)?;
+        let frame = encrypt_encoded_inner(tx, &inner)?;
         self.frames_sent = self.frames_sent.saturating_add(1);
         actions.push(SessionAction::WriteBytes(frame));
         Ok(actions)
@@ -518,6 +525,9 @@ impl SessionMachine {
                     .ok_or(CoreError::HostKeyUnverified)?
                     .try_into()
                     .map_err(|_| CoreError::HostKeyUnverified)?;
+                if !is_valid_x25519_public_key(&peer_static) {
+                    return Err(CoreError::HostKeyUnverified);
+                }
 
                 let (_, pinned_signing) = match roster.get(target_id) {
                     Some(entry) => match entry.state {
@@ -628,6 +638,11 @@ impl SessionMachine {
                     ))?
                     .try_into()
                     .map_err(|_| CoreError::ProtocolViolation("invalid initiator static length"))?;
+                if !is_valid_x25519_public_key(&peer_static) {
+                    return Err(CoreError::ProtocolViolation(
+                        "invalid or low-order initiator static key",
+                    ));
+                }
                 let hello: SessionHello = serde_json::from_slice(&pt[..n])
                     .map_err(|err| CoreError::Json(err.to_string()))?;
                 if hello.device_id != device_id(&peer_static) {
@@ -862,7 +877,7 @@ fn build_handshake(
         .parse()
         .map_err(|err| CoreError::Noise(format!("{err}")))?;
     let preamble = Preamble::v1(Intent::Session).encode();
-    let mut builder = Builder::new(params)
+    let mut builder = new_noise_builder(params)
         .local_private_key(identity.static_key().secret_bytes())
         .map_err(|err| CoreError::Noise(format!("{err}")))?
         .prologue(&preamble)
@@ -878,17 +893,21 @@ fn build_handshake(
     .map_err(|err| CoreError::Noise(format!("{err}")))
 }
 
+fn encrypt_encoded_inner(tx: &mut TransportState, inner: &[u8]) -> Result<Vec<u8>, CoreError> {
+    let mut out_ct = vec![0u8; MAX_FRAME_LEN];
+    let n = tx
+        .write_message(inner, &mut out_ct)
+        .map_err(|err| CoreError::Noise(format!("{err}")))?;
+    encode_frame(&out_ct[..n])
+}
+
 fn encrypt_inner(
     tx: &mut TransportState,
     kind: InnerFrameType,
     payload: &[u8],
 ) -> Result<Vec<u8>, CoreError> {
     let inner = encode_inner_frame(kind, payload)?;
-    let mut out_ct = vec![0u8; MAX_FRAME_LEN];
-    let n = tx
-        .write_message(&inner, &mut out_ct)
-        .map_err(|err| CoreError::Noise(format!("{err}")))?;
-    encode_frame(&out_ct[..n])
+    encrypt_encoded_inner(tx, &inner)
 }
 
 #[cfg(test)]

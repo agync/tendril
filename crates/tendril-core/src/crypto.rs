@@ -6,12 +6,16 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use data_encoding::BASE32_NOPAD;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+use snow::Builder;
+use snow::params::{CipherChoice, DHChoice, HashChoice, NoiseParams};
+use snow::resolvers::{CryptoResolver, DefaultResolver};
+use snow::types::{Cipher, Dh, Hash, Random};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::CoreError;
 
@@ -72,6 +76,100 @@ pub fn b64url_decode_array<const N: usize>(encoded: &str) -> Result<[u8; N], Cor
 pub fn x25519_public_from_scalar(scalar: &[u8; 32]) -> [u8; 32] {
     let secret = X25519StaticSecret::from(*scalar);
     X25519PublicKey::from(&secret).to_bytes()
+}
+
+/// Validates that `pub_bytes` is a full-order Curve25519 public key (not in any small-order subgroup).
+#[must_use]
+pub fn is_valid_x25519_public_key(pub_bytes: &[u8; 32]) -> bool {
+    let zero_scalar = X25519StaticSecret::from([0u8; 32]);
+    let peer_pub = X25519PublicKey::from(*pub_bytes);
+    zero_scalar.diffie_hellman(&peer_pub).was_contributory()
+}
+
+/// Validates that `pub_bytes` decodes as a non-zero Ed25519 verifying key.
+#[must_use]
+pub fn is_valid_ed25519_public_key(pub_bytes: &[u8; 32]) -> bool {
+    !bool::from(pub_bytes.ct_eq(&[0u8; 32])) && VerifyingKey::from_bytes(pub_bytes).is_ok()
+}
+
+struct ContributoryDh {
+    inner: Box<dyn Dh>,
+}
+
+impl Dh for ContributoryDh {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn pub_len(&self) -> usize {
+        self.inner.pub_len()
+    }
+
+    fn priv_len(&self) -> usize {
+        self.inner.priv_len()
+    }
+
+    fn set(&mut self, privkey: &[u8]) {
+        self.inner.set(privkey);
+    }
+
+    fn generate(&mut self, rng: &mut dyn Random) -> Result<(), snow::Error> {
+        self.inner.generate(rng)
+    }
+
+    fn pubkey(&self) -> &[u8] {
+        self.inner.pubkey()
+    }
+
+    fn privkey(&self) -> &[u8] {
+        self.inner.privkey()
+    }
+
+    fn dh(&self, pubkey: &[u8], out: &mut [u8]) -> Result<(), snow::Error> {
+        if pubkey.len() < 32 || out.len() < 32 {
+            return Err(snow::Error::Input);
+        }
+        self.inner.dh(pubkey, out)?;
+        if bool::from(out[..32].ct_eq(&[0u8; 32])) {
+            out[..32].zeroize();
+            return Err(snow::Error::Dh);
+        }
+        Ok(())
+    }
+
+    fn dh_len(&self) -> usize {
+        self.inner.dh_len()
+    }
+}
+
+pub(crate) struct TendrilCryptoResolver;
+
+impl CryptoResolver for TendrilCryptoResolver {
+    fn resolve_rng(&self) -> Option<Box<dyn Random>> {
+        DefaultResolver.resolve_rng()
+    }
+
+    fn resolve_dh(&self, choice: &DHChoice) -> Option<Box<dyn Dh>> {
+        let inner = DefaultResolver.resolve_dh(choice)?;
+        match choice {
+            DHChoice::Curve25519 => Some(Box::new(ContributoryDh { inner })),
+            _ => Some(inner),
+        }
+    }
+
+    fn resolve_hash(&self, choice: &HashChoice) -> Option<Box<dyn Hash>> {
+        DefaultResolver.resolve_hash(choice)
+    }
+
+    fn resolve_cipher(&self, choice: &CipherChoice) -> Option<Box<dyn Cipher>> {
+        DefaultResolver.resolve_cipher(choice)
+    }
+}
+
+/// Builds a `snow` handshake builder enforcing RFC 7748 contributory X25519 DH checks.
+#[must_use]
+pub(crate) fn new_noise_builder(params: NoiseParams) -> Builder<'static> {
+    Builder::with_resolver(params, Box::new(TendrilCryptoResolver))
 }
 
 /// Derives the canonical `device_id` (`"dev_" + hex_lower(SHA-256(static_pub)[..8])`).

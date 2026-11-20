@@ -336,6 +336,13 @@ async function main() {
       if (sdk.verifyGrantJson(JSON.stringify(gv.delegated_widened), keys, gv.leaf_id, gv.root_issuer_id, 'fs.read:/photos/2026/a.jpg', now)) {
         throw new Error('widened grant allowed');
       }
+      if (!sdk.verifyGrantJson(JSON.stringify(gv.delegated_valid), keys, gv.leaf_id, gv.root_issuer_id, 'fs.read:/photos/2026/a.jpg', now, JSON.stringify(gv.revocation_list))) {
+        throw new Error('valid grant with signed CRL rejected');
+      }
+      const forgedCrl = { ...gv.revocation_list, revoked_devices: [] };
+      if (sdk.verifyGrantJson(JSON.stringify(gv.delegated_valid), keys, gv.leaf_id, gv.root_issuer_id, 'fs.read:/photos/2026/a.jpg', now, JSON.stringify(forgedCrl))) {
+        throw new Error('forged CRL was accepted');
+      }
 
       const benchMain = await sdk.benchmarkArgon2(3, { useWorker: false });
       const benchWorker = await sdk.benchmarkArgon2(2, { useWorker: true });

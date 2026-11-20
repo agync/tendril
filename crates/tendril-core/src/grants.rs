@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::crypto::{b64url_decode_array, b64url_encode};
 use crate::error::CoreError;
@@ -104,8 +104,44 @@ fn is_valid_ident(s: &str) -> bool {
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+fn deserialize_non_empty_delegated_from<'de, D>(deserializer: D) -> Result<Vec<Grant>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let items = Vec::<Grant>::deserialize(deserializer)?;
+    if items.is_empty() {
+        return Err(serde::de::Error::custom(
+            "empty delegated_from array must be omitted from canonical grant JSON",
+        ));
+    }
+    Ok(items)
+}
+
+fn deserialize_some_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)?
+        .ok_or_else(|| {
+            serde::de::Error::custom("null uses field must be omitted from canonical grant JSON")
+        })
+        .map(Some)
+}
+
+fn deserialize_some_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<bool>::deserialize(deserializer)?
+        .ok_or_else(|| {
+            serde::de::Error::custom("null machine field must be omitted from canonical grant JSON")
+        })
+        .map(Some)
+}
+
 /// Unsigned capability grant body used for canonical JSON serialization and signing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantUnsigned {
     pub v: u8,
     pub issuer: String,
@@ -114,16 +150,29 @@ pub struct GrantUnsigned {
     pub not_before: String,
     pub not_after: String,
     pub nonce: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_non_empty_delegated_from"
+    )]
     pub delegated_from: Vec<Grant>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some_u64"
+    )]
     pub uses: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some_bool"
+    )]
     pub machine: Option<bool>,
 }
 
 /// Signed capability grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Grant {
     pub v: u8,
     pub issuer: String,
@@ -132,11 +181,23 @@ pub struct Grant {
     pub not_before: String,
     pub not_after: String,
     pub nonce: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_non_empty_delegated_from"
+    )]
     pub delegated_from: Vec<Grant>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some_u64"
+    )]
     pub uses: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some_bool"
+    )]
     pub machine: Option<bool>,
     pub sig: String,
 }
@@ -162,6 +223,7 @@ impl Grant {
 
 /// Unsigned revocation list body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationListUnsigned {
     pub v: u8,
     pub issuer: String,
@@ -173,6 +235,7 @@ pub struct RevocationListUnsigned {
 
 /// Signed revocation list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationList {
     pub v: u8,
     pub issuer: String,
@@ -294,11 +357,10 @@ pub fn verify_delegation_subset(child: &Grant, parent: &Grant) -> Result<(), Cor
 /// Validates a full delegation chain recursively (structural bounds, subject, time, CRL,
 /// root authority, signatures, subset rules).
 ///
-/// # Preconditions
-///
-/// When `crl` is `Some(list)`, callers MUST have already verified `list.v == 1`,
-/// `list.issuer == expected_root_issuer`, monotonic `list.seq`, valid whole-second UTC `list.ts`,
-/// and `verify_crl_signature(list, root_pub)`.
+/// When `crl` is `Some(list)`, this verifies `list.v == 1`, `list.issuer == expected_root_issuer`,
+/// valid whole-second UTC `list.ts`, and `verify_crl_signature(list, root_pub)` using the key
+/// returned by `lookup_issuer_key(expected_root_issuer)`. Stateful callers persisting CRL history
+/// MUST also enforce monotonic `list.seq` via `Roster::ingest_crl`.
 pub fn verify_grant_with_chain<F>(
     grant: &Grant,
     expected_subject: &str,
@@ -310,6 +372,22 @@ pub fn verify_grant_with_chain<F>(
 where
     F: FnMut(&str) -> Option<[u8; 32]>,
 {
+    if let Some(list) = crl {
+        if list.v != 1 {
+            return Err(CoreError::CrlUnsupportedVersion(list.v));
+        }
+        if list.issuer != expected_root_issuer {
+            return Err(CoreError::CrlIssuerMismatch {
+                expected: expected_root_issuer.to_string(),
+                got: list.issuer.clone(),
+            });
+        }
+        let root_pub = lookup_issuer_key(expected_root_issuer).ok_or_else(|| {
+            CoreError::GrantDenied("unknown or inactive root issuer for CRL".to_string())
+        })?;
+        verify_crl_signature(list, &root_pub)?;
+    }
+
     let mut seen_nonces = HashSet::new();
     let mut seen_subjects = HashSet::new();
     verify_grant_node(
@@ -709,14 +787,19 @@ mod tests {
         };
         let now = parse_rfc3339_utc("2026-11-25T00:00:00Z").unwrap();
 
-        let mk_crl = |devs: Vec<&str>, nonces: Vec<&str>| RevocationList {
-            v: 1,
-            issuer: "dev_root".to_string(),
-            seq: 1,
-            revoked_devices: devs.into_iter().map(str::to_string).collect(),
-            revoked_nonces: nonces.into_iter().map(str::to_string).collect(),
-            ts: "2026-11-22T00:00:00Z".to_string(),
-            sig: String::new(),
+        let mk_crl = |devs: Vec<&str>, nonces: Vec<&str>| {
+            sign_crl(
+                RevocationListUnsigned {
+                    v: 1,
+                    issuer: "dev_root".to_string(),
+                    seq: 1,
+                    revoked_devices: devs.into_iter().map(str::to_string).collect(),
+                    revoked_nonces: nonces.into_iter().map(str::to_string).collect(),
+                    ts: "2026-11-22T00:00:00Z".to_string(),
+                },
+                &sk_root,
+            )
+            .unwrap()
         };
 
         let crl_subj = mk_crl(vec!["dev_leaf"], vec![]);

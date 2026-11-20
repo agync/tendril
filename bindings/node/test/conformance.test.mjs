@@ -128,6 +128,31 @@ test("Node binding reproduces all v1 conformance vectors", async () => {
     ),
     false
   );
+  assert.equal(
+    tendril.verifyGrantJson(
+      JSON.stringify(gv.delegated_valid),
+      keys,
+      gv.leaf_id,
+      gv.root_issuer_id,
+      "fs.read:/photos/2026/a.jpg",
+      now,
+      JSON.stringify(gv.revocation_list)
+    ),
+    true
+  );
+  const forgedCrl = { ...gv.revocation_list, revoked_devices: [] };
+  assert.equal(
+    tendril.verifyGrantJson(
+      JSON.stringify(gv.delegated_valid),
+      keys,
+      gv.leaf_id,
+      gv.root_issuer_id,
+      "fs.read:/photos/2026/a.jpg",
+      now,
+      JSON.stringify(forgedCrl)
+    ),
+    false
+  );
 });
 
 test("Node N-API keeps JS event loop responsive during Argon2 computeCodeMac", async () => {

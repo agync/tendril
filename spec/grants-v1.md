@@ -71,7 +71,11 @@ To sign or verify a `Grant`, serialize the object **without** the `"sig"` field 
 signed_bytes = "tendril-grant-v1\0" (17 B) || UTF-8(RFC8785_JCS(grant_without_sig))
 ```
 
-Verification MUST use strict Ed25519 signature verification against the issuer's pinned Ed25519 signing public key.
+Canonical encoding and strict JSON decoding rules:
+
+- Optional fields (`delegated_from` when empty, `uses` and `machine` when unset) MUST be omitted from Grant JSON (not encoded as `[]` or `null`).
+- Verifiers MUST reject unknown JSON fields (`deny_unknown_fields`) on `Grant` and `RevocationList`.
+- Verification MUST use strict Ed25519 signature verification against the issuer's pinned Ed25519 signing public key.
 
 ---
 
@@ -116,11 +120,11 @@ Verifiers MUST reject any `RevocationList` with a `seq` lower than the highest v
 
 Every grant check (at session connect, on `0x04 REKEY`, and on `authorize(requested_cap)`) executes the following checks in order and denies on the first failure (performing cheap structural, time, CRL, and root checks before Ed25519 signature verification):
 
-1. Validate `grant.v == 1`, non-empty `nonce`, delegation depth `<= 4`, no nonce or subject cycles, and syntactically valid `caps`.
+1. Validate `grant.v == 1`, non-empty `nonce`, delegation depth `<= 4`, no nonce or subject cycles, and syntactically valid `caps`. When a `RevocationList` is supplied, also fail closed if `crl.v != 1`, `crl.issuer != root_issuer`, `crl.ts` is invalid UTC, or strict Ed25519 verification of `crl.sig` under `root_issuer`'s pinned signing key fails.
 2. Verify `grant.subject` matches the authenticated session peer `device_id` (or `child.issuer` during recursion).
 3. Check time bounds with a maximum `30 s` clock-skew allowance: `grant.not_before.saturating_sub(30s) <= now < grant.not_after` and `grant.not_before < grant.not_after`.
 4. Check `RevocationList` for `grant.subject`, `grant.issuer`, and `grant.nonce`.
-5. If `delegated_from` is absent or empty, verify `grant.issuer` equals the authoritative root verifier; otherwise require `delegated_from.len() == 1`.
+5. If `delegated_from` is omitted (root grant), verify `grant.issuer` equals the authoritative root verifier; otherwise require `delegated_from.len() == 1`.
 6. Look up `grant.issuer` in the roster (confirming `active` status) and strictly verify `grant.sig`.
 7. If `delegated_from` is present, verify delegation subset rules (Section 3) against the immediate parent and recursively evaluate that parent link starting from step 1.
 8. Match `requested_cap` against `grant.caps` (denying by default if unmatched) and emit a structured `AuditEvent { ts, subject, cap, grant_nonce, allow, reason }`.

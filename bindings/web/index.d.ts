@@ -12,6 +12,8 @@ export interface ParsedPairingUri {
   host_static_pub_b64: string;
   host_signing_pub_b64: string;
   endpoints: string[];
+  host_id?: string | null;
+  rotation_seq?: number | null;
 }
 
 export interface ParsedP2pEndpoint {

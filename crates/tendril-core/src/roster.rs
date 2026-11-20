@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{b64url_encode, device_id};
+use crate::crypto::{b64url_encode, device_id, is_valid_x25519_public_key};
 use crate::error::CoreError;
 use crate::grants::{
     Capability, Grant, GrantUnsigned, RevocationList, sign_grant, verify_crl_signature,
@@ -42,9 +42,9 @@ pub struct RosterEntry {
 }
 
 impl RosterEntry {
-    /// Confirms this entry pins a non-zero X25519 static public key.
+    /// Confirms this entry pins a valid full-order X25519 static public key.
     pub fn require_static_pin(&self) -> Result<[u8; 32], CoreError> {
-        if self.static_pub == [0u8; 32] {
+        if !is_valid_x25519_public_key(&self.static_pub) {
             return Err(CoreError::IncompletePin(self.device_id.clone()));
         }
         Ok(self.static_pub)
@@ -101,7 +101,7 @@ impl Roster {
         rotation_seq: u64,
         relay_hints: Vec<String>,
     ) -> Result<&RosterEntry, CoreError> {
-        if host_id.is_empty() || static_pub == [0u8; 32] {
+        if host_id.is_empty() || !is_valid_x25519_public_key(&static_pub) {
             return Err(CoreError::IncompletePin(host_id));
         }
         if matches!(signing_pub, Some(sig) if sig == [0u8; 32]) {
@@ -144,8 +144,10 @@ impl Roster {
         kind: String,
         pairing_sas: String,
     ) -> Result<&RosterEntry, CoreError> {
-        if static_pub == [0u8; 32] {
-            return Err(CoreError::IncompletePin("zero static_pub".to_string()));
+        if !is_valid_x25519_public_key(&static_pub) {
+            return Err(CoreError::IncompletePin(
+                "invalid or low-order static_pub".to_string(),
+            ));
         }
         if matches!(signing_pub, Some(sig) if sig == [0u8; 32]) {
             return Err(CoreError::IncompletePin("zero signing_pub".to_string()));
@@ -280,14 +282,29 @@ impl Roster {
         Ok(&self.entries[peer_id])
     }
 
-    /// Marks `peer_id` as `Revoked` and clears any stored grants.
+    /// Marks `peer_id` (and any sibling entry sharing its cryptographic keys) as `Revoked`
+    /// and clears any stored grants.
     pub fn revoke_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
-        let entry = self
-            .entries
-            .get_mut(peer_id)
-            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
-        entry.state = PeerState::Revoked;
-        entry.grants.clear();
+        let (revoked_static, revoked_signing) = {
+            let entry = self
+                .entries
+                .get_mut(peer_id)
+                .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+            entry.state = PeerState::Revoked;
+            entry.grants.clear();
+            (entry.static_pub, entry.signing_pub)
+        };
+        for other in self.entries.values_mut() {
+            let shares_static = revoked_static != [0u8; 32] && other.static_pub == revoked_static;
+            let shares_signing = matches!(
+                (revoked_signing, other.signing_pub),
+                (Some(a), Some(b)) if a != [0u8; 32] && a == b
+            );
+            if shares_static || shares_signing {
+                other.state = PeerState::Revoked;
+                other.grants.clear();
+            }
+        }
         Ok(())
     }
 
@@ -400,8 +417,10 @@ impl Roster {
         &self,
         static_pub: &[u8; 32],
     ) -> Result<&RosterEntry, CoreError> {
-        if *static_pub == [0u8; 32] {
-            return Err(CoreError::IncompletePin("zero static_pub".to_string()));
+        if !is_valid_x25519_public_key(static_pub) {
+            return Err(CoreError::IncompletePin(
+                "invalid or low-order static_pub".to_string(),
+            ));
         }
         let mut active: Option<&RosterEntry> = None;
         let mut pending: Option<&RosterEntry> = None;
@@ -426,17 +445,49 @@ impl Roster {
         Err(CoreError::PeerNotFound(device_id(static_pub)))
     }
 
-    /// Returns the pinned Ed25519 signing public key of an `Active` peer for grant verification.
+    /// Returns the pinned Ed25519 signing public key of an `Active` peer for grant verification,
+    /// enforcing revocation precedence across sibling entries and ingested CRLs.
     #[must_use]
     pub fn lookup_active_signing_key(&self, issuer_id: &str) -> Option<[u8; 32]> {
+        if self.entries.iter().any(|(k, e)| {
+            (k == issuer_id || e.device_id == issuer_id) && e.state == PeerState::Revoked
+        }) {
+            return None;
+        }
         let entry = self
             .entries
             .get(issuer_id)
-            .or_else(|| self.entries.values().find(|e| e.device_id == issuer_id))?;
-        if entry.state != PeerState::Active {
+            .filter(|e| e.state == PeerState::Active)
+            .or_else(|| {
+                self.entries
+                    .values()
+                    .find(|e| e.device_id == issuer_id && e.state == PeerState::Active)
+            })?;
+        let sig_pub = entry.signing_pub.filter(|k| *k != [0u8; 32])?;
+        let cand_derived_id = device_id(&entry.static_pub);
+
+        let sibling_revoked = self.entries.values().any(|other| {
+            other.state == PeerState::Revoked
+                && (other.device_id == issuer_id
+                    || other.device_id == entry.device_id
+                    || other.device_id == cand_derived_id
+                    || other.static_pub == entry.static_pub
+                    || other.signing_pub == Some(sig_pub))
+        });
+        if sibling_revoked {
             return None;
         }
-        entry.signing_pub.filter(|k| *k != [0u8; 32])
+
+        let crl_revoked = self.crls.values().any(|crl| {
+            crl.revoked_devices
+                .iter()
+                .any(|d| d == issuer_id || d == &entry.device_id || d == &cand_derived_id)
+        });
+        if crl_revoked {
+            return None;
+        }
+
+        Some(sig_pub)
     }
 }
 

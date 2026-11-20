@@ -125,6 +125,30 @@ class TendrilPythonTests(unittest.TestCase):
                 now,
             )
         )
+        self.assertTrue(
+            tendril.verify_grant_json(
+                json.dumps(gv["delegated_valid"]),
+                keys,
+                gv["leaf_id"],
+                gv["root_issuer_id"],
+                "fs.read:/photos/2026/a.jpg",
+                now,
+                json.dumps(gv["revocation_list"]),
+            )
+        )
+        forged_crl = dict(gv["revocation_list"])
+        forged_crl["revoked_devices"] = []
+        self.assertFalse(
+            tendril.verify_grant_json(
+                json.dumps(gv["delegated_valid"]),
+                keys,
+                gv["leaf_id"],
+                gv["root_issuer_id"],
+                "fs.read:/photos/2026/a.jpg",
+                now,
+                json.dumps(forged_crl),
+            )
+        )
 
     def test_multithreaded_gil_release_and_interop_with_peer(self) -> None:
         # 1a. Concurrent heartbeat ticks freely while another Python thread runs Argon2 compute_code_mac.
