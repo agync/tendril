@@ -1,0 +1,99 @@
+{
+  "root_issuer_id": "dev_4edf675a405941ea",
+  "root_signing_seed_hex": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+  "root_signing_pub_hex": "cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa",
+  "delegate_id": "dev_eb6548111a4552a4",
+  "delegate_signing_seed_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+  "delegate_signing_pub_hex": "4fd099ccd47d7893dfe9ec24414ecb0d9b5420232aad30d91c465be33cbe65c4",
+  "leaf_id": "dev_d8a0c96629a7b580",
+  "root_unsorted_json": "{\"nonce\":\"AQEBAQEBAQEBAQEBAQEBAQ\",\"v\":1,\"caps\":[\"session.open\",\"pair.mint\",\"fs.read:/photos/*\"],\"not_after\":\"2026-12-20T00:00:00Z\",\"subject\":\"dev_eb6548111a4552a4\",\"issuer\":\"dev_4edf675a405941ea\",\"not_before\":\"2026-11-20T00:00:00Z\"}",
+  "root_jcs_json": "{\"caps\":[\"session.open\",\"pair.mint\",\"fs.read:/photos/*\"],\"issuer\":\"dev_4edf675a405941ea\",\"nonce\":\"AQEBAQEBAQEBAQEBAQEBAQ\",\"not_after\":\"2026-12-20T00:00:00Z\",\"not_before\":\"2026-11-20T00:00:00Z\",\"subject\":\"dev_eb6548111a4552a4\",\"v\":1}",
+  "root_signed_bytes_hex": "74656e6472696c2d6772616e742d7631007b2263617073223a5b2273657373696f6e2e6f70656e222c22706169722e6d696e74222c2266732e726561643a2f70686f746f732f2a225d2c22697373756572223a226465765f34656466363735613430353934316561222c226e6f6e6365223a2241514542415145424151454241514542415145424151222c226e6f745f6166746572223a22323032362d31322d32305430303a30303a30305a222c226e6f745f6265666f7265223a22323032362d31312d32305430303a30303a30305a222c227375626a656374223a226465765f65623635343831313161343535326134222c2276223a317d",
+  "root_grant": {
+    "v": 1,
+    "issuer": "dev_4edf675a405941ea",
+    "subject": "dev_eb6548111a4552a4",
+    "caps": [
+      "session.open",
+      "pair.mint",
+      "fs.read:/photos/*"
+    ],
+    "not_before": "2026-11-20T00:00:00Z",
+    "not_after": "2026-12-20T00:00:00Z",
+    "nonce": "AQEBAQEBAQEBAQEBAQEBAQ",
+    "sig": "GuIqU7L9psae5wRhl6egMFWItC5_AO-n_cHZ9oRciUkfj5dWROfBEU5kwbNEYR7R3aDjqTtA-H-va6mZD3pmBg"
+  },
+  "delegated_valid": {
+    "v": 1,
+    "issuer": "dev_eb6548111a4552a4",
+    "subject": "dev_d8a0c96629a7b580",
+    "caps": [
+      "session.open",
+      "fs.read:/photos/2026/*"
+    ],
+    "not_before": "2026-11-21T00:00:00Z",
+    "not_after": "2026-12-01T00:00:00Z",
+    "nonce": "AgICAgICAgICAgICAgICAg",
+    "delegated_from": [
+      {
+        "v": 1,
+        "issuer": "dev_4edf675a405941ea",
+        "subject": "dev_eb6548111a4552a4",
+        "caps": [
+          "session.open",
+          "pair.mint",
+          "fs.read:/photos/*"
+        ],
+        "not_before": "2026-11-20T00:00:00Z",
+        "not_after": "2026-12-20T00:00:00Z",
+        "nonce": "AQEBAQEBAQEBAQEBAQEBAQ",
+        "sig": "GuIqU7L9psae5wRhl6egMFWItC5_AO-n_cHZ9oRciUkfj5dWROfBEU5kwbNEYR7R3aDjqTtA-H-va6mZD3pmBg"
+      }
+    ],
+    "sig": "oDjzLbbPHfEttVB-_ZZsv43wVxMRPpqKONtl9w1ubPEQumaS9zsG1Al7TEVAJIwQ0_elnA_m3xbaTq9h_5AWAw"
+  },
+  "delegated_widened": {
+    "v": 1,
+    "issuer": "dev_eb6548111a4552a4",
+    "subject": "dev_d8a0c96629a7b580",
+    "caps": [
+      "session.open",
+      "fs.read:/*"
+    ],
+    "not_before": "2026-11-21T00:00:00Z",
+    "not_after": "2026-12-01T00:00:00Z",
+    "nonce": "AwMDAwMDAwMDAwMDAwMDAw",
+    "delegated_from": [
+      {
+        "v": 1,
+        "issuer": "dev_4edf675a405941ea",
+        "subject": "dev_eb6548111a4552a4",
+        "caps": [
+          "session.open",
+          "pair.mint",
+          "fs.read:/photos/*"
+        ],
+        "not_before": "2026-11-20T00:00:00Z",
+        "not_after": "2026-12-20T00:00:00Z",
+        "nonce": "AQEBAQEBAQEBAQEBAQEBAQ",
+        "sig": "GuIqU7L9psae5wRhl6egMFWItC5_AO-n_cHZ9oRciUkfj5dWROfBEU5kwbNEYR7R3aDjqTtA-H-va6mZD3pmBg"
+      }
+    ],
+    "sig": "fMHRqT3l2MtD5RkALG0jb5xFCPBUkt5EOJMDXuWdBe96WSkVR9M97HJAWgL53cXRId3Av1ibuUNGbEVM-OuvCA"
+  },
+  "crl_jcs_json": "{\"issuer\":\"dev_4edf675a405941ea\",\"revoked_devices\":[\"dev_deadbeefcafebabe\"],\"revoked_nonces\":[\"CQkJCQkJCQkJCQkJCQkJCQ\"],\"seq\":1,\"ts\":\"2026-11-22T00:00:00Z\",\"v\":1}",
+  "crl_signed_bytes_hex": "74656e6472696c2d63726c2d7631007b22697373756572223a226465765f34656466363735613430353934316561222c227265766f6b65645f64657669636573223a5b226465765f64656164626565666361666562616265225d2c227265766f6b65645f6e6f6e636573223a5b2243516b4a43516b4a43516b4a43516b4a43516b4a4351225d2c22736571223a312c227473223a22323032362d31312d32325430303a30303a30305a222c2276223a317d",
+  "revocation_list": {
+    "v": 1,
+    "issuer": "dev_4edf675a405941ea",
+    "seq": 1,
+    "revoked_devices": [
+      "dev_deadbeefcafebabe"
+    ],
+    "revoked_nonces": [
+      "CQkJCQkJCQkJCQkJCQkJCQ"
+    ],
+    "ts": "2026-11-22T00:00:00Z",
+    "sig": "S5TCfhQygjDLKPpbdu5THunWOUR4z3EAJKsds6bFtUomm9XvyFuRV6VoVYfkuuSfPB_LQda45xex8RGETkgaBw"
+  }
+}

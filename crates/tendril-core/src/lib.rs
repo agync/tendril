@@ -3,16 +3,16 @@
 //! This crate owns device identity, pairing verification, the sealed Noise
 //! session, capability grants, and path selection policy without direct OS I/O.
 
-/// Wire protocol version encoded in the cleartext preamble.
-pub const WIRE_VERSION: u8 = 1;
+pub mod crypto;
+pub mod error;
+pub mod grants;
+pub mod identity;
+pub mod wire;
 
-/// Length in bytes of the Noise AEAD authentication tag.
-pub const AEAD_TAG_LEN: usize = 16;
-
-/// Maximum length in bytes of a single framed payload body.
-///
-/// Leaves headroom for the 16-byte AEAD tag beneath the 64 KiB Noise message ceiling.
-pub const MAX_FRAME_LEN: usize = 65_519;
+pub use wire::{
+    AEAD_TAG_LEN, MAX_APP_DATA_LEN, MAX_FRAME_LEN, MAX_TRANSPORT_PLAINTEXT, NOISE_PATTERN,
+    PREAMBLE_LEN, PREAMBLE_MAGIC, WIRE_VERSION,
+};
 
 #[cfg(test)]
 mod tests {
@@ -21,5 +21,20 @@ mod tests {
     #[test]
     fn frame_ceiling_fits_within_u16_with_aead_tag() {
         assert_eq!(MAX_FRAME_LEN + AEAD_TAG_LEN, usize::from(u16::MAX));
+    }
+
+    #[test]
+    fn capability_prefix_and_exact_coverage() {
+        let wild = grants::Capability::parse("fs.read:/photos/*").unwrap();
+        let exact_child = grants::Capability::parse("fs.read:/photos/2026/a.jpg").unwrap();
+        let narrow_wild = grants::Capability::parse("fs.read:/photos/2026/*").unwrap();
+        let sibling = grants::Capability::parse("fs.read:/docs/a.txt").unwrap();
+        assert!(wild.covers(&exact_child));
+        assert!(wild.covers(&narrow_wild));
+        assert!(!wild.covers(&sibling));
+
+        let exact = grants::Capability::parse("fs.read:/photos").unwrap();
+        assert!(exact.covers(&grants::Capability::parse("fs.read:/photos").unwrap()));
+        assert!(!exact.covers(&exact_child));
     }
 }

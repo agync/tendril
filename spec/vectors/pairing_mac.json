@@ -1,0 +1,26 @@
+{
+  "handshake_hash_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+  "salt_hex": "404142434445464748494a4b4c4d4e4f",
+  "mac_label": "tendril-pair-v1",
+  "argon2id": {
+    "t": 3,
+    "m_kib": 65536,
+    "p": 1,
+    "key_len": 32,
+    "version": "0x13"
+  },
+  "remote_3group": {
+    "code": "tnd-4f9k-22xq-8n3p",
+    "code_normalized": "TND4F9K22XQ8N3P",
+    "kdf_hex": "811bbb471895429d48010381df8d54343a7b6979036bfe2d20b6e1930dcb9947",
+    "code_mac_hex": "7a69ad0968b2fea1b5e5ee1204ff08dd703e82cec34ee3f405951e889365f252",
+    "code_mac_b64url": "emmtCWiy_qG15e4SBP8I3XA-gs7DTuP0BZUeiJNl8lI"
+  },
+  "lan_2group": {
+    "code": "TND-4F9K-22XQ",
+    "code_normalized": "TND4F9K22XQ",
+    "kdf_hex": "38fc16fde457f41df18305b435a97a1737fc6dbae5f910e3334f5040e50f7798",
+    "code_mac_hex": "3b4404670e86e65aba139b76a0e4b319d9d73c19e215fb927eff38bdb0fc9a1c",
+    "code_mac_b64url": "O0QEZw6G5lq6E5t2oOSzGdnXPBniFfuSfv84vbD8mhw"
+  }
+}

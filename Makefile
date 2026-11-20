@@ -11,7 +11,7 @@ FMT_HOOKS := trailing-whitespace end-of-file-fixer mixed-line-ending
 override MSG := $(value MSG)
 export MSG
 
-.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean docs/check docs/build docs/serve docs/log hooks/require hooks/update
+.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check docs/check docs/build docs/serve docs/log hooks/require hooks/update
 
 ##@ Bootstrap
 
@@ -43,7 +43,11 @@ fmt: hooks/require ## Format Rust sources and fix whitespace and line endings
 fmt/check: ## Fail if Rust formatting differs from rustfmt output
 	cargo fmt --all -- --check
 
-check: lint test ## Full quality gate
+vectors/check: ## Verify canonical conformance vectors in Rust and Go
+	cargo test -p tendril-core --test vectors
+	cd spec/vectors/verify_go && go test ./...
+
+check: lint test vectors/check ## Full quality gate
 	@printf 'check: ok\n'
 
 clean: ## Remove build artifacts
