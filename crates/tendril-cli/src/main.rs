@@ -16,10 +16,12 @@ use tendril_core::pairing::{
 use tendril_core::policy::ProviderId;
 use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, HalfOpenGuard,
-    LocalDialer, PathDialer, PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter,
-    PrefixedPathStream, RelayDialer, RelayListener, SessionDriver, SessionEvent, StateStore,
-    drive_pair_initiator, drive_pair_responder_with_options, peek_exact,
+    BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, EmbeddedRelay, HalfOpenGuard, LocalDialer,
+    OverlayDialer, OverlayListener, P2pDialer, P2pListener, P2pRelayMode, PathDialer, PathListener,
+    PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream, RelayDialer, RelayListener,
+    SessionDriver, SessionEvent, StateStore, drive_pair_initiator,
+    drive_pair_responder_with_options, peek_exact,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -45,14 +47,24 @@ enum Command {
         #[arg(long)]
         host_id: Option<String>,
     },
-    /// Serve incoming pairing and session connections over direct TCP and optional relay.
+    /// Serve incoming pairing and session connections across configured path providers.
     Serve {
         #[arg(long, default_value = "127.0.0.1:0")]
         listen: SocketAddr,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "embedded_relay")]
         relay: Option<String>,
         #[arg(long)]
         relay_host: Option<String>,
+        #[arg(long)]
+        embedded_relay: bool,
+        #[arg(long, conflicts_with = "p2p_local")]
+        p2p: bool,
+        #[arg(long)]
+        p2p_local: bool,
+        #[arg(long)]
+        overlay: Option<SocketAddr>,
+        #[arg(long)]
+        broker: Option<SocketAddr>,
         #[arg(long, value_enum)]
         issue_code: Option<PairKindArg>,
     },
@@ -68,6 +80,8 @@ enum Command {
         kind: String,
         #[arg(long)]
         relay_host: Option<String>,
+        #[arg(long)]
+        p2p_local: bool,
     },
     /// Confirm a pending paired peer (`pair.confirm`), moving it to Active with zero capabilities.
     Confirm {
@@ -91,6 +105,8 @@ enum Command {
         endpoint: String,
         #[arg(long)]
         relay_host: Option<String>,
+        #[arg(long)]
+        p2p_local: bool,
         #[arg(long)]
         grant: Option<String>,
         #[arg(long)]
@@ -124,8 +140,24 @@ fn print_json_line<T: Serialize>(value: &T) {
 async fn dial_endpoint(
     endpoint: &str,
     relay_host: Option<&str>,
+    p2p_local: bool,
 ) -> Result<Box<dyn PathStream>, Box<dyn std::error::Error>> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+    if endpoint.starts_with("iroh://") {
+        let local_only = p2p_local || std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1");
+        let mode = if local_only {
+            P2pRelayMode::Disabled
+        } else {
+            P2pRelayMode::Default
+        };
+        let dialer = P2pDialer::bind(mode).await?;
+        Ok(dialer.dial(endpoint).await?)
+    } else if endpoint.starts_with("overlay://") {
+        let dialer = OverlayDialer::new();
+        Ok(dialer.dial(endpoint).await?)
+    } else if endpoint.starts_with("broker+ws://") || endpoint.starts_with("broker+wss://") {
+        let dialer = BrokerDialer::new();
+        Ok(dialer.dial(endpoint).await?)
+    } else if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
         let mut dialer = RelayDialer::new();
         if let Some(host) = relay_host {
             dialer = dialer.with_expected_host(host);
@@ -138,6 +170,27 @@ async fn dial_endpoint(
         let dialer = DirectDialer::new();
         Ok(dialer.dial(endpoint).await?)
     }
+}
+
+fn spawn_listener_pump(
+    mut listener: Box<dyn PathListener>,
+    tx: tokio::sync::mpsc::Sender<Box<dyn PathStream>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok(stream) => {
+                    if tx.send(stream).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "listener terminated");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 async fn handle_inbound(
@@ -165,10 +218,11 @@ async fn handle_inbound(
 
     match preamble.intent {
         Intent::Pair => {
-            let path_kind = if wrapped.provider_id() == ProviderId::Relay {
-                PairingPathKind::Remote
-            } else {
-                PairingPathKind::Lan
+            let path_kind = match wrapped.provider_id() {
+                ProviderId::Local | ProviderId::Direct => PairingPathKind::Lan,
+                ProviderId::Overlay | ProviderId::P2p | ProviderId::Relay | ProviderId::Broker => {
+                    PairingPathKind::Remote
+                }
             };
             let current_roster = {
                 let _guard = store_lock.lock().await;
@@ -359,6 +413,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen,
             relay,
             relay_host,
+            embedded_relay,
+            p2p,
+            p2p_local,
+            overlay,
+            broker,
             issue_code,
         } => {
             let identity = Arc::new(store.load_or_generate_identity(None)?);
@@ -381,22 +440,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            let mut direct_listener = DirectListener::bind(listen, None).await?;
+            let direct_listener = DirectListener::bind(listen, None).await?;
             let direct_ep = direct_listener.local_endpoint();
-            let mut relay_listener = if let Some(relay_url) = relay {
-                Some(
-                    RelayListener::bind(
-                        relay_url,
-                        relay_host,
-                        identity.signing_key().signing_key(),
-                        DEFAULT_WRITE_TIMEOUT,
+            let mut listeners: Vec<Box<dyn PathListener>> = vec![Box::new(direct_listener)];
+
+            let (embedded_relay_handle, embedded_relay_url, effective_relay_url, effective_host) =
+                if embedded_relay {
+                    let host_name = relay_host.clone().unwrap_or_else(|| "localhost".to_owned());
+                    let emb = EmbeddedRelay::bind_local(host_name.clone()).await?;
+                    let ws_url = emb.ws_url();
+                    (
+                        Some(emb),
+                        Some(ws_url.clone()),
+                        Some(ws_url),
+                        Some(host_name),
                     )
-                    .await?,
+                } else {
+                    (None, None, relay, relay_host)
+                };
+
+            let relay_ep = if let Some(relay_url) = effective_relay_url {
+                let rl = RelayListener::bind(
+                    relay_url,
+                    effective_host,
+                    identity.signing_key().signing_key(),
+                    DEFAULT_WRITE_TIMEOUT,
                 )
+                .await?;
+                let ep = rl.local_endpoint();
+                listeners.push(Box::new(rl));
+                Some(ep)
             } else {
                 None
             };
-            let relay_ep = relay_listener.as_ref().map(PathListener::local_endpoint);
+
+            let p2p_ep = if p2p || p2p_local {
+                let mode = if p2p_local {
+                    P2pRelayMode::Disabled
+                } else {
+                    P2pRelayMode::Default
+                };
+                let pl = P2pListener::bind(mode).await?;
+                let ep = pl.local_endpoint();
+                listeners.push(Box::new(pl));
+                Some(ep)
+            } else {
+                None
+            };
+
+            let overlay_ep = if let Some(overlay_addr) = overlay {
+                let ol = OverlayListener::bind(overlay_addr, None).await?;
+                let ep = ol.local_endpoint();
+                listeners.push(Box::new(ol));
+                Some(ep)
+            } else {
+                None
+            };
+
+            let broker_ep = if let Some(broker_addr) = broker {
+                let bl = BrokerListener::bind(BrokerServerConfig {
+                    listen_addr: broker_addr,
+                    ..BrokerServerConfig::default()
+                })
+                .await?;
+                let ep = bl.local_endpoint();
+                listeners.push(Box::new(bl));
+                Some(ep)
+            } else {
+                None
+            };
 
             print_json_line(&serde_json::json!({
                 "event": "listening",
@@ -404,8 +516,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "device_id": identity.device_id(),
                 "direct_endpoint": direct_ep,
                 "relay_endpoint": relay_ep,
+                "embedded_relay_url": embedded_relay_url,
+                "p2p_endpoint": p2p_ep,
+                "overlay_endpoint": overlay_ep,
+                "broker_endpoint": broker_ep,
                 "pairing_code": issued,
             }));
+
+            let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(64);
+            let pump_handles: Vec<_> = listeners
+                .into_iter()
+                .map(|listener| spawn_listener_pump(listener, inbound_tx.clone()))
+                .collect();
+            drop(inbound_tx);
 
             let dispatch_stream =
                 |stream: Box<dyn PathStream>| match rate_limiter.try_acquire(stream.peer_ip()) {
@@ -428,27 +551,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => break,
-                    res = direct_listener.accept() => {
-                        if let Ok(stream) = res {
-                            dispatch_stream(stream);
-                        }
-                    }
-                    res = async {
-                        match relay_listener.as_mut() {
-                            Some(rl) => Some(rl.accept().await),
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        match res {
-                            Some(Ok(stream)) => dispatch_stream(stream),
-                            Some(Err(err)) => {
-                                tracing::warn!(error = %err, "relay listener terminated; disabling relay accept arm");
-                                relay_listener = None;
-                            }
-                            None => {}
+                    maybe_stream = inbound_rx.recv() => {
+                        match maybe_stream {
+                            Some(stream) => dispatch_stream(stream),
+                            None => break,
                         }
                     }
                 }
+            }
+
+            for handle in pump_handles {
+                handle.abort();
+            }
+            if let Some(emb) = embedded_relay_handle {
+                let _ = emb.shutdown().await;
             }
         }
         Command::Pair {
@@ -457,10 +573,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name,
             kind,
             relay_host,
+            p2p_local,
         } => {
             let identity = store.load_or_generate_identity(None)?;
             let mut roster = store.load_roster()?;
-            let mut stream = dial_endpoint(&endpoint, relay_host.as_deref()).await?;
+            let mut stream = dial_endpoint(&endpoint, relay_host.as_deref(), p2p_local).await?;
             let res =
                 drive_pair_initiator(stream.as_mut(), &identity, name, kind, code, None).await?;
             match res.outcome {
@@ -526,13 +643,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             target,
             endpoint,
             relay_host,
+            p2p_local,
             grant,
             message,
         } => {
             let identity = store.load_identity()?;
             let mut roster = store.load_roster()?;
             let grant_obj = grant.as_deref().map(load_grant_arg).transpose()?;
-            let stream = dial_endpoint(&endpoint, relay_host.as_deref()).await?;
+            let stream = dial_endpoint(&endpoint, relay_host.as_deref(), p2p_local).await?;
             let mut driver = SessionDriver::connect(
                 stream,
                 &identity,

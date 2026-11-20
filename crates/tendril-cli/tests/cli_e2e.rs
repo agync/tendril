@@ -412,3 +412,150 @@ fn conformance_peer_drives_full_json_stdio_session() {
     let status_cli = client.child.0.wait().expect("wait cli");
     assert!(status_cli.success());
 }
+
+#[test]
+fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "host-multi"])
+            .status
+            .success()
+    );
+    let init_cli = run_tendril(client_dir.path(), &["init"]);
+    assert!(init_cli.status.success());
+    let cli_info: serde_json::Value =
+        serde_json::from_slice(&init_cli.stdout).expect("parse cli init");
+    let cli_dev_id = cli_info["device_id"]
+        .as_str()
+        .expect("cli dev id")
+        .to_owned();
+
+    let mut serve = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(host_dir.path())
+            .args([
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--embedded-relay",
+                "--p2p-local",
+                "--overlay",
+                "127.0.0.1:0",
+                "--broker",
+                "127.0.0.1:0",
+                "--issue-code",
+                "remote",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve"),
+    );
+
+    let mut stdout = BufReader::new(serve.0.stdout.take().expect("serve stdout"));
+    let listening = read_json_line(&mut stdout);
+    assert_eq!(listening["event"], "listening");
+    let relay_ep = listening["relay_endpoint"]
+        .as_str()
+        .expect("relay_endpoint")
+        .to_owned();
+    let p2p_ep = listening["p2p_endpoint"]
+        .as_str()
+        .expect("p2p_endpoint")
+        .to_owned();
+    let overlay_ep = listening["overlay_endpoint"]
+        .as_str()
+        .expect("overlay_endpoint")
+        .to_owned();
+    let broker_ep = listening["broker_endpoint"]
+        .as_str()
+        .expect("broker_endpoint")
+        .to_owned();
+    assert!(listening["embedded_relay_url"].as_str().is_some());
+    let code = listening["pairing_code"]
+        .as_str()
+        .expect("pairing_code")
+        .to_owned();
+
+    // Pair over P2P (iroh) locally.
+    let pair_out = run_tendril(
+        client_dir.path(),
+        &[
+            "pair",
+            "--p2p-local",
+            "--endpoint",
+            &p2p_ep,
+            "--code",
+            &code,
+            "--name",
+            "cli-p2p",
+        ],
+    );
+    assert!(
+        pair_out.status.success(),
+        "pair stderr: {}",
+        String::from_utf8_lossy(&pair_out.stderr)
+    );
+    let paired_info: serde_json::Value =
+        serde_json::from_slice(&pair_out.stdout).expect("pair json");
+    let sas = paired_info["sas"].as_str().expect("sas");
+
+    let paired_ev = read_json_line(&mut stdout);
+    assert_eq!(paired_ev["event"], "paired");
+    assert_eq!(paired_ev["device_id"], cli_dev_id);
+    assert_eq!(paired_ev["sas"], sas);
+
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", sas])
+            .status
+            .success()
+    );
+    let mint_out = run_tendril(host_dir.path(), &["mint", &cli_dev_id, "--cap", "fs.read"]);
+    assert!(mint_out.status.success());
+    let grant_json = String::from_utf8(mint_out.stdout).expect("grant utf8");
+
+    for (ep, expected_provider, msg) in [
+        (&p2p_ep, "P2p", "hello-cli-p2p"),
+        (&overlay_ep, "Overlay", "hello-cli-overlay"),
+        (&broker_ep, "Broker", "hello-cli-broker"),
+        (&relay_ep, "Relay", "hello-cli-embedded-relay"),
+    ] {
+        let mut args = vec![
+            "dial",
+            "--target",
+            "host-multi",
+            "--endpoint",
+            ep.as_str(),
+            "--grant",
+            grant_json.trim(),
+            "--message",
+            msg,
+        ];
+        if expected_provider == "Relay" {
+            args.extend(["--relay-host", "localhost"]);
+        } else if expected_provider == "P2p" {
+            args.push("--p2p-local");
+        }
+        let dial_out = run_tendril(client_dir.path(), &args);
+        assert!(
+            dial_out.status.success(),
+            "dial {expected_provider} stderr: {}",
+            String::from_utf8_lossy(&dial_out.stderr)
+        );
+        let dial_json: serde_json::Value =
+            serde_json::from_slice(&dial_out.stdout).expect("dial json");
+        assert_eq!(dial_json["provider"], expected_provider);
+
+        let est = read_json_line(&mut stdout);
+        assert_eq!(est["event"], "session_established");
+        assert_eq!(est["provider"], expected_provider);
+        let data = read_json_line(&mut stdout);
+        assert_eq!(data["event"], "data");
+        assert_eq!(data["utf8"], msg);
+        let closed = read_json_line(&mut stdout);
+        assert_eq!(closed["event"], "closed");
+    }
+}
