@@ -29,8 +29,13 @@ Each endpoint isolates its `0o700` state directory containing `0o600` `identity.
 tendril --state-dir ./host-state init --host-id my-host
 tendril --state-dir ./cli-state init
 
-# 2. Start host listener (direct TCP, optional relay, and one-time pairing code)
+# 2. Start host listener (direct TCP, optional relay/embedded-relay/p2p/overlay/broker, and pairing code)
 tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --issue-code lan
+
+# Optional multi-rung host serving (zero-setup P2P or embedded relay):
+# tendril --state-dir ./host-state serve --p2p --embedded-relay --issue-code remote
+# tendril --state-dir ./host-state serve --p2p-local --overlay 127.0.0.1:0 --broker 127.0.0.1:0 --issue-code remote
+# (Pass --p2p-local on pair/dial when connecting to a --p2p-local endpoint offline.)
 
 # 3. Pair client using printed endpoint and code, then record matching SAS
 tendril --state-dir ./cli-state pair --endpoint 127.0.0.1:PORT --code TND-XXXX-XXXX
