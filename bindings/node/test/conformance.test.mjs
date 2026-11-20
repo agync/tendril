@@ -386,3 +386,111 @@ test("Node binding isolates Intent::Pair flood from acceptSession", async () => 
     cliEp.close();
   }
 });
+
+test("Node binding validates safe integers and runs full-duplex session ops concurrently", async () => {
+  const gv = readVec("grants.json");
+  const keysJson = JSON.stringify({
+    [gv.root_issuer_id]: hexToB64Url(gv.root_signing_pub_hex),
+    [gv.delegate_id]: hexToB64Url(gv.delegate_signing_pub_hex),
+  });
+  const grantJson = JSON.stringify(gv.delegated_valid);
+  const rot = readVec("rotation.json");
+  const records = rot.chain.map((e) => e.record);
+  const psig = hexToB64Url(rot.pinned_signing_pub_hex);
+  const pstat = hexToB64Url(rot.pinned_static_pub_hex);
+  const last = records[records.length - 1];
+
+  // SEC-07: reject NaN, Infinity, negative, fractional, and unsafe integers across helpers & methods.
+  for (const bad of [NaN, Infinity, -Infinity, -1, 1.5, 2 ** 53, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() =>
+      tendril.verifyGrantJson(
+        grantJson,
+        keysJson,
+        gv.leaf_id,
+        gv.root_issuer_id,
+        "fs.read:/photos/2026/a.jpg",
+        bad
+      )
+    );
+    assert.throws(() =>
+      tendril.verifyRotationChainJson(
+        psig,
+        pstat,
+        bad,
+        JSON.stringify(records),
+        last.new_static_pub,
+        last.new_signing_pub
+      )
+    );
+  }
+
+  const hostEp = new tendril.Endpoint(null, "node-sec07-host");
+  const cliEp = new tendril.Endpoint(null, "node-sec07-cli");
+  try {
+    const addr = await hostEp.serveDirect("127.0.0.1:0");
+    const code = hostEp.issueCode("lan");
+    const [pairRaw, accRaw] = await Promise.all([
+      cliEp.pairInitiate(addr, code, null, "node-conc", "node"),
+      hostEp.pairAccept(5000),
+    ]);
+    const pairCli = JSON.parse(pairRaw);
+    const acc = JSON.parse(accRaw);
+    hostEp.confirmPeer(acc.device_id, pairCli.sas);
+    cliEp.confirmPeer("node-sec07-host", pairCli.sas);
+
+    for (const badTtl of [-1, NaN, Infinity, 1.5, 2 ** 53]) {
+      assert.throws(() => hostEp.mintGrant(acc.device_id, ["fs.read"], badTtl));
+    }
+    const largeTtlGrant = JSON.parse(hostEp.mintGrant(acc.device_id, ["fs.read"], 2 ** 32 + 5));
+    const nbf = Date.parse(largeTtlGrant.not_before) / 1000;
+    const exp = Date.parse(largeTtlGrant.not_after) / 1000;
+    assert.equal(exp - nbf, 2 ** 32 + 5);
+
+    for (const badTimeout of [-1, NaN, Infinity, 1.5, 2 ** 32]) {
+      await assert.rejects(hostEp.pairAccept(badTimeout));
+      await assert.rejects(hostEp.acceptSession(badTimeout));
+    }
+
+    const grantJson = hostEp.mintGrant(acc.device_id, ["fs.read"], 3600);
+    const [cliSess, hostSess] = await Promise.all([
+      cliEp.connect(addr, "node-sec07-host", grantJson),
+      hostEp.acceptSession(5000),
+    ]);
+    for (const badTimeout of [-1, NaN, Infinity, 1.5, 2 ** 32]) {
+      await assert.rejects(hostSess.pollEvent(badTimeout));
+    }
+    for (const badCode of [-1, NaN, 1.5, 65536]) {
+      await assert.rejects(cliSess.close(badCode, "bad"));
+    }
+
+    // SEC-17: Concurrent sendData + authorize + rekey must not wait on an active pollEvent(5000).
+    const pollPromise = hostSess.pollEvent(5000);
+    await new Promise((r) => setTimeout(r, 60));
+    const t0 = Date.now();
+    assert.equal(await hostSess.authorize("fs.read"), true);
+    await hostSess.sendData(Buffer.from("node-duplex-reply", "utf8"));
+    const cliEv = JSON.parse(await cliSess.pollEvent(2000));
+    assert.equal(cliEv.event, "data");
+    assert.equal(Buffer.from(cliEv.data_b64, "base64url").toString("utf8"), "node-duplex-reply");
+    await cliSess.sendData(Buffer.from("wake-host-poll", "utf8"));
+    const hostEv = JSON.parse(await pollPromise);
+    assert.equal(hostEv.event, "data");
+    assert.ok(Date.now() - t0 < 1500, "full-duplex Node ops stalled behind pollEvent");
+
+    // SEC-31: grant expiring while hostSess.pollEvent(5000) is awaiting rejects incoming rekey.
+    const shortGrant = hostEp.mintGrant(acc.device_id, ["fs.read"], 1);
+    const [cliSess2, hostSess2] = await Promise.all([
+      cliEp.connect(addr, "node-sec07-host", shortGrant),
+      hostEp.acceptSession(5000),
+    ]);
+    const expPollPromise = hostSess2.pollEvent(5000);
+    await new Promise((r) => setTimeout(r, 2200));
+    await cliSess2.rekey();
+    await assert.rejects(expPollPromise);
+    await cliSess2.close(1000, "done");
+    await cliSess.close(1000, "done");
+  } finally {
+    hostEp.close();
+    cliEp.close();
+  }
+});

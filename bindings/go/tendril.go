@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -85,14 +86,23 @@ func ffiErr(code C.int32_t) error {
 	return fmt.Errorf("tendril ffi error (%d): %s", int(code), msg)
 }
 
-func withOptCStr(s string, fn func(*C.char)) {
-	if s == "" {
-		fn(nil)
-		return
+func toCStr(s, name string) (*C.char, error) {
+	if strings.IndexByte(s, 0) >= 0 {
+		return nil, fmt.Errorf("tendril: %s contains interior NUL byte", name)
 	}
-	cs := C.CString(s)
+	return C.CString(s), nil
+}
+
+func withOptCStr(s, name string, fn func(*C.char) error) error {
+	if s == "" {
+		return fn(nil)
+	}
+	cs, err := toCStr(s, name)
+	if err != nil {
+		return err
+	}
 	defer C.free(unsafe.Pointer(cs))
-	fn(cs)
+	return fn(cs)
 }
 
 func takeOutCStr(p *C.char) string {
@@ -156,7 +166,10 @@ func ComputeCodeMAC(code string, handshakeHash [32]byte) ([32]byte, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	var mac [32]byte
-	ccode := C.CString(code)
+	ccode, err := toCStr(code, "code")
+	if err != nil {
+		return [32]byte{}, err
+	}
 	defer C.free(unsafe.Pointer(ccode))
 	rc := C.tendril_compute_code_mac(
 		ccode,
@@ -177,18 +190,31 @@ func VerifyRotationChainJSON(
 ) (uint64, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	cpsig := C.CString(pinnedSigningB64)
-	cpstat := C.CString(pinnedStaticB64)
-	cchain := C.CString(chainJSON)
-	ccstat := C.CString(curStaticB64)
-	ccsig := C.CString(curSigningB64)
-	defer func() {
-		C.free(unsafe.Pointer(cpsig))
-		C.free(unsafe.Pointer(cpstat))
-		C.free(unsafe.Pointer(cchain))
-		C.free(unsafe.Pointer(ccstat))
-		C.free(unsafe.Pointer(ccsig))
-	}()
+	cpsig, err := toCStr(pinnedSigningB64, "pinnedSigningB64")
+	if err != nil {
+		return 0, err
+	}
+	defer C.free(unsafe.Pointer(cpsig))
+	cpstat, err := toCStr(pinnedStaticB64, "pinnedStaticB64")
+	if err != nil {
+		return 0, err
+	}
+	defer C.free(unsafe.Pointer(cpstat))
+	cchain, err := toCStr(chainJSON, "chainJSON")
+	if err != nil {
+		return 0, err
+	}
+	defer C.free(unsafe.Pointer(cchain))
+	ccstat, err := toCStr(curStaticB64, "curStaticB64")
+	if err != nil {
+		return 0, err
+	}
+	defer C.free(unsafe.Pointer(ccstat))
+	ccsig, err := toCStr(curSigningB64, "curSigningB64")
+	if err != nil {
+		return 0, err
+	}
+	defer C.free(unsafe.Pointer(ccsig))
 
 	var finalSeq C.uint64_t
 	rc := C.tendril_verify_rotation_chain_json(
@@ -208,26 +234,42 @@ func VerifyGrantJSON(
 ) (bool, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	cgrant := C.CString(grantJSON)
-	ckeys := C.CString(issuerKeysJSON)
-	csubj := C.CString(expectedSubject)
-	croot := C.CString(expectedRootIssuer)
-	ccap := C.CString(requestedCap)
-	defer func() {
-		C.free(unsafe.Pointer(cgrant))
-		C.free(unsafe.Pointer(ckeys))
-		C.free(unsafe.Pointer(csubj))
-		C.free(unsafe.Pointer(croot))
-		C.free(unsafe.Pointer(ccap))
-	}()
+	cgrant, err := toCStr(grantJSON, "grantJSON")
+	if err != nil {
+		return false, err
+	}
+	defer C.free(unsafe.Pointer(cgrant))
+	ckeys, err := toCStr(issuerKeysJSON, "issuerKeysJSON")
+	if err != nil {
+		return false, err
+	}
+	defer C.free(unsafe.Pointer(ckeys))
+	csubj, err := toCStr(expectedSubject, "expectedSubject")
+	if err != nil {
+		return false, err
+	}
+	defer C.free(unsafe.Pointer(csubj))
+	croot, err := toCStr(expectedRootIssuer, "expectedRootIssuer")
+	if err != nil {
+		return false, err
+	}
+	defer C.free(unsafe.Pointer(croot))
+	ccap, err := toCStr(requestedCap, "requestedCap")
+	if err != nil {
+		return false, err
+	}
+	defer C.free(unsafe.Pointer(ccap))
 
 	var allowed C.uint8_t
 	var rc C.int32_t
-	withOptCStr(crlJSON, func(ccrl *C.char) {
+	if err := withOptCStr(crlJSON, "crlJSON", func(ccrl *C.char) error {
 		rc = C.tendril_verify_grant_json(
 			cgrant, ckeys, csubj, croot, ccap, C.uint64_t(nowUnix), ccrl, &allowed,
 		)
-	})
+		return nil
+	}); err != nil {
+		return false, err
+	}
 	if rc != C.TENDRIL_OK {
 		return false, ffiErr(rc)
 	}
@@ -245,11 +287,14 @@ func NewEndpoint(stateDir, hostID string) (*Endpoint, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	var raw *C.TendrilEndpoint
-	withOptCStr(stateDir, func(cd *C.char) {
-		withOptCStr(hostID, func(ch *C.char) {
+	if err := withOptCStr(stateDir, "stateDir", func(cd *C.char) error {
+		return withOptCStr(hostID, "hostID", func(ch *C.char) error {
 			raw = C.tendril_endpoint_new(cd, ch)
+			return nil
 		})
-	})
+	}); err != nil {
+		return nil, err
+	}
 	if raw == nil {
 		return nil, fmt.Errorf("tendril_endpoint_new failed: %s", lastError())
 	}
@@ -258,8 +303,16 @@ func NewEndpoint(stateDir, hostID string) (*Endpoint, error) {
 	return ep, nil
 }
 
-// Close frees the underlying native TendrilEndpoint handle idempotently.
+// Close frees the underlying native TendrilEndpoint handle idempotently without blocking on active accepts.
 func (ep *Endpoint) Close() error {
+	ep.mu.RLock()
+	h := ep.ptr
+	if h != nil {
+		C.tendril_endpoint_close(h)
+	}
+	runtime.KeepAlive(ep)
+	ep.mu.RUnlock()
+
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 	if ep.ptr != nil {
@@ -301,9 +354,12 @@ func (ep *Endpoint) ServeDirect(listenAddr string) (string, error) {
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
 		var out *C.char
 		var rc C.int32_t
-		withOptCStr(listenAddr, func(ca *C.char) {
+		if err := withOptCStr(listenAddr, "listenAddr", func(ca *C.char) error {
 			rc = C.tendril_endpoint_serve_direct(h, ca, &out)
-		})
+			return nil
+		}); err != nil {
+			return err
+		}
 		if rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}
@@ -317,13 +373,19 @@ func (ep *Endpoint) ServeDirect(listenAddr string) (string, error) {
 func (ep *Endpoint) ServeRelay(relayURL, expectedHost string) (string, error) {
 	var endpoint string
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
-		curl := C.CString(relayURL)
+		curl, err := toCStr(relayURL, "relayURL")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(curl))
 		var out *C.char
 		var rc C.int32_t
-		withOptCStr(expectedHost, func(ch *C.char) {
+		if err := withOptCStr(expectedHost, "expectedHost", func(ch *C.char) error {
 			rc = C.tendril_endpoint_serve_relay(h, curl, ch, &out)
-		})
+			return nil
+		}); err != nil {
+			return err
+		}
 		if rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}
@@ -339,9 +401,12 @@ func (ep *Endpoint) ServeP2p(relayMode string) (string, error) {
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
 		var out *C.char
 		var rc C.int32_t
-		withOptCStr(relayMode, func(cm *C.char) {
+		if err := withOptCStr(relayMode, "relayMode", func(cm *C.char) error {
 			rc = C.tendril_endpoint_serve_p2p(h, cm, &out)
-		})
+			return nil
+		}); err != nil {
+			return err
+		}
 		if rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}
@@ -357,9 +422,12 @@ func (ep *Endpoint) IssueCode(kind string) (string, error) {
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
 		var out *C.char
 		var rc C.int32_t
-		withOptCStr(kind, func(ck *C.char) {
+		if err := withOptCStr(kind, "kind", func(ck *C.char) error {
 			rc = C.tendril_endpoint_issue_code(h, ck, &out)
-		})
+			return nil
+		}); err != nil {
+			return err
+		}
 		if rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}
@@ -374,20 +442,29 @@ func (ep *Endpoint) IssueCode(kind string) (string, error) {
 func (ep *Endpoint) PairInitiate(endpoint, relayHost, code, name, kind string) (PairInitiateResult, error) {
 	var res PairInitiateResult
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
-		cep := C.CString(endpoint)
-		ccode := C.CString(code)
+		cep, err := toCStr(endpoint, "endpoint")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(cep))
+		ccode, err := toCStr(code, "code")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(ccode))
 
 		var out *C.char
 		var rc C.int32_t
-		withOptCStr(relayHost, func(cr *C.char) {
-			withOptCStr(name, func(cn *C.char) {
-				withOptCStr(kind, func(ck *C.char) {
+		if err := withOptCStr(relayHost, "relayHost", func(cr *C.char) error {
+			return withOptCStr(name, "name", func(cn *C.char) error {
+				return withOptCStr(kind, "kind", func(ck *C.char) error {
 					rc = C.tendril_endpoint_pair_initiate(h, cep, cr, ccode, cn, ck, &out)
+					return nil
 				})
 			})
-		})
+		}); err != nil {
+			return err
+		}
 		if rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}
@@ -416,12 +493,18 @@ func (ep *Endpoint) PairAccept(timeoutMs uint64) (PairAcceptResult, error) {
 // ConfirmPeer promotes a paired peer to Active, asserting sas when non-empty.
 func (ep *Endpoint) ConfirmPeer(peerID, sas string) error {
 	return ep.withHandle(func(h *C.TendrilEndpoint) error {
-		cp := C.CString(peerID)
+		cp, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(cp))
 		var rc C.int32_t
-		withOptCStr(sas, func(cs *C.char) {
+		if err := withOptCStr(sas, "sas", func(cs *C.char) error {
 			rc = C.tendril_endpoint_confirm_peer(h, cp, cs)
-		})
+			return nil
+		}); err != nil {
+			return err
+		}
 		if rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}
@@ -437,9 +520,15 @@ func (ep *Endpoint) MintGrant(peerID string, caps []string, ttlSecs uint64) (str
 		if err != nil {
 			return err
 		}
-		cp := C.CString(peerID)
-		ccaps := C.CString(string(capsBytes))
+		cp, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(cp))
+		ccaps, err := toCStr(string(capsBytes), "caps")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(ccaps))
 
 		var out *C.char
@@ -456,7 +545,10 @@ func (ep *Endpoint) MintGrant(peerID string, caps []string, ttlSecs uint64) (str
 // RevokePeer marks peerID as Revoked and clears its grants.
 func (ep *Endpoint) RevokePeer(peerID string) error {
 	return ep.withHandle(func(h *C.TendrilEndpoint) error {
-		cp := C.CString(peerID)
+		cp, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(cp))
 		if rc := C.tendril_endpoint_revoke_peer(h, cp); rc != C.TENDRIL_OK {
 			return ffiErr(rc)
@@ -469,17 +561,26 @@ func (ep *Endpoint) RevokePeer(peerID string) error {
 func (ep *Endpoint) Connect(endpoint, relayHost, targetHostID, grantJSON string) (*Session, error) {
 	var sess *Session
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
-		cep := C.CString(endpoint)
-		ctarget := C.CString(targetHostID)
+		cep, err := toCStr(endpoint, "endpoint")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(cep))
+		ctarget, err := toCStr(targetHostID, "targetHostID")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(ctarget))
 
 		var raw *C.TendrilSession
-		withOptCStr(relayHost, func(cr *C.char) {
-			withOptCStr(grantJSON, func(cg *C.char) {
+		if err := withOptCStr(relayHost, "relayHost", func(cr *C.char) error {
+			return withOptCStr(grantJSON, "grantJSON", func(cg *C.char) error {
 				raw = C.tendril_session_connect(h, cep, cr, ctarget, cg)
+				return nil
 			})
-		})
+		}); err != nil {
+			return err
+		}
 		if raw == nil {
 			return fmt.Errorf("tendril_session_connect failed: %s", lastError())
 		}
@@ -505,7 +606,7 @@ func (ep *Endpoint) AcceptSession(timeoutMs uint64) (*Session, error) {
 
 // Session wraps an opaque C TendrilSession handle.
 type Session struct {
-	mu  sync.Mutex
+	mu  sync.RWMutex
 	ptr *C.TendrilSession
 }
 
@@ -515,8 +616,16 @@ func newSession(raw *C.TendrilSession) *Session {
 	return s
 }
 
-// Close frees the underlying native TendrilSession handle idempotently.
+// Close frees the underlying native TendrilSession handle idempotently without blocking on active PollEvent calls.
 func (s *Session) Close() error {
+	s.mu.RLock()
+	h := s.ptr
+	if h != nil {
+		C.tendril_session_shutdown(h)
+	}
+	runtime.KeepAlive(s)
+	s.mu.RUnlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ptr != nil {
@@ -530,8 +639,8 @@ func (s *Session) Close() error {
 func (s *Session) withHandle(fn func(*C.TendrilSession) error) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	defer runtime.KeepAlive(s)
 	if s.ptr == nil {
 		return errors.New("tendril: session freed")
@@ -583,7 +692,10 @@ func (s *Session) PollEvent(timeoutMs uint64) (*SessionEvent, error) {
 func (s *Session) Authorize(requestedCap string) (bool, error) {
 	var allowedBool bool
 	err := s.withHandle(func(h *C.TendrilSession) error {
-		ccap := C.CString(requestedCap)
+		ccap, err := toCStr(requestedCap, "requestedCap")
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(ccap))
 		var allowed C.uint8_t
 		if rc := C.tendril_session_authorize(h, ccap, &allowed); rc != C.TENDRIL_OK {
@@ -609,9 +721,12 @@ func (s *Session) Rekey() error {
 func (s *Session) CloseSession(code uint16, reason string) error {
 	return s.withHandle(func(h *C.TendrilSession) error {
 		var rc C.int32_t
-		withOptCStr(reason, func(cr *C.char) {
+		if err := withOptCStr(reason, "reason", func(cr *C.char) error {
 			rc = C.tendril_session_close(h, C.uint16_t(code), cr)
-		})
+			return nil
+		}); err != nil {
+			return err
+		}
 		if rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}

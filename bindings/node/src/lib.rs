@@ -17,13 +17,59 @@ use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_c
 use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
 use tendril_core::roster::Roster;
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener, InboundRouter, P2pListener,
-    PathListener, PathStream, RelayListener, SessionDriver, SessionEvent, StateStore,
-    dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
+    ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
+    InboundRouter, P2pListener, PathListener, PathStream, RelayListener, SessionDriver,
+    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
     drive_pair_responder_with_options, pairing_path_kind_for_provider, parse_p2p_relay_mode,
 };
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
+
+const MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
+
+fn f64_to_u64(v: f64, name: &str) -> Result<u64> {
+    if !(0.0..=MAX_SAFE_INTEGER_F64).contains(&v) || v.fract() != 0.0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{name} must be a non-negative safe integer"),
+        ));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(v as u64)
+}
+
+fn f64_to_timeout_ms(v: Option<f64>, default_ms: u64) -> Result<u64> {
+    let Some(raw) = v else {
+        return Ok(default_ms);
+    };
+    let ms = f64_to_u64(raw, "timeout_ms")?;
+    if ms > u64::from(u32::MAX) {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "timeout_ms exceeds u32 maximum",
+        ));
+    }
+    Ok(ms)
+}
+
+fn f64_to_u16(v: Option<f64>, default_val: u16, name: &str) -> Result<u16> {
+    let Some(raw) = v else {
+        return Ok(default_val);
+    };
+    let n = f64_to_u64(raw, name)?;
+    u16::try_from(n)
+        .map_err(|_| Error::new(Status::InvalidArg, format!("{name} must be in 0..=65535")))
+}
+
+fn u64_to_f64(v: u64) -> Result<f64> {
+    if v > 9_007_199_254_740_991 {
+        return Err(Error::new(
+            Status::GenericFailure,
+            "sequence exceeds JavaScript safe integer range",
+        ));
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Ok(v as f64)
+}
 
 fn persist_store_roster(
     store: Option<&Arc<StateStore>>,
@@ -108,13 +154,12 @@ pub async fn compute_code_mac(code: String, handshake_hash: Buffer) -> Result<Bu
 pub fn verify_rotation_chain_json(
     pinned_signing_b64: String,
     pinned_static_b64: String,
-    pinned_seq: i64,
+    pinned_seq: f64,
     chain_json: String,
     cur_static_b64: String,
     cur_signing_b64: String,
-) -> Result<u32> {
-    let pinned_seq_u64 = u64::try_from(pinned_seq)
-        .map_err(|_| Error::new(Status::InvalidArg, "pinned_seq must be non-negative"))?;
+) -> Result<f64> {
+    let pinned_seq_u64 = f64_to_u64(pinned_seq, "pinned_seq")?;
     let psig = b64url_decode_array::<32>(&pinned_signing_b64).map_err(to_generic_err)?;
     let pstat = b64url_decode_array::<32>(&pinned_static_b64).map_err(to_generic_err)?;
     let cstat = b64url_decode_array::<32>(&cur_static_b64).map_err(to_generic_err)?;
@@ -122,7 +167,7 @@ pub fn verify_rotation_chain_json(
     let chain: Vec<RotationRecord> = serde_json::from_str(&chain_json).map_err(to_generic_err)?;
     let seq = verify_rotation_chain(&psig, &pstat, pinned_seq_u64, &chain, &cstat, &csig)
         .map_err(to_generic_err)?;
-    u32::try_from(seq).map_err(to_generic_err)
+    u64_to_f64(seq)
 }
 
 #[napi]
@@ -132,11 +177,10 @@ pub fn verify_grant_json(
     expected_subject: String,
     expected_root_issuer: String,
     requested_cap: String,
-    now_unix_secs: i64,
+    now_unix_secs: f64,
     crl_json: Option<String>,
 ) -> Result<bool> {
-    let now_u64 = u64::try_from(now_unix_secs)
-        .map_err(|_| Error::new(Status::InvalidArg, "now_unix_secs must be non-negative"))?;
+    let now_u64 = f64_to_u64(now_unix_secs, "now_unix_secs")?;
     let grant: Grant = serde_json::from_str(&grant_json).map_err(to_generic_err)?;
     let key_map_raw: HashMap<String, String> =
         serde_json::from_str(&issuer_keys_json).map_err(to_generic_err)?;
@@ -359,8 +403,8 @@ impl Endpoint {
     }
 
     #[napi]
-    pub async fn pair_accept(&self, timeout_ms: Option<u32>) -> Result<String> {
-        let wait = Duration::from_millis(u64::from(timeout_ms.unwrap_or(5000)));
+    pub async fn pair_accept(&self, timeout_ms: Option<f64>) -> Result<String> {
+        let wait = Duration::from_millis(f64_to_timeout_ms(timeout_ms, 5000)?);
         let (mut stream, guard) = match self.router.recv_pair(wait).await {
             Ok(Some(pair)) => pair,
             Ok(None) => return Err(to_generic_err("listener closed")),
@@ -420,12 +464,15 @@ impl Endpoint {
         &self,
         peer_id: String,
         caps: Vec<String>,
-        ttl_secs: Option<u32>,
+        ttl_secs: Option<f64>,
     ) -> Result<String> {
+        let ttl = match ttl_secs {
+            Some(v) => f64_to_u64(v, "ttl_secs")?,
+            None => 3600,
+        };
         let nonce = random_bytes::<16>().map_err(to_generic_err)?;
         let mut roster = self.roster.lock().expect("roster mutex poisoned");
         let now = now_unix();
-        let ttl = u64::from(ttl_secs.unwrap_or(3600));
         let grant = roster
             .mint_grant(
                 &self.identity,
@@ -487,13 +534,13 @@ impl Endpoint {
         Ok(Session {
             store: self.store.clone(),
             roster: Arc::clone(&self.roster),
-            driver: Arc::new(AsyncMutex::new(driver)),
+            session: Arc::new(driver.into_concurrent()),
         })
     }
 
     #[napi]
-    pub async fn accept_session(&self, timeout_ms: Option<u32>) -> Result<Session> {
-        let wait = Duration::from_millis(u64::from(timeout_ms.unwrap_or(5000)));
+    pub async fn accept_session(&self, timeout_ms: Option<f64>) -> Result<Session> {
+        let wait = Duration::from_millis(f64_to_timeout_ms(timeout_ms, 5000)?);
         let (stream, guard) = match self.router.recv_session(wait).await {
             Ok(Some(pair)) => pair,
             Ok(None) => return Err(to_generic_err("listener closed")),
@@ -515,7 +562,7 @@ impl Endpoint {
         Ok(Session {
             store: self.store.clone(),
             roster: Arc::clone(&self.roster),
-            driver: Arc::new(AsyncMutex::new(driver)),
+            session: Arc::new(driver.into_concurrent()),
         })
     }
 
@@ -529,25 +576,23 @@ impl Endpoint {
 pub struct Session {
     store: Option<Arc<StateStore>>,
     roster: Arc<StdMutex<Roster>>,
-    driver: Arc<AsyncMutex<SessionDriver>>,
+    session: Arc<ConcurrentSession>,
 }
 
 #[napi]
 impl Session {
     #[napi]
     pub async fn send_data(&self, payload: Buffer) -> Result<()> {
-        let mut guard = self.driver.lock().await;
-        guard
+        self.session
             .send_data(payload.as_ref())
             .await
             .map_err(to_generic_err)
     }
 
     #[napi]
-    pub async fn poll_event(&self, timeout_ms: Option<u32>) -> Result<String> {
-        let wait = Duration::from_millis(u64::from(timeout_ms.unwrap_or(5000)));
-        let mut guard = self.driver.lock().await;
-        match timeout(wait, guard.next_event_locked(now_unix(), &self.roster)).await {
+    pub async fn poll_event(&self, timeout_ms: Option<f64>) -> Result<String> {
+        let wait = Duration::from_millis(f64_to_timeout_ms(timeout_ms, 5000)?);
+        match timeout(wait, self.session.next_event_locked_now(&self.roster)).await {
             Ok(Ok(Some(ev))) => {
                 let json = match ev {
                     SessionEvent::AppData(data) => serde_json::json!({
@@ -607,22 +652,23 @@ impl Session {
 
     #[napi]
     pub async fn authorize(&self, requested_cap: String) -> bool {
-        let guard = self.driver.lock().await;
         let r = self.roster.lock().expect("roster mutex poisoned");
-        guard.authorize(&requested_cap, now_unix(), &r).0.is_ok()
+        self.session
+            .authorize(&requested_cap, now_unix(), &r)
+            .0
+            .is_ok()
     }
 
     #[napi]
     pub async fn rekey(&self) -> Result<()> {
-        let mut guard = self.driver.lock().await;
-        guard.send_rekey().await.map_err(to_generic_err)
+        self.session.send_rekey().await.map_err(to_generic_err)
     }
 
     #[napi]
-    pub async fn close(&self, code: Option<u16>, reason: Option<String>) -> Result<()> {
-        let mut guard = self.driver.lock().await;
-        guard
-            .send_close(code.unwrap_or(1000), reason.as_deref().unwrap_or("normal"))
+    pub async fn close(&self, code: Option<f64>, reason: Option<String>) -> Result<()> {
+        let close_code = f64_to_u16(code, 1000, "code")?;
+        self.session
+            .send_close(close_code, reason.as_deref().unwrap_or("normal"))
             .await
             .map_err(to_generic_err)
     }

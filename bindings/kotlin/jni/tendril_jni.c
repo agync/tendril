@@ -2,17 +2,50 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "tendril.h"
+
+static void zeroize_cstr_free(char *p) {
+  if (p == NULL) {
+    return;
+  }
+  volatile unsigned char *vp = (volatile unsigned char *)p;
+  while (*vp != 0) {
+    *vp++ = 0;
+  }
+  free(p);
+}
+
+static jstring utf8_to_jstring(JNIEnv *env, const char *s);
 
 static void throw_ex(JNIEnv *env, const char *class_name, const char *msg) {
   if ((*env)->ExceptionCheck(env)) {
     return;
   }
   jclass cls = (*env)->FindClass(env, class_name);
-  if (cls != NULL) {
-    (*env)->ThrowNew(env, cls, msg);
+  if (cls == NULL) {
+    return;
   }
+  jmethodID ctor = (*env)->GetMethodID(env, cls, "<init>", "(Ljava/lang/String;)V");
+  jstring jmsg = ctor != NULL ? utf8_to_jstring(env, msg) : NULL;
+  jthrowable ex = NULL;
+  if (jmsg != NULL && !(*env)->ExceptionCheck(env)) {
+    ex = (jthrowable)(*env)->NewObject(env, cls, ctor, jmsg);
+  }
+  if (jmsg != NULL) {
+    (*env)->DeleteLocalRef(env, jmsg);
+  }
+  if (ex != NULL && !(*env)->ExceptionCheck(env)) {
+    (*env)->Throw(env, ex);
+    (*env)->DeleteLocalRef(env, ex);
+  } else {
+    if ((*env)->ExceptionCheck(env)) {
+      (*env)->ExceptionClear(env);
+    }
+    (*env)->ThrowNew(env, cls, msg != NULL ? msg : "");
+  }
+  (*env)->DeleteLocalRef(env, cls);
 }
 
 static void throw_ffi_error(JNIEnv *env, int32_t rc, const char *fallback) {
@@ -22,13 +55,32 @@ static void throw_ffi_error(JNIEnv *env, int32_t rc, const char *fallback) {
   char errbuf[512];
   errbuf[0] = '\0';
   int32_t needed = tendril_last_error(errbuf, sizeof(errbuf));
-  char full[640];
-  if (needed > 1) {
-    snprintf(full, sizeof(full), "tendril ffi error (%d): %s", (int)rc, errbuf);
-  } else {
-    snprintf(full, sizeof(full), "%s (code %d)", fallback, (int)rc);
+  const char *err_msg = errbuf;
+  char *dyn_err = NULL;
+  if (needed > (int32_t)sizeof(errbuf)) {
+    dyn_err = (char *)malloc((size_t)needed);
+    if (dyn_err != NULL) {
+      dyn_err[0] = '\0';
+      tendril_last_error(dyn_err, (size_t)needed);
+      err_msg = dyn_err;
+    }
   }
-  throw_ex(env, "java/lang/IllegalStateException", full);
+  if (needed > 1) {
+    size_t full_cap = strlen(err_msg) + 48;
+    char *full = (char *)malloc(full_cap);
+    if (full != NULL) {
+      snprintf(full, full_cap, "tendril ffi error (%d): %s", (int)rc, err_msg);
+      throw_ex(env, "java/lang/IllegalStateException", full);
+      free(full);
+    } else {
+      throw_ex(env, "java/lang/IllegalStateException", err_msg);
+    }
+  } else {
+    char full[128];
+    snprintf(full, sizeof(full), "%s (code %d)", fallback, (int)rc);
+    throw_ex(env, "java/lang/IllegalStateException", full);
+  }
+  free(dyn_err);
 }
 
 static int dup_opt_utf8(JNIEnv *env, jstring s, char **out_buf) {
@@ -50,7 +102,11 @@ static int dup_opt_utf8(JNIEnv *env, jstring s, char **out_buf) {
   size_t byte_len = 0;
   for (jsize i = 0; i < len16; i++) {
     uint16_t c = u16[i];
-    if (c < 0x80) {
+    if (c == 0) {
+      if (u16 != NULL) (*env)->ReleaseStringChars(env, s, u16);
+      throw_ex(env, "java/lang/IllegalArgumentException", "string contains interior NUL byte");
+      return 0;
+    } else if (c < 0x80) {
       byte_len += 1;
     } else if (c < 0x800) {
       byte_len += 2;
@@ -416,6 +472,72 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointFree(
   }
 }
 
+JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_endpointNewFromState(
+    JNIEnv *env, jclass cls, jstring identity_json, jstring roster_json, jstring host_id) {
+  (void)cls;
+  char *c_id = NULL;
+  char *c_roster = NULL;
+  char *c_host = NULL;
+  TendrilEndpoint *ep = NULL;
+  if (dup_opt_utf8(env, identity_json, &c_id) &&
+      dup_opt_utf8(env, roster_json, &c_roster) &&
+      dup_opt_utf8(env, host_id, &c_host)) {
+    ep = tendril_endpoint_new_from_state(c_id, c_roster, c_host);
+  }
+  zeroize_cstr_free(c_id);
+  free(c_roster);
+  free(c_host);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
+  if (ep == NULL) {
+    throw_ffi_error(env, TENDRIL_ERR_INTERNAL, "tendril_endpoint_new_from_state failed");
+    return 0;
+  }
+  return (jlong)(uintptr_t)ep;
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointClose(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)env;
+  (void)cls;
+  if (ptr != 0) {
+    tendril_endpoint_close((TendrilEndpoint *)(uintptr_t)ptr);
+  }
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointExportIdentityJson(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_endpoint_export_identity_json((TendrilEndpoint *)(uintptr_t)ptr, &out);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_export_identity_json failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointExportRosterJson(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_endpoint_export_roster_json((TendrilEndpoint *)(uintptr_t)ptr, &out);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_export_roster_json failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
 JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointInfoJson(
     JNIEnv *env, jclass cls, jlong ptr) {
   (void)cls;
@@ -704,6 +826,31 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionAccept(
     return 0;
   }
   return (jlong)(uintptr_t)sess;
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_sessionShutdown(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)env;
+  (void)cls;
+  if (ptr != 0) {
+    tendril_session_shutdown((TendrilSession *)(uintptr_t)ptr);
+  }
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_sessionExportRosterJson(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "session freed");
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_session_export_roster_json((TendrilSession *)(uintptr_t)ptr, &out);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_session_export_roster_json failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
 }
 
 JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_sessionFree(

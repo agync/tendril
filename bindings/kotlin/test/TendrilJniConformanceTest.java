@@ -593,6 +593,123 @@ public final class TendrilJniConformanceTest {
     }
   }
 
+  private static void verifyJniSecurityHardening() throws Exception {
+    // SEC-16: reject interior NUL bytes across JNI strings.
+    boolean nulRejected = false;
+    try {
+      TendrilNative.computeCodeMac("4829-1704\u0000EXTRA", new byte[32]);
+    } catch (IllegalArgumentException e) {
+      nulRejected = true;
+    }
+    check(nulRejected, "computeCodeMac must reject interior NUL");
+
+    // SEC-08: endpointNewFromState + export roundtrip creates zero files.
+    long memEp = TendrilNative.endpointNewFromState(null, null, "jni-state-host");
+    try {
+      String idJson = TendrilNative.endpointExportIdentityJson(memEp);
+      String rstJson = TendrilNative.endpointExportRosterJson(memEp);
+      String infoOrig = TendrilNative.endpointInfoJson(memEp);
+      long restored = TendrilNative.endpointNewFromState(idJson, rstJson, null);
+      try {
+        check(
+            infoOrig.equals(TendrilNative.endpointInfoJson(restored)),
+            "restored endpoint info mismatch");
+      } finally {
+        TendrilNative.endpointFree(restored);
+      }
+
+      // SEC-37: non-BMP emoji and long (> 512-byte) errors preserve UTF-8 verbatim under -Xcheck:jni.
+      String emojiPeer = "peer_\uD83D\uDE00_" + "x".repeat(600);
+      String caughtMsg = null;
+      try {
+        TendrilNative.endpointRevokePeer(memEp, emojiPeer);
+      } catch (IllegalStateException e) {
+        caughtMsg = e.getMessage();
+      }
+      check(caughtMsg != null && caughtMsg.contains(emojiPeer), "emoji/long error corrupted: " + caughtMsg);
+    } finally {
+      TendrilNative.endpointFree(memEp);
+    }
+
+    // SEC-17: endpointClose unblocks parked sessionAccept(5000) and sessionPollEvent(5000) does not stall ops.
+    long hostEp = TendrilNative.endpointNewFromState(null, null, "jni-sec17-host");
+    long cliEp = TendrilNative.endpointNewFromState(null, null, "jni-sec17-cli");
+    try {
+      String ep = TendrilNative.endpointServeDirect(hostEp, "127.0.0.1:0");
+      String code = TendrilNative.endpointIssueCode(hostEp, "lan");
+      final String[] acc = new String[1];
+      Thread pt =
+          new Thread(
+              () -> {
+                acc[0] = TendrilNative.endpointPairAccept(hostEp, 5000);
+              });
+      pt.start();
+      Map<String, Object> cliPair =
+          asObj(Json.parse(TendrilNative.endpointPairInitiate(cliEp, ep, null, code, "j", "android")));
+      pt.join(5000);
+      String devId = asStr(asObj(Json.parse(acc[0])).get("device_id"));
+      TendrilNative.endpointConfirmPeer(hostEp, devId, asStr(cliPair.get("sas")));
+      TendrilNative.endpointConfirmPeer(cliEp, "jni-sec17-host", asStr(cliPair.get("sas")));
+      String grant =
+          TendrilNative.endpointMintGrant(hostEp, devId, Json.stringify(List.of("fs.read")), 3600);
+
+      final long[] hostSessHolder = new long[1];
+      Thread st =
+          new Thread(
+              () -> {
+                hostSessHolder[0] = TendrilNative.sessionAccept(hostEp, 5000);
+              });
+      st.start();
+      long cliSess = TendrilNative.sessionConnect(cliEp, ep, null, "jni-sec17-host", grant);
+      st.join(5000);
+      long hostSess = hostSessHolder[0];
+      check(hostSess != 0, "session accept failed");
+      String sessRoster = TendrilNative.sessionExportRosterJson(hostSess);
+      check(sessRoster.contains(devId), "sessionExportRosterJson missing peer");
+
+      long t0 = System.nanoTime();
+      final String[] pollOut = new String[1];
+      Thread pollT =
+          new Thread(
+              () -> {
+                pollOut[0] = TendrilNative.sessionPollEvent(hostSess, 5000);
+              });
+      pollT.start();
+      Thread.sleep(60);
+      check(TendrilNative.sessionAuthorize(hostSess, "fs.read"), "authorize failed while polling");
+      TendrilNative.sessionSendData(hostSess, "jni-duplex".getBytes(StandardCharsets.UTF_8));
+      Map<String, Object> cliEv = asObj(Json.parse(TendrilNative.sessionPollEvent(cliSess, 2000)));
+      check("data".equals(cliEv.get("event")), "expected duplex data event: " + cliEv);
+      TendrilNative.sessionShutdown(hostSess);
+      pollT.join(2000);
+      check(pollOut[0].contains("\"eof\""), "expected eof on sessionShutdown: " + pollOut[0]);
+      long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+      check(elapsedMs < 1500, "full-duplex JNI ops stalled: " + elapsedMs + "ms");
+
+      TendrilNative.sessionFree(cliSess);
+      TendrilNative.sessionFree(hostSess);
+
+      long closeT0 = System.nanoTime();
+      Thread blockedAcc =
+          new Thread(
+              () -> {
+                try {
+                  TendrilNative.sessionAccept(hostEp, 5000);
+                } catch (IllegalStateException ignored) {
+                }
+              });
+      blockedAcc.start();
+      Thread.sleep(60);
+      TendrilNative.endpointClose(hostEp);
+      blockedAcc.join(2000);
+      long closeMs = (System.nanoTime() - closeT0) / 1_000_000L;
+      check(closeMs < 1500, "endpointClose stalled: " + closeMs + "ms");
+    } finally {
+      TendrilNative.endpointFree(cliEp);
+      TendrilNative.endpointFree(hostEp);
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     Path root = Paths.get("").toAbsolutePath().normalize();
     Path peerBin = root.resolve("target").resolve("debug").resolve("tendril-conformance-peer");
@@ -600,6 +717,7 @@ public final class TendrilJniConformanceTest {
     System.out.println("JNI_VECTORS_OK=true");
     verifyLiveInterop(peerBin);
     verifyServeP2pLoopback();
+    verifyJniSecurityHardening();
     System.out.println("JNI_LIVE_INTEROP_OK=true");
   }
 }

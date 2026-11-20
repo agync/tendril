@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	tendril "tendril.dev/bindings/go"
 )
@@ -569,6 +570,144 @@ func TestServeP2pDisabledLoopback(t *testing.T) {
 	ev, err := hostSess.PollEvent(2000)
 	if err != nil || ev.Event != "data" {
 		t.Fatalf("expected p2p data event, got %+v err=%v", ev, err)
+	}
+}
+
+func TestNulByteRejection(t *testing.T) {
+	var hh [32]byte
+	if _, err := tendril.ComputeCodeMAC("4829-1704\x00EXTRA", hh); err == nil {
+		t.Fatal("ComputeCodeMAC must reject interior NUL")
+	}
+	if _, err := tendril.VerifyGrantJSON("{}\x00", "{}", "s", "r", "fs.read\x00.delete", 1, ""); err == nil {
+		t.Fatal("VerifyGrantJSON must reject interior NUL")
+	}
+	if _, err := tendril.VerifyRotationChainJSON("a\x00b", "c", 0, "[]", "d", "e"); err == nil {
+		t.Fatal("VerifyRotationChainJSON must reject interior NUL")
+	}
+	if _, err := tendril.NewEndpoint("", "host\x00bad"); err == nil {
+		t.Fatal("NewEndpoint must reject interior NUL")
+	}
+	ep, err := tendril.NewEndpoint("", "go-nul-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer ep.Close()
+	if _, err := ep.ServeDirect("127.0.0.1:0\x00bad"); err == nil {
+		t.Fatal("ServeDirect must reject interior NUL")
+	}
+	if _, err := ep.IssueCode("lan\x00"); err == nil {
+		t.Fatal("IssueCode must reject interior NUL")
+	}
+	if err := ep.RevokePeer("dev_1234\x005678"); err == nil {
+		t.Fatal("RevokePeer must reject interior NUL")
+	}
+}
+
+func TestConcurrentEndpointCloseAndFullDuplexSession(t *testing.T) {
+	hostEp, err := tendril.NewEndpoint("", "go-sec17-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint host: %v", err)
+	}
+	cliEp, err := tendril.NewEndpoint("", "go-sec17-cli")
+	if err != nil {
+		t.Fatalf("NewEndpoint cli: %v", err)
+	}
+
+	addr, err := hostEp.ServeDirect("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	code, err := hostEp.IssueCode("lan")
+	if err != nil {
+		t.Fatalf("IssueCode: %v", err)
+	}
+	pairCh := make(chan tendril.PairAcceptResult, 1)
+	go func() {
+		res, _ := hostEp.PairAccept(5000)
+		pairCh <- res
+	}()
+	cliPair, err := cliEp.PairInitiate(addr, "", code, "go-dev", "go")
+	if err != nil {
+		t.Fatalf("PairInitiate: %v", err)
+	}
+	acc := <-pairCh
+	if err := hostEp.ConfirmPeer(acc.DeviceID, acc.SAS); err != nil {
+		t.Fatalf("ConfirmPeer: %v", err)
+	}
+	if err := cliEp.ConfirmPeer("go-sec17-host", cliPair.SAS); err != nil {
+		t.Fatalf("cli ConfirmPeer: %v", err)
+	}
+	grant, err := hostEp.MintGrant(acc.DeviceID, []string{"fs.read"}, 3600)
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+
+	sessCh := make(chan *tendril.Session, 1)
+	go func() {
+		s, err := hostEp.AcceptSession(5000)
+		if err == nil {
+			sessCh <- s
+		}
+	}()
+	cliSess, err := cliEp.Connect(addr, "", "go-sec17-host", grant)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	hostSess := <-sessCh
+
+	pollDone := make(chan error, 1)
+	go func() {
+		_, err := hostSess.PollEvent(5000)
+		pollDone <- err
+	}()
+	time.Sleep(60 * time.Millisecond)
+
+	t0 := time.Now()
+	if allowed, err := hostSess.Authorize("fs.read"); err != nil || !allowed {
+		t.Fatalf("Authorize failed while polling: allowed=%v err=%v", allowed, err)
+	}
+	if _, err := hostSess.Authorize("fs.read\x00.delete"); err == nil {
+		t.Fatal("Authorize must reject interior NUL")
+	}
+	if err := hostSess.SendData([]byte("go-duplex-ok")); err != nil {
+		t.Fatalf("SendData failed while polling: %v", err)
+	}
+
+	ev, err := cliSess.PollEvent(2000)
+	if err != nil || ev.Event != "data" {
+		t.Fatalf("expected cli data event while host polling, got %+v err=%v", ev, err)
+	}
+	if err := hostSess.Close(); err != nil {
+		t.Fatalf("hostSess Close: %v", err)
+	}
+	if err := <-pollDone; !errors.Is(err, errors.New("EOF")) && err.Error() != "EOF" {
+		t.Fatalf("expected EOF unblocking PollEvent on Close, got %v", err)
+	}
+	if time.Since(t0) > time.Second {
+		t.Fatalf("full-duplex Go ops took too long: %v", time.Since(t0))
+	}
+	_ = cliSess.Close()
+	_ = cliEp.Close()
+
+	// Endpoint.Close() must wake blocked AcceptSession(5000) promptly without blocking Info().
+	accErrCh := make(chan error, 1)
+	go func() {
+		_, err := hostEp.AcceptSession(5000)
+		accErrCh <- err
+	}()
+	time.Sleep(60 * time.Millisecond)
+	closeT0 := time.Now()
+	if info, err := hostEp.Info(); err != nil || info.HostID != "go-sec17-host" {
+		t.Fatalf("Info while AcceptSession parked failed: %+v err=%v", info, err)
+	}
+	if err := hostEp.Close(); err != nil {
+		t.Fatalf("hostEp Close: %v", err)
+	}
+	if err := <-accErrCh; err == nil {
+		t.Fatal("expected AcceptSession error after Endpoint.Close()")
+	}
+	if time.Since(closeT0) > time.Second {
+		t.Fatalf("Endpoint.Close took too long: %v", time.Since(closeT0))
 	}
 }
 

@@ -441,6 +441,77 @@ class TendrilPythonTests(unittest.TestCase):
             host_ep.close()
             cli_ep.close()
 
+    def test_full_duplex_poll_does_not_block_send_authorize_and_expiry(self) -> None:
+        host_ep = tendril.Endpoint(None, "py-sec17-host")
+        cli_ep = tendril.Endpoint(None, "py-sec17-cli")
+        try:
+            addr = host_ep.serve_direct("127.0.0.1:0")
+            code = host_ep.issue_code("lan")
+            t_pair = threading.Thread(target=lambda: host_ep.pair_accept(5000))
+            t_pair.start()
+            cli_pair = json.loads(cli_ep.pair_initiate(addr, code))
+            t_pair.join(timeout=5)
+            host_ep.confirm_peer(cli_pair["device_id"], cli_pair["sas"])
+            cli_ep.confirm_peer("py-sec17-host", cli_pair["sas"])
+            grant = host_ep.mint_grant(cli_pair["device_id"], ["fs.read"], 3600)
+
+            sess_holder: dict = {}
+            t_acc = threading.Thread(
+                target=lambda: sess_holder.__setitem__("sess", host_ep.accept_session(5000))
+            )
+            t_acc.start()
+            cli_sess = cli_ep.connect(addr, "py-sec17-host", grant)
+            t_acc.join(timeout=5)
+            host_sess = sess_holder["sess"]
+
+            poll_holder: dict = {}
+            t_poll = threading.Thread(
+                target=lambda: poll_holder.__setitem__("ev", host_sess.poll_event(5000))
+            )
+            t_poll.start()
+            time.sleep(0.06)
+
+            t0 = time.monotonic()
+            self.assertTrue(host_sess.authorize("fs.read"))
+            host_sess.send_data(b"py-duplex-reply")
+            cli_ev = json.loads(cli_sess.poll_event(2000))
+            self.assertEqual(cli_ev["event"], "data")
+            cli_sess.send_data(b"py-wake-host")
+            t_poll.join(timeout=2)
+            self.assertLess(time.monotonic() - t0, 1.5)
+            self.assertEqual(json.loads(poll_holder["ev"])["event"], "data")
+
+            # SEC-31: grant expiring while poll_event(5000) is parked must reject incoming rekey.
+            short_grant = host_ep.mint_grant(cli_pair["device_id"], ["fs.read"], 1)
+            sess2_holder: dict = {}
+            t_acc2 = threading.Thread(
+                target=lambda: sess2_holder.__setitem__("sess", host_ep.accept_session(5000))
+            )
+            t_acc2.start()
+            cli_sess2 = cli_ep.connect(addr, "py-sec17-host", short_grant)
+            t_acc2.join(timeout=5)
+            host_sess2 = sess2_holder["sess"]
+            poll2_err: dict = {}
+
+            def poll_exp() -> None:
+                try:
+                    poll2_err["ev"] = host_sess2.poll_event(5000)
+                except RuntimeError as exc:
+                    poll2_err["err"] = str(exc)
+
+            t_exp = threading.Thread(target=poll_exp)
+            t_exp.start()
+            time.sleep(2.2)
+            cli_sess2.rekey()
+            t_exp.join(timeout=3)
+            self.assertIn("err", poll2_err)
+
+            cli_sess2.close()
+            cli_sess.close()
+        finally:
+            host_ep.close()
+            cli_ep.close()
+
 
 if __name__ == "__main__":
     unittest.main()

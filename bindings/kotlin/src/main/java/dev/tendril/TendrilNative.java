@@ -36,7 +36,16 @@ final class TendrilNative {
 
   public static native long endpointNew(String stateDir, String hostId);
 
+  public static native long endpointNewFromState(
+      String identityJson, String rosterJson, String hostId);
+
+  public static native void endpointClose(long ptr);
+
   public static native void endpointFree(long ptr);
+
+  public static native String endpointExportIdentityJson(long ptr);
+
+  public static native String endpointExportRosterJson(long ptr);
 
   public static native String endpointInfoJson(long ptr);
 
@@ -65,6 +74,10 @@ final class TendrilNative {
       long epPtr, String endpoint, String relayHost, String targetHostId, String grantJson);
 
   public static native long sessionAccept(long epPtr, long timeoutMs);
+
+  public static native void sessionShutdown(long ptr);
+
+  public static native String sessionExportRosterJson(long ptr);
 
   public static native void sessionFree(long ptr);
 

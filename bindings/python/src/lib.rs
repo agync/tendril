@@ -18,13 +18,12 @@ use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_c
 use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
 use tendril_core::roster::Roster;
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener, InboundRouter, P2pListener,
-    PathListener, PathStream, RelayListener, SessionDriver, SessionEvent, StateStore,
-    dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
+    ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
+    InboundRouter, P2pListener, PathListener, PathStream, RelayListener, SessionDriver,
+    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
     drive_pair_responder_with_options, pairing_path_kind_for_provider, parse_p2p_relay_mode,
 };
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 
 fn persist_store_roster(
@@ -568,7 +567,7 @@ impl Endpoint {
             rt: Arc::clone(&self.rt),
             store: self.store.clone(),
             roster: Arc::clone(&self.roster),
-            driver: Arc::new(AsyncMutex::new(driver)),
+            session: Arc::new(driver.into_concurrent()),
         })
     }
 
@@ -606,7 +605,7 @@ impl Endpoint {
             rt: Arc::clone(&self.rt),
             store: self.store.clone(),
             roster: Arc::clone(&self.roster),
-            driver: Arc::new(AsyncMutex::new(driver)),
+            session: Arc::new(driver.into_concurrent()),
         })
     }
 
@@ -621,7 +620,7 @@ struct Session {
     rt: Arc<Runtime>,
     store: Option<Arc<StateStore>>,
     roster: Arc<StdMutex<Roster>>,
-    driver: Arc<AsyncMutex<SessionDriver>>,
+    session: Arc<ConcurrentSession>,
 }
 
 #[pymethods]
@@ -629,12 +628,10 @@ impl Session {
     fn send_data(&self, py: Python<'_>, payload: &[u8]) -> PyResult<()> {
         let data = payload.to_vec();
         let rt = Arc::clone(&self.rt);
-        let drv = Arc::clone(&self.driver);
+        let sess = Arc::clone(&self.session);
         py.detach(move || {
             rt.block_on(async move {
-                let mut guard = drv.lock().await;
-                guard
-                    .send_data(&data)
+                sess.send_data(&data)
                     .await
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })
@@ -644,15 +641,14 @@ impl Session {
     #[pyo3(signature = (timeout_ms=5000))]
     fn poll_event(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<String> {
         let rt = Arc::clone(&self.rt);
-        let drv = Arc::clone(&self.driver);
+        let sess = Arc::clone(&self.session);
         let roster = Arc::clone(&self.roster);
         let store = self.store.clone();
         let wait = Duration::from_millis(timeout_ms);
 
         py.detach(move || {
             rt.block_on(async move {
-                let mut guard = drv.lock().await;
-                match timeout(wait, guard.next_event_locked(now_unix(), &roster)).await {
+                match timeout(wait, sess.next_event_locked_now(&roster)).await {
                     Ok(Ok(Some(ev))) => {
                         let json = match ev {
                             SessionEvent::AppData(data) => serde_json::json!({
@@ -713,27 +709,21 @@ impl Session {
     }
 
     fn authorize(&self, py: Python<'_>, requested_cap: &str) -> bool {
-        let rt = Arc::clone(&self.rt);
-        let drv = Arc::clone(&self.driver);
+        let sess = Arc::clone(&self.session);
         let roster = Arc::clone(&self.roster);
         let cap = requested_cap.to_owned();
         py.detach(move || {
-            rt.block_on(async move {
-                let guard = drv.lock().await;
-                let r = roster.lock().expect("roster mutex poisoned");
-                guard.authorize(&cap, now_unix(), &r).0.is_ok()
-            })
+            let r = roster.lock().expect("roster mutex poisoned");
+            sess.authorize(&cap, now_unix(), &r).0.is_ok()
         })
     }
 
     fn rekey(&self, py: Python<'_>) -> PyResult<()> {
         let rt = Arc::clone(&self.rt);
-        let drv = Arc::clone(&self.driver);
+        let sess = Arc::clone(&self.session);
         py.detach(move || {
             rt.block_on(async move {
-                let mut guard = drv.lock().await;
-                guard
-                    .send_rekey()
+                sess.send_rekey()
                     .await
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })
@@ -743,13 +733,11 @@ impl Session {
     #[pyo3(signature = (code=1000, reason="normal"))]
     fn close(&self, py: Python<'_>, code: u16, reason: &str) -> PyResult<()> {
         let rt = Arc::clone(&self.rt);
-        let drv = Arc::clone(&self.driver);
+        let sess = Arc::clone(&self.session);
         let reason_s = reason.to_owned();
         py.detach(move || {
             rt.block_on(async move {
-                let mut guard = drv.lock().await;
-                guard
-                    .send_close(code, &reason_s)
+                sess.send_close(code, &reason_s)
                     .await
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })

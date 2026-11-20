@@ -4,7 +4,10 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
   <uses-permission android:name="android.permission.INTERNET" />
 
-  <application>
+  <application
+    android:allowBackup="false"
+    android:fullBackupContent="@xml/tendril_backup_rules"
+    android:dataExtractionRules="@xml/tendril_data_extraction_rules">
     <service
       android:name="dev.tendril.TendrilForegroundService"
       android:exported="false"
