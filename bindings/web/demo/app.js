@@ -172,7 +172,8 @@ $("connect-btn").addEventListener("click", async () => {
 
 $("reconnect-btn").addEventListener("click", async () => {
   try {
-    appendLog("Reconnecting session via relay...");
+    const { endpoint } = transportArgsFromUi();
+    appendLog(`Reconnecting session via ${endpoint ? "iroh P2P" : "relay"}...`);
     await connectSession();
   } catch (err) {
     appendLog(`Reconnect failed: ${err.message || err}`);

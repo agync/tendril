@@ -58,6 +58,13 @@ async function sendProtocolBytes(stream, bytes) {
   }
 }
 
+async function warmTargetTransport(endpoint, relayUrl) {
+  const target = endpoint || relayUrl;
+  if (target && target.startsWith("iroh://")) {
+    await initTendrilP2p();
+  }
+}
+
 async function dialWebStream({
   endpoint = null,
   relayUrl = null,
@@ -285,6 +292,7 @@ export class TendrilWebClient {
       throw new Error("pairing code or pairingUri is required");
     }
 
+    await warmTargetTransport(endpoint, relayUrl);
     const deadlineMs = performance.now() + timeoutMs;
     const initiator = new WasmPairInitiator(
       this.#identity,
@@ -294,15 +302,16 @@ export class TendrilWebClient {
       hostStaticPin,
       hostSigningPin
     );
-    const stream = await dialWebStream({
-      endpoint,
-      relayUrl,
-      targetPub,
-      expectedHost,
-      relayUrlOverride,
-      timeoutMs: remainingBudgetMs(deadlineMs, "pairing timed out connecting to transport"),
-    });
+    let stream = null;
     try {
+      stream = await dialWebStream({
+        endpoint,
+        relayUrl,
+        targetPub,
+        expectedHost,
+        relayUrlOverride,
+        timeoutMs: remainingBudgetMs(deadlineMs, "pairing timed out connecting to transport"),
+      });
       const startBytes = initiator.start();
       await sendProtocolBytes(stream, startBytes);
       while (true) {
@@ -335,7 +344,9 @@ export class TendrilWebClient {
       }
     } finally {
       initiator.free();
-      await stream.close();
+      if (stream) {
+        await stream.close();
+      }
     }
   }
 
@@ -350,6 +361,7 @@ export class TendrilWebClient {
     crlSeq = null,
     timeoutMs = 15000,
   }) {
+    await warmTargetTransport(endpoint, relayUrl);
     const deadlineMs = performance.now() + timeoutMs;
     const seq = crlSeq ?? this.#roster.crl_seq(targetHostId);
     const session = new WasmSessionClient(
@@ -358,16 +370,17 @@ export class TendrilWebClient {
       grantJson,
       seq ?? null
     );
-    const stream = await dialWebStream({
-      endpoint,
-      relayUrl,
-      targetPub,
-      expectedHost,
-      relayUrlOverride,
-      timeoutMs: remainingBudgetMs(deadlineMs, "session handshake timed out connecting to transport"),
-    });
-    const startedMs = performance.now();
+    let stream = null;
     try {
+      stream = await dialWebStream({
+        endpoint,
+        relayUrl,
+        targetPub,
+        expectedHost,
+        relayUrlOverride,
+        timeoutMs: remainingBudgetMs(deadlineMs, "session handshake timed out connecting to transport"),
+      });
+      const startedMs = performance.now();
       const m1 = session.start();
       await sendProtocolBytes(stream, m1);
       while (!session.is_established()) {
@@ -419,7 +432,9 @@ export class TendrilWebClient {
       );
     } catch (err) {
       session.free();
-      await stream.close();
+      if (stream) {
+        await stream.close();
+      }
       throw err;
     }
   }

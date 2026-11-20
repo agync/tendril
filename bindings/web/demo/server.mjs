@@ -2,7 +2,9 @@ import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
+import { pipeline } from "node:stream";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.resolve(__dirname, "..");
@@ -46,6 +48,7 @@ const MIME = {
   ".json": "application/json; charset=utf-8",
   ".css": "text/css; charset=utf-8",
 };
+const COMPRESSIBLE_EXTS = new Set([".wasm", ".js", ".mjs", ".html", ".css", ".json"]);
 
 function resolveSafe(baseDir, relPath) {
   const clean = path.normalize(relPath).replace(/^(\.\.(\/|\\|$))+/, "");
@@ -106,8 +109,28 @@ const server = http.createServer((req, res) => {
     return;
   }
   const ext = path.extname(filePath);
-  res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
-  fs.createReadStream(filePath).pipe(res);
+  const contentType = MIME[ext] || "application/octet-stream";
+  const compressible = COMPRESSIBLE_EXTS.has(ext);
+  const acceptsGzip = /\bgzip\b/i.test(String(req.headers["accept-encoding"] || ""));
+  const useGzip = compressible && acceptsGzip;
+  const headers = { "Content-Type": contentType };
+  if (compressible) {
+    headers.Vary = "Accept-Encoding";
+  }
+  if (useGzip) {
+    headers["Content-Encoding"] = "gzip";
+  }
+  res.writeHead(200, headers);
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  const raw = fs.createReadStream(filePath);
+  if (useGzip) {
+    pipeline(raw, zlib.createGzip(), res, () => {});
+  } else {
+    pipeline(raw, res, () => {});
+  }
 });
 
 server.on("upgrade", (req, socket, head) => {
