@@ -1,0 +1,71 @@
+# Agent scratch area: working notes, drafts, inbox, task breakdowns.
+# Never committed.
+/.agents/brain/
+
+# Local assistant state and tool shims. The one contract is AGENTS.md; every
+# shim points at it, and .agents/bootstrap.sh writes them. Never committed.
+/.claude/
+/.gemini/
+/.antigravity/
+/.cursor/
+/.opencode/
+/.pi/
+/.codex/
+/.windsurf/
+/.continue/
+/.aider*
+/CLAUDE.md
+/GEMINI.md
+/ANTIGRAVITY.md
+/CURSOR.md
+/PI.md
+/.cursorrules
+/.windsurfrules
+
+# Worktrees
+/.worktrees/
+
+# Rust build output
+/target/
+
+# Go build and test output
+*.test
+*.out
+
+# Python virtualenvs, caches, and build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+wheels/
+
+# Node, TypeScript, and WASM output
+node_modules/
+dist/
+pkg/
+*.node
+
+# Mobile and native build artifacts
+.gradle/
+build/
+.build/
+DerivedData/
+*.xcframework/
+
+# Rendered docs
+/_site/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Editor and OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
