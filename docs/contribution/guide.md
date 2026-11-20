@@ -38,3 +38,4 @@ flowchart LR
 | Docs | Update `spec/` and `docs/` (including parent `index.md` and `docs/logs/` via `make docs/log`) in the same commit |
 | Verify | Run `make check` and confirm all hooks, lints, docs checks, and tests pass |
 | Review | Run a skeptical maintainer review before requesting a push; humans approve outward actions |
+| Security Audit | Run the two-wave security and privacy audit skill before release or protocol milestones (`.agents/skills/security-privacy-audit/SKILL.md`) |
