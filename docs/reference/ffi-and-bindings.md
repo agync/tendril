@@ -16,46 +16,49 @@ Tendril keeps one Rust core (`tendril-core` + `tendril-runtime`) across every ta
 Host app (Go / Python / Node.js)
   -> Thin language wrapper (mutex / GIL release / N-API Promise)
     -> C ABI (`tendril-ffi`) or direct Rust bridge (PyO3 / napi-rs)
-      -> `tendril-runtime` + `tendril-core`
+      -> `tendril-runtime` (`InboundRouter`, `StateStore`, `SessionDriver`) + `tendril-core`
 ```
 
+- **Shared inbound routing (`InboundRouter`):** Peeks each incoming stream's cleartext preamble under the pre-auth rate limiter and dispatches `Intent::Pair` and `Intent::Session` streams onto separate queues (`pair_rx` and `session_rx`) so `pair_accept` and `accept_session` never block or starve each other, while `close()` wakes waiting callers immediately.
+- **Durable roster persistence:** Host key rotations and rotation-fork revocations during `connect`, as well as CRL updates (including session-terminating `0x03 REVOCATION` frames), are persisted to `StateStore` across `tendril-ffi`, Python, and Node.
 - **Go (`bindings/go`):** Links `libtendril_ffi` through cgo against `crates/tendril-ffi/include/tendril.h`.
-- **Python (`bindings/python`):** Builds a PyO3 `abi3-py39` extension module (`tendril._tendril`) with `unsafe_code = "forbid"`, releasing the GIL via `py.detach` around Argon2 derivation (`compute_code_mac`) and every blocking runtime call.
-- **Node.js (`bindings/node`):** Builds a `napi-rs` N-API v8 native addon (`index.node`) with `unsafe_code = "forbid"`, offloading Argon2 and async session/endpoint operations onto Tokio so the JS event loop remains responsive.
+- **Python (`bindings/python`):** Builds a PyO3 `abi3-py39` extension module (`tendril._tendril`) with `unsafe_code = "forbid"`, releasing the GIL via `py.detach` around Argon2 derivation (`compute_code_mac`) and every `Endpoint`/`Session` mutex, disk I/O, or blocking runtime operation (`info_json` is a lock-free metadata serialization).
+- **Node.js (`bindings/node`):** Builds a `napi-rs` N-API v8 native addon (`index.node`) with `unsafe_code = "forbid"`, offloading Argon2 (`computeCodeMac`) and async session/endpoint operations onto Tokio so the JS event loop stays responsive.
 
 ## C ABI surface (`crates/tendril-ffi`)
 
-`crates/tendril-ffi/include/tendril.h` defines a callback-free polled C ABI backed by a multi-threaded Tokio runtime:
+`crates/tendril-ffi/include/tendril.h` is manually maintained in lockstep with `crates/tendril-ffi/src/lib.rs` and defines a callback-free polled C ABI backed by a multi-threaded Tokio runtime:
 
 | Symbol Group | Representative Functions | Ownership & Error Contract |
 |---|---|---|
 | Status & cleanup | `tendril_last_error`, `tendril_string_free` | Negative `TendrilResult` populates thread-local error buffer; heap strings returned via `char **` must be released with `tendril_string_free` |
-| Vector & core helpers | `tendril_device_id`, `tendril_fingerprint_host`, `tendril_fingerprint_device`, `tendril_pairing_sas`, `tendril_compute_code_mac`, `tendril_verify_rotation_chain_json`, `tendril_verify_grant_json` | Pure delegation to `tendril-core` with `catch_unwind` panic boundaries |
-| Endpoint lifecycle | `tendril_endpoint_new`, `tendril_endpoint_free`, `tendril_endpoint_info_json`, `tendril_endpoint_serve_direct`, `tendril_endpoint_serve_relay`, `tendril_endpoint_issue_code`, `tendril_endpoint_pair_initiate`, `tendril_endpoint_pair_accept`, `tendril_endpoint_confirm_peer`, `tendril_endpoint_mint_grant`, `tendril_endpoint_revoke_peer` | Opaque `TendrilEndpoint *`; state directory defaults to ephemeral in-memory operation when NULL |
-| Session lifecycle & polling | `tendril_session_connect`, `tendril_session_accept`, `tendril_session_free`, `tendril_session_send_data`, `tendril_session_poll_event`, `tendril_session_authorize`, `tendril_session_rekey`, `tendril_session_close` | Opaque `TendrilSession *` remains valid after `tendril_endpoint_free`; `tendril_session_poll_event` returns `TENDRIL_OK` (`0`), `TENDRIL_WOULD_BLOCK` (`1`), or `TENDRIL_EOF` (`2`) |
+| Vector & core helpers | `tendril_device_id`, `tendril_fingerprint_host`, `tendril_fingerprint_device`, `tendril_pairing_sas`, `tendril_compute_code_mac`, `tendril_verify_rotation_chain_json`, `tendril_verify_grant_json` | Pure delegation to `tendril-core` with early out-pointer validation and `catch_unwind` panic boundaries |
+| Endpoint lifecycle | `tendril_endpoint_new`, `tendril_endpoint_free`, `tendril_endpoint_info_json`, `tendril_endpoint_serve_direct`, `tendril_endpoint_serve_relay`, `tendril_endpoint_issue_code`, `tendril_endpoint_pair_initiate`, `tendril_endpoint_pair_accept`, `tendril_endpoint_confirm_peer`, `tendril_endpoint_mint_grant`, `tendril_endpoint_revoke_peer` | Opaque `TendrilEndpoint *`; NULL or empty `state_dir` selects ephemeral in-memory operation |
+| Session lifecycle & polling | `tendril_session_connect`, `tendril_session_accept`, `tendril_session_free`, `tendril_session_send_data`, `tendril_session_poll_event`, `tendril_session_authorize`, `tendril_session_rekey`, `tendril_session_close` | Opaque `TendrilSession *` remains valid after `tendril_endpoint_free`; `tendril_session_poll_event` validates `out_event_json` before polling and returns `TENDRIL_OK` (`0`), `TENDRIL_WOULD_BLOCK` (`1`), or `TENDRIL_EOF` (`2`) |
 
 ### `TendrilResult` status codes
 
 - `TENDRIL_OK` (`0`): operation succeeded.
 - `TENDRIL_WOULD_BLOCK` (`1`): timed poll completed with no queued event ready.
 - `TENDRIL_EOF` (`2`): peer stream ended cleanly.
-- Negative codes (`TENDRIL_ERR_INVALID_ARG` `-1`, `TENDRIL_ERR_NOT_FOUND` `-2`, `TENDRIL_ERR_BUFFER_TOO_SMALL` `-3`, `TENDRIL_ERR_CLOSED` `-5`, `TENDRIL_ERR_PROTOCOL` `-6`, `TENDRIL_ERR_INTERNAL` `-7`): error details are readable via `tendril_last_error`.
+- Negative codes (`TENDRIL_ERR_INVALID_ARG` `-1`, `TENDRIL_ERR_NOT_FOUND` `-2`, `TENDRIL_ERR_CLOSED` `-5`, `TENDRIL_ERR_PROTOCOL` `-6`, `TENDRIL_ERR_INTERNAL` `-7`): error details are readable via `tendril_last_error`.
 
 ## Language bindings summary
 
 ### Go (`bindings/go`)
 
-- Exposes typed wrappers (`Endpoint`, `Session`, `EndpointInfo`, `PairInitiateResult`, `PairAcceptResult`, `SessionEvent`, `ErrWouldBlock`) and pure helper functions (`DeviceID`, `FingerprintHost`, `FingerprintDevice`, `PairingSAS`, `ComputeCodeMAC`, `VerifyRotationChainJSON`, `VerifyGrantJSON`).
-- Guards `Endpoint` with `sync.RWMutex` and `Session` with `sync.Mutex`, pairing pointer reads with `runtime.KeepAlive` so concurrent `Close()` calls remain data-race free under `go test -race`.
+- Exposes typed wrappers (`Endpoint`, `Session`, `EndpointInfo`, `PairInitiateResult`, `PairAcceptResult`, `SessionEvent` including `Audit`, `ErrWouldBlock`) and pure helper functions (`DeviceID`, `FingerprintHost`, `FingerprintDevice`, `PairingSAS`, `ComputeCodeMAC`, `VerifyRotationChainJSON`, `VerifyGrantJSON`).
+- Guards `Endpoint` with `sync.RWMutex` and `Session` with `sync.Mutex`, pairs pointer and byte-slice reads with `runtime.KeepAlive`, and pins OS threads via `runtime.LockOSThread()` / `runtime.UnlockOSThread()` around cgo calls and `tendril_last_error()` reads so goroutine migration cannot lose or cross-contaminate thread-local errors under `go test -race`.
 
 ### Python (`bindings/python`)
 
 - Exposes `Endpoint`, `Session`, `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, and `verify_grant_json` from `tendril`.
-- `compute_code_mac` and all `Endpoint`/`Session` network or mutex operations run inside `py.detach`, verified by multi-threaded heartbeat tests during concurrent Argon2 execution.
+- `compute_code_mac` and all blocking, mutex-acquiring, or disk-persisting `Endpoint` and `Session` methods release the GIL via `py.detach`, verified by a multi-threaded heartbeat test during concurrent `compute_code_mac` Argon2 execution and concurrent handshake threads.
 
 ### Node.js (`bindings/node`)
 
-- Exposes `Endpoint`, `Session`, synchronous hash/verifier helpers (`deviceId`, `fingerprintHost`, `fingerprintDevice`, `pairingSas`, `verifyRotationChainJson`, `verifyGrantJson`), and async `Promise` methods (`computeCodeMac`, `serveDirect`, `serveRelay`, `pairInitiate`, `pairAccept`, `connect`, `acceptSession`, `sendData`, `pollEvent`, `authorize`, `rekey`, `close`) declared in `bindings/node/index.d.ts`.
+- Exposes `Endpoint`, `Session` (non-constructible directly via `private constructor()` in `bindings/node/index.d.ts`), synchronous hash/verifier helpers (`deviceId`, `fingerprintHost`, `fingerprintDevice`, `pairingSas`, `verifyRotationChainJson`, `verifyGrantJson`), and async `Promise` methods (`computeCodeMac`, `serveDirect`, `serveRelay`, `pairInitiate`, `pairAccept`, `connect`, `acceptSession`, `sendData`, `pollEvent`, `authorize`, `rekey`, `close`).
+- Verified by a `setInterval` timer responsiveness test running alongside concurrent `computeCodeMac` Argon2 promises.
 
 ## Gate #7 baselines (Linux `x86_64` release)
 
@@ -63,16 +66,16 @@ Measured against stripped release builds (`lto = "thin"`, `codegen-units = 1`, `
 
 | Binding / Crate | Stripped Release Size | Per-Call FFI Overhead (`device_id`) | Measurement Method |
 |---|---|---|---|
-| `tendril-ffi` (`target/release/libtendril_ffi.so`) | 3,994,904 bytes (3.81 MiB) | Included via Go cgo measurement | `stat -c%s` on `libtendril_ffi.so` |
-| Go (`bindings/go`) | Links `libtendril_ffi.so` | 281.2 ns/op (`4,029,955` iterations in 1s) | `go test -run=^$ -bench=BenchmarkFFIOverhead -benchtime=1s` (`ldd` verified release library) |
-| Python (`bindings/python`, `lib_tendril.so`) | 4,233,288 bytes (4.04 MiB) | 257.6 ns/op (`100,000` calls in `0.0258s`) | `timeit` calling `tendril.device_id(k)` |
-| Node.js (`bindings/node`, `libtendril_node.so`) | 4,364,104 bytes (4.16 MiB) | 375.6 ns/op (`100,000` calls in `37.56ms`) | `performance.now()` calling `deviceId(k)` |
+| `tendril-ffi` (`target/release/libtendril_ffi.so`) | 4,023,576 bytes (3.84 MiB) | Included via Go cgo measurement | `stat -c%s` on `libtendril_ffi.so` |
+| Go (`bindings/go`) | Links `libtendril_ffi.so` | 363.1 ns/op (`2,924,054` iterations in 1s) | `go test -run=^$ -bench=BenchmarkFFIOverhead -benchtime=1s` (`ldd` verified release library, including `runtime.LockOSThread`) |
+| Python (`bindings/python`, `lib_tendril.so`) | 4,274,248 bytes (4.08 MiB) | 255.2 ns/op (`100,000` calls in `0.0255s`) | `timeit` calling `tendril.device_id(k)` |
+| Node.js (`bindings/node`, `libtendril_node.so`) | 4,405,064 bytes (4.20 MiB) | 475.6 ns/op (`100,000` calls in `47.56ms`) | `performance.now()` calling `deviceId(k)` |
 
 Mobile (`aarch64-apple-ios`, `aarch64-linux-android`) and browser WASM bundle budgets are deferred to Phase 4.
 
 ## Verification
 
-Each binding runs both offline `spec/vectors/` checks and bidirectional live session interop (pairing, SAS confirmation, grant minting, data exchange, authorization, and revocation) against `tendril-conformance-peer`:
+Each binding verifies all canonical `spec/vectors/` files offline and runs bidirectional client/host live interop against `tendril-conformance-peer` (covering pairing, SAS confirmation, capability minting, encrypted data exchange, authorization, revocation, plus `rekey` in Python/Node bidirectional runs and Go concurrency tests):
 
 ```bash
 make bindings/go      # build tendril-ffi and run Go cgo tests with -race
