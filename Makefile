@@ -1,18 +1,19 @@
 .DEFAULT_GOAL := help
 
-export PATH := $(HOME)/.local/bin:$(PATH)
+export PATH := $(HOME)/.cargo/bin:$(HOME)/.local/bin:$(PATH)
 
 OKF_WIKI ?= $(HOME)/.agents/skills/okf-wiki
 DOCS := docs
 KIND ?= Update
 FMT_HOOKS := trailing-whitespace end-of-file-fixer mixed-line-ending
 SHLIB_EXT := $(if $(filter Darwin,$(shell uname -s)),dylib,so)
+JNI_OS := $(if $(filter Darwin,$(shell uname -s)),darwin,linux)
 
 # Pass free-text messages via the environment so quotes and backticks survive shell expansion.
 override MSG := $(value MSG)
 export MSG
 
-.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check bindings/go bindings/python bindings/node bindings/check docs/check docs/build docs/serve docs/log hooks/require hooks/update
+.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check bindings/go bindings/python bindings/node bindings/wasm bindings/web bindings/jni bindings/android bindings/check docs/check docs/build docs/serve docs/log hooks/require hooks/update
 
 ##@ Bootstrap
 
@@ -64,6 +65,7 @@ clean: ## Remove build artifacts
 	cargo clean --manifest-path bindings/python/Cargo.toml
 	cargo clean --manifest-path bindings/node/Cargo.toml
 	rm -f bindings/python/tendril/_tendril.so bindings/node/index.node
+	rm -rf bindings/web/pkg bindings/kotlin/build-jni
 
 ##@ Bindings
 
@@ -84,7 +86,43 @@ bindings/node: ## Build N-API addon and run Node conformance tests
 	cp -f bindings/node/target/debug/libtendril_node.$(SHLIB_EXT) bindings/node/index.node
 	cd bindings/node && node --test
 
-bindings/check: bindings/go bindings/python bindings/node ## Verify Go, Python, and Node bindings and conformance suites
+bindings/wasm: ## Build tendril-wasm for wasm32-unknown-unknown and generate browser bindings
+	cargo build --release --target wasm32-unknown-unknown -p tendril-wasm
+	wasm-bindgen --target web --out-dir bindings/web/pkg target/wasm32-unknown-unknown/release/tendril_wasm.wasm
+
+bindings/web: bindings/wasm ## Run headless Chrome Web SDK conformance and live relay E2E tests
+	cargo build -p tendril-relay --bin tendril-relay
+	cargo build -p tendril-cli --bin tendril-conformance-peer
+	node bindings/web/test/browser_e2e.mjs
+
+bindings/jni: ## Build tendril_jni shared library and run host JVM conformance tests
+	cargo build -p tendril-ffi --lib
+	cargo build -p tendril-cli --bin tendril-conformance-peer
+	@JDK_HOME="$${JAVA_HOME:-$$(dirname "$$(dirname "$$(readlink -f "$$(command -v javac)")")")}"; \
+	mkdir -p bindings/kotlin/build-jni/classes; \
+	gcc -shared -fPIC -Wall -Wextra -Werror \
+	  -I"$$JDK_HOME/include" -I"$$JDK_HOME/include/$(JNI_OS)" \
+	  -Icrates/tendril-ffi/include bindings/kotlin/jni/tendril_jni.c \
+	  -L"$$(pwd)/target/debug" -ltendril_ffi -Wl,-rpath,"$$(pwd)/target/debug" \
+	  -o bindings/kotlin/build-jni/libtendril_jni.$(SHLIB_EXT); \
+	javac -d bindings/kotlin/build-jni/classes \
+	  bindings/kotlin/src/main/java/dev/tendril/TendrilNative.java \
+	  bindings/kotlin/test/TendrilJniConformanceTest.java; \
+	java --enable-native-access=ALL-UNNAMED \
+	  -Djava.library.path="$$(pwd)/bindings/kotlin/build-jni" \
+	  -cp bindings/kotlin/build-jni/classes dev.tendril.TendrilJniConformanceTest
+
+bindings/android: ## Cross-compile tendril-ffi for aarch64-linux-android using local Android NDK
+	@NDK_ROOT="$${ANDROID_NDK_HOME:-$$(ls -d "$(HOME)"/Android/Sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)}"; \
+	NDK_BIN="$$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"; \
+	CLANG="$$(ls "$$NDK_BIN"/aarch64-linux-android*-clang 2>/dev/null | sort -V | awk -F'android|-clang' '$$2 >= 26 {print $$0; exit}')"; \
+	test -x "$$CLANG" || { printf 'bindings/android: no Android NDK aarch64 clang >= API 26 found under %s\n' "$$NDK_ROOT" >&2; exit 1; }; \
+	CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$$CLANG" \
+	CC_aarch64_linux_android="$$CLANG" \
+	AR_aarch64_linux_android="$$NDK_BIN/llvm-ar" \
+	cargo build --release --target aarch64-linux-android -p tendril-ffi --lib
+
+bindings/check: bindings/go bindings/python bindings/node bindings/web bindings/jni ## Verify Go, Python, Node, Web WASM, and Kotlin JNI bindings
 
 ##@ Docs
 

@@ -71,7 +71,7 @@ Measured against stripped release builds (`lto = "thin"`, `codegen-units = 1`, `
 | Python (`bindings/python`, `lib_tendril.so`) | 4,274,248 bytes (4.08 MiB) | 255.2 ns/op (`100,000` calls in `0.0255s`) | `timeit` calling `tendril.device_id(k)` |
 | Node.js (`bindings/node`, `libtendril_node.so`) | 4,405,064 bytes (4.20 MiB) | 475.6 ns/op (`100,000` calls in `47.56ms`) | `performance.now()` calling `deviceId(k)` |
 
-Mobile (`aarch64-apple-ios`, `aarch64-linux-android`) and browser WASM bundle budgets are deferred to Phase 4.
+For mobile (`aarch64-linux-android`, Swift) and browser WASM bundle budgets and Argon2id timings, see [Web and mobile bindings](web-and-mobile.md).
 
 ## Verification
 
