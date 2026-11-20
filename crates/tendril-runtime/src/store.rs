@@ -149,21 +149,30 @@ impl StateStore {
     }
 
     fn atomic_write_0600(&self, target: &Path, bytes: &[u8]) -> Result<(), RuntimeError> {
+        static NEXT_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_name = format!(
-            ".{}.tmp.{}",
+            ".{}.tmp.{}.{}",
             target
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("state"),
-            std::process::id()
+            std::process::id(),
+            seq,
         );
         let tmp_path = self.dir.join(tmp_name);
-        let mut file = open_temp_0600(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp_path, target)?;
-        Ok(())
+        let write_res = (|| -> Result<(), RuntimeError> {
+            let mut file = open_temp_0600(&tmp_path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp_path, target)?;
+            Ok(())
+        })();
+        if write_res.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        write_res
     }
 }
 
@@ -184,8 +193,7 @@ fn open_temp_0600(path: &Path) -> Result<File, RuntimeError> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     Ok(file)
@@ -193,10 +201,6 @@ fn open_temp_0600(path: &Path) -> Result<File, RuntimeError> {
 
 #[cfg(not(unix))]
 fn open_temp_0600(path: &Path) -> Result<File, RuntimeError> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
     Ok(file)
 }

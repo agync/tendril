@@ -18,7 +18,7 @@ Launch `tendril-relay` locally or build the rootless container defined in `crate
 cargo run -p tendril-relay -- --listen 127.0.0.1:8443 --host localhost
 ```
 
-In production deployments, terminate TLS (`wss://<host>/v1/relay`) at your reverse proxy or load balancer and match `--host` to the canonical public hostname verified in `register` and `accept` signatures.
+In production deployments, terminate TLS (`wss://<host>/v1/relay`) at your reverse proxy or load balancer and match `--host` to the canonical public hostname verified in `register` and `accept` signatures. Because `tendril-relay` keys its per-IP token bucket and active connection limit (`max_active_per_ip = 64`) off the TCP peer address, preserve client source IPs via TLS passthrough or configure proxy connection limits accordingly.
 
 ## Endpoint lifecycle with `tendril`
 

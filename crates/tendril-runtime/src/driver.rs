@@ -19,11 +19,14 @@ use tendril_core::roster::Roster;
 use tendril_core::session::{RekeyDirection, SessionAction, SessionMachine};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use tokio::time::sleep;
+use tokio::time::{Instant as TokioInstant, sleep, timeout_at};
 
 use crate::error::RuntimeError;
 use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathStream};
 use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
+
+/// Default pre-authentication handshake deadline guarding responder paths (`10 s`).
+pub const DEFAULT_PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Semantic events emitted by an established [`SessionDriver`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,15 +103,56 @@ pub async fn drive_pair_responder(
     now_unix: u64,
     rate_limiter: Option<&PreAuthRateLimiter>,
 ) -> Result<PairDriveResult, RuntimeError> {
-    let _half_open = rate_limiter
-        .map(|rl| rl.try_acquire(stream.peer_ip()))
-        .transpose()?;
+    drive_pair_responder_with_options(
+        stream,
+        identity,
+        manager,
+        roster,
+        path_kind,
+        now_unix,
+        rate_limiter,
+        None,
+        DEFAULT_PRE_AUTH_TIMEOUT,
+    )
+    .await
+}
+
+/// Drives a pairing responder handshake with an optional caller-held [`HalfOpenGuard`]
+/// and an explicit overall pre-auth handshake deadline.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_pair_responder_with_options(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    manager: &Mutex<PairingManager>,
+    roster: &Mutex<Roster>,
+    path_kind: PairingPathKind,
+    now_unix: u64,
+    rate_limiter: Option<&PreAuthRateLimiter>,
+    existing_guard: Option<HalfOpenGuard>,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    let _half_open = match existing_guard {
+        Some(g) => Some(g),
+        None => rate_limiter
+            .map(|rl| rl.try_acquire(stream.peer_ip()))
+            .transpose()?,
+    };
     let mut machine = PairingResponder::new(identity, path_kind, None)?;
     let mut observed_sas = None;
     let mut buf = vec![0u8; MAX_OUTER_FRAME_LEN];
+    let deadline = TokioInstant::now() + handshake_timeout;
 
     loop {
-        let n = stream.recv_chunk(&mut buf).await?;
+        let n = match timeout_at(deadline, stream.recv_chunk(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                let _ = stream.close().await;
+                return Err(RuntimeError::Timeout(
+                    "pre-auth pairing handshake timed out",
+                ));
+            }
+        };
         if n == 0 {
             return Err(RuntimeError::Closed);
         }
@@ -194,7 +238,7 @@ impl SessionDriver {
         };
         driver.apply_actions(start_actions).await?;
         driver
-            .drive_until_established(now_unix, roster, None)
+            .drive_until_established(now_unix, roster, None, Some(DEFAULT_PRE_AUTH_TIMEOUT))
             .await?;
         Ok(driver)
     }
@@ -207,9 +251,35 @@ impl SessionDriver {
         now_unix: u64,
         rate_limiter: Option<&PreAuthRateLimiter>,
     ) -> Result<Self, RuntimeError> {
-        let half_open = rate_limiter
-            .map(|rl| rl.try_acquire(stream.peer_ip()))
-            .transpose()?;
+        Self::accept_with_options(
+            stream,
+            local_identity,
+            roster,
+            now_unix,
+            rate_limiter,
+            None,
+            DEFAULT_PRE_AUTH_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Accepts an inbound Noise XX session handshake with an optional caller-held [`HalfOpenGuard`]
+    /// and an explicit overall pre-auth handshake deadline.
+    pub async fn accept_with_options(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        roster: &mut Roster,
+        now_unix: u64,
+        rate_limiter: Option<&PreAuthRateLimiter>,
+        existing_guard: Option<HalfOpenGuard>,
+        handshake_timeout: Duration,
+    ) -> Result<Self, RuntimeError> {
+        let half_open = match existing_guard {
+            Some(g) => Some(g),
+            None => rate_limiter
+                .map(|rl| rl.try_acquire(stream.peer_ip()))
+                .transpose()?,
+        };
         let machine = SessionMachine::new_responder(local_identity, None)?;
         let mut driver = Self {
             stream,
@@ -220,7 +290,7 @@ impl SessionDriver {
             _half_open: half_open,
         };
         driver
-            .drive_until_established(now_unix, roster, rate_limiter)
+            .drive_until_established(now_unix, roster, rate_limiter, Some(handshake_timeout))
             .await?;
         Ok(driver)
     }
@@ -338,12 +408,27 @@ impl SessionDriver {
         now_unix: u64,
         roster: &mut Roster,
         rate_limiter: Option<&PreAuthRateLimiter>,
+        handshake_timeout: Option<Duration>,
     ) -> Result<(), RuntimeError> {
+        let deadline = handshake_timeout.map(|d| TokioInstant::now() + d);
         while !self.machine.is_established() {
             if self.machine.is_closed() {
                 return Err(RuntimeError::Closed);
             }
-            let n = self.stream.recv_chunk(&mut self.recv_buf).await?;
+            let n = match deadline {
+                Some(dl) => {
+                    match timeout_at(dl, self.stream.recv_chunk(&mut self.recv_buf)).await {
+                        Ok(res) => res?,
+                        Err(_) => {
+                            let _ = self.stream.close().await;
+                            return Err(RuntimeError::Timeout(
+                                "pre-auth session handshake timed out",
+                            ));
+                        }
+                    }
+                }
+                None => self.stream.recv_chunk(&mut self.recv_buf).await?,
+            };
             if n == 0 {
                 return Err(RuntimeError::Closed);
             }
@@ -422,16 +507,17 @@ pub async fn dial_with_policy(
     let started = Instant::now();
     planner.start(0);
 
+    struct AbortOnDrop(AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     let (result_tx, mut result_rx) =
         mpsc::channel::<(usize, Result<Box<dyn PathStream>, RuntimeError>)>(32);
-    let mut in_flight_handles: HashMap<usize, AbortHandle> = HashMap::new();
+    let mut in_flight_handles: HashMap<usize, AbortOnDrop> = HashMap::new();
     let mut succeeded_streams: HashMap<usize, Box<dyn PathStream>> = HashMap::new();
-
-    let abort_all = |handles: &mut HashMap<usize, AbortHandle>| {
-        for (_, h) in handles.drain() {
-            h.abort();
-        }
-    };
 
     loop {
         for action in planner.drain_actions() {
@@ -450,23 +536,21 @@ pub async fn dial_with_policy(
                         let res = dialer.dial(&endpoint).await;
                         let _ = tx.send((id, res)).await;
                     });
-                    in_flight_handles.insert(cand.id, handle.abort_handle());
+                    in_flight_handles.insert(cand.id, AbortOnDrop(handle.abort_handle()));
                 }
                 PlannerAction::CancelCandidate(id) | PlannerAction::CloseActivePath { id, .. } => {
-                    if let Some(h) = in_flight_handles.remove(&id) {
-                        h.abort();
-                    }
+                    in_flight_handles.remove(&id);
                     succeeded_streams.remove(&id);
                 }
                 PlannerAction::ActivatePath(cand) => {
                     if let Some(stream) = succeeded_streams.remove(&cand.id) {
-                        abort_all(&mut in_flight_handles);
+                        in_flight_handles.clear();
                         return Ok((cand, stream));
                     }
                 }
                 PlannerAction::ProbeBetterPath(_) => {}
                 PlannerAction::AllCandidatesExhausted => {
-                    abort_all(&mut in_flight_handles);
+                    in_flight_handles.clear();
                     return Err(RuntimeError::Policy("all candidates exhausted"));
                 }
             }
@@ -475,7 +559,7 @@ pub async fn dial_with_policy(
         tokio::select! {
             maybe_res = result_rx.recv() => {
                 let Some((id, res)) = maybe_res else {
-                    abort_all(&mut in_flight_handles);
+                    in_flight_handles.clear();
                     return Err(RuntimeError::Policy("dialer channel closed"));
                 };
                 in_flight_handles.remove(&id);

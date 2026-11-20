@@ -687,17 +687,17 @@ async fn handle_accept(
         match tables.pending.get(&conn_id) {
             None => ClaimResult::NotFound,
             Some(entry) if entry.target_pub != acceptor_pub => ClaimResult::WrongOwner,
-            Some(_) => {
-                let pending = tables.pending.remove(&conn_id).expect("checked Some above");
-                decrement_count(&mut tables.pending_counts, &pending.target_pub);
+            Some(entry) => {
                 let active_count = tables
                     .active_per_mailbox
-                    .get(&pending.target_pub)
+                    .get(&entry.target_pub)
                     .copied()
                     .unwrap_or(0);
                 if active_count >= state.config.max_active_per_mailbox {
                     ClaimResult::RateLimited
                 } else {
+                    let pending = tables.pending.remove(&conn_id).expect("checked Some above");
+                    decrement_count(&mut tables.pending_counts, &pending.target_pub);
                     *tables
                         .active_per_mailbox
                         .entry(pending.target_pub)

@@ -16,10 +16,10 @@ use tendril_core::pairing::{
 use tendril_core::policy::ProviderId;
 use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
-    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer, PathDialer, PathListener,
-    PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream, RelayDialer, RelayListener,
-    SessionDriver, SessionEvent, StateStore, drive_pair_initiator, drive_pair_responder,
-    peek_exact,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, HalfOpenGuard,
+    LocalDialer, PathDialer, PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter,
+    PrefixedPathStream, RelayDialer, RelayListener, SessionDriver, SessionEvent, StateStore,
+    drive_pair_initiator, drive_pair_responder_with_options, peek_exact,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -142,13 +142,19 @@ async fn dial_endpoint(
 
 async fn handle_inbound(
     mut stream: Box<dyn PathStream>,
+    pre_auth_guard: HalfOpenGuard,
     store: Arc<StateStore>,
     store_lock: Arc<AsyncMutex<()>>,
     identity: Arc<tendril_core::identity::EndpointIdentity>,
     pair_mgr: Arc<StdMutex<PairingManager>>,
     rate_limiter: PreAuthRateLimiter,
 ) {
-    let Ok(peeked) = peek_exact(stream.as_mut(), PREAMBLE_LEN).await else {
+    let Ok(Ok(peeked)) = tokio::time::timeout(
+        DEFAULT_PRE_AUTH_TIMEOUT,
+        peek_exact(stream.as_mut(), PREAMBLE_LEN),
+    )
+    .await
+    else {
         return;
     };
     let Ok(preamble) = Preamble::decode(&peeked[..PREAMBLE_LEN]) else {
@@ -166,10 +172,16 @@ async fn handle_inbound(
             };
             let current_roster = {
                 let _guard = store_lock.lock().await;
-                store.load_roster().unwrap_or_default()
+                match store.load_roster() {
+                    Ok(r) => r,
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to load roster before pair");
+                        return;
+                    }
+                }
             };
             let roster_sync = StdMutex::new(current_roster);
-            match drive_pair_responder(
+            match drive_pair_responder_with_options(
                 wrapped.as_mut(),
                 &identity,
                 &pair_mgr,
@@ -177,6 +189,8 @@ async fn handle_inbound(
                 path_kind,
                 now,
                 Some(&rate_limiter),
+                Some(pre_auth_guard),
+                DEFAULT_PRE_AUTH_TIMEOUT,
             )
             .await
             {
@@ -190,15 +204,27 @@ async fn handle_inbound(
                         ..
                     } => {
                         let _guard = store_lock.lock().await;
-                        let mut persisted = store.load_roster().unwrap_or_default();
-                        let _ = persisted.record_pending_pair(
+                        let mut persisted = match store.load_roster() {
+                            Ok(r) => r,
+                            Err(err) => {
+                                tracing::error!(error = %err, "failed to reload roster after pair");
+                                return;
+                            }
+                        };
+                        if let Err(err) = persisted.record_pending_pair(
                             device_static_pub,
                             None,
                             name,
                             kind,
                             pairing_sas.clone(),
-                        );
-                        let _ = store.save_roster(&persisted);
+                        ) {
+                            tracing::error!(error = %err, "failed to record paired peer");
+                            return;
+                        }
+                        if let Err(err) = store.save_roster(&persisted) {
+                            tracing::error!(error = %err, "failed to persist paired roster");
+                            return;
+                        }
                         print_json_line(&serde_json::json!({
                             "event": "paired",
                             "device_id": device_id,
@@ -221,11 +247,24 @@ async fn handle_inbound(
         Intent::Session => {
             let mut roster = {
                 let _guard = store_lock.lock().await;
-                store.load_roster().unwrap_or_default()
+                match store.load_roster() {
+                    Ok(r) => r,
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to load roster before session");
+                        return;
+                    }
+                }
             };
-            let Ok(mut driver) =
-                SessionDriver::accept(wrapped, &identity, &mut roster, now, Some(&rate_limiter))
-                    .await
+            let Ok(mut driver) = SessionDriver::accept_with_options(
+                wrapped,
+                &identity,
+                &mut roster,
+                now,
+                Some(&rate_limiter),
+                Some(pre_auth_guard),
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
             else {
                 tracing::debug!("inbound session rejected");
                 return;
@@ -368,19 +407,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "pairing_code": issued,
             }));
 
+            let dispatch_stream =
+                |stream: Box<dyn PathStream>| match rate_limiter.try_acquire(stream.peer_ip()) {
+                    Ok(guard) => {
+                        tokio::spawn(handle_inbound(
+                            stream,
+                            guard,
+                            Arc::clone(&store),
+                            Arc::clone(&store_lock),
+                            Arc::clone(&identity),
+                            Arc::clone(&pair_mgr),
+                            rate_limiter.clone(),
+                        ));
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "rejected inbound stream at pre-auth limit");
+                    }
+                };
+
             loop {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => break,
                     res = direct_listener.accept() => {
                         if let Ok(stream) = res {
-                            tokio::spawn(handle_inbound(
-                                stream,
-                                Arc::clone(&store),
-                                Arc::clone(&store_lock),
-                                Arc::clone(&identity),
-                                Arc::clone(&pair_mgr),
-                                rate_limiter.clone(),
-                            ));
+                            dispatch_stream(stream);
                         }
                     }
                     res = async {
@@ -389,15 +439,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             None => std::future::pending().await,
                         }
                     } => {
-                        if let Some(Ok(stream)) = res {
-                            tokio::spawn(handle_inbound(
-                                stream,
-                                Arc::clone(&store),
-                                Arc::clone(&store_lock),
-                                Arc::clone(&identity),
-                                Arc::clone(&pair_mgr),
-                                rate_limiter.clone(),
-                            ));
+                        match res {
+                            Some(Ok(stream)) => dispatch_stream(stream),
+                            Some(Err(err)) => {
+                                tracing::warn!(error = %err, "relay listener terminated; disabling relay accept arm");
+                                relay_listener = None;
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -463,7 +511,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut roster = store.load_roster()?;
             let now = now_unix();
             let nonce = random_bytes::<16>()?;
-            let grant = roster.mint_grant(&identity, &peer_id, caps, now, now + ttl_secs, nonce)?;
+            let grant = roster.mint_grant(
+                &identity,
+                &peer_id,
+                caps,
+                now,
+                now.saturating_add(ttl_secs),
+                nonce,
+            )?;
             store.save_roster(&roster)?;
             print_json_line(&grant);
         }

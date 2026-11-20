@@ -1,6 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
 use tempfile::TempDir;
 use tendril_relay::{RelayConfig, RelayServer};
@@ -412,5 +411,4 @@ fn conformance_peer_drives_full_json_stdio_session() {
     assert!(status.success());
     let status_cli = client.child.0.wait().expect("wait cli");
     assert!(status_cli.success());
-    let _ = Duration::from_millis(1);
 }

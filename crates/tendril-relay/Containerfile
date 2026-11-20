@@ -1,8 +1,7 @@
 FROM rust:1.88-alpine AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/tendril-core ./crates/tendril-core
-COPY crates/tendril-relay ./crates/tendril-relay
+COPY crates ./crates
 RUN apk add --no-cache musl-dev \
     && cargo build --release --locked -p tendril-relay --bin tendril-relay
 

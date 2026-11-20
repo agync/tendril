@@ -84,10 +84,41 @@ async fn send_control_msg(
     }
 }
 
+fn extract_url_host(relay_url: &str) -> Result<String, RuntimeError> {
+    let after_scheme = relay_url
+        .strip_prefix("wss://")
+        .or_else(|| relay_url.strip_prefix("ws://"))
+        .ok_or_else(|| {
+            RuntimeError::Protocol(format!("relay URL must use ws:// or wss://: '{relay_url}'"))
+        })?;
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, hostport)| hostport);
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    if host.is_empty() {
+        return Err(RuntimeError::Protocol(format!(
+            "missing host in relay URL: '{relay_url}'"
+        )));
+    }
+    Ok(host.to_owned())
+}
+
 async fn connect_and_verify_challenge(
     relay_url: &str,
     expected_host: Option<&str>,
 ) -> Result<(ClientWsStream, String, [u8; 32]), RuntimeError> {
+    let required_host = match expected_host {
+        Some(h) if !h.is_empty() => h.to_owned(),
+        _ => extract_url_host(relay_url)?,
+    };
     ensure_rustls_ring_provider();
     let (mut ws, _) = timeout(
         CONTROL_TIMEOUT,
@@ -112,11 +143,9 @@ async fn connect_and_verify_challenge(
             "relay max_frame {max_frame} below required {MAX_RELAY_FRAME_LEN}"
         )));
     }
-    if let Some(exp) = expected_host
-        && host != exp
-    {
+    if host != required_host {
         return Err(RuntimeError::Protocol(format!(
-            "relay host mismatch: expected '{exp}', got '{host}'"
+            "relay host mismatch: expected '{required_host}', got '{host}'"
         )));
     }
     let nonce_bytes = b64url_decode_array::<32>(&nonce)?;

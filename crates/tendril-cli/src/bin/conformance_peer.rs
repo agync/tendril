@@ -337,9 +337,13 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 else {
                     return (err_json("timed out accepting pairing connection"), false);
                 };
-                let peeked = match peek_exact(stream.as_mut(), PREAMBLE_LEN).await {
-                    Ok(p) => p,
-                    Err(e) => return (err_json(e.to_string()), false),
+                let Ok(Ok(peeked)) = timeout(
+                    Duration::from_secs(10),
+                    peek_exact(stream.as_mut(), PREAMBLE_LEN),
+                )
+                .await
+                else {
+                    return (err_json("timed out reading pairing preamble"), false);
                 };
                 if let Err(e) = Preamble::decode(&peeked[..PREAMBLE_LEN])
                     .map_err(|e| e.to_string())
@@ -434,7 +438,7 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 &peer_id,
                 caps,
                 now,
-                now + ttl_secs.unwrap_or(3600),
+                now.saturating_add(ttl_secs.unwrap_or(3600)),
                 nonce,
             ) {
                 Ok(grant) => {

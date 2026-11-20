@@ -8,7 +8,8 @@ pub mod rate_limit;
 pub mod store;
 
 pub use driver::{
-    SessionDriver, SessionEvent, dial_with_policy, drive_pair_initiator, drive_pair_responder,
+    DEFAULT_PRE_AUTH_TIMEOUT, SessionDriver, SessionEvent, dial_with_policy, drive_pair_initiator,
+    drive_pair_responder, drive_pair_responder_with_options,
 };
 pub use error::RuntimeError;
 pub use provider::{

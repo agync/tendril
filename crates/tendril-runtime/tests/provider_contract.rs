@@ -682,3 +682,99 @@ async fn full_lifecycle_pair_confirm_mint_connect_authorize_data_rekey_revoke_ac
         }
     }
 }
+
+#[tokio::test]
+async fn pre_auth_slowloris_times_out_and_releases_half_open_slot() {
+    use tendril_core::wire::{Intent, Preamble};
+    use tendril_runtime::drive_pair_responder_with_options;
+
+    let limiter = PreAuthRateLimiter::new(PreAuthConfig::default());
+    let host_id = EndpointIdentity::generate().expect("host id");
+    let now = 1_795_132_800;
+
+    // 1. Stalled SessionDriver::accept_with_options releasing HalfOpenGuard cleanly.
+    let mut pair = setup_provider(ProviderId::Direct).await;
+    let (srv_sess, mut cli_sess) = open_pair(&mut pair).await;
+    cli_sess
+        .send_chunk(&Preamble::v1(Intent::Session).encode())
+        .await
+        .expect("send preamble only");
+    let mut roster = Roster::new();
+    let res = SessionDriver::accept_with_options(
+        srv_sess,
+        &host_id,
+        &mut roster,
+        now,
+        Some(&limiter),
+        None,
+        Duration::from_millis(120),
+    )
+    .await;
+    assert!(matches!(res, Err(RuntimeError::Timeout(_))));
+    assert_eq!(limiter.active_half_open(), 0);
+    drop(cli_sess);
+
+    // 2. Stalled drive_pair_responder_with_options releasing HalfOpenGuard cleanly.
+    let (mut srv_pair, mut cli_pair) = open_pair(&mut pair).await;
+    cli_pair
+        .send_chunk(&Preamble::v1(Intent::Pair).encode())
+        .await
+        .expect("send pair preamble only");
+    let mgr = Mutex::new(PairingManager::new(PairingConfig::default()));
+    let roster_sync = Mutex::new(Roster::new());
+    let pair_res = drive_pair_responder_with_options(
+        srv_pair.as_mut(),
+        &host_id,
+        &mgr,
+        &roster_sync,
+        PairingPathKind::Lan,
+        now,
+        Some(&limiter),
+        None,
+        Duration::from_millis(120),
+    )
+    .await;
+    assert!(matches!(pair_res, Err(RuntimeError::Timeout(_))));
+    assert_eq!(limiter.active_half_open(), 0);
+}
+
+#[tokio::test]
+async fn relay_listener_verifies_url_host_even_when_expected_host_is_none() {
+    // Server claims host = "localhost", URL connects to "ws://127.0.0.1:<port>/v1/relay".
+    let srv_mismatch = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind mismatch relay");
+    let h_mismatch = srv_mismatch.spawn();
+    let key = SigningKeypair::generate().expect("key");
+    let res = RelayListener::bind(
+        h_mismatch.ws_url(),
+        None,
+        key.signing_key(),
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await;
+    assert!(
+        matches!(res, Err(RuntimeError::Protocol(_))),
+        "expected host verification failure when challenge.host != URL host"
+    );
+    h_mismatch.stop().await.expect("stop");
+
+    // Server whose host matches URL authority ("127.0.0.1") succeeds with expected_host = None.
+    let srv_match = RelayServer::bind(RelayConfig {
+        host: "127.0.0.1".to_owned(),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind matching relay");
+    let h_match = srv_match.spawn();
+    let listener = RelayListener::bind(
+        h_match.ws_url(),
+        None,
+        key.signing_key(),
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await
+    .expect("matching URL host must succeed with None override");
+    drop(listener);
+    h_match.stop().await.expect("stop");
+}
