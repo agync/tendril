@@ -1,0 +1,14 @@
+{
+  "name": "@tendril/node",
+  "version": "0.1.0",
+  "description": "Node.js N-API bindings for Tendril private device-to-device links.",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
