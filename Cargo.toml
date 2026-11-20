@@ -13,6 +13,7 @@ argon2 = { version = "0.6", default-features = false, features = ["alloc", "zero
 base64 = "0.23"
 data-encoding = "2.11"
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "zeroize", "signature"] }
+getrandom = "0.3"
 hex = "0.4"
 hmac = { version = "0.13", features = ["zeroize"] }
 serde = { version = "1", features = ["derive"] }

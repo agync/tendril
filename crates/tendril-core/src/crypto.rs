@@ -1,9 +1,12 @@
 //! Deterministic cryptographic primitives, key encodings, SAS, and pairing MACs.
 
+use std::fmt;
+
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use data_encoding::BASE32_NOPAD;
+use ed25519_dalek::SigningKey;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -163,4 +166,129 @@ pub fn verify_code_mac(
 ) -> Result<bool, CoreError> {
     let expected = compute_code_mac(code, handshake_hash)?;
     Ok(bool::from(expected.ct_eq(candidate)))
+}
+
+/// Fills a fixed-size buffer using the platform CSPRNG.
+pub fn random_bytes<const N: usize>() -> Result<[u8; N], CoreError> {
+    let mut out = [0u8; N];
+    getrandom::fill(&mut out).map_err(|err| CoreError::Rng(err.to_string()))?;
+    Ok(out)
+}
+
+/// X25519 static keypair whose private scalar is zeroized on drop and redacted from `Debug`.
+#[derive(Clone)]
+pub struct StaticKeypair {
+    secret: Zeroizing<[u8; 32]>,
+    public: [u8; 32],
+}
+
+impl StaticKeypair {
+    /// Generates a fresh X25519 static keypair using the platform CSPRNG.
+    pub fn generate() -> Result<Self, CoreError> {
+        let mut scalar = Zeroizing::new(random_bytes::<32>()?);
+        let secret = X25519StaticSecret::from(*scalar);
+        let public = X25519PublicKey::from(&secret).to_bytes();
+        // Zeroize intermediate copy; `secret` wrapper holds the final clamped or raw scalar.
+        scalar.as_mut().copy_from_slice(&secret.to_bytes());
+        Ok(Self {
+            secret: scalar,
+            public,
+        })
+    }
+
+    /// Constructs a static keypair from an existing 32-byte private scalar.
+    #[must_use]
+    pub fn from_scalar(scalar: [u8; 32]) -> Self {
+        let public = x25519_public_from_scalar(&scalar);
+        Self {
+            secret: Zeroizing::new(scalar),
+            public,
+        }
+    }
+
+    /// Returns the raw 32-byte private scalar.
+    #[must_use]
+    pub fn secret_bytes(&self) -> &[u8; 32] {
+        &self.secret
+    }
+
+    /// Returns the 32-byte X25519 public key.
+    #[must_use]
+    pub const fn public_bytes(&self) -> &[u8; 32] {
+        &self.public
+    }
+
+    /// Returns the canonical `device_id` derived from this public key.
+    #[must_use]
+    pub fn device_id(&self) -> String {
+        device_id(&self.public)
+    }
+
+    /// Returns the `4x4` lowercase base32 host fingerprint for this static key.
+    #[must_use]
+    pub fn host_fingerprint(&self) -> String {
+        fingerprint_host(&self.public)
+    }
+
+    /// Returns the `4x4` uppercase hex device fingerprint for this static key.
+    #[must_use]
+    pub fn device_fingerprint(&self) -> String {
+        fingerprint_device(&self.public)
+    }
+}
+
+impl fmt::Debug for StaticKeypair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StaticKeypair")
+            .field("device_id", &self.device_id())
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Ed25519 signing keypair whose seed is zeroized on drop and redacted from `Debug`.
+#[derive(Clone)]
+pub struct SigningKeypair {
+    seed: Zeroizing<[u8; 32]>,
+    public: [u8; 32],
+}
+
+impl SigningKeypair {
+    /// Generates a fresh Ed25519 signing keypair using the platform CSPRNG.
+    pub fn generate() -> Result<Self, CoreError> {
+        let seed = random_bytes::<32>()?;
+        Ok(Self::from_seed(seed))
+    }
+
+    /// Constructs a signing keypair from an existing 32-byte Ed25519 seed.
+    #[must_use]
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let sk = SigningKey::from_bytes(&seed);
+        let public = sk.verifying_key().to_bytes();
+        Self {
+            seed: Zeroizing::new(seed),
+            public,
+        }
+    }
+
+    /// Builds an `ed25519_dalek::SigningKey` from the zeroizing seed.
+    #[must_use]
+    pub fn signing_key(&self) -> SigningKey {
+        SigningKey::from_bytes(&self.seed)
+    }
+
+    /// Returns the 32-byte Ed25519 verifying public key.
+    #[must_use]
+    pub const fn public_bytes(&self) -> &[u8; 32] {
+        &self.public
+    }
+}
+
+impl fmt::Debug for SigningKeypair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SigningKeypair")
+            .field("public", &b64url_encode(&self.public))
+            .field("seed", &"<redacted>")
+            .finish()
+    }
 }

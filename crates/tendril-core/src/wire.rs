@@ -33,6 +33,9 @@ pub const MAX_TRANSPORT_PLAINTEXT: usize = MAX_FRAME_LEN - AEAD_TAG_LEN;
 /// Maximum application bytes carried inside a `0x01 DATA` inner frame.
 pub const MAX_APP_DATA_LEN: usize = MAX_TRANSPORT_PLAINTEXT - 1;
 
+/// Maximum total bytes queued inside [`ResumableFrameReader`] before rejecting unbounded buffering.
+pub const MAX_READ_BUFFER_LEN: usize = 4 * (2 + MAX_FRAME_LEN);
+
 /// Handshake intent carried in the 6-byte cleartext preamble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -293,6 +296,130 @@ pub enum PairResponse {
     },
 }
 
+/// Incremental, bounded decoder for Tendril preambles and `uint16_be len || body` frames.
+#[derive(Debug, Default)]
+pub struct ResumableFrameReader {
+    buf: Vec<u8>,
+    offset: usize,
+    expect_preamble: bool,
+    preamble: Option<Preamble>,
+}
+
+impl ResumableFrameReader {
+    /// Creates a reader expecting length-prefixed frames immediately (initiator side).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a reader expecting a 6-byte cleartext [`Preamble`] before any frames (responder side).
+    #[must_use]
+    pub fn with_preamble() -> Self {
+        Self {
+            buf: Vec::new(),
+            offset: 0,
+            expect_preamble: true,
+            preamble: None,
+        }
+    }
+
+    /// Returns the decoded preamble once [`Self::take_preamble`] has succeeded.
+    #[must_use]
+    pub const fn preamble(&self) -> Option<Preamble> {
+        self.preamble
+    }
+
+    /// Appends received transport bytes, enforcing [`MAX_READ_BUFFER_LEN`] before allocation.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), CoreError> {
+        if self.offset > 0 {
+            let unread = self.buf.len() - self.offset;
+            if unread == 0 {
+                self.buf.clear();
+                self.offset = 0;
+            } else if self.offset >= 4096
+                || self.buf.len().saturating_add(chunk.len()) > MAX_READ_BUFFER_LEN
+            {
+                self.buf.copy_within(self.offset.., 0);
+                self.buf.truncate(unread);
+                self.offset = 0;
+            }
+        }
+
+        let unread = self.buf.len() - self.offset;
+        let Some(total) = unread.checked_add(chunk.len()) else {
+            return Err(CoreError::BufferOverflow {
+                len: usize::MAX,
+                max: MAX_READ_BUFFER_LEN,
+            });
+        };
+        if total > MAX_READ_BUFFER_LEN {
+            return Err(CoreError::BufferOverflow {
+                len: total,
+                max: MAX_READ_BUFFER_LEN,
+            });
+        }
+        self.buf.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// Consumes and validates the initial 6-byte [`Preamble`] once all 6 bytes have arrived.
+    pub fn take_preamble(&mut self) -> Result<Option<Preamble>, CoreError> {
+        if !self.expect_preamble {
+            return Ok(self.preamble);
+        }
+        let unread = &self.buf[self.offset..];
+        if unread.len() < PREAMBLE_LEN {
+            return Ok(None);
+        }
+        let decoded = Preamble::decode(&unread[..PREAMBLE_LEN])?;
+        self.offset += PREAMBLE_LEN;
+        self.expect_preamble = false;
+        self.preamble = Some(decoded);
+        if self.offset >= self.buf.len() {
+            self.buf.clear();
+            self.offset = 0;
+        }
+        Ok(Some(decoded))
+    }
+
+    /// Decodes the next complete outer frame, immediately rejecting declared lengths above
+    /// [`MAX_FRAME_LEN`] before buffering the payload.
+    pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>, CoreError> {
+        if self.expect_preamble {
+            return Err(CoreError::ProtocolViolation(
+                "preamble must be decoded before reading frames",
+            ));
+        }
+        let unread = &self.buf[self.offset..];
+        if unread.len() < 2 {
+            return Ok(None);
+        }
+        let len = usize::from(u16::from_be_bytes([unread[0], unread[1]]));
+        if len > MAX_FRAME_LEN {
+            return Err(CoreError::FrameTooLarge {
+                len,
+                max: MAX_FRAME_LEN,
+            });
+        }
+        let total = 2 + len;
+        if unread.len() < total {
+            return Ok(None);
+        }
+        let body = unread[2..total].to_vec();
+        self.offset += total;
+        if self.offset >= self.buf.len() {
+            self.buf.clear();
+            self.offset = 0;
+        } else if self.offset >= 4096 {
+            let rem = self.buf.len() - self.offset;
+            self.buf.copy_within(self.offset.., 0);
+            self.buf.truncate(rem);
+            self.offset = 0;
+        }
+        Ok(Some(body))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +557,69 @@ mod tests {
             Err(CoreError::FrameTooLarge {
                 len: MAX_TRANSPORT_PLAINTEXT + 1,
                 max: MAX_TRANSPORT_PLAINTEXT
+            })
+        );
+    }
+
+    #[test]
+    fn resumable_reader_handles_single_byte_splits_coalesced_frames_and_bounds() {
+        let mut reader = ResumableFrameReader::with_preamble();
+        assert_eq!(
+            reader.next_frame(),
+            Err(CoreError::ProtocolViolation(
+                "preamble must be decoded before reading frames"
+            ))
+        );
+
+        let mut stream = Preamble::v1(Intent::Session).encode().to_vec();
+        stream.extend_from_slice(&encode_frame(&[]).unwrap());
+        stream.extend_from_slice(&encode_frame(b"alpha").unwrap());
+        stream.extend_from_slice(&encode_frame(b"beta").unwrap());
+
+        let mut preamble = None;
+        let mut frames = Vec::new();
+        for b in &stream {
+            reader.push(std::slice::from_ref(b)).unwrap();
+            if preamble.is_none() {
+                preamble = reader.take_preamble().unwrap();
+                if preamble.is_none() {
+                    continue;
+                }
+            }
+            while let Some(frame) = reader.next_frame().unwrap() {
+                frames.push(frame);
+            }
+        }
+
+        assert_eq!(preamble, Some(Preamble::v1(Intent::Session)));
+        assert_eq!(
+            frames,
+            vec![Vec::new(), b"alpha".to_vec(), b"beta".to_vec()]
+        );
+
+        // Two oversized length header bytes must fail immediately before payload arrives.
+        let mut hdr_reader = ResumableFrameReader::new();
+        hdr_reader
+            .push(&((MAX_FRAME_LEN + 1) as u16).to_be_bytes())
+            .unwrap();
+        assert_eq!(
+            hdr_reader.next_frame(),
+            Err(CoreError::FrameTooLarge {
+                len: MAX_FRAME_LEN + 1,
+                max: MAX_FRAME_LEN
+            })
+        );
+
+        // Buffer overflow must trigger cleanly before unbounded allocation.
+        let mut overflow_reader = ResumableFrameReader::new();
+        overflow_reader
+            .push(&vec![0u8; MAX_READ_BUFFER_LEN])
+            .unwrap();
+        assert_eq!(
+            overflow_reader.push(&[0x01]),
+            Err(CoreError::BufferOverflow {
+                len: MAX_READ_BUFFER_LEN + 1,
+                max: MAX_READ_BUFFER_LEN
             })
         );
     }

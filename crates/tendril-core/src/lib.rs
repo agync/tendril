@@ -7,6 +7,10 @@ pub mod crypto;
 pub mod error;
 pub mod grants;
 pub mod identity;
+pub mod pairing;
+pub mod policy;
+pub mod roster;
+pub mod session;
 pub mod wire;
 
 pub use wire::{

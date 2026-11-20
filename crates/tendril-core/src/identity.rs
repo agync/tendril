@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{b64url_decode_array, b64url_encode};
+use crate::crypto::{SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode};
 use crate::error::CoreError;
 
 /// 15-byte domain separator prefix for binary `RotationRecord` signatures.
@@ -16,6 +16,108 @@ pub const ROTATION_SIGNED_LEN: usize = 15 + 8 + 32 + 32 + 32 + 8;
 
 /// Maximum formatted UTC timestamp supported (`9999-12-31T23:59:59Z`).
 const MAX_UNIX_SECS: u64 = 253_402_300_799;
+
+/// Local endpoint identity combining X25519 static keys, Ed25519 signing keys, and
+/// signed rotation history.
+#[derive(Debug, Clone)]
+pub struct EndpointIdentity {
+    host_id: String,
+    static_key: StaticKeypair,
+    signing_key: SigningKeypair,
+    rotation_chain: Vec<RotationRecord>,
+    rotation_seq: u64,
+}
+
+impl EndpointIdentity {
+    /// Generates a fresh endpoint identity with random static and signing keys.
+    pub fn generate() -> Result<Self, CoreError> {
+        let static_key = StaticKeypair::generate()?;
+        let signing_key = SigningKeypair::generate()?;
+        Ok(Self::from_keys(static_key, signing_key))
+    }
+
+    /// Builds an endpoint identity from existing keypairs, deriving `host_id` from `static_key`.
+    #[must_use]
+    pub fn from_keys(static_key: StaticKeypair, signing_key: SigningKeypair) -> Self {
+        let host_id = static_key.device_id();
+        Self {
+            host_id,
+            static_key,
+            signing_key,
+            rotation_chain: Vec::new(),
+            rotation_seq: 0,
+        }
+    }
+
+    /// Overrides the stable `host_id` carried in `HostHello`.
+    #[must_use]
+    pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
+        self.host_id = host_id.into();
+        self
+    }
+
+    /// Returns the stable `host_id`.
+    #[must_use]
+    pub fn host_id(&self) -> &str {
+        &self.host_id
+    }
+
+    /// Returns the `device_id` corresponding to the current active static key.
+    #[must_use]
+    pub fn device_id(&self) -> String {
+        self.static_key.device_id()
+    }
+
+    /// Returns the active X25519 static keypair.
+    #[must_use]
+    pub const fn static_key(&self) -> &StaticKeypair {
+        &self.static_key
+    }
+
+    /// Returns the active Ed25519 signing keypair.
+    #[must_use]
+    pub const fn signing_key(&self) -> &SigningKeypair {
+        &self.signing_key
+    }
+
+    /// Returns all signed rotation records issued by this identity.
+    #[must_use]
+    pub fn rotation_chain(&self) -> &[RotationRecord] {
+        &self.rotation_chain
+    }
+
+    /// Returns the current rotation sequence counter (`0` before any rotation).
+    #[must_use]
+    pub const fn rotation_seq(&self) -> u64 {
+        self.rotation_seq
+    }
+
+    /// Signs a new [`RotationRecord`] using the outgoing signing key and rotates keys atomically.
+    pub fn rotate(
+        &mut self,
+        new_static: StaticKeypair,
+        new_signing: SigningKeypair,
+        now_unix: u64,
+    ) -> Result<RotationRecord, CoreError> {
+        let next_seq = self
+            .rotation_seq
+            .checked_add(1)
+            .ok_or(CoreError::RotationNonContiguous)?;
+        let outgoing = self.signing_key.signing_key();
+        let rec = sign_rotation(
+            next_seq,
+            &outgoing,
+            new_signing.public_bytes(),
+            new_static.public_bytes(),
+            now_unix,
+        )?;
+        self.rotation_chain.push(rec.clone());
+        self.static_key = new_static;
+        self.signing_key = new_signing;
+        self.rotation_seq = next_seq;
+        Ok(rec)
+    }
+}
 
 /// One signed link in a peer's key-rotation chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

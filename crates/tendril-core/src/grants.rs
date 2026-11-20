@@ -423,6 +423,87 @@ where
     Ok(())
 }
 
+/// Structured authorization audit record emitted on every grant evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub ts: u64,
+    pub subject: String,
+    pub cap: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_nonce: Option<String>,
+    pub allow: bool,
+    pub reason: String,
+}
+
+/// Evaluates `grant` for `requested_cap` (fail-closed) and always emits a structured [`AuditEvent`].
+pub fn authorize_grant<F>(
+    grant: Option<&Grant>,
+    expected_subject: &str,
+    expected_root_issuer: &str,
+    requested_cap: &str,
+    now_unix: u64,
+    crl: Option<&RevocationList>,
+    lookup_issuer_key: F,
+) -> (Result<(), CoreError>, AuditEvent)
+where
+    F: FnMut(&str) -> Option<[u8; 32]>,
+{
+    let deny = |err: CoreError, nonce: Option<String>| -> (Result<(), CoreError>, AuditEvent) {
+        let audit = AuditEvent {
+            ts: now_unix,
+            subject: expected_subject.to_string(),
+            cap: requested_cap.to_string(),
+            grant_nonce: nonce,
+            allow: false,
+            reason: err.to_string(),
+        };
+        (Err(err), audit)
+    };
+
+    let Some(g) = grant else {
+        return deny(
+            CoreError::GrantDenied("missing capability grant".to_string()),
+            None,
+        );
+    };
+    let nonce = Some(g.nonce.clone());
+
+    if let Err(err) = verify_grant_with_chain(
+        g,
+        expected_subject,
+        expected_root_issuer,
+        now_unix,
+        crl,
+        lookup_issuer_key,
+    ) {
+        return deny(err, nonce);
+    }
+
+    let req = match Capability::parse(requested_cap) {
+        Ok(cap) => cap,
+        Err(err) => return deny(err, nonce),
+    };
+
+    match grant_allows(g, &req) {
+        Ok(true) => (
+            Ok(()),
+            AuditEvent {
+                ts: now_unix,
+                subject: expected_subject.to_string(),
+                cap: requested_cap.to_string(),
+                grant_nonce: nonce,
+                allow: true,
+                reason: "allowed".to_string(),
+            },
+        ),
+        Ok(false) => deny(
+            CoreError::GrantDenied(format!("capability {requested_cap} not granted")),
+            nonce,
+        ),
+        Err(err) => deny(err, nonce),
+    }
+}
+
 /// Checks if a grant covers `requested` (without re-verifying signatures; run after [`verify_grant_with_chain`]).
 pub fn grant_allows(grant: &Grant, requested: &Capability) -> Result<bool, CoreError> {
     let caps = parse_caps(&grant.caps)?;
@@ -857,5 +938,54 @@ mod tests {
             verify_crl_signature(&bad_crl, &pk_crl),
             Err(CoreError::InvalidTimestamp(_))
         ));
+
+        let (sk_auth, pk_auth) = mk_signer(0x66);
+        let auth_g = mk_grant(
+            &sk_auth,
+            "dev_root",
+            "dev_leaf",
+            vec!["fs.read:/docs/*"],
+            "au_1",
+            vec![],
+        );
+        let lookup_auth = |id: &str| (id == "dev_root").then_some(pk_auth);
+        let (none_res, none_audit) = authorize_grant(
+            None,
+            "dev_leaf",
+            "dev_root",
+            "fs.read:/docs/a.md",
+            now,
+            None,
+            lookup_auth,
+        );
+        assert!(matches!(none_res, Err(CoreError::GrantDenied(_))));
+        assert!(!none_audit.allow);
+        assert!(none_audit.grant_nonce.is_none());
+
+        let (ok_res, ok_audit) = authorize_grant(
+            Some(&auth_g),
+            "dev_leaf",
+            "dev_root",
+            "fs.read:/docs/a.md",
+            now,
+            None,
+            lookup_auth,
+        );
+        assert!(ok_res.is_ok());
+        assert!(ok_audit.allow);
+        assert_eq!(ok_audit.grant_nonce.as_deref(), Some("au_1"));
+
+        let (deny_res, deny_audit) = authorize_grant(
+            Some(&auth_g),
+            "dev_leaf",
+            "dev_root",
+            "fs.write:/docs/a.md",
+            now,
+            None,
+            lookup_auth,
+        );
+        assert!(matches!(deny_res, Err(CoreError::GrantDenied(_))));
+        assert!(!deny_audit.allow);
+        assert_eq!(deny_audit.grant_nonce.as_deref(), Some("au_1"));
     }
 }
