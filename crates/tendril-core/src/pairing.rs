@@ -552,7 +552,7 @@ fn is_valid_url_hint(url: &str, secure_scheme: &str, loopback_scheme: &str) -> b
     {
         return false;
     }
-    if let Ok(ip) = bare_host.parse::<IpAddr>()
+    if let Ok(ip) = bare_host.trim_end_matches('.').parse::<IpAddr>()
         && is_disallowed_hint_ip(ip)
     {
         return false;
@@ -577,6 +577,15 @@ fn is_valid_host_port_hint(target: &str) -> bool {
     let Some((host, port_str)) = target.rsplit_once(':') else {
         return false;
     };
+    let trimmed_host = host.strip_prefix('[').unwrap_or(host).trim_end_matches('.');
+    if trimmed_host.is_empty()
+        || trimmed_host.eq_ignore_ascii_case("metadata.google.internal")
+        || trimmed_host
+            .parse::<IpAddr>()
+            .is_ok_and(is_disallowed_hint_ip)
+    {
+        return false;
+    }
     if host.is_empty()
         || host
             .trim_end_matches('.')

@@ -540,6 +540,7 @@ impl P2pListener {
                         return;
                     };
                     let Ok(_permit) = post_sem.try_acquire_owned() else {
+                        conn.close(0u32.into(), b"rate_limited");
                         return;
                     };
                     let Some(_peer_guard) = PeerAcceptGuard::try_acquire(
@@ -547,6 +548,7 @@ impl P2pListener {
                         conn.remote_id(),
                         MAX_CONCURRENT_ACCEPTS_PER_PEER,
                     ) else {
+                        conn.close(0u32.into(), b"rate_limited");
                         return;
                     };
                     let Ok(Ok((send, mut recv))) =

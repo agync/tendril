@@ -2221,6 +2221,125 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
         assert!(!audit.allow);
     }
 
+    // SEC-24 delegated escalation denial: /public* parent delegated to /public_secrets/* child
+    // must NOT pass authorize_path_capability, while valid * -> /public/* delegation still allows /public/readme.md.
+    {
+        use tendril_core::grants::authorize_path_capability;
+
+        let del = mk_identity(83);
+        let leaf = mk_identity(84);
+        let del_parent = sign_grant(
+            GrantUnsigned {
+                v: 1,
+                issuer: host.host_id().to_string(),
+                subject: del.device_id(),
+                caps: vec!["pair.mint".into(), "fs.read:/public*".into()],
+                not_before: "2026-11-20T00:00:00Z".into(),
+                not_after: "2026-12-20T00:00:00Z".into(),
+                nonce: "delpar01".into(),
+                delegated_from: vec![],
+                uses: None,
+                machine: None,
+            },
+            &host.signing_key().signing_key(),
+        )
+        .unwrap();
+        let bad_child = sign_grant(
+            GrantUnsigned {
+                v: 1,
+                issuer: del.device_id(),
+                subject: leaf.device_id(),
+                caps: vec!["fs.read:/public_secrets/*".into()],
+                not_before: "2026-11-20T00:00:00Z".into(),
+                not_after: "2026-12-20T00:00:00Z".into(),
+                nonce: "delchild01".into(),
+                delegated_from: vec![del_parent],
+                uses: None,
+                machine: None,
+            },
+            &del.signing_key().signing_key(),
+        )
+        .unwrap();
+        let lookup_del = |id: &str| -> Option<[u8; 32]> {
+            if id == host.host_id() {
+                Some(*host.signing_key().public_bytes())
+            } else if id == del.device_id() {
+                Some(*del.signing_key().public_bytes())
+            } else {
+                None
+            }
+        };
+        let (esc_res, esc_audit) = authorize_path_capability(
+            Some(&bad_child),
+            &leaf.device_id(),
+            host.host_id(),
+            "fs.read",
+            "/public_secrets/key.pem",
+            NOW_UNIX,
+            None,
+            lookup_del,
+        );
+        assert!(esc_res.is_err());
+        assert!(!esc_audit.allow);
+
+        let star_parent = sign_grant(
+            GrantUnsigned {
+                v: 1,
+                issuer: host.host_id().to_string(),
+                subject: del.device_id(),
+                caps: vec!["pair.mint".into(), "fs.read:*".into()],
+                not_before: "2026-11-20T00:00:00Z".into(),
+                not_after: "2026-12-20T00:00:00Z".into(),
+                nonce: "delpar02".into(),
+                delegated_from: vec![],
+                uses: None,
+                machine: None,
+            },
+            &host.signing_key().signing_key(),
+        )
+        .unwrap();
+        let good_child = sign_grant(
+            GrantUnsigned {
+                v: 1,
+                issuer: del.device_id(),
+                subject: leaf.device_id(),
+                caps: vec!["fs.read:/public/*".into()],
+                not_before: "2026-11-20T00:00:00Z".into(),
+                not_after: "2026-12-20T00:00:00Z".into(),
+                nonce: "delchild02".into(),
+                delegated_from: vec![star_parent],
+                uses: None,
+                machine: None,
+            },
+            &del.signing_key().signing_key(),
+        )
+        .unwrap();
+        let (ok_res, ok_audit) = authorize_path_capability(
+            Some(&good_child),
+            &leaf.device_id(),
+            host.host_id(),
+            "fs.read",
+            "/public/readme.md",
+            NOW_UNIX,
+            None,
+            lookup_del,
+        );
+        assert!(ok_res.is_ok());
+        assert!(ok_audit.allow);
+        let (deny_res, deny_audit) = authorize_path_capability(
+            Some(&good_child),
+            &leaf.device_id(),
+            host.host_id(),
+            "fs.read",
+            "/public_secrets/key.pem",
+            NOW_UNIX,
+            None,
+            lookup_del,
+        );
+        assert!(deny_res.is_err());
+        assert!(!deny_audit.allow);
+    }
+
     // SEC-28: End-to-end encrypted data & explicit rekey under Zeroizing CryptoResolver primitives.
     let rekey_acts = s_cli.send_rekey(20).unwrap();
     let mut rekey_wire = Vec::new();
@@ -2284,6 +2403,12 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
         ),
         format!(
             "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=overlay://169.254.169.254"
+        ),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=direct:169.254.169.254.:80"
+        ),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=relay:wss://169.254.169.254./v1/relay"
         ),
     ] {
         assert!(

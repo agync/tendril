@@ -95,7 +95,7 @@ impl Capability {
         let (Some(granted_res), Some(req_res)) = (&self.resource, &requested.resource) else {
             return false;
         };
-        if granted_res == "/*" {
+        if granted_res == "*" || granted_res == "/*" {
             return if let Some(req_prefix) = req_res.strip_suffix('*') {
                 parse_path_prefix(req_prefix).is_ok()
             } else {
@@ -173,6 +173,11 @@ pub fn canonicalize_capability_path(raw: &str) -> Result<String, CoreError> {
 }
 
 fn parse_path_prefix(prefix: &str) -> Result<(String, bool), CoreError> {
+    if prefix.contains("//") {
+        return Err(CoreError::InvalidCapability(format!(
+            "unsafe path prefix '{prefix}'"
+        )));
+    }
     if prefix == "/" {
         return Ok(("/".to_string(), false));
     }
@@ -795,11 +800,33 @@ pub fn grant_allows(grant: &Grant, requested: &Capability) -> Result<bool, CoreE
     Ok(caps.iter().any(|c| c.covers(requested)))
 }
 
-/// Checks if a grant covers a path-scoped `requested` capability using canonical segment boundaries
-/// (without re-verifying signatures; run after [`verify_grant_with_chain`]).
+/// Checks if a grant and every ancestor in its delegation chain cover a path-scoped
+/// `requested` capability using canonical segment boundaries (without re-verifying signatures;
+/// run after [`verify_grant_with_chain`]).
 pub fn grant_allows_path(grant: &Grant, requested: &Capability) -> Result<bool, CoreError> {
+    grant_allows_path_depth(grant, requested, 0)
+}
+
+fn grant_allows_path_depth(
+    grant: &Grant,
+    requested: &Capability,
+    depth: usize,
+) -> Result<bool, CoreError> {
+    if depth > MAX_DELEGATION_DEPTH {
+        return Err(CoreError::GrantDenied(
+            "delegation depth exceeded".to_string(),
+        ));
+    }
     let caps = parse_caps(&grant.caps)?;
-    Ok(caps.iter().any(|c| c.covers_path(requested)))
+    if !caps.iter().any(|c| c.covers_path(requested)) {
+        return Ok(false);
+    }
+    for parent in &grant.delegated_from {
+        if !grant_allows_path_depth(parent, requested, depth + 1)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn parse_caps(raw: &[String]) -> Result<Vec<Capability>, CoreError> {
@@ -1334,5 +1361,14 @@ mod tests {
         assert!(root_wild.covers_path(&Capability::parse("fs.read:/anything/here").unwrap()));
         assert!(exact_dir.covers_path(&Capability::parse("fs.read:/photos").unwrap()));
         assert!(!exact_dir.covers_path(&Capability::parse("fs.read:/photos/a.jpg").unwrap()));
+
+        let star_wild = Capability::parse("fs.read:*").unwrap();
+        assert!(star_wild.covers_path(&Capability::parse("fs.read:/public/a.txt").unwrap()));
+        assert!(
+            !star_wild.covers_path(&Capability::parse("fs.read:/public/../etc/passwd").unwrap())
+        );
+
+        let dbl_slash = Capability::parse("fs.read://*").unwrap();
+        assert!(!dbl_slash.covers_path(&Capability::parse("fs.read:/etc/passwd").unwrap()));
     }
 }
