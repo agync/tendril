@@ -27,6 +27,11 @@ pub trait PathStream: Send + Sync {
     /// Returns the remote peer IP address when backed by an IP socket.
     fn peer_ip(&self) -> Option<IpAddr>;
 
+    /// Returns a cryptographic transport peer identifier when available (for pre-auth rate limiting only).
+    fn peer_transport_id(&self) -> Option<String> {
+        None
+    }
+
     /// Sends one raw wire chunk (`<= MAX_OUTER_FRAME_LEN`) within write backpressure bounds.
     async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError>;
 
@@ -153,6 +158,10 @@ impl PathStream for PrefixedPathStream {
 
     fn peer_ip(&self) -> Option<IpAddr> {
         self.inner.peer_ip()
+    }
+
+    fn peer_transport_id(&self) -> Option<String> {
+        self.inner.peer_transport_id()
     }
 
     async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {

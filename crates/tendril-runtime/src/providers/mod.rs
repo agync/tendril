@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::error::RuntimeError;
-use crate::provider::{MAX_OUTER_FRAME_LEN, PathStream};
+use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathStream};
 
 pub use broker::{BrokerDialer, BrokerListener, BrokerServerConfig};
 pub use direct::{DirectDialer, DirectListener};
@@ -36,9 +36,66 @@ pub use overlay::{
 };
 #[cfg(feature = "p2p-iroh")]
 pub use p2p::{
-    P2pDialer, P2pListener, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint, parse_p2p_endpoint,
+    P2pDialer, P2pListener, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint,
+    parse_p2p_endpoint, parse_p2p_relay_mode,
 };
 pub use relay::{EmbeddedRelay, RelayDialer, RelayListener};
+
+/// Dials any supported Tendril endpoint (`iroh://`, `overlay://`, `broker+ws(s)://`,
+/// `ws(s)://`, `unix://`/`/...`, or `host:port`) via its matching [`PathDialer`].
+///
+/// For `ws(s)://`, `relay_host` overrides the expected TLS and challenge hostname.
+/// For `iroh://`, `relay_host` selects the P2P relay mode (`"default"`, `"disabled"`/`"local"`,
+/// or `https://...`); when `None` and `TENDRIL_P2P_LOCAL=1`, local-only mode is selected.
+pub async fn dial_endpoint(
+    endpoint: &str,
+    relay_host: Option<&str>,
+) -> Result<Box<dyn PathStream>, RuntimeError> {
+    if endpoint.starts_with("iroh://") {
+        #[cfg(feature = "p2p-iroh")]
+        {
+            let mode = match relay_host {
+                Some(spec) => parse_p2p_relay_mode(Some(spec))?,
+                None if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") => {
+                    P2pRelayMode::Disabled
+                }
+                None => P2pRelayMode::Default,
+            };
+            let dialer = P2pDialer::bind(mode).await?;
+            return match dialer.dial(endpoint).await {
+                Ok(stream) => Ok(stream),
+                Err(err) => {
+                    dialer.close().await;
+                    Err(err)
+                }
+            };
+        }
+        #[cfg(not(feature = "p2p-iroh"))]
+        {
+            let _ = relay_host;
+            return Err(RuntimeError::Protocol(
+                "p2p-iroh feature is not enabled in tendril-runtime".to_owned(),
+            ));
+        }
+    }
+    if endpoint.starts_with("overlay://") {
+        return OverlayDialer::new().dial(endpoint).await;
+    }
+    if endpoint.starts_with("broker+ws://") || endpoint.starts_with("broker+wss://") {
+        return BrokerDialer::new().dial(endpoint).await;
+    }
+    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        let mut dialer = RelayDialer::new();
+        if let Some(host) = relay_host {
+            dialer = dialer.with_expected_host(host);
+        }
+        return dialer.dial(endpoint).await;
+    }
+    if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
+        return LocalDialer::new().dial(endpoint).await;
+    }
+    DirectDialer::new().dial(endpoint).await
+}
 
 static RUSTLS_RING_INIT: Once = Once::new();
 

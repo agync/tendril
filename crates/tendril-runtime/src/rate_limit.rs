@@ -153,7 +153,18 @@ impl PreAuthRateLimiter {
 
     /// Consumes a token for `ip` (if present) and acquires one bounded half-open slot.
     pub fn try_acquire(&self, ip: Option<IpAddr>) -> Result<HalfOpenGuard, RuntimeError> {
-        if let Some(addr) = ip {
+        self.try_acquire_for_peer(ip, None)
+    }
+
+    /// Consumes a peer token when `peer_transport_id` is present, else an IP token, then acquires a half-open slot.
+    pub fn try_acquire_for_peer(
+        &self,
+        ip: Option<IpAddr>,
+        peer_transport_id: Option<&str>,
+    ) -> Result<HalfOpenGuard, RuntimeError> {
+        if let Some(pid) = peer_transport_id {
+            self.check_peer(pid)?;
+        } else if let Some(addr) = ip {
             let mut ips = self
                 .inner
                 .ip_buckets

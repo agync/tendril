@@ -16,12 +16,11 @@ use tendril_core::pairing::{
 use tendril_core::policy::ProviderId;
 use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
-    BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, EmbeddedRelay, HalfOpenGuard, LocalDialer,
-    OverlayDialer, OverlayListener, P2pDialer, P2pListener, P2pRelayMode, PathDialer, PathListener,
-    PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream, RelayDialer, RelayListener,
-    SessionDriver, SessionEvent, StateStore, drive_pair_initiator,
-    drive_pair_responder_with_options, peek_exact,
+    BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
+    DirectListener, EmbeddedRelay, HalfOpenGuard, OverlayListener, P2pListener, P2pRelayMode,
+    PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream, RelayListener,
+    SessionDriver, SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint,
+    drive_pair_initiator, drive_pair_responder_with_options, peek_exact,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -142,34 +141,14 @@ async fn dial_endpoint(
     relay_host: Option<&str>,
     p2p_local: bool,
 ) -> Result<Box<dyn PathStream>, Box<dyn std::error::Error>> {
-    if endpoint.starts_with("iroh://") {
-        let local_only = p2p_local || std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1");
-        let mode = if local_only {
-            P2pRelayMode::Disabled
-        } else {
-            P2pRelayMode::Default
-        };
-        let dialer = P2pDialer::bind(mode).await?;
-        Ok(dialer.dial(endpoint).await?)
-    } else if endpoint.starts_with("overlay://") {
-        let dialer = OverlayDialer::new();
-        Ok(dialer.dial(endpoint).await?)
-    } else if endpoint.starts_with("broker+ws://") || endpoint.starts_with("broker+wss://") {
-        let dialer = BrokerDialer::new();
-        Ok(dialer.dial(endpoint).await?)
-    } else if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        let mut dialer = RelayDialer::new();
-        if let Some(host) = relay_host {
-            dialer = dialer.with_expected_host(host);
-        }
-        Ok(dialer.dial(endpoint).await?)
-    } else if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
-        let dialer = LocalDialer::new();
-        Ok(dialer.dial(endpoint).await?)
+    let effective_hint = if endpoint.starts_with("iroh://")
+        && (p2p_local || std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"))
+    {
+        Some("disabled")
     } else {
-        let dialer = DirectDialer::new();
-        Ok(dialer.dial(endpoint).await?)
-    }
+        relay_host
+    };
+    Ok(runtime_dial_endpoint(endpoint, effective_hint).await?)
 }
 
 fn spawn_listener_pump(
@@ -480,7 +459,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     P2pRelayMode::Default
                 };
-                let pl = P2pListener::bind(mode).await?;
+                let seed = identity.derive_p2p_identity_seed();
+                let pl = P2pListener::bind_with_secret(mode, *seed).await?;
                 let ep = pl.local_endpoint();
                 listeners.push(Box::new(pl));
                 Some(ep)
@@ -530,23 +510,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             drop(inbound_tx);
 
-            let dispatch_stream =
-                |stream: Box<dyn PathStream>| match rate_limiter.try_acquire(stream.peer_ip()) {
-                    Ok(guard) => {
-                        tokio::spawn(handle_inbound(
-                            stream,
-                            guard,
-                            Arc::clone(&store),
-                            Arc::clone(&store_lock),
-                            Arc::clone(&identity),
-                            Arc::clone(&pair_mgr),
-                            rate_limiter.clone(),
-                        ));
-                    }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "rejected inbound stream at pre-auth limit");
-                    }
-                };
+            let dispatch_stream = |stream: Box<dyn PathStream>| match rate_limiter
+                .try_acquire_for_peer(stream.peer_ip(), stream.peer_transport_id().as_deref())
+            {
+                Ok(guard) => {
+                    tokio::spawn(handle_inbound(
+                        stream,
+                        guard,
+                        Arc::clone(&store),
+                        Arc::clone(&store_lock),
+                        Arc::clone(&identity),
+                        Arc::clone(&pair_mgr),
+                        rate_limiter.clone(),
+                    ));
+                }
+                Err(err) => {
+                    tracing::debug!(error = %err, "rejected inbound stream at pre-auth limit");
+                }
+            };
 
             loop {
                 tokio::select! {
@@ -579,7 +560,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut roster = store.load_roster()?;
             let mut stream = dial_endpoint(&endpoint, relay_host.as_deref(), p2p_local).await?;
             let res =
-                drive_pair_initiator(stream.as_mut(), &identity, name, kind, code, None).await?;
+                drive_pair_initiator(stream.as_mut(), &identity, name, kind, code, None).await;
+            let _ = stream.close().await;
+            let res = res?;
             match res.outcome {
                 PairOutcome::InitiatorPending {
                     host_id,

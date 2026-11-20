@@ -3,15 +3,17 @@
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use tendril_core::policy::ProviderId;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use zeroize::Zeroize;
 
 use crate::error::RuntimeError;
 use crate::provider::{
@@ -39,30 +41,60 @@ pub enum P2pRelayMode {
 
 struct EndpointGuard {
     endpoint: Endpoint,
+    closed: AtomicBool,
 }
 
 impl EndpointGuard {
     fn new(endpoint: Endpoint) -> Arc<Self> {
-        Arc::new(Self { endpoint })
+        Arc::new(Self {
+            endpoint,
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    async fn close_now(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.endpoint.close().await;
+        }
     }
 }
 
 impl Drop for EndpointGuard {
     fn drop(&mut self) {
-        let ep = self.endpoint.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                ep.close().await;
-            });
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let ep = self.endpoint.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    ep.close().await;
+                });
+            }
         }
+    }
+}
+
+/// Parses an optional P2P relay mode selector (`"default"`, `"disabled"`/`"local"`, or `http(s)://...`).
+pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeError> {
+    match mode.map(str::trim) {
+        None | Some("" | "default") => Ok(P2pRelayMode::Default),
+        Some("disabled" | "local") => Ok(P2pRelayMode::Disabled),
+        Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
+            let _ = RelayUrl::from_str(url).map_err(|err| {
+                RuntimeError::Protocol(format!("invalid iroh relay URL '{url}': {err}"))
+            })?;
+            Ok(P2pRelayMode::Custom(url.to_owned()))
+        }
+        Some(other) => Err(RuntimeError::Protocol(format!(
+            "invalid p2p relay mode '{other}' (expected default, disabled, local, or relay URL)"
+        ))),
     }
 }
 
 async fn build_iroh_endpoint(
     relay_mode: &P2pRelayMode,
     alpns: Vec<Vec<u8>>,
+    secret_seed: Option<[u8; 32]>,
 ) -> Result<Endpoint, RuntimeError> {
-    let builder = match relay_mode {
+    let mut builder = match relay_mode {
         P2pRelayMode::Default => Endpoint::builder(presets::N0).relay_mode(RelayMode::Default),
         P2pRelayMode::Custom(url_str) => {
             let url = RelayUrl::from_str(url_str).map_err(|err| {
@@ -74,6 +106,11 @@ async fn build_iroh_endpoint(
             Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
         }
     };
+    if let Some(mut seed) = secret_seed {
+        let sk = SecretKey::from_bytes(&seed);
+        seed.zeroize();
+        builder = builder.secret_key(sk);
+    }
     builder
         .alpns(alpns)
         .bind()
@@ -144,6 +181,7 @@ pub struct P2pStream {
     guard: Option<Arc<EndpointGuard>>,
     conn: Option<Connection>,
     peer_ip: Option<IpAddr>,
+    peer_transport_id: String,
     send: SendStream,
     recv: RecvStream,
     write_timeout: Duration,
@@ -157,10 +195,12 @@ impl P2pStream {
         recv: RecvStream,
         write_timeout: Duration,
     ) -> Self {
+        let peer_transport_id = conn.remote_id().to_string();
         Self {
             guard: Some(guard),
             conn: Some(conn),
             peer_ip: None,
+            peer_transport_id,
             send,
             recv,
             write_timeout,
@@ -194,6 +234,10 @@ impl PathStream for P2pStream {
         self.peer_ip
     }
 
+    fn peer_transport_id(&self) -> Option<String> {
+        Some(self.peer_transport_id.clone())
+    }
+
     async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
         if bytes.len() > MAX_OUTER_FRAME_LEN {
             return Err(RuntimeError::FrameTooLarge {
@@ -222,6 +266,12 @@ impl PathStream for P2pStream {
     async fn close(&mut self) -> Result<(), RuntimeError> {
         let _ = self.send.finish();
         let _ = timeout(Duration::from_millis(50), self.send.stopped()).await;
+        drop(self.conn.take());
+        if let Some(guard) = self.guard.take()
+            && let Ok(g) = Arc::try_unwrap(guard)
+        {
+            g.close_now().await;
+        }
         Ok(())
     }
 }
@@ -236,9 +286,25 @@ pub struct P2pListener {
 }
 
 impl P2pListener {
-    /// Binds a new `iroh` P2P endpoint listener under `relay_mode`.
+    /// Binds a new `iroh` P2P endpoint listener under `relay_mode` with a fresh ephemeral key.
     pub async fn bind(relay_mode: P2pRelayMode) -> Result<Self, RuntimeError> {
-        let endpoint = build_iroh_endpoint(&relay_mode, vec![TENDRIL_P2P_ALPN.to_vec()]).await?;
+        Self::bind_inner(relay_mode, None).await
+    }
+
+    /// Binds a new `iroh` P2P endpoint listener under `relay_mode` with a deterministic secret seed.
+    pub async fn bind_with_secret(
+        relay_mode: P2pRelayMode,
+        secret_seed: [u8; 32],
+    ) -> Result<Self, RuntimeError> {
+        Self::bind_inner(relay_mode, Some(secret_seed)).await
+    }
+
+    async fn bind_inner(
+        relay_mode: P2pRelayMode,
+        secret_seed: Option<[u8; 32]>,
+    ) -> Result<Self, RuntimeError> {
+        let endpoint =
+            build_iroh_endpoint(&relay_mode, vec![TENDRIL_P2P_ALPN.to_vec()], secret_seed).await?;
         if !matches!(relay_mode, P2pRelayMode::Disabled) {
             let _ = timeout(Duration::from_secs(3), endpoint.online()).await;
         }
@@ -336,7 +402,7 @@ pub struct P2pDialer {
 impl P2pDialer {
     /// Binds a client `iroh` endpoint configured with `relay_mode`.
     pub async fn bind(relay_mode: P2pRelayMode) -> Result<Self, RuntimeError> {
-        let endpoint = build_iroh_endpoint(&relay_mode, Vec::new()).await?;
+        let endpoint = build_iroh_endpoint(&relay_mode, Vec::new(), None).await?;
         Ok(Self {
             guard: EndpointGuard::new(endpoint),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
@@ -353,7 +419,7 @@ impl P2pDialer {
     /// Gracefully closes the client endpoint handle when no active streams still hold it.
     pub async fn close(self) {
         if let Ok(guard) = Arc::try_unwrap(self.guard) {
-            guard.endpoint.close().await;
+            guard.close_now().await;
         }
     }
 }

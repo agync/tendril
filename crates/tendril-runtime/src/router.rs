@@ -94,7 +94,9 @@ impl InboundRouter {
                         Err(_) => break,
                     },
                 };
-                let Ok(guard) = limiter.try_acquire(stream.peer_ip()) else {
+                let Ok(guard) =
+                    limiter.try_acquire_for_peer(stream.peer_ip(), stream.peer_transport_id().as_deref())
+                else {
                     continue;
                 };
                 let p_tx = pair_tx.clone();

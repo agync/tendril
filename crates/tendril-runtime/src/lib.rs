@@ -21,11 +21,12 @@ pub use providers::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DirectDialer, DirectListener, EmbeddedRelay,
     LocalDialer, LocalListener, OverlayConfig, OverlayDialer, OverlayHelperDialer,
     OverlayHelperListener, OverlayListener, OverlayMode, OverlayResolvedMode, RelayDialer,
-    RelayListener, is_tailnet_ip, select_overlay_mode,
+    RelayListener, dial_endpoint, is_tailnet_ip, select_overlay_mode,
 };
 #[cfg(feature = "p2p-iroh")]
 pub use providers::{
-    P2pDialer, P2pListener, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint, parse_p2p_endpoint,
+    P2pDialer, P2pListener, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint,
+    parse_p2p_endpoint, parse_p2p_relay_mode,
 };
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};

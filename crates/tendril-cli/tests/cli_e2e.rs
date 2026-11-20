@@ -499,6 +499,11 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
         "pair stderr: {}",
         String::from_utf8_lossy(&pair_out.stderr)
     );
+    assert!(
+        !String::from_utf8_lossy(&pair_out.stderr).contains("Endpoint dropped without calling"),
+        "unexpected ungraceful iroh drop warning on pair stderr: {}",
+        String::from_utf8_lossy(&pair_out.stderr)
+    );
     let paired_info: serde_json::Value =
         serde_json::from_slice(&pair_out.stdout).expect("pair json");
     let sas = paired_info["sas"].as_str().expect("sas");
@@ -548,6 +553,14 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
         let dial_json: serde_json::Value =
             serde_json::from_slice(&dial_out.stdout).expect("dial json");
         assert_eq!(dial_json["provider"], expected_provider);
+        if expected_provider == "P2p" {
+            assert!(
+                !String::from_utf8_lossy(&dial_out.stderr)
+                    .contains("Endpoint dropped without calling"),
+                "unexpected ungraceful iroh drop warning on dial stderr: {}",
+                String::from_utf8_lossy(&dial_out.stderr)
+            );
+        }
 
         let est = read_json_line(&mut stdout);
         assert_eq!(est["event"], "session_established");
@@ -558,4 +571,26 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
         let closed = read_json_line(&mut stdout);
         assert_eq!(closed["event"], "closed");
     }
+
+    drop(stdout);
+    drop(serve);
+
+    // Restarting serve from the same state_dir preserves the HKDF-derived P2P EndpointId.
+    let mut serve2 = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(host_dir.path())
+            .args(["serve", "--listen", "127.0.0.1:0", "--p2p-local"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve restart"),
+    );
+    let mut stdout2 = BufReader::new(serve2.0.stdout.take().expect("serve2 stdout"));
+    let listening2 = read_json_line(&mut stdout2);
+    let p2p_ep2 = listening2["p2p_endpoint"]
+        .as_str()
+        .expect("p2p_endpoint2")
+        .to_owned();
+    assert_eq!(p2p_ep.split('?').next(), p2p_ep2.split('?').next());
 }

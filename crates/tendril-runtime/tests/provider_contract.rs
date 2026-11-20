@@ -1464,3 +1464,100 @@ async fn dial_with_policy_respects_p2p_cold_delay_and_falls_back_across_rungs() 
     assert_eq!(winner2.provider, ProviderId::Broker);
     let _srv2 = accept_broker.await.expect("join").expect("broker accept");
 }
+
+#[test]
+fn pre_auth_rate_limiter_keys_p2p_by_transport_peer_id() {
+    let limiter = PreAuthRateLimiter::new(PreAuthConfig {
+        max_entries: 16,
+        max_half_open: 32,
+        ip_burst: 1,
+        ip_refill_per_sec: 1,
+        peer_burst: 2,
+        peer_refill_per_sec: 1,
+    });
+    let shared_relay_ip: IpAddr = "198.51.100.1".parse().expect("ip");
+
+    let g1 = limiter
+        .try_acquire_for_peer(Some(shared_relay_ip), Some("peer-a"))
+        .expect("peer-a 1");
+    let g2 = limiter
+        .try_acquire_for_peer(Some(shared_relay_ip), Some("peer-a"))
+        .expect("peer-a 2");
+    assert!(matches!(
+        limiter.try_acquire_for_peer(Some(shared_relay_ip), Some("peer-a")),
+        Err(RuntimeError::RateLimited(_))
+    ));
+    drop((g1, g2));
+
+    let g_other_peer = limiter
+        .try_acquire_for_peer(Some(shared_relay_ip), Some("peer-b"))
+        .expect("peer-b behind same IP is not starved");
+    drop(g_other_peer);
+
+    // Direct IP path without transport PeerID still enforces ip_burst independently.
+    let g_ip = limiter
+        .try_acquire_for_peer(Some(shared_relay_ip), None)
+        .expect("ip bucket still full");
+    assert!(matches!(
+        limiter.try_acquire_for_peer(Some(shared_relay_ip), None),
+        Err(RuntimeError::RateLimited(_))
+    ));
+    drop(g_ip);
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn p2p_deterministic_endpoint_id_and_peer_transport_id() {
+    let mut id = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar([0x51; 32]),
+        SigningKeypair::from_seed([0x52; 32]),
+    )
+    .with_host_id("deterministic-p2p-host");
+    let seed1 = id.derive_p2p_identity_seed();
+
+    let l1 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, *seed1)
+        .await
+        .expect("bind l1");
+    let ep_id1 = l1.endpoint_id();
+    drop(l1);
+
+    let l2 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, *seed1)
+        .await
+        .expect("rebind l2");
+    assert_eq!(l2.endpoint_id(), ep_id1);
+    drop(l2);
+
+    id.rotate(
+        StaticKeypair::from_scalar([0x53; 32]),
+        SigningKeypair::from_seed([0x54; 32]),
+        1_795_132_950,
+    )
+    .expect("rotate identity");
+    let seed2 = id.derive_p2p_identity_seed();
+
+    let mut l3 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, *seed2)
+        .await
+        .expect("bind rotated l3");
+    assert_ne!(l3.endpoint_id(), ep_id1);
+    let ep3 = l3.local_endpoint();
+
+    let accept_task = tokio::spawn(async move { l3.accept().await });
+    let dialer = P2pDialer::bind(P2pRelayMode::Disabled)
+        .await
+        .expect("bind dialer");
+    let mut cli_stream = dialer.dial(&ep3).await.expect("dial rotated");
+    drop(dialer);
+
+    let mut srv_stream = accept_task
+        .await
+        .expect("join accept")
+        .expect("accept rotated");
+    let transport_pid = srv_stream
+        .peer_transport_id()
+        .expect("p2p stream exposes remote transport peer id");
+    assert!(!transport_pid.is_empty());
+    assert_ne!(transport_pid, ep_id1.to_string());
+
+    let _ = srv_stream.close().await;
+    let _ = cli_stream.close().await;
+}
