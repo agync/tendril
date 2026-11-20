@@ -468,13 +468,15 @@ fn state_store_sets_permissions_and_preserves_rotated_identity() {
         .expect("rotate");
     store.save_identity(&identity).expect("save rotated");
 
+    let peer_static = *tendril_core::crypto::StaticKeypair::from_scalar([0x51; 32]).public_bytes();
+    let peer_signing = *tendril_core::crypto::SigningKeypair::from_seed([0x52; 32]).public_bytes();
     let mut roster = Roster::new();
     roster
         .insert_pinned_host(
             "peer-1".to_owned(),
             "phone".to_owned(),
-            [0x51; 32],
-            Some([0x52; 32]),
+            peer_static,
+            Some(peer_signing),
             0,
             vec!["wss://relay.example/v1/relay".to_owned()],
         )
@@ -1844,7 +1846,11 @@ fn batch1_sec04_state_store_flock_serializes_concurrent_updates() {
         h.join().expect("join thread");
     }
 
-    let final_roster = store.load_roster().expect("load final roster");
+    let (final_roster, loaded_stamp) = store.load_roster_with_stamp().expect("load final roster");
+    assert_eq!(
+        loaded_stamp,
+        store.roster_stamp().expect("read stamp after load")
+    );
     assert_eq!(
         final_roster.get(&target_id).expect("target present").state,
         PeerState::Revoked
@@ -1857,4 +1863,23 @@ fn batch1_sec04_state_store_flock_serializes_concurrent_updates() {
             );
         }
     }
+
+    let ((), updated_roster, updated_stamp) = store
+        .update_roster_with_state(|r| {
+            r.update_relay_hints("peer-0", vec!["wss://relay.example/v1/relay".to_owned()])?;
+            Ok(())
+        })
+        .expect("update with state");
+    assert_eq!(
+        updated_stamp,
+        store.roster_stamp().expect("read stamp after update")
+    );
+    assert_eq!(
+        updated_roster.get(&target_id).expect("target").state,
+        PeerState::Revoked
+    );
+    assert_eq!(
+        updated_roster.get("peer-0").expect("peer-0").relay_hints,
+        vec!["wss://relay.example/v1/relay".to_owned()]
+    );
 }

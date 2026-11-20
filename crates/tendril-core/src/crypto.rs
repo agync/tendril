@@ -86,10 +86,11 @@ pub fn is_valid_x25519_public_key(pub_bytes: &[u8; 32]) -> bool {
     zero_scalar.diffie_hellman(&peer_pub).was_contributory()
 }
 
-/// Validates that `pub_bytes` decodes as a non-zero Ed25519 verifying key.
+/// Validates that `pub_bytes` decodes as a non-zero, non-weak Ed25519 verifying key.
 #[must_use]
 pub fn is_valid_ed25519_public_key(pub_bytes: &[u8; 32]) -> bool {
-    !bool::from(pub_bytes.ct_eq(&[0u8; 32])) && VerifyingKey::from_bytes(pub_bytes).is_ok()
+    !bool::from(pub_bytes.ct_eq(&[0u8; 32]))
+        && VerifyingKey::from_bytes(pub_bytes).is_ok_and(|vk| !vk.is_weak())
 }
 
 struct ContributoryDh {

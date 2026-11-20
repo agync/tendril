@@ -164,8 +164,16 @@ impl StateStore {
     /// Loads [`Roster`] from `roster.json` under a shared advisory lock, or returns a fresh
     /// default-deny [`Roster`] if absent.
     pub fn load_roster(&self) -> Result<Roster, RuntimeError> {
+        let (roster, _) = self.load_roster_with_stamp()?;
+        Ok(roster)
+    }
+
+    /// Loads [`Roster`] and its matching [`RosterStamp`] atomically under a shared advisory lock.
+    pub fn load_roster_with_stamp(&self) -> Result<(Roster, Option<RosterStamp>), RuntimeError> {
         let _lock = self.lock_roster_file(false)?;
-        self.load_roster_unlocked()
+        let roster = self.load_roster_unlocked()?;
+        let stamp = self.roster_stamp()?;
+        Ok((roster, stamp))
     }
 
     /// Atomically persists [`Roster`] under an exclusive advisory lock with `0o600` file mode on Unix.
@@ -175,8 +183,12 @@ impl StateStore {
     }
 
     /// Executes `f` transactionally against the latest on-disk [`Roster`] under an exclusive
-    /// advisory lock (`flock`), persisting updates atomically on `Ok`.
-    pub fn update_roster<T, F>(&self, f: F) -> Result<T, RuntimeError>
+    /// advisory lock (`flock`), persisting updates atomically on `Ok` and returning the updated
+    /// roster with its matching [`RosterStamp`].
+    pub fn update_roster_with_state<T, F>(
+        &self,
+        f: F,
+    ) -> Result<(T, Roster, Option<RosterStamp>), RuntimeError>
     where
         F: FnOnce(&mut Roster) -> Result<T, RuntimeError>,
     {
@@ -184,6 +196,17 @@ impl StateStore {
         let mut roster = self.load_roster_unlocked()?;
         let out = f(&mut roster)?;
         self.save_roster_unlocked(&roster)?;
+        let stamp = self.roster_stamp()?;
+        Ok((out, roster, stamp))
+    }
+
+    /// Executes `f` transactionally against the latest on-disk [`Roster`] under an exclusive
+    /// advisory lock (`flock`), persisting updates atomically on `Ok`.
+    pub fn update_roster<T, F>(&self, f: F) -> Result<T, RuntimeError>
+    where
+        F: FnOnce(&mut Roster) -> Result<T, RuntimeError>,
+    {
+        let (out, _, _) = self.update_roster_with_state(f)?;
         Ok(out)
     }
 

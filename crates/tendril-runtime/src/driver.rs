@@ -537,8 +537,17 @@ impl SessionDriver {
         F: FnMut(&mut Roster) -> Result<bool, RuntimeError>,
     {
         loop {
-            if let Some(ev) = self.pending_events.pop_front() {
-                return Ok(Some(ev));
+            if !self.pending_events.is_empty() {
+                let now_unix = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if refresh_roster(roster)? {
+                    self.tick(now_unix, roster).await?;
+                }
+                if let Some(ev) = self.pending_events.pop_front() {
+                    return Ok(Some(ev));
+                }
             }
             if self.machine.is_closed() {
                 return Ok(None);

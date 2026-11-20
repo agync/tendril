@@ -271,15 +271,13 @@ async fn handle_inbound(
         Intent::Session => {
             let (mut roster, initial_stamp) = {
                 let _guard = store_lock.lock().await;
-                let r = match store.load_roster() {
-                    Ok(r) => r,
+                match store.load_roster_with_stamp() {
+                    Ok(pair) => pair,
                     Err(err) => {
                         tracing::error!(error = %err, "failed to load roster before session");
                         return;
                     }
-                };
-                let stamp = store.roster_stamp().ok().flatten();
-                (r, stamp)
+                }
             };
             let Ok(mut driver) = SessionDriver::accept_with_options(
                 wrapped,
@@ -307,8 +305,9 @@ async fn handle_inbound(
                     .next_event_with_refresh(&mut roster, Duration::from_millis(250), |mem| {
                         let current_stamp = store.roster_stamp()?;
                         if current_stamp != last_stamp {
-                            *mem = store.load_roster()?;
-                            last_stamp = current_stamp;
+                            let (disk, fresh_stamp) = store.load_roster_with_stamp()?;
+                            *mem = disk;
+                            last_stamp = fresh_stamp;
                             return Ok(true);
                         }
                         Ok(false)
@@ -327,7 +326,7 @@ async fn handle_inbound(
                             store.as_ref(),
                             store_lock.as_ref(),
                             identity.as_ref(),
-                            &roster,
+                            &mut roster,
                             &issuer,
                             &mut last_stamp,
                         )
@@ -337,6 +336,14 @@ async fn handle_inbound(
                             "issuer": issuer,
                             "seq": seq,
                         }));
+                        if let Err(err) = driver.tick(now_unix(), &roster).await {
+                            print_json_line(&serde_json::json!({
+                                "event": "closed",
+                                "code": 1000,
+                                "reason": err.to_string(),
+                            }));
+                            break;
+                        }
                     }
                     Ok(Some(SessionEvent::Closed { code, reason })) => {
                         print_json_line(&serde_json::json!({
@@ -354,7 +361,7 @@ async fn handle_inbound(
                                 store.as_ref(),
                                 store_lock.as_ref(),
                                 identity.as_ref(),
-                                &roster,
+                                &mut roster,
                                 issuer,
                                 &mut last_stamp,
                             )
@@ -378,19 +385,29 @@ fn persist_crl_for_issuer(
     identity: &tendril_core::identity::EndpointIdentity,
     roster: &tendril_core::roster::Roster,
     issuer: &str,
-) -> Result<bool, tendril_runtime::RuntimeError> {
+) -> Result<
+    Option<(
+        tendril_core::roster::Roster,
+        Option<tendril_runtime::RosterStamp>,
+    )>,
+    tendril_runtime::RuntimeError,
+> {
     let Some(crl) = roster.crl(issuer).cloned() else {
-        return Ok(false);
+        return Ok(None);
     };
-    let issuer_pub = if issuer == identity.host_id() {
-        Some(*identity.signing_key().public_bytes())
-    } else {
-        roster.lookup_active_signing_key(issuer)
-    };
-    let Some(pk) = issuer_pub else {
-        return Ok(false);
-    };
-    store.update_roster(|disk| {
+    let ((), disk, stamp) = store.update_roster_with_state(|disk| {
+        let issuer_pub = if issuer == identity.host_id() {
+            Some(*identity.signing_key().public_bytes())
+        } else {
+            disk.lookup_active_signing_key(issuer).or_else(|| {
+                disk.get(issuer)
+                    .filter(|e| e.state != tendril_core::roster::PeerState::Pending)
+                    .and_then(|e| e.signing_pub)
+            })
+        };
+        let Some(pk) = issuer_pub else {
+            return Ok(());
+        };
         if let Err(err) = disk.ingest_crl(crl, issuer, &pk)
             && !matches!(err, tendril_core::error::CoreError::CrlStaleSeq { .. })
         {
@@ -398,23 +415,24 @@ fn persist_crl_for_issuer(
         }
         Ok(())
     })?;
-    Ok(true)
+    Ok(Some((disk, stamp)))
 }
 
 async fn persist_session_crl(
     store: &StateStore,
     store_lock: &AsyncMutex<()>,
     identity: &tendril_core::identity::EndpointIdentity,
-    roster: &tendril_core::roster::Roster,
+    roster: &mut tendril_core::roster::Roster,
     issuer: &str,
     last_stamp: &mut Option<tendril_runtime::RosterStamp>,
 ) {
     let _guard = store_lock.lock().await;
     match persist_crl_for_issuer(store, identity, roster, issuer) {
-        Ok(true) => {
-            *last_stamp = store.roster_stamp().ok().flatten();
+        Ok(Some((disk, stamp))) => {
+            *roster = disk;
+            *last_stamp = stamp;
         }
-        Ok(false) => {}
+        Ok(None) => {}
         Err(err) => {
             tracing::error!(error = %err, "failed to persist session CRL update");
         }
@@ -848,8 +866,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             }
             .await;
-            let _ = persist_crl_for_issuer(&store, &identity, &roster, &target);
+            let persist_res = persist_crl_for_issuer(&store, &identity, &roster, &target);
+            if let Err(err) = &persist_res {
+                tracing::error!(error = %err, "failed to persist dial session CRL update");
+            }
             session_res?;
+            let _ = persist_res?;
             print_json_line(&serde_json::json!({
                 "connected": target,
                 "provider": provider,

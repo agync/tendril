@@ -148,6 +148,11 @@ pub fn verify_grant_json(
 #[wasm_bindgen]
 pub fn parse_pairing_uri_json(uri: &str) -> Result<String, JsValue> {
     let parsed = PairingUri::parse(uri).map_err(to_js_err)?;
+    let rotation_seq = parsed
+        .rotation_seq
+        .map(u64_to_f64)
+        .transpose()
+        .map_err(to_js_err)?;
     Ok(json!({
         "host_name": parsed.host_name,
         "code": parsed.code,
@@ -155,7 +160,7 @@ pub fn parse_pairing_uri_json(uri: &str) -> Result<String, JsValue> {
         "host_signing_pub_b64": b64url_encode(&parsed.host_signing_pub),
         "endpoints": parsed.endpoints,
         "host_id": parsed.host_id,
-        "rotation_seq": parsed.rotation_seq.and_then(|s| u64_to_f64(s).ok()),
+        "rotation_seq": rotation_seq,
     })
     .to_string())
 }
