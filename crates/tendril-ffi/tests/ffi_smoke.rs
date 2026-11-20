@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -1107,4 +1107,82 @@ fn ffi_serve_p2p_without_feature_returns_protocol_error() {
     assert!(p2p_ptr.is_null());
     assert!(read_last_err().contains("p2p-iroh"));
     unsafe { tendril_endpoint_free(host_ep) };
+}
+
+#[test]
+fn batch1_sec03_ffi_pair_flood_does_not_starve_accept_session() {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    let tmp = TempDir::new().unwrap();
+    let host_dir = tmp.path().join("host");
+    let cli_dir = tmp.path().join("cli");
+    let grant_str = pair_and_mint_c(
+        host_dir.to_str().unwrap(),
+        cli_dir.to_str().unwrap(),
+        "ffi-sec03-host",
+        "[\"fs.read\"]",
+    );
+
+    let hd_c = CString::new(host_dir.to_str().unwrap()).unwrap();
+    let cd_c = CString::new(cli_dir.to_str().unwrap()).unwrap();
+    let hn_c = CString::new("ffi-sec03-host").unwrap();
+    let host_ep = unsafe { tendril_endpoint_new(hd_c.as_ptr(), hn_c.as_ptr()) };
+    let cli_ep = unsafe { tendril_endpoint_new(cd_c.as_ptr(), ptr::null()) };
+    assert!(!host_ep.is_null() && !cli_ep.is_null());
+
+    let mut ep_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, ptr::null(), &raw mut ep_ptr) },
+        TENDRIL_OK
+    );
+    let ep_str = unsafe { take_cstr(ep_ptr) };
+    let addr = ep_str.strip_prefix("direct:").unwrap_or(&ep_str);
+
+    // Park 32 unconsumed Intent::Pair streams across two IP bursts while pair_accept is unpolled.
+    let mut floods = Vec::new();
+    for i in 0..32usize {
+        if i == 24 {
+            thread::sleep(Duration::from_millis(1_500));
+        }
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"TND\x01\x02\x00").unwrap();
+        floods.push(s);
+    }
+    thread::sleep(Duration::from_millis(300));
+
+    let ep_usize = host_ep as usize;
+    let accept_thr = thread::spawn(move || {
+        let s =
+            unsafe { tendril_session_accept(ep_usize as *mut tendril_ffi::TendrilEndpoint, 4_000) };
+        assert!(!s.is_null(), "session accept starved: {}", read_last_err());
+        s as usize
+    });
+
+    let ep_c = CString::new(ep_str).unwrap();
+    let grant_c = CString::new(grant_str).unwrap();
+    let cli_sess = unsafe {
+        tendril_session_connect(
+            cli_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            hn_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(
+        !cli_sess.is_null(),
+        "session connect failed after pair flood: {}",
+        read_last_err()
+    );
+    let host_sess = accept_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
+
+    drop(floods);
+    unsafe {
+        tendril_session_close(cli_sess, 1000, ptr::null());
+        tendril_session_free(cli_sess);
+        tendril_session_free(host_sess);
+        tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
 }

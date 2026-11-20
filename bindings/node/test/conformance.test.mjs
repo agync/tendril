@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import readline from "node:readline";
 import test from "node:test";
@@ -335,6 +336,52 @@ test("Node binding pairs and connects over local P2p (disabled relay mode)", asy
     const closeEv = JSON.parse(await hostSess.pollEvent(2000));
     assert.ok(closeEv.event === "closed" || closeEv.status === "eof", `expected close/eof, got ${JSON.stringify(closeEv)}`);
   } finally {
+    hostEp.close();
+    cliEp.close();
+  }
+});
+
+test("Node binding isolates Intent::Pair flood from acceptSession", async () => {
+  const hostEp = new tendril.Endpoint(null, "node-sec03-host");
+  const cliEp = new tendril.Endpoint(null, "node-sec03-cli");
+  const sockets = [];
+  try {
+    const addr = await hostEp.serveDirect("127.0.0.1:0");
+    const code = hostEp.issueCode("lan");
+    const [pairRaw, accRaw] = await Promise.all([
+      cliEp.pairInitiate(addr, code, null, "node-sec03", "node"),
+      hostEp.pairAccept(5000),
+    ]);
+    const pairCli = JSON.parse(pairRaw);
+    const acc = JSON.parse(accRaw);
+    hostEp.confirmPeer(acc.device_id, pairCli.sas);
+    cliEp.confirmPeer("node-sec03-host", pairCli.sas);
+    const grantJson = hostEp.mintGrant(acc.device_id, ["fs.read"], 3600);
+
+    const port = Number(addr.split(":").pop());
+    for (let i = 0; i < 32; i += 1) {
+      if (i === 24) {
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      const sock = net.createConnection({ host: "127.0.0.1", port });
+      await new Promise((resolve, reject) => {
+        sock.once("connect", () => sock.write(Buffer.from("TND\x01\x02\x00", "latin1"), resolve));
+        sock.once("error", reject);
+      });
+      sockets.push(sock);
+    }
+    await new Promise((r) => setTimeout(r, 300));
+
+    const [cliSess, hostSess] = await Promise.all([
+      cliEp.connect(addr, "node-sec03-host", grantJson),
+      hostEp.acceptSession(4000),
+    ]);
+    await cliSess.sendData(Buffer.from("after-pair-flood", "utf8"));
+    const ev = JSON.parse(await hostSess.pollEvent(2000));
+    assert.equal(ev.event, "data");
+    await cliSess.close(1000, "done");
+  } finally {
+    for (const s of sockets) s.destroy();
     hostEp.close();
     cliEp.close();
   }

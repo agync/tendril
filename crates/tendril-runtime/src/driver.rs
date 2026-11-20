@@ -3,11 +3,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tendril_core::error::CoreError;
 use tendril_core::grants::{AuditEvent, Grant, RevocationList};
-use tendril_core::identity::EndpointIdentity;
+use tendril_core::identity::{EndpointIdentity, RotationRecord};
 use tendril_core::pairing::{
     PairAction, PairOutcome, PairingInitiator, PairingManager, PairingPathKind, PairingResponder,
     PinnedHost,
@@ -19,7 +19,7 @@ use tendril_core::roster::Roster;
 use tendril_core::session::{RekeyDirection, SessionAction, SessionMachine};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use tokio::time::{Instant as TokioInstant, sleep, timeout_at};
+use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
 
 use crate::error::RuntimeError;
 use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathStream};
@@ -455,8 +455,13 @@ impl SessionDriver {
     /// Advances rekey/grant expiration checks against `roster`.
     pub async fn tick(&mut self, now_unix: u64, roster: &Roster) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.tick(now_unix, now_ms, roster)?;
-        self.apply_actions(actions).await
+        match self.machine.tick(now_unix, now_ms, roster) {
+            Ok(actions) => self.apply_actions(actions).await,
+            Err(err) => {
+                let _ = self.stream.close().await;
+                Err(err.into())
+            }
+        }
     }
 
     /// Evaluates default-deny capability authorization and produces a structured audit event.
@@ -487,6 +492,12 @@ impl SessionDriver {
         self.machine.active_grant()
     }
 
+    /// Returns the verified host rotation chain applied during handshake, if any.
+    #[must_use]
+    pub fn applied_rotation(&self) -> &[RotationRecord] {
+        self.machine.applied_rotation()
+    }
+
     /// Returns the provider ID backing the active stream.
     #[must_use]
     pub fn provider_id(&self) -> ProviderId {
@@ -512,6 +523,51 @@ impl SessionDriver {
     ) -> Result<Option<SessionEvent>, RuntimeError> {
         self.next_event_with_roster(now_unix, RosterRef::Locked(roster))
             .await
+    }
+
+    /// Returns the next semantic event, polling inbound frames at `poll_interval` and calling
+    /// `refresh_roster` before evaluating `tick` or feeding incoming frames.
+    pub async fn next_event_with_refresh<F>(
+        &mut self,
+        roster: &mut Roster,
+        poll_interval: Duration,
+        mut refresh_roster: F,
+    ) -> Result<Option<SessionEvent>, RuntimeError>
+    where
+        F: FnMut(&mut Roster) -> Result<bool, RuntimeError>,
+    {
+        loop {
+            if let Some(ev) = self.pending_events.pop_front() {
+                return Ok(Some(ev));
+            }
+            if self.machine.is_closed() {
+                return Ok(None);
+            }
+            let recv_res = timeout(poll_interval, self.stream.recv_chunk(&mut self.recv_buf)).await;
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let now_ms = self.elapsed_ms();
+            match recv_res {
+                Ok(Ok(0)) => return Ok(None),
+                Ok(Err(err)) => return Err(err),
+                Ok(Ok(n)) => {
+                    if refresh_roster(roster)? {
+                        self.tick(now_unix, roster).await?;
+                    }
+                    let chunk = self.recv_buf[..n].to_vec();
+                    let mut roster_ref = RosterRef::Direct(roster);
+                    let actions =
+                        self.feed_with_roster(&chunk, now_unix, now_ms, &mut roster_ref)?;
+                    self.apply_actions(actions).await?;
+                }
+                Err(_) => {
+                    let _ = refresh_roster(roster)?;
+                    self.tick(now_unix, roster).await?;
+                }
+            }
+        }
     }
 
     async fn next_event_with_roster(

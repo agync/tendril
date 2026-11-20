@@ -19,7 +19,7 @@ Host app (Go / Python / Node.js)
       -> `tendril-runtime` (`InboundRouter`, `StateStore`, `SessionDriver`) + `tendril-core`
 ```
 
-- **Shared inbound routing (`InboundRouter`):** Peeks each incoming stream's cleartext preamble under the pre-auth rate limiter and dispatches `Intent::Pair` and `Intent::Session` streams onto separate queues (`pair_rx` and `session_rx`) so `pair_accept` and `accept_session` never block or starve each other, while `close()` wakes waiting callers immediately.
+- **Shared inbound routing (`InboundRouter`):** Peeks each incoming stream's cleartext preamble under the pre-auth rate limiter and dispatches `Intent::Pair` and `Intent::Session` streams onto independent bounded queues (`pair_rx` and `session_rx`) with isolated half-open budgets and automatic expiration (`DEFAULT_PRE_AUTH_TIMEOUT`), so unconsumed pairing floods never block or starve `accept_session` (and vice versa), while `set_pair_enabled(false)` disables pairing at the router and `close()` wakes waiting callers immediately.
 - **Durable roster persistence:** Host key rotations and rotation-fork revocations during `connect`, as well as CRL updates (including session-terminating `0x03 REVOCATION` frames), are persisted to `StateStore` across `tendril-ffi`, Python, and Node.
 - **Go (`bindings/go`):** Links `libtendril_ffi` through cgo against `crates/tendril-ffi/include/tendril.h`.
 - **Python (`bindings/python`):** Builds a PyO3 `abi3-py39` extension module (`tendril._tendril`) with `unsafe_code = "forbid"`, releasing the GIL via `py.detach` around Argon2 derivation (`compute_code_mac`) and every `Endpoint`/`Session` mutex, disk I/O, or blocking runtime operation (`info_json` is a lock-free metadata serialization).

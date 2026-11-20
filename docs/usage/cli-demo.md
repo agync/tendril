@@ -51,7 +51,7 @@ tendril --state-dir ./cli-state dial --target my-host --endpoint 127.0.0.1:PORT 
 tendril --state-dir ./host-state revoke <client_device_id>
 ```
 
-Once revoked, subsequent `dial` attempts fail closed on the host listener during session establishment.
+Once revoked, subsequent `dial` attempts fail closed on the host listener during session establishment, and active `tendril serve` sessions reload `roster.json` updates (under `.roster.lock` advisory locking) to terminate revoked peers immediately across ticks or incoming frames (`0x04 REKEY`, `0x01 DATA`).
 
 ## JSON stdio conformance peer (`tendril-conformance-peer`)
 

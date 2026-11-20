@@ -10,7 +10,7 @@ use crate::crypto::{
 };
 use crate::error::CoreError;
 use crate::grants::{AuditEvent, Grant, RevocationList, authorize_grant, verify_grant_with_chain};
-use crate::identity::EndpointIdentity;
+use crate::identity::{EndpointIdentity, RotationRecord};
 use crate::roster::{PeerState, Roster};
 use crate::wire::{
     HostHello, InnerFrameType, Intent, MAX_FRAME_LEN, NOISE_PATTERN, Preamble,
@@ -93,7 +93,8 @@ pub struct SessionMachine {
     local_host_id: String,
     local_device_id: String,
     local_signing_pub: [u8; 32],
-    local_rotation_chain: Vec<crate::identity::RotationRecord>,
+    local_rotation_chain: Vec<RotationRecord>,
+    applied_rotation: Vec<RotationRecord>,
     target_host_id: Option<String>,
     initial_grant: Option<Grant>,
     initial_crl_seq: Option<u64>,
@@ -136,6 +137,7 @@ impl SessionMachine {
             local_device_id: local_identity.device_id(),
             local_signing_pub: *local_identity.signing_key().public_bytes(),
             local_rotation_chain: local_identity.rotation_chain().to_vec(),
+            applied_rotation: Vec::new(),
             target_host_id: Some(target_host_id.into()),
             initial_grant: initial_grant.clone(),
             initial_crl_seq: crl_seq,
@@ -164,6 +166,7 @@ impl SessionMachine {
             local_device_id: local_identity.device_id(),
             local_signing_pub: *local_identity.signing_key().public_bytes(),
             local_rotation_chain: local_identity.rotation_chain().to_vec(),
+            applied_rotation: Vec::new(),
             target_host_id: None,
             initial_grant: None,
             initial_crl_seq: None,
@@ -212,6 +215,12 @@ impl SessionMachine {
     #[must_use]
     pub const fn active_grant(&self) -> Option<&Grant> {
         self.active_grant.as_ref()
+    }
+
+    /// Returns the verified host rotation chain applied during handshake, if any.
+    #[must_use]
+    pub fn applied_rotation(&self) -> &[RotationRecord] {
+        &self.applied_rotation
     }
 
     /// Emits the initial 6-byte `Intent::Session` preamble + empty Noise `msg1` (initiator only).
@@ -559,7 +568,11 @@ impl SessionMachine {
                     &peer_static,
                     &presented_signing,
                 ) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if !host_hello.rotation.is_empty() {
+                            self.applied_rotation = host_hello.rotation;
+                        }
+                    }
                     Err(
                         err @ (CoreError::RotationForkDetected { .. }
                         | CoreError::IncompletePin(_)

@@ -175,6 +175,11 @@ impl PreAuthRateLimiter {
             }
         }
 
+        self.try_acquire_half_open()
+    }
+
+    /// Acquires one bounded half-open handshake slot without consuming IP or peer rate tokens.
+    pub fn try_acquire_half_open(&self) -> Result<HalfOpenGuard, RuntimeError> {
         loop {
             let cur = self.inner.active_half_open.load(Ordering::Acquire);
             if cur >= self.inner.max_half_open {

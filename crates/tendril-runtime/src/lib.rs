@@ -30,4 +30,4 @@ pub use providers::{
 };
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
-pub use store::StateStore;
+pub use store::{RosterStamp, StateStore};

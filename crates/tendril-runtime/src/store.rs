@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use tendril_core::crypto::{SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode};
@@ -14,6 +15,16 @@ use crate::error::RuntimeError;
 
 const IDENTITY_FILE: &str = "identity.json";
 const ROSTER_FILE: &str = "roster.json";
+const ROSTER_LOCK_FILE: &str = ".roster.lock";
+
+/// Snapshot metadata identifying the on-disk state of `roster.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterStamp {
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+    #[cfg(unix)]
+    pub ino: u64,
+}
 
 #[derive(Serialize, Deserialize)]
 struct PersistedIdentity {
@@ -65,6 +76,12 @@ impl StateStore {
     #[must_use]
     pub fn roster_path(&self) -> PathBuf {
         self.dir.join(ROSTER_FILE)
+    }
+
+    /// Returns the path to the advisory lock file guarding `roster.json`.
+    #[must_use]
+    pub fn roster_lock_path(&self) -> PathBuf {
+        self.dir.join(ROSTER_LOCK_FILE)
     }
 
     /// Loads [`EndpointIdentity`] from `identity.json`.
@@ -130,8 +147,57 @@ impl StateStore {
         Ok(identity)
     }
 
-    /// Loads [`Roster`] from `roster.json`, or returns a fresh default-deny [`Roster`] if absent.
+    /// Returns lightweight filesystem metadata identifying the current `roster.json` generation.
+    pub fn roster_stamp(&self) -> Result<Option<RosterStamp>, RuntimeError> {
+        match fs::metadata(self.roster_path()) {
+            Ok(meta) => Ok(Some(RosterStamp {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+                #[cfg(unix)]
+                ino: std::os::unix::fs::MetadataExt::ino(&meta),
+            })),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(RuntimeError::Io(err)),
+        }
+    }
+
+    /// Loads [`Roster`] from `roster.json` under a shared advisory lock, or returns a fresh
+    /// default-deny [`Roster`] if absent.
     pub fn load_roster(&self) -> Result<Roster, RuntimeError> {
+        let _lock = self.lock_roster_file(false)?;
+        self.load_roster_unlocked()
+    }
+
+    /// Atomically persists [`Roster`] under an exclusive advisory lock with `0o600` file mode on Unix.
+    pub fn save_roster(&self, roster: &Roster) -> Result<(), RuntimeError> {
+        let _lock = self.lock_roster_file(true)?;
+        self.save_roster_unlocked(roster)
+    }
+
+    /// Executes `f` transactionally against the latest on-disk [`Roster`] under an exclusive
+    /// advisory lock (`flock`), persisting updates atomically on `Ok`.
+    pub fn update_roster<T, F>(&self, f: F) -> Result<T, RuntimeError>
+    where
+        F: FnOnce(&mut Roster) -> Result<T, RuntimeError>,
+    {
+        let _lock = self.lock_roster_file(true)?;
+        let mut roster = self.load_roster_unlocked()?;
+        let out = f(&mut roster)?;
+        self.save_roster_unlocked(&roster)?;
+        Ok(out)
+    }
+
+    fn lock_roster_file(&self, exclusive: bool) -> Result<File, RuntimeError> {
+        let file = open_lock_0600(&self.roster_lock_path())?;
+        if exclusive {
+            file.lock()?;
+        } else {
+            file.lock_shared()?;
+        }
+        Ok(file)
+    }
+
+    fn load_roster_unlocked(&self) -> Result<Roster, RuntimeError> {
         let path = self.roster_path();
         if !path.exists() {
             return Ok(Roster::new());
@@ -141,8 +207,7 @@ impl StateStore {
             .map_err(|err| RuntimeError::Storage(format!("invalid roster json: {err}")))
     }
 
-    /// Atomically persists [`Roster`] with `0o600` file mode on Unix.
-    pub fn save_roster(&self, roster: &Roster) -> Result<(), RuntimeError> {
+    fn save_roster_unlocked(&self, roster: &Roster) -> Result<(), RuntimeError> {
         let json = serde_json::to_vec_pretty(roster)
             .map_err(|err| RuntimeError::Storage(format!("serialize roster failed: {err}")))?;
         self.atomic_write_0600(&self.roster_path(), &json)
@@ -186,6 +251,17 @@ fn set_dir_mode_0700(dir: &Path) -> Result<(), RuntimeError> {
 #[cfg(not(unix))]
 fn set_dir_mode_0700(_dir: &Path) -> Result<(), RuntimeError> {
     Ok(())
+}
+
+fn open_lock_0600(path: &Path) -> Result<File, RuntimeError> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    Ok(opts.open(path)?)
 }
 
 #[cfg(unix)]

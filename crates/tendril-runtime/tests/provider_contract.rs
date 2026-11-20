@@ -1709,3 +1709,152 @@ async fn direct_driver_paths_enforce_peer_transport_id_rate_limit() {
     .await;
     assert!(matches!(pair_b2, Err(RuntimeError::RateLimited(_))));
 }
+
+#[tokio::test]
+async fn batch1_sec03_inbound_router_isolates_queues_expires_stale_and_gates_pair() {
+    use tendril_core::wire::{Intent, Preamble};
+    use tendril_runtime::{DirectDialer, DirectListener, InboundRouter};
+
+    let cfg = PreAuthConfig {
+        max_entries: 64,
+        max_half_open: 16,
+        ip_burst: 64,
+        ip_refill_per_sec: 32,
+        peer_burst: 32,
+        peer_refill_per_sec: 16,
+    };
+    let listener = DirectListener::bind("127.0.0.1:0".parse().expect("addr"), None)
+        .await
+        .expect("bind direct");
+    let ep = listener.local_endpoint();
+    let router = Arc::new(InboundRouter::with_config_and_ttl(
+        cfg,
+        Duration::from_millis(80),
+    ));
+    router.spawn_listener(&tokio::runtime::Handle::current(), Box::new(listener));
+
+    let dialer = DirectDialer::new();
+    // Fill the isolated Intent::Pair queue without ever polling recv_pair().
+    let mut held_pair_streams = Vec::new();
+    for _ in 0..16 {
+        let mut s = dialer.dial(&ep).await.expect("dial pair");
+        s.send_chunk(&Preamble::v1(Intent::Pair).encode())
+            .await
+            .expect("send pair preamble");
+        held_pair_streams.push(s);
+    }
+
+    // Legitimate Intent::Session connections MUST succeed immediately despite full pair queue.
+    let mut sess_conn = dialer.dial(&ep).await.expect("dial session");
+    sess_conn
+        .send_chunk(&Preamble::v1(Intent::Session).encode())
+        .await
+        .expect("send session preamble");
+    let (_sess_stream, sess_guard) = router
+        .recv_session(Duration::from_secs(2))
+        .await
+        .expect("session wait ok")
+        .expect("session stream");
+    assert_eq!(router.session_rate_limiter().active_half_open(), 1);
+    drop((_sess_stream, sess_guard));
+    assert_eq!(router.session_rate_limiter().active_half_open(), 0);
+
+    // Unconsumed queued Intent::Pair streams automatically expire after queue_ttl.
+    let mut drained = false;
+    for _ in 0..30 {
+        if router.pair_rate_limiter().active_half_open() == 0 {
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(drained, "expected unpolled pair queue guards to expire");
+
+    // Disabling Intent::Pair rejects pair preambles without consuming pair queue slots.
+    router.set_pair_enabled(false);
+    let mut disabled_pair = dialer.dial(&ep).await.expect("dial disabled pair");
+    disabled_pair
+        .send_chunk(&Preamble::v1(Intent::Pair).encode())
+        .await
+        .expect("send disabled pair preamble");
+    assert!(matches!(
+        router.recv_pair(Duration::from_millis(100)).await,
+        Err(())
+    ));
+    assert_eq!(router.pair_rate_limiter().active_half_open(), 0);
+    router.close();
+}
+
+#[test]
+fn batch1_sec04_state_store_flock_serializes_concurrent_updates() {
+    use tendril_core::roster::PeerState;
+    use tendril_runtime::StateStore;
+
+    let tmp = TempDir::new().expect("temp dir");
+    let store = StateStore::open_or_create(tmp.path()).expect("store");
+    let target = tendril_core::identity::EndpointIdentity::generate().expect("target");
+    let target_id = "peer-target".to_owned();
+    let target_pub = *target.static_key().public_bytes();
+    let target_sig = *target.signing_key().public_bytes();
+
+    store
+        .update_roster(|r| {
+            r.insert_pinned_host(
+                target_id.clone(),
+                "Target".into(),
+                target_pub,
+                Some(target_sig),
+                0,
+                vec![],
+            )?;
+            Ok(())
+        })
+        .expect("seed target");
+
+    let mut handles = Vec::new();
+    for i in 0..8usize {
+        let dir = tmp.path().to_path_buf();
+        let tid = target_id.clone();
+        handles.push(std::thread::spawn(move || {
+            let st = StateStore::open_or_create(dir).expect("reopen");
+            if i == 3 {
+                st.update_roster(|r| {
+                    r.revoke_peer(&tid)?;
+                    Ok(())
+                })
+                .expect("revoke");
+            } else {
+                let peer = tendril_core::identity::EndpointIdentity::generate().expect("peer");
+                st.update_roster(|r| {
+                    r.insert_pinned_host(
+                        format!("peer-{i}"),
+                        format!("Peer {i}"),
+                        *peer.static_key().public_bytes(),
+                        Some(*peer.signing_key().public_bytes()),
+                        0,
+                        vec![],
+                    )?;
+                    Ok(())
+                })
+                .expect("insert peer");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("join thread");
+    }
+
+    let final_roster = store.load_roster().expect("load final roster");
+    assert_eq!(
+        final_roster.get(&target_id).expect("target present").state,
+        PeerState::Revoked
+    );
+    for i in 0..8usize {
+        if i != 3 {
+            assert!(
+                final_roster.get(&format!("peer-{i}")).is_some(),
+                "lost concurrent peer-{i}"
+            );
+        }
+    }
+}

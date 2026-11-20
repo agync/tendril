@@ -1,6 +1,7 @@
 import base64
 import json
 import pathlib
+import socket
 import subprocess
 import threading
 import time
@@ -395,6 +396,48 @@ class TendrilPythonTests(unittest.TestCase):
             ev_close = json.loads(host_sess.poll_event(2000))
             self.assertIn(ev_close.get("event") or ev_close.get("status"), ("closed", "eof"))
         finally:
+            host_ep.close()
+            cli_ep.close()
+
+    def test_pair_flood_does_not_starve_accept_session(self) -> None:
+        host_ep = tendril.Endpoint(None, "py-sec03-host")
+        cli_ep = tendril.Endpoint(None, "py-sec03-cli")
+        flood_socks: list[socket.socket] = []
+        try:
+            addr = host_ep.serve_direct("127.0.0.1:0")
+            code = host_ep.issue_code("lan")
+            t_pair = threading.Thread(target=lambda: host_ep.pair_accept(5000))
+            t_pair.start()
+            cli_pair = json.loads(cli_ep.pair_initiate(addr, code))
+            t_pair.join(timeout=5)
+            host_ep.confirm_peer(cli_pair["device_id"], cli_pair["sas"])
+            cli_ep.confirm_peer("py-sec03-host", cli_pair["sas"])
+            grant = host_ep.mint_grant(cli_pair["device_id"], ["fs.read"], 3600)
+
+            host_port = int(addr.rsplit(":", 1)[1])
+            for i in range(32):
+                if i == 24:
+                    time.sleep(1.5)
+                s = socket.create_connection(("127.0.0.1", host_port), timeout=2)
+                s.sendall(b"TND\x01\x02\x00")
+                flood_socks.append(s)
+            time.sleep(0.3)
+
+            sess_holder: dict = {}
+
+            def accept_sess() -> None:
+                sess_holder["sess"] = host_ep.accept_session(4000)
+
+            t_acc = threading.Thread(target=accept_sess)
+            t_acc.start()
+            cli_sess = cli_ep.connect(addr, "py-sec03-host", grant)
+            t_acc.join(timeout=5)
+            self.assertIn("sess", sess_holder)
+            cli_sess.close()
+            sess_holder["sess"].close()
+        finally:
+            for s in flood_socks:
+                s.close()
             host_ep.close()
             cli_ep.close()
 

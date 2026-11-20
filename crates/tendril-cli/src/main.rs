@@ -234,25 +234,19 @@ async fn handle_inbound(
                         ..
                     } => {
                         let _guard = store_lock.lock().await;
-                        let mut persisted = match store.load_roster() {
-                            Ok(r) => r,
-                            Err(err) => {
-                                tracing::error!(error = %err, "failed to reload roster after pair");
-                                return;
-                            }
-                        };
-                        if let Err(err) = persisted.record_pending_pair(
-                            device_static_pub,
-                            None,
-                            name,
-                            kind,
-                            pairing_sas.clone(),
-                        ) {
+                        if let Err(err) = store.update_roster(|persisted| {
+                            persisted
+                                .record_pending_pair(
+                                    device_static_pub,
+                                    None,
+                                    name,
+                                    kind,
+                                    pairing_sas.clone(),
+                                )
+                                .map(|_| ())
+                                .map_err(Into::into)
+                        }) {
                             tracing::error!(error = %err, "failed to record paired peer");
-                            return;
-                        }
-                        if let Err(err) = store.save_roster(&persisted) {
-                            tracing::error!(error = %err, "failed to persist paired roster");
                             return;
                         }
                         print_json_line(&serde_json::json!({
@@ -275,15 +269,17 @@ async fn handle_inbound(
             }
         }
         Intent::Session => {
-            let mut roster = {
+            let (mut roster, initial_stamp) = {
                 let _guard = store_lock.lock().await;
-                match store.load_roster() {
+                let r = match store.load_roster() {
                     Ok(r) => r,
                     Err(err) => {
                         tracing::error!(error = %err, "failed to load roster before session");
                         return;
                     }
-                }
+                };
+                let stamp = store.roster_stamp().ok().flatten();
+                (r, stamp)
             };
             let Ok(mut driver) = SessionDriver::accept_with_options(
                 wrapped,
@@ -305,16 +301,44 @@ async fn handle_inbound(
                 "peer_device_id": peer_id,
                 "provider": format!("{:?}", driver.provider_id()),
             }));
-            while let Ok(Some(ev)) = driver.next_event(now_unix(), &mut roster).await {
-                match ev {
-                    SessionEvent::AppData(data) => {
+            let mut last_stamp = initial_stamp;
+            loop {
+                let ev_res = driver
+                    .next_event_with_refresh(&mut roster, Duration::from_millis(250), |mem| {
+                        let current_stamp = store.roster_stamp()?;
+                        if current_stamp != last_stamp {
+                            *mem = store.load_roster()?;
+                            last_stamp = current_stamp;
+                            return Ok(true);
+                        }
+                        Ok(false)
+                    })
+                    .await;
+                match ev_res {
+                    Ok(Some(SessionEvent::AppData(data))) => {
                         print_json_line(&serde_json::json!({
                             "event": "data",
                             "len": data.len(),
                             "utf8": String::from_utf8_lossy(&data),
                         }));
                     }
-                    SessionEvent::Closed { code, reason } => {
+                    Ok(Some(SessionEvent::RevocationUpdated { issuer, seq })) => {
+                        persist_session_crl(
+                            store.as_ref(),
+                            store_lock.as_ref(),
+                            identity.as_ref(),
+                            &roster,
+                            &issuer,
+                            &mut last_stamp,
+                        )
+                        .await;
+                        print_json_line(&serde_json::json!({
+                            "event": "revocation_updated",
+                            "issuer": issuer,
+                            "seq": seq,
+                        }));
+                    }
+                    Ok(Some(SessionEvent::Closed { code, reason })) => {
                         print_json_line(&serde_json::json!({
                             "event": "closed",
                             "code": code,
@@ -322,9 +346,77 @@ async fn handle_inbound(
                         }));
                         break;
                     }
-                    _ => {}
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(err) => {
+                        for issuer in [identity.host_id(), peer_id.as_str()] {
+                            persist_session_crl(
+                                store.as_ref(),
+                                store_lock.as_ref(),
+                                identity.as_ref(),
+                                &roster,
+                                issuer,
+                                &mut last_stamp,
+                            )
+                            .await;
+                        }
+                        print_json_line(&serde_json::json!({
+                            "event": "closed",
+                            "code": 1000,
+                            "reason": err.to_string(),
+                        }));
+                        break;
+                    }
                 }
             }
+        }
+    }
+}
+
+fn persist_crl_for_issuer(
+    store: &StateStore,
+    identity: &tendril_core::identity::EndpointIdentity,
+    roster: &tendril_core::roster::Roster,
+    issuer: &str,
+) -> Result<bool, tendril_runtime::RuntimeError> {
+    let Some(crl) = roster.crl(issuer).cloned() else {
+        return Ok(false);
+    };
+    let issuer_pub = if issuer == identity.host_id() {
+        Some(*identity.signing_key().public_bytes())
+    } else {
+        roster.lookup_active_signing_key(issuer)
+    };
+    let Some(pk) = issuer_pub else {
+        return Ok(false);
+    };
+    store.update_roster(|disk| {
+        if let Err(err) = disk.ingest_crl(crl, issuer, &pk)
+            && !matches!(err, tendril_core::error::CoreError::CrlStaleSeq { .. })
+        {
+            return Err(err.into());
+        }
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+async fn persist_session_crl(
+    store: &StateStore,
+    store_lock: &AsyncMutex<()>,
+    identity: &tendril_core::identity::EndpointIdentity,
+    roster: &tendril_core::roster::Roster,
+    issuer: &str,
+    last_stamp: &mut Option<tendril_runtime::RosterStamp>,
+) {
+    let _guard = store_lock.lock().await;
+    match persist_crl_for_issuer(store, identity, roster, issuer) {
+        Ok(true) => {
+            *last_stamp = store.roster_stamp().ok().flatten();
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::error!(error = %err, "failed to persist session CRL update");
         }
     }
 }
@@ -580,7 +672,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("endpoint or URI ep hint is required")?,
             };
             let identity = store.load_or_generate_identity(None)?;
-            let mut roster = store.load_roster()?;
             let mut stream =
                 dial_endpoint(&effective_endpoint, relay_host.as_deref(), p2p_local).await?;
             let res = drive_pair_initiator(
@@ -612,31 +703,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .as_ref()
                         .map(|u| u.endpoints.clone())
                         .unwrap_or_default();
-                    if host_pin_verified {
-                        roster.insert_pinned_host(
-                            host_id.clone(),
-                            display_name,
-                            host_static_pub,
-                            Some(host_signing_pub),
-                            host_rotation_seq,
-                            hints,
-                        )?;
-                    } else {
-                        roster.record_pending_host(
-                            host_id.clone(),
-                            display_name,
-                            host_static_pub,
-                            host_signing_pub,
-                            host_rotation_seq,
-                            pairing_sas.clone(),
-                            hints,
-                        )?;
-                    }
-                    store.save_roster(&roster)?;
+                    let host_id_out = host_id.clone();
+                    let sas_out = pairing_sas.clone();
+                    store.update_roster(|roster| {
+                        if host_pin_verified {
+                            roster
+                                .insert_pinned_host(
+                                    host_id,
+                                    display_name,
+                                    host_static_pub,
+                                    Some(host_signing_pub),
+                                    host_rotation_seq,
+                                    hints,
+                                )
+                                .map(|_| ())
+                                .map_err(Into::into)
+                        } else {
+                            roster
+                                .record_pending_host(
+                                    host_id,
+                                    display_name,
+                                    host_static_pub,
+                                    host_signing_pub,
+                                    host_rotation_seq,
+                                    pairing_sas,
+                                    hints,
+                                )
+                                .map(|_| ())
+                                .map_err(Into::into)
+                        }
+                    })?;
                     print_json_line(&serde_json::json!({
                         "device_id": device_id,
-                        "paired_host_id": host_id,
-                        "sas": pairing_sas,
+                        "paired_host_id": host_id_out,
+                        "sas": sas_out,
                         "status": if host_pin_verified { "active" } else { "pending" },
                         "host_confirmed": host_pin_verified,
                         "static_pub": b64url_encode(&host_static_pub),
@@ -652,9 +752,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Confirm { peer_id, sas } => {
-            let mut roster = store.load_roster()?;
-            roster.confirm_peer(&peer_id, sas.as_deref())?;
-            store.save_roster(&roster)?;
+            store.update_roster(|roster| {
+                roster
+                    .confirm_peer(&peer_id, sas.as_deref())
+                    .map(|_| ())
+                    .map_err(Into::into)
+            })?;
             print_json_line(&serde_json::json!({ "confirmed": peer_id }));
         }
         Command::Mint {
@@ -663,18 +766,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ttl_secs,
         } => {
             let identity = store.load_identity()?;
-            let mut roster = store.load_roster()?;
             let now = now_unix();
             let nonce = random_bytes::<16>()?;
-            let grant = roster.mint_grant(
-                &identity,
-                &peer_id,
-                caps,
-                now,
-                now.saturating_add(ttl_secs),
-                nonce,
-            )?;
-            store.save_roster(&roster)?;
+            let grant = store.update_roster(|roster| {
+                roster
+                    .mint_grant(
+                        &identity,
+                        &peer_id,
+                        caps,
+                        now,
+                        now.saturating_add(ttl_secs),
+                        nonce,
+                    )
+                    .map_err(Into::into)
+            })?;
             print_json_line(&grant);
         }
         Command::Dial {
@@ -687,9 +792,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let identity = store.load_identity()?;
             let mut roster = store.load_roster()?;
+            let initial_seq = roster.get(&target).map(|e| e.rotation_seq);
             let grant_obj = grant.as_deref().map(load_grant_arg).transpose()?;
             let stream = dial_endpoint(&endpoint, relay_host.as_deref(), p2p_local).await?;
-            let mut driver = SessionDriver::connect(
+            let connect_res = SessionDriver::connect(
                 stream,
                 &identity,
                 &target,
@@ -697,23 +803,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut roster,
                 now_unix(),
             )
-            .await?;
-            let provider = format!("{:?}", driver.provider_id());
-            await_pong(&mut driver, &mut roster, 1).await?;
-            if let Some(msg) = message {
-                driver.send_data(msg.as_bytes()).await?;
-                await_pong(&mut driver, &mut roster, 2).await?;
+            .await;
+            if let Err(err) = &connect_res
+                && roster
+                    .get(&target)
+                    .is_some_and(|e| e.state == tendril_core::roster::PeerState::Revoked)
+            {
+                let _ = store.update_roster(|disk| {
+                    let _ = disk.revoke_peer(&target);
+                    Ok(())
+                });
+                return Err(err.to_string().into());
             }
-            driver.send_close(1000, "done").await?;
+            let mut driver = connect_res?;
+            let chain = driver.applied_rotation().to_vec();
+            if !chain.is_empty()
+                && let Some(rotated) = roster.get(&target).cloned()
+                && rotated.rotation_seq > initial_seq.unwrap_or(0)
+                && let Some(signing_pub) = rotated.signing_pub
+            {
+                store.update_roster(|disk| {
+                    if let Some(entry) = disk.get(&target)
+                        && entry.state == tendril_core::roster::PeerState::Active
+                        && entry.rotation_seq < rotated.rotation_seq
+                    {
+                        disk.apply_verified_rotation(
+                            &target,
+                            &chain,
+                            &rotated.static_pub,
+                            &signing_pub,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+            let provider = format!("{:?}", driver.provider_id());
+            let session_res: Result<(), Box<dyn std::error::Error>> = async {
+                await_pong(&mut driver, &mut roster, 1).await?;
+                if let Some(msg) = message {
+                    driver.send_data(msg.as_bytes()).await?;
+                    await_pong(&mut driver, &mut roster, 2).await?;
+                }
+                driver.send_close(1000, "done").await?;
+                Ok(())
+            }
+            .await;
+            let _ = persist_crl_for_issuer(&store, &identity, &roster, &target);
+            session_res?;
             print_json_line(&serde_json::json!({
                 "connected": target,
                 "provider": provider,
             }));
         }
         Command::Revoke { peer_id } => {
-            let mut roster = store.load_roster()?;
-            roster.revoke_peer(&peer_id)?;
-            store.save_roster(&roster)?;
+            store.update_roster(|roster| roster.revoke_peer(&peer_id).map_err(Into::into))?;
             print_json_line(&serde_json::json!({ "revoked": peer_id }));
         }
     }

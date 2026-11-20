@@ -630,3 +630,168 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
         .to_owned();
     assert_eq!(p2p_ep.split('?').next(), p2p_ep2.split('?').next());
 }
+
+#[tokio::test]
+async fn batch1_sec04_cli_serve_enforces_live_revoke_and_flock_pair_safety() {
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "host-live-rev"])
+            .status
+            .success()
+    );
+    let init_cli = run_tendril(client_dir.path(), &["init"]);
+    assert!(init_cli.status.success());
+    let cli_info: serde_json::Value = serde_json::from_slice(&init_cli.stdout).expect("cli init");
+    let cli_dev_id = cli_info["device_id"].as_str().expect("dev id").to_owned();
+
+    let mut serve = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(host_dir.path())
+            .args(["serve", "--listen", "127.0.0.1:0", "--issue-code", "lan"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve"),
+    );
+    let mut stdout = BufReader::new(serve.0.stdout.take().expect("serve stdout"));
+    let listening = read_json_line(&mut stdout);
+    let direct_ep = listening["direct_endpoint"]
+        .as_str()
+        .expect("direct_ep")
+        .to_owned();
+    let code = listening["pairing_code"]
+        .as_str()
+        .expect("pairing_code")
+        .to_owned();
+
+    let pair_out = run_tendril(
+        client_dir.path(),
+        &["pair", "--endpoint", &direct_ep, "--code", &code],
+    );
+    assert!(pair_out.status.success());
+    let paired_info: serde_json::Value =
+        serde_json::from_slice(&pair_out.stdout).expect("pair json");
+    let sas = paired_info["sas"].as_str().expect("sas").to_owned();
+    let paired_ev = read_json_line(&mut stdout);
+    assert_eq!(paired_ev["event"], "paired");
+
+    assert!(
+        run_tendril(
+            client_dir.path(),
+            &["confirm", "host-live-rev", "--sas", &sas]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", &sas])
+            .status
+            .success()
+    );
+    let mint_out = run_tendril(host_dir.path(), &["mint", &cli_dev_id, "--cap", "fs.read"]);
+    assert!(mint_out.status.success());
+    let grant: tendril_core::grants::Grant =
+        serde_json::from_slice(&mint_out.stdout).expect("grant json");
+
+    let cli_store = tendril_runtime::StateStore::open_or_create(client_dir.path()).unwrap();
+    let cli_id = cli_store.load_identity().unwrap();
+    let mut cli_roster = cli_store.load_roster().unwrap();
+
+    // Connect open session, verify live ping, then revoke via CLI while session stays open.
+    let stream = tendril_runtime::dial_endpoint(&direct_ep, None)
+        .await
+        .unwrap();
+    let mut driver = tendril_runtime::SessionDriver::connect(
+        stream,
+        &cli_id,
+        "host-live-rev",
+        Some(grant),
+        &mut cli_roster,
+        1_795_564_800,
+    )
+    .await
+    .unwrap();
+    let est = read_json_line(&mut stdout);
+    assert_eq!(est["event"], "session_established");
+
+    driver.send_ping(99).await.unwrap();
+    loop {
+        if let Some(tendril_runtime::SessionEvent::PongReceived(99)) = driver
+            .next_event(1_795_564_800, &mut cli_roster)
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+
+    // Revoke client in external CLI process while session is active; serve MUST terminate
+    // promptly via roster reload and refuse subsequent REKEY / DATA frames.
+    assert!(
+        run_tendril(host_dir.path(), &["revoke", &cli_dev_id])
+            .status
+            .success()
+    );
+    let _ = driver.send_rekey().await;
+    let _ = driver.send_data(b"must-not-deliver").await;
+
+    let closed = read_json_line(&mut stdout);
+    assert_eq!(
+        closed["event"], "closed",
+        "expected serve to close revoked session immediately instead of emitting data: {closed:?}"
+    );
+    let _ = driver.next_event(1_795_564_800, &mut cli_roster).await;
+
+    // Concurrent CLI pair against another host must not clobber pre-existing revocations.
+    let second_dir = TempDir::new().expect("second host");
+    assert!(
+        run_tendril(second_dir.path(), &["init", "--host-id", "host-second"])
+            .status
+            .success()
+    );
+    let mut serve2 = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(second_dir.path())
+            .args(["serve", "--listen", "127.0.0.1:0", "--issue-code", "lan"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve2"),
+    );
+    let mut stdout2 = BufReader::new(serve2.0.stdout.take().expect("serve2 stdout"));
+    let l2 = read_json_line(&mut stdout2);
+    let ep2 = l2["direct_endpoint"].as_str().unwrap().to_owned();
+    let code2 = l2["pairing_code"].as_str().unwrap().to_owned();
+
+    // Seed an active host + revoke it on client_dir, verify pair + update_roster retains Revoked state.
+    cli_store
+        .update_roster(|r| {
+            let dummy = tendril_core::identity::EndpointIdentity::generate()?;
+            r.insert_pinned_host(
+                "revoked-keep".into(),
+                "Revoked".into(),
+                *dummy.static_key().public_bytes(),
+                Some(*dummy.signing_key().public_bytes()),
+                0,
+                vec![],
+            )?;
+            r.revoke_peer("revoked-keep")?;
+            Ok(())
+        })
+        .unwrap();
+    let pair2 = run_tendril(
+        client_dir.path(),
+        &["pair", "--endpoint", &ep2, "--code", &code2],
+    );
+    assert!(pair2.status.success());
+    let after_pair = cli_store.load_roster().unwrap();
+    assert_eq!(
+        after_pair.get("revoked-keep").unwrap().state,
+        tendril_core::roster::PeerState::Revoked
+    );
+    assert!(after_pair.get("host-second").is_some());
+}
