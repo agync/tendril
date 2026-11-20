@@ -1,0 +1,5 @@
+module CTendril [system] {
+  header "shim.h"
+  link "tendril_ffi"
+  export *
+}
