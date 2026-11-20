@@ -1,0 +1,15 @@
+FROM rust:1.88-alpine AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/tendril-core ./crates/tendril-core
+COPY crates/tendril-relay ./crates/tendril-relay
+RUN apk add --no-cache musl-dev \
+    && cargo build --release --locked -p tendril-relay --bin tendril-relay
+
+FROM alpine:3.21
+RUN adduser -D -u 65532 tendril
+USER 65532:65532
+COPY --from=builder /src/target/release/tendril-relay /usr/local/bin/tendril-relay
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/tendril-relay"]
+CMD ["--listen", "0.0.0.0:8443"]
