@@ -2,6 +2,7 @@
 //! to concrete [`PathStream`] and [`PathDialer`] transports.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -68,7 +69,7 @@ async fn write_protocol_bytes(
     Ok(())
 }
 
-/// Drives a pairing initiator handshake to completion over `stream`.
+/// Drives a pairing initiator handshake to completion over `stream` within `DEFAULT_PRE_AUTH_TIMEOUT`.
 pub async fn drive_pair_initiator(
     stream: &mut dyn PathStream,
     identity: &EndpointIdentity,
@@ -77,29 +78,91 @@ pub async fn drive_pair_initiator(
     code: String,
     pinned_host: Option<PinnedHost>,
 ) -> Result<PairDriveResult, RuntimeError> {
+    drive_pair_initiator_with_timeout(
+        stream,
+        identity,
+        device_name,
+        device_kind,
+        code,
+        pinned_host,
+        DEFAULT_PRE_AUTH_TIMEOUT,
+    )
+    .await
+}
+
+/// Drives a pairing initiator handshake to completion over `stream` within `handshake_timeout`.
+pub async fn drive_pair_initiator_with_timeout(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    device_name: String,
+    device_kind: String,
+    code: String,
+    pinned_host: Option<PinnedHost>,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
     let mut machine =
         PairingInitiator::new(identity, device_name, device_kind, code, pinned_host, None)?;
     let mut observed_sas = None;
+    let deadline = TokioInstant::now() + handshake_timeout;
     let init_actions = machine.start()?;
-    if let Some(outcome) = dispatch_pair_actions(stream, init_actions, &mut observed_sas).await? {
-        return Ok(PairDriveResult {
-            outcome,
-            sas: observed_sas,
-        });
-    }
-
-    let mut buf = vec![0u8; MAX_OUTER_FRAME_LEN];
-    loop {
-        let n = stream.recv_chunk(&mut buf).await?;
-        if n == 0 {
-            return Err(RuntimeError::Closed);
-        }
-        let actions = machine.feed_bytes(&buf[..n])?;
-        if let Some(outcome) = dispatch_pair_actions(stream, actions, &mut observed_sas).await? {
+    match timeout_at(
+        deadline,
+        dispatch_pair_actions(stream, init_actions, &mut observed_sas),
+    )
+    .await
+    {
+        Ok(Ok(Some(outcome))) => {
             return Ok(PairDriveResult {
                 outcome,
                 sas: observed_sas,
             });
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(_) => {
+            let _ = stream.close().await;
+            return Err(RuntimeError::Timeout(
+                "pre-auth pairing handshake timed out",
+            ));
+        }
+    }
+
+    let mut buf = vec![0u8; MAX_OUTER_FRAME_LEN];
+    loop {
+        let n = match timeout_at(deadline, stream.recv_chunk(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                let _ = stream.close().await;
+                return Err(RuntimeError::Timeout(
+                    "pre-auth pairing handshake timed out",
+                ));
+            }
+        };
+        if n == 0 {
+            return Err(RuntimeError::Closed);
+        }
+        let actions = machine.feed_bytes(&buf[..n])?;
+        match timeout_at(
+            deadline,
+            dispatch_pair_actions(stream, actions, &mut observed_sas),
+        )
+        .await
+        {
+            Ok(Ok(Some(outcome))) => {
+                return Ok(PairDriveResult {
+                    outcome,
+                    sas: observed_sas,
+                });
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                let _ = stream.close().await;
+                return Err(RuntimeError::Timeout(
+                    "pre-auth pairing handshake timed out",
+                ));
+            }
         }
     }
 }
@@ -279,6 +342,39 @@ impl SessionDriver {
             now_unix,
         )
         .await
+    }
+
+    /// Concurrently races candidate paths under Happy Eyeballs rules and activates the first path
+    /// that completes a full authenticated Noise XX handshake (`HostHello` verified before aborting
+    /// competing candidates).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_policy(
+        dialers: &[Arc<dyn PathDialer>],
+        policy_config: PathPolicyConfig,
+        candidates: Vec<CandidateEndpoint>,
+        local_identity: Arc<EndpointIdentity>,
+        target_host_id: &str,
+        initial_grant: Option<Grant>,
+        roster: &mut Roster,
+        now_unix: u64,
+    ) -> Result<(CandidateEndpoint, Self), RuntimeError> {
+        let shared_roster = Arc::new(Mutex::new(std::mem::take(roster)));
+        let roster_out = Arc::clone(&shared_roster);
+        let target_owned = target_host_id.to_owned();
+        let res =
+            dial_with_policy_verified(dialers, policy_config, candidates, move |_cand, stream| {
+                let id_c = Arc::clone(&local_identity);
+                let target_c = target_owned.clone();
+                let grant_c = initial_grant.clone();
+                let roster_c = Arc::clone(&shared_roster);
+                async move {
+                    Self::connect_locked(stream, &id_c, &target_c, grant_c, &roster_c, now_unix)
+                        .await
+                }
+            })
+            .await;
+        *roster = roster_out.lock().expect("roster mutex poisoned").clone();
+        res
     }
 
     async fn connect_with_roster(
@@ -723,11 +819,35 @@ pub async fn dial_with_policy(
     policy_config: PathPolicyConfig,
     candidates: Vec<CandidateEndpoint>,
 ) -> Result<(CandidateEndpoint, Box<dyn PathStream>), RuntimeError> {
+    dial_with_policy_verified(
+        dialers,
+        policy_config,
+        candidates,
+        |_cand, stream| async move { Ok(stream) },
+    )
+    .await
+}
+
+/// Drives [`PathPlanner`] concurrently across provider dialers and gates path activation on an
+/// asynchronous caller verifier (`verify`), keeping competing candidates alive until verification
+/// succeeds.
+pub async fn dial_with_policy_verified<T, F, Fut>(
+    dialers: &[Arc<dyn PathDialer>],
+    policy_config: PathPolicyConfig,
+    candidates: Vec<CandidateEndpoint>,
+    verify: F,
+) -> Result<(CandidateEndpoint, T), RuntimeError>
+where
+    T: Send + 'static,
+    F: Fn(CandidateEndpoint, Box<dyn PathStream>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<T, RuntimeError>> + Send + 'static,
+{
     let dialer_map: HashMap<ProviderId, Arc<dyn PathDialer>> = dialers
         .iter()
         .map(|d| (d.provider_id(), Arc::clone(d)))
         .collect();
 
+    let verifier = Arc::new(verify);
     let mut planner = PathPlanner::new(policy_config, candidates);
     let started = Instant::now();
     planner.start(0);
@@ -739,10 +859,9 @@ pub async fn dial_with_policy(
         }
     }
 
-    let (result_tx, mut result_rx) =
-        mpsc::channel::<(usize, Result<Box<dyn PathStream>, RuntimeError>)>(32);
+    let (result_tx, mut result_rx) = mpsc::channel::<(usize, Result<T, RuntimeError>)>(32);
     let mut in_flight_handles: HashMap<usize, AbortOnDrop> = HashMap::new();
-    let mut succeeded_streams: HashMap<usize, Box<dyn PathStream>> = HashMap::new();
+    let mut verified_values: HashMap<usize, T> = HashMap::new();
 
     loop {
         for action in planner.drain_actions() {
@@ -756,21 +875,25 @@ pub async fn dial_with_policy(
                     };
                     let tx = result_tx.clone();
                     let id = cand.id;
-                    let endpoint = cand.addr;
+                    let endpoint = cand.addr.clone();
+                    let verify_c = Arc::clone(&verifier);
                     let handle = tokio::spawn(async move {
-                        let res = dialer.dial(&endpoint).await;
+                        let res = match dialer.dial(&endpoint).await {
+                            Ok(stream) => verify_c(cand, stream).await,
+                            Err(err) => Err(err),
+                        };
                         let _ = tx.send((id, res)).await;
                     });
-                    in_flight_handles.insert(cand.id, AbortOnDrop(handle.abort_handle()));
+                    in_flight_handles.insert(id, AbortOnDrop(handle.abort_handle()));
                 }
                 PlannerAction::CancelCandidate(id) | PlannerAction::CloseActivePath { id, .. } => {
                     in_flight_handles.remove(&id);
-                    succeeded_streams.remove(&id);
+                    verified_values.remove(&id);
                 }
                 PlannerAction::ActivatePath(cand) => {
-                    if let Some(stream) = succeeded_streams.remove(&cand.id) {
+                    if let Some(value) = verified_values.remove(&cand.id) {
                         in_flight_handles.clear();
-                        return Ok((cand, stream));
+                        return Ok((cand, value));
                     }
                 }
                 PlannerAction::ProbeBetterPath(_) => {}
@@ -790,8 +913,8 @@ pub async fn dial_with_policy(
                 in_flight_handles.remove(&id);
                 let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 match res {
-                    Ok(stream) => {
-                        succeeded_streams.insert(id, stream);
+                    Ok(value) => {
+                        verified_values.insert(id, value);
                         planner.on_dial_succeeded(id, now_ms);
                     }
                     Err(err) => {

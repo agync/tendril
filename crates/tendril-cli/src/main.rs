@@ -1,5 +1,6 @@
 //! Tendril reference CLI (`tendril`) for identity, pairing, grants, serving, and dialing.
 
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -16,13 +17,15 @@ use tendril_core::pairing::{
 use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
     BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
-    DirectListener, EmbeddedRelay, HalfOpenGuard, OverlayListener, P2pListener, P2pRelayMode,
-    PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream, RelayListener,
-    SessionDriver, SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint,
-    drive_pair_initiator, drive_pair_responder_with_options, pairing_path_kind_for_provider,
+    DirectListener, EmbeddedRelay, HalfOpenGuard, OverlayListener, P2pDialer, P2pListener,
+    P2pOptions, P2pRelayMode, PathDialer, PathListener, PathStream, PreAuthConfig,
+    PreAuthRateLimiter, PrefixedPathStream, RelayListener, SessionDriver, SessionEvent, StateStore,
+    dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
+    drive_pair_responder_with_options, pairing_path_kind_for_provider, parse_p2p_relay_mode,
     peek_exact,
 };
 use tokio::sync::Mutex as AsyncMutex;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Parser)]
 #[command(name = "tendril", about = "Tendril private device-to-device CLI")]
@@ -60,6 +63,14 @@ enum Command {
         p2p: bool,
         #[arg(long)]
         p2p_local: bool,
+        #[arg(long, conflicts_with = "p2p_local", value_name = "MODE_OR_URL")]
+        p2p_relay: Option<String>,
+        #[arg(long)]
+        no_pkarr: bool,
+        #[arg(long)]
+        ephemeral_p2p: bool,
+        #[arg(long)]
+        include_direct_addrs: bool,
         #[arg(long)]
         overlay: Option<SocketAddr>,
         #[arg(long)]
@@ -71,8 +82,12 @@ enum Command {
     Pair {
         #[arg(long, required_unless_present = "pairing_uri")]
         endpoint: Option<String>,
-        #[arg(long, required_unless_present = "pairing_uri")]
+        #[arg(long, conflicts_with_all = ["code_stdin", "code_file"])]
         code: Option<String>,
+        #[arg(long, conflicts_with_all = ["code", "code_file"])]
+        code_stdin: bool,
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["code", "code_stdin"])]
+        code_file: Option<PathBuf>,
         #[arg(long)]
         pairing_uri: Option<String>,
         #[arg(long, default_value = "device")]
@@ -83,6 +98,10 @@ enum Command {
         relay_host: Option<String>,
         #[arg(long)]
         p2p_local: bool,
+        #[arg(long, conflicts_with = "p2p_local", value_name = "MODE_OR_URL")]
+        p2p_relay: Option<String>,
+        #[arg(long)]
+        no_pkarr: bool,
     },
     /// Confirm a pending paired peer (`pair.confirm`), moving it to Active with zero capabilities.
     Confirm {
@@ -108,6 +127,10 @@ enum Command {
         relay_host: Option<String>,
         #[arg(long)]
         p2p_local: bool,
+        #[arg(long, conflicts_with = "p2p_local", value_name = "MODE_OR_URL")]
+        p2p_relay: Option<String>,
+        #[arg(long)]
+        no_pkarr: bool,
         #[arg(long)]
         grant: Option<String>,
         #[arg(long)]
@@ -142,15 +165,89 @@ async fn dial_endpoint(
     endpoint: &str,
     relay_host: Option<&str>,
     p2p_local: bool,
+    p2p_relay: Option<&str>,
+    no_pkarr: bool,
 ) -> Result<Box<dyn PathStream>, Box<dyn std::error::Error>> {
-    let effective_hint = if endpoint.starts_with("iroh://")
-        && (p2p_local || std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"))
+    if endpoint.starts_with("iroh://")
+        && (p2p_local
+            || p2p_relay.is_some()
+            || no_pkarr
+            || std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"))
     {
-        Some("disabled")
-    } else {
-        relay_host
+        let mode = if p2p_local
+            || (p2p_relay.is_none() && std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"))
+        {
+            P2pRelayMode::Disabled
+        } else if let Some(spec) = p2p_relay {
+            parse_p2p_relay_mode(Some(spec))?
+        } else {
+            P2pRelayMode::Default
+        };
+        let mut opts = P2pOptions::for_dialer(mode);
+        if no_pkarr {
+            opts = opts.with_resolve_pkarr(false);
+        }
+        let dialer = P2pDialer::bind_with_options(opts).await?;
+        return match dialer.dial(endpoint).await {
+            Ok(stream) => Ok(stream),
+            Err(err) => {
+                dialer.close().await;
+                Err(err.into())
+            }
+        };
+    }
+    Ok(runtime_dial_endpoint(endpoint, relay_host).await?)
+}
+
+fn trim_secret_code(mut raw: String) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    let trimmed = raw.trim_end_matches(['\r', '\n']).trim().to_owned();
+    raw.zeroize();
+    if trimmed.is_empty() {
+        return Err("pairing code input is empty".into());
+    }
+    Ok(Zeroizing::new(trimmed))
+}
+
+fn resolve_pair_code(
+    code: Option<String>,
+    code_stdin: bool,
+    code_file: Option<PathBuf>,
+    uri_code: Option<&str>,
+) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    let env_raw = match std::env::var("TENDRIL_PAIR_CODE") {
+        Ok(val) if !val.is_empty() => Some(Zeroizing::new(val)),
+        Ok(_) | Err(_) => None,
     };
-    Ok(runtime_dial_endpoint(endpoint, effective_hint).await?)
+    let explicit_count = usize::from(code.is_some())
+        + usize::from(code_stdin)
+        + usize::from(code_file.is_some())
+        + usize::from(env_raw.is_some());
+    if explicit_count > 1 {
+        return Err(
+            "conflicting pairing code sources: supply only one of --code, --code-stdin, --code-file, or TENDRIL_PAIR_CODE"
+                .into(),
+        );
+    }
+    if let Some(c) = code {
+        return trim_secret_code(c);
+    }
+    if code_stdin {
+        let mut buf = Zeroizing::new(String::new());
+        std::io::stdin().read_to_string(&mut buf)?;
+        let out = trim_secret_code(std::mem::take(&mut *buf))?;
+        return Ok(out);
+    }
+    if let Some(path) = code_file {
+        let content = Zeroizing::new(std::fs::read_to_string(&path)?);
+        return trim_secret_code(content.as_str().to_owned());
+    }
+    if let Some(env_val) = env_raw {
+        return trim_secret_code(env_val.as_str().to_owned());
+    }
+    if let Some(u_code) = uri_code {
+        return trim_secret_code(u_code.to_owned());
+    }
+    Err("pairing code (--code, --code-stdin, --code-file, TENDRIL_PAIR_CODE, or --pairing-uri) is required".into())
 }
 
 fn spawn_listener_pump(
@@ -502,6 +599,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             embedded_relay,
             p2p,
             p2p_local,
+            p2p_relay,
+            no_pkarr,
+            ephemeral_p2p,
+            include_direct_addrs,
             overlay,
             broker,
             issue_code,
@@ -560,14 +661,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            let p2p_ep = if p2p || p2p_local {
+            let p2p_ep = if p2p || p2p_local || p2p_relay.is_some() {
                 let mode = if p2p_local {
+                    P2pRelayMode::Disabled
+                } else if let Some(spec) = p2p_relay.as_deref() {
+                    parse_p2p_relay_mode(Some(spec))?
+                } else if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") {
                     P2pRelayMode::Disabled
                 } else {
                     P2pRelayMode::Default
                 };
-                let seed = identity.derive_p2p_identity_seed();
-                let pl = P2pListener::bind_with_secret(mode, seed).await?;
+                let mut opts = P2pOptions::for_listener(mode);
+                if no_pkarr {
+                    opts = opts.with_publish_pkarr(false).with_resolve_pkarr(false);
+                }
+                if include_direct_addrs {
+                    opts = opts.with_advertise_direct_addrs(true);
+                }
+                let seed = if ephemeral_p2p {
+                    None
+                } else {
+                    Some(identity.derive_p2p_identity_seed())
+                };
+                let pl = P2pListener::bind_with_options(opts, seed).await?;
                 let ep = pl.local_endpoint();
                 listeners.push(Box::new(pl));
                 Some(ep)
@@ -661,21 +777,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Pair {
             endpoint,
             code,
+            code_stdin,
+            code_file,
             pairing_uri,
             name,
             kind,
             relay_host,
             p2p_local,
+            p2p_relay,
+            no_pkarr,
         } => {
             let parsed_uri = pairing_uri.as_deref().map(PairingUri::parse).transpose()?;
             let pinned_host = parsed_uri.as_ref().map(PairingUri::to_pinned_host);
-            let effective_code = match code {
-                Some(c) => c,
-                None => parsed_uri
-                    .as_ref()
-                    .map(|u| u.code.clone())
-                    .ok_or("pairing code or --pairing-uri is required")?,
-            };
+            let effective_code = resolve_pair_code(
+                code,
+                code_stdin,
+                code_file,
+                parsed_uri.as_ref().map(|u| u.code.as_str()),
+            )?;
             let effective_endpoint = match endpoint {
                 Some(ep) => ep,
                 None => parsed_uri
@@ -693,14 +812,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("endpoint or URI ep hint is required")?,
             };
             let identity = store.load_or_generate_identity(None)?;
-            let mut stream =
-                dial_endpoint(&effective_endpoint, relay_host.as_deref(), p2p_local).await?;
+            let mut stream = dial_endpoint(
+                &effective_endpoint,
+                relay_host.as_deref(),
+                p2p_local,
+                p2p_relay.as_deref(),
+                no_pkarr,
+            )
+            .await?;
             let res = drive_pair_initiator(
                 stream.as_mut(),
                 &identity,
                 name,
                 kind,
-                effective_code,
+                effective_code.as_str().to_owned(),
                 pinned_host,
             )
             .await;
@@ -808,6 +933,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             endpoint,
             relay_host,
             p2p_local,
+            p2p_relay,
+            no_pkarr,
             grant,
             message,
         } => {
@@ -815,7 +942,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut roster = store.load_roster()?;
             let initial_seq = roster.get(&target).map(|e| e.rotation_seq);
             let grant_obj = grant.as_deref().map(load_grant_arg).transpose()?;
-            let stream = dial_endpoint(&endpoint, relay_host.as_deref(), p2p_local).await?;
+            let stream = dial_endpoint(
+                &endpoint,
+                relay_host.as_deref(),
+                p2p_local,
+                p2p_relay.as_deref(),
+                no_pkarr,
+            )
+            .await?;
             let connect_res = SessionDriver::connect(
                 stream,
                 &identity,

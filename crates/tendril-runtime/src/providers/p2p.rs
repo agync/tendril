@@ -68,13 +68,93 @@ impl Drop for PeerAcceptGuard {
 /// Relay strategy used when constructing [`P2pListener`] and [`P2pDialer`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum P2pRelayMode {
-    /// Zero-setup public relays and global peer discovery (`presets::N0`).
+    /// Zero-setup public relays (`RelayMode::Default`).
     #[default]
     Default,
     /// Self-hosted or regional `iroh-relay` HTTPS URL (`https://...`).
     Custom(String),
     /// Direct UDP socket addresses only (no relay server).
     Disabled,
+}
+
+/// Privacy and discovery options controlling `iroh` P2P endpoint construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P2pOptions {
+    pub relay_mode: P2pRelayMode,
+    pub publish_pkarr: bool,
+    pub resolve_pkarr: bool,
+    pub advertise_direct_addrs: bool,
+    pub allow_private_addrs: bool,
+}
+
+impl Default for P2pOptions {
+    fn default() -> Self {
+        Self::for_listener(P2pRelayMode::Default)
+    }
+}
+
+impl P2pOptions {
+    /// Default privacy-preserving options for a listening [`P2pListener`].
+    ///
+    /// - [`P2pRelayMode::Default`]: publishes and resolves via `n0` Pkarr/DNS; omits direct `?addr=` hints.
+    /// - [`P2pRelayMode::Custom`]: disables `n0` Pkarr/DNS (`presets::Minimal`) and omits direct `?addr=` hints.
+    /// - [`P2pRelayMode::Disabled`]: disables `n0` Pkarr/DNS and advertises local `?addr=` hints.
+    #[must_use]
+    pub fn for_listener(relay_mode: P2pRelayMode) -> Self {
+        let is_default = matches!(relay_mode, P2pRelayMode::Default);
+        let is_disabled = matches!(relay_mode, P2pRelayMode::Disabled);
+        Self {
+            relay_mode,
+            publish_pkarr: is_default,
+            resolve_pkarr: is_default,
+            advertise_direct_addrs: is_disabled,
+            allow_private_addrs: is_disabled,
+        }
+    }
+
+    /// Default privacy-preserving options for a dialing [`P2pDialer`].
+    ///
+    /// Never enables `PkarrPublisher` so ephemeral client identities are never published.
+    #[must_use]
+    pub fn for_dialer(relay_mode: P2pRelayMode) -> Self {
+        let is_default = matches!(relay_mode, P2pRelayMode::Default);
+        let is_disabled = matches!(relay_mode, P2pRelayMode::Disabled);
+        Self {
+            relay_mode,
+            publish_pkarr: false,
+            resolve_pkarr: is_default,
+            advertise_direct_addrs: false,
+            allow_private_addrs: is_disabled,
+        }
+    }
+
+    /// Enables or disables publishing this endpoint to `n0` Pkarr/DNS.
+    #[must_use]
+    pub fn with_publish_pkarr(mut self, publish: bool) -> Self {
+        self.publish_pkarr = publish;
+        self
+    }
+
+    /// Enables or disables resolving peer endpoints via `n0` Pkarr/DNS.
+    #[must_use]
+    pub fn with_resolve_pkarr(mut self, resolve: bool) -> Self {
+        self.resolve_pkarr = resolve;
+        self
+    }
+
+    /// Controls whether [`P2pListener`] serializes non-metadata `?addr=` direct socket hints.
+    #[must_use]
+    pub fn with_advertise_direct_addrs(mut self, advertise: bool) -> Self {
+        self.advertise_direct_addrs = advertise;
+        self
+    }
+
+    /// Controls whether [`P2pDialer`] accepts private/loopback `?addr=` hints.
+    #[must_use]
+    pub fn with_allow_private_addrs(mut self, allow: bool) -> Self {
+        self.allow_private_addrs = allow;
+        self
+    }
 }
 
 struct EndpointGuard {
@@ -129,40 +209,60 @@ pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeE
 }
 
 async fn build_iroh_endpoint(
-    relay_mode: &P2pRelayMode,
+    options: &P2pOptions,
     alpns: Vec<Vec<u8>>,
     secret_seed: Option<Zeroizing<[u8; 32]>>,
 ) -> Result<Endpoint, RuntimeError> {
-    let mut builder = match relay_mode {
-        P2pRelayMode::Default => Endpoint::builder(presets::N0).relay_mode(RelayMode::Default),
+    let mut builder = match &options.relay_mode {
+        P2pRelayMode::Default => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Default),
         P2pRelayMode::Custom(url_str) => {
             super::validate_iroh_relay_url(url_str)?;
             let url = RelayUrl::from_str(url_str).map_err(|err| {
                 RuntimeError::Protocol(format!("invalid iroh relay URL '{url_str}': {err}"))
             })?;
-            Endpoint::builder(presets::N0).relay_mode(RelayMode::Custom(url.into()))
+            Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(url.into()))
         }
         P2pRelayMode::Disabled => {
             Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
         }
     };
+    if options.publish_pkarr {
+        builder = builder.address_lookup(iroh::address_lookup::PkarrPublisher::n0_dns());
+    }
+    if options.resolve_pkarr {
+        builder = builder.address_lookup(iroh::address_lookup::PkarrResolver::n0_dns());
+        builder = builder.address_lookup(iroh::address_lookup::DnsAddressLookup::n0_dns());
+    }
     if let Some(seed) = secret_seed {
         let sk = SecretKey::from_bytes(&seed);
         builder = builder.secret_key(sk);
     }
+    if !alpns.is_empty() {
+        builder = builder.alpns(alpns);
+    }
     builder
-        .alpns(alpns)
         .bind()
         .await
         .map_err(|err| RuntimeError::Protocol(format!("iroh endpoint bind failed: {err}")))
 }
 
-/// Formats an [`EndpointAddr`] as a compact `iroh://<endpoint_id>[?addr=...&relay=...]` string.
+/// Formats an [`EndpointAddr`] without direct `?addr=` IP hints (`iroh://<endpoint_id>[?relay=...]`).
 #[must_use]
 pub fn format_p2p_endpoint(addr: &EndpointAddr) -> String {
+    format_p2p_endpoint_with_addrs(addr, false)
+}
+
+/// Formats an [`EndpointAddr`] as `iroh://<endpoint_id>[?addr=...&relay=...]`, omitting `?addr=`
+/// hints unless `include_addrs` is `true` and unconditionally skipping link-local/metadata IPs.
+#[must_use]
+pub fn format_p2p_endpoint_with_addrs(addr: &EndpointAddr, include_addrs: bool) -> String {
     let mut query = Vec::new();
-    for sock in addr.ip_addrs() {
-        query.push(format!("addr={sock}"));
+    if include_addrs {
+        for sock in addr.ip_addrs() {
+            if !super::is_metadata_or_link_local_ip(sock.ip()) {
+                query.push(format!("addr={sock}"));
+            }
+        }
     }
     for relay in addr.relay_urls() {
         query.push(format!("relay={relay}"));
@@ -339,6 +439,7 @@ impl PathStream for P2pStream {
 pub struct P2pListener {
     guard: Arc<EndpointGuard>,
     local_ep: String,
+    advertise_direct_addrs: bool,
     accepted_rx: mpsc::Receiver<P2pStream>,
     accept_task: JoinHandle<()>,
     write_timeout: Duration,
@@ -347,7 +448,7 @@ pub struct P2pListener {
 impl P2pListener {
     /// Binds a new `iroh` P2P endpoint listener under `relay_mode` with a fresh ephemeral key.
     pub async fn bind(relay_mode: P2pRelayMode) -> Result<Self, RuntimeError> {
-        Self::bind_inner(relay_mode, None).await
+        Self::bind_with_options(P2pOptions::for_listener(relay_mode), None).await
     }
 
     /// Binds a new `iroh` P2P endpoint listener under `relay_mode` with a deterministic secret seed.
@@ -355,19 +456,21 @@ impl P2pListener {
         relay_mode: P2pRelayMode,
         secret_seed: Zeroizing<[u8; 32]>,
     ) -> Result<Self, RuntimeError> {
-        Self::bind_inner(relay_mode, Some(secret_seed)).await
+        Self::bind_with_options(P2pOptions::for_listener(relay_mode), Some(secret_seed)).await
     }
 
-    async fn bind_inner(
-        relay_mode: P2pRelayMode,
+    /// Binds a new `iroh` P2P endpoint listener with explicit privacy and lookup options.
+    pub async fn bind_with_options(
+        options: P2pOptions,
         secret_seed: Option<Zeroizing<[u8; 32]>>,
     ) -> Result<Self, RuntimeError> {
         let endpoint =
-            build_iroh_endpoint(&relay_mode, vec![TENDRIL_P2P_ALPN.to_vec()], secret_seed).await?;
-        if !matches!(relay_mode, P2pRelayMode::Disabled) {
+            build_iroh_endpoint(&options, vec![TENDRIL_P2P_ALPN.to_vec()], secret_seed).await?;
+        if !matches!(options.relay_mode, P2pRelayMode::Disabled) {
             let _ = timeout(Duration::from_secs(3), endpoint.online()).await;
         }
-        let local_ep = format_p2p_endpoint(&endpoint.addr());
+        let advertise_direct_addrs = options.advertise_direct_addrs;
+        let local_ep = format_p2p_endpoint_with_addrs(&endpoint.addr(), advertise_direct_addrs);
         let write_timeout = DEFAULT_WRITE_TIMEOUT;
         let guard = EndpointGuard::new(endpoint);
         let (accepted_tx, accepted_rx) = mpsc::channel(32);
@@ -413,6 +516,7 @@ impl P2pListener {
         Ok(Self {
             guard,
             local_ep,
+            advertise_direct_addrs,
             accepted_rx,
             accept_task,
             write_timeout,
@@ -428,7 +532,7 @@ impl P2pListener {
     /// Returns a fresh serialized `iroh://...` address snapshot (useful once relays finish homing).
     #[must_use]
     pub fn current_endpoint(&self) -> String {
-        format_p2p_endpoint(&self.guard.endpoint.addr())
+        format_p2p_endpoint_with_addrs(&self.guard.endpoint.addr(), self.advertise_direct_addrs)
     }
 
     /// Returns the configured per-write timeout.
@@ -452,7 +556,10 @@ impl PathListener for P2pListener {
     }
 
     fn local_endpoint(&self) -> String {
-        let current = format_p2p_endpoint(&self.guard.endpoint.addr());
+        let current = format_p2p_endpoint_with_addrs(
+            &self.guard.endpoint.addr(),
+            self.advertise_direct_addrs,
+        );
         if current == format!("iroh://{}", self.guard.endpoint.id()) {
             self.local_ep.clone()
         } else {
@@ -471,8 +578,13 @@ pub struct P2pDialer {
 impl P2pDialer {
     /// Binds a client `iroh` endpoint configured with `relay_mode`.
     pub async fn bind(relay_mode: P2pRelayMode) -> Result<Self, RuntimeError> {
-        let allow_private_addrs = matches!(relay_mode, P2pRelayMode::Disabled);
-        let endpoint = build_iroh_endpoint(&relay_mode, Vec::new(), None).await?;
+        Self::bind_with_options(P2pOptions::for_dialer(relay_mode)).await
+    }
+
+    /// Binds a client `iroh` endpoint with explicit privacy and lookup options.
+    pub async fn bind_with_options(options: P2pOptions) -> Result<Self, RuntimeError> {
+        let allow_private_addrs = options.allow_private_addrs;
+        let endpoint = build_iroh_endpoint(&options, Vec::new(), None).await?;
         Ok(Self {
             guard: EndpointGuard::new(endpoint),
             write_timeout: DEFAULT_WRITE_TIMEOUT,

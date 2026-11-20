@@ -14,6 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::error::RuntimeError;
 
 const IDENTITY_FILE: &str = "identity.json";
+const IDENTITY_LOCK_FILE: &str = ".identity.lock";
 const ROSTER_FILE: &str = "roster.json";
 const ROSTER_LOCK_FILE: &str = ".roster.lock";
 
@@ -55,8 +56,7 @@ impl StateStore {
     /// Opens or creates `dir` with `0o700` permissions on Unix.
     pub fn open_or_create(dir: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
-        set_dir_mode_0700(&dir)?;
+        create_private_dir_0700(&dir)?;
         Ok(Self { dir })
     }
 
@@ -86,7 +86,9 @@ impl StateStore {
 
     /// Loads [`EndpointIdentity`] from `identity.json`.
     pub fn load_identity(&self) -> Result<EndpointIdentity, RuntimeError> {
-        let raw = Zeroizing::new(fs::read_to_string(self.identity_path())?);
+        let path = self.identity_path();
+        verify_private_file_0600(&path)?;
+        let raw = Zeroizing::new(fs::read_to_string(&path)?);
         let disk: PersistedIdentity = serde_json::from_str(&raw)
             .map_err(|err| RuntimeError::Storage(format!("invalid identity json: {err}")))?;
         if disk.version != 1 {
@@ -128,14 +130,19 @@ impl StateStore {
         self.atomic_write_0600(&self.identity_path(), &json)
     }
 
-    /// Loads the existing identity or generates, optionally assigns `host_id`, and saves one.
+    /// Loads the existing identity or generates, optionally assigns `host_id`, and saves one
+    /// under an exclusive `.identity.lock` advisory lock.
     pub fn load_or_generate_identity(
         &self,
         host_id: Option<&str>,
     ) -> Result<EndpointIdentity, RuntimeError> {
+        let lock = open_lock_0600(&self.dir.join(IDENTITY_LOCK_FILE))?;
+        lock.lock()?;
         let path = self.identity_path();
-        if path.exists() {
-            return self.load_identity();
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return self.load_identity(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(RuntimeError::Io(err)),
         }
         let mut identity = EndpointIdentity::generate()?;
         if let Some(id) = host_id
@@ -222,8 +229,10 @@ impl StateStore {
 
     fn load_roster_unlocked(&self) -> Result<Roster, RuntimeError> {
         let path = self.roster_path();
-        if !path.exists() {
-            return Ok(Roster::new());
+        match fs::symlink_metadata(&path) {
+            Ok(_) => verify_private_file_0600(&path)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Roster::new()),
+            Err(err) => return Err(RuntimeError::Io(err)),
         }
         let raw = fs::read_to_string(&path)?;
         serde_json::from_str(&raw)
@@ -265,18 +274,69 @@ impl StateStore {
 }
 
 #[cfg(unix)]
-fn set_dir_mode_0700(dir: &Path) -> Result<(), RuntimeError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+fn create_private_dir_0700(dir: &Path) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(RuntimeError::Storage(format!(
+            "state dir '{}' must be a real directory, not a symlink",
+            dir.display()
+        )));
+    }
+    if (meta.permissions().mode() & 0o077) != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_dir_mode_0700(_dir: &Path) -> Result<(), RuntimeError> {
+fn create_private_dir_0700(dir: &Path) -> Result<(), RuntimeError> {
+    fs::create_dir_all(dir)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_private_file_0600(path: &Path) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(RuntimeError::Storage(format!(
+            "state file '{}' must be a regular file, not a symlink",
+            path.display()
+        )));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if (mode & 0o077) != 0 {
+        return Err(RuntimeError::Storage(format!(
+            "state file '{}' has insecure mode {mode:#o}; expected group/other zeroed",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_file_0600(_path: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
 fn open_lock_0600(path: &Path) -> Result<File, RuntimeError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(RuntimeError::Storage(format!(
+                    "lock file '{}' must be a regular file, not a symlink",
+                    path.display()
+                )));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(RuntimeError::Io(err)),
+    }
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]

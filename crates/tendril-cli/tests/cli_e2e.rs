@@ -795,3 +795,167 @@ async fn batch1_sec04_cli_serve_enforces_live_revoke_and_flock_pair_safety() {
     );
     assert!(after_pair.get("host-second").is_some());
 }
+
+#[test]
+fn cli_e2e_pair_non_argv_code_inputs() {
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "host-sec25"])
+            .status
+            .success()
+    );
+    assert!(run_tendril(client_dir.path(), &["init"]).status.success());
+
+    let spawn_pair_server = || {
+        let mut serve = KillOnDrop(
+            Command::new(tendril_bin())
+                .arg("--state-dir")
+                .arg(host_dir.path())
+                .args(["serve", "--listen", "127.0.0.1:0", "--issue-code", "lan"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn serve"),
+        );
+        let mut stdout = BufReader::new(serve.0.stdout.take().expect("stdout"));
+        let listening = read_json_line(&mut stdout);
+        let ep = listening["direct_endpoint"]
+            .as_str()
+            .expect("ep")
+            .to_owned();
+        let code = listening["pairing_code"].as_str().expect("code").to_owned();
+        (serve, ep, code)
+    };
+
+    // 1. --code-stdin
+    let (_s1, ep1, code1) = spawn_pair_server();
+    let mut child = Command::new(tendril_bin())
+        .arg("--state-dir")
+        .arg(client_dir.path())
+        .args(["pair", "--endpoint", &ep1, "--code-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pair stdin");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(format!("{code1}\n").as_bytes())
+        .expect("write code stdin");
+    let out1 = child.wait_with_output().expect("wait stdin");
+    assert!(
+        out1.status.success(),
+        "pair --code-stdin failed: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    // 2. --code-file
+    let (_s2, ep2, code2) = spawn_pair_server();
+    let code_file = client_dir.path().join("pair.code");
+    std::fs::write(&code_file, format!("{code2}\r\n")).expect("write code file");
+    let out2 = run_tendril(
+        client_dir.path(),
+        &[
+            "pair",
+            "--endpoint",
+            &ep2,
+            "--code-file",
+            code_file.to_str().expect("utf8 path"),
+        ],
+    );
+    assert!(
+        out2.status.success(),
+        "pair --code-file failed: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    // 3. TENDRIL_PAIR_CODE env var, plus conflict rejection when combined with --code.
+    let (_s3, ep3, code3) = spawn_pair_server();
+    let conflict = Command::new(tendril_bin())
+        .arg("--state-dir")
+        .arg(client_dir.path())
+        .env("TENDRIL_PAIR_CODE", &code3)
+        .args(["pair", "--endpoint", &ep3, "--code", &code3])
+        .output()
+        .expect("run conflict pair");
+    assert!(
+        !conflict.status.success(),
+        "conflicting code sources must fail"
+    );
+
+    let out3 = Command::new(tendril_bin())
+        .arg("--state-dir")
+        .arg(client_dir.path())
+        .env("TENDRIL_PAIR_CODE", &code3)
+        .args(["pair", "--endpoint", &ep3])
+        .output()
+        .expect("run env pair");
+    assert!(
+        out3.status.success(),
+        "TENDRIL_PAIR_CODE pair failed: {}",
+        String::from_utf8_lossy(&out3.stderr)
+    );
+}
+
+#[test]
+fn cli_e2e_p2p_ephemeral_and_local_env() {
+    let host_dir = TempDir::new().expect("host dir");
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "host-priv01"])
+            .status
+            .success()
+    );
+
+    let start_ephemeral = || {
+        let mut serve = KillOnDrop(
+            Command::new(tendril_bin())
+                .arg("--state-dir")
+                .arg(host_dir.path())
+                .env("TENDRIL_P2P_LOCAL", "1")
+                .args([
+                    "serve",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--p2p",
+                    "--ephemeral-p2p",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn ephemeral serve"),
+        );
+        let mut stdout = BufReader::new(serve.0.stdout.take().expect("stdout"));
+        let listening = read_json_line(&mut stdout);
+        listening["p2p_endpoint"]
+            .as_str()
+            .expect("p2p_endpoint")
+            .to_owned()
+    };
+
+    let ep1 = start_ephemeral();
+    let ep2 = start_ephemeral();
+    assert!(ep1.starts_with("iroh://"));
+    assert!(
+        ep1.contains("addr="),
+        "TENDRIL_P2P_LOCAL=1 on serve --p2p selects offline Disabled mode with local addr: {ep1}"
+    );
+    let id1 = ep1
+        .strip_prefix("iroh://")
+        .unwrap()
+        .split('?')
+        .next()
+        .unwrap();
+    let id2 = ep2
+        .strip_prefix("iroh://")
+        .unwrap()
+        .split('?')
+        .next()
+        .unwrap();
+    assert_ne!(
+        id1, id2,
+        "--ephemeral-p2p must rotate EndpointId per invocation"
+    );
+}

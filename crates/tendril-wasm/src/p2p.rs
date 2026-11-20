@@ -234,9 +234,16 @@ impl WasmIrohStream {
                 validate_iroh_relay_url_wasm(url_str).map_err(to_js_err)?;
                 let url = RelayUrl::from_str(url_str)
                     .map_err(|e| to_js_err(format!("invalid relay URL '{url_str}': {e}")))?;
-                Endpoint::builder(presets::N0).relay_mode(RelayMode::Custom(url.into()))
+                Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(url.into()))
             }
-            None => Endpoint::builder(presets::N0).relay_mode(RelayMode::Default),
+            None => {
+                let mut builder =
+                    Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Default);
+                if addr.relay_urls().next().is_none() {
+                    builder = builder.address_lookup(iroh::address_lookup::PkarrResolver::n0_dns());
+                }
+                builder
+            }
         };
         let ep = timeout(budget, builder.bind())
             .await

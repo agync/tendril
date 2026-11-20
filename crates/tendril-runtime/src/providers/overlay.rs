@@ -16,7 +16,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::time::{Instant, timeout, timeout_at};
 
-use super::{set_dir_mode_0700, set_mode_0600};
 use crate::error::RuntimeError;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, IoPathStream, PathDialer, PathListener, PathStream};
 
@@ -271,17 +270,7 @@ impl OverlayHelperListener {
     /// Binds an IPC socket for inbound overlay helper streams inside a `0o700` parent directory.
     pub fn bind(socket_path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let socket_path = socket_path.as_ref().to_path_buf();
-        if let Some(parent) = socket_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-            set_dir_mode_0700(parent)?;
-        }
-        if socket_path.exists() {
-            fs::remove_file(&socket_path)?;
-        }
-        let listener = UnixListener::bind(&socket_path)?;
-        set_mode_0600(&socket_path)?;
+        let listener = super::bind_private_unix_listener(&socket_path, true)?;
         Ok(Self {
             listener,
             socket_path,

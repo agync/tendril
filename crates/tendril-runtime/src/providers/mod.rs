@@ -36,8 +36,9 @@ pub use overlay::{
 };
 #[cfg(feature = "p2p-iroh")]
 pub use p2p::{
-    P2pDialer, P2pListener, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint,
-    parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode,
+    P2pDialer, P2pListener, P2pOptions, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint,
+    format_p2p_endpoint_with_addrs, parse_p2p_endpoint, parse_p2p_endpoint_filtered,
+    parse_p2p_relay_mode,
 };
 pub use relay::{EmbeddedRelay, RelayDialer, RelayListener};
 
@@ -127,15 +128,131 @@ pub(crate) fn set_mode_0600(_path: &Path) -> Result<(), RuntimeError> {
 }
 
 #[cfg(unix)]
-pub(crate) fn set_dir_mode_0700(path: &Path) -> Result<(), RuntimeError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+pub(crate) fn create_private_dir_0700(dir: &Path) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(RuntimeError::Storage(format!(
+            "refusing symlink or non-directory '{}'",
+            dir.display()
+        )));
+    }
+    if (meta.permissions().mode() & 0o077) != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
-pub(crate) fn set_dir_mode_0700(_path: &Path) -> Result<(), RuntimeError> {
+pub(crate) fn create_private_dir_0700(dir: &Path) -> Result<(), RuntimeError> {
+    fs::create_dir_all(dir)?;
     Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn bind_private_unix_listener(
+    path: &Path,
+    enforce_parent_0700: bool,
+) -> Result<tokio::net::UnixListener, RuntimeError> {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+    static STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
+                return Err(RuntimeError::Storage(format!(
+                    "refusing to unlink symlink or non-socket path '{}'",
+                    path.display()
+                )));
+            }
+            fs::remove_file(path)?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(RuntimeError::Io(err)),
+    }
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if enforce_parent_0700 {
+        create_private_dir_0700(parent)?;
+    } else if fs::symlink_metadata(parent).is_err() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+
+    let parent_meta = fs::symlink_metadata(parent)?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        return Err(RuntimeError::Storage(format!(
+            "socket parent directory '{}' must be a real directory",
+            parent.display()
+        )));
+    }
+
+    if (parent_meta.permissions().mode() & 0o077) != 0 {
+        let seq = STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stage_dir = parent.join(format!(".t-{}-{seq}", std::process::id()));
+        let stage_sock = stage_dir.join("s");
+        if stage_sock.as_os_str().as_encoded_bytes().len() < 104 {
+            fs::DirBuilder::new().mode(0o700).create(&stage_dir)?;
+            let res = (|| -> Result<tokio::net::UnixListener, RuntimeError> {
+                fs::set_permissions(&stage_dir, fs::Permissions::from_mode(0o700))?;
+                let listener = tokio::net::UnixListener::bind(&stage_sock)?;
+                set_mode_0600(&stage_sock)?;
+                match fs::symlink_metadata(path) {
+                    Ok(_) => {
+                        return Err(RuntimeError::Storage(format!(
+                            "concurrent path created at '{}'",
+                            path.display()
+                        )));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(RuntimeError::Io(err)),
+                }
+                fs::rename(&stage_sock, path)?;
+                Ok(listener)
+            })();
+            let _ = fs::remove_file(&stage_sock);
+            let _ = fs::remove_dir(&stage_dir);
+            return res;
+        }
+    }
+
+    let listener = tokio::net::UnixListener::bind(path)?;
+    let sock_meta = fs::symlink_metadata(path)?;
+    if sock_meta.file_type().is_symlink() || !sock_meta.file_type().is_socket() {
+        return Err(RuntimeError::Storage(format!(
+            "bound path '{}' is not a unix socket",
+            path.display()
+        )));
+    }
+    set_mode_0600(path)?;
+    Ok(listener)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn bind_private_unix_listener(
+    path: &Path,
+    enforce_parent_0700: bool,
+) -> Result<tokio::net::UnixListener, RuntimeError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && (enforce_parent_0700 || !parent.exists())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(tokio::net::UnixListener::bind(path)?)
 }
 
 /// Shared WebSocket binary-frame `PathStream` used by `relay` and `broker` providers.

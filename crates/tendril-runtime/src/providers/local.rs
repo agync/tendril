@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use tendril_core::policy::ProviderId;
 use tokio::net::{UnixListener, UnixStream};
 
-use super::set_mode_0600;
+use super::bind_private_unix_listener;
 use crate::error::RuntimeError;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, IoPathStream, PathDialer, PathListener, PathStream};
 
@@ -20,14 +20,10 @@ pub struct LocalListener {
 }
 
 impl LocalListener {
-    /// Binds a Unix domain socket listener at `path`, replacing any stale socket file.
+    /// Binds a Unix domain socket listener at `path`, replacing only a verified stale socket.
     pub fn bind(path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let path = path.as_ref().to_path_buf();
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        let listener = UnixListener::bind(&path)?;
-        set_mode_0600(&path)?;
+        let listener = bind_private_unix_listener(&path, false)?;
         Ok(Self {
             listener,
             path,

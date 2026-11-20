@@ -2141,3 +2141,301 @@ async fn batch2a_sec14_url_ssrf_and_filtered_p2p_addrs() {
         );
     }
 }
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn batch2a_priv01_priv02_p2p_options_and_endpoint_formatting() {
+    use iroh::{EndpointAddr, TransportAddr};
+    use tendril_runtime::{P2pOptions, format_p2p_endpoint, format_p2p_endpoint_with_addrs};
+
+    let custom_opts =
+        P2pOptions::for_listener(P2pRelayMode::Custom("https://relay.example/".to_owned()));
+    assert!(!custom_opts.publish_pkarr);
+    assert!(!custom_opts.resolve_pkarr);
+    assert!(!custom_opts.advertise_direct_addrs);
+    assert!(!custom_opts.allow_private_addrs);
+
+    let default_listener_opts = P2pOptions::for_listener(P2pRelayMode::Default);
+    assert!(default_listener_opts.publish_pkarr);
+    assert!(default_listener_opts.resolve_pkarr);
+    assert!(!default_listener_opts.advertise_direct_addrs);
+
+    let default_dialer_opts = P2pOptions::for_dialer(P2pRelayMode::Default);
+    assert!(!default_dialer_opts.publish_pkarr);
+    assert!(default_dialer_opts.resolve_pkarr);
+
+    let id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
+    let addr = EndpointAddr::from_parts(
+        id,
+        [
+            TransportAddr::Ip("192.168.1.10:4433".parse().expect("ip1")),
+            TransportAddr::Ip("169.254.169.254:80".parse().expect("meta")),
+            TransportAddr::Ip("93.184.216.34:4433".parse().expect("pub")),
+            TransportAddr::Relay("https://relay.example/".parse().expect("relay")),
+        ],
+    );
+    let default_fmt = format_p2p_endpoint(&addr);
+    assert_eq!(
+        default_fmt,
+        format!("iroh://{id}?relay=https://relay.example/")
+    );
+    assert!(!default_fmt.contains("addr="));
+
+    let with_addrs = format_p2p_endpoint_with_addrs(&addr, true);
+    assert!(with_addrs.contains("addr=192.168.1.10:4433"));
+    assert!(with_addrs.contains("addr=93.184.216.34:4433"));
+    assert!(!with_addrs.contains("169.254.169.254"));
+    assert!(with_addrs.contains("relay=https://relay.example/"));
+
+    let disabled_listener = P2pListener::bind(P2pRelayMode::Disabled)
+        .await
+        .expect("bind disabled");
+    assert!(disabled_listener.local_endpoint().contains("addr="));
+
+    let hidden_listener = P2pListener::bind_with_options(
+        P2pOptions::for_listener(P2pRelayMode::Disabled).with_advertise_direct_addrs(false),
+        None,
+    )
+    .await
+    .expect("bind hidden");
+    assert!(!hidden_listener.local_endpoint().contains("addr="));
+}
+
+#[tokio::test]
+async fn batch2a_sec20_connect_with_policy_fails_over_past_malicious_direct() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Bind a decoy Direct TCP listener that responds immediately with garbage bytes.
+    let decoy = TcpListener::bind("127.0.0.1:0").await.expect("bind decoy");
+    let decoy_addr = decoy.local_addr().expect("decoy addr");
+    let decoy_task = tokio::spawn(async move {
+        let mut sink = Vec::new();
+        while let Ok((mut s, _)) = decoy.accept().await {
+            let mut buf = [0u8; 64];
+            let _ = s.read(&mut buf).await;
+            let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            sink.push(s);
+        }
+    });
+
+    // Real host & paired client over live Relay.
+    let relay = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind relay");
+    let relay_handle = relay.spawn();
+
+    let host_id = EndpointIdentity::generate()
+        .expect("host id")
+        .with_host_id("sec20-host");
+    let cli_id = Arc::new(
+        EndpointIdentity::generate()
+            .expect("cli id")
+            .with_host_id("sec20-cli"),
+    );
+
+    let mut host_roster = Roster::new();
+    host_roster
+        .insert_pinned_host(
+            cli_id.device_id(),
+            "cli".to_owned(),
+            *cli_id.static_key().public_bytes(),
+            Some(*cli_id.signing_key().public_bytes()),
+            cli_id.rotation_seq(),
+            Vec::new(),
+        )
+        .expect("pin cli");
+
+    let mut cli_roster = Roster::new();
+    cli_roster
+        .insert_pinned_host(
+            host_id.host_id().to_owned(),
+            "host".to_owned(),
+            *host_id.static_key().public_bytes(),
+            Some(*host_id.signing_key().public_bytes()),
+            host_id.rotation_seq(),
+            Vec::new(),
+        )
+        .expect("pin host");
+
+    let mut relay_listener = RelayListener::bind(
+        relay_handle.ws_url(),
+        Some("localhost".to_owned()),
+        host_id.signing_key().signing_key(),
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await
+    .expect("bind relay listener");
+    let relay_ep = relay_listener.local_endpoint();
+
+    let srv_task = tokio::spawn(async move {
+        let stream = relay_listener.accept().await.expect("accept relay");
+        let mut srv_driver =
+            SessionDriver::accept(stream, &host_id, &mut host_roster, 1_795_564_800, None)
+                .await
+                .expect("srv accept noise");
+        let ev = srv_driver
+            .next_event(1_795_564_800, &mut host_roster)
+            .await
+            .expect("srv event");
+        assert!(matches!(ev, Some(SessionEvent::AppData(d)) if d == b"verified-path"));
+    });
+
+    let dialers: Vec<Arc<dyn PathDialer>> = vec![
+        Arc::new(DirectDialer::new()),
+        Arc::new(RelayDialer::new().with_expected_host("localhost")),
+    ];
+    let candidates = vec![
+        CandidateEndpoint::new(1, ProviderId::Direct, decoy_addr.to_string()),
+        CandidateEndpoint::new(2, ProviderId::Relay, relay_ep),
+    ];
+
+    let (winner, mut cli_driver) = SessionDriver::connect_with_policy(
+        &dialers,
+        PathPolicyConfig::default(),
+        candidates,
+        Arc::clone(&cli_id),
+        "sec20-host",
+        None,
+        &mut cli_roster,
+        1_795_564_800,
+    )
+    .await
+    .expect("connect_with_policy must fail over to Noise-authenticated relay");
+    assert_eq!(winner.provider, ProviderId::Relay);
+    cli_driver
+        .send_data(b"verified-path")
+        .await
+        .expect("send data");
+    srv_task.await.expect("srv join");
+
+    decoy_task.abort();
+    relay_handle.stop().await.expect("stop relay");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn batch2a_sec26_unix_socket_and_store_hardening() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    // 1. Refuse to unlink pre-existing regular files and symlinks.
+    let reg_file = tmp.path().join("important.txt");
+    std::fs::write(&reg_file, "do-not-delete").expect("write reg file");
+    assert!(matches!(
+        LocalListener::bind(&reg_file),
+        Err(RuntimeError::Storage(_))
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&reg_file).expect("read intact"),
+        "do-not-delete"
+    );
+
+    let sym_sock = tmp.path().join("sym.sock");
+    std::os::unix::fs::symlink(&reg_file, &sym_sock).expect("symlink");
+    assert!(matches!(
+        LocalListener::bind(&sym_sock),
+        Err(RuntimeError::Storage(_))
+    ));
+    assert!(matches!(
+        OverlayHelperListener::bind(&sym_sock),
+        Err(RuntimeError::Storage(_))
+    ));
+
+    // 2. Binding inside a 0o755 parent uses staging without chmod-ing parent; socket is 0o600 and dialable.
+    let shared_dir = tmp.path().join("shared755");
+    std::fs::create_dir(&shared_dir).expect("mkdir shared");
+    std::fs::set_permissions(&shared_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod 755");
+    let sock_path = shared_dir.join("ipc.sock");
+    let mut local_listener = LocalListener::bind(&sock_path).expect("bind local in 755");
+    let parent_mode = std::fs::symlink_metadata(&shared_dir)
+        .expect("parent meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(parent_mode, 0o755);
+    let sock_mode = std::fs::symlink_metadata(&sock_path)
+        .expect("sock meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(sock_mode, 0o600);
+    let local_dialer = LocalDialer::new();
+    let (cli, srv) = tokio::join!(local_dialer.connect(&sock_path), local_listener.accept());
+    assert_eq!(cli.expect("cli").provider_id(), ProviderId::Local);
+    assert_eq!(srv.expect("srv").provider_id(), ProviderId::Local);
+
+    // 3. StateStore rejects group/world-readable modes & symlinks, and serializes concurrent init.
+    let store_dir = tmp.path().join("store");
+    let store = StateStore::open_or_create(&store_dir).expect("open store");
+    let id = store
+        .load_or_generate_identity(Some("sec26-host"))
+        .expect("gen");
+    std::fs::set_permissions(
+        store.identity_path(),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("weaken mode");
+    assert!(matches!(
+        store.load_identity(),
+        Err(RuntimeError::Storage(_))
+    ));
+    std::fs::remove_file(store.identity_path()).expect("rm id");
+    std::os::unix::fs::symlink(&reg_file, store.identity_path()).expect("id symlink");
+    assert!(matches!(
+        store.load_identity(),
+        Err(RuntimeError::Storage(_))
+    ));
+    std::os::unix::fs::symlink(&reg_file, store.roster_path()).expect("roster symlink");
+    assert!(matches!(store.load_roster(), Err(RuntimeError::Storage(_))));
+    let _ = id;
+
+    let conc_dir = tmp.path().join("conc-store");
+    let mut threads = Vec::new();
+    for _ in 0..4 {
+        let p = conc_dir.clone();
+        threads.push(std::thread::spawn(move || {
+            StateStore::open_or_create(&p)
+                .expect("open")
+                .load_or_generate_identity(Some("conc-host"))
+                .expect("load_or_gen")
+                .device_id()
+        }));
+    }
+    let ids: Vec<String> = threads
+        .into_iter()
+        .map(|h| h.join().expect("thread join"))
+        .collect();
+    assert!(ids.iter().all(|d| d == &ids[0]));
+}
+
+#[tokio::test]
+async fn batch2a_sec30_drive_pair_initiator_times_out_on_stalled_peer() {
+    use tendril_runtime::drive_pair_initiator_with_timeout;
+
+    let mut listener = DirectListener::bind("127.0.0.1:0".parse().expect("addr"), None)
+        .await
+        .expect("bind");
+    let ep = listener.local_endpoint();
+    let hold = tokio::spawn(async move {
+        let _s = listener.accept().await.expect("accept");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let id = EndpointIdentity::generate().expect("id");
+    let mut cli = DirectDialer::new().dial(&ep).await.expect("dial");
+    let started = Instant::now();
+    let res = drive_pair_initiator_with_timeout(
+        cli.as_mut(),
+        &id,
+        "dev".to_owned(),
+        "cli".to_owned(),
+        "TND-1234-5678".to_owned(),
+        None,
+        Duration::from_millis(120),
+    )
+    .await;
+    assert!(matches!(res, Err(RuntimeError::Timeout(_))));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    hold.abort();
+}

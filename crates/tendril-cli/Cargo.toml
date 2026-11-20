@@ -23,6 +23,7 @@ tendril-runtime = { workspace = true, features = ["p2p-iroh"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

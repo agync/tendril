@@ -9,7 +9,8 @@ pub mod router;
 pub mod store;
 
 pub use driver::{
-    DEFAULT_PRE_AUTH_TIMEOUT, SessionDriver, SessionEvent, dial_with_policy, drive_pair_initiator,
+    DEFAULT_PRE_AUTH_TIMEOUT, SessionDriver, SessionEvent, dial_with_policy,
+    dial_with_policy_verified, drive_pair_initiator, drive_pair_initiator_with_timeout,
     drive_pair_responder, drive_pair_responder_with_options, pairing_path_kind_for_provider,
 };
 pub use error::RuntimeError;
@@ -26,8 +27,9 @@ pub use providers::{
 };
 #[cfg(feature = "p2p-iroh")]
 pub use providers::{
-    P2pDialer, P2pListener, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint,
-    parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode,
+    P2pDialer, P2pListener, P2pOptions, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint,
+    format_p2p_endpoint_with_addrs, parse_p2p_endpoint, parse_p2p_endpoint_filtered,
+    parse_p2p_relay_mode,
 };
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
