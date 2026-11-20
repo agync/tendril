@@ -263,6 +263,23 @@ impl Roster {
         Ok(grant)
     }
 
+    /// Updates cached `relay_hints` for an existing non-revoked peer without modifying cryptographic pins or grants.
+    pub fn update_relay_hints(
+        &mut self,
+        peer_id: &str,
+        relay_hints: Vec<String>,
+    ) -> Result<&RosterEntry, CoreError> {
+        let entry = self
+            .entries
+            .get_mut(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+        if entry.state == PeerState::Revoked {
+            return Err(CoreError::PeerRevoked(peer_id.to_string()));
+        }
+        entry.relay_hints = relay_hints;
+        Ok(&self.entries[peer_id])
+    }
+
     /// Marks `peer_id` as `Revoked` and clears any stored grants.
     pub fn revoke_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
         let entry = self
@@ -457,6 +474,44 @@ mod tests {
 
         assert!(matches!(
             roster.lookup_active_by_static(&pub_k),
+            Err(CoreError::PeerRevoked(_))
+        ));
+    }
+
+    #[test]
+    fn update_relay_hints_preserves_pins_and_rejects_revoked_or_missing() {
+        let mut roster = Roster::new();
+        let pub_k = [0x55u8; 32];
+        let sig_k = [0x66u8; 32];
+        roster
+            .insert_pinned_host(
+                "host-a".to_string(),
+                "Host A".to_string(),
+                pub_k,
+                Some(sig_k),
+                3,
+                vec!["wss://relay1.example/v1/relay".to_string()],
+            )
+            .unwrap();
+
+        let updated = roster
+            .update_relay_hints("host-a", vec!["wss://relay2.example/v1/relay".to_string()])
+            .unwrap();
+        assert_eq!(updated.static_pub, pub_k);
+        assert_eq!(updated.signing_pub, Some(sig_k));
+        assert_eq!(updated.rotation_seq, 3);
+        assert_eq!(
+            updated.relay_hints,
+            vec!["wss://relay2.example/v1/relay".to_string()]
+        );
+
+        assert!(matches!(
+            roster.update_relay_hints("missing", vec![]),
+            Err(CoreError::PeerNotFound(_))
+        ));
+        roster.revoke_peer("host-a").unwrap();
+        assert!(matches!(
+            roster.update_relay_hints("host-a", vec![]),
             Err(CoreError::PeerRevoked(_))
         ));
     }
