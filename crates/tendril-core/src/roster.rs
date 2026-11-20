@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{b64url_encode, device_id, is_valid_x25519_public_key};
+use crate::crypto::{
+    b64url_encode, device_id, is_valid_ed25519_public_key, is_valid_x25519_public_key,
+};
 use crate::error::CoreError;
 use crate::grants::{
     Capability, Grant, GrantUnsigned, RevocationList, sign_grant, verify_crl_signature,
@@ -91,7 +93,11 @@ impl Roster {
         self.crls.get(issuer)
     }
 
-    /// Inserts or updates a client-side `Active` pin for a remote host before session connect.
+    /// Inserts or updates a verified client-side `Active` pin for a remote host before session connect.
+    ///
+    /// Refuses to overwrite a `Revoked` entry or any existing entry whose `static_pub`,
+    /// `signing_pub`, or `rotation_seq` conflicts with the supplied pin, and never retains grants
+    /// across differing keys.
     pub fn insert_pinned_host(
         &mut self,
         host_id: String,
@@ -107,16 +113,35 @@ impl Roster {
         if matches!(signing_pub, Some(sig) if sig == [0u8; 32]) {
             return Err(CoreError::IncompletePin(host_id));
         }
-        if let Some(existing) = self.entries.get(&host_id)
-            && existing.state == PeerState::Revoked
-        {
-            return Err(CoreError::PeerRevoked(host_id));
+        if let Some(existing) = self.entries.get_mut(&host_id) {
+            if existing.state == PeerState::Revoked {
+                return Err(CoreError::PeerRevoked(host_id));
+            }
+            let signing_conflict = match (existing.signing_pub, signing_pub) {
+                (Some(prev), Some(next)) => prev != next,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if existing.static_pub != static_pub
+                || signing_conflict
+                || rotation_seq < existing.rotation_seq
+            {
+                return Err(CoreError::ProtocolViolation(
+                    "cannot overwrite pinned host keys; rotate or revoke existing pin first",
+                ));
+            }
+            existing.name = name;
+            if existing.signing_pub.is_none() {
+                existing.signing_pub = signing_pub;
+            }
+            existing.rotation_seq = existing.rotation_seq.max(rotation_seq);
+            existing.state = PeerState::Active;
+            if !relay_hints.is_empty() {
+                existing.relay_hints = relay_hints;
+            }
+            return Ok(&self.entries[&host_id]);
         }
-        let existing_grants = self
-            .entries
-            .get(&host_id)
-            .map(|e| e.grants.clone())
-            .unwrap_or_default();
+
         let entry = RosterEntry {
             device_id: host_id.clone(),
             name,
@@ -126,11 +151,91 @@ impl Roster {
             rotation_seq,
             state: PeerState::Active,
             last_pairing_sas: None,
-            grants: existing_grants,
+            grants: Vec::new(),
             relay_hints,
         };
         self.entries.insert(host_id.clone(), entry);
         Ok(&self.entries[&host_id])
+    }
+
+    /// Records an unpinned host from manual pairing in `Pending` state awaiting SAS confirmation.
+    ///
+    /// Rejects `Revoked` entries and refuses to overwrite any existing entry carrying distinct keys.
+    /// Never auto-promotes `Pending` to `Active`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_pending_host(
+        &mut self,
+        host_id: String,
+        name: String,
+        static_pub: [u8; 32],
+        signing_pub: [u8; 32],
+        rotation_seq: u64,
+        pairing_sas: String,
+        relay_hints: Vec<String>,
+    ) -> Result<&RosterEntry, CoreError> {
+        if host_id.is_empty()
+            || !is_valid_x25519_public_key(&static_pub)
+            || !is_valid_ed25519_public_key(&signing_pub)
+        {
+            return Err(CoreError::IncompletePin(host_id));
+        }
+        if let Some(existing) = self.entries.get_mut(&host_id) {
+            if existing.state == PeerState::Revoked {
+                return Err(CoreError::PeerRevoked(host_id));
+            }
+            let signing_conflict =
+                matches!(existing.signing_pub, Some(prev) if prev != signing_pub);
+            if existing.static_pub != static_pub
+                || signing_conflict
+                || rotation_seq < existing.rotation_seq
+            {
+                return Err(CoreError::ProtocolViolation(
+                    "host_id collision with distinct pinned keys",
+                ));
+            }
+            existing.name = name;
+            existing.signing_pub = Some(signing_pub);
+            existing.rotation_seq = existing.rotation_seq.max(rotation_seq);
+            existing.last_pairing_sas = Some(pairing_sas);
+            if !relay_hints.is_empty() {
+                existing.relay_hints = relay_hints;
+            }
+            return Ok(&self.entries[&host_id]);
+        }
+
+        let entry = RosterEntry {
+            device_id: host_id.clone(),
+            name,
+            kind: "host".to_string(),
+            static_pub,
+            signing_pub: Some(signing_pub),
+            rotation_seq,
+            state: PeerState::Pending,
+            last_pairing_sas: Some(pairing_sas),
+            grants: Vec::new(),
+            relay_hints,
+        };
+        self.entries.insert(host_id.clone(), entry);
+        Ok(&self.entries[&host_id])
+    }
+
+    /// Removes a `Pending` (unconfirmed) peer or host entry, refusing to drop `Active` or `Revoked` entries.
+    pub fn remove_pending_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
+        let state = self
+            .entries
+            .get(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?
+            .state;
+        match state {
+            PeerState::Pending => {
+                self.entries.remove(peer_id);
+                Ok(())
+            }
+            PeerState::Revoked => Err(CoreError::PeerRevoked(peer_id.to_string())),
+            PeerState::Active => Err(CoreError::ProtocolViolation(
+                "cannot remove active peer; revoke instead",
+            )),
+        }
     }
 
     /// Records a newly paired device in `Pending` state after verifying `code_mac`.
@@ -565,5 +670,78 @@ mod tests {
             roster.update_relay_hints("host-a", vec![]),
             Err(CoreError::PeerRevoked(_))
         ));
+    }
+
+    #[test]
+    fn sec01_insert_and_pending_host_refuse_overwrite_and_gate_on_confirm() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+
+        let mut roster = Roster::new();
+        let k1 = *StaticKeypair::from_scalar([0x21; 32]).public_bytes();
+        let s1 = *SigningKeypair::from_seed([0x22; 32]).public_bytes();
+        let k2 = *StaticKeypair::from_scalar([0x23; 32]).public_bytes();
+        let s2 = *SigningKeypair::from_seed([0x24; 32]).public_bytes();
+
+        roster
+            .insert_pinned_host("host-x".into(), "Host X".into(), k1, Some(s1), 0, vec![])
+            .unwrap();
+        assert!(matches!(
+            roster.insert_pinned_host("host-x".into(), "Evil".into(), k2, Some(s2), 0, vec![]),
+            Err(CoreError::ProtocolViolation(_))
+        ));
+        assert!(matches!(
+            roster.record_pending_host(
+                "host-x".into(),
+                "Evil".into(),
+                k2,
+                s2,
+                0,
+                "evil sas1".into(),
+                vec![],
+            ),
+            Err(CoreError::ProtocolViolation(_))
+        ));
+        assert_eq!(roster.get("host-x").unwrap().static_pub, k1);
+
+        // Fresh unpinned manual host enters Pending and requires matching SAS confirm_peer.
+        let pend = roster
+            .record_pending_host(
+                "host-y".into(),
+                "Host Y".into(),
+                k1,
+                s1,
+                0,
+                "abcd 1234 efgh 5678".into(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(pend.state, PeerState::Pending);
+        assert!(matches!(
+            roster.confirm_peer("host-y", Some("wrong sas")),
+            Err(CoreError::ProtocolViolation(_))
+        ));
+        assert!(matches!(
+            roster.remove_pending_peer("host-x"),
+            Err(CoreError::ProtocolViolation(_))
+        ));
+        roster
+            .confirm_peer("host-y", Some("abcd 1234 efgh 5678"))
+            .unwrap();
+        assert_eq!(roster.get("host-y").unwrap().state, PeerState::Active);
+
+        // Unconfirmed pending host can be cleanly discarded via remove_pending_peer.
+        roster
+            .record_pending_host(
+                "host-z".into(),
+                "Host Z".into(),
+                k2,
+                s2,
+                0,
+                "bad sas".into(),
+                vec![],
+            )
+            .unwrap();
+        roster.remove_pending_peer("host-z").unwrap();
+        assert!(roster.get("host-z").is_none());
     }
 }

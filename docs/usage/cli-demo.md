@@ -37,11 +37,12 @@ tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --issue-code lan
 # tendril --state-dir ./host-state serve --p2p-local --overlay 127.0.0.1:0 --broker 127.0.0.1:0 --issue-code remote
 # (Pass --p2p-local on pair/dial when connecting to a --p2p-local endpoint offline.)
 
-# 3. Pair client using printed endpoint and code, then record matching SAS
+# 3. Pair client using printed endpoint and code, then confirm SAS on both host and client
 tendril --state-dir ./cli-state pair --endpoint 127.0.0.1:PORT --code TND-XXXX-XXXX
 
-# 4. Confirm peer (default deny) and mint scoped capability grant on host
+# 4. Confirm peer on host and host pin on client (default deny), then mint scoped grant
 tendril --state-dir ./host-state confirm <client_device_id> --sas "<sas>"
+tendril --state-dir ./cli-state confirm my-host --sas "<sas>"
 tendril --state-dir ./host-state mint <client_device_id> --cap fs.read
 
 # 5. Connect, send data, verify liveness via encrypted PING/PONG, then revoke

@@ -317,10 +317,11 @@ impl Endpoint {
                 host_signing_pub,
                 host_rotation_seq,
                 pairing_sas,
+                host_pin_verified,
             } => {
                 let mut roster = self.roster.lock().expect("roster mutex poisoned");
-                roster
-                    .insert_pinned_host(
+                let pin_res = if host_pin_verified {
+                    roster.insert_pinned_host(
                         host_id.clone(),
                         host_id.clone(),
                         host_static_pub,
@@ -328,12 +329,25 @@ impl Endpoint {
                         host_rotation_seq,
                         Vec::new(),
                     )
-                    .map_err(to_generic_err)?;
+                } else {
+                    roster.record_pending_host(
+                        host_id.clone(),
+                        host_id.clone(),
+                        host_static_pub,
+                        host_signing_pub,
+                        host_rotation_seq,
+                        pairing_sas.clone(),
+                        Vec::new(),
+                    )
+                };
+                pin_res.map_err(to_generic_err)?;
                 self.persist_roster(&roster)?;
                 Ok(serde_json::json!({
                     "device_id": device_id,
                     "host_id": host_id,
                     "sas": pairing_sas,
+                    "status": if host_pin_verified { "active" } else { "pending" },
+                    "host_confirmed": host_pin_verified,
                 })
                 .to_string())
             }

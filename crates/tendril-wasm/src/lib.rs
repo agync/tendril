@@ -312,6 +312,23 @@ impl WasmRoster {
     }
 
     #[wasm_bindgen]
+    pub fn confirm_peer(
+        &mut self,
+        peer_id: &str,
+        expected_sas: Option<String>,
+    ) -> Result<(), JsValue> {
+        self.inner
+            .confirm_peer(peer_id, expected_sas.as_deref())
+            .map_err(to_js_err)?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn remove_pending_peer(&mut self, peer_id: &str) -> Result<(), JsValue> {
+        self.inner.remove_pending_peer(peer_id).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
     #[must_use]
     pub fn get_peer_json(&self, peer_id: &str) -> Option<String> {
         self.inner
@@ -404,10 +421,10 @@ impl WasmPairInitiator {
                     host_signing_pub,
                     host_rotation_seq,
                     pairing_sas,
+                    host_pin_verified,
                 }) => {
-                    roster
-                        .inner
-                        .insert_pinned_host(
+                    let pin_res = if host_pin_verified {
+                        roster.inner.insert_pinned_host(
                             host_id.clone(),
                             host_id.clone(),
                             host_static_pub,
@@ -415,13 +432,25 @@ impl WasmPairInitiator {
                             host_rotation_seq,
                             Vec::new(),
                         )
-                        .map_err(|e| e.to_string())?;
+                    } else {
+                        roster.inner.record_pending_host(
+                            host_id.clone(),
+                            host_id.clone(),
+                            host_static_pub,
+                            host_signing_pub,
+                            host_rotation_seq,
+                            pairing_sas.clone(),
+                            Vec::new(),
+                        )
+                    };
+                    pin_res.map_err(|e| e.to_string())?;
                     sas = Some(pairing_sas.clone());
                     outcome_json = Some(json!({
                         "status": "pending",
                         "device_id": device_id,
                         "host_id": host_id,
                         "sas": pairing_sas,
+                        "host_confirmed": host_pin_verified,
                     }));
                 }
                 PairAction::Completed(PairOutcome::Rejected { error }) => {
@@ -770,6 +799,10 @@ mod tests {
 
         host_roster
             .confirm_peer(&cli_dev_id, Some(&host_sas))
+            .unwrap();
+        cli_roster
+            .inner
+            .confirm_peer("wasm-test-host", Some(&host_sas))
             .unwrap();
         let grant = host_roster
             .mint_grant(

@@ -261,6 +261,16 @@ export class TendrilWebClient {
     return raw ? JSON.parse(raw) : null;
   }
 
+  async confirmPeer(peerId, sas = null) {
+    this.#roster.confirm_peer(peerId, sas);
+    await this.#persistRoster();
+  }
+
+  async removePendingPeer(peerId) {
+    this.#roster.remove_pending_peer(peerId);
+    await this.#persistRoster();
+  }
+
   async #persistRoster() {
     if (typeof this.#onPersistRoster === "function") {
       await this.#onPersistRoster(this.#roster.to_json());
@@ -340,6 +350,7 @@ export class TendrilWebClient {
               device_id: res.outcome.device_id,
               host_id: res.outcome.host_id,
               sas: res.outcome.sas,
+              host_confirmed: Boolean(res.outcome.host_confirmed),
             };
           }
           if (res.outcome.status === "rejected") {

@@ -102,6 +102,12 @@ fn cli_e2e_direct_pair_confirm_mint_dial_and_revoke() {
     assert_eq!(paired_event["device_id"], cli_dev_id);
     assert_eq!(paired_event["sas"], sas);
 
+    let confirm_cli = run_tendril(client_dir.path(), &["confirm", "host-direct", "--sas", sas]);
+    assert!(
+        confirm_cli.status.success(),
+        "client confirm stderr: {}",
+        String::from_utf8_lossy(&confirm_cli.stderr)
+    );
     let confirm_out = run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", sas]);
     assert!(confirm_out.status.success());
 
@@ -235,6 +241,30 @@ async fn cli_e2e_relay_pair_confirm_mint_dial_and_revoke() {
         let paired_ev = read_json_line(&mut stdout);
         assert_eq!(paired_ev["event"], "paired");
 
+        let pre_confirm_dial = run_tendril(
+            client_dir.path(),
+            &[
+                "dial",
+                "--target",
+                "host-relayed",
+                "--endpoint",
+                &relay_ep,
+                "--relay-host",
+                "localhost",
+            ],
+        );
+        assert!(
+            !pre_confirm_dial.status.success(),
+            "dial before client confirm must fail closed"
+        );
+        assert!(
+            run_tendril(
+                client_dir.path(),
+                &["confirm", "host-relayed", "--sas", sas]
+            )
+            .status
+            .success()
+        );
         assert!(
             run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", sas])
                 .status
@@ -369,6 +399,7 @@ fn conformance_peer_drives_full_json_stdio_session() {
     let sas = host_pair["sas"].as_str().expect("sas").to_owned();
 
     host.call(serde_json::json!({ "op": "confirm", "peer_id": client_dev_id, "sas": sas }));
+    client.call(serde_json::json!({ "op": "confirm", "peer_id": "conf-host", "sas": sas }));
     let mint = host.call(serde_json::json!({
         "op": "mint",
         "peer_id": client_dev_id,
@@ -513,6 +544,11 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
     assert_eq!(paired_ev["device_id"], cli_dev_id);
     assert_eq!(paired_ev["sas"], sas);
 
+    assert!(
+        run_tendril(client_dir.path(), &["confirm", "host-multi", "--sas", sas])
+            .status
+            .success()
+    );
     assert!(
         run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", sas])
             .status

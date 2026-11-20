@@ -34,9 +34,11 @@ type EndpointInfo struct {
 
 // PairInitiateResult holds the client-side outcome of pairing initiation.
 type PairInitiateResult struct {
-	DeviceID string `json:"device_id"`
-	HostID   string `json:"host_id"`
-	SAS      string `json:"sas"`
+	DeviceID      string `json:"device_id"`
+	HostID        string `json:"host_id"`
+	SAS           string `json:"sas"`
+	Status        string `json:"status,omitempty"`
+	HostConfirmed bool   `json:"host_confirmed,omitempty"`
 }
 
 // PairAcceptResult holds the server-side outcome of accepting a pairing connection.
@@ -367,7 +369,8 @@ func (ep *Endpoint) IssueCode(kind string) (string, error) {
 	return code, err
 }
 
-// PairInitiate dials endpoint with a pairing code and pins the responder host.
+// PairInitiate dials endpoint with a pairing code and records the responder host pin
+// (`Pending` awaiting ConfirmPeer on manual pairing).
 func (ep *Endpoint) PairInitiate(endpoint, relayHost, code, name, kind string) (PairInitiateResult, error) {
 	var res PairInitiateResult
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {

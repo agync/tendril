@@ -382,11 +382,35 @@ async function main() {
     const peerPair = await peer.call({ op: "pair" });
     const browserPair = await chromePairEval;
     assert.equal(browserPair.sas, peerPair.sas);
+    assert.equal(browserPair.host_confirmed, false);
 
     await peer.call({ op: "confirm", peer_id: peerPair.device_id, sas: peerPair.sas });
     const grantObj = (
       await peer.call({ op: "mint", peer_id: peerPair.device_id, caps: ["fs.read"] })
     ).grant;
+
+    // Session connect MUST fail closed in the browser until confirmPeer is called.
+    peer.send({ op: "connect" });
+    const preConfirmRejected = await cdp.evalAsync(`
+      try {
+        await window.__e2eClient.connect({
+          relayUrl: 'ws://127.0.0.1:${server.port}/v1/relay',
+          targetPub: ${JSON.stringify(peerInit.signing_pub)},
+          expectedHost: '127.0.0.1',
+          targetHostId: 'web-e2e-host',
+          grantJson: ${JSON.stringify(JSON.stringify(grantObj))},
+        });
+        return false;
+      } catch (err) {
+        return String(err);
+      }
+    `);
+    assert.ok(typeof preConfirmRejected === "string" && preConfirmRejected.includes("pending"));
+    assert.equal((await peer.recv()).ok, false);
+
+    await cdp.evalAsync(`
+      await window.__e2eClient.confirmPeer('web-e2e-host', ${JSON.stringify(browserPair.sas)});
+    `);
 
     const chromeConnEval = cdp.evalAsync(`
       window.__e2eSession = await window.__e2eClient.connect({
@@ -559,6 +583,7 @@ async function main() {
         ).trim();
 
         const connInfo = await cdp.evalAsync(`
+          await window.__p2pClient.confirmPeer('web-p2p-host', ${JSON.stringify(p2pBrowserPair.sas)});
           const sess = await window.__p2pClient.connect({
             endpoint: ${JSON.stringify(bareP2p)},
             targetHostId: 'web-p2p-host',

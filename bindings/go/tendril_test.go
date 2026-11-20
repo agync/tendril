@@ -245,6 +245,18 @@ func TestLiveInteropWithConformancePeer(t *testing.T) {
 		"op": "mint", "peer_id": cliDevID, "caps": []string{"fs.read"},
 	})["grant"])
 
+	// Connecting before client-side ConfirmPeer must fail closed.
+	peer.send(t, map[string]any{"op": "connect"})
+	if _, err := goClient.Connect(ep, "", "rust-peer", string(grantBytes)); err == nil {
+		t.Fatalf("Go Connect succeeded before client ConfirmPeer")
+	}
+	if ok, _ := peer.recv(t)["ok"].(bool); ok {
+		t.Fatalf("expected peer connect to observe client pre-confirm abort")
+	}
+	if err := goClient.ConfirmPeer("rust-peer", pairRes.SAS); err != nil {
+		t.Fatalf("Go client ConfirmPeer: %v", err)
+	}
+
 	peer.send(t, map[string]any{"op": "connect"})
 	sess, err := goClient.Connect(ep, "", "rust-peer", string(grantBytes))
 	if err != nil {
@@ -312,6 +324,7 @@ func TestLiveInteropWithConformancePeer(t *testing.T) {
 	if err := goHost.ConfirmPeer(accPair.DeviceID, accPair.SAS); err != nil {
 		t.Fatalf("Go ConfirmPeer: %v", err)
 	}
+	peer2.call(t, map[string]any{"op": "confirm", "peer_id": "go-host", "sas": accPair.SAS})
 	grantJSON, err := goHost.MintGrant(accPair.DeviceID, []string{"fs.read"}, 3600)
 	if err != nil {
 		t.Fatalf("Go MintGrant: %v", err)
@@ -416,6 +429,9 @@ func TestConcurrencyLifetimeRekeyAndWouldBlock(t *testing.T) {
 		if err := hostEp.ConfirmPeer(acc.DeviceID, acc.SAS); err != nil {
 			t.Fatalf("ConfirmPeer: %v", err)
 		}
+		if err := cliEp.ConfirmPeer("go-race-host", cliPair.SAS); err != nil {
+			t.Fatalf("client ConfirmPeer: %v", err)
+		}
 		grant, err := hostEp.MintGrant(acc.DeviceID, []string{"fs.read"}, 3600)
 		if err != nil {
 			t.Fatalf("MintGrant: %v", err)
@@ -514,6 +530,9 @@ func TestServeP2pDisabledLoopback(t *testing.T) {
 	}
 	if err := hostEp.ConfirmPeer(acc.DeviceID, cliPair.SAS); err != nil {
 		t.Fatalf("ConfirmPeer: %v", err)
+	}
+	if err := cliEp.ConfirmPeer("go-p2p-host", cliPair.SAS); err != nil {
+		t.Fatalf("client ConfirmPeer p2p: %v", err)
 	}
 	grant, err := hostEp.MintGrant(acc.DeviceID, []string{"fs.read"}, 3600)
 	if err != nil {

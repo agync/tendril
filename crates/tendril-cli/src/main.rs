@@ -10,7 +10,9 @@ use serde::Serialize;
 use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::{b64url_encode, random_bytes};
 use tendril_core::grants::Grant;
-use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
+use tendril_core::pairing::{
+    PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PairingUri,
+};
 use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
     BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
@@ -65,12 +67,14 @@ enum Command {
         #[arg(long, value_enum)]
         issue_code: Option<PairKindArg>,
     },
-    /// Pair with a remote host using a one-time pairing code.
+    /// Pair with a remote host using a one-time pairing code or `tendril://pair?...` URI.
     Pair {
+        #[arg(long, required_unless_present = "pairing_uri")]
+        endpoint: Option<String>,
+        #[arg(long, required_unless_present = "pairing_uri")]
+        code: Option<String>,
         #[arg(long)]
-        endpoint: String,
-        #[arg(long)]
-        code: String,
+        pairing_uri: Option<String>,
         #[arg(long, default_value = "device")]
         name: String,
         #[arg(long, default_value = "cli")]
@@ -544,39 +548,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Pair {
             endpoint,
             code,
+            pairing_uri,
             name,
             kind,
             relay_host,
             p2p_local,
         } => {
+            let parsed_uri = pairing_uri.as_deref().map(PairingUri::parse).transpose()?;
+            let pinned_host = parsed_uri.as_ref().map(PairingUri::to_pinned_host);
+            let effective_code = match code {
+                Some(c) => c,
+                None => parsed_uri
+                    .as_ref()
+                    .map(|u| u.code.clone())
+                    .ok_or("pairing code or --pairing-uri is required")?,
+            };
+            let effective_endpoint = match endpoint {
+                Some(ep) => ep,
+                None => parsed_uri
+                    .as_ref()
+                    .and_then(|u| u.endpoints.first())
+                    .map(|hint| {
+                        for prefix in ["direct:", "relay:", "overlay:", "broker:", "local:", "p2p:"]
+                        {
+                            if let Some(rest) = hint.strip_prefix(prefix) {
+                                return rest.to_owned();
+                            }
+                        }
+                        hint.clone()
+                    })
+                    .ok_or("endpoint or URI ep hint is required")?,
+            };
             let identity = store.load_or_generate_identity(None)?;
             let mut roster = store.load_roster()?;
-            let mut stream = dial_endpoint(&endpoint, relay_host.as_deref(), p2p_local).await?;
-            let res =
-                drive_pair_initiator(stream.as_mut(), &identity, name, kind, code, None).await;
+            let mut stream =
+                dial_endpoint(&effective_endpoint, relay_host.as_deref(), p2p_local).await?;
+            let res = drive_pair_initiator(
+                stream.as_mut(),
+                &identity,
+                name,
+                kind,
+                effective_code,
+                pinned_host,
+            )
+            .await;
             let _ = stream.close().await;
             let res = res?;
             match res.outcome {
                 PairOutcome::InitiatorPending {
+                    device_id,
                     host_id,
                     host_static_pub,
                     host_signing_pub,
                     host_rotation_seq,
                     pairing_sas,
-                    ..
+                    host_pin_verified,
                 } => {
-                    roster.insert_pinned_host(
-                        host_id.clone(),
-                        host_id.clone(),
-                        host_static_pub,
-                        Some(host_signing_pub),
-                        host_rotation_seq,
-                        Vec::new(),
-                    )?;
+                    let display_name = parsed_uri
+                        .as_ref()
+                        .map(|u| u.host_name.clone())
+                        .unwrap_or_else(|| host_id.clone());
+                    let hints = parsed_uri
+                        .as_ref()
+                        .map(|u| u.endpoints.clone())
+                        .unwrap_or_default();
+                    if host_pin_verified {
+                        roster.insert_pinned_host(
+                            host_id.clone(),
+                            display_name,
+                            host_static_pub,
+                            Some(host_signing_pub),
+                            host_rotation_seq,
+                            hints,
+                        )?;
+                    } else {
+                        roster.record_pending_host(
+                            host_id.clone(),
+                            display_name,
+                            host_static_pub,
+                            host_signing_pub,
+                            host_rotation_seq,
+                            pairing_sas.clone(),
+                            hints,
+                        )?;
+                    }
                     store.save_roster(&roster)?;
                     print_json_line(&serde_json::json!({
+                        "device_id": device_id,
                         "paired_host_id": host_id,
                         "sas": pairing_sas,
+                        "status": if host_pin_verified { "active" } else { "pending" },
+                        "host_confirmed": host_pin_verified,
                         "static_pub": b64url_encode(&host_static_pub),
                         "signing_pub": b64url_encode(&host_signing_pub),
                     }));

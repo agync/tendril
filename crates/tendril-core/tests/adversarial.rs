@@ -219,6 +219,7 @@ fn full_pair_confirm_mint_data_rekey_rotate_delegate_revoke_close_lifecycle() {
             host_signing_pub,
             host_rotation_seq,
             pairing_sas: cli_sas,
+            host_pin_verified,
         },
         PairOutcome::ResponderPending {
             device_id: host_dev_id,
@@ -232,6 +233,7 @@ fn full_pair_confirm_mint_data_rekey_rotate_delegate_revoke_close_lifecycle() {
     assert_eq!(cli_dev_id, host_dev_id);
     assert_eq!(cli_sas, host_sas);
     assert_eq!(host_rotation_seq, 0);
+    assert!(host_pin_verified);
 
     client_roster
         .insert_pinned_host(
@@ -1983,4 +1985,150 @@ fn batch1_sec11_qr_pinned_pairing_works_after_host_rotation() {
         };
         assert_eq!(host_rotation_seq, 2);
     }
+}
+
+#[test]
+fn batch1_sec01_manual_pairing_gates_on_client_sas_and_prevents_pin_hijack() {
+    let real_host = mk_identity(101).with_host_id("studio-nas");
+    let evil_host = mk_identity(102).with_host_id("studio-nas");
+    let cli = mk_identity(103);
+
+    let mut host_roster = Roster::new();
+    let mut cli_roster = Roster::new();
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code_with_entropy(PairingCodeKind::Remote3Group, NOW_UNIX, &[5u8; 32])
+        .unwrap();
+
+    // Unpinned manual pairing yields host_pin_verified == false and keeps client entry Pending.
+    let mut p_init = PairingInitiator::new(&cli, "Phone", "ios", &code, None, None).unwrap();
+    let mut p_resp = PairingResponder::new(&real_host, PairingPathKind::Remote, None).unwrap();
+    let (init_ev, _) = run_pair_exchange(
+        &mut p_init,
+        &mut p_resp,
+        &mut mgr,
+        &mut host_roster,
+        NOW_UNIX + 1,
+        32,
+    );
+    let PairOutcome::InitiatorPending {
+        device_id: cli_dev,
+        host_id,
+        host_static_pub,
+        host_signing_pub,
+        host_rotation_seq,
+        pairing_sas,
+        host_pin_verified,
+    } = init_ev
+        .into_iter()
+        .find_map(|a| match a {
+            PairAction::Completed(o @ PairOutcome::InitiatorPending { .. }) => Some(o),
+            _ => None,
+        })
+        .unwrap()
+    else {
+        unreachable!();
+    };
+    assert!(!host_pin_verified);
+    assert_eq!(host_id, "studio-nas");
+
+    cli_roster
+        .record_pending_host(
+            host_id.clone(),
+            host_id.clone(),
+            host_static_pub,
+            host_signing_pub,
+            host_rotation_seq,
+            pairing_sas.clone(),
+            vec![],
+        )
+        .unwrap();
+    host_roster
+        .confirm_peer(&cli_dev, Some(&pairing_sas))
+        .unwrap();
+
+    // Session MUST fail closed until client also confirms host SAS.
+    let mut s_pre = SessionMachine::new_initiator(&cli, &host_id, None, None, None).unwrap();
+    let mut s_resp = SessionMachine::new_responder(&real_host, None).unwrap();
+    assert_eq!(
+        connect_session(
+            &mut s_pre,
+            &mut s_resp,
+            &mut cli_roster,
+            &mut host_roster,
+            NOW_UNIX + 2,
+            10,
+            64,
+        )
+        .unwrap_err(),
+        CoreError::PeerPending("studio-nas".into())
+    );
+
+    cli_roster
+        .confirm_peer(&host_id, Some(&pairing_sas))
+        .unwrap();
+
+    // Now simulate an attacker claiming the same `host_id = "studio-nas"` during manual pairing.
+    let mut evil_roster = Roster::new();
+    let mut evil_mgr = PairingManager::new(PairingConfig::default());
+    let evil_code = evil_mgr
+        .issue_code_with_entropy(PairingCodeKind::Remote3Group, NOW_UNIX + 3, &[6u8; 32])
+        .unwrap();
+    let mut evil_init =
+        PairingInitiator::new(&cli, "Phone", "ios", &evil_code, None, None).unwrap();
+    let mut evil_resp = PairingResponder::new(&evil_host, PairingPathKind::Remote, None).unwrap();
+    let (evil_ev, _) = run_pair_exchange(
+        &mut evil_init,
+        &mut evil_resp,
+        &mut evil_mgr,
+        &mut evil_roster,
+        NOW_UNIX + 4,
+        32,
+    );
+    let PairOutcome::InitiatorPending {
+        host_static_pub: evil_stat,
+        host_signing_pub: evil_sig,
+        host_rotation_seq: evil_seq,
+        pairing_sas: evil_sas,
+        ..
+    } = evil_ev
+        .into_iter()
+        .find_map(|a| match a {
+            PairAction::Completed(o @ PairOutcome::InitiatorPending { .. }) => Some(o),
+            _ => None,
+        })
+        .unwrap()
+    else {
+        unreachable!();
+    };
+    assert!(matches!(
+        cli_roster.record_pending_host(
+            "studio-nas".into(),
+            "studio-nas".into(),
+            evil_stat,
+            evil_sig,
+            evil_seq,
+            evil_sas,
+            vec![],
+        ),
+        Err(CoreError::ProtocolViolation(_))
+    ));
+    assert_eq!(
+        cli_roster.get("studio-nas").unwrap().static_pub,
+        *real_host.static_key().public_bytes()
+    );
+
+    // Real host still connects cleanly after the attempted collision.
+    let mut s_ok = SessionMachine::new_initiator(&cli, &host_id, None, None, None).unwrap();
+    let mut s_ok_resp = SessionMachine::new_responder(&real_host, None).unwrap();
+    connect_session(
+        &mut s_ok,
+        &mut s_ok_resp,
+        &mut cli_roster,
+        &mut host_roster,
+        NOW_UNIX + 5,
+        20,
+        64,
+    )
+    .unwrap();
 }

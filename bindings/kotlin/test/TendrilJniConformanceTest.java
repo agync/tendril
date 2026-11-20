@@ -415,6 +415,7 @@ public final class TendrilJniConformanceTest {
         String cliDevId = asStr(peerPair.get("device_id"));
 
         peer.call(Map.of("op", "confirm", "peer_id", cliDevId, "sas", asStr(peerPair.get("sas"))));
+        TendrilNative.endpointConfirmPeer(cliEp, "rust-peer", asStr(cliPair.get("sas")));
         Object grantObj =
             peer.call(Map.of("op", "mint", "peer_id", cliDevId, "caps", List.of("fs.read"))).get("grant");
 
@@ -482,6 +483,7 @@ public final class TendrilJniConformanceTest {
         String accId = asStr(acc.get("device_id"));
 
         TendrilNative.endpointConfirmPeer(hostEp, accId, asStr(acc.get("sas")));
+        peer2.call(Map.of("op", "confirm", "peer_id", "jni-host", "sas", asStr(acc.get("sas"))));
         String grantJson = TendrilNative.endpointMintGrant(hostEp, accId, Json.stringify(List.of("fs.read")), 3600);
 
         peer2.send(
@@ -544,6 +546,7 @@ public final class TendrilJniConformanceTest {
 
       String devId = asStr(accepted[0].get("device_id"));
       TendrilNative.endpointConfirmPeer(hostEp, devId, asStr(cliPair.get("sas")));
+      TendrilNative.endpointConfirmPeer(cliEp, "jni-p2p-host", asStr(cliPair.get("sas")));
       String grant =
           TendrilNative.endpointMintGrant(hostEp, devId, Json.stringify(List.of("fs.read")), 3600);
 

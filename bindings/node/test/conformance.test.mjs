@@ -194,6 +194,7 @@ test("Node N-API bidirectional async interop with Rust tendril-conformance-peer"
     assert.equal(accepted.sas, peerPair.sas);
 
     hostEp.confirmPeer(accepted.device_id, accepted.sas);
+    await peer.call({ op: "confirm", peer_id: "node-host", sas: accepted.sas });
     const grantJson = hostEp.mintGrant(accepted.device_id, ["fs.read"], 3600);
     const grantObj = JSON.parse(grantJson);
 
@@ -259,6 +260,12 @@ test("Node N-API bidirectional async interop with Rust tendril-conformance-peer"
       })
     ).grant;
 
+    // Connecting before client confirmPeer must fail closed.
+    peer2.send({ op: "connect" });
+    await assert.rejects(cliEp.connect(srv.endpoint, "rust-host", JSON.stringify(grantObj2)));
+    assert.equal((await peer2.recv()).ok, false);
+    cliEp.confirmPeer("rust-host", pairRes.sas);
+
     const [cliSess, hostConn] = await Promise.all([
       cliEp.connect(srv.endpoint, "rust-host", JSON.stringify(grantObj2)),
       peer2.call({ op: "connect" }),
@@ -314,6 +321,7 @@ test("Node binding pairs and connects over local P2p (disabled relay mode)", asy
     assert.equal(pairCli.sas, acc.sas);
 
     hostEp.confirmPeer(acc.device_id, pairCli.sas);
+    cliEp.confirmPeer("node-p2p-host", pairCli.sas);
     const grantJson = hostEp.mintGrant(acc.device_id, ["fs.read"], 3600);
     const [cliSess, hostSess] = await Promise.all([
       cliEp.connect(p2pAddr, "node-p2p-host", grantJson, "disabled"),

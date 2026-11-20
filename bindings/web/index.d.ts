@@ -45,6 +45,7 @@ export interface PairResult {
   device_id: string;
   host_id: string;
   sas: string;
+  host_confirmed: boolean;
 }
 
 export interface PollEvent {
@@ -122,6 +123,8 @@ export class TendrilWebClient {
   exportIdentityJson(): string;
   exportRosterJson(): string;
   getPeer(peerId: string): unknown | null;
+  confirmPeer(peerId: string, sas?: string | null): Promise<void>;
+  removePendingPeer(peerId: string): Promise<void>;
   pair(options: {
     endpoint?: string | null;
     relayUrl?: string | null;

@@ -123,6 +123,10 @@ code_mac = HMAC-SHA256(key = K, msg = "tendril-pair-v1" || h)
   - Re-pairing a `revoked` static key MUST fail (`Revoked`) and keep the peer `revoked`; the matched pairing code still burns so an attacker cannot probe live codes with a revoked device.
   - A peer in `pending` state MUST NOT open `intent = session` connections until an operator runs `pair.confirm` after comparing `device_fingerprint` and `pairing_sas`.
 - **Grant separation:** `pair.confirm` marks the roster entry `active` with zero non-session grants by default. Minting capabilities (`pair.mint`) is an independent operation.
+- **Symmetric client-side SAS gate & pin protection:**
+  - When initiating pairing via an out-of-band pinned URI (`PinnedHost`), the initiator cryptographically verifies the responder's static/signing keys and rotation chain in `msg2` and may record the host pin directly as `active`.
+  - When initiating manual unpinned pairing without a pre-shared host key pin, the client MUST record the newly learned host pin in `pending` state awaiting operator SAS confirmation (`pair.confirm`) before allowing `intent = session` connections.
+  - Existing `active`, `pending`, or `revoked` host pins MUST NOT be overwritten with differing cryptographic keys during pairing (`host_id` collisions fail closed without retaining or transferring prior grants).
 
 ---
 

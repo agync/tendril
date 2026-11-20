@@ -195,6 +195,7 @@ class TendrilPythonTests(unittest.TestCase):
         t.join(timeout=5)
         self.assertEqual(accepted_holder["res"]["sas"], cli_pair["sas"])
         host_ep.confirm_peer(accepted_holder["res"]["device_id"], cli_pair["sas"])
+        cli_ep.confirm_peer("py-host", cli_pair["sas"])
         grant = host_ep.mint_grant(accepted_holder["res"]["device_id"], ["fs.read"], 3600)
 
         sess_holder: dict = {}
@@ -236,6 +237,13 @@ class TendrilPythonTests(unittest.TestCase):
 
             peer.call({"op": "confirm", "peer_id": dev_id, "sas": p_res["sas"]})
             grant_obj = peer.call({"op": "mint", "peer_id": dev_id, "caps": ["fs.read"]})["grant"]
+
+            # Pre-confirm connect on Python client must fail closed before SAS confirm.
+            peer.send({"op": "connect"})
+            with self.assertRaises(RuntimeError):
+                py_cli.connect(ep, "rust-host", json.dumps(grant_obj))
+            self.assertFalse(peer.recv()["ok"])
+            py_cli.confirm_peer("rust-host", p_res["sas"])
 
             peer.send({"op": "connect"})
             s = py_cli.connect(ep, "rust-host", json.dumps(grant_obj))
@@ -288,6 +296,7 @@ class TendrilPythonTests(unittest.TestCase):
             self.assertEqual(p2_pair["sas"], acc["sas"])
 
             py_host.confirm_peer(acc["device_id"], acc["sas"])
+            peer2.call({"op": "confirm", "peer_id": "py-interop-host", "sas": acc["sas"]})
             grant_str = py_host.mint_grant(acc["device_id"], ["fs.read"], 3600)
 
             peer2.send(
@@ -366,6 +375,7 @@ class TendrilPythonTests(unittest.TestCase):
             t.join(timeout=10)
             self.assertEqual(accepted["res"]["sas"], cli_pair["sas"])
             host_ep.confirm_peer(accepted["res"]["device_id"], cli_pair["sas"])
+            cli_ep.confirm_peer("py-p2p-host", cli_pair["sas"])
             grant = host_ep.mint_grant(accepted["res"]["device_id"], ["fs.read"], 3600)
 
             sess_holder: dict = {}

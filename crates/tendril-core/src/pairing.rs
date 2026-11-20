@@ -523,6 +523,7 @@ pub enum PairOutcome {
         host_signing_pub: [u8; 32],
         host_rotation_seq: u64,
         pairing_sas: String,
+        host_pin_verified: bool,
     },
     ResponderPending {
         device_id: String,
@@ -548,6 +549,7 @@ enum InitiatorPhase {
         verified_seq: Option<u64>,
         presented_rotation: Vec<RotationRecord>,
         pairing_sas: String,
+        host_pin_verified: bool,
     },
     Closed,
 }
@@ -792,6 +794,7 @@ impl PairingInitiator {
                     verified_seq,
                     presented_rotation: host_hello.rotation,
                     pairing_sas: sas,
+                    host_pin_verified: self.pinned_host.is_some(),
                 };
                 Ok(())
             }
@@ -803,6 +806,7 @@ impl PairingInitiator {
                 verified_seq,
                 presented_rotation,
                 pairing_sas,
+                host_pin_verified,
             } => {
                 let mut pt = vec![0u8; MAX_FRAME_LEN];
                 let n = transport
@@ -854,6 +858,7 @@ impl PairingInitiator {
                             host_signing_pub: host_signing,
                             host_rotation_seq,
                             pairing_sas,
+                            host_pin_verified,
                         }));
                         actions.push(PairAction::CloseTransport("pairing complete".to_string()));
                         self.phase = InitiatorPhase::Closed;

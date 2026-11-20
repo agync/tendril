@@ -352,6 +352,7 @@ fn ffi_full_lifecycle_and_session_outlives_endpoint() {
     let cli_pair: Value = serde_json::from_str(&unsafe { take_cstr(cli_pair_ptr) }).unwrap();
     let host_pair: Value = serde_json::from_str(&accept_pair_thr.join().unwrap()).unwrap();
     assert_eq!(cli_pair["sas"], host_pair["sas"]);
+    assert_eq!(cli_pair["status"], "pending");
 
     let peer_dev_c = CString::new(host_pair["device_id"].as_str().unwrap()).unwrap();
     let sas_c = CString::new(host_pair["sas"].as_str().unwrap()).unwrap();
@@ -376,6 +377,36 @@ fn ffi_full_lifecycle_and_session_outlives_endpoint() {
     );
     let grant_str = unsafe { take_cstr(grant_ptr) };
 
+    // Connecting before client-side confirm_peer must fail closed (PeerPending).
+    let grant_c = CString::new(grant_str).unwrap();
+    let ep_pre = ep_usize;
+    let pre_acc = thread::spawn(move || {
+        let s =
+            unsafe { tendril_session_accept(ep_pre as *mut tendril_ffi::TendrilEndpoint, 2_000) };
+        assert!(s.is_null(), "pre-confirm session must not establish");
+    });
+    let pre_sess = unsafe {
+        tendril_session_connect(
+            cli_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            host_name.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(
+        pre_sess.is_null(),
+        "client must reject session before confirm"
+    );
+    assert!(read_last_err().contains("pending"));
+    pre_acc.join().unwrap();
+
+    // Confirm host pin on client with matching SAS, then connect cleanly.
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(cli_ep, host_name.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+
     let accept_sess_thr = thread::spawn(move || {
         let sess =
             unsafe { tendril_session_accept(ep_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) };
@@ -387,7 +418,6 @@ fn ffi_full_lifecycle_and_session_outlives_endpoint() {
         sess as usize
     });
 
-    let grant_c = CString::new(grant_str).unwrap();
     let cli_sess = unsafe {
         tendril_session_connect(
             cli_ep,
@@ -545,6 +575,10 @@ fn pair_and_mint_c(host_dir: &str, cli_dir: &str, host_name_str: &str, caps_json
     let sas_c = CString::new(host_pair["sas"].as_str().unwrap()).unwrap();
     assert_eq!(
         unsafe { tendril_endpoint_confirm_peer(host_ep, peer_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(cli_ep, hn.as_ptr(), sas_c.as_ptr()) },
         TENDRIL_OK
     );
 
@@ -922,6 +956,10 @@ fn ffi_serve_p2p_deterministic_pair_mint_session_roundtrip() {
     let sas_c = CString::new(pair_cli["sas"].as_str().unwrap()).unwrap();
     assert_eq!(
         unsafe { tendril_endpoint_confirm_peer(host_ep, dev_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(cli_ep, hname_c.as_ptr(), sas_c.as_ptr()) },
         TENDRIL_OK
     );
 

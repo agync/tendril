@@ -848,16 +848,30 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
                     host_signing_pub,
                     host_rotation_seq,
                     pairing_sas,
+                    host_pin_verified,
                 } => {
                     let mut roster = ep.roster.lock().expect("roster mutex poisoned");
-                    if let Err(e) = roster.insert_pinned_host(
-                        host_id.clone(),
-                        host_id.clone(),
-                        host_static_pub,
-                        Some(host_signing_pub),
-                        host_rotation_seq,
-                        Vec::new(),
-                    ) {
+                    let pin_res = if host_pin_verified {
+                        roster.insert_pinned_host(
+                            host_id.clone(),
+                            host_id.clone(),
+                            host_static_pub,
+                            Some(host_signing_pub),
+                            host_rotation_seq,
+                            Vec::new(),
+                        )
+                    } else {
+                        roster.record_pending_host(
+                            host_id.clone(),
+                            host_id.clone(),
+                            host_static_pub,
+                            host_signing_pub,
+                            host_rotation_seq,
+                            pairing_sas.clone(),
+                            Vec::new(),
+                        )
+                    };
+                    if let Err(e) = pin_res {
                         set_last_error(e.to_string());
                         return TENDRIL_ERR_PROTOCOL;
                     }
@@ -869,6 +883,8 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
                         "device_id": device_id,
                         "host_id": host_id,
                         "sas": pairing_sas,
+                        "status": if host_pin_verified { "active" } else { "pending" },
+                        "host_confirmed": host_pin_verified,
                     });
                     unsafe { write_out_cstring(out_json, &out.to_string()) }
                 }

@@ -646,11 +646,13 @@ async fn full_lifecycle_pair_confirm_mint_connect_authorize_data_rekey_revoke_ac
             host_signing_pub,
             host_rotation_seq,
             pairing_sas: cli_out_sas,
+            host_pin_verified,
             ..
         } = cli_out
         else {
             panic!("expected InitiatorPending: {cli_out:?}");
         };
+        assert!(!host_pin_verified);
         assert_eq!(host_sas, cli_sas);
         assert_eq!(host_sas, cli_out_sas);
 
@@ -671,15 +673,19 @@ async fn full_lifecycle_pair_confirm_mint_connect_authorize_data_rekey_revoke_ac
             .expect("mint grant");
 
         client_roster
-            .insert_pinned_host(
+            .record_pending_host(
                 learned_host_id.clone(),
                 "workstation".to_owned(),
                 host_static_pub,
-                Some(host_signing_pub),
+                host_signing_pub,
                 host_rotation_seq,
+                cli_out_sas.clone(),
                 Vec::new(),
             )
-            .expect("pin host");
+            .expect("record pending host");
+        client_roster
+            .confirm_peer(&learned_host_id, Some(&cli_out_sas))
+            .expect("confirm host on client");
 
         // Step 3: Session connect, authorize, data, rekey, revoke.
         let (srv_sess_stream, cli_sess_stream) = open_pair(&mut pair).await;
@@ -1252,21 +1258,26 @@ async fn relay_hint_migration_public_to_self_hosted_to_embedded_without_repairin
         host_static_pub,
         host_signing_pub,
         host_rotation_seq,
+        pairing_sas: cli_sas,
         ..
     } = c_pair.outcome
     else {
         panic!("expected InitiatorPending");
     };
     cli_roster
-        .insert_pinned_host(
+        .record_pending_host(
             learned_host_id.clone(),
             "mig-host".to_owned(),
             host_static_pub,
-            Some(host_signing_pub),
+            host_signing_pub,
             host_rotation_seq,
+            cli_sas.clone(),
             vec![ep_a.clone()],
         )
-        .expect("pin host");
+        .expect("record pending host");
+    cli_roster
+        .confirm_peer(&learned_host_id, Some(&cli_sas))
+        .expect("confirm host on client");
     host_roster
         .confirm_peer(&cli_dev, Some(&sas))
         .expect("confirm");

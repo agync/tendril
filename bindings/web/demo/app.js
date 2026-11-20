@@ -21,6 +21,8 @@ function defaultRelayUrl() {
 let client = null;
 let session = null;
 let polling = false;
+let pendingHostId = null;
+let pendingHostSas = null;
 
 async function initClient() {
   const identityJson = localStorage.getItem(IDENTITY_KEY);
@@ -154,11 +156,36 @@ $("pair-btn").addEventListener("click", async () => {
     const elapsedSec = ((performance.now() - t0) / 1000).toFixed(2);
     $("sas-box").textContent = `SAS: ${res.sas}`;
     $("target-host-id").value = res.host_id;
-    $("pair-meta").textContent =
-      `Paired host=${res.host_id} in ${elapsedSec}s (awaiting host confirm)`;
+    if (res.host_confirmed) {
+      pendingHostId = null;
+      pendingHostSas = null;
+      $("confirm-host-btn").hidden = true;
+      $("pair-meta").textContent =
+        `Paired & pinned host=${res.host_id} in ${elapsedSec}s (awaiting host confirm)`;
+    } else {
+      pendingHostId = res.host_id;
+      pendingHostSas = res.sas;
+      $("confirm-host-btn").hidden = false;
+      $("pair-meta").textContent =
+        `Paired host=${res.host_id} in ${elapsedSec}s: verify SAS match on host, then click Confirm Host SAS`;
+    }
     appendLog(`Pairing pending: host=${res.host_id} sas=${res.sas} elapsed=${elapsedSec}s`);
   } catch (err) {
     appendLog(`Pairing failed: ${err.message || err}`);
+  }
+});
+
+$("confirm-host-btn").addEventListener("click", async () => {
+  if (!client || !pendingHostId || !pendingHostSas) return;
+  try {
+    await client.confirmPeer(pendingHostId, pendingHostSas);
+    appendLog(`Confirmed host pin ${pendingHostId} via SAS match.`);
+    $("pair-meta").textContent = `Host ${pendingHostId} confirmed; ready to connect.`;
+    pendingHostId = null;
+    pendingHostSas = null;
+    $("confirm-host-btn").hidden = true;
+  } catch (err) {
+    appendLog(`Confirm host failed: ${err.message || err}`);
   }
 });
 

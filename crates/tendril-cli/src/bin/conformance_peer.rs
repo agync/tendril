@@ -299,15 +299,29 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                             host_signing_pub,
                             host_rotation_seq,
                             pairing_sas,
+                            host_pin_verified,
                         } => {
-                            if let Err(e) = state.roster.insert_pinned_host(
-                                host_id.clone(),
-                                host_id.clone(),
-                                host_static_pub,
-                                Some(host_signing_pub),
-                                host_rotation_seq,
-                                Vec::new(),
-                            ) {
+                            let pin_res = if host_pin_verified {
+                                state.roster.insert_pinned_host(
+                                    host_id.clone(),
+                                    host_id.clone(),
+                                    host_static_pub,
+                                    Some(host_signing_pub),
+                                    host_rotation_seq,
+                                    Vec::new(),
+                                )
+                            } else {
+                                state.roster.record_pending_host(
+                                    host_id.clone(),
+                                    host_id.clone(),
+                                    host_static_pub,
+                                    host_signing_pub,
+                                    host_rotation_seq,
+                                    pairing_sas.clone(),
+                                    Vec::new(),
+                                )
+                            };
+                            if let Err(e) = pin_res {
                                 return (err_json(e.to_string()), false);
                             }
                             if let Err(e) = state.persist_roster() {
@@ -320,6 +334,7 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                                     "device_id": device_id,
                                     "host_id": host_id,
                                     "sas": pairing_sas,
+                                    "host_confirmed": host_pin_verified,
                                 }),
                                 false,
                             )

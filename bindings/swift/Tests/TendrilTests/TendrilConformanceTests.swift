@@ -161,6 +161,7 @@ final class TendrilConformanceTests: XCTestCase {
     let devId = accObj["device_id"] as! String
 
     try host.confirmPeer(peerId: devId, sas: accObj["sas"] as? String)
+    try client.confirmPeer(peerId: "swift-host", sas: initObj["sas"] as? String)
     let grantJson = try host.mintGrant(peerId: devId, capsJson: "[\"fs.read\"]", ttlSecs: 3600)
 
     let sessExp = expectation(description: "session accept")
