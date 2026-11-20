@@ -28,6 +28,17 @@ use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
 /// Default pre-authentication handshake deadline guarding responder paths (`10 s`).
 pub const DEFAULT_PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maps an inbound [`ProviderId`] to its spec-mandated [`PairingPathKind`] policy.
+#[must_use]
+pub const fn pairing_path_kind_for_provider(provider: ProviderId) -> PairingPathKind {
+    match provider {
+        ProviderId::Local | ProviderId::Direct => PairingPathKind::Lan,
+        ProviderId::Overlay | ProviderId::P2p | ProviderId::Relay | ProviderId::Broker => {
+            PairingPathKind::Remote
+        }
+    }
+}
+
 /// Semantic events emitted by an established [`SessionDriver`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
@@ -134,7 +145,9 @@ pub async fn drive_pair_responder_with_options(
     let _half_open = match existing_guard {
         Some(g) => Some(g),
         None => rate_limiter
-            .map(|rl| rl.try_acquire(stream.peer_ip()))
+            .map(|rl| {
+                rl.try_acquire_for_peer(stream.peer_ip(), stream.peer_transport_id().as_deref())
+            })
             .transpose()?,
     };
     let mut machine = PairingResponder::new(identity, path_kind, None)?;
@@ -376,7 +389,9 @@ impl SessionDriver {
         let half_open = match existing_guard {
             Some(g) => Some(g),
             None => rate_limiter
-                .map(|rl| rl.try_acquire(stream.peer_ip()))
+                .map(|rl| {
+                    rl.try_acquire_for_peer(stream.peer_ip(), stream.peer_transport_id().as_deref())
+                })
                 .transpose()?,
         };
         let machine = SessionMachine::new_responder(local_identity, None)?;

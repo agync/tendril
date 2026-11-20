@@ -18,12 +18,13 @@ use tendril_core::roster::{PeerState, Roster};
 use tendril_core::wire::ResumableFrameReader;
 use tendril_relay::{RelayConfig, RelayHandle, RelayServer};
 use tendril_runtime::{
-    BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_WRITE_TIMEOUT, DirectDialer,
-    DirectListener, EmbeddedRelay, LocalDialer, LocalListener, MAX_OUTER_FRAME_LEN, OverlayConfig,
-    OverlayDialer, OverlayHelperDialer, OverlayHelperListener, OverlayListener, OverlayMode,
-    OverlayResolvedMode, PathDialer, PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter,
-    RelayDialer, RelayListener, RuntimeError, SessionDriver, SessionEvent, StateStore,
-    dial_with_policy, drive_pair_initiator, drive_pair_responder, is_tailnet_ip,
+    BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, EmbeddedRelay, LocalDialer, LocalListener,
+    MAX_OUTER_FRAME_LEN, OverlayConfig, OverlayDialer, OverlayHelperDialer, OverlayHelperListener,
+    OverlayListener, OverlayMode, OverlayResolvedMode, PathDialer, PathListener, PathStream,
+    PreAuthConfig, PreAuthRateLimiter, RelayDialer, RelayListener, RuntimeError, SessionDriver,
+    SessionEvent, StateStore, dial_with_policy, drive_pair_initiator, drive_pair_responder,
+    drive_pair_responder_with_options, is_tailnet_ip, pairing_path_kind_for_provider,
     recv_tendril_frame, select_overlay_mode, send_tendril_frame,
 };
 #[cfg(feature = "p2p-iroh")]
@@ -1515,13 +1516,13 @@ async fn p2p_deterministic_endpoint_id_and_peer_transport_id() {
     .with_host_id("deterministic-p2p-host");
     let seed1 = id.derive_p2p_identity_seed();
 
-    let l1 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, *seed1)
+    let l1 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, seed1.clone())
         .await
         .expect("bind l1");
     let ep_id1 = l1.endpoint_id();
     drop(l1);
 
-    let l2 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, *seed1)
+    let l2 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, seed1)
         .await
         .expect("rebind l2");
     assert_eq!(l2.endpoint_id(), ep_id1);
@@ -1535,7 +1536,7 @@ async fn p2p_deterministic_endpoint_id_and_peer_transport_id() {
     .expect("rotate identity");
     let seed2 = id.derive_p2p_identity_seed();
 
-    let mut l3 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, *seed2)
+    let mut l3 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, seed2)
         .await
         .expect("bind rotated l3");
     assert_ne!(l3.endpoint_id(), ep_id1);
@@ -1560,4 +1561,140 @@ async fn p2p_deterministic_endpoint_id_and_peer_transport_id() {
 
     let _ = srv_stream.close().await;
     let _ = cli_stream.close().await;
+}
+
+struct MockPeerIdEofStream {
+    ip: Option<IpAddr>,
+    transport_id: Option<String>,
+}
+
+#[async_trait]
+impl PathStream for MockPeerIdEofStream {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::P2p
+    }
+
+    fn peer_ip(&self) -> Option<IpAddr> {
+        self.ip
+    }
+
+    fn peer_transport_id(&self) -> Option<String> {
+        self.transport_id.clone()
+    }
+
+    async fn send_chunk(&mut self, _bytes: &[u8]) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn recv_chunk(&mut self, _buf: &mut [u8]) -> Result<usize, RuntimeError> {
+        Ok(0)
+    }
+
+    async fn close(&mut self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn pairing_path_kind_for_provider_maps_all_providers() {
+    assert_eq!(
+        pairing_path_kind_for_provider(ProviderId::Local),
+        PairingPathKind::Lan
+    );
+    assert_eq!(
+        pairing_path_kind_for_provider(ProviderId::Direct),
+        PairingPathKind::Lan
+    );
+    for provider in [
+        ProviderId::Overlay,
+        ProviderId::P2p,
+        ProviderId::Relay,
+        ProviderId::Broker,
+    ] {
+        assert_eq!(
+            pairing_path_kind_for_provider(provider),
+            PairingPathKind::Remote
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_driver_paths_enforce_peer_transport_id_rate_limit() {
+    let host = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar([0x61; 32]),
+        SigningKeypair::from_seed([0x62; 32]),
+    )
+    .with_host_id("direct-rl-host");
+    let mgr = Mutex::new(PairingManager::new(PairingConfig::default()));
+    let mut roster = Roster::new();
+    let shared_ip: IpAddr = "198.51.100.7".parse().expect("ip");
+    let limiter = PreAuthRateLimiter::new(PreAuthConfig {
+        max_entries: 16,
+        max_half_open: 16,
+        ip_burst: 1,
+        ip_refill_per_sec: 1,
+        peer_burst: 1,
+        peer_refill_per_sec: 1,
+    });
+
+    // SessionDriver::accept uses peer_transport_id("peer-a") instead of colliding on shared_ip.
+    let err1 = SessionDriver::accept(
+        Box::new(MockPeerIdEofStream {
+            ip: Some(shared_ip),
+            transport_id: Some("peer-a".to_owned()),
+        }),
+        &host,
+        &mut roster,
+        1_795_133_000,
+        Some(&limiter),
+    )
+    .await;
+    assert!(matches!(err1, Err(RuntimeError::Closed)));
+
+    let err2 = SessionDriver::accept(
+        Box::new(MockPeerIdEofStream {
+            ip: Some(shared_ip),
+            transport_id: Some("peer-a".to_owned()),
+        }),
+        &host,
+        &mut roster,
+        1_795_133_000,
+        Some(&limiter),
+    )
+    .await;
+    assert!(matches!(err2, Err(RuntimeError::RateLimited(_))));
+
+    // Direct pair responder also scopes independently per peer_transport_id("peer-b").
+    let roster_sync = Mutex::new(Roster::new());
+    let mut stream_b = MockPeerIdEofStream {
+        ip: Some(shared_ip),
+        transport_id: Some("peer-b".to_owned()),
+    };
+    let pair_b1 = drive_pair_responder_with_options(
+        &mut stream_b,
+        &host,
+        &mgr,
+        &roster_sync,
+        PairingPathKind::Remote,
+        1_795_133_000,
+        Some(&limiter),
+        None,
+        DEFAULT_PRE_AUTH_TIMEOUT,
+    )
+    .await;
+    assert!(matches!(pair_b1, Err(RuntimeError::Closed)));
+
+    let pair_b2 = drive_pair_responder_with_options(
+        &mut stream_b,
+        &host,
+        &mgr,
+        &roster_sync,
+        PairingPathKind::Remote,
+        1_795_133_000,
+        Some(&limiter),
+        None,
+        DEFAULT_PRE_AUTH_TIMEOUT,
+    )
+    .await;
+    assert!(matches!(pair_b2, Err(RuntimeError::RateLimited(_))));
 }

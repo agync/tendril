@@ -16,15 +16,12 @@ use tendril_core::crypto::{
 };
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
 use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
-use tendril_core::pairing::{
-    PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PairingPathKind,
-};
-use tendril_core::policy::ProviderId;
+use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
 use tendril_core::roster::Roster;
 use tendril_runtime::{
     DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener, InboundRouter, PathListener,
     RelayListener, SessionDriver, SessionEvent, StateStore, dial_endpoint, drive_pair_initiator,
-    drive_pair_responder_with_options,
+    drive_pair_responder_with_options, pairing_path_kind_for_provider,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{P2pListener, parse_p2p_relay_mode};
@@ -728,7 +725,7 @@ pub unsafe extern "C" fn tendril_endpoint_serve_p2p(
                 }
             };
             let seed = ep.identity.derive_p2p_identity_seed();
-            match ep.rt.block_on(P2pListener::bind_with_secret(mode, *seed)) {
+            match ep.rt.block_on(P2pListener::bind_with_secret(mode, seed)) {
                 Ok(listener) => {
                     let local_ep = listener.local_endpoint();
                     ep.spawn_listener(Box::new(listener));
@@ -918,11 +915,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
                 }
             };
 
-            let path_kind = if stream.provider_id() == ProviderId::Relay {
-                PairingPathKind::Remote
-            } else {
-                PairingPathKind::Lan
-            };
+            let path_kind = pairing_path_kind_for_provider(stream.provider_id());
             drive_pair_responder_with_options(
                 stream.as_mut(),
                 &ep.identity,

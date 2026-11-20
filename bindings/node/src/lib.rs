@@ -14,16 +14,13 @@ use tendril_core::crypto::{
 };
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
 use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
-use tendril_core::pairing::{
-    PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PairingPathKind,
-};
-use tendril_core::policy::ProviderId;
+use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
 use tendril_core::roster::Roster;
 use tendril_runtime::{
     DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener, InboundRouter, P2pListener,
     PathListener, PathStream, RelayListener, SessionDriver, SessionEvent, StateStore,
     dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
-    drive_pair_responder_with_options, parse_p2p_relay_mode,
+    drive_pair_responder_with_options, pairing_path_kind_for_provider, parse_p2p_relay_mode,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
@@ -264,7 +261,7 @@ impl Endpoint {
         let mode = parse_p2p_relay_mode(relay_mode.as_deref())
             .map_err(|e| Error::new(Status::InvalidArg, e.to_string()))?;
         let seed = self.identity.derive_p2p_identity_seed();
-        let listener = P2pListener::bind_with_secret(mode, *seed)
+        let listener = P2pListener::bind_with_secret(mode, seed)
             .await
             .map_err(to_generic_err)?;
         let ep = listener.local_endpoint();
@@ -356,11 +353,7 @@ impl Endpoint {
             Err(()) => return Err(to_generic_err("timed out accepting pair")),
         };
 
-        let path_kind = if stream.provider_id() == ProviderId::Relay {
-            PairingPathKind::Remote
-        } else {
-            PairingPathKind::Lan
-        };
+        let path_kind = pairing_path_kind_for_provider(stream.provider_id());
         let res = drive_pair_responder_with_options(
             stream.as_mut(),
             &self.identity,

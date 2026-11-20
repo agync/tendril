@@ -13,7 +13,7 @@ use tendril_core::policy::ProviderId;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::error::RuntimeError;
 use crate::provider::{
@@ -92,7 +92,7 @@ pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeE
 async fn build_iroh_endpoint(
     relay_mode: &P2pRelayMode,
     alpns: Vec<Vec<u8>>,
-    secret_seed: Option<[u8; 32]>,
+    secret_seed: Option<Zeroizing<[u8; 32]>>,
 ) -> Result<Endpoint, RuntimeError> {
     let mut builder = match relay_mode {
         P2pRelayMode::Default => Endpoint::builder(presets::N0).relay_mode(RelayMode::Default),
@@ -106,9 +106,8 @@ async fn build_iroh_endpoint(
             Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
         }
     };
-    if let Some(mut seed) = secret_seed {
+    if let Some(seed) = secret_seed {
         let sk = SecretKey::from_bytes(&seed);
-        seed.zeroize();
         builder = builder.secret_key(sk);
     }
     builder
@@ -294,14 +293,14 @@ impl P2pListener {
     /// Binds a new `iroh` P2P endpoint listener under `relay_mode` with a deterministic secret seed.
     pub async fn bind_with_secret(
         relay_mode: P2pRelayMode,
-        secret_seed: [u8; 32],
+        secret_seed: Zeroizing<[u8; 32]>,
     ) -> Result<Self, RuntimeError> {
         Self::bind_inner(relay_mode, Some(secret_seed)).await
     }
 
     async fn bind_inner(
         relay_mode: P2pRelayMode,
-        secret_seed: Option<[u8; 32]>,
+        secret_seed: Option<Zeroizing<[u8; 32]>>,
     ) -> Result<Self, RuntimeError> {
         let endpoint =
             build_iroh_endpoint(&relay_mode, vec![TENDRIL_P2P_ALPN.to_vec()], secret_seed).await?;

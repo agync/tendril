@@ -15,16 +15,13 @@ use tendril_core::crypto::{
 };
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
 use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
-use tendril_core::pairing::{
-    PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PairingPathKind,
-};
-use tendril_core::policy::ProviderId;
+use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
 use tendril_core::roster::Roster;
 use tendril_runtime::{
     DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener, InboundRouter, P2pListener,
     PathListener, PathStream, RelayListener, SessionDriver, SessionEvent, StateStore,
     dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
-    drive_pair_responder_with_options, parse_p2p_relay_mode,
+    drive_pair_responder_with_options, pairing_path_kind_for_provider, parse_p2p_relay_mode,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -272,7 +269,7 @@ impl Endpoint {
         let router = Arc::clone(&self.router);
         py.detach(move || {
             let listener = rt
-                .block_on(P2pListener::bind_with_secret(mode, *seed))
+                .block_on(P2pListener::bind_with_secret(mode, seed))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let ep = listener.local_endpoint();
             router.spawn_listener(rt.handle(), Box::new(listener));
@@ -390,11 +387,7 @@ impl Endpoint {
                     Err(()) => return Err(PyRuntimeError::new_err("timed out accepting pair")),
                 };
 
-                let path_kind = if stream.provider_id() == ProviderId::Relay {
-                    PairingPathKind::Remote
-                } else {
-                    PairingPathKind::Lan
-                };
+                let path_kind = pairing_path_kind_for_provider(stream.provider_id());
                 drive_pair_responder_with_options(
                     stream.as_mut(),
                     &identity,

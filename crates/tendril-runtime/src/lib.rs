@@ -10,7 +10,7 @@ pub mod store;
 
 pub use driver::{
     DEFAULT_PRE_AUTH_TIMEOUT, SessionDriver, SessionEvent, dial_with_policy, drive_pair_initiator,
-    drive_pair_responder, drive_pair_responder_with_options,
+    drive_pair_responder, drive_pair_responder_with_options, pairing_path_kind_for_provider,
 };
 pub use error::RuntimeError;
 pub use provider::{

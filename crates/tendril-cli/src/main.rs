@@ -10,17 +10,15 @@ use serde::Serialize;
 use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::{b64url_encode, random_bytes};
 use tendril_core::grants::Grant;
-use tendril_core::pairing::{
-    PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PairingPathKind,
-};
-use tendril_core::policy::ProviderId;
+use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
 use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
     BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
     DirectListener, EmbeddedRelay, HalfOpenGuard, OverlayListener, P2pListener, P2pRelayMode,
     PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter, PrefixedPathStream, RelayListener,
     SessionDriver, SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint,
-    drive_pair_initiator, drive_pair_responder_with_options, peek_exact,
+    drive_pair_initiator, drive_pair_responder_with_options, pairing_path_kind_for_provider,
+    peek_exact,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -197,12 +195,7 @@ async fn handle_inbound(
 
     match preamble.intent {
         Intent::Pair => {
-            let path_kind = match wrapped.provider_id() {
-                ProviderId::Local | ProviderId::Direct => PairingPathKind::Lan,
-                ProviderId::Overlay | ProviderId::P2p | ProviderId::Relay | ProviderId::Broker => {
-                    PairingPathKind::Remote
-                }
-            };
+            let path_kind = pairing_path_kind_for_provider(wrapped.provider_id());
             let current_roster = {
                 let _guard = store_lock.lock().await;
                 match store.load_roster() {
@@ -460,7 +453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     P2pRelayMode::Default
                 };
                 let seed = identity.derive_p2p_identity_seed();
-                let pl = P2pListener::bind_with_secret(mode, *seed).await?;
+                let pl = P2pListener::bind_with_secret(mode, seed).await?;
                 let ep = pl.local_endpoint();
                 listeners.push(Box::new(pl));
                 Some(ep)

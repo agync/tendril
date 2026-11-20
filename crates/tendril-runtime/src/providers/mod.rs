@@ -51,10 +51,11 @@ pub async fn dial_endpoint(
     endpoint: &str,
     relay_host: Option<&str>,
 ) -> Result<Box<dyn PathStream>, RuntimeError> {
+    let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
         #[cfg(feature = "p2p-iroh")]
         {
-            let mode = match relay_host {
+            let mode = match normalized_host {
                 Some(spec) => parse_p2p_relay_mode(Some(spec))?,
                 None if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") => {
                     P2pRelayMode::Disabled
@@ -72,7 +73,7 @@ pub async fn dial_endpoint(
         }
         #[cfg(not(feature = "p2p-iroh"))]
         {
-            let _ = relay_host;
+            let _ = normalized_host;
             return Err(RuntimeError::Protocol(
                 "p2p-iroh feature is not enabled in tendril-runtime".to_owned(),
             ));
@@ -86,7 +87,7 @@ pub async fn dial_endpoint(
     }
     if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
         let mut dialer = RelayDialer::new();
-        if let Some(host) = relay_host {
+        if let Some(host) = normalized_host {
             dialer = dialer.with_expected_host(host);
         }
         return dialer.dial(endpoint).await;

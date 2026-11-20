@@ -313,6 +313,23 @@ class TendrilPythonTests(unittest.TestCase):
         try:
             p2p_addr = host_ep.serve_p2p("disabled")
             self.assertTrue(p2p_addr.startswith("iroh://"))
+
+            lan_code = host_ep.issue_code("lan")
+            rejected: dict = {}
+
+            def reject_lan_pair() -> None:
+                try:
+                    host_ep.pair_accept(5000)
+                except RuntimeError as exc:
+                    rejected["err"] = str(exc)
+
+            t_rej = threading.Thread(target=reject_lan_pair)
+            t_rej.start()
+            with self.assertRaises(RuntimeError):
+                cli_ep.pair_initiate(p2p_addr, lan_code, relay_host="disabled")
+            t_rej.join(timeout=10)
+            self.assertIn("err", rejected)
+
             code = host_ep.issue_code("remote")
             accepted: dict = {}
 

@@ -270,6 +270,15 @@ test("Node binding pairs and connects over local P2p (disabled relay mode)", asy
   try {
     const p2pAddr = await hostEp.serveP2p("disabled");
     assert.ok(p2pAddr.startsWith("iroh://"), `expected iroh:// endpoint, got ${p2pAddr}`);
+
+    const lanCode = hostEp.issueCode("lan");
+    await assert.rejects(
+      Promise.all([
+        cliEp.pairInitiate(p2pAddr, lanCode, "disabled", "node-p2p-lan", "node"),
+        hostEp.pairAccept(5000),
+      ])
+    );
+
     const code = hostEp.issueCode("remote");
     const [pairRaw, accRaw] = await Promise.all([
       cliEp.pairInitiate(p2pAddr, code, "disabled", "node-p2p-dev", "node"),

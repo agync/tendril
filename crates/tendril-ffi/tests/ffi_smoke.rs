@@ -15,19 +15,17 @@ use tendril_core::roster::PeerState;
 use tendril_core::wire::{
     HostHello, Intent, NOISE_PATTERN, Preamble, ResumableFrameReader, encode_frame,
 };
-#[cfg(feature = "p2p-iroh")]
-use tendril_ffi::tendril_endpoint_serve_p2p;
 use tendril_ffi::{
     TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_PROTOCOL, TENDRIL_OK, TENDRIL_WOULD_BLOCK,
     tendril_compute_code_mac, tendril_device_id, tendril_endpoint_confirm_peer,
     tendril_endpoint_free, tendril_endpoint_info_json, tendril_endpoint_issue_code,
     tendril_endpoint_mint_grant, tendril_endpoint_new, tendril_endpoint_pair_accept,
     tendril_endpoint_pair_initiate, tendril_endpoint_revoke_peer, tendril_endpoint_serve_direct,
-    tendril_fingerprint_device, tendril_fingerprint_host, tendril_last_error, tendril_pairing_sas,
-    tendril_session_accept, tendril_session_authorize, tendril_session_close,
-    tendril_session_connect, tendril_session_free, tendril_session_poll_event,
-    tendril_session_rekey, tendril_session_send_data, tendril_string_free,
-    tendril_verify_grant_json, tendril_verify_rotation_chain_json,
+    tendril_endpoint_serve_p2p, tendril_fingerprint_device, tendril_fingerprint_host,
+    tendril_last_error, tendril_pairing_sas, tendril_session_accept, tendril_session_authorize,
+    tendril_session_close, tendril_session_connect, tendril_session_free,
+    tendril_session_poll_event, tendril_session_rekey, tendril_session_send_data,
+    tendril_string_free, tendril_verify_grant_json, tendril_verify_rotation_chain_json,
 };
 use tendril_runtime::{
     DirectListener, PathListener, PathStream, PrefixedPathStream, SessionDriver, StateStore,
@@ -962,4 +960,74 @@ fn ffi_serve_p2p_deterministic_pair_mint_session_roundtrip() {
     let p2p_ep2 = unsafe { take_cstr(p2p_ptr2) };
     assert_eq!(p2p_ep.split('?').next(), p2p_ep2.split('?').next());
     unsafe { tendril_endpoint_free(host_ep_reopened) };
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[test]
+fn ffi_serve_p2p_rejects_lan_code() {
+    let host_ep = unsafe { tendril_endpoint_new(ptr::null(), ptr::null()) };
+    let cli_ep = unsafe { tendril_endpoint_new(ptr::null(), ptr::null()) };
+    assert!(!host_ep.is_null() && !cli_ep.is_null());
+
+    let disabled_c = CString::new("disabled").unwrap();
+    let mut p2p_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_p2p(host_ep, disabled_c.as_ptr(), &raw mut p2p_ptr) },
+        TENDRIL_OK
+    );
+    let p2p_ep = unsafe { take_cstr(p2p_ptr) };
+
+    let mut code_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, ptr::null(), &raw mut code_ptr) },
+        TENDRIL_OK
+    );
+    let lan_code_c = CString::new(unsafe { take_cstr(code_ptr) }).unwrap();
+    let p2p_c = CString::new(p2p_ep).unwrap();
+
+    let host_ep_usize = host_ep as usize;
+    let accept_pair = thread::spawn(move || unsafe {
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = tendril_endpoint_pair_accept(
+            host_ep_usize as *mut tendril_ffi::TendrilEndpoint,
+            8_000,
+            &raw mut out,
+        );
+        assert_eq!(rc, TENDRIL_ERR_PROTOCOL);
+        assert!(out.is_null());
+    });
+
+    let mut pair_out_ptr: *mut c_char = ptr::null_mut();
+    let cli_rc = unsafe {
+        tendril_endpoint_pair_initiate(
+            cli_ep,
+            p2p_c.as_ptr(),
+            disabled_c.as_ptr(),
+            lan_code_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            &raw mut pair_out_ptr,
+        )
+    };
+    assert_ne!(cli_rc, TENDRIL_OK);
+    assert!(pair_out_ptr.is_null());
+    accept_pair.join().unwrap();
+
+    unsafe {
+        tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
+}
+
+#[cfg(not(feature = "p2p-iroh"))]
+#[test]
+fn ffi_serve_p2p_without_feature_returns_protocol_error() {
+    let host_ep = unsafe { tendril_endpoint_new(ptr::null(), ptr::null()) };
+    assert!(!host_ep.is_null());
+    let mut p2p_ptr: *mut c_char = ptr::null_mut();
+    let rc = unsafe { tendril_endpoint_serve_p2p(host_ep, ptr::null(), &raw mut p2p_ptr) };
+    assert_eq!(rc, TENDRIL_ERR_PROTOCOL);
+    assert!(p2p_ptr.is_null());
+    assert!(read_last_err().contains("p2p-iroh"));
+    unsafe { tendril_endpoint_free(host_ep) };
 }
