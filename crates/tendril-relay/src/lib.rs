@@ -9,4 +9,5 @@ pub use protocol::{
     RelayServerMsg, relay_accept_signed_bytes, relay_register_signed_bytes, sign_relay_accept,
     sign_relay_register, verify_relay_accept, verify_relay_register,
 };
-pub use server::{RelayConfig, RelayError, RelayHandle, RelayServer};
+pub use rate_limit::{IpTokenLimiter, normalize_rate_limit_ip};
+pub use server::{IpCidr, RelayConfig, RelayError, RelayHandle, RelayServer};

@@ -146,7 +146,11 @@ pub async fn drive_pair_responder_with_options(
         Some(g) => Some(g),
         None => rate_limiter
             .map(|rl| {
-                rl.try_acquire_for_peer(stream.peer_ip(), stream.peer_transport_id().as_deref())
+                rl.try_acquire_for_stream(
+                    stream.provider_id(),
+                    stream.peer_ip(),
+                    stream.peer_transport_id().as_deref(),
+                )
             })
             .transpose()?,
     };
@@ -390,7 +394,11 @@ impl SessionDriver {
             Some(g) => Some(g),
             None => rate_limiter
                 .map(|rl| {
-                    rl.try_acquire_for_peer(stream.peer_ip(), stream.peer_transport_id().as_deref())
+                    rl.try_acquire_for_stream(
+                        stream.provider_id(),
+                        stream.peer_ip(),
+                        stream.peer_transport_id().as_deref(),
+                    )
                 })
                 .transpose()?,
         };

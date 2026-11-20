@@ -202,6 +202,7 @@ impl PathListener for BrokerListener {
 pub struct BrokerDialer {
     headers: Vec<(String, String)>,
     write_timeout: Duration,
+    allow_insecure_ws: bool,
 }
 
 impl Default for BrokerDialer {
@@ -217,7 +218,15 @@ impl BrokerDialer {
         Self {
             headers: Vec::new(),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            allow_insecure_ws: false,
         }
+    }
+
+    /// Explicitly permits cleartext `ws://` / `broker+ws://` outside loopback hosts.
+    #[must_use]
+    pub fn with_allow_insecure_ws(mut self, allow: bool) -> Self {
+        self.allow_insecure_ws = allow;
+        self
     }
 
     /// Attaches an HTTP request header (such as a tunnel bearer token) to WebSocket upgrades.
@@ -244,7 +253,11 @@ impl PathDialer for BrokerDialer {
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-        let ws_url = endpoint.strip_prefix("broker+").unwrap_or(endpoint);
+        let _validated = super::validate_ws_url(endpoint, self.allow_insecure_ws)?;
+        let ws_url = endpoint
+            .trim()
+            .strip_prefix("broker+")
+            .unwrap_or(endpoint.trim());
         if !ws_url.starts_with("ws://") && !ws_url.starts_with("wss://") {
             return Err(RuntimeError::Protocol(format!(
                 "broker endpoint must use broker+ws(s):// or ws(s)://: '{endpoint}'"

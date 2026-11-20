@@ -422,6 +422,8 @@ async fn pre_auth_rate_limiter_enforces_half_open_cap_32_and_ip_burst() {
         ip_refill_per_sec: 1,
         peer_burst: 3,
         peer_refill_per_sec: 1,
+        max_half_open_per_key: 32,
+        ..PreAuthConfig::default()
     });
     let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
     let mut guards = Vec::new();
@@ -1488,6 +1490,7 @@ fn pre_auth_rate_limiter_keys_p2p_by_transport_peer_id() {
         ip_refill_per_sec: 1,
         peer_burst: 2,
         peer_refill_per_sec: 1,
+        ..PreAuthConfig::default()
     });
     let shared_relay_ip: IpAddr = "198.51.100.1".parse().expect("ip");
 
@@ -1648,6 +1651,7 @@ async fn direct_driver_paths_enforce_peer_transport_id_rate_limit() {
         ip_refill_per_sec: 1,
         peer_burst: 1,
         peer_refill_per_sec: 1,
+        ..PreAuthConfig::default()
     });
 
     // SessionDriver::accept uses peer_transport_id("peer-a") instead of colliding on shared_ip.
@@ -1724,6 +1728,7 @@ async fn batch1_sec03_inbound_router_isolates_queues_expires_stale_and_gates_pai
         ip_refill_per_sec: 32,
         peer_burst: 32,
         peer_refill_per_sec: 16,
+        ..PreAuthConfig::default()
     };
     let listener = DirectListener::bind("127.0.0.1:0".parse().expect("addr"), None)
         .await
@@ -1882,4 +1887,257 @@ fn batch1_sec04_state_store_flock_serializes_concurrent_updates() {
         updated_roster.get("peer-0").expect("peer-0").relay_hints,
         vec!["wss://relay.example/v1/relay".to_owned()]
     );
+}
+
+#[test]
+fn batch2a_sec05_relay_partition_and_unattributed_bucket() {
+    let limiter = PreAuthRateLimiter::new(PreAuthConfig {
+        max_entries: 64,
+        max_half_open: 8,
+        untrusted_max_half_open: 3,
+        ip_burst: 64,
+        ip_refill_per_sec: 16,
+        peer_burst: 64,
+        peer_refill_per_sec: 16,
+        unattributed_burst: 2,
+        unattributed_refill_per_sec: 1,
+        max_half_open_per_key: 2,
+    });
+
+    // Unattributed untrusted relay connections draw from unattributed_burst (2), never starving trusted slots.
+    let g1 = limiter
+        .try_acquire_for_stream(ProviderId::Relay, None, None)
+        .expect("unattributed 1");
+    let g2 = limiter
+        .try_acquire_for_stream(ProviderId::Broker, None, None)
+        .expect("unattributed 2");
+    assert_eq!(limiter.untrusted_active_half_open(), 2);
+    assert_eq!(limiter.active_half_open(), 0);
+    assert!(matches!(
+        limiter.try_acquire_for_stream(ProviderId::Relay, None, None),
+        Err(RuntimeError::RateLimited(_))
+    ));
+    drop((g1, g2));
+    assert_eq!(limiter.untrusted_active_half_open(), 0);
+
+    // Attributed relay streams hit untrusted_max_half_open (3) while trusted Direct streams still work.
+    let g3 = limiter
+        .try_acquire_for_stream(ProviderId::Relay, None, Some("relay-peer-a"))
+        .expect("relay a1");
+    let g4 = limiter
+        .try_acquire_for_stream(ProviderId::Relay, None, Some("relay-peer-a"))
+        .expect("relay a2");
+    assert!(
+        matches!(
+            limiter.try_acquire_for_stream(ProviderId::Relay, None, Some("relay-peer-a")),
+            Err(RuntimeError::RateLimited(_))
+        ),
+        "single peer exceeds max_half_open_per_key=2"
+    );
+    let g5 = limiter
+        .try_acquire_for_stream(ProviderId::Relay, None, Some("relay-peer-b"))
+        .expect("relay b1 fills untrusted cap=3");
+    assert!(matches!(
+        limiter.try_acquire_for_stream(ProviderId::Relay, None, Some("relay-peer-c")),
+        Err(RuntimeError::RateLimited(_))
+    ));
+    let direct_g = limiter
+        .try_acquire_for_stream(
+            ProviderId::Direct,
+            Some("203.0.113.10".parse().expect("ip")),
+            None,
+        )
+        .expect("trusted direct must remain unaffected when untrusted cap is saturated");
+    assert_eq!(limiter.active_half_open(), 1);
+    drop((g3, g4, g5, direct_g));
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn batch2a_sec06_p2p_per_peer_accept_cap() {
+    use tendril_runtime::{TENDRIL_P2P_ALPN, parse_p2p_endpoint};
+
+    let mut listener = P2pListener::bind(P2pRelayMode::Disabled)
+        .await
+        .expect("bind p2p listener");
+    let ep_str = listener.local_endpoint();
+    let target_addr = parse_p2p_endpoint(&ep_str).expect("parse p2p endpoint");
+
+    let attacker_ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await
+        .expect("bind attacker endpoint");
+
+    // Peer A opens 6 connections without writing the 0x54 stream magic byte, attempting to stall accept_bi.
+    let mut attacker_conns = Vec::new();
+    for _ in 0..6 {
+        let conn = attacker_ep
+            .connect(target_addr.clone(), TENDRIL_P2P_ALPN)
+            .await
+            .expect("attacker connect");
+        let _bi = conn.open_bi().await.expect("attacker open_bi");
+        attacker_conns.push(conn);
+    }
+
+    let legit_dialer = P2pDialer::bind(P2pRelayMode::Disabled)
+        .await
+        .expect("bind legit dialer");
+    let dial_task = tokio::spawn(async move { legit_dialer.dial(&ep_str).await });
+    let srv_stream = timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .expect("legit peer accept must not be blocked by attacker peer")
+        .expect("accept ok");
+    let cli_stream = dial_task.await.expect("dial join").expect("legit dial ok");
+    assert_eq!(srv_stream.provider_id(), ProviderId::P2p);
+    assert_eq!(cli_stream.provider_id(), ProviderId::P2p);
+
+    drop(attacker_conns);
+    attacker_ep.close().await;
+}
+
+#[test]
+fn batch2a_sec13_runtime_pre_auth_ipv6_and_eviction() {
+    use std::net::Ipv6Addr;
+
+    let limiter = PreAuthRateLimiter::new(PreAuthConfig {
+        max_entries: 2,
+        max_half_open: 16,
+        untrusted_max_half_open: 8,
+        ip_burst: 1,
+        ip_refill_per_sec: 1,
+        peer_burst: 1,
+        peer_refill_per_sec: 1,
+        unattributed_burst: 1,
+        unattributed_refill_per_sec: 1,
+        max_half_open_per_key: 8,
+    });
+
+    let v6_a = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0x10, 0x20, 0, 0, 0, 1));
+    let v6_b = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0x10, 0x20, 1, 2, 3, 4));
+    let g_a = limiter.try_acquire(Some(v6_a)).expect("v6 /64 first");
+    assert!(matches!(
+        limiter.try_acquire(Some(v6_b)),
+        Err(RuntimeError::RateLimited(_))
+    ));
+    drop(g_a);
+
+    // Exhaust mapped v4/v6 sharing.
+    let v4: IpAddr = "198.51.100.5".parse().expect("v4");
+    let v4_mapped: IpAddr = "::ffff:198.51.100.5".parse().expect("v4 mapped");
+    let g_v4 = limiter.try_acquire(Some(v4)).expect("v4 first");
+    assert!(matches!(
+        limiter.try_acquire(Some(v4_mapped)),
+        Err(RuntimeError::RateLimited(_))
+    ));
+    drop(g_v4);
+
+    // Table is at max_entries=2; overflow bucket allows 1 eviction insertion then blocks burst reset.
+    let new1: IpAddr = "203.0.113.1".parse().expect("new1");
+    let new2: IpAddr = "203.0.113.2".parse().expect("new2");
+    let g_n1 = limiter.try_acquire(Some(new1)).expect("overflow slot 1");
+    drop(g_n1);
+    assert!(matches!(
+        limiter.try_acquire(Some(new2)),
+        Err(RuntimeError::RateLimited(_))
+    ));
+}
+
+#[tokio::test]
+async fn batch2a_sec14_url_ssrf_and_filtered_p2p_addrs() {
+    use tendril_runtime::{is_loopback_host, is_metadata_or_link_local_ip};
+
+    assert!(is_loopback_host("localhost"));
+    assert!(is_loopback_host("sub.LOCALHOST."));
+    assert!(is_loopback_host("127.0.0.42"));
+    assert!(is_loopback_host("[::1]"));
+    assert!(is_loopback_host("[::ffff:127.0.0.1]"));
+    assert!(!is_loopback_host("example.com"));
+
+    assert!(is_metadata_or_link_local_ip(
+        "169.254.169.254".parse().expect("ip")
+    ));
+    assert!(is_metadata_or_link_local_ip(
+        "::ffff:169.254.169.254".parse().expect("ip")
+    ));
+    assert!(is_metadata_or_link_local_ip("fe80::1".parse().expect("ip")));
+    assert!(is_metadata_or_link_local_ip(
+        "fd00:ec2::254".parse().expect("ip")
+    ));
+    assert!(is_metadata_or_link_local_ip("0.0.0.0".parse().expect("ip")));
+
+    let target_b64 = tendril_core::crypto::b64url_encode(&[7u8; 32]);
+    let kp = SigningKeypair::generate().expect("kp");
+    assert!(matches!(
+        RelayListener::bind(
+            "ws://relay.example/v1/relay",
+            None,
+            kp.signing_key(),
+            DEFAULT_WRITE_TIMEOUT
+        )
+        .await,
+        Err(RuntimeError::Protocol(_))
+    ));
+    assert!(matches!(
+        RelayDialer::new()
+            .dial(&format!("ws://relay.example/v1/relay#{target_b64}"))
+            .await,
+        Err(RuntimeError::Protocol(msg)) if msg.contains("explicit opt-in")
+    ));
+    assert!(matches!(
+        RelayDialer::new()
+            .with_allow_insecure_ws(true)
+            .dial(&format!("ws://169.254.169.254/v1/relay#{target_b64}"))
+            .await,
+        Err(RuntimeError::Protocol(msg)) if msg.contains("link-local or metadata")
+    ));
+    assert!(matches!(
+        BrokerDialer::new().dial("broker+ws://broker.example/ws").await,
+        Err(RuntimeError::Protocol(msg)) if msg.contains("explicit opt-in")
+    ));
+    assert!(matches!(
+        BrokerDialer::new()
+            .with_allow_insecure_ws(true)
+            .dial("broker+wss://[::ffff:169.254.169.254]/ws")
+            .await,
+        Err(RuntimeError::Protocol(msg)) if msg.contains("link-local or metadata")
+    ));
+    assert!(matches!(
+        BrokerDialer::new().dial("wss://user@broker.example/ws").await,
+        Err(RuntimeError::Protocol(msg)) if msg.contains("userinfo")
+    ));
+
+    #[cfg(feature = "p2p-iroh")]
+    {
+        use tendril_runtime::{parse_p2p_endpoint_filtered, parse_p2p_relay_mode};
+
+        assert!(parse_p2p_relay_mode(Some("http://relay.example/")).is_err());
+        assert!(parse_p2p_relay_mode(Some("https://169.254.169.254/")).is_err());
+        assert!(parse_p2p_relay_mode(Some("http://127.0.0.1:8080/")).is_ok());
+        assert!(parse_p2p_relay_mode(Some("https://relay.example/")).is_ok());
+
+        let ep_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+        let uri = format!(
+            "iroh://{ep_id}?addr=192.168.1.5:4433&addr=10.0.0.5:4433&addr=100.64.0.1:4433&addr=127.0.0.1:4433&addr=169.254.169.254:80&addr=[fe80::1]:4433&addr=93.184.216.34:4433&relay=https://relay.example/"
+        );
+        let filtered = parse_p2p_endpoint_filtered(&uri, false).expect("filtered");
+        let kept: Vec<String> = filtered.ip_addrs().map(ToString::to_string).collect();
+        assert_eq!(kept, vec!["93.184.216.34:4433"]);
+        assert_eq!(filtered.relay_urls().count(), 1);
+
+        let allow_priv = parse_p2p_endpoint_filtered(&uri, true).expect("allow priv");
+        let priv_ips: Vec<String> = allow_priv.ip_addrs().map(ToString::to_string).collect();
+        assert!(!priv_ips.iter().any(|a| a.starts_with("169.254.")));
+        assert!(!priv_ips.iter().any(|a| a.starts_with("[fe80:")));
+        assert!(priv_ips.contains(&"127.0.0.1:4433".to_owned()));
+        assert!(priv_ips.contains(&"93.184.216.34:4433".to_owned()));
+
+        assert!(
+            parse_p2p_endpoint_filtered(
+                &format!("iroh://{ep_id}?relay=http://evil.example/"),
+                false
+            )
+            .is_err()
+        );
+    }
 }

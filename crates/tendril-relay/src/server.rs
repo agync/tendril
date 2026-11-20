@@ -1,22 +1,30 @@
 //! Stateless async WebSocket relay server implementing `spec/relay-v1.md`.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Once};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tendril_core::crypto::{b64url_decode_array, b64url_encode, random_bytes};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::http::{HeaderMap, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -24,7 +32,112 @@ use crate::protocol::{
     MAX_RELAY_FRAME_LEN, RELAY_PATH, RelayClientMsg, RelayServerMsg, verify_relay_accept,
     verify_relay_register,
 };
-use crate::rate_limit::IpTokenLimiter;
+use crate::rate_limit::{IpTokenLimiter, normalize_rate_limit_ip};
+
+static RELAY_RING_INIT: Once = Once::new();
+
+fn ensure_rustls_ring_provider() {
+    RELAY_RING_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// IPv4 or IPv6 CIDR matcher used to configure trusted reverse proxies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpCidr {
+    V4 { network: u32, prefix: u8 },
+    V6 { network: u128, prefix: u8 },
+}
+
+impl IpCidr {
+    /// Checks whether `ip` (unwrapping IPv4-mapped IPv6 addresses) belongs to this CIDR range.
+    #[must_use]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let canonical = match ip {
+            IpAddr::V4(v4) => IpAddr::V4(v4),
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        };
+        match (self, canonical) {
+            (Self::V4 { network, prefix }, IpAddr::V4(v4)) => {
+                let mask = if *prefix == 0 {
+                    0u32
+                } else {
+                    !0u32 << (32 - *prefix)
+                };
+                (u32::from(v4) & mask) == *network
+            }
+            (Self::V6 { network, prefix }, IpAddr::V6(v6)) => {
+                let mask = if *prefix == 0 {
+                    0u128
+                } else {
+                    !0u128 << (128 - *prefix)
+                };
+                (u128::from(v6) & mask) == *network
+            }
+            _ => false,
+        }
+    }
+}
+
+impl FromStr for IpCidr {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if let Some((ip_s, pfx_s)) = trimmed.split_once('/') {
+            let ip: IpAddr = ip_s
+                .parse()
+                .map_err(|e| format!("invalid CIDR address '{ip_s}': {e}"))?;
+            let prefix: u8 = pfx_s
+                .parse()
+                .map_err(|e| format!("invalid CIDR prefix '{pfx_s}': {e}"))?;
+            match ip {
+                IpAddr::V4(v4) => {
+                    if prefix > 32 {
+                        return Err(format!("IPv4 CIDR prefix {prefix} > 32"));
+                    }
+                    let mask = if prefix == 0 {
+                        0u32
+                    } else {
+                        !0u32 << (32 - prefix)
+                    };
+                    Ok(Self::V4 {
+                        network: u32::from(v4) & mask,
+                        prefix,
+                    })
+                }
+                IpAddr::V6(v6) => {
+                    if prefix > 128 {
+                        return Err(format!("IPv6 CIDR prefix {prefix} > 128"));
+                    }
+                    let mask = if prefix == 0 {
+                        0u128
+                    } else {
+                        !0u128 << (128 - prefix)
+                    };
+                    Ok(Self::V6 {
+                        network: u128::from(v6) & mask,
+                        prefix,
+                    })
+                }
+            }
+        } else {
+            let ip: IpAddr = trimmed
+                .parse()
+                .map_err(|e| format!("invalid IP/CIDR '{trimmed}': {e}"))?;
+            match ip {
+                IpAddr::V4(v4) => Ok(Self::V4 {
+                    network: u32::from(v4),
+                    prefix: 32,
+                }),
+                IpAddr::V6(v6) => Ok(Self::V6 {
+                    network: u128::from(v6),
+                    prefix: 128,
+                }),
+            }
+        }
+    }
+}
 
 /// Configuration for [`RelayServer`].
 #[derive(Debug, Clone)]
@@ -34,12 +147,17 @@ pub struct RelayConfig {
     pub max_pending_per_mailbox: usize,
     pub max_active_per_ip: usize,
     pub max_active_per_mailbox: usize,
+    pub max_total_connections: usize,
+    pub max_mailboxes: usize,
     pub max_tracked_ips: usize,
     pub ip_burst_capacity: u32,
     pub ip_refill_per_sec: u32,
     pub accept_timeout: Duration,
     pub idle_timeout: Duration,
     pub write_timeout: Duration,
+    pub tls_cert_path: Option<PathBuf>,
+    pub tls_key_path: Option<PathBuf>,
+    pub trusted_proxies: Vec<IpCidr>,
 }
 
 impl Default for RelayConfig {
@@ -50,12 +168,17 @@ impl Default for RelayConfig {
             max_pending_per_mailbox: 8,
             max_active_per_ip: 64,
             max_active_per_mailbox: 64,
+            max_total_connections: 4096,
+            max_mailboxes: 1024,
             max_tracked_ips: 4096,
             ip_burst_capacity: 60,
             ip_refill_per_sec: 20,
             accept_timeout: Duration::from_secs(15),
             idle_timeout: Duration::from_secs(300),
             write_timeout: Duration::from_secs(1),
+            tls_cert_path: None,
+            tls_key_path: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -67,12 +190,17 @@ pub enum RelayError {
     Io(#[from] std::io::Error),
     #[error("relay background task failed: {0}")]
     TaskJoin(String),
+    #[error("invalid relay configuration: {0}")]
+    InvalidConfig(String),
+    #[error("tls setup failed: {0}")]
+    Tls(String),
 }
 
 /// Handle to a background [`RelayServer`] instance.
 #[derive(Debug)]
 pub struct RelayHandle {
     addr: SocketAddr,
+    uses_tls: bool,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -84,10 +212,11 @@ impl RelayHandle {
         self.addr
     }
 
-    /// Returns a `ws://` URL pointing at the canonical `/v1/relay` path.
+    /// Returns a `ws://` or `wss://` URL pointing at the canonical `/v1/relay` path.
     #[must_use]
     pub fn ws_url(&self) -> String {
-        format!("ws://{}{RELAY_PATH}", self.addr)
+        let scheme = if self.uses_tls { "wss" } else { "ws" };
+        format!("{scheme}://{}{RELAY_PATH}", self.addr)
     }
 
     /// Signals graceful shutdown and awaits server task exit.
@@ -114,6 +243,51 @@ impl Drop for RelayHandle {
     }
 }
 
+enum RelayTcpStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for RelayTcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(&mut **s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for RelayTcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(&mut **s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(&mut **s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(&mut **s).poll_shutdown(cx),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct MailboxEntry {
     reg_id: u64,
@@ -127,7 +301,8 @@ struct PendingDial {
 }
 
 struct AcceptorTransfer {
-    ws: WebSocketStream<TcpStream>,
+    ws: WebSocketStream<RelayTcpStream>,
+    _global_guard: GlobalConnGuard,
     _ip_guard: IpConnGuard,
     _stream_guard: MailboxStreamGuard,
 }
@@ -161,6 +336,7 @@ impl RelayTables {
 struct RelayState {
     config: RelayConfig,
     limiter: Mutex<IpTokenLimiter>,
+    active_connections: AtomicUsize,
     active_per_ip: Mutex<HashMap<IpAddr, usize>>,
     tables: Mutex<RelayTables>,
 }
@@ -175,15 +351,36 @@ impl RelayState {
         Self {
             config,
             limiter: Mutex::new(limiter),
+            active_connections: AtomicUsize::new(0),
             active_per_ip: Mutex::new(HashMap::new()),
             tables: Mutex::new(RelayTables::new()),
         }
     }
 
+    fn try_acquire_global(self: &Arc<Self>) -> Option<GlobalConnGuard> {
+        let cap = self.config.max_total_connections.max(1);
+        loop {
+            let cur = self.active_connections.load(Ordering::Acquire);
+            if cur >= cap {
+                return None;
+            }
+            if self
+                .active_connections
+                .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(GlobalConnGuard {
+                    state: Arc::clone(self),
+                });
+            }
+        }
+    }
+
     fn try_acquire_ip(self: &Arc<Self>, ip: IpAddr) -> Option<IpConnGuard> {
+        let key = normalize_rate_limit_ip(ip);
         {
             let mut limiter = self.limiter.lock().expect("limiter mutex poisoned");
-            if !limiter.allow(ip, Instant::now()) {
+            if !limiter.allow(key, Instant::now()) {
                 return None;
             }
         }
@@ -191,15 +388,25 @@ impl RelayState {
             .active_per_ip
             .lock()
             .expect("active_per_ip mutex poisoned");
-        let count = active.entry(ip).or_insert(0);
+        let count = active.entry(key).or_insert(0);
         if *count >= self.config.max_active_per_ip {
             return None;
         }
         *count += 1;
         Some(IpConnGuard {
             state: Arc::clone(self),
-            ip,
+            ip: key,
         })
+    }
+}
+
+struct GlobalConnGuard {
+    state: Arc<RelayState>,
+}
+
+impl Drop for GlobalConnGuard {
+    fn drop(&mut self) {
+        self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -292,11 +499,45 @@ pub struct RelayServer {
     listener: TcpListener,
     addr: SocketAddr,
     state: Arc<RelayState>,
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl RelayServer {
-    /// Binds a TCP listener using `config`.
+    /// Binds a TCP listener using `config`, optionally enabling native `rustls` TLS.
     pub async fn bind(config: RelayConfig) -> Result<Self, RelayError> {
+        let tls_acceptor = match (&config.tls_cert_path, &config.tls_key_path) {
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(RelayError::InvalidConfig(
+                    "both tls_cert_path and tls_key_path must be set".to_owned(),
+                ));
+            }
+            (Some(cert_path), Some(key_path)) => {
+                ensure_rustls_ring_provider();
+                let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+                    .map_err(|e| {
+                        RelayError::Tls(format!("read cert '{}': {e}", cert_path.display()))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        RelayError::Tls(format!("parse cert '{}': {e}", cert_path.display()))
+                    })?;
+                if certs.is_empty() {
+                    return Err(RelayError::Tls(format!(
+                        "no certificates found in '{}'",
+                        cert_path.display()
+                    )));
+                }
+                let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| {
+                    RelayError::Tls(format!("read private key '{}': {e}", key_path.display()))
+                })?;
+                let server_cfg = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .map_err(|e| RelayError::Tls(format!("invalid TLS cert/key pair: {e}")))?;
+                Some(TlsAcceptor::from(Arc::new(server_cfg)))
+            }
+        };
         let listener = TcpListener::bind(config.listen_addr).await?;
         let addr = listener.local_addr()?;
         let state = Arc::new(RelayState::new(config));
@@ -304,6 +545,7 @@ impl RelayServer {
             listener,
             addr,
             state,
+            tls_acceptor,
         })
     }
 
@@ -313,10 +555,15 @@ impl RelayServer {
         self.addr
     }
 
-    /// Returns a `ws://` URL pointing at `/v1/relay`.
+    /// Returns a `ws://` or `wss://` URL pointing at `/v1/relay`.
     #[must_use]
     pub fn ws_url(&self) -> String {
-        format!("ws://{}{RELAY_PATH}", self.addr)
+        let scheme = if self.tls_acceptor.is_some() {
+            "wss"
+        } else {
+            "ws"
+        };
+        format!("{scheme}://{}{RELAY_PATH}", self.addr)
     }
 
     /// Runs the accept loop until `shutdown` fires.
@@ -330,14 +577,32 @@ impl RelayServer {
                 accept_res = self.listener.accept() => {
                     match accept_res {
                         Ok((stream, peer_addr)) => {
-                            let Some(ip_guard) = self.state.try_acquire_ip(peer_addr.ip()) else {
-                                tracing::debug!(ip = %peer_addr.ip(), "rejected relay connection by rate/ip cap");
+                            let Some(global_guard) = self.state.try_acquire_global() else {
+                                tracing::debug!(ip = %peer_addr.ip(), "rejected relay connection at global cap");
                                 drop(stream);
                                 continue;
                             };
+                            let peer_ip = peer_addr.ip();
+                            let from_trusted_proxy = self
+                                .state
+                                .config
+                                .trusted_proxies
+                                .iter()
+                                .any(|cidr| cidr.contains(peer_ip));
+                            let ip_guard = if from_trusted_proxy {
+                                None
+                            } else {
+                                let Some(guard) = self.state.try_acquire_ip(peer_ip) else {
+                                    tracing::debug!(ip = %peer_ip, "rejected relay connection by rate/ip cap");
+                                    drop(stream);
+                                    continue;
+                                };
+                                Some(guard)
+                            };
                             let state = Arc::clone(&self.state);
+                            let tls = self.tls_acceptor.clone();
                             tokio::spawn(async move {
-                                handle_connection(stream, ip_guard, state).await;
+                                handle_connection(stream, peer_ip, global_guard, ip_guard, tls, state).await;
                             });
                         }
                         Err(err) => {
@@ -353,12 +618,14 @@ impl RelayServer {
     #[must_use]
     pub fn spawn(self) -> RelayHandle {
         let addr = self.addr;
+        let uses_tls = self.tls_acceptor.is_some();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             let _ = self.serve_until(shutdown_rx).await;
         });
         RelayHandle {
             addr,
+            uses_tls,
             shutdown_tx: Some(shutdown_tx),
             task: Some(task),
         }
@@ -366,7 +633,7 @@ impl RelayServer {
 }
 
 async fn send_json(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut WebSocketStream<RelayTcpStream>,
     msg: &RelayServerMsg,
     write_timeout: Duration,
 ) -> bool {
@@ -379,7 +646,7 @@ async fn send_json(
 }
 
 async fn send_error_and_close(
-    ws: &mut WebSocketStream<TcpStream>,
+    ws: &mut WebSocketStream<RelayTcpStream>,
     code: &str,
     write_timeout: Duration,
 ) {
@@ -394,31 +661,136 @@ async fn send_error_and_close(
     let _ = timeout(write_timeout, ws.close(None)).await;
 }
 
-#[allow(clippy::result_large_err)]
-fn validate_relay_path(req: &Request, resp: Response) -> Result<Response, ErrorResponse> {
-    if req.uri().path() != RELAY_PATH {
-        let mut err = ErrorResponse::new(Some("not found".to_owned()));
-        *err.status_mut() = StatusCode::NOT_FOUND;
-        return Err(err);
+fn parse_forwarded_ip_token(raw: &str) -> Option<IpAddr> {
+    let mut s = raw.trim().trim_matches('"');
+    if s.is_empty() {
+        return None;
     }
-    Ok(resp)
+    if let Some(bracketed) = s.strip_prefix('[')
+        && let Some((inner, _)) = bracketed.split_once(']')
+    {
+        return inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6);
+    }
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(sock) = s.parse::<SocketAddr>() {
+        return Some(sock.ip());
+    }
+    if let Some((h, port)) = s.rsplit_once(':')
+        && port.parse::<u16>().is_ok()
+    {
+        s = h;
+        return s.parse::<IpAddr>().ok();
+    }
+    None
 }
 
-async fn handle_connection(stream: TcpStream, ip_guard: IpConnGuard, state: Arc<RelayState>) {
+fn extract_trusted_client_ip(
+    headers: &HeaderMap,
+    trusted_proxies: &[IpCidr],
+    peer_ip: IpAddr,
+) -> IpAddr {
+    let mut candidates = Vec::new();
+    for val in headers.get_all("x-forwarded-for") {
+        if let Ok(s) = val.to_str() {
+            for part in s.split(',') {
+                if let Some(ip) = parse_forwarded_ip_token(part) {
+                    candidates.push(ip);
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        for val in headers.get_all("forwarded") {
+            if let Ok(s) = val.to_str() {
+                for entry in s.split(',') {
+                    for param in entry.split(';') {
+                        let trimmed = param.trim();
+                        if trimmed.len() > 4
+                            && trimmed[..4].eq_ignore_ascii_case("for=")
+                            && let Some(ip) = parse_forwarded_ip_token(&trimmed[4..])
+                        {
+                            candidates.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for ip in candidates.into_iter().rev() {
+        if !trusted_proxies.iter().any(|cidr| cidr.contains(ip)) {
+            return ip;
+        }
+    }
+    peer_ip
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    peer_ip: IpAddr,
+    global_guard: GlobalConnGuard,
+    pre_acquired_ip: Option<IpConnGuard>,
+    tls_acceptor: Option<TlsAcceptor>,
+    state: Arc<RelayState>,
+) {
     let _ = stream.set_nodelay(true);
+    let io_stream = match tls_acceptor {
+        Some(acceptor) => match timeout(state.config.accept_timeout, acceptor.accept(stream)).await
+        {
+            Ok(Ok(tls_stream)) => RelayTcpStream::Tls(Box::new(tls_stream)),
+            Ok(Err(_)) | Err(_) => return,
+        },
+        None => RelayTcpStream::Plain(stream),
+    };
+
     let ws_config = WebSocketConfig::default()
         .write_buffer_size(0)
         .max_write_buffer_size(MAX_RELAY_FRAME_LEN * 2)
         .max_message_size(Some(MAX_RELAY_FRAME_LEN))
         .max_frame_size(Some(MAX_RELAY_FRAME_LEN));
 
+    let extracted_ip = Arc::new(Mutex::new(None::<IpAddr>));
+    let extract_trusted = pre_acquired_ip.is_none();
+    let trusted_proxies = state.config.trusted_proxies.clone();
+    let extracted_slot = Arc::clone(&extracted_ip);
+
+    #[allow(clippy::result_large_err)]
+    let validate_req = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+        if req.uri().path() != RELAY_PATH {
+            let mut err = ErrorResponse::new(Some("not found".to_owned()));
+            *err.status_mut() = StatusCode::NOT_FOUND;
+            return Err(err);
+        }
+        if extract_trusted {
+            let resolved = extract_trusted_client_ip(req.headers(), &trusted_proxies, peer_ip);
+            *extracted_slot.lock().expect("extracted_ip mutex poisoned") = Some(resolved);
+        }
+        Ok(resp)
+    };
+
     let Ok(Ok(mut ws)) = timeout(
         state.config.accept_timeout,
-        accept_hdr_async_with_config(stream, validate_relay_path, Some(ws_config)),
+        accept_hdr_async_with_config(io_stream, validate_req, Some(ws_config)),
     )
     .await
     else {
         return;
+    };
+
+    let ip_guard = match pre_acquired_ip {
+        Some(g) => g,
+        None => {
+            let resolved = extracted_ip
+                .lock()
+                .expect("extracted_ip mutex poisoned")
+                .unwrap_or(peer_ip);
+            let Some(g) = state.try_acquire_ip(resolved) else {
+                send_error_and_close(&mut ws, "rate_limited", state.config.write_timeout).await;
+                return;
+            };
+            g
+        }
     };
 
     let Ok(nonce) = random_bytes::<32>() else {
@@ -453,26 +825,37 @@ async fn handle_connection(stream: TcpStream, ip_guard: IpConnGuard, state: Arc<
 
     match cmd {
         RelayClientMsg::Register { pub_key, sig } => {
-            handle_register(ws, ip_guard, state, &nonce, pub_key, sig).await;
+            handle_register(ws, global_guard, ip_guard, state, &nonce, pub_key, sig).await;
         }
         RelayClientMsg::Dial {
             target_pub,
             conn_id,
         } => {
-            handle_dial(ws, ip_guard, state, target_pub, conn_id).await;
+            handle_dial(ws, global_guard, ip_guard, state, target_pub, conn_id).await;
         }
         RelayClientMsg::Accept {
             pub_key,
             conn_id,
             sig,
         } => {
-            handle_accept(ws, ip_guard, state, &nonce, pub_key, conn_id, sig).await;
+            handle_accept(
+                ws,
+                global_guard,
+                ip_guard,
+                state,
+                &nonce,
+                pub_key,
+                conn_id,
+                sig,
+            )
+            .await;
         }
     }
 }
 
 async fn handle_register(
-    mut ws: WebSocketStream<TcpStream>,
+    mut ws: WebSocketStream<RelayTcpStream>,
+    _global_guard: GlobalConnGuard,
     _ip_guard: IpConnGuard,
     state: Arc<RelayState>,
     nonce: &[u8; 32],
@@ -491,17 +874,27 @@ async fn handle_register(
         .saturating_mul(2)
         .max(8);
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<String>(chan_cap);
-    let reg_id = {
+    let reg_id_opt = {
         let mut tables = state.tables.lock().expect("tables mutex poisoned");
-        let reg_id = tables.alloc_id();
-        tables.mailboxes.insert(
-            mailbox_pub,
-            MailboxEntry {
-                reg_id,
-                incoming_tx,
-            },
-        );
-        reg_id
+        if !tables.mailboxes.contains_key(&mailbox_pub)
+            && tables.mailboxes.len() >= state.config.max_mailboxes.max(1)
+        {
+            None
+        } else {
+            let reg_id = tables.alloc_id();
+            tables.mailboxes.insert(
+                mailbox_pub,
+                MailboxEntry {
+                    reg_id,
+                    incoming_tx,
+                },
+            );
+            Some(reg_id)
+        }
+    };
+    let Some(reg_id) = reg_id_opt else {
+        send_error_and_close(&mut ws, "capacity_exceeded", state.config.write_timeout).await;
+        return;
     };
     let _reg_guard = MailboxRegGuard {
         state: Arc::clone(&state),
@@ -543,7 +936,8 @@ async fn handle_register(
 }
 
 async fn handle_dial(
-    mut ws: WebSocketStream<TcpStream>,
+    mut ws: WebSocketStream<RelayTcpStream>,
+    _global_guard: GlobalConnGuard,
     _ip_guard: IpConnGuard,
     state: Arc<RelayState>,
     target_pub_b64: String,
@@ -648,12 +1042,15 @@ async fn handle_dial(
         state.config.idle_timeout,
     )
     .await;
+    drop(acceptor._global_guard);
     drop(acceptor._ip_guard);
     drop(acceptor._stream_guard);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_accept(
-    mut ws: WebSocketStream<TcpStream>,
+    mut ws: WebSocketStream<RelayTcpStream>,
+    global_guard: GlobalConnGuard,
     ip_guard: IpConnGuard,
     state: Arc<RelayState>,
     nonce: &[u8; 32],
@@ -749,14 +1146,15 @@ async fn handle_accept(
 
     let _ = match_tx.send(AcceptorTransfer {
         ws,
+        _global_guard: global_guard,
         _ip_guard: ip_guard,
         _stream_guard: stream_guard,
     });
 }
 
 async fn bridge_streams(
-    dialer_ws: WebSocketStream<TcpStream>,
-    acceptor_ws: WebSocketStream<TcpStream>,
+    dialer_ws: WebSocketStream<RelayTcpStream>,
+    acceptor_ws: WebSocketStream<RelayTcpStream>,
     write_timeout: Duration,
     idle_timeout: Duration,
 ) {

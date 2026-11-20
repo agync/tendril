@@ -247,9 +247,12 @@ impl InboundRouter {
                         Err(_) => break,
                     },
                 };
-                let Ok(peek_guard) = peek_limiter
-                    .try_acquire_for_peer(stream.peer_ip(), stream.peer_transport_id().as_deref())
-                else {
+                let provider = stream.provider_id();
+                let Ok(peek_guard) = peek_limiter.try_acquire_for_stream(
+                    provider,
+                    stream.peer_ip(),
+                    stream.peer_transport_id().as_deref(),
+                ) else {
                     continue;
                 };
                 let p_lim = pair_limiter.clone();
@@ -284,13 +287,13 @@ impl InboundRouter {
                             if !p_enabled.load(Ordering::Acquire) {
                                 return;
                             }
-                            let Ok(guard) = p_lim.try_acquire_half_open() else {
+                            let Ok(guard) = p_lim.try_acquire_half_open_for_provider(provider) else {
                                 return;
                             };
                             let _ = p_q.try_push((wrapped, guard), expires_at);
                         }
                         Intent::Session => {
-                            let Ok(guard) = s_lim.try_acquire_half_open() else {
+                            let Ok(guard) = s_lim.try_acquire_half_open_for_provider(provider) else {
                                 return;
                             };
                             let _ = s_q.try_push((wrapped, guard), expires_at);

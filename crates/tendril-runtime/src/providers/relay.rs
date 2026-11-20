@@ -198,6 +198,12 @@ impl RelayListener {
         write_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
         let relay_url = relay_url.into();
+        let parsed = super::validate_ws_url(&relay_url, false)?;
+        if !matches!(parsed.scheme(), "ws" | "wss") {
+            return Err(RuntimeError::Protocol(format!(
+                "relay URL must use ws:// or wss://: '{relay_url}'"
+            )));
+        }
         let (mut control_ws, challenge_host, nonce) =
             connect_and_verify_challenge(&relay_url, expected_host.as_deref()).await?;
         let (pub_b64, sig_b64) = sign_relay_register(&signing_key, &challenge_host, &nonce);
@@ -359,6 +365,7 @@ async fn accept_one_stream(
 pub struct RelayDialer {
     expected_host: Option<String>,
     write_timeout: Duration,
+    allow_insecure_ws: bool,
 }
 
 impl Default for RelayDialer {
@@ -374,7 +381,15 @@ impl RelayDialer {
         Self {
             expected_host: None,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            allow_insecure_ws: false,
         }
+    }
+
+    /// Explicitly permits cleartext `ws://` outside loopback hosts.
+    #[must_use]
+    pub fn with_allow_insecure_ws(mut self, allow: bool) -> Self {
+        self.allow_insecure_ws = allow;
+        self
     }
 
     /// Requires the server `Challenge.host` field to match `host`.
@@ -397,6 +412,12 @@ impl RelayDialer {
         relay_url: &str,
         target_signing_pub: &[u8; 32],
     ) -> Result<Box<dyn PathStream>, RuntimeError> {
+        let parsed = super::validate_ws_url(relay_url, self.allow_insecure_ws)?;
+        if !matches!(parsed.scheme(), "ws" | "wss") {
+            return Err(RuntimeError::Protocol(format!(
+                "relay URL must use ws:// or wss://: '{relay_url}'"
+            )));
+        }
         let (mut ws, _host, _nonce) =
             connect_and_verify_challenge(relay_url, self.expected_host.as_deref()).await?;
         let conn_id_bytes = random_bytes::<16>()?;

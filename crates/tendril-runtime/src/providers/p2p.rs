@@ -25,7 +25,45 @@ pub const TENDRIL_P2P_ALPN: &[u8] = b"tendril/p2p/v1";
 
 const P2P_STREAM_MAGIC: u8 = 0x54;
 const P2P_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const P2P_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const P2P_ACCEPT_BI_TIMEOUT: Duration = Duration::from_secs(3);
+const P2P_MAGIC_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONCURRENT_ACCEPTS: usize = 64;
+const MAX_CONCURRENT_ACCEPTS_PER_PEER: usize = 4;
+
+struct PeerAcceptGuard {
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<iroh::EndpointId, usize>>>,
+    peer: iroh::EndpointId,
+}
+
+impl PeerAcceptGuard {
+    fn try_acquire(
+        counts: Arc<std::sync::Mutex<std::collections::HashMap<iroh::EndpointId, usize>>>,
+        peer: iroh::EndpointId,
+    ) -> Option<Self> {
+        let mut map = counts.lock().unwrap_or_else(|err| err.into_inner());
+        let entry = map.entry(peer).or_insert(0);
+        if *entry >= MAX_CONCURRENT_ACCEPTS_PER_PEER {
+            return None;
+        }
+        *entry += 1;
+        drop(map);
+        Some(Self { counts, peer })
+    }
+}
+
+impl Drop for PeerAcceptGuard {
+    fn drop(&mut self) {
+        let mut map = self.counts.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(count) = map.get_mut(&self.peer) {
+            if *count <= 1 {
+                map.remove(&self.peer);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
 
 /// Relay strategy used when constructing [`P2pListener`] and [`P2pDialer`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -78,6 +116,7 @@ pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeE
         None | Some("" | "default") => Ok(P2pRelayMode::Default),
         Some("disabled" | "local") => Ok(P2pRelayMode::Disabled),
         Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
+            super::validate_iroh_relay_url(url)?;
             let _ = RelayUrl::from_str(url).map_err(|err| {
                 RuntimeError::Protocol(format!("invalid iroh relay URL '{url}': {err}"))
             })?;
@@ -97,6 +136,7 @@ async fn build_iroh_endpoint(
     let mut builder = match relay_mode {
         P2pRelayMode::Default => Endpoint::builder(presets::N0).relay_mode(RelayMode::Default),
         P2pRelayMode::Custom(url_str) => {
+            super::validate_iroh_relay_url(url_str)?;
             let url = RelayUrl::from_str(url_str).map_err(|err| {
                 RuntimeError::Protocol(format!("invalid iroh relay URL '{url_str}': {err}"))
             })?;
@@ -136,6 +176,20 @@ pub fn format_p2p_endpoint(addr: &EndpointAddr) -> String {
 
 /// Parses an `iroh://<endpoint_id>[?addr=...&relay=...]` endpoint string into [`EndpointAddr`].
 pub fn parse_p2p_endpoint(endpoint: &str) -> Result<EndpointAddr, RuntimeError> {
+    parse_p2p_endpoint_filtered(endpoint, true)
+}
+
+/// Parses an `iroh://...` endpoint URI while always stripping metadata/link-local IPs
+/// and optionally stripping private/loopback/reserved `?addr=` hints.
+pub fn parse_p2p_endpoint_filtered(
+    endpoint: &str,
+    allow_private_addrs: bool,
+) -> Result<EndpointAddr, RuntimeError> {
+    if endpoint.chars().any(char::is_control) {
+        return Err(RuntimeError::Protocol(
+            "iroh endpoint contains control characters".into(),
+        ));
+    }
     let raw = endpoint.strip_prefix("iroh://").unwrap_or(endpoint);
     let (id_part, query_part) = raw.split_once('?').unwrap_or((raw, ""));
     let id = EndpointId::from_str(id_part).map_err(|err| {
@@ -156,9 +210,15 @@ pub fn parse_p2p_endpoint(endpoint: &str) -> Result<EndpointAddr, RuntimeError> 
                     let sock: SocketAddr = val.parse().map_err(|err| {
                         RuntimeError::Protocol(format!("invalid iroh socket addr '{val}': {err}"))
                     })?;
+                    if super::is_metadata_or_link_local_ip(sock.ip())
+                        || (!allow_private_addrs && super::is_private_or_reserved_ip(sock.ip()))
+                    {
+                        continue;
+                    }
                     addrs.push(TransportAddr::Ip(sock));
                 }
                 "relay" => {
+                    super::validate_iroh_relay_url(val)?;
                     let url = RelayUrl::from_str(val).map_err(|err| {
                         RuntimeError::Protocol(format!("invalid iroh relay URL '{val}': {err}"))
                     })?;
@@ -312,6 +372,7 @@ impl P2pListener {
         let guard = EndpointGuard::new(endpoint);
         let (accepted_tx, accepted_rx) = mpsc::channel(32);
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_ACCEPTS));
+        let peer_accepts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let guard_clone = Arc::clone(&guard);
 
         let accept_task = tokio::spawn(async move {
@@ -321,21 +382,29 @@ impl P2pListener {
                 };
                 let tx_c = accepted_tx.clone();
                 let stream_guard = Arc::clone(&guard_clone);
+                let peer_counts = Arc::clone(&peer_accepts);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Ok(Ok(conn)) = timeout(P2P_HANDSHAKE_TIMEOUT, incoming).await
-                        && let Ok(Ok((send, mut recv))) =
-                            timeout(P2P_HANDSHAKE_TIMEOUT, conn.accept_bi()).await
+                    let Ok(Ok(conn)) = timeout(P2P_CONNECT_TIMEOUT, incoming).await else {
+                        return;
+                    };
+                    let Some(_peer_guard) =
+                        PeerAcceptGuard::try_acquire(peer_counts, conn.remote_id())
+                    else {
+                        return;
+                    };
+                    let Ok(Ok((send, mut recv))) =
+                        timeout(P2P_ACCEPT_BI_TIMEOUT, conn.accept_bi()).await
+                    else {
+                        return;
+                    };
+                    let mut magic = [0u8; 1];
+                    if let Ok(Ok(())) =
+                        timeout(P2P_MAGIC_TIMEOUT, recv.read_exact(&mut magic)).await
+                        && magic[0] == P2P_STREAM_MAGIC
                     {
-                        let mut magic = [0u8; 1];
-                        if let Ok(Ok(())) =
-                            timeout(Duration::from_secs(5), recv.read_exact(&mut magic)).await
-                            && magic[0] == P2P_STREAM_MAGIC
-                        {
-                            let stream =
-                                P2pStream::new(stream_guard, conn, send, recv, write_timeout);
-                            let _ = tx_c.send(stream).await;
-                        }
+                        let stream = P2pStream::new(stream_guard, conn, send, recv, write_timeout);
+                        let _ = timeout(P2P_ACCEPT_BI_TIMEOUT, tx_c.send(stream)).await;
                     }
                 });
             }
@@ -396,15 +465,18 @@ impl PathListener for P2pListener {
 pub struct P2pDialer {
     guard: Arc<EndpointGuard>,
     write_timeout: Duration,
+    allow_private_addrs: bool,
 }
 
 impl P2pDialer {
     /// Binds a client `iroh` endpoint configured with `relay_mode`.
     pub async fn bind(relay_mode: P2pRelayMode) -> Result<Self, RuntimeError> {
+        let allow_private_addrs = matches!(relay_mode, P2pRelayMode::Disabled);
         let endpoint = build_iroh_endpoint(&relay_mode, Vec::new(), None).await?;
         Ok(Self {
             guard: EndpointGuard::new(endpoint),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            allow_private_addrs,
         })
     }
 
@@ -412,6 +484,13 @@ impl P2pDialer {
     #[must_use]
     pub fn with_write_timeout(mut self, write_timeout: Duration) -> Self {
         self.write_timeout = write_timeout;
+        self
+    }
+
+    /// Allows dialing private/loopback `?addr=` hints on relayed P2P connections.
+    #[must_use]
+    pub fn with_allow_private_addrs(mut self, allow: bool) -> Self {
+        self.allow_private_addrs = allow;
         self
     }
 
@@ -430,7 +509,7 @@ impl PathDialer for P2pDialer {
     }
 
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
-        let addr = parse_p2p_endpoint(endpoint)?;
+        let addr = parse_p2p_endpoint_filtered(endpoint, self.allow_private_addrs)?;
         let conn = timeout(
             P2P_HANDSHAKE_TIMEOUT,
             self.guard.endpoint.connect(addr, TENDRIL_P2P_ALPN),

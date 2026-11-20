@@ -618,8 +618,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             drop(inbound_tx);
 
             let dispatch_stream = |stream: Box<dyn PathStream>| match rate_limiter
-                .try_acquire_for_peer(stream.peer_ip(), stream.peer_transport_id().as_deref())
-            {
+                .try_acquire_for_stream(
+                    stream.provider_id(),
+                    stream.peer_ip(),
+                    stream.peer_transport_id().as_deref(),
+                ) {
                 Ok(guard) => {
                     tokio::spawn(handle_inbound(
                         stream,

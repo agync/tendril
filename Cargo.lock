@@ -3116,11 +3116,15 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "futures-util",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tendril-core",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
@@ -3145,6 +3149,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "url",
  "zeroize",
 ]
 
@@ -3161,6 +3166,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tendril-core",
+ "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
 ]

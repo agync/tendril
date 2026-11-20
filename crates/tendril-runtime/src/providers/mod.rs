@@ -37,7 +37,7 @@ pub use overlay::{
 #[cfg(feature = "p2p-iroh")]
 pub use p2p::{
     P2pDialer, P2pListener, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint,
-    parse_p2p_endpoint, parse_p2p_relay_mode,
+    parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode,
 };
 pub use relay::{EmbeddedRelay, RelayDialer, RelayListener};
 
@@ -247,4 +247,184 @@ where
         let _ = timeout(self.write_timeout, self.ws.close(None)).await;
         Ok(())
     }
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+    }
+}
+
+fn strip_host_brackets(host: &str) -> &str {
+    let trimmed = host.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(trimmed)
+}
+
+/// Returns `true` if `host` refers to loopback (`localhost`, `*.localhost`, `127.0.0.0/8`, or `::1`).
+#[must_use]
+pub fn is_loopback_host(host: &str) -> bool {
+    let bare = strip_host_brackets(host).trim_end_matches('.');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return match canonical_ip(ip) {
+            IpAddr::V4(v4) => v4.is_loopback(),
+            IpAddr::V6(v6) => v6.is_loopback(),
+        };
+    }
+    bare.eq_ignore_ascii_case("localhost")
+        || (bare.len() > ".localhost".len()
+            && bare[bare.len() - ".localhost".len()..].eq_ignore_ascii_case(".localhost"))
+}
+
+/// Returns `true` if `ip` is a cloud metadata, link-local, or unspecified address.
+#[must_use]
+pub fn is_metadata_or_link_local_ip(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+        }
+    }
+}
+
+/// Returns `true` if `ip` is private, loopback, link-local, CGNAT, documentation, multicast, or reserved.
+#[cfg(feature = "p2p-iroh")]
+#[must_use]
+pub(crate) fn is_private_or_reserved_ip(ip: IpAddr) -> bool {
+    if is_metadata_or_link_local_ip(ip) {
+        return true;
+    }
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || oct[0] == 0
+                || (oct[0] == 100 && (oct[1] & 0xc0) == 64)
+                || (oct[0] == 192 && oct[1] == 0 && oct[2] == 0)
+                || (oct[0] == 198 && (oct[1] & 0xfe) == 18)
+                || oct[0] >= 240
+        }
+        IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            v6.is_loopback()
+                || v6.is_multicast()
+                || (segs[0] & 0xfe00) == 0xfc00
+                || (segs[0] & 0xffc0) == 0xfe80
+                || (segs[0] & 0xffc0) == 0xfec0
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+                || (segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0)
+                || segs == [0, 0, 0, 0, 0, 0, 0, 0]
+        }
+    }
+}
+
+fn validate_url_host_safety(parsed: &url::Url) -> Result<&str, RuntimeError> {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(RuntimeError::Protocol(
+            "URL userinfo credentials are not permitted".into(),
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(RuntimeError::Protocol(
+            "URL fragments are not permitted".into(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| RuntimeError::Protocol("URL is missing a host".into()))?;
+    let bare = strip_host_brackets(host);
+    if bare.eq_ignore_ascii_case("metadata.google.internal") {
+        return Err(RuntimeError::Protocol(
+            "cloud metadata hostname is not permitted".into(),
+        ));
+    }
+    if let Ok(ip) = bare.parse::<IpAddr>()
+        && is_metadata_or_link_local_ip(ip)
+    {
+        return Err(RuntimeError::Protocol(format!(
+            "link-local or metadata address '{ip}' is not permitted"
+        )));
+    }
+    Ok(bare)
+}
+
+/// Validates a WebSocket relay or broker URL (`ws`, `wss`, `broker+ws`, `broker+wss`).
+pub(crate) fn validate_ws_url(
+    url_str: &str,
+    allow_insecure_ws: bool,
+) -> Result<url::Url, RuntimeError> {
+    if url_str.chars().any(char::is_control) {
+        return Err(RuntimeError::Protocol(
+            "websocket URL contains control characters".into(),
+        ));
+    }
+    let trimmed = url_str.trim();
+    let parsed = url::Url::parse(trimmed).map_err(|err| {
+        RuntimeError::Protocol(format!("invalid websocket URL '{url_str}': {err}"))
+    })?;
+    let is_cleartext = match parsed.scheme() {
+        "wss" | "broker+wss" => false,
+        "ws" | "broker+ws" => true,
+        other => {
+            return Err(RuntimeError::Protocol(format!(
+                "unsupported websocket scheme '{other}'"
+            )));
+        }
+    };
+    let bare_host = validate_url_host_safety(&parsed)?;
+    if is_cleartext && !allow_insecure_ws && !is_loopback_host(bare_host) {
+        return Err(RuntimeError::Protocol(format!(
+            "cleartext {}:// requires explicit opt-in outside loopback",
+            parsed.scheme()
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Validates an `iroh` custom relay URL (`https://` anywhere, or `http://` only on loopback).
+#[cfg(feature = "p2p-iroh")]
+pub(crate) fn validate_iroh_relay_url(url_str: &str) -> Result<url::Url, RuntimeError> {
+    if url_str.chars().any(char::is_control) {
+        return Err(RuntimeError::Protocol(
+            "iroh relay URL contains control characters".into(),
+        ));
+    }
+    let trimmed = url_str.trim();
+    let parsed = url::Url::parse(trimmed).map_err(|err| {
+        RuntimeError::Protocol(format!("invalid iroh relay URL '{url_str}': {err}"))
+    })?;
+    if parsed.query().is_some() {
+        return Err(RuntimeError::Protocol(
+            "iroh relay URL must not contain a query string".into(),
+        ));
+    }
+    let is_http = match parsed.scheme() {
+        "https" => false,
+        "http" => true,
+        other => {
+            return Err(RuntimeError::Protocol(format!(
+                "unsupported iroh relay URL scheme '{other}'"
+            )));
+        }
+    };
+    let bare_host = validate_url_host_safety(&parsed)?;
+    if is_http && !is_loopback_host(bare_host) {
+        return Err(RuntimeError::Protocol(
+            "cleartext http:// iroh relay URL is permitted only for loopback hosts".into(),
+        ));
+    }
+    Ok(parsed)
 }
