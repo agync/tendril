@@ -46,9 +46,11 @@ fn is_loopback_host(host: &str) -> bool {
             IpAddr::V6(v6) => v6.is_loopback(),
         };
     }
+    let suffix = b".localhost";
+    let bare_bytes = bare.as_bytes();
     bare.eq_ignore_ascii_case("localhost")
-        || (bare.len() > ".localhost".len()
-            && bare[bare.len() - ".localhost".len()..].eq_ignore_ascii_case(".localhost"))
+        || (bare_bytes.len() > suffix.len()
+            && bare_bytes[bare_bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix))
 }
 
 fn is_metadata_or_link_local_ip(ip: IpAddr) -> bool {
@@ -117,7 +119,10 @@ fn validate_iroh_relay_url_wasm(url_str: &str) -> Result<Url, String> {
         .filter(|h| !h.is_empty())
         .ok_or_else(|| "iroh relay URL is missing a host".to_owned())?;
     let bare = strip_host_brackets(host);
-    if bare.eq_ignore_ascii_case("metadata.google.internal") {
+    if bare
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case("metadata.google.internal")
+    {
         return Err("cloud metadata hostname is not permitted".to_owned());
     }
     if let Ok(ip) = bare.parse::<IpAddr>()
@@ -372,11 +377,14 @@ mod tests {
 
     #[test]
     fn validate_iroh_relay_url_and_filtered_endpoint_wasm() {
+        assert!(is_loopback_host("my-\u{00e9}.localhost"));
+        assert!(!is_loopback_host("my-\u{00e9}-host.org"));
         assert!(validate_iroh_relay_url_wasm("https://relay.example/").is_ok());
         assert!(validate_iroh_relay_url_wasm("http://127.0.0.1:8080/").is_ok());
         assert!(validate_iroh_relay_url_wasm("http://[::1]:8080/").is_ok());
         assert!(validate_iroh_relay_url_wasm("http://evil.example/").is_err());
         assert!(validate_iroh_relay_url_wasm("https://169.254.169.254/").is_err());
+        assert!(validate_iroh_relay_url_wasm("https://metadata.google.internal./").is_err());
         assert!(validate_iroh_relay_url_wasm("javascript:alert(1)").is_err());
         assert!(validate_iroh_relay_url_wasm("https://user@relay.example/").is_err());
         assert!(validate_iroh_relay_url_wasm("https://relay.example/\n").is_err());

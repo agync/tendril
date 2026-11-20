@@ -546,7 +546,10 @@ fn is_valid_url_hint(url: &str, secure_scheme: &str, loopback_scheme: &str) -> b
     {
         return false;
     }
-    if bare_host.eq_ignore_ascii_case("metadata.google.internal") {
+    if bare_host
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case("metadata.google.internal")
+    {
         return false;
     }
     if let Ok(ip) = bare_host.parse::<IpAddr>()
@@ -575,7 +578,9 @@ fn is_valid_host_port_hint(target: &str) -> bool {
         return false;
     };
     if host.is_empty()
-        || host.eq_ignore_ascii_case("metadata.google.internal")
+        || host
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case("metadata.google.internal")
         || host.contains([':', '/', '?', '#', '@'])
         || !host
             .bytes()

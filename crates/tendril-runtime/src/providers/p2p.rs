@@ -31,33 +31,65 @@ const P2P_MAGIC_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONCURRENT_ACCEPTS: usize = 64;
 const MAX_CONCURRENT_ACCEPTS_PER_PEER: usize = 4;
 
-struct PeerAcceptGuard {
-    counts: Arc<std::sync::Mutex<std::collections::HashMap<iroh::EndpointId, usize>>>,
-    peer: iroh::EndpointId,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum IncomingSourceKey {
+    Ip(IpAddr),
+    Peer(EndpointId),
+    Other,
 }
 
-impl PeerAcceptGuard {
+fn normalize_incoming_source(addr: &iroh::endpoint::IncomingAddr) -> IncomingSourceKey {
+    match addr {
+        iroh::endpoint::IncomingAddr::Ip(sock) => {
+            let ip = match sock.ip() {
+                IpAddr::V4(v4) => IpAddr::V4(v4),
+                IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => IpAddr::V4(v4),
+                    None => {
+                        let seg = v6.segments();
+                        IpAddr::V6(std::net::Ipv6Addr::new(
+                            seg[0], seg[1], seg[2], seg[3], 0, 0, 0, 0,
+                        ))
+                    }
+                },
+            };
+            IncomingSourceKey::Ip(ip)
+        }
+        iroh::endpoint::IncomingAddr::Relay { endpoint_id, .. } => {
+            IncomingSourceKey::Peer(*endpoint_id)
+        }
+        _ => IncomingSourceKey::Other,
+    }
+}
+
+struct PeerAcceptGuard<K: Eq + std::hash::Hash> {
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<K, usize>>>,
+    key: K,
+}
+
+impl<K: Eq + std::hash::Hash + Clone> PeerAcceptGuard<K> {
     fn try_acquire(
-        counts: Arc<std::sync::Mutex<std::collections::HashMap<iroh::EndpointId, usize>>>,
-        peer: iroh::EndpointId,
+        counts: Arc<std::sync::Mutex<std::collections::HashMap<K, usize>>>,
+        key: K,
+        limit: usize,
     ) -> Option<Self> {
         let mut map = counts.lock().unwrap_or_else(|err| err.into_inner());
-        let entry = map.entry(peer).or_insert(0);
-        if *entry >= MAX_CONCURRENT_ACCEPTS_PER_PEER {
+        let entry = map.entry(key.clone()).or_insert(0);
+        if *entry >= limit {
             return None;
         }
         *entry += 1;
         drop(map);
-        Some(Self { counts, peer })
+        Some(Self { counts, key })
     }
 }
 
-impl Drop for PeerAcceptGuard {
+impl<K: Eq + std::hash::Hash> Drop for PeerAcceptGuard<K> {
     fn drop(&mut self) {
         let mut map = self.counts.lock().unwrap_or_else(|err| err.into_inner());
-        if let Some(count) = map.get_mut(&self.peer) {
+        if let Some(count) = map.get_mut(&self.key) {
             if *count <= 1 {
-                map.remove(&self.peer);
+                map.remove(&self.key);
             } else {
                 *count -= 1;
             }
@@ -474,26 +506,47 @@ impl P2pListener {
         let write_timeout = DEFAULT_WRITE_TIMEOUT;
         let guard = EndpointGuard::new(endpoint);
         let (accepted_tx, accepted_rx) = mpsc::channel(32);
+        let incoming_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_ACCEPTS));
+        let pre_accepts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_ACCEPTS));
         let peer_accepts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let guard_clone = Arc::clone(&guard);
 
         let accept_task = tokio::spawn(async move {
             while let Some(incoming) = guard_clone.endpoint.accept().await {
-                let Ok(permit) = Arc::clone(&sem).try_acquire_owned() else {
+                let source_key = normalize_incoming_source(&incoming.remote_addr());
+                let Some(pre_guard) = PeerAcceptGuard::try_acquire(
+                    Arc::clone(&pre_accepts),
+                    source_key,
+                    MAX_CONCURRENT_ACCEPTS_PER_PEER,
+                ) else {
+                    incoming.ignore();
+                    continue;
+                };
+                let Ok(pre_permit) = Arc::clone(&incoming_sem).try_acquire_owned() else {
+                    drop(pre_guard);
+                    incoming.ignore();
                     continue;
                 };
                 let tx_c = accepted_tx.clone();
                 let stream_guard = Arc::clone(&guard_clone);
                 let peer_counts = Arc::clone(&peer_accepts);
+                let post_sem = Arc::clone(&sem);
                 tokio::spawn(async move {
-                    let _permit = permit;
-                    let Ok(Ok(conn)) = timeout(P2P_CONNECT_TIMEOUT, incoming).await else {
+                    let conn_res = timeout(P2P_CONNECT_TIMEOUT, incoming).await;
+                    drop(pre_permit);
+                    drop(pre_guard);
+                    let Ok(Ok(conn)) = conn_res else {
                         return;
                     };
-                    let Some(_peer_guard) =
-                        PeerAcceptGuard::try_acquire(peer_counts, conn.remote_id())
-                    else {
+                    let Ok(_permit) = post_sem.try_acquire_owned() else {
+                        return;
+                    };
+                    let Some(_peer_guard) = PeerAcceptGuard::try_acquire(
+                        peer_counts,
+                        conn.remote_id(),
+                        MAX_CONCURRENT_ACCEPTS_PER_PEER,
+                    ) else {
                         return;
                     };
                     let Ok(Ok((send, mut recv))) =
@@ -672,5 +725,29 @@ mod tests {
 
         let err = parse_p2p_endpoint(&format!("iroh://{ep_id}?unknown=1"));
         assert!(matches!(err, Err(RuntimeError::Protocol(_))));
+    }
+
+    #[test]
+    fn incoming_source_key_normalizes_ipv6_prefix_and_caps_concurrent_guards() {
+        let counts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let a1 = normalize_incoming_source(&iroh::endpoint::IncomingAddr::Ip(
+            "[2001:db8:1:2::10]:4433".parse().expect("sock"),
+        ));
+        let a2 = normalize_incoming_source(&iroh::endpoint::IncomingAddr::Ip(
+            "[2001:db8:1:2:ffff::99]:5555".parse().expect("sock"),
+        ));
+        assert_eq!(a1, a2);
+
+        let g1 = PeerAcceptGuard::try_acquire(Arc::clone(&counts), a1.clone(), 4).expect("1");
+        let g2 = PeerAcceptGuard::try_acquire(Arc::clone(&counts), a1.clone(), 4).expect("2");
+        let g3 = PeerAcceptGuard::try_acquire(Arc::clone(&counts), a1.clone(), 4).expect("3");
+        let g4 = PeerAcceptGuard::try_acquire(Arc::clone(&counts), a2, 4).expect("4");
+        assert!(PeerAcceptGuard::try_acquire(Arc::clone(&counts), a1.clone(), 4).is_none());
+        let other = normalize_incoming_source(&iroh::endpoint::IncomingAddr::Ip(
+            "192.0.2.50:4433".parse().expect("sock"),
+        ));
+        let g_other = PeerAcceptGuard::try_acquire(Arc::clone(&counts), other, 4).expect("other");
+        drop((g1, g2, g3, g4, g_other));
+        assert!(counts.lock().expect("lock").is_empty());
     }
 }

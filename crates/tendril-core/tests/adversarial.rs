@@ -2276,6 +2276,15 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
         format!(
             "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=iroh://abc?relay=http://169.254.169.254"
         ),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=relay:wss://metadata.google.internal./v1/relay"
+        ),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=direct:metadata.google.internal.:80"
+        ),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=overlay://169.254.169.254"
+        ),
     ] {
         assert!(
             PairingUri::parse(&bad_uri).is_err(),

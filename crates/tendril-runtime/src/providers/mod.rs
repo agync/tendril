@@ -394,9 +394,11 @@ pub fn is_loopback_host(host: &str) -> bool {
             IpAddr::V6(v6) => v6.is_loopback(),
         };
     }
+    let suffix = b".localhost";
+    let bare_bytes = bare.as_bytes();
     bare.eq_ignore_ascii_case("localhost")
-        || (bare.len() > ".localhost".len()
-            && bare[bare.len() - ".localhost".len()..].eq_ignore_ascii_case(".localhost"))
+        || (bare_bytes.len() > suffix.len()
+            && bare_bytes[bare_bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix))
 }
 
 /// Returns `true` if `ip` is a cloud metadata, link-local, or unspecified address.
@@ -463,7 +465,10 @@ fn validate_url_host_safety(parsed: &url::Url) -> Result<&str, RuntimeError> {
         .filter(|h| !h.is_empty())
         .ok_or_else(|| RuntimeError::Protocol("URL is missing a host".into()))?;
     let bare = strip_host_brackets(host);
-    if bare.eq_ignore_ascii_case("metadata.google.internal") {
+    if bare
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case("metadata.google.internal")
+    {
         return Err(RuntimeError::Protocol(
             "cloud metadata hostname is not permitted".into(),
         ));

@@ -19,14 +19,14 @@ bytes / commands + (now_unix, now_ms) ---> StateMachine ---> Vec<Action>
 ```
 
 - `ResumableFrameReader` bounds buffered bytes at `MAX_READ_BUFFER_LEN`, decodes the 6-byte cleartext preamble first, and rejects declared outer frame lengths above `65519` before payload allocation.
-- Private key scalars (`StaticKeypair`, `SigningKeypair`), pairing codes, and Argon2id outputs use `zeroize` wrappers and redact secrets from `Debug` output.
+- Private key scalars (`StaticKeypair`, `SigningKeypair`), pairing codes, Argon2id outputs, `snow` Noise DH/cipher/hash resolvers, and decoded handshake/transport plaintext buffers use `zeroize` wrappers and redact secrets from `Debug` output.
 
 ## Pairing and roster trust transitions
 
 | Component | Key Rules |
 |---|---|
 | `PairingManager` | Unbiased 31-char code sampling, `900 s` default TTL, `5` failed claims burn all live codes, single-use burn even when a `revoked` peer claims a live code, 2-group LAN codes rejected on `Remote` paths |
-| `PairingUri` | `tendril://pair?v=1&...` codec validating scheme, version, non-zero static and signing keys, and percent-encoded endpoint hints |
+| `PairingUri` | `tendril://pair?v=1&...` codec validating scheme, version, non-zero static and signing keys, strict query parameters, control-character absence, and validated endpoint hints |
 | `PairingInitiator` / `PairingResponder` | Decouples `pair` (`pending`) from host `confirm_peer` and `mint_grant`; validates optional QR pins before emitting `msg3` |
 | `Roster` | Indexes peer entries cleanly, matches inbound `Session` peers strictly on full 32-byte `static_pub`, enforces non-zero pins (`IncompletePin`), transitions immediately to `revoked` on trust-root rotation forks, and ingests monotonic signed CRLs |
 

@@ -1969,31 +1969,32 @@ async fn batch2a_sec06_p2p_per_peer_accept_cap() {
         .await
         .expect("bind attacker endpoint");
 
-    // Peer A opens 68 connections (> MAX_CONCURRENT_ACCEPTS = 64) without writing the 0x54 stream
-    // magic byte, attempting to saturate the global accept semaphore before legitimate peers arrive.
-    let mut tasks = Vec::new();
+    // Peer A floods 68 concurrent connections (> MAX_CONCURRENT_ACCEPTS = 64) without writing the
+    // 0x54 stream magic byte; per-peer pre/post-handshake caps limit Peer A to 4 slots.
+    let started = Instant::now();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let mut burst = Vec::new();
     for _ in 0..68 {
         let ep = attacker_ep.clone();
         let addr = target_addr.clone();
-        tasks.push(tokio::spawn(async move {
-            let conn = ep
-                .connect(addr, TENDRIL_P2P_ALPN)
-                .await
-                .map_err(|e| e.to_string())?;
-            let bi = conn.open_bi().await.map_err(|e| e.to_string())?;
-            Ok::<_, String>((conn, bi))
+        let held_c = Arc::clone(&held);
+        burst.push(tokio::spawn(async move {
+            if let Ok(Ok(conn)) = timeout(
+                Duration::from_millis(250),
+                ep.connect(addr, TENDRIL_P2P_ALPN),
+            )
+            .await
+                && let Ok(bi) = conn.open_bi().await
+            {
+                held_c.lock().expect("held lock").push((conn, bi));
+            }
         }));
     }
-    let mut attacker_conns = Vec::new();
-    for t in tasks {
-        if let Ok(Ok(held)) = timeout(Duration::from_secs(3), t).await {
-            attacker_conns.push(held);
-        }
-    }
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let held_count = held.lock().expect("held lock").len();
     assert!(
-        attacker_conns.len() >= 65,
-        "expected >= 65 attacker connections to exercise >64 global slots, got {}",
-        attacker_conns.len()
+        held_count >= 4,
+        "expected >= 4 attacker connections holding per-peer cap, got {held_count}"
     );
 
     let legit_dialer = P2pDialer::bind(P2pRelayMode::Disabled)
@@ -2005,10 +2006,17 @@ async fn batch2a_sec06_p2p_per_peer_accept_cap() {
         .expect("legit peer accept must not be blocked by attacker peer")
         .expect("accept ok");
     let cli_stream = dial_task.await.expect("dial join").expect("legit dial ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "legit dial must succeed before attacker accept_bi timeouts expire"
+    );
     assert_eq!(srv_stream.provider_id(), ProviderId::P2p);
     assert_eq!(cli_stream.provider_id(), ProviderId::P2p);
 
-    drop(attacker_conns);
+    for handle in burst {
+        handle.abort();
+    }
+    drop(held);
     attacker_ep.close().await;
 }
 
@@ -2068,6 +2076,8 @@ async fn batch2a_sec14_url_ssrf_and_filtered_p2p_addrs() {
     assert!(is_loopback_host("127.0.0.42"));
     assert!(is_loopback_host("[::1]"));
     assert!(is_loopback_host("[::ffff:127.0.0.1]"));
+    assert!(is_loopback_host("my-\u{00e9}.localhost"));
+    assert!(!is_loopback_host("my-\u{00e9}-host.org"));
     assert!(!is_loopback_host("example.com"));
 
     assert!(is_metadata_or_link_local_ip(
@@ -2121,6 +2131,12 @@ async fn batch2a_sec14_url_ssrf_and_filtered_p2p_addrs() {
     assert!(matches!(
         BrokerDialer::new().dial("wss://user@broker.example/ws").await,
         Err(RuntimeError::Protocol(msg)) if msg.contains("userinfo")
+    ));
+    assert!(matches!(
+        BrokerDialer::new()
+            .dial("wss://metadata.google.internal./ws")
+            .await,
+        Err(RuntimeError::Protocol(msg)) if msg.contains("metadata hostname")
     ));
 
     #[cfg(feature = "p2p-iroh")]

@@ -15,7 +15,7 @@ Confirming a peer's identity (`pair.confirm`) pins its cryptographic key and per
 Capabilities follow `namespace.verb` or `namespace.verb:resource`:
 
 - `namespace` and `verb` match `^[a-z][a-z0-9_]{0,31}$`.
-- `resource` uses printable non-whitespace ASCII and allows at most one trailing `'*'` prefix wildcard; matching operates on opaque ASCII strings, so path-scoped callers canonicalize paths before checking capabilities.
+- `resource` uses printable non-whitespace ASCII and allows at most one trailing `'*'` prefix wildcard; matching operates on opaque ASCII strings, while `canonicalize_capability_path`, `Capability::covers_path`, `grant_allows_path`, `authorize_path_capability`, and `SessionMachine::authorize_path` reject traversal, dot segments, backslashes, `//`, and trailing slashes for path-scoped checks.
 - Reserved core capabilities are `session.open`, `pair.confirm`, `pair.mint`, `roster.read`, and `roster.revoke`.
 
 ## Signing and delegation
