@@ -6,13 +6,19 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+p2p-iroh = ["dep:iroh"]
+
 [dependencies]
 async-trait.workspace = true
 ed25519-dalek.workspace = true
 futures-util.workspace = true
+iroh = { workspace = true, optional = true }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 tendril-core.workspace = true
 tendril-relay.workspace = true
 thiserror.workspace = true

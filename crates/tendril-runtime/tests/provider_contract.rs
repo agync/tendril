@@ -18,12 +18,16 @@ use tendril_core::roster::{PeerState, Roster};
 use tendril_core::wire::ResumableFrameReader;
 use tendril_relay::{RelayConfig, RelayHandle, RelayServer};
 use tendril_runtime::{
-    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer, LocalListener,
-    MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter,
+    BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_WRITE_TIMEOUT, DirectDialer,
+    DirectListener, EmbeddedRelay, LocalDialer, LocalListener, MAX_OUTER_FRAME_LEN, OverlayConfig,
+    OverlayDialer, OverlayHelperDialer, OverlayHelperListener, OverlayListener, OverlayMode,
+    OverlayResolvedMode, PathDialer, PathListener, PathStream, PreAuthConfig, PreAuthRateLimiter,
     RelayDialer, RelayListener, RuntimeError, SessionDriver, SessionEvent, StateStore,
-    dial_with_policy, drive_pair_initiator, drive_pair_responder, recv_tendril_frame,
-    send_tendril_frame,
+    dial_with_policy, drive_pair_initiator, drive_pair_responder, is_tailnet_ip,
+    recv_tendril_frame, select_overlay_mode, send_tendril_frame,
 };
+#[cfg(feature = "p2p-iroh")]
+use tendril_runtime::{P2pDialer, P2pListener, P2pRelayMode};
 use tokio::time::timeout;
 
 struct ProviderPair {
@@ -62,6 +66,38 @@ async fn setup_provider(provider: ProviderId) -> ProviderPair {
                 _relay: None,
             }
         }
+        ProviderId::Overlay => {
+            let listener = OverlayListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)), None)
+                .await
+                .expect("bind overlay");
+            let endpoint = listener.local_endpoint();
+            ProviderPair {
+                listener: Box::new(listener),
+                dialer: Box::new(OverlayDialer::new()),
+                endpoint,
+                _tmp: None,
+                _relay: None,
+            }
+        }
+        #[cfg(feature = "p2p-iroh")]
+        ProviderId::P2p => {
+            let listener = P2pListener::bind(P2pRelayMode::Disabled)
+                .await
+                .expect("bind p2p");
+            let dialer = P2pDialer::bind(P2pRelayMode::Disabled)
+                .await
+                .expect("bind p2p dialer");
+            let endpoint = listener.local_endpoint();
+            ProviderPair {
+                listener: Box::new(listener),
+                dialer: Box::new(dialer),
+                endpoint,
+                _tmp: None,
+                _relay: None,
+            }
+        }
+        #[cfg(not(feature = "p2p-iroh"))]
+        ProviderId::P2p => panic!("p2p requires p2p-iroh feature"),
         ProviderId::Relay => {
             let server = RelayServer::bind(RelayConfig::default())
                 .await
@@ -85,7 +121,24 @@ async fn setup_provider(provider: ProviderId) -> ProviderPair {
                 _relay: Some(handle),
             }
         }
-        other => panic!("unsupported provider in Phase 2 contract: {other:?}"),
+        ProviderId::Broker => {
+            let listener = BrokerListener::bind(BrokerServerConfig {
+                auth_header: Some(("authorization".to_owned(), "Bearer test-token".to_owned())),
+                ..BrokerServerConfig::default()
+            })
+            .await
+            .expect("bind broker");
+            let endpoint = listener.local_endpoint();
+            ProviderPair {
+                listener: Box::new(listener),
+                dialer: Box::new(
+                    BrokerDialer::new().with_header("authorization", "Bearer test-token"),
+                ),
+                endpoint,
+                _tmp: None,
+                _relay: None,
+            }
+        }
     }
 }
 
@@ -344,6 +397,22 @@ async fn six_point_provider_contract_relay() {
 }
 
 #[tokio::test]
+async fn six_point_provider_contract_overlay() {
+    run_six_point_contract(ProviderId::Overlay).await;
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn six_point_provider_contract_p2p() {
+    run_six_point_contract(ProviderId::P2p).await;
+}
+
+#[tokio::test]
+async fn six_point_provider_contract_broker() {
+    run_six_point_contract(ProviderId::Broker).await;
+}
+
+#[tokio::test]
 async fn pre_auth_rate_limiter_enforces_half_open_cap_32_and_ip_burst() {
     let limiter = PreAuthRateLimiter::new(PreAuthConfig {
         max_entries: 4,
@@ -499,7 +568,24 @@ async fn dial_with_policy_fails_over_from_unreachable_direct_to_live_relay() {
 
 #[tokio::test]
 async fn full_lifecycle_pair_confirm_mint_connect_authorize_data_rekey_revoke_across_providers() {
-    for provider in [ProviderId::Local, ProviderId::Direct, ProviderId::Relay] {
+    #[cfg(feature = "p2p-iroh")]
+    let providers = [
+        ProviderId::Local,
+        ProviderId::Direct,
+        ProviderId::Overlay,
+        ProviderId::P2p,
+        ProviderId::Relay,
+        ProviderId::Broker,
+    ];
+    #[cfg(not(feature = "p2p-iroh"))]
+    let providers = [
+        ProviderId::Local,
+        ProviderId::Direct,
+        ProviderId::Overlay,
+        ProviderId::Relay,
+        ProviderId::Broker,
+    ];
+    for provider in providers {
         let mut pair = setup_provider(provider).await;
         let now = 1_795_132_800;
 
@@ -830,4 +916,551 @@ async fn inbound_router_separates_pair_and_session_and_wakes_on_close() {
         .expect("waiter must wake promptly on close")
         .expect("join");
     assert!(matches!(woke, Ok(None)));
+}
+
+#[tokio::test]
+async fn overlay_mode_selection_and_scoped_unix_helper_roundtrip() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
+
+    assert!(is_tailnet_ip("100.100.100.100".parse().expect("v4")));
+    assert!(!is_tailnet_ip("192.168.1.10".parse().expect("lan")));
+    assert!(is_tailnet_ip("fd7a:115c:a1e0::1".parse().expect("ts v6")));
+    assert!(!is_tailnet_ip("fe80::1".parse().expect("ll")));
+
+    let base_cfg = OverlayConfig::default();
+    assert_eq!(
+        select_overlay_mode(&base_cfg, false),
+        OverlayResolvedMode::Unavailable
+    );
+    assert_eq!(
+        select_overlay_mode(&base_cfg, true),
+        OverlayResolvedMode::Host
+    );
+
+    let tmp = TempDir::new().expect("tempdir");
+    let key_file = tmp.path().join("authkey");
+    let missing_cred_cfg = OverlayConfig {
+        mode: OverlayMode::Helper,
+        helper_bin: Some(tmp.path().join("tendril-tsnet")),
+        ..OverlayConfig::default()
+    };
+    assert_eq!(
+        select_overlay_mode(&missing_cred_cfg, true),
+        OverlayResolvedMode::Unavailable
+    );
+    let helper_cfg = OverlayConfig {
+        mode: OverlayMode::Auto,
+        helper_bin: Some(tmp.path().join("tendril-tsnet")),
+        auth_key_file: Some(key_file),
+        ..OverlayConfig::default()
+    };
+    assert_eq!(
+        select_overlay_mode(&helper_cfg, true),
+        OverlayResolvedMode::Helper
+    );
+    let disabled_cfg = OverlayConfig {
+        mode: OverlayMode::Disabled,
+        ..helper_cfg
+    };
+    assert_eq!(
+        select_overlay_mode(&disabled_cfg, true),
+        OverlayResolvedMode::Unavailable
+    );
+
+    let ipc_dir = tmp.path().join("tsnet-ipc");
+    let listen_sock = ipc_dir.join("accept.sock");
+    let dial_sock = ipc_dir.join("dial.sock");
+    let mut overlay_listener =
+        OverlayHelperListener::bind(&listen_sock).expect("bind helper accept");
+    #[cfg(unix)]
+    {
+        let dir_mode = std::fs::metadata(&ipc_dir)
+            .expect("dir meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        let sock_mode = std::fs::metadata(&listen_sock)
+            .expect("sock meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(sock_mode, 0o600);
+    }
+
+    let helper_dial_listener = UnixListener::bind(&dial_sock).expect("bind helper dial");
+    let listen_sock_c = listen_sock.clone();
+    tokio::spawn(async move {
+        if let Ok((cli_ipc, _)) = helper_dial_listener.accept().await {
+            let mut reader = BufReader::new(cli_ipc);
+            let mut req_line = String::new();
+            let _ = reader.read_line(&mut req_line).await;
+            let mut cli_ipc = reader.into_inner();
+            let mut srv_ipc = UnixStream::connect(&listen_sock_c)
+                .await
+                .expect("connect accept");
+            srv_ipc
+                .write_all(b"{\"op\":\"accept\",\"peer_ip\":\"100.64.0.10\"}\n")
+                .await
+                .expect("send accept");
+            let mut ack_buf = [0u8; 64];
+            let n = tokio::io::AsyncReadExt::read(&mut srv_ipc, &mut ack_buf)
+                .await
+                .expect("read ack");
+            assert!(
+                std::str::from_utf8(&ack_buf[..n])
+                    .expect("utf8")
+                    .contains("\"ok\":true")
+            );
+            cli_ipc
+                .write_all(b"{\"ok\":true}\n")
+                .await
+                .expect("send dial ack");
+            let _ = tokio::io::copy_bidirectional(&mut cli_ipc, &mut srv_ipc).await;
+        }
+    });
+
+    let dialer = OverlayHelperDialer::new(&dial_sock);
+    let (acc, dialed) = tokio::join!(
+        overlay_listener.accept(),
+        dialer.dial("overlay-helper://demo-host.ts.net:443")
+    );
+    let mut srv_stream = acc.expect("accept helper");
+    let mut cli_stream = dialed.expect("dial helper");
+    assert_eq!(srv_stream.provider_id(), ProviderId::Overlay);
+    assert_eq!(cli_stream.provider_id(), ProviderId::Overlay);
+    assert_eq!(
+        srv_stream.peer_ip(),
+        Some("100.64.0.10".parse().expect("ip"))
+    );
+
+    send_tendril_frame(cli_stream.as_mut(), b"hello-overlay-helper")
+        .await
+        .expect("send frame");
+    let mut reader = ResumableFrameReader::new();
+    let got = recv_tendril_frame(srv_stream.as_mut(), &mut reader)
+        .await
+        .expect("recv frame");
+    assert_eq!(got, b"hello-overlay-helper");
+
+    // Verify {"ok":false} helper rejection and oversized control line rejection.
+    let err_sock = ipc_dir.join("err-dial.sock");
+    let err_listener = UnixListener::bind(&err_sock).expect("bind err sock");
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = err_listener.accept().await {
+            let mut reader = BufReader::new(&mut s);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            let _ = s.write_all(b"{\"ok\":false,\"error\":\"denied\"}\n").await;
+        }
+        if let Ok((mut s, _)) = err_listener.accept().await {
+            let mut reader = BufReader::new(&mut s);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            let long_line = vec![b'x'; 2048];
+            let _ = s.write_all(&long_line).await;
+        }
+    });
+    let err_dialer = OverlayHelperDialer::new(&err_sock);
+    assert!(matches!(
+        err_dialer.dial("overlay-helper://x").await,
+        Err(RuntimeError::Protocol(_))
+    ));
+    assert!(matches!(
+        err_dialer.dial("overlay-helper://x").await,
+        Err(RuntimeError::Protocol(_))
+    ));
+}
+
+#[tokio::test]
+async fn broker_rejects_wrong_path_and_invalid_auth_header() {
+    use futures_util::SinkExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut listener = BrokerListener::bind(BrokerServerConfig {
+        path: "/custom/tunnel".to_owned(),
+        auth_header: Some(("x-tendril-token".to_owned(), "secret-v1".to_owned())),
+        ..BrokerServerConfig::default()
+    })
+    .await
+    .expect("bind broker");
+    let addr = listener.local_addr();
+
+    let wrong_path = BrokerDialer::new()
+        .with_header("x-tendril-token", "secret-v1")
+        .dial(&format!("broker+ws://{addr}/wrong"))
+        .await;
+    assert!(matches!(wrong_path, Err(RuntimeError::Protocol(_))));
+
+    let missing_auth = BrokerDialer::new()
+        .dial(&format!("broker+ws://{addr}/custom/tunnel"))
+        .await;
+    assert!(matches!(missing_auth, Err(RuntimeError::Protocol(_))));
+
+    let bad_auth = BrokerDialer::new()
+        .with_header("x-tendril-token", "wrong-token")
+        .dial(&format!("broker+ws://{addr}/custom/tunnel"))
+        .await;
+    assert!(matches!(bad_auth, Err(RuntimeError::Protocol(_))));
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut dup_req = format!("ws://{addr}/custom/tunnel")
+        .into_client_request()
+        .expect("dup req");
+    dup_req
+        .headers_mut()
+        .append("x-tendril-token", "secret-v1".parse().expect("hdr"));
+    dup_req
+        .headers_mut()
+        .append("x-tendril-token", "secret-v1".parse().expect("hdr"));
+    assert!(connect_async(dup_req).await.is_err());
+
+    let mut raw = TcpStream::connect(addr).await.expect("raw tcp");
+    raw.write_all(
+        b"POST /custom/tunnel HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nx-tendril-token: secret-v1\r\n\r\n",
+    )
+    .await
+    .expect("write POST");
+    let mut http_buf = [0u8; 256];
+    let n = raw.read(&mut http_buf).await.expect("read POST reply");
+    let resp = std::str::from_utf8(&http_buf[..n]).unwrap_or_default();
+    assert!(
+        n == 0 || resp.starts_with("HTTP/1.1 4"),
+        "unexpected HTTP reply to POST upgrade: {resp:?}"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "listener should not accept POST upgrade"
+    );
+
+    // Connect a raw authenticated WebSocket and verify non-binary text frame is rejected.
+    let mut req = format!("ws://{addr}/custom/tunnel")
+        .into_client_request()
+        .expect("req");
+    req.headers_mut()
+        .insert("x-tendril-token", "secret-v1".parse().expect("hdr"));
+    let (mut raw_ws, _) = connect_async(req).await.expect("connect text test");
+    let mut accepted = listener.accept().await.expect("accept text test");
+    raw_ws
+        .send(Message::Text("bad-text".into()))
+        .await
+        .expect("send text");
+    let mut tmp_buf = [0u8; 64];
+    assert!(matches!(
+        accepted.recv_chunk(&mut tmp_buf).await,
+        Err(RuntimeError::Protocol(_))
+    ));
+
+    let ok_stream = BrokerDialer::new()
+        .with_header("x-tendril-token", "secret-v1")
+        .dial(&format!("broker+ws://{addr}/custom/tunnel"))
+        .await
+        .expect("valid broker dial");
+    assert_eq!(ok_stream.provider_id(), ProviderId::Broker);
+    drop(listener);
+}
+
+#[tokio::test]
+async fn relay_hint_migration_public_to_self_hosted_to_embedded_without_repairing() {
+    let relay_a = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind relay a")
+        .spawn();
+    let relay_b = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind relay b")
+        .spawn();
+    let relay_c = EmbeddedRelay::bind_local("localhost")
+        .await
+        .expect("bind embedded relay");
+
+    let host_dir = TempDir::new().expect("host dir");
+    let cli_dir = TempDir::new().expect("cli dir");
+    let host_store = StateStore::open_or_create(host_dir.path()).expect("host store");
+    let cli_store = StateStore::open_or_create(cli_dir.path()).expect("cli store");
+    let host_id = host_store
+        .load_or_generate_identity(Some("mig-host"))
+        .expect("host id");
+    let cli_id = cli_store
+        .load_or_generate_identity(Some("mig-cli"))
+        .expect("cli id");
+
+    let mut cli_roster = Roster::new();
+    let mgr = Mutex::new(PairingManager::new(PairingConfig::default()));
+    let now = 1_795_132_800;
+
+    // Step 1: Pair ONCE through Relay A (simulating public relay).
+    let mut host_relay_a = RelayListener::bind(
+        relay_a.ws_url(),
+        Some("localhost".to_owned()),
+        host_id.signing_key().signing_key(),
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await
+    .expect("host listen A");
+    let ep_a = host_relay_a.local_endpoint();
+    let code = mgr
+        .lock()
+        .expect("lock")
+        .issue_code(PairingCodeKind::Remote3Group, now)
+        .expect("code");
+    let dialer = RelayDialer::new().with_expected_host("localhost");
+
+    let (srv_p, cli_p) = tokio::join!(host_relay_a.accept(), dialer.dial(&ep_a));
+    let mut srv_p = srv_p.expect("accept pair A");
+    let mut cli_p = cli_p.expect("dial pair A");
+    let host_r = Mutex::new(Roster::new());
+    let (h_res, c_res) = tokio::join!(
+        drive_pair_responder(
+            srv_p.as_mut(),
+            &host_id,
+            &mgr,
+            &host_r,
+            PairingPathKind::Remote,
+            now,
+            None
+        ),
+        drive_pair_initiator(
+            cli_p.as_mut(),
+            &cli_id,
+            "phone".to_owned(),
+            "ios".to_owned(),
+            code,
+            None
+        )
+    );
+    let h_pair = h_res.expect("host pair");
+    let c_pair = c_res.expect("cli pair");
+    let mut host_roster = host_r.into_inner().expect("unlock");
+    let (cli_dev, sas) = match h_pair.outcome {
+        PairOutcome::ResponderPending {
+            device_id,
+            pairing_sas,
+            ..
+        } => (device_id, pairing_sas),
+        other => panic!("unexpected pair: {other:?}"),
+    };
+    let PairOutcome::InitiatorPending {
+        host_id: learned_host_id,
+        host_static_pub,
+        host_signing_pub,
+        host_rotation_seq,
+        ..
+    } = c_pair.outcome
+    else {
+        panic!("expected InitiatorPending");
+    };
+    cli_roster
+        .insert_pinned_host(
+            learned_host_id.clone(),
+            "mig-host".to_owned(),
+            host_static_pub,
+            Some(host_signing_pub),
+            host_rotation_seq,
+            vec![ep_a.clone()],
+        )
+        .expect("pin host");
+    host_roster
+        .confirm_peer(&cli_dev, Some(&sas))
+        .expect("confirm");
+    let grant = host_roster
+        .mint_grant(
+            &host_id,
+            &cli_dev,
+            vec!["fs.read:/notes/*".to_owned()],
+            now - 60,
+            now + 3600,
+            [9u8; 16],
+        )
+        .expect("mint");
+    cli_store.save_roster(&cli_roster).expect("save cli A");
+
+    // Step 2: Migrate relay hints from Relay A -> Relay B (self-hosted), zero re-pairing.
+    drop(host_relay_a);
+    relay_a.stop().await.expect("stop A");
+    let mut host_relay_b = RelayListener::bind(
+        relay_b.ws_url(),
+        Some("localhost".to_owned()),
+        host_id.signing_key().signing_key(),
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await
+    .expect("host listen B");
+    let ep_b = host_relay_b.local_endpoint();
+    let mut cli_roster = cli_store.load_roster().expect("reload cli roster");
+    cli_roster
+        .update_relay_hints(&learned_host_id, vec![ep_b.clone()])
+        .expect("update hint B");
+    cli_store.save_roster(&cli_roster).expect("save cli B");
+
+    let (srv_b, cli_b) = tokio::join!(host_relay_b.accept(), dialer.dial(&ep_b));
+    let (h_b, c_b) = tokio::join!(
+        SessionDriver::accept(srv_b.expect("srv B"), &host_id, &mut host_roster, now, None),
+        SessionDriver::connect(
+            cli_b.expect("cli B"),
+            &cli_id,
+            &learned_host_id,
+            Some(grant.clone()),
+            &mut cli_roster,
+            now
+        )
+    );
+    let mut host_sess_b = h_b.expect("host sess B");
+    let mut cli_sess_b = c_b.expect("cli sess B");
+    cli_sess_b
+        .send_data(b"via-self-hosted-relay")
+        .await
+        .expect("send B");
+    assert_eq!(
+        host_sess_b
+            .next_event(now, &mut host_roster)
+            .await
+            .expect("ev B"),
+        Some(SessionEvent::AppData(b"via-self-hosted-relay".to_vec()))
+    );
+    drop(cli_sess_b);
+    drop(host_sess_b);
+
+    // Step 3: Migrate relay hints from Relay B -> EmbeddedRelay, keeping same pin + grant + rekey.
+    drop(host_relay_b);
+    relay_b.stop().await.expect("stop B");
+    let mut host_relay_c = RelayListener::bind(
+        relay_c.ws_url(),
+        Some(relay_c.host().to_owned()),
+        host_id.signing_key().signing_key(),
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await
+    .expect("host listen C");
+    let ep_c = host_relay_c.local_endpoint();
+    cli_roster
+        .update_relay_hints(&learned_host_id, vec![ep_c.clone()])
+        .expect("update hint C");
+    cli_store.save_roster(&cli_roster).expect("save cli C");
+
+    let mut reloaded_cli = cli_store.load_roster().expect("reload cli C");
+    assert_eq!(
+        reloaded_cli.get(&learned_host_id).expect("pin").relay_hints,
+        vec![ep_c.clone()]
+    );
+    let (srv_c, cli_c) = tokio::join!(host_relay_c.accept(), dialer.dial(&ep_c));
+    let (h_c, c_c) = tokio::join!(
+        SessionDriver::accept(srv_c.expect("srv C"), &host_id, &mut host_roster, now, None),
+        SessionDriver::connect(
+            cli_c.expect("cli C"),
+            &cli_id,
+            &learned_host_id,
+            Some(grant),
+            &mut reloaded_cli,
+            now
+        )
+    );
+    let mut host_sess_c = h_c.expect("host sess C");
+    let mut cli_sess_c = c_c.expect("cli sess C");
+    assert!(
+        host_sess_c
+            .authorize("fs.read:/notes/1.md", now, &host_roster)
+            .0
+            .is_ok()
+    );
+    cli_sess_c.send_rekey().await.expect("rekey C");
+    cli_sess_c
+        .send_data(b"via-embedded-relay")
+        .await
+        .expect("send C");
+    let mut got_rekey = false;
+    let mut got_data = false;
+    for _ in 0..4 {
+        match host_sess_c
+            .next_event(now, &mut host_roster)
+            .await
+            .expect("ev C")
+        {
+            Some(SessionEvent::Rekeyed { .. }) => got_rekey = true,
+            Some(SessionEvent::AppData(d)) if d == b"via-embedded-relay" => {
+                got_data = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(got_rekey && got_data);
+    drop(host_relay_c);
+    relay_c.shutdown().await.expect("shutdown embedded relay");
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn dial_with_policy_respects_p2p_cold_delay_and_falls_back_across_rungs() {
+    let mut p2p_listener = P2pListener::bind(P2pRelayMode::Disabled)
+        .await
+        .expect("bind p2p");
+    let p2p_ep = p2p_listener.local_endpoint();
+    let p2p_dialer = Arc::new(
+        P2pDialer::bind(P2pRelayMode::Disabled)
+            .await
+            .expect("p2p dialer"),
+    );
+
+    let unused_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused");
+    let dead_addr = unused_listener.local_addr().expect("unused addr");
+    drop(unused_listener);
+
+    // Dead Direct + live P2p -> falls back to P2p after cold delay.
+    let dialers: Vec<Arc<dyn PathDialer>> = vec![
+        Arc::new(DirectDialer::new()),
+        Arc::clone(&p2p_dialer) as Arc<dyn PathDialer>,
+    ];
+    let cands = vec![
+        CandidateEndpoint::new(1, ProviderId::Direct, dead_addr.to_string()),
+        CandidateEndpoint::new(2, ProviderId::P2p, p2p_ep.clone()),
+    ];
+    let accept_task = tokio::spawn(async move { p2p_listener.accept().await });
+    let (winner, mut cli_stream) = dial_with_policy(&dialers, PathPolicyConfig::default(), cands)
+        .await
+        .expect("fallback to p2p");
+    assert_eq!(winner.provider, ProviderId::P2p);
+    let mut srv_stream = accept_task.await.expect("join").expect("accept");
+    send_tendril_frame(cli_stream.as_mut(), b"policy-p2p")
+        .await
+        .expect("send");
+    let mut reader = ResumableFrameReader::new();
+    assert_eq!(
+        recv_tendril_frame(srv_stream.as_mut(), &mut reader)
+            .await
+            .expect("recv"),
+        b"policy-p2p"
+    );
+
+    // Dead P2p -> falls back cleanly to live Broker.
+    let mut broker_listener = BrokerListener::bind(BrokerServerConfig::default())
+        .await
+        .expect("bind broker");
+    let broker_ep = broker_listener.local_endpoint();
+    let dialers2: Vec<Arc<dyn PathDialer>> = vec![p2p_dialer, Arc::new(BrokerDialer::new())];
+    let bad_p2p =
+        "iroh://0000000000000000000000000000000000000000000000000000000000000000?addr=127.0.0.1:9";
+    let cands2 = vec![
+        CandidateEndpoint::new(1, ProviderId::P2p, bad_p2p),
+        CandidateEndpoint::new(2, ProviderId::Broker, broker_ep),
+    ];
+    let accept_broker = tokio::spawn(async move { broker_listener.accept().await });
+    let (winner2, _cli2) = dial_with_policy(
+        &dialers2,
+        PathPolicyConfig {
+            p2p_cold_delay_ms: 50,
+            ..PathPolicyConfig::default()
+        },
+        cands2,
+    )
+    .await
+    .expect("fallback to broker");
+    assert_eq!(winner2.provider, ProviderId::Broker);
+    let _srv2 = accept_broker.await.expect("join").expect("broker accept");
 }

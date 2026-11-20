@@ -18,7 +18,14 @@ pub use provider::{
     PrefixedPathStream, peek_exact, recv_tendril_frame, send_tendril_frame,
 };
 pub use providers::{
-    DirectDialer, DirectListener, LocalDialer, LocalListener, RelayDialer, RelayListener,
+    BrokerDialer, BrokerListener, BrokerServerConfig, DirectDialer, DirectListener, EmbeddedRelay,
+    LocalDialer, LocalListener, OverlayConfig, OverlayDialer, OverlayHelperDialer,
+    OverlayHelperListener, OverlayListener, OverlayMode, OverlayResolvedMode, RelayDialer,
+    RelayListener, is_tailnet_ip, select_overlay_mode,
+};
+#[cfg(feature = "p2p-iroh")]
+pub use providers::{
+    P2pDialer, P2pListener, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint, parse_p2p_endpoint,
 };
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};

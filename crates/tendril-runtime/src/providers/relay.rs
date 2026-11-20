@@ -1,8 +1,7 @@
 //! Untrusted WebSocket relay path provider (`relay`) speaking `spec/relay-v1.md`.
 
-use std::collections::VecDeque;
-use std::net::IpAddr;
-use std::sync::{Arc, Once};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,36 +12,23 @@ use tendril_core::policy::ProviderId;
 use tendril_relay::protocol::{
     MAX_RELAY_FRAME_LEN, RelayClientMsg, RelayServerMsg, sign_relay_accept, sign_relay_register,
 };
-use tendril_relay::server::ClientWsStream;
+use tendril_relay::server::{ClientWsStream, RelayConfig, RelayHandle, RelayServer};
+use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, connect_async_with_config};
 
+use super::{WsBinaryPathStream, ensure_rustls_ring_provider, ws_binary_config};
 use crate::error::RuntimeError;
-use crate::provider::{
-    DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathStream,
-};
+use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_ACCEPTS: usize = 16;
 
-static RUSTLS_INIT: Once = Once::new();
-
-fn ensure_rustls_ring_provider() {
-    RUSTLS_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
-fn client_ws_config() -> WebSocketConfig {
-    WebSocketConfig::default()
-        .write_buffer_size(0)
-        .max_write_buffer_size(MAX_RELAY_FRAME_LEN * 2)
-        .max_message_size(Some(MAX_RELAY_FRAME_LEN))
-        .max_frame_size(Some(MAX_RELAY_FRAME_LEN))
+fn client_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    ws_binary_config()
 }
 
 async fn recv_control_msg(ws: &mut ClientWsStream) -> Result<RelayServerMsg, RuntimeError> {
@@ -154,17 +140,19 @@ async fn connect_and_verify_challenge(
 
 /// Active binary bridge stream over a Tendril v1 WebSocket relay.
 pub struct RelayStream {
-    ws: ClientWsStream,
-    write_timeout: Duration,
-    pending_read: VecDeque<u8>,
+    inner: WsBinaryPathStream<MaybeTlsStream<TcpStream>>,
 }
 
 impl RelayStream {
     fn new(ws: ClientWsStream, write_timeout: Duration) -> Self {
         Self {
-            ws,
-            write_timeout,
-            pending_read: VecDeque::new(),
+            inner: WsBinaryPathStream::new(
+                ProviderId::Relay,
+                None,
+                ws,
+                write_timeout,
+                MAX_RELAY_FRAME_LEN,
+            ),
         }
     }
 }
@@ -172,79 +160,23 @@ impl RelayStream {
 #[async_trait]
 impl PathStream for RelayStream {
     fn provider_id(&self) -> ProviderId {
-        ProviderId::Relay
+        self.inner.provider_id()
     }
 
-    fn peer_ip(&self) -> Option<IpAddr> {
-        None
+    fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.inner.peer_ip()
     }
 
     async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
-        if bytes.len() > MAX_OUTER_FRAME_LEN {
-            return Err(RuntimeError::FrameTooLarge {
-                size: bytes.len(),
-                max: MAX_OUTER_FRAME_LEN,
-            });
-        }
-        match timeout(
-            self.write_timeout,
-            self.ws.send(Message::Binary(bytes.to_vec().into())),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(RuntimeError::Protocol(err.to_string())),
-            Err(_) => Err(RuntimeError::Timeout("relay stream write timed out")),
-        }
+        self.inner.send_chunk(bytes).await
     }
 
     async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, RuntimeError> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if !self.pending_read.is_empty() {
-            let take = buf.len().min(self.pending_read.len());
-            for slot in &mut buf[..take] {
-                *slot = self.pending_read.pop_front().expect("checked non-empty");
-            }
-            return Ok(take);
-        }
-
-        while let Some(item) = self.ws.next().await {
-            match item {
-                Ok(Message::Binary(data)) => {
-                    if data.len() > MAX_RELAY_FRAME_LEN {
-                        return Err(RuntimeError::FrameTooLarge {
-                            size: data.len(),
-                            max: MAX_RELAY_FRAME_LEN,
-                        });
-                    }
-                    if data.is_empty() {
-                        continue;
-                    }
-                    let take = buf.len().min(data.len());
-                    buf[..take].copy_from_slice(&data[..take]);
-                    if take < data.len() {
-                        self.pending_read.extend(&data[take..]);
-                    }
-                    return Ok(take);
-                }
-                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
-                Ok(Message::Close(_)) => return Ok(0),
-                Ok(other) => {
-                    return Err(RuntimeError::Protocol(format!(
-                        "unexpected non-binary relay frame: {other:?}"
-                    )));
-                }
-                Err(err) => return Err(RuntimeError::Protocol(err.to_string())),
-            }
-        }
-        Ok(0)
+        self.inner.recv_chunk(buf).await
     }
 
     async fn close(&mut self) -> Result<(), RuntimeError> {
-        let _ = timeout(self.write_timeout, self.ws.close(None)).await;
-        Ok(())
+        self.inner.close().await
     }
 }
 
@@ -508,5 +440,59 @@ impl PathDialer for RelayDialer {
         })?;
         let target_pub = b64url_decode_array::<32>(target_b64)?;
         self.connect(url, &target_pub).await
+    }
+}
+
+/// Embedded in-process [`tendril_relay`] server backing zero-dependency relay fallback.
+#[derive(Debug)]
+pub struct EmbeddedRelay {
+    handle: RelayHandle,
+    host: String,
+}
+
+impl EmbeddedRelay {
+    /// Starts an embedded relay configured with `config`.
+    pub async fn start(config: RelayConfig) -> Result<Self, RuntimeError> {
+        let host = config.host.clone();
+        let server = RelayServer::bind(config)
+            .await
+            .map_err(|err| RuntimeError::Protocol(err.to_string()))?;
+        let handle = server.spawn();
+        Ok(Self { handle, host })
+    }
+
+    /// Binds an embedded relay on `127.0.0.1:0` expecting `host` in challenge messages.
+    pub async fn bind_local(host: impl Into<String>) -> Result<Self, RuntimeError> {
+        let config = RelayConfig {
+            host: host.into(),
+            ..RelayConfig::default()
+        };
+        Self::start(config).await
+    }
+
+    /// Returns the bound local socket address of the embedded relay.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.handle.local_addr()
+    }
+
+    /// Returns the `ws://.../v1/relay` URL served by this embedded relay.
+    #[must_use]
+    pub fn ws_url(&self) -> String {
+        self.handle.ws_url()
+    }
+
+    /// Returns the configured expected host identifier advertised by challenges.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Gracefully stops the embedded relay task.
+    pub async fn shutdown(self) -> Result<(), RuntimeError> {
+        self.handle
+            .stop()
+            .await
+            .map_err(|err| RuntimeError::Protocol(err.to_string()))
     }
 }

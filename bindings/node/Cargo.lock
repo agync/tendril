@@ -1179,6 +1179,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "subtle",
  "tendril-core",
  "tendril-relay",
  "thiserror",

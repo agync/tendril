@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use tendril_core::policy::ProviderId;
 use tokio::net::{UnixListener, UnixStream};
 
+use super::set_mode_0600;
 use crate::error::RuntimeError;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, IoPathStream, PathDialer, PathListener, PathStream};
 
@@ -26,7 +27,7 @@ impl LocalListener {
             fs::remove_file(&path)?;
         }
         let listener = UnixListener::bind(&path)?;
-        set_socket_mode_0600(&path)?;
+        set_mode_0600(&path)?;
         Ok(Self {
             listener,
             path,
@@ -124,16 +125,4 @@ impl PathDialer for LocalDialer {
         let path = endpoint.strip_prefix("unix://").unwrap_or(endpoint);
         self.connect(path).await
     }
-}
-
-#[cfg(unix)]
-fn set_socket_mode_0600(path: &Path) -> Result<(), RuntimeError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_socket_mode_0600(_path: &Path) -> Result<(), RuntimeError> {
-    Ok(())
 }
