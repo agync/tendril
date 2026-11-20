@@ -58,16 +58,25 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 | `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26) | 3,412,800 bytes | 3,412,472 bytes (3.25 MiB) stripped | `stat -c%s` before and after `llvm-strip` |
 | `aarch64-apple-ios` static archive | `aarch64-apple-ios` | Not measured on Linux | Not measured on Linux | Requires Apple Xcode toolchain |
 
-## Gate #8 Chromium WASM Argon2id timings
+## Gate #8 WASM Argon2id timings
 
-Measured in headless Google Chrome via `bindings/web/test/browser_e2e.mjs` (`benchmarkArgon2`):
+Measured via `benchmarkArgon2` (`t=3, m=64 MiB, p=1`) in headless desktop Google Chrome (`bindings/web/test/browser_e2e.mjs`) and on a physical mobile phone browser over TLS relay demo:
 
 | Execution Context | Runs | Min (ms) | Median (ms) | Max (ms) | Notes |
 |---|---|---|---|---|---|
-| Browser main thread (`useWorker: false`) | 3 | 158.6 | 159.4 | 163.9 | Single-call `compute_code_mac` (`t=3, m=64 MiB, p=1`) |
-| Web Worker (`useWorker: true`) | 2 | 168.7 | 193.8 | 193.8 | Includes worker spawn and WASM initialization overhead |
+| Desktop headless Chrome (main thread) | 3 | 158.6 | 159.4 | 163.9 | Single-call `compute_code_mac` (`useWorker: false`) |
+| Desktop headless Chrome (Web Worker) | 2 | 168.7 | 193.8 | 193.8 | Includes worker spawn and WASM init (`useWorker: true`) |
+| Mobile phone browser (main thread) | 3 | 153.8 | 155.8 | 171.7 | Physical phone run against hosted demo (`useWorker: false`) |
+| Mobile phone browser (Web Worker) | 3 | 402.6 | 665.7 | 1030.9 | Includes worker spawn and WASM init per call (`useWorker: true`) |
 
-Physical phone Chrome/Safari Argon2id timings and manual Gate #9 Wi-Fi/cellular transition timing remain pending device testing against the live demo stack.
+## Gate #9 real-device relay pairing and reconnect baseline
+
+Observed between a physical mobile browser and the desktop Rust `tendril` CLI host over the WebSocket relay demo (`< 30 s` pairing target):
+
+- **Remote pairing:** `0.59 s` end-to-end with verified 16-character SAS match and host `tendril confirm`.
+- **Authenticated session connect:** `332.1 ms` initial Noise XX handshake over relay (`164.5 ms` repeat connect).
+- **Encrypted control and data round-trip:** `27 ms` encrypted `0x05 PING` -> `0x06 PONG`, followed by `0x04 REKEY` and verified plaintext delivery (`21` bytes) decoded on the Rust host.
+- **Disconnect and reconnect recovery:** Re-established authenticated relay sessions in `526.5 ms`, `520.4 ms`, and `418.0 ms` across manual reconnect and connectivity restoration tests.
 
 ## Verification commands
 
