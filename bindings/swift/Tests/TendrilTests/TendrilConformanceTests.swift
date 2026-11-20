@@ -80,6 +80,22 @@ final class TendrilConformanceTests: XCTestCase {
     )
     XCTAssertEqual(finalSeq, 2)
 
+    let forkEntry = (rot["fork_record"] as! [String: Any])["record"] as! [String: Any]
+    let forkJson = String(
+      data: try JSONSerialization.data(withJSONObject: [records[0], forkEntry]),
+      encoding: .utf8
+    )!
+    XCTAssertThrowsError(
+      try TendrilCrypto.verifyRotationChainJson(
+        pinnedSigningB64: pSig,
+        pinnedStaticB64: pStat,
+        pinnedSeq: 0,
+        chainJson: forkJson,
+        curStaticB64: lastRec["new_static_pub"] as! String,
+        curSigningB64: lastRec["new_signing_pub"] as! String
+      )
+    )
+
     let gv = try loadJson("grants.json")
     let keys: [String: String] = [
       gv["root_issuer_id"] as! String: b64Url(hexData(gv["root_signing_pub_hex"] as! String)),
@@ -116,5 +132,59 @@ final class TendrilConformanceTests: XCTestCase {
         nowUnix: 1795564800
       )
     )
+  }
+
+  func testLocalEndpointLifecycle() throws {
+    let host = try TendrilEndpoint(hostId: "swift-host")
+    let client = try TendrilEndpoint(hostId: "swift-client")
+    defer {
+      host.close()
+      client.close()
+    }
+
+    let addr = try host.serveDirect(listenAddr: "127.0.0.1:0")
+    let code = try host.issueCode(kind: "lan")
+
+    let pairQueue = DispatchQueue(label: "tendril.swift.pair")
+    let pairExp = expectation(description: "pair accept")
+    var acceptJson = ""
+    pairQueue.async {
+      acceptJson = (try? host.pairAccept(timeoutMs: 5000)) ?? ""
+      pairExp.fulfill()
+    }
+    let initJson = try client.pairInitiate(endpoint: addr, code: code, deviceName: "swift-phone", deviceKind: "ios")
+    wait(for: [pairExp], timeout: 5.0)
+
+    let initObj = try JSONSerialization.jsonObject(with: Data(initJson.utf8)) as! [String: Any]
+    let accObj = try JSONSerialization.jsonObject(with: Data(acceptJson.utf8)) as! [String: Any]
+    XCTAssertEqual(initObj["sas"] as? String, accObj["sas"] as? String)
+    let devId = accObj["device_id"] as! String
+
+    try host.confirmPeer(peerId: devId, sas: accObj["sas"] as? String)
+    let grantJson = try host.mintGrant(peerId: devId, capsJson: "[\"fs.read\"]", ttlSecs: 3600)
+
+    let sessExp = expectation(description: "session accept")
+    var hostSess: TendrilSession?
+    pairQueue.async {
+      hostSess = try? host.acceptSession(timeoutMs: 5000)
+      sessExp.fulfill()
+    }
+    let cliSess = try client.connect(endpoint: addr, targetHostId: "swift-host", grantJson: grantJson)
+    wait(for: [sessExp], timeout: 5.0)
+    let srvSess = try XCTUnwrap(hostSess)
+    defer {
+      cliSess.free()
+      srvSess.free()
+    }
+
+    XCTAssertTrue(try srvSess.authorize("fs.read"))
+    XCTAssertFalse(try srvSess.authorize("shell.exec"))
+    try cliSess.sendData(Data("hello-swift".utf8))
+    let evJson = try srvSess.pollEvent(timeoutMs: 2000)
+    let evObj = try JSONSerialization.jsonObject(with: Data(evJson.utf8)) as! [String: Any]
+    XCTAssertEqual(evObj["event"] as? String, "data")
+    try host.revokePeer(peerId: devId)
+    XCTAssertFalse(try srvSess.authorize("fs.read"))
+    try cliSess.close(code: 1000, reason: "done")
   }
 }

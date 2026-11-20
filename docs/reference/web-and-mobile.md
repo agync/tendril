@@ -22,7 +22,7 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 
 ### `crates/tendril-wasm`
 
-`crates/tendril-wasm` compiles cleanly for `wasm32-unknown-unknown` using `.cargo/config.toml` (`getrandom_backend="wasm_js"`) and exports four stateful types plus seven helper functions:
+`crates/tendril-wasm` compiles cleanly for `wasm32-unknown-unknown` using `.cargo/config.toml` (`getrandom_backend="wasm_js"`) and exports four stateful types plus eight helper functions:
 
 - `WasmIdentity`: generates, exports, and restores client Ed25519 signing and X25519 static keys without touching host storage directly.
 - `WasmRoster`: serializes pinned hosts, pairing state, and verified CRL sequence tracking.
@@ -39,15 +39,15 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 
 ## Android Kotlin JNI (`bindings/kotlin`)
 
-- `bindings/kotlin/jni/tendril_jni.c` bridges `dev.tendril.TendrilNative` methods to `crates/tendril-ffi/include/tendril.h`, mapping `TENDRIL_WOULD_BLOCK` and `TENDRIL_EOF` into JSON status sentinels and freeing all returned C strings with `tendril_string_free`.
-- `TendrilEndpoint` and `TendrilSession` in `TendrilClient.kt` implement `java.io.Closeable` with idempotent `AtomicLong` handle guards.
-- `KeystoreStateCipher.kt` encrypts serialized endpoint state under a hardware-backed `AndroidKeyStore` AES-256-GCM key (`12`-byte random IV prefix).
-- `TendrilForegroundService.kt` maintains an active `dataSync` foreground notification and monitors `ConnectivityManager.NetworkCallback` transitions across Wi-Fi and cellular networks.
-- `bindings/kotlin/test/TendrilJniConformanceTest.java` validates all four helper vectors (`fingerprints.json`, `pairing_mac.json`, `rotation.json`, `grants.json`) and bidirectional live interop against `tendril-conformance-peer` on host Linux JVM.
+- `bindings/kotlin/jni/tendril_jni.c` bridges `dev.tendril.TendrilNative` methods to `crates/tendril-ffi/include/tendril.h`, converts standard UTF-8 <-> UTF-16 directly (preserving non-BMP characters), validates non-negative integer inputs and `0..=65535` close codes, maps `TENDRIL_WOULD_BLOCK` and `TENDRIL_EOF` into JSON status sentinels, and frees all returned C strings with `tendril_string_free`.
+- `TendrilEndpoint` and `TendrilSession` in `TendrilClient.kt` implement `java.io.Closeable` with `ReentrantReadWriteLock` / `ReentrantLock` handle synchronization so concurrent `close()` calls cannot race active FFI polls or sends.
+- `KeystoreStateCipher.kt` provides a standalone AES-256-GCM sealing helper (`12`-byte random IV prefix) backed by a hardware `AndroidKeyStore` key; `TendrilEndpoint` itself delegates on-disk identity and roster storage inside `stateDir` to `tendril-ffi` `StateStore`.
+- `TendrilForegroundService.kt` maintains a `dataSync` foreground notification and monitors `ConnectivityManager.registerDefaultNetworkCallback` across Wi-Fi and cellular handoffs.
+- `bindings/kotlin/test/TendrilJniConformanceTest.java` validates all four helper vectors (`fingerprints.json`, `pairing_mac.json`, `rotation.json`, `grants.json`) and bidirectional live interop against `tendril-conformance-peer` on host Linux JVM (`make bindings/jni` tests the C JNI bridge and Java declarations; compiling `.kt` Android sources requires Gradle and the Android SDK).
 
 ## Apple Swift (`bindings/swift`)
 
-- `bindings/swift/Package.swift` declares `CTendril` (`module.modulemap` + `shim.h` referencing `crates/tendril-ffi/include/tendril.h`), the `Tendril` wrapper module (`TendrilCrypto`, `TendrilEndpoint`, `TendrilSession`), `TendrilKeychainStore` (Keychain + `CryptoKit` AES-GCM), and `TendrilTests`.
+- `bindings/swift/Package.swift` declares `CTendril` (`module.modulemap` + `shim.h` referencing `crates/tendril-ffi/include/tendril.h`), the synchronized `Tendril` wrapper module (`TendrilCrypto`, `TendrilEndpoint`, `TendrilSession`, including `serveRelay`), `TendrilKeychainStore` (standalone Keychain + `CryptoKit` AES-GCM master-key sealing helper), and `TendrilTests` (offline vectors, fork rejection, and local endpoint lifecycle).
 - Verification note: SwiftPM compilation and `XCTest` execution (`TendrilConformanceTests.swift`) require Apple macOS/iOS toolchains and were not executed on Linux.
 
 ## Gate #7 baselines

@@ -17,6 +17,7 @@ class KeystoreStateCipher(private val alias: String = DEFAULT_ALIAS) {
     private const val TAG_BITS = 128
   }
 
+  @Synchronized
   private fun getOrCreateKey(): SecretKey {
     val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
     val existing = ks.getKey(alias, null) as? SecretKey

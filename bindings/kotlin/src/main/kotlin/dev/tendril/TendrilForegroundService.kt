@@ -5,10 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -49,12 +49,18 @@ class TendrilForegroundService : Service() {
     super.onCreate()
     ensureNotificationChannel()
     val notification = buildForegroundNotification("Tendril encrypted link active")
-    startForeground(NOTIFICATION_ID, notification)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      startForeground(
+        NOTIFICATION_ID,
+        notification,
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+      )
+    } else {
+      startForeground(NOTIFICATION_ID, notification)
+    }
 
-    val cm = getSystemService(ConnectivityManager::class.java)
+    val cm = getSystemService(ConnectivityManager::class.java) ?: return
     connectivityManager = cm
-    val req =
-      NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
     val netCallback =
       object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -66,11 +72,13 @@ class TendrilForegroundService : Service() {
         }
 
         override fun onLost(network: Network) {
-          updateTransport(NetworkTransportKind.NONE)
+          val active = cm.activeNetwork
+          val caps = if (active != null) cm.getNetworkCapabilities(active) else null
+          classifyAndNotify(caps)
         }
       }
     callback = netCallback
-    cm?.registerNetworkCallback(req, netCallback)
+    cm.registerDefaultNetworkCallback(netCallback)
   }
 
   override fun onBind(intent: Intent?): IBinder = binder
@@ -119,6 +127,7 @@ class TendrilForegroundService : Service() {
         @Suppress("DEPRECATION") Notification.Builder(this)
       }
     return builder
+      .setSmallIcon(android.R.drawable.stat_notify_sync)
       .setContentTitle("Tendril")
       .setContentText(content)
       .setOngoing(true)

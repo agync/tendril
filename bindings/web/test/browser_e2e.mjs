@@ -435,13 +435,23 @@ async function main() {
     `);
     assert.equal(backPayload, "back-to-chrome");
 
+    await cdp.evalAsync(`
+      await window.__e2eSession.sendData(new Uint8Array(65502).fill(65));
+    `);
+    const evLarge = await peer.call({ op: "recv", timeout_ms: 2000 });
+    assert.equal(evLarge.data_utf8.length, 65502);
+
     await peer.call({ op: "revoke", peer_id: peerPair.device_id });
     assert.equal((await peer.call({ op: "authorize", cap: "fs.read" })).allowed, false);
 
-    await cdp.evalAsync(`
+    const pollCloseRes = await cdp.evalAsync(`
+      const pendingPoll = window.__e2eSession.pollEvent(2000);
       await window.__e2eSession.close(1000, 'done');
+      const res = await pendingPoll;
       window.__e2eClient.free();
+      return res;
     `);
+    assert.equal(pollCloseRes.status, "eof");
     const evClosed = await peer.call({ op: "recv", timeout_ms: 2000 });
     assert.equal(evClosed.event, "closed");
     await peer.call({ op: "shutdown" });

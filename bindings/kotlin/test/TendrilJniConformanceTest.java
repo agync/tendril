@@ -405,10 +405,12 @@ public final class TendrilJniConformanceTest {
         String code = asStr(peer.call(Map.of("op", "issue_code", "kind", "lan")).get("code"));
 
         peer.send(Map.of("op", "pair"));
+        String emojiName = "jni-\uD83D\uDE80";
         Map<String, Object> cliPair =
-            asObj(Json.parse(TendrilNative.endpointPairInitiate(cliEp, epAddr, null, code, "jni-dev", "android")));
+            asObj(Json.parse(TendrilNative.endpointPairInitiate(cliEp, epAddr, null, code, emojiName, "android")));
         Map<String, Object> peerPair = peer.recv();
         check(Boolean.TRUE.equals(peerPair.get("ok")), "peer pair failed");
+        check(emojiName.equals(asStr(peerPair.get("name"))), "non-BMP UTF-8 name mismatch: " + peerPair);
         check(asStr(peerPair.get("sas")).equals(asStr(cliPair.get("sas"))), "SAS mismatch dir1");
         String cliDevId = asStr(peerPair.get("device_id"));
 
@@ -461,6 +463,13 @@ public final class TendrilJniConformanceTest {
         check("jni-host".equals(hostInfo.get("host_id")), "unexpected host info");
         Map<String, Object> wb = asObj(Json.parse(TendrilNative.endpointPairAccept(hostEp, 0)));
         check("would_block".equals(wb.get("status")), "expected would_block on PairAccept(0)");
+        boolean negRejected = false;
+        try {
+          TendrilNative.endpointPairAccept(hostEp, -1L);
+        } catch (IllegalArgumentException expected) {
+          negRejected = true;
+        }
+        check(negRejected, "negative timeout_ms was not rejected");
 
         String hostAddr = TendrilNative.endpointServeDirect(hostEp, "127.0.0.1:0");
         String code2 = TendrilNative.endpointIssueCode(hostEp, "lan");

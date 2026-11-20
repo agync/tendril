@@ -59,7 +59,14 @@ function resolveSafe(baseDir, relPath) {
 const cfg = parseArgs(process.argv.slice(2));
 
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+  let url;
+  try {
+    url = new URL(req.url || "/", "http://127.0.0.1");
+  } catch {
+    res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("bad request");
+    return;
+  }
   const pathname = url.pathname;
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -102,8 +109,14 @@ const server = http.createServer((req, res) => {
 });
 
 server.on("upgrade", (req, socket, head) => {
-  const url = new URL(req.url || "/", "http://127.0.0.1");
-  if (url.pathname !== "/v1/relay" || !cfg.relayHost || !cfg.relayPort) {
+  let url;
+  try {
+    url = new URL(req.url || "/", "http://127.0.0.1");
+  } catch {
+    socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    return;
+  }
+  if (req.method !== "GET" || url.pathname !== "/v1/relay" || !cfg.relayHost || !cfg.relayPort) {
     socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
     return;
   }
@@ -114,12 +127,19 @@ server.on("upgrade", (req, socket, head) => {
   socket.on("error", () => {
     upstream.destroy();
   });
+  upstream.on("close", () => {
+    socket.destroy();
+  });
+  socket.on("close", () => {
+    upstream.destroy();
+  });
   upstream.on("connect", () => {
     const headerLines = [];
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       headerLines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
     }
-    const reqHead = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n${headerLines.join("\r\n")}\r\n\r\n`;
+    const targetPath = `${url.pathname}${url.search}`;
+    const reqHead = `${req.method} ${targetPath} HTTP/${req.httpVersion}\r\n${headerLines.join("\r\n")}\r\n\r\n`;
     upstream.write(reqHead);
     if (head && head.length > 0) {
       upstream.write(head);

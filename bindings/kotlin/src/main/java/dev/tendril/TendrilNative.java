@@ -1,6 +1,6 @@
 package dev.tendril;
 
-public final class TendrilNative {
+final class TendrilNative {
   static {
     System.loadLibrary("tendril_jni");
   }

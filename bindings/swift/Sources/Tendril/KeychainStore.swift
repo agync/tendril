@@ -10,6 +10,7 @@ public enum TendrilKeychainError: Error {
 }
 
 public final class TendrilKeychainStore {
+  private let lock = NSLock()
   private let service: String
   private let account: String
 
@@ -19,6 +20,8 @@ public final class TendrilKeychainStore {
   }
 
   public func loadOrCreateMasterKey() throws -> SymmetricKey {
+    lock.lock()
+    defer { lock.unlock() }
     if let existing = try readKeyData() {
       guard existing.count == 32 else {
         throw TendrilKeychainError.invalidData

@@ -81,6 +81,6 @@ Each binding verifies the four helper-level `spec/vectors/` files (`fingerprints
 make bindings/go      # build tendril-ffi and run Go cgo tests with -race
 make bindings/python  # build _tendril.so and run Python unittest suite
 make bindings/node    # build index.node and run node --test suite
-make bindings/check   # run Go, Python, and Node binding suites
+make bindings/check   # run Go, Python, Node, Web WASM, and Kotlin JNI suites
 make check            # run full workspace lint, Rust tests, vectors, and bindings
 ```

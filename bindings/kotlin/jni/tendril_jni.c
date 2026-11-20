@@ -6,6 +6,9 @@
 #include "tendril.h"
 
 static void throw_ex(JNIEnv *env, const char *class_name, const char *msg) {
+  if ((*env)->ExceptionCheck(env)) {
+    return;
+  }
   jclass cls = (*env)->FindClass(env, class_name);
   if (cls != NULL) {
     (*env)->ThrowNew(env, cls, msg);
@@ -13,9 +16,12 @@ static void throw_ex(JNIEnv *env, const char *class_name, const char *msg) {
 }
 
 static void throw_ffi_error(JNIEnv *env, int32_t rc, const char *fallback) {
+  if ((*env)->ExceptionCheck(env)) {
+    return;
+  }
   char errbuf[512];
   errbuf[0] = '\0';
-  size_t needed = tendril_last_error(errbuf, sizeof(errbuf));
+  int32_t needed = tendril_last_error(errbuf, sizeof(errbuf));
   char full[640];
   if (needed > 1) {
     snprintf(full, sizeof(full), "tendril ffi error (%d): %s", (int)rc, errbuf);
@@ -25,26 +31,156 @@ static void throw_ffi_error(JNIEnv *env, int32_t rc, const char *fallback) {
   throw_ex(env, "java/lang/IllegalStateException", full);
 }
 
-static jstring take_out_string(JNIEnv *env, char *ptr) {
-  if (ptr == NULL) {
-    return (*env)->NewStringUTF(env, "");
+static int dup_opt_utf8(JNIEnv *env, jstring s, char **out_buf) {
+  *out_buf = NULL;
+  if (s == NULL) {
+    return 1;
   }
-  jstring out = (*env)->NewStringUTF(env, ptr);
-  tendril_string_free(ptr);
+  jsize len16 = (*env)->GetStringLength(env, s);
+  if (len16 < 0) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid string length");
+    return 0;
+  }
+  const jchar *u16 = len16 > 0 ? (*env)->GetStringChars(env, s, NULL) : NULL;
+  if (len16 > 0 && u16 == NULL) {
+    throw_ex(env, "java/lang/OutOfMemoryError", "GetStringChars failed");
+    return 0;
+  }
+
+  size_t byte_len = 0;
+  for (jsize i = 0; i < len16; i++) {
+    uint16_t c = u16[i];
+    if (c < 0x80) {
+      byte_len += 1;
+    } else if (c < 0x800) {
+      byte_len += 2;
+    } else if (c >= 0xD800 && c <= 0xDBFF) {
+      if (i + 1 >= len16 || u16[i + 1] < 0xDC00 || u16[i + 1] > 0xDFFF) {
+        if (u16 != NULL) (*env)->ReleaseStringChars(env, s, u16);
+        throw_ex(env, "java/lang/IllegalArgumentException", "unpaired UTF-16 high surrogate");
+        return 0;
+      }
+      i++;
+      byte_len += 4;
+    } else if (c >= 0xDC00 && c <= 0xDFFF) {
+      if (u16 != NULL) (*env)->ReleaseStringChars(env, s, u16);
+      throw_ex(env, "java/lang/IllegalArgumentException", "unpaired UTF-16 low surrogate");
+      return 0;
+    } else {
+      byte_len += 3;
+    }
+  }
+
+  char *utf8 = (char *)malloc(byte_len + 1);
+  if (utf8 == NULL) {
+    if (u16 != NULL) (*env)->ReleaseStringChars(env, s, u16);
+    throw_ex(env, "java/lang/OutOfMemoryError", "malloc failed encoding UTF-8");
+    return 0;
+  }
+
+  size_t w = 0;
+  for (jsize i = 0; i < len16; i++) {
+    uint32_t c = u16[i];
+    if (c < 0x80) {
+      utf8[w++] = (char)c;
+    } else if (c < 0x800) {
+      utf8[w++] = (char)(0xC0 | (c >> 6));
+      utf8[w++] = (char)(0x80 | (c & 0x3F));
+    } else if (c >= 0xD800 && c <= 0xDBFF) {
+      uint32_t lo = u16[++i];
+      uint32_t cp = 0x10000 + (((c - 0xD800) << 10) | (lo - 0xDC00));
+      utf8[w++] = (char)(0xF0 | (cp >> 18));
+      utf8[w++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+      utf8[w++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+      utf8[w++] = (char)(0x80 | (cp & 0x3F));
+    } else {
+      utf8[w++] = (char)(0xE0 | (c >> 12));
+      utf8[w++] = (char)(0x80 | ((c >> 6) & 0x3F));
+      utf8[w++] = (char)(0x80 | (c & 0x3F));
+    }
+  }
+  utf8[w] = '\0';
+  if (u16 != NULL) {
+    (*env)->ReleaseStringChars(env, s, u16);
+  }
+  *out_buf = utf8;
+  return 1;
+}
+
+static jstring utf8_to_jstring(JNIEnv *env, const char *s) {
+  if (s == NULL) {
+    jchar empty = 0;
+    return (*env)->NewString(env, &empty, 0);
+  }
+  const uint8_t *p = (const uint8_t *)s;
+  size_t len16 = 0;
+  while (*p != 0) {
+    uint8_t b0 = p[0];
+    if (b0 < 0x80) {
+      p += 1;
+      len16 += 1;
+    } else if ((b0 & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+      p += 2;
+      len16 += 1;
+    } else if ((b0 & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+      p += 3;
+      len16 += 1;
+    } else if ((b0 & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 &&
+               (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+      p += 4;
+      len16 += 2;
+    } else {
+      p += 1;
+      len16 += 1;
+    }
+  }
+  jchar *u16 = (jchar *)malloc((len16 > 0 ? len16 : 1) * sizeof(jchar));
+  if (u16 == NULL) {
+    throw_ex(env, "java/lang/OutOfMemoryError", "malloc failed decoding UTF-8");
+    return NULL;
+  }
+
+  p = (const uint8_t *)s;
+  size_t idx = 0;
+  while (*p != 0 && idx < len16) {
+    uint8_t b0 = p[0];
+    if (b0 < 0x80) {
+      u16[idx++] = (jchar)b0;
+      p += 1;
+    } else if ((b0 & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+      uint32_t cp = ((uint32_t)(b0 & 0x1F) << 6) | (uint32_t)(p[1] & 0x3F);
+      u16[idx++] = (jchar)cp;
+      p += 2;
+    } else if ((b0 & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+      uint32_t cp = ((uint32_t)(b0 & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) |
+                    (uint32_t)(p[2] & 0x3F);
+      u16[idx++] = (jchar)cp;
+      p += 3;
+    } else if ((b0 & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 &&
+               (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+      uint32_t cp = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(p[1] & 0x3F) << 12) |
+                    ((uint32_t)(p[2] & 0x3F) << 6) | (uint32_t)(p[3] & 0x3F);
+      cp -= 0x10000;
+      u16[idx++] = (jchar)(0xD800 + (cp >> 10));
+      u16[idx++] = (jchar)(0xDC00 + (cp & 0x3FF));
+      p += 4;
+    } else {
+      u16[idx++] = (jchar)0xFFFD;
+      p += 1;
+    }
+  }
+  jstring out = (*env)->NewString(env, u16, (jsize)idx);
+  free(u16);
   return out;
 }
 
-static const char *get_opt_utf(JNIEnv *env, jstring s) {
-  if (s == NULL) {
-    return NULL;
+static jstring take_out_string(JNIEnv *env, char *ptr) {
+  if (ptr == NULL) {
+    return utf8_to_jstring(env, "");
   }
-  return (*env)->GetStringUTFChars(env, s, NULL);
-}
-
-static void release_opt_utf(JNIEnv *env, jstring s, const char *cstr) {
-  if (s != NULL && cstr != NULL) {
-    (*env)->ReleaseStringUTFChars(env, s, cstr);
-  }
+  jstring out = utf8_to_jstring(env, ptr);
+  tendril_string_free(ptr);
+  return out;
 }
 
 static int read_bytes32(JNIEnv *env, jbyteArray arr, uint8_t out[32]) {
@@ -53,6 +189,19 @@ static int read_bytes32(JNIEnv *env, jbyteArray arr, uint8_t out[32]) {
     return 0;
   }
   (*env)->GetByteArrayRegion(env, arr, 0, 32, (jbyte *)out);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
+  return 1;
+}
+
+static int require_non_negative_jlong(JNIEnv *env, jlong val, const char *name) {
+  if (val < 0) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "%s must be non-negative", name);
+    throw_ex(env, "java/lang/IllegalArgumentException", msg);
+    return 0;
+  }
   return 1;
 }
 
@@ -131,13 +280,13 @@ JNIEXPORT jbyteArray JNICALL Java_dev_tendril_TendrilNative_computeCodeMac(
   if (!read_bytes32(env, handshake_hash, hh)) {
     return NULL;
   }
-  const char *c_code = get_opt_utf(env, code);
-  if (c_code == NULL) {
+  char *c_code = NULL;
+  if (!dup_opt_utf8(env, code, &c_code)) {
     return NULL;
   }
   uint8_t mac[32];
   int32_t rc = tendril_compute_code_mac(c_code, hh, mac);
-  release_opt_utf(env, code, c_code);
+  free(c_code);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_compute_code_mac failed");
     return NULL;
@@ -158,19 +307,32 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_verifyRotationChainJson(
     throw_ex(env, "java/lang/IllegalArgumentException", "rotation inputs must not be null");
     return 0;
   }
-  const char *c_psig = get_opt_utf(env, pinned_signing_b64);
-  const char *c_pstat = get_opt_utf(env, pinned_static_b64);
-  const char *c_chain = get_opt_utf(env, chain_json);
-  const char *c_cstat = get_opt_utf(env, cur_static_b64);
-  const char *c_csig = get_opt_utf(env, cur_signing_b64);
+  if (!require_non_negative_jlong(env, pinned_seq, "pinned_seq")) {
+    return 0;
+  }
+  char *c_psig = NULL;
+  char *c_pstat = NULL;
+  char *c_chain = NULL;
+  char *c_cstat = NULL;
+  char *c_csig = NULL;
   uint64_t final_seq = 0;
-  int32_t rc = tendril_verify_rotation_chain_json(
-      c_psig, c_pstat, (uint64_t)pinned_seq, c_chain, c_cstat, c_csig, &final_seq);
-  release_opt_utf(env, pinned_signing_b64, c_psig);
-  release_opt_utf(env, pinned_static_b64, c_pstat);
-  release_opt_utf(env, chain_json, c_chain);
-  release_opt_utf(env, cur_static_b64, c_cstat);
-  release_opt_utf(env, cur_signing_b64, c_csig);
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, pinned_signing_b64, &c_psig) &&
+      dup_opt_utf8(env, pinned_static_b64, &c_pstat) &&
+      dup_opt_utf8(env, chain_json, &c_chain) &&
+      dup_opt_utf8(env, cur_static_b64, &c_cstat) &&
+      dup_opt_utf8(env, cur_signing_b64, &c_csig)) {
+    rc = tendril_verify_rotation_chain_json(
+        c_psig, c_pstat, (uint64_t)pinned_seq, c_chain, c_cstat, c_csig, &final_seq);
+  }
+  free(c_psig);
+  free(c_pstat);
+  free(c_chain);
+  free(c_cstat);
+  free(c_csig);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_verify_rotation_chain_json failed");
     return 0;
@@ -188,21 +350,35 @@ JNIEXPORT jboolean JNICALL Java_dev_tendril_TendrilNative_verifyGrantJson(
     throw_ex(env, "java/lang/IllegalArgumentException", "required grant inputs must not be null");
     return JNI_FALSE;
   }
-  const char *c_grant = get_opt_utf(env, grant_json);
-  const char *c_keys = get_opt_utf(env, issuer_keys_json);
-  const char *c_subj = get_opt_utf(env, expected_subject);
-  const char *c_root = get_opt_utf(env, expected_root_issuer);
-  const char *c_cap = get_opt_utf(env, requested_cap);
-  const char *c_crl = get_opt_utf(env, crl_json);
+  if (!require_non_negative_jlong(env, now_unix, "now_unix")) {
+    return JNI_FALSE;
+  }
+  char *c_grant = NULL;
+  char *c_keys = NULL;
+  char *c_subj = NULL;
+  char *c_root = NULL;
+  char *c_cap = NULL;
+  char *c_crl = NULL;
   uint8_t allowed = 0;
-  int32_t rc = tendril_verify_grant_json(
-      c_grant, c_keys, c_subj, c_root, c_cap, (uint64_t)now_unix, c_crl, &allowed);
-  release_opt_utf(env, grant_json, c_grant);
-  release_opt_utf(env, issuer_keys_json, c_keys);
-  release_opt_utf(env, expected_subject, c_subj);
-  release_opt_utf(env, expected_root_issuer, c_root);
-  release_opt_utf(env, requested_cap, c_cap);
-  release_opt_utf(env, crl_json, c_crl);
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, grant_json, &c_grant) &&
+      dup_opt_utf8(env, issuer_keys_json, &c_keys) &&
+      dup_opt_utf8(env, expected_subject, &c_subj) &&
+      dup_opt_utf8(env, expected_root_issuer, &c_root) &&
+      dup_opt_utf8(env, requested_cap, &c_cap) &&
+      dup_opt_utf8(env, crl_json, &c_crl)) {
+    rc = tendril_verify_grant_json(
+        c_grant, c_keys, c_subj, c_root, c_cap, (uint64_t)now_unix, c_crl, &allowed);
+  }
+  free(c_grant);
+  free(c_keys);
+  free(c_subj);
+  free(c_root);
+  free(c_cap);
+  free(c_crl);
+  if ((*env)->ExceptionCheck(env)) {
+    return JNI_FALSE;
+  }
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_verify_grant_json failed");
     return JNI_FALSE;
@@ -213,11 +389,17 @@ JNIEXPORT jboolean JNICALL Java_dev_tendril_TendrilNative_verifyGrantJson(
 JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_endpointNew(
     JNIEnv *env, jclass cls, jstring state_dir, jstring host_id) {
   (void)cls;
-  const char *c_dir = get_opt_utf(env, state_dir);
-  const char *c_host = get_opt_utf(env, host_id);
-  TendrilEndpoint *ep = tendril_endpoint_new(c_dir, c_host);
-  release_opt_utf(env, state_dir, c_dir);
-  release_opt_utf(env, host_id, c_host);
+  char *c_dir = NULL;
+  char *c_host = NULL;
+  TendrilEndpoint *ep = NULL;
+  if (dup_opt_utf8(env, state_dir, &c_dir) && dup_opt_utf8(env, host_id, &c_host)) {
+    ep = tendril_endpoint_new(c_dir, c_host);
+  }
+  free(c_dir);
+  free(c_host);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
   if (ep == NULL) {
     throw_ffi_error(env, TENDRIL_ERR_INTERNAL, "tendril_endpoint_new failed");
     return 0;
@@ -257,10 +439,13 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointServeDirect(
     throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
     return NULL;
   }
-  const char *c_addr = get_opt_utf(env, listen_addr);
+  char *c_addr = NULL;
+  if (!dup_opt_utf8(env, listen_addr, &c_addr)) {
+    return NULL;
+  }
   char *out = NULL;
   int32_t rc = tendril_endpoint_serve_direct((TendrilEndpoint *)(uintptr_t)ptr, c_addr, &out);
-  release_opt_utf(env, listen_addr, c_addr);
+  free(c_addr);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_serve_direct failed");
     return NULL;
@@ -275,12 +460,18 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointServeRelay(
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid endpoint or relay_url");
     return NULL;
   }
-  const char *c_url = get_opt_utf(env, relay_url);
-  const char *c_host = get_opt_utf(env, expected_host);
+  char *c_url = NULL;
+  char *c_host = NULL;
   char *out = NULL;
-  int32_t rc = tendril_endpoint_serve_relay((TendrilEndpoint *)(uintptr_t)ptr, c_url, c_host, &out);
-  release_opt_utf(env, relay_url, c_url);
-  release_opt_utf(env, expected_host, c_host);
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, relay_url, &c_url) && dup_opt_utf8(env, expected_host, &c_host)) {
+    rc = tendril_endpoint_serve_relay((TendrilEndpoint *)(uintptr_t)ptr, c_url, c_host, &out);
+  }
+  free(c_url);
+  free(c_host);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_serve_relay failed");
     return NULL;
@@ -295,10 +486,13 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointIssueCode(
     throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
     return NULL;
   }
-  const char *c_kind = get_opt_utf(env, kind);
+  char *c_kind = NULL;
+  if (!dup_opt_utf8(env, kind, &c_kind)) {
+    return NULL;
+  }
   char *out = NULL;
   int32_t rc = tendril_endpoint_issue_code((TendrilEndpoint *)(uintptr_t)ptr, c_kind, &out);
-  release_opt_utf(env, kind, c_kind);
+  free(c_kind);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_issue_code failed");
     return NULL;
@@ -314,19 +508,29 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointPairInitiate(
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid pair initiate arguments");
     return NULL;
   }
-  const char *c_ep = get_opt_utf(env, endpoint);
-  const char *c_rh = get_opt_utf(env, relay_host);
-  const char *c_code = get_opt_utf(env, code);
-  const char *c_name = get_opt_utf(env, name);
-  const char *c_kind = get_opt_utf(env, kind);
+  char *c_ep = NULL;
+  char *c_rh = NULL;
+  char *c_code = NULL;
+  char *c_name = NULL;
+  char *c_kind = NULL;
   char *out = NULL;
-  int32_t rc = tendril_endpoint_pair_initiate(
-      (TendrilEndpoint *)(uintptr_t)ptr, c_ep, c_rh, c_code, c_name, c_kind, &out);
-  release_opt_utf(env, endpoint, c_ep);
-  release_opt_utf(env, relay_host, c_rh);
-  release_opt_utf(env, code, c_code);
-  release_opt_utf(env, name, c_name);
-  release_opt_utf(env, kind, c_kind);
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, endpoint, &c_ep) &&
+      dup_opt_utf8(env, relay_host, &c_rh) &&
+      dup_opt_utf8(env, code, &c_code) &&
+      dup_opt_utf8(env, name, &c_name) &&
+      dup_opt_utf8(env, kind, &c_kind)) {
+    rc = tendril_endpoint_pair_initiate(
+        (TendrilEndpoint *)(uintptr_t)ptr, c_ep, c_rh, c_code, c_name, c_kind, &out);
+  }
+  free(c_ep);
+  free(c_rh);
+  free(c_code);
+  free(c_name);
+  free(c_kind);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_pair_initiate failed");
     return NULL;
@@ -341,11 +545,14 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointPairAccept(
     throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
     return NULL;
   }
+  if (!require_non_negative_jlong(env, timeout_ms, "timeout_ms")) {
+    return NULL;
+  }
   char *out = NULL;
   int32_t rc = tendril_endpoint_pair_accept(
       (TendrilEndpoint *)(uintptr_t)ptr, (uint64_t)timeout_ms, &out);
   if (rc == TENDRIL_WOULD_BLOCK) {
-    return (*env)->NewStringUTF(env, "{\"status\":\"would_block\"}");
+    return utf8_to_jstring(env, "{\"status\":\"would_block\"}");
   }
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_pair_accept failed");
@@ -361,11 +568,17 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointConfirmPeer(
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid confirm arguments");
     return;
   }
-  const char *c_peer = get_opt_utf(env, peer_id);
-  const char *c_sas = get_opt_utf(env, sas);
-  int32_t rc = tendril_endpoint_confirm_peer((TendrilEndpoint *)(uintptr_t)ptr, c_peer, c_sas);
-  release_opt_utf(env, peer_id, c_peer);
-  release_opt_utf(env, sas, c_sas);
+  char *c_peer = NULL;
+  char *c_sas = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, peer_id, &c_peer) && dup_opt_utf8(env, sas, &c_sas)) {
+    rc = tendril_endpoint_confirm_peer((TendrilEndpoint *)(uintptr_t)ptr, c_peer, c_sas);
+  }
+  free(c_peer);
+  free(c_sas);
+  if ((*env)->ExceptionCheck(env)) {
+    return;
+  }
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_confirm_peer failed");
   }
@@ -378,13 +591,22 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointMintGrant(
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid mint grant arguments");
     return NULL;
   }
-  const char *c_peer = get_opt_utf(env, peer_id);
-  const char *c_caps = get_opt_utf(env, caps_json);
+  if (!require_non_negative_jlong(env, ttl_secs, "ttl_secs")) {
+    return NULL;
+  }
+  char *c_peer = NULL;
+  char *c_caps = NULL;
   char *out = NULL;
-  int32_t rc = tendril_endpoint_mint_grant(
-      (TendrilEndpoint *)(uintptr_t)ptr, c_peer, c_caps, (uint64_t)ttl_secs, &out);
-  release_opt_utf(env, peer_id, c_peer);
-  release_opt_utf(env, caps_json, c_caps);
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, peer_id, &c_peer) && dup_opt_utf8(env, caps_json, &c_caps)) {
+    rc = tendril_endpoint_mint_grant(
+        (TendrilEndpoint *)(uintptr_t)ptr, c_peer, c_caps, (uint64_t)ttl_secs, &out);
+  }
+  free(c_peer);
+  free(c_caps);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_mint_grant failed");
     return NULL;
@@ -399,9 +621,12 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointRevokePeer(
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid revoke arguments");
     return;
   }
-  const char *c_peer = get_opt_utf(env, peer_id);
+  char *c_peer = NULL;
+  if (!dup_opt_utf8(env, peer_id, &c_peer)) {
+    return;
+  }
   int32_t rc = tendril_endpoint_revoke_peer((TendrilEndpoint *)(uintptr_t)ptr, c_peer);
-  release_opt_utf(env, peer_id, c_peer);
+  free(c_peer);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_revoke_peer failed");
   }
@@ -415,16 +640,25 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionConnect(
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid sessionConnect arguments");
     return 0;
   }
-  const char *c_ep = get_opt_utf(env, endpoint);
-  const char *c_rh = get_opt_utf(env, relay_host);
-  const char *c_target = get_opt_utf(env, target_host_id);
-  const char *c_grant = get_opt_utf(env, grant_json);
-  TendrilSession *sess = tendril_session_connect(
-      (TendrilEndpoint *)(uintptr_t)ep_ptr, c_ep, c_rh, c_target, c_grant);
-  release_opt_utf(env, endpoint, c_ep);
-  release_opt_utf(env, relay_host, c_rh);
-  release_opt_utf(env, target_host_id, c_target);
-  release_opt_utf(env, grant_json, c_grant);
+  char *c_ep = NULL;
+  char *c_rh = NULL;
+  char *c_target = NULL;
+  char *c_grant = NULL;
+  TendrilSession *sess = NULL;
+  if (dup_opt_utf8(env, endpoint, &c_ep) &&
+      dup_opt_utf8(env, relay_host, &c_rh) &&
+      dup_opt_utf8(env, target_host_id, &c_target) &&
+      dup_opt_utf8(env, grant_json, &c_grant)) {
+    sess = tendril_session_connect(
+        (TendrilEndpoint *)(uintptr_t)ep_ptr, c_ep, c_rh, c_target, c_grant);
+  }
+  free(c_ep);
+  free(c_rh);
+  free(c_target);
+  free(c_grant);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
   if (sess == NULL) {
     throw_ffi_error(env, TENDRIL_ERR_INTERNAL, "tendril_session_connect failed");
     return 0;
@@ -437,6 +671,9 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionAccept(
   (void)cls;
   if (ep_ptr == 0) {
     throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
+    return 0;
+  }
+  if (!require_non_negative_jlong(env, timeout_ms, "timeout_ms")) {
     return 0;
   }
   TendrilSession *sess = tendril_session_accept(
@@ -466,6 +703,10 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_sessionSendData(
   }
   jsize len = (*env)->GetArrayLength(env, data);
   jbyte *bytes = len > 0 ? (*env)->GetByteArrayElements(env, data, NULL) : NULL;
+  if (len > 0 && bytes == NULL) {
+    throw_ex(env, "java/lang/OutOfMemoryError", "GetByteArrayElements failed");
+    return;
+  }
   int32_t rc = tendril_session_send_data(
       (TendrilSession *)(uintptr_t)ptr, (const uint8_t *)bytes, (size_t)len);
   if (bytes != NULL) {
@@ -483,14 +724,17 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_sessionPollEvent(
     throw_ex(env, "java/lang/IllegalStateException", "session freed");
     return NULL;
   }
+  if (!require_non_negative_jlong(env, timeout_ms, "timeout_ms")) {
+    return NULL;
+  }
   char *out = NULL;
   int32_t rc = tendril_session_poll_event(
       (TendrilSession *)(uintptr_t)ptr, (uint64_t)timeout_ms, &out);
   if (rc == TENDRIL_WOULD_BLOCK) {
-    return (*env)->NewStringUTF(env, "{\"status\":\"would_block\"}");
+    return utf8_to_jstring(env, "{\"status\":\"would_block\"}");
   }
   if (rc == TENDRIL_EOF) {
-    return (*env)->NewStringUTF(env, "{\"status\":\"eof\"}");
+    return utf8_to_jstring(env, "{\"status\":\"eof\"}");
   }
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_session_poll_event failed");
@@ -506,10 +750,13 @@ JNIEXPORT jboolean JNICALL Java_dev_tendril_TendrilNative_sessionAuthorize(
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid sessionAuthorize arguments");
     return JNI_FALSE;
   }
-  const char *c_cap = get_opt_utf(env, cap);
+  char *c_cap = NULL;
+  if (!dup_opt_utf8(env, cap, &c_cap)) {
+    return JNI_FALSE;
+  }
   uint8_t allowed = 0;
   int32_t rc = tendril_session_authorize((TendrilSession *)(uintptr_t)ptr, c_cap, &allowed);
-  release_opt_utf(env, cap, c_cap);
+  free(c_cap);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_session_authorize failed");
     return JNI_FALSE;
@@ -537,9 +784,16 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_sessionClose(
     throw_ex(env, "java/lang/IllegalStateException", "session freed");
     return;
   }
-  const char *c_reason = get_opt_utf(env, reason);
+  if (code < 0 || code > 65535) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "close code must be 0..=65535");
+    return;
+  }
+  char *c_reason = NULL;
+  if (!dup_opt_utf8(env, reason, &c_reason)) {
+    return;
+  }
   int32_t rc = tendril_session_close((TendrilSession *)(uintptr_t)ptr, (uint16_t)code, c_reason);
-  release_opt_utf(env, reason, c_reason);
+  free(c_reason);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_session_close failed");
   }

@@ -24,10 +24,15 @@ class RelayStream {
     this.#ws = ws;
   }
 
+  maxFrame() {
+    return this.#maxFrame;
+  }
+
   _setMaxFrame(maxFrame) {
-    if (Number.isInteger(maxFrame) && maxFrame > 0 && maxFrame <= MAX_RELAY_FRAME_LEN) {
-      this.#maxFrame = maxFrame;
+    if (!Number.isInteger(maxFrame) || maxFrame < MAX_RELAY_FRAME_LEN) {
+      throw new Error(`relay max_frame ${maxFrame} below required ${MAX_RELAY_FRAME_LEN}`);
     }
+    this.#maxFrame = MAX_RELAY_FRAME_LEN;
   }
 
   _pushFrame(bytes) {
@@ -147,7 +152,10 @@ export async function dialRelayStream({
     throw new Error(`relayUrl must use ws:// or wss://: ${relayUrl}`);
   }
   const parsedUrl = new URL(relayUrl);
-  const expHost = expectedHost || parsedUrl.hostname;
+  const rawHost = parsedUrl.hostname;
+  const normalizedHost =
+    rawHost.startsWith("[") && rawHost.endsWith("]") ? rawHost.slice(1, -1) : rawHost;
+  const expHost = expectedHost || normalizedHost;
   if (!targetPub) {
     throw new Error("targetPub is required for relay dial");
   }
@@ -299,7 +307,7 @@ export async function dialRelayStream({
         `relay challenge host mismatch: expected '${expHost}', got '${challenge.host}'`
       );
     }
-    if (typeof challenge.max_frame === "number") {
+    if (challenge.max_frame !== undefined) {
       stream._setMaxFrame(challenge.max_frame);
     }
 

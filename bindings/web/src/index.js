@@ -31,6 +31,24 @@ function nowUnixSecs() {
   return Math.floor(Date.now() / 1000);
 }
 
+function sendProtocolBytes(stream, bytes) {
+  if (!bytes || bytes.length === 0) {
+    return;
+  }
+  const maxFrame = stream.maxFrame();
+  for (let offset = 0; offset < bytes.length; offset += maxFrame) {
+    stream.send(bytes.subarray(offset, offset + maxFrame));
+  }
+}
+
+function remainingBudgetMs(deadlineMs, label) {
+  const remaining = Math.ceil(deadlineMs - performance.now());
+  if (remaining <= 0) {
+    throw new Error(label);
+  }
+  return remaining;
+}
+
 export function b64urlEncode(bytes) {
   let bin = "";
   for (let i = 0; i < bytes.length; i += 1) {
@@ -233,6 +251,7 @@ export class TendrilWebClient {
       throw new Error("pairing code or pairingUri is required");
     }
 
+    const deadlineMs = performance.now() + timeoutMs;
     const initiator = new WasmPairInitiator(
       this.#identity,
       deviceName,
@@ -241,14 +260,18 @@ export class TendrilWebClient {
       hostStaticPin,
       hostSigningPin
     );
-    const stream = await dialRelayStream({ relayUrl, targetPub, expectedHost, timeoutMs });
+    const stream = await dialRelayStream({
+      relayUrl,
+      targetPub,
+      expectedHost,
+      timeoutMs: remainingBudgetMs(deadlineMs, "pairing timed out connecting to relay"),
+    });
     try {
       const startBytes = initiator.start();
-      if (startBytes.length > 0) {
-        stream.send(startBytes);
-      }
+      sendProtocolBytes(stream, startBytes);
       while (true) {
-        const frame = await stream.recv(timeoutMs);
+        const waitMs = remainingBudgetMs(deadlineMs, "pairing timed out waiting for host response");
+        const frame = await stream.recv(waitMs);
         if (frame.status === "would_block") {
           throw new Error("pairing timed out waiting for host response");
         }
@@ -257,7 +280,7 @@ export class TendrilWebClient {
         }
         const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
         if (res.write_b64) {
-          stream.send(b64urlDecode(res.write_b64));
+          sendProtocolBytes(stream, b64urlDecode(res.write_b64));
         }
         if (res.outcome) {
           if (res.outcome.status === "pending") {
@@ -289,6 +312,7 @@ export class TendrilWebClient {
     crlSeq = null,
     timeoutMs = 15000,
   }) {
+    const deadlineMs = performance.now() + timeoutMs;
     const seq = crlSeq ?? this.#roster.crl_seq(targetHostId);
     const session = new WasmSessionClient(
       this.#identity,
@@ -296,15 +320,19 @@ export class TendrilWebClient {
       grantJson,
       seq ?? null
     );
-    const stream = await dialRelayStream({ relayUrl, targetPub, expectedHost, timeoutMs });
+    const stream = await dialRelayStream({
+      relayUrl,
+      targetPub,
+      expectedHost,
+      timeoutMs: remainingBudgetMs(deadlineMs, "session handshake timed out connecting to relay"),
+    });
     const startedMs = performance.now();
     try {
       const m1 = session.start();
-      if (m1.length > 0) {
-        stream.send(m1);
-      }
+      sendProtocolBytes(stream, m1);
       while (!session.is_established()) {
-        const frame = await stream.recv(timeoutMs);
+        const waitMs = remainingBudgetMs(deadlineMs, "session handshake timed out");
+        const frame = await stream.recv(waitMs);
         if (frame.status === "would_block") {
           throw new Error("session handshake timed out");
         }
@@ -324,7 +352,7 @@ export class TendrilWebClient {
           throw err;
         }
         if (step.write_b64) {
-          stream.send(b64urlDecode(step.write_b64));
+          sendProtocolBytes(stream, b64urlDecode(step.write_b64));
         }
         if (step.established) {
           await this.#persistRoster();
@@ -405,25 +433,19 @@ export class TendrilWebSession {
     this.#ensureOpen();
     const bytes = typeof payload === "string" ? encoder.encode(payload) : payload;
     const out = this.#session.send_data(bytes, this.#elapsedMs());
-    if (out.length > 0) {
-      this.#stream.send(out);
-    }
+    sendProtocolBytes(this.#stream, out);
   }
 
   async rekey() {
     this.#ensureOpen();
     const out = this.#session.send_rekey(this.#elapsedMs());
-    if (out.length > 0) {
-      this.#stream.send(out);
-    }
+    sendProtocolBytes(this.#stream, out);
   }
 
   async ping(cookie = 1) {
     this.#ensureOpen();
     const out = this.#session.send_ping(cookie, this.#elapsedMs());
-    if (out.length > 0) {
-      this.#stream.send(out);
-    }
+    sendProtocolBytes(this.#stream, out);
   }
 
   async tick() {
@@ -437,9 +459,7 @@ export class TendrilWebSession {
       } catch {}
       throw err;
     }
-    if (out.length > 0) {
-      this.#stream.send(out);
-    }
+    sendProtocolBytes(this.#stream, out);
   }
 
   authorize(requestedCap) {
@@ -452,15 +472,15 @@ export class TendrilWebSession {
     while (true) {
       if (this.#queue.length > 0) {
         const ev = this.#queue.shift();
-        if (ev.event === "revocation_updated") {
-          await this.#persist();
-        }
         return { status: "event", ...ev };
       }
-      if (this.#session.is_closed()) {
+      if (this.#freed || this.#session.is_closed()) {
         return { status: "eof" };
       }
       const frame = await this.#stream.recv(timeoutMs);
+      if (this.#freed) {
+        return { status: "eof" };
+      }
       if (frame.status === "would_block") {
         return { status: "would_block" };
       }
@@ -479,9 +499,12 @@ export class TendrilWebSession {
         throw err;
       }
       if (step.write_b64) {
-        this.#stream.send(b64urlDecode(step.write_b64));
+        sendProtocolBytes(this.#stream, b64urlDecode(step.write_b64));
       }
       if (step.events && step.events.length > 0) {
+        if (step.events.some((ev) => ev.event === "revocation_updated")) {
+          await this.#persist();
+        }
         this.#queue.push(...step.events);
       }
       if (step.closed && this.#queue.length === 0) {
@@ -498,9 +521,7 @@ export class TendrilWebSession {
     try {
       if (!this.#session.is_closed()) {
         const out = this.#session.send_close(code, reason);
-        if (out.length > 0) {
-          this.#stream.send(out);
-        }
+        sendProtocolBytes(this.#stream, out);
       }
     } catch {}
     this.#stream.close();

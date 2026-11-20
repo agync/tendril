@@ -42,6 +42,8 @@ export interface PollEvent {
 }
 
 export function initTendril(wasmUrl?: string | URL | RequestInfo | BufferSource): Promise<void>;
+export function b64urlEncode(bytes: Uint8Array): string;
+export function b64urlDecode(str: string): Uint8Array;
 export function deviceId(staticPub: Uint8Array): string;
 export function fingerprintHost(staticPub: Uint8Array): string;
 export function fingerprintDevice(staticPub: Uint8Array): string;

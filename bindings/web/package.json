@@ -5,8 +5,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "exports": {
-    ".": "./src/index.js",
-    "./relay": "./src/relay.js"
+    ".": "./src/index.js"
   },
   "types": "./index.d.ts",
   "files": [

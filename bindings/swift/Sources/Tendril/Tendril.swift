@@ -191,6 +191,7 @@ public enum TendrilCrypto {
 }
 
 public final class TendrilEndpoint {
+  private let lock = NSLock()
   private var handle: OpaquePointer?
 
   public init(stateDir: String? = nil, hostId: String? = nil) throws {
@@ -215,51 +216,76 @@ public final class TendrilEndpoint {
   }
 
   public func close() {
+    lock.lock()
+    defer { lock.unlock() }
     if let h = handle {
-      tendril_endpoint_free(h)
       handle = nil
+      tendril_endpoint_free(h)
     }
   }
 
-  private func requireHandle() throws -> OpaquePointer {
+  private func withHandle<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
+    lock.lock()
+    defer { lock.unlock() }
     guard let h = handle else {
       throw TendrilError.closed
     }
-    return h
+    return try body(h)
   }
 
   public func infoJson() throws -> String {
-    let h = try requireHandle()
-    var out: UnsafeMutablePointer<CChar>?
-    let rc = tendril_endpoint_info_json(h, &out)
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_endpoint_info_json failed")
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_endpoint_info_json(h, &out)
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_info_json failed")
+      }
+      return takeOutCString(out)
     }
-    return takeOutCString(out)
   }
 
   public func serveDirect(listenAddr: String = "127.0.0.1:0") throws -> String {
-    let h = try requireHandle()
-    var out: UnsafeMutablePointer<CChar>?
-    let rc = listenAddr.withCString { cAddr in
-      tendril_endpoint_serve_direct(h, cAddr, &out)
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = listenAddr.withCString { cAddr in
+        tendril_endpoint_serve_direct(h, cAddr, &out)
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_serve_direct failed")
+      }
+      return takeOutCString(out)
     }
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_endpoint_serve_direct failed")
+  }
+
+  public func serveRelay(relayUrl: String, expectedHost: String? = nil) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = relayUrl.withCString { cUrl in
+        if let expectedHost {
+          return expectedHost.withCString { cHost in
+            tendril_endpoint_serve_relay(h, cUrl, cHost, &out)
+          }
+        }
+        return tendril_endpoint_serve_relay(h, cUrl, nil, &out)
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_serve_relay failed")
+      }
+      return takeOutCString(out)
     }
-    return takeOutCString(out)
   }
 
   public func issueCode(kind: String = "remote") throws -> String {
-    let h = try requireHandle()
-    var out: UnsafeMutablePointer<CChar>?
-    let rc = kind.withCString { cKind in
-      tendril_endpoint_issue_code(h, cKind, &out)
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = kind.withCString { cKind in
+        tendril_endpoint_issue_code(h, cKind, &out)
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_issue_code failed")
+      }
+      return takeOutCString(out)
     }
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_endpoint_issue_code failed")
-    }
-    return takeOutCString(out)
   }
 
   public func pairInitiate(
@@ -269,70 +295,75 @@ public final class TendrilEndpoint {
     deviceName: String,
     deviceKind: String = "ios"
   ) throws -> String {
-    let h = try requireHandle()
-    var out: UnsafeMutablePointer<CChar>?
-    let rc = endpoint.withCString { cEp in
-      code.withCString { cCode in
-        deviceName.withCString { cName in
-          deviceKind.withCString { cKind in
-            if let relayHost {
-              return relayHost.withCString { cRh in
-                tendril_endpoint_pair_initiate(h, cEp, cRh, cCode, cName, cKind, &out)
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = endpoint.withCString { cEp in
+        code.withCString { cCode in
+          deviceName.withCString { cName in
+            deviceKind.withCString { cKind in
+              if let relayHost {
+                return relayHost.withCString { cRh in
+                  tendril_endpoint_pair_initiate(h, cEp, cRh, cCode, cName, cKind, &out)
+                }
               }
+              return tendril_endpoint_pair_initiate(h, cEp, nil, cCode, cName, cKind, &out)
             }
-            return tendril_endpoint_pair_initiate(h, cEp, nil, cCode, cName, cKind, &out)
           }
         }
       }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_pair_initiate failed")
+      }
+      return takeOutCString(out)
     }
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_endpoint_pair_initiate failed")
-    }
-    return takeOutCString(out)
   }
 
   public func pairAccept(timeoutMs: UInt64) throws -> String {
-    let h = try requireHandle()
-    var out: UnsafeMutablePointer<CChar>?
-    let rc = tendril_endpoint_pair_accept(h, timeoutMs, &out)
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_endpoint_pair_accept(h, timeoutMs, &out)
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
+      }
+      return takeOutCString(out)
     }
-    return takeOutCString(out)
   }
 
   public func confirmPeer(peerId: String, sas: String? = nil) throws {
-    let h = try requireHandle()
-    let rc = peerId.withCString { cPeer in
-      if let sas {
-        return sas.withCString { cSas in tendril_endpoint_confirm_peer(h, cPeer, cSas) }
+    try withHandle { h in
+      let rc = peerId.withCString { cPeer in
+        if let sas {
+          return sas.withCString { cSas in tendril_endpoint_confirm_peer(h, cPeer, cSas) }
+        }
+        return tendril_endpoint_confirm_peer(h, cPeer, nil)
       }
-      return tendril_endpoint_confirm_peer(h, cPeer, nil)
-    }
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_endpoint_confirm_peer failed")
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_confirm_peer failed")
+      }
     }
   }
 
   public func mintGrant(peerId: String, capsJson: String, ttlSecs: UInt64 = 3600) throws -> String {
-    let h = try requireHandle()
-    var out: UnsafeMutablePointer<CChar>?
-    let rc = peerId.withCString { cPeer in
-      capsJson.withCString { cCaps in
-        tendril_endpoint_mint_grant(h, cPeer, cCaps, ttlSecs, &out)
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = peerId.withCString { cPeer in
+        capsJson.withCString { cCaps in
+          tendril_endpoint_mint_grant(h, cPeer, cCaps, ttlSecs, &out)
+        }
       }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_mint_grant failed")
+      }
+      return takeOutCString(out)
     }
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_endpoint_mint_grant failed")
-    }
-    return takeOutCString(out)
   }
 
   public func revokePeer(peerId: String) throws {
-    let h = try requireHandle()
-    let rc = peerId.withCString { cPeer in tendril_endpoint_revoke_peer(h, cPeer) }
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_endpoint_revoke_peer failed")
+    try withHandle { h in
+      let rc = peerId.withCString { cPeer in tendril_endpoint_revoke_peer(h, cPeer) }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_revoke_peer failed")
+      }
     }
   }
 
@@ -342,37 +373,40 @@ public final class TendrilEndpoint {
     targetHostId: String,
     grantJson: String? = nil
   ) throws -> TendrilSession {
-    let h = try requireHandle()
-    let raw: OpaquePointer? = endpoint.withCString { cEp in
-      targetHostId.withCString { cTarget in
-        switch (relayHost, grantJson) {
-        case (.some(let rh), .some(let g)):
-          return rh.withCString { cr in g.withCString { cg in tendril_session_connect(h, cEp, cr, cTarget, cg) } }
-        case (.some(let rh), .none):
-          return rh.withCString { cr in tendril_session_connect(h, cEp, cr, cTarget, nil) }
-        case (.none, .some(let g)):
-          return g.withCString { cg in tendril_session_connect(h, cEp, nil, cTarget, cg) }
-        case (.none, .none):
-          return tendril_session_connect(h, cEp, nil, cTarget, nil)
+    try withHandle { h in
+      let raw: OpaquePointer? = endpoint.withCString { cEp in
+        targetHostId.withCString { cTarget in
+          switch (relayHost, grantJson) {
+          case (.some(let rh), .some(let g)):
+            return rh.withCString { cr in g.withCString { cg in tendril_session_connect(h, cEp, cr, cTarget, cg) } }
+          case (.some(let rh), .none):
+            return rh.withCString { cr in tendril_session_connect(h, cEp, cr, cTarget, nil) }
+          case (.none, .some(let g)):
+            return g.withCString { cg in tendril_session_connect(h, cEp, nil, cTarget, cg) }
+          case (.none, .none):
+            return tendril_session_connect(h, cEp, nil, cTarget, nil)
+          }
         }
       }
+      guard let raw else {
+        throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_session_connect failed")
+      }
+      return TendrilSession(handle: raw)
     }
-    guard let raw else {
-      throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_session_connect failed")
-    }
-    return TendrilSession(handle: raw)
   }
 
   public func acceptSession(timeoutMs: UInt64) throws -> TendrilSession {
-    let h = try requireHandle()
-    guard let raw = tendril_session_accept(h, timeoutMs) else {
-      throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_session_accept failed")
+    try withHandle { h in
+      guard let raw = tendril_session_accept(h, timeoutMs) else {
+        throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_session_accept failed")
+      }
+      return TendrilSession(handle: raw)
     }
-    return TendrilSession(handle: raw)
   }
 }
 
 public final class TendrilSession {
+  private let lock = NSLock()
   private var handle: OpaquePointer?
 
   internal init(handle: OpaquePointer) {
@@ -384,66 +418,75 @@ public final class TendrilSession {
   }
 
   public func free() {
+    lock.lock()
+    defer { lock.unlock() }
     if let h = handle {
-      tendril_session_free(h)
       handle = nil
+      tendril_session_free(h)
     }
   }
 
-  private func requireHandle() throws -> OpaquePointer {
+  private func withHandle<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
+    lock.lock()
+    defer { lock.unlock() }
     guard let h = handle else {
       throw TendrilError.closed
     }
-    return h
+    return try body(h)
   }
 
   public func sendData(_ data: Data) throws {
-    let h = try requireHandle()
-    let rc = data.withUnsafeBytes { raw in
-      tendril_session_send_data(h, raw.bindMemory(to: UInt8.self).baseAddress, data.count)
-    }
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_session_send_data failed")
+    try withHandle { h in
+      let rc = data.withUnsafeBytes { raw in
+        tendril_session_send_data(h, raw.bindMemory(to: UInt8.self).baseAddress, data.count)
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_session_send_data failed")
+      }
     }
   }
 
   public func pollEvent(timeoutMs: UInt64) throws -> String {
-    let h = try requireHandle()
-    var out: UnsafeMutablePointer<CChar>?
-    let rc = tendril_session_poll_event(h, timeoutMs, &out)
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_session_poll_event failed")
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_session_poll_event(h, timeoutMs, &out)
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_session_poll_event failed")
+      }
+      return takeOutCString(out)
     }
-    return takeOutCString(out)
   }
 
   public func authorize(_ requestedCap: String) throws -> Bool {
-    let h = try requireHandle()
-    var allowed: UInt8 = 0
-    let rc = requestedCap.withCString { cCap in
-      tendril_session_authorize(h, cCap, &allowed)
+    try withHandle { h in
+      var allowed: UInt8 = 0
+      let rc = requestedCap.withCString { cCap in
+        tendril_session_authorize(h, cCap, &allowed)
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_session_authorize failed")
+      }
+      return allowed == 1
     }
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_session_authorize failed")
-    }
-    return allowed == 1
   }
 
   public func rekey() throws {
-    let h = try requireHandle()
-    let rc = tendril_session_rekey(h)
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_session_rekey failed")
+    try withHandle { h in
+      let rc = tendril_session_rekey(h)
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_session_rekey failed")
+      }
     }
   }
 
   public func close(code: UInt16 = 1000, reason: String = "") throws {
-    let h = try requireHandle()
-    let rc = reason.withCString { cReason in
-      tendril_session_close(h, code, cReason)
-    }
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_session_close failed")
+    try withHandle { h in
+      let rc = reason.withCString { cReason in
+        tendril_session_close(h, code, cReason)
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_session_close failed")
+      }
     }
   }
 }
