@@ -307,7 +307,7 @@ pub fn verify_rotation_chain(
     }
     let trusted_records: Vec<VerifiedRotation> = decoded
         .iter()
-        .filter(|r| trusted_keys.contains(&r.prev_signing_pub))
+        .filter(|r| r.seq > pinned_seq && trusted_keys.contains(&r.prev_signing_pub))
         .cloned()
         .collect();
     detect_fork_in_verified(&trusted_records)?;

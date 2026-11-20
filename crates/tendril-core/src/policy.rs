@@ -1,7 +1,7 @@
 //! Deterministic path ranking, Happy Eyeballs dialing, no-flap pinning, and failover policy.
 
+use core::net::{IpAddr, SocketAddr};
 use std::collections::{BTreeSet, VecDeque};
-use std::net::{IpAddr, SocketAddr};
 
 /// Transport rung identifier ordered from lowest latency/trust-dependency to fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,7 +64,12 @@ pub fn is_numeric_host_addr(addr: &str) -> bool {
     if authority.starts_with('[') {
         if let Some(end) = authority.find(']') {
             let host = &authority[1..end];
-            return host.parse::<IpAddr>().is_ok();
+            let suffix = &authority[end + 1..];
+            let valid_suffix = suffix.is_empty()
+                || (suffix.starts_with(':')
+                    && suffix.len() > 1
+                    && suffix[1..].bytes().all(|b| b.is_ascii_digit()));
+            return valid_suffix && host.parse::<IpAddr>().is_ok();
         }
         return false;
     }
@@ -217,6 +222,9 @@ impl PathPlanner {
         };
 
         if let Some(cur) = self.active.clone() {
+            if cand.id == cur.id {
+                return;
+            }
             let better = sort_key(&cand) < sort_key(&cur);
             let dwell_ok = now_ms.saturating_sub(self.pin_since_ms) >= self.config.min_pin_dwell_ms;
             if better && dwell_ok {
@@ -354,6 +362,10 @@ mod tests {
         let planner = PathPlanner::new(PathPolicyConfig::default(), cands);
         let ids: Vec<usize> = planner.candidates().iter().map(|c| c.id).collect();
         assert_eq!(ids, vec![5, 3, 4, 2, 1]);
+        assert!(!is_numeric_host_addr("[::1]garbage"));
+        assert!(!is_numeric_host_addr("[::1]:abc"));
+        assert!(is_numeric_host_addr("[::1]:7000"));
+        assert!(is_numeric_host_addr("[::1]"));
     }
 
     #[test]

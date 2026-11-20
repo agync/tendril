@@ -117,10 +117,20 @@ fn group4_first16(s: &str) -> String {
     out
 }
 
+fn normalize_code_into(code: &str, out: &mut String) {
+    for ch in code.chars() {
+        if ch != '-' {
+            out.push(ch.to_ascii_uppercase());
+        }
+    }
+}
+
 /// Normalizes a user-entered pairing code: ASCII uppercase with all hyphens stripped.
 #[must_use]
 pub fn normalize_code(code: &str) -> String {
-    code.to_ascii_uppercase().replace('-', "")
+    let mut out = String::with_capacity(code.len());
+    normalize_code_into(code, &mut out);
+    out
 }
 
 /// Derives the 32-byte pairing HMAC key using Argon2id v1.3 salted by `handshake_hash[..16]`.
@@ -128,7 +138,8 @@ pub fn argon2id_pairing_key(
     code: &str,
     handshake_hash: &[u8; 32],
 ) -> Result<Zeroizing<[u8; ARGON2_KEY_LEN]>, CoreError> {
-    let normalized = Zeroizing::new(normalize_code(code));
+    let mut normalized = Zeroizing::new(String::with_capacity(code.len()));
+    normalize_code_into(code, &mut normalized);
     let params = Params::new(
         ARGON2_MEMORY_KIB,
         ARGON2_TIME,

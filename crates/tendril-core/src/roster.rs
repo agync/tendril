@@ -152,6 +152,11 @@ impl Roster {
         }
         let id = device_id(&static_pub);
         if let Some(existing) = self.entries.get_mut(&id) {
+            if existing.static_pub != static_pub {
+                return Err(CoreError::ProtocolViolation(
+                    "device_id collision with distinct static key",
+                ));
+            }
             if existing.state == PeerState::Revoked {
                 return Err(CoreError::PeerRevoked(id));
             }
@@ -381,18 +386,27 @@ impl Roster {
         if *static_pub == [0u8; 32] {
             return Err(CoreError::IncompletePin("zero static_pub".to_string()));
         }
-        let derived = device_id(static_pub);
-        if let Some(entry) = self.entries.values().find(|e| e.static_pub == *static_pub) {
-            return match entry.state {
-                PeerState::Pending => Err(CoreError::PeerPending(entry.device_id.clone())),
-                PeerState::Revoked => Err(CoreError::PeerRevoked(entry.device_id.clone())),
-                PeerState::Active => {
-                    entry.require_static_pin()?;
-                    Ok(entry)
-                }
-            };
+        let mut active: Option<&RosterEntry> = None;
+        let mut pending: Option<&RosterEntry> = None;
+        for entry in self
+            .entries
+            .values()
+            .filter(|e| e.static_pub == *static_pub)
+        {
+            match entry.state {
+                PeerState::Revoked => return Err(CoreError::PeerRevoked(entry.device_id.clone())),
+                PeerState::Pending => pending = Some(entry),
+                PeerState::Active => active = Some(entry),
+            }
         }
-        Err(CoreError::PeerNotFound(derived))
+        if let Some(entry) = active {
+            entry.require_static_pin()?;
+            return Ok(entry);
+        }
+        if let Some(entry) = pending {
+            return Err(CoreError::PeerPending(entry.device_id.clone()));
+        }
+        Err(CoreError::PeerNotFound(device_id(static_pub)))
     }
 
     /// Returns the pinned Ed25519 signing public key of an `Active` peer for grant verification.
@@ -406,5 +420,44 @@ impl Roster {
             return None;
         }
         entry.signing_pub.filter(|k| *k != [0u8; 32])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revoked_duplicate_static_pub_takes_precedence_and_blocks_session_lookup() {
+        let mut roster = Roster::new();
+        let pub_k = [0x33u8; 32];
+        let sig_k = [0x44u8; 32];
+        roster
+            .insert_pinned_host(
+                "aa_revoked_host".to_string(),
+                "Revoked".to_string(),
+                pub_k,
+                Some(sig_k),
+                0,
+                vec![],
+            )
+            .unwrap();
+        roster.revoke_peer("aa_revoked_host").unwrap();
+
+        roster
+            .insert_pinned_host(
+                "zz_active_host".to_string(),
+                "Active".to_string(),
+                pub_k,
+                Some(sig_k),
+                0,
+                vec![],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            roster.lookup_active_by_static(&pub_k),
+            Err(CoreError::PeerRevoked(_))
+        ));
     }
 }

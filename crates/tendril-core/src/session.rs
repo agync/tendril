@@ -95,6 +95,7 @@ pub struct SessionMachine {
     target_host_id: Option<String>,
     initial_grant: Option<Grant>,
     initial_crl_seq: Option<u64>,
+    peer_crl_seq: Option<u64>,
     peer_device_id: Option<String>,
     peer_static_pub: Option<[u8; 32]>,
     active_grant: Option<Grant>,
@@ -136,6 +137,7 @@ impl SessionMachine {
             target_host_id: Some(target_host_id.into()),
             initial_grant: initial_grant.clone(),
             initial_crl_seq: crl_seq,
+            peer_crl_seq: None,
             peer_device_id: None,
             peer_static_pub: None,
             active_grant: initial_grant,
@@ -163,6 +165,7 @@ impl SessionMachine {
             target_host_id: None,
             initial_grant: None,
             initial_crl_seq: None,
+            peer_crl_seq: None,
             peer_device_id: None,
             peer_static_pub: None,
             active_grant: None,
@@ -195,6 +198,12 @@ impl SessionMachine {
     #[must_use]
     pub fn peer_device_id(&self) -> Option<&str> {
         self.peer_device_id.as_deref()
+    }
+
+    /// Returns the `crl_seq` advertised by the initiator in `SessionHello`, if any.
+    #[must_use]
+    pub const fn peer_crl_seq(&self) -> Option<u64> {
+        self.peer_crl_seq
     }
 
     /// Returns the currently verified capability grant associated with this session, if any.
@@ -387,11 +396,12 @@ impl SessionMachine {
         roster: &Roster,
     ) -> (Result<(), CoreError>, AuditEvent) {
         let peer_subj = self.peer_device_id.as_deref().unwrap_or("");
+        let audit_subj = self.incoming_grant_subject().unwrap_or(peer_subj);
         if !self.is_established() {
             let err = CoreError::NotReady("session not established");
             let audit = AuditEvent {
                 ts: now_unix,
-                subject: peer_subj.to_string(),
+                subject: audit_subj.to_string(),
                 cap: requested_cap.to_string(),
                 grant_nonce: self.active_grant.as_ref().map(|g| g.nonce.clone()),
                 allow: false,
@@ -402,7 +412,7 @@ impl SessionMachine {
         if let Err(err) = self.ensure_peer_active_in_roster(roster) {
             let audit = AuditEvent {
                 ts: now_unix,
-                subject: peer_subj.to_string(),
+                subject: audit_subj.to_string(),
                 cap: requested_cap.to_string(),
                 grant_nonce: self.active_grant.as_ref().map(|g| g.nonce.clone()),
                 allow: false,
@@ -416,7 +426,7 @@ impl SessionMachine {
                 Err(err.clone()),
                 AuditEvent {
                     ts: now_unix,
-                    subject: peer_subj.to_string(),
+                    subject: audit_subj.to_string(),
                     cap: requested_cap.to_string(),
                     grant_nonce: None,
                     allow: false,
@@ -425,13 +435,9 @@ impl SessionMachine {
             );
         };
         let crl = roster.crl(root_id);
-        let subj = match self.role {
-            SessionRole::Responder => peer_subj,
-            SessionRole::Initiator => self.local_device_id.as_str(),
-        };
         authorize_grant(
             self.active_grant.as_ref(),
-            subj,
+            audit_subj,
             root_id,
             requested_cap,
             now_unix,
@@ -661,6 +667,7 @@ impl SessionMachine {
                     .into_transport_mode()
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
 
+                self.peer_crl_seq = hello.crl_seq;
                 self.peer_device_id = Some(canonical_peer_id.clone());
                 self.peer_static_pub = Some(peer_static);
                 self.last_rekey_outgoing_ms = now_ms;
@@ -838,7 +845,7 @@ impl SessionMachine {
     }
 
     fn lookup_issuer_key(&self, roster: &Roster, issuer_id: &str) -> Option<[u8; 32]> {
-        if issuer_id == self.local_host_id {
+        if self.role == SessionRole::Responder && issuer_id == self.local_host_id {
             Some(self.local_signing_pub)
         } else {
             roster.lookup_active_signing_key(issuer_id)
@@ -882,4 +889,77 @@ fn encrypt_inner(
         .write_message(&inner, &mut out_ct)
         .map_err(|err| CoreError::Noise(format!("{err}")))?;
     encode_frame(&out_ct[..n])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{SigningKeypair, StaticKeypair};
+
+    #[test]
+    fn responder_records_peer_crl_seq_from_session_hello() {
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x51; 32]),
+            SigningKeypair::from_seed([0x52; 32]),
+        );
+        let cli = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x53; 32]),
+            SigningKeypair::from_seed([0x54; 32]),
+        );
+        let mut host_roster = Roster::new();
+        host_roster
+            .record_pending_pair(
+                *cli.static_key().public_bytes(),
+                None,
+                "Cli".to_string(),
+                "cli".to_string(),
+                "abcd".to_string(),
+            )
+            .unwrap();
+        host_roster.confirm_peer(&cli.device_id(), None).unwrap();
+
+        let mut cli_roster = Roster::new();
+        cli_roster
+            .insert_pinned_host(
+                host.host_id().to_string(),
+                "Host".to_string(),
+                *host.static_key().public_bytes(),
+                Some(*host.signing_key().public_bytes()),
+                0,
+                vec![],
+            )
+            .unwrap();
+
+        let mut init =
+            SessionMachine::new_initiator(&cli, host.host_id(), None, Some(7), None).unwrap();
+        let mut resp = SessionMachine::new_responder(&host, None).unwrap();
+
+        let mut m1 = Vec::new();
+        for a in init.start().unwrap() {
+            if let SessionAction::WriteBytes(b) = a {
+                m1.extend_from_slice(&b);
+            }
+        }
+        let mut m2 = Vec::new();
+        for a in resp
+            .feed_bytes(&m1, 1_795_564_800, 1, &mut host_roster)
+            .unwrap()
+        {
+            if let SessionAction::WriteBytes(b) = a {
+                m2.extend_from_slice(&b);
+            }
+        }
+        let mut m3 = Vec::new();
+        for a in init
+            .feed_bytes(&m2, 1_795_564_800, 2, &mut cli_roster)
+            .unwrap()
+        {
+            if let SessionAction::WriteBytes(b) = a {
+                m3.extend_from_slice(&b);
+            }
+        }
+        resp.feed_bytes(&m3, 1_795_564_800, 3, &mut host_roster)
+            .unwrap();
+        assert_eq!(resp.peer_crl_seq(), Some(7));
+    }
 }

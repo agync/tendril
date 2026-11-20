@@ -113,7 +113,7 @@ impl PairingManager {
         kind: PairingCodeKind,
         now_unix: u64,
     ) -> Result<String, CoreError> {
-        let mut entropy = Vec::with_capacity(64);
+        let mut entropy = Zeroizing::new(Vec::with_capacity(64));
         while entropy.len() < 64 {
             entropy.extend_from_slice(&random_bytes::<32>()?);
         }
@@ -529,6 +529,15 @@ impl PairingInitiator {
         pinned_host: Option<PinnedHost>,
         fixed_ephemeral: Option<[u8; 32]>,
     ) -> Result<Self, CoreError> {
+        if let Some(ref pin) = pinned_host
+            && (pin.static_pub == [0u8; 32] || pin.signing_pub == [0u8; 32])
+        {
+            return Err(CoreError::IncompletePin(
+                pin.host_id
+                    .clone()
+                    .unwrap_or_else(|| "pinned_host".to_string()),
+            ));
+        }
         let params: NoiseParams = NOISE_PATTERN
             .parse()
             .map_err(|err| CoreError::Noise(format!("{err}")))?;
@@ -1170,5 +1179,26 @@ mod tests {
             mgr.verify_claim(&h, &mac3, PairingPathKind::Remote, 3900),
             Err(CoreError::PairingCodeExpired)
         );
+
+        let id = EndpointIdentity::from_keys(
+            crate::crypto::StaticKeypair::from_scalar([0x41; 32]),
+            crate::crypto::SigningKeypair::from_seed([0x42; 32]),
+        );
+        assert!(matches!(
+            PairingInitiator::new(
+                &id,
+                "Dev",
+                "cli",
+                "TND-AAAA-BBBB",
+                Some(PinnedHost {
+                    host_id: Some("host-1".to_string()),
+                    static_pub: [0u8; 32],
+                    signing_pub: [0x11; 32],
+                    rotation_seq: 0,
+                }),
+                None,
+            ),
+            Err(CoreError::IncompletePin(_))
+        ));
     }
 }
