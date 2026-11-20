@@ -110,6 +110,20 @@ impl FromStr for IpCidr {
                     if prefix > 128 {
                         return Err(format!("IPv6 CIDR prefix {prefix} > 128"));
                     }
+                    if prefix >= 96
+                        && let Some(v4) = v6.to_ipv4_mapped()
+                    {
+                        let pfx4 = prefix - 96;
+                        let mask4 = if pfx4 == 0 {
+                            0u32
+                        } else {
+                            !0u32 << (32 - pfx4)
+                        };
+                        return Ok(Self::V4 {
+                            network: u32::from(v4) & mask4,
+                            prefix: pfx4,
+                        });
+                    }
                     let mask = if prefix == 0 {
                         0u128
                     } else {
@@ -130,10 +144,19 @@ impl FromStr for IpCidr {
                     network: u32::from(v4),
                     prefix: 32,
                 }),
-                IpAddr::V6(v6) => Ok(Self::V6 {
-                    network: u128::from(v6),
-                    prefix: 128,
-                }),
+                IpAddr::V6(v6) => {
+                    if let Some(v4) = v6.to_ipv4_mapped() {
+                        Ok(Self::V4 {
+                            network: u32::from(v4),
+                            prefix: 32,
+                        })
+                    } else {
+                        Ok(Self::V6 {
+                            network: u128::from(v6),
+                            prefix: 128,
+                        })
+                    }
+                }
             }
         }
     }
@@ -692,27 +715,27 @@ fn extract_trusted_client_ip(
     peer_ip: IpAddr,
 ) -> IpAddr {
     let mut candidates = Vec::new();
-    for val in headers.get_all("x-forwarded-for") {
+    for val in headers.get_all("forwarded") {
         if let Ok(s) = val.to_str() {
-            for part in s.split(',') {
-                if let Some(ip) = parse_forwarded_ip_token(part) {
-                    candidates.push(ip);
+            for entry in s.split(',') {
+                for param in entry.split(';') {
+                    let trimmed = param.trim();
+                    if trimmed.len() > 4
+                        && trimmed[..4].eq_ignore_ascii_case("for=")
+                        && let Some(ip) = parse_forwarded_ip_token(&trimmed[4..])
+                    {
+                        candidates.push(ip);
+                    }
                 }
             }
         }
     }
     if candidates.is_empty() {
-        for val in headers.get_all("forwarded") {
+        for val in headers.get_all("x-forwarded-for") {
             if let Ok(s) = val.to_str() {
-                for entry in s.split(',') {
-                    for param in entry.split(';') {
-                        let trimmed = param.trim();
-                        if trimmed.len() > 4
-                            && trimmed[..4].eq_ignore_ascii_case("for=")
-                            && let Some(ip) = parse_forwarded_ip_token(&trimmed[4..])
-                        {
-                            candidates.push(ip);
-                        }
+                for part in s.split(',') {
+                    if let Some(ip) = parse_forwarded_ip_token(part) {
+                        candidates.push(ip);
                     }
                 }
             }

@@ -18,7 +18,7 @@ Launch `tendril-relay` locally or build the rootless container defined in `crate
 cargo run -p tendril-relay -- --listen 127.0.0.1:8443 --host localhost
 ```
 
-In production deployments, terminate TLS directly on `tendril-relay` (`--tls-cert` and `--tls-key`, serving `wss://<host>/v1/relay`) or behind a trusted reverse proxy configured with `--trusted-proxy <CIDR>`. Right-to-left `X-Forwarded-For` and RFC 7239 `Forwarded` extraction runs only when the TCP peer matches `--trusted-proxy`, and rate limits normalize IPv4-mapped addresses and group IPv6 addresses by `/64` prefix alongside global `--max-connections` and `--max-mailboxes` caps.
+In production deployments, terminate TLS directly on `tendril-relay` (`--tls-cert` and `--tls-key`, serving `wss://<host>/v1/relay`) or behind a trusted reverse proxy configured with `--trusted-proxy <CIDR>`. Right-to-left RFC 7239 `Forwarded` (falling back to `X-Forwarded-For` if absent) extraction runs only when the TCP peer matches `--trusted-proxy`, so reverse proxies should strip or overwrite untrusted client forwarding headers. Rate limits normalize IPv4-mapped addresses and group IPv6 addresses by `/64` prefix alongside global `--max-connections` and `--max-mailboxes` caps.
 
 ## Endpoint lifecycle with `tendril`
 

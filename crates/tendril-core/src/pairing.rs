@@ -546,6 +546,9 @@ fn is_valid_url_hint(url: &str, secure_scheme: &str, loopback_scheme: &str) -> b
     {
         return false;
     }
+    if bare_host.eq_ignore_ascii_case("metadata.google.internal") {
+        return false;
+    }
     if let Ok(ip) = bare_host.parse::<IpAddr>()
         && is_disallowed_hint_ip(ip)
     {
@@ -572,6 +575,7 @@ fn is_valid_host_port_hint(target: &str) -> bool {
         return false;
     };
     if host.is_empty()
+        || host.eq_ignore_ascii_case("metadata.google.internal")
         || host.contains([':', '/', '?', '#', '@'])
         || !host
             .bytes()
@@ -610,12 +614,7 @@ fn is_valid_pairing_endpoint_hint(ep: &str) -> bool {
         return !local.is_empty() && !local.contains(['?', '#']);
     }
     if let Some(overlay) = ep.strip_prefix("overlay://") {
-        if overlay.is_empty() || overlay.contains(['?', '#']) {
-            return false;
-        }
-        return overlay
-            .parse::<SocketAddr>()
-            .map_or(true, |s| s.port() > 0 && !is_disallowed_hint_ip(s.ip()));
+        return is_valid_host_port_hint(overlay);
     }
     let iroh_cand = ep.strip_prefix("p2p:").unwrap_or(ep);
     if let Some(rest) = iroh_cand.strip_prefix("iroh://") {

@@ -358,23 +358,32 @@ impl SessionDriver {
         roster: &mut Roster,
         now_unix: u64,
     ) -> Result<(CandidateEndpoint, Self), RuntimeError> {
-        let shared_roster = Arc::new(Mutex::new(std::mem::take(roster)));
-        let roster_out = Arc::clone(&shared_roster);
+        struct RosterSyncGuard<'a> {
+            dst: &'a mut Roster,
+            shared: Arc<Mutex<Roster>>,
+        }
+        impl Drop for RosterSyncGuard<'_> {
+            fn drop(&mut self) {
+                *self.dst = self.shared.lock().expect("roster mutex poisoned").clone();
+            }
+        }
+
+        let shared_roster = Arc::new(Mutex::new(roster.clone()));
+        let _sync_guard = RosterSyncGuard {
+            dst: roster,
+            shared: Arc::clone(&shared_roster),
+        };
         let target_owned = target_host_id.to_owned();
-        let res =
-            dial_with_policy_verified(dialers, policy_config, candidates, move |_cand, stream| {
-                let id_c = Arc::clone(&local_identity);
-                let target_c = target_owned.clone();
-                let grant_c = initial_grant.clone();
-                let roster_c = Arc::clone(&shared_roster);
-                async move {
-                    Self::connect_locked(stream, &id_c, &target_c, grant_c, &roster_c, now_unix)
-                        .await
-                }
-            })
-            .await;
-        *roster = roster_out.lock().expect("roster mutex poisoned").clone();
-        res
+        dial_with_policy_verified(dialers, policy_config, candidates, move |_cand, stream| {
+            let id_c = Arc::clone(&local_identity);
+            let target_c = target_owned.clone();
+            let grant_c = initial_grant.clone();
+            let roster_c = Arc::clone(&shared_roster);
+            async move {
+                Self::connect_locked(stream, &id_c, &target_c, grant_c, &roster_c, now_unix).await
+            }
+        })
+        .await
     }
 
     async fn connect_with_roster(

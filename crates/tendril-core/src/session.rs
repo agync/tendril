@@ -761,13 +761,12 @@ impl SessionMachine {
                     .read_message(body, &mut pt)
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
                 let (kind, payload) = decode_inner_frame(&pt[..n])?;
-                let payload_owned = Zeroizing::new(payload.to_vec());
                 self.phase = SessionPhase::Transport(tx);
 
                 match kind {
                     InnerFrameType::Data => actions.push(SessionAction::AppData(payload.to_vec())),
                     InnerFrameType::Grant => {
-                        let grant: Grant = serde_json::from_slice(&payload_owned)
+                        let grant: Grant = serde_json::from_slice(payload)
                             .map_err(|err| CoreError::Json(err.to_string()))?;
                         let root_id = self.authoritative_root_id()?.to_string();
                         let subject = self.incoming_grant_subject()?.to_string();
@@ -783,7 +782,7 @@ impl SessionMachine {
                         actions.push(SessionAction::GrantUpdated(grant));
                     }
                     InnerFrameType::Revocation => {
-                        let crl: RevocationList = serde_json::from_slice(&payload_owned)
+                        let crl: RevocationList = serde_json::from_slice(payload)
                             .map_err(|err| CoreError::Json(err.to_string()))?;
                         let root_id = self.authoritative_root_id()?.to_string();
                         let root_pub = self
@@ -807,26 +806,23 @@ impl SessionMachine {
                         });
                     }
                     InnerFrameType::Ping => {
-                        let cookie: [u8; 8] =
-                            payload_owned.as_slice().try_into().map_err(|_| {
-                                CoreError::InvalidInnerFramePayload("PING must be 8 bytes")
-                            })?;
+                        let cookie: [u8; 8] = payload.try_into().map_err(|_| {
+                            CoreError::InvalidInnerFramePayload("PING must be 8 bytes")
+                        })?;
                         let mut reply = self.send_inner(InnerFrameType::Pong, &cookie, now_ms)?;
                         actions.append(&mut reply);
                     }
                     InnerFrameType::Pong => {
-                        let cookie: [u8; 8] =
-                            payload_owned.as_slice().try_into().map_err(|_| {
-                                CoreError::InvalidInnerFramePayload("PONG must be 8 bytes")
-                            })?;
+                        let cookie: [u8; 8] = payload.try_into().map_err(|_| {
+                            CoreError::InvalidInnerFramePayload("PONG must be 8 bytes")
+                        })?;
                         actions.push(SessionAction::PongReceived(u64::from_be_bytes(cookie)));
                     }
                     InnerFrameType::Close => {
-                        let code = u16::from_be_bytes([payload_owned[0], payload_owned[1]]);
-                        let reason =
-                            String::from_utf8(payload_owned[2..].to_vec()).map_err(|_| {
-                                CoreError::InvalidInnerFramePayload("CLOSE reason must be UTF-8")
-                            })?;
+                        let code = u16::from_be_bytes([payload[0], payload[1]]);
+                        let reason = String::from_utf8(payload[2..].to_vec()).map_err(|_| {
+                            CoreError::InvalidInnerFramePayload("CLOSE reason must be UTF-8")
+                        })?;
                         self.phase = SessionPhase::Closed;
                         actions.push(SessionAction::CloseTransport { code, reason });
                     }

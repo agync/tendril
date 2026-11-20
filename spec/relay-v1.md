@@ -118,7 +118,7 @@ Before entering binary forwarding mode, control errors return one JSON text fram
 { "op": "error", "code": string }
 ```
 
-Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"invalid_request"`, `"timeout"`.
+Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"capacity_exceeded"`, `"invalid_request"`, `"timeout"`.
 
 ---
 
@@ -133,7 +133,9 @@ Once `ready` has been sent:
 | Limit | Default v1 Value | Enforcement |
 |---|---|---|
 | `max_frame` | `65521` bytes | Close both halves immediately on oversize frame |
-| `max_tracked_ips` | `4096` entries | LRU-bounded per-IP token bucket table |
+| `max_tracked_ips` | `4096` entries | LRU-bounded per-IP/prefix (`/64` IPv6) token bucket table with eviction-overflow throttling |
+| `max_total_connections` | `4096` active sockets | Reject above cap immediately at accept |
+| `max_mailboxes` | `1024` registered keys | Return `"capacity_exceeded"` on new registrations above cap |
 | `max_pending_per_mailbox` | `8` concurrent pending dials | Return `"rate_limited"` above cap |
 | `max_active_per_ip` | `64` active connections | Reject above cap before holding state |
 | `max_active_per_mailbox` | `64` active bridged streams | Reject above cap |

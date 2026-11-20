@@ -169,10 +169,14 @@ async fn sec15_native_rustls_wss_listener_and_config_validation() {
 
 #[tokio::test]
 async fn sec15_trusted_proxy_right_to_left_xff_and_spoof_rejection() {
+    let mapped_cidr: IpCidr = "::ffff:10.0.0.0/104".parse().expect("mapped v6 cidr");
+    assert!(mapped_cidr.contains("10.1.2.3".parse().expect("v4")));
+    assert!(!mapped_cidr.contains("11.1.2.3".parse().expect("v4 out")));
+
     let trusted_server = RelayServer::bind(RelayConfig {
         trusted_proxies: vec![
             "127.0.0.1/32".parse::<IpCidr>().expect("loopback cidr"),
-            "10.0.0.0/8".parse::<IpCidr>().expect("proxy cidr"),
+            mapped_cidr,
         ],
         ip_burst_capacity: 1,
         ip_refill_per_sec: 1,
@@ -224,8 +228,10 @@ async fn sec15_trusted_proxy_right_to_left_xff_and_spoof_rejection() {
         RelayServerMsg::Error { code } if code == "rate_limited"
     ));
 
-    // A different untrusted IP via RFC 7239 Forwarded header gets its own bucket.
-    let mut req3 = ws_url.into_client_request().expect("req3");
+    // RFC 7239 Forwarded takes precedence even if an untrusted client injected X-Forwarded-For.
+    let mut req3 = ws_url.clone().into_client_request().expect("req3");
+    req3.headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
     req3.headers_mut().insert(
         "forwarded",
         HeaderValue::from_static("for=\"[2001:db8:cafe:beef::1]\";proto=https, for=10.0.0.9"),
@@ -245,7 +251,30 @@ async fn sec15_trusted_proxy_right_to_left_xff_and_spoof_rejection() {
         RelayServerMsg::Challenge { .. }
     ));
 
-    drop((ws1, ws2, ws3));
+    // A second request with the same Forwarded client IP shares that bucket despite changing XFF.
+    let mut req4 = ws_url.into_client_request().expect("req4");
+    req4.headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.77"));
+    req4.headers_mut().insert(
+        "forwarded",
+        HeaderValue::from_static("for=\"[2001:db8:cafe:beef::1]\";proto=https, for=10.0.0.9"),
+    );
+    let (mut ws4, _) = connect_async_with_config(req4, None, false)
+        .await
+        .expect("ws4 connect");
+    let fourth_msg = ws4
+        .next()
+        .await
+        .expect("ws4 item")
+        .expect("ws4 ok")
+        .into_text()
+        .expect("ws4 text");
+    assert!(matches!(
+        serde_json::from_str::<RelayServerMsg>(&fourth_msg).expect("msg4"),
+        RelayServerMsg::Error { code } if code == "rate_limited"
+    ));
+
+    drop((ws1, ws2, ws3, ws4));
     trusted_handle.stop().await.expect("stop trusted");
 
     // Untrusted proxy configuration must ignore X-Forwarded-For completely.

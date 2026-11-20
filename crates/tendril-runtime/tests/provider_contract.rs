@@ -1969,16 +1969,32 @@ async fn batch2a_sec06_p2p_per_peer_accept_cap() {
         .await
         .expect("bind attacker endpoint");
 
-    // Peer A opens 6 connections without writing the 0x54 stream magic byte, attempting to stall accept_bi.
-    let mut attacker_conns = Vec::new();
-    for _ in 0..6 {
-        let conn = attacker_ep
-            .connect(target_addr.clone(), TENDRIL_P2P_ALPN)
-            .await
-            .expect("attacker connect");
-        let _bi = conn.open_bi().await.expect("attacker open_bi");
-        attacker_conns.push(conn);
+    // Peer A opens 68 connections (> MAX_CONCURRENT_ACCEPTS = 64) without writing the 0x54 stream
+    // magic byte, attempting to saturate the global accept semaphore before legitimate peers arrive.
+    let mut tasks = Vec::new();
+    for _ in 0..68 {
+        let ep = attacker_ep.clone();
+        let addr = target_addr.clone();
+        tasks.push(tokio::spawn(async move {
+            let conn = ep
+                .connect(addr, TENDRIL_P2P_ALPN)
+                .await
+                .map_err(|e| e.to_string())?;
+            let bi = conn.open_bi().await.map_err(|e| e.to_string())?;
+            Ok::<_, String>((conn, bi))
+        }));
     }
+    let mut attacker_conns = Vec::new();
+    for t in tasks {
+        if let Ok(Ok(held)) = timeout(Duration::from_secs(3), t).await {
+            attacker_conns.push(held);
+        }
+    }
+    assert!(
+        attacker_conns.len() >= 65,
+        "expected >= 65 attacker connections to exercise >64 global slots, got {}",
+        attacker_conns.len()
+    );
 
     let legit_dialer = P2pDialer::bind(P2pRelayMode::Disabled)
         .await
@@ -2289,6 +2305,37 @@ async fn batch2a_sec20_connect_with_policy_fails_over_past_malicious_direct() {
         CandidateEndpoint::new(1, ProviderId::Direct, decoy_addr.to_string()),
         CandidateEndpoint::new(2, ProviderId::Relay, relay_ep),
     ];
+
+    // Canceling SessionDriver::connect_with_policy mid-flight must preserve existing roster entries.
+    let silent_decoy = TcpListener::bind("127.0.0.1:0").await.expect("bind silent");
+    let silent_addr = silent_decoy.local_addr().expect("silent addr");
+    let _silent_hold = tokio::spawn(async move {
+        let _s = silent_decoy.accept().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    let canceled = timeout(
+        Duration::from_millis(60),
+        SessionDriver::connect_with_policy(
+            &dialers,
+            PathPolicyConfig::default(),
+            vec![CandidateEndpoint::new(
+                1,
+                ProviderId::Direct,
+                silent_addr.to_string(),
+            )],
+            Arc::clone(&cli_id),
+            "sec20-host",
+            None,
+            &mut cli_roster,
+            1_795_564_800,
+        ),
+    )
+    .await;
+    assert!(canceled.is_err(), "expected timeout cancel");
+    assert!(
+        cli_roster.get("sec20-host").is_some(),
+        "canceling connect_with_policy must not wipe caller roster"
+    );
 
     let (winner, mut cli_driver) = SessionDriver::connect_with_policy(
         &dialers,
