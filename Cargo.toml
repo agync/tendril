@@ -36,6 +36,7 @@ x25519-dalek = { version = "3.0", default-features = false, features = ["precomp
 zeroize = { version = "1.9", features = ["derive"] }
 tendril-core = { path = "crates/tendril-core" }
 tendril-relay = { path = "crates/tendril-relay" }
+tendril-runtime = { path = "crates/tendril-runtime" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

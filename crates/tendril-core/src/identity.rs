@@ -49,6 +49,56 @@ impl EndpointIdentity {
         }
     }
 
+    /// Restores a persisted endpoint identity, validating `host_id` and any rotation chain.
+    pub fn from_persisted(
+        host_id: String,
+        static_key: StaticKeypair,
+        signing_key: SigningKeypair,
+        rotation_chain: Vec<RotationRecord>,
+        rotation_seq: u64,
+    ) -> Result<Self, CoreError> {
+        if host_id.is_empty() {
+            return Err(CoreError::IncompletePin("empty host_id".to_string()));
+        }
+        if static_key.public_bytes() == &[0u8; 32] {
+            return Err(CoreError::IncompletePin(
+                "zero static public key".to_string(),
+            ));
+        }
+        if rotation_chain.is_empty() {
+            if rotation_seq != 0 {
+                return Err(CoreError::RotationNonContiguous);
+            }
+        } else {
+            if rotation_chain[0].seq != 1 {
+                return Err(CoreError::RotationNonMonotonicSeq {
+                    expected_min: 1,
+                    got: rotation_chain[0].seq,
+                });
+            }
+            let genesis_signing: [u8; 32] =
+                b64url_decode_array(&rotation_chain[0].prev_signing_pub)?;
+            let final_seq = verify_rotation_chain(
+                &genesis_signing,
+                &[0u8; 32],
+                0,
+                &rotation_chain,
+                static_key.public_bytes(),
+                signing_key.public_bytes(),
+            )?;
+            if final_seq != rotation_seq {
+                return Err(CoreError::RotationNonContiguous);
+            }
+        }
+        Ok(Self {
+            host_id,
+            static_key,
+            signing_key,
+            rotation_chain,
+            rotation_seq,
+        })
+    }
+
     /// Overrides the stable `host_id` carried in `HostHello`.
     #[must_use]
     pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
@@ -678,6 +728,72 @@ mod tests {
         assert_eq!(
             verify_rotation_chain(&pk0, &stat0, u64::MAX, &[r_pinned], &stat1, &pk1),
             Err(CoreError::RotationNonContiguous)
+        );
+    }
+
+    #[test]
+    fn endpoint_identity_from_persisted_validates_unrotated_and_rotated_chains() {
+        let mut id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x31; 32]),
+            SigningKeypair::from_seed([0x32; 32]),
+        )
+        .with_host_id("stable-host-id");
+        let restored_unrotated = EndpointIdentity::from_persisted(
+            id.host_id().to_string(),
+            StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
+            SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+            id.rotation_chain().to_vec(),
+            id.rotation_seq(),
+        )
+        .expect("unrotated reload succeeds");
+        assert_eq!(restored_unrotated.host_id(), "stable-host-id");
+        assert_eq!(restored_unrotated.rotation_seq(), 0);
+
+        let ts = 1_795_132_800;
+        id.rotate(
+            StaticKeypair::from_scalar([0x33; 32]),
+            SigningKeypair::from_seed([0x34; 32]),
+            ts,
+        )
+        .unwrap();
+        id.rotate(
+            StaticKeypair::from_scalar([0x35; 32]),
+            SigningKeypair::from_seed([0x36; 32]),
+            ts + 60,
+        )
+        .unwrap();
+
+        let restored_rotated = EndpointIdentity::from_persisted(
+            id.host_id().to_string(),
+            StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
+            SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+            id.rotation_chain().to_vec(),
+            id.rotation_seq(),
+        )
+        .expect("2x rotated reload succeeds");
+        assert_eq!(restored_rotated.rotation_seq(), 2);
+        assert_eq!(restored_rotated.rotation_chain().len(), 2);
+        assert_eq!(restored_rotated.host_id(), "stable-host-id");
+
+        assert!(
+            EndpointIdentity::from_persisted(
+                id.host_id().to_string(),
+                StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
+                SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+                id.rotation_chain().to_vec(),
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            EndpointIdentity::from_persisted(
+                id.host_id().to_string(),
+                StaticKeypair::from_scalar([0x37; 32]),
+                SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+                id.rotation_chain().to_vec(),
+                id.rotation_seq(),
+            )
+            .is_err()
         );
     }
 }

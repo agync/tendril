@@ -288,6 +288,12 @@ impl SigningKeypair {
         SigningKey::from_bytes(&self.seed)
     }
 
+    /// Returns the 32-byte Ed25519 signing seed.
+    #[must_use]
+    pub fn seed_bytes(&self) -> &[u8; 32] {
+        &self.seed
+    }
+
     /// Returns the 32-byte Ed25519 verifying public key.
     #[must_use]
     pub const fn public_bytes(&self) -> &[u8; 32] {

@@ -1,0 +1,28 @@
+[package]
+name = "tendril-runtime"
+description = "Async Tokio runtime, path providers, rate limits, and persistence for Tendril."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tendril-core.workspace = true
+tendril-relay.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
