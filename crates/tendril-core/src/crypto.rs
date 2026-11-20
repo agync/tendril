@@ -26,6 +26,9 @@ pub const PAIR_MAC_LABEL: &[u8] = b"tendril-pair-v1";
 /// ASCII domain separation label for post-`msg2` pairing SAS.
 pub const SAS_LABEL: &[u8] = b"tendril-sas-v1";
 
+/// HKDF-SHA256 domain separation label for deriving the host P2P routing seed.
+pub const P2P_IDENTITY_HKDF_LABEL: &[u8] = b"tendril/p2p/iroh-identity/v1";
+
 /// Argon2id memory cost in KiB (64 MiB).
 pub const ARGON2_MEMORY_KIB: u32 = 65_536;
 
@@ -307,5 +310,52 @@ impl fmt::Debug for SigningKeypair {
             .field("public", &b64url_encode(&self.public))
             .field("seed", &"<redacted>")
             .finish()
+    }
+}
+
+/// Derives a 32-byte subkey using single-block RFC 5869 HKDF-SHA256.
+#[must_use]
+pub fn hkdf_sha256_32(ikm: &[u8], salt: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
+    let zero_salt = [0u8; 32];
+    let effective_salt = if salt.is_empty() {
+        &zero_salt[..]
+    } else {
+        salt
+    };
+    let mut extract =
+        HmacSha256::new_from_slice(effective_salt).expect("HMAC-SHA256 accepts any salt length");
+    extract.update(ikm);
+    let prk: Zeroizing<[u8; 32]> = Zeroizing::new(extract.finalize().into_bytes().into());
+
+    let mut expand =
+        HmacSha256::new_from_slice(&*prk).expect("HMAC-SHA256 accepts 32-byte PRK key");
+    expand.update(info);
+    expand.update(&[0x01u8]);
+    Zeroizing::new(expand.finalize().into_bytes().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hkdf_sha256_32_matches_rfc5869_vectors() {
+        // RFC 5869 Appendix A.1 (first 32 bytes of 42-byte OKM).
+        let ikm1 = [0x0bu8; 22];
+        let salt1 = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info1 = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let okm1 = hkdf_sha256_32(&ikm1, &salt1, &info1);
+        assert_eq!(
+            hex::encode(*okm1),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+        );
+
+        // RFC 5869 Appendix A.3 (empty salt, empty info, first 32 bytes of OKM).
+        let ikm3 = [0x0bu8; 22];
+        let okm3 = hkdf_sha256_32(&ikm3, &[], &[]);
+        assert_eq!(
+            hex::encode(*okm3),
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d"
+        );
     }
 }

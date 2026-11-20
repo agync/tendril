@@ -5,8 +5,12 @@ use std::collections::{HashMap, HashSet};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode};
+use crate::crypto::{
+    P2P_IDENTITY_HKDF_LABEL, SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode,
+    hkdf_sha256_32,
+};
 use crate::error::CoreError;
+use zeroize::Zeroizing;
 
 /// 15-byte domain separator prefix for binary `RotationRecord` signatures.
 pub const ROTATION_DOMAIN: &[u8] = b"tendril-rot-v1\0";
@@ -140,6 +144,15 @@ impl EndpointIdentity {
     #[must_use]
     pub const fn rotation_seq(&self) -> u64 {
         self.rotation_seq
+    }
+
+    /// Derives the deterministic 32-byte P2P transport routing seed via HKDF-SHA256.
+    ///
+    /// Used strictly for outer transport routing identity and never as an authorization input.
+    /// Rotates automatically whenever [`EndpointIdentity::rotate`] updates `static_key`.
+    #[must_use]
+    pub fn derive_p2p_identity_seed(&self) -> Zeroizing<[u8; 32]> {
+        hkdf_sha256_32(self.static_key.secret_bytes(), &[], P2P_IDENTITY_HKDF_LABEL)
     }
 
     /// Signs a new [`RotationRecord`] using the outgoing signing key and rotates keys atomically.
@@ -795,5 +808,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn derive_p2p_identity_seed_is_deterministic_domain_separated_and_rotates() {
+        let mut id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x41; 32]),
+            SigningKeypair::from_seed([0x42; 32]),
+        )
+        .with_host_id("p2p-seed-host");
+        let seed1 = id.derive_p2p_identity_seed();
+        let reloaded = EndpointIdentity::from_persisted(
+            id.host_id().to_string(),
+            StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
+            SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+            id.rotation_chain().to_vec(),
+            id.rotation_seq(),
+        )
+        .expect("reload identity");
+        let seed_reloaded = reloaded.derive_p2p_identity_seed();
+        assert_eq!(&*seed1, &*seed_reloaded);
+        assert_ne!(&*seed1, id.static_key().secret_bytes());
+        assert_ne!(&*seed1, id.signing_key().seed_bytes());
+
+        id.rotate(
+            StaticKeypair::from_scalar([0x43; 32]),
+            SigningKeypair::from_seed([0x44; 32]),
+            1_795_132_900,
+        )
+        .expect("rotate identity");
+        let seed2 = id.derive_p2p_identity_seed();
+        assert_ne!(&*seed1, &*seed2);
     }
 }
