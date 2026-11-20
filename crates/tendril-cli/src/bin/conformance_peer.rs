@@ -547,7 +547,7 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 return (err_json("no active session"), false);
             };
             let wait = Duration::from_millis(timeout_ms.unwrap_or(5_000));
-            match timeout(wait, session.next_event(now_unix(), &mut state.roster)).await {
+            match timeout(wait, session.next_event_now(&mut state.roster)).await {
                 Ok(Ok(Some(SessionEvent::AppData(data)))) => (
                     serde_json::json!({
                         "ok": true,

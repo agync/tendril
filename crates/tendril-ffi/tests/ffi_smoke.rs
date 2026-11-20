@@ -16,16 +16,19 @@ use tendril_core::wire::{
     HostHello, Intent, NOISE_PATTERN, Preamble, ResumableFrameReader, encode_frame,
 };
 use tendril_ffi::{
-    TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_PROTOCOL, TENDRIL_OK, TENDRIL_WOULD_BLOCK,
-    tendril_compute_code_mac, tendril_device_id, tendril_endpoint_confirm_peer,
-    tendril_endpoint_free, tendril_endpoint_info_json, tendril_endpoint_issue_code,
-    tendril_endpoint_mint_grant, tendril_endpoint_new, tendril_endpoint_pair_accept,
-    tendril_endpoint_pair_initiate, tendril_endpoint_revoke_peer, tendril_endpoint_serve_direct,
-    tendril_endpoint_serve_p2p, tendril_fingerprint_device, tendril_fingerprint_host,
-    tendril_last_error, tendril_pairing_sas, tendril_session_accept, tendril_session_authorize,
-    tendril_session_close, tendril_session_connect, tendril_session_free,
+    TENDRIL_EOF, TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_ERR_PROTOCOL, TENDRIL_OK,
+    TENDRIL_WOULD_BLOCK, tendril_compute_code_mac, tendril_device_id, tendril_endpoint_close,
+    tendril_endpoint_confirm_peer, tendril_endpoint_export_identity_json,
+    tendril_endpoint_export_roster_json, tendril_endpoint_free, tendril_endpoint_info_json,
+    tendril_endpoint_issue_code, tendril_endpoint_mint_grant, tendril_endpoint_new,
+    tendril_endpoint_new_from_state, tendril_endpoint_pair_accept, tendril_endpoint_pair_initiate,
+    tendril_endpoint_revoke_peer, tendril_endpoint_serve_direct, tendril_endpoint_serve_p2p,
+    tendril_fingerprint_device, tendril_fingerprint_host, tendril_last_error, tendril_pairing_sas,
+    tendril_session_accept, tendril_session_authorize, tendril_session_close,
+    tendril_session_connect, tendril_session_export_roster_json, tendril_session_free,
     tendril_session_poll_event, tendril_session_rekey, tendril_session_send_data,
-    tendril_string_free, tendril_verify_grant_json, tendril_verify_rotation_chain_json,
+    tendril_session_shutdown, tendril_string_free, tendril_verify_grant_json,
+    tendril_verify_rotation_chain_json,
 };
 use tendril_runtime::{
     DirectListener, PathListener, PathStream, PrefixedPathStream, SessionDriver, StateStore,
@@ -1179,6 +1182,273 @@ fn batch1_sec03_ffi_pair_flood_does_not_starve_accept_session() {
 
     drop(floods);
     unsafe {
+        tendril_session_close(cli_sess, 1000, ptr::null());
+        tendril_session_free(cli_sess);
+        tendril_session_free(host_sess);
+        tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
+}
+
+#[test]
+fn batch2b_sec08_sec17_sec32_sec37_ffi_hardening() {
+    use std::time::Instant;
+
+    // SEC-08: in-memory state creation + export with zero filesystem state.
+    let hn = CString::new("mem-host").unwrap();
+    let mem_ep = unsafe { tendril_endpoint_new_from_state(ptr::null(), ptr::null(), hn.as_ptr()) };
+    assert!(!mem_ep.is_null());
+
+    let mut id_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_identity_json(mem_ep, &raw mut id_ptr) },
+        TENDRIL_OK
+    );
+    let id_json = unsafe { take_cstr(id_ptr) };
+
+    let mut rst_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_roster_json(mem_ep, &raw mut rst_ptr) },
+        TENDRIL_OK
+    );
+    let rst_json = unsafe { take_cstr(rst_ptr) };
+
+    let mut info_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(mem_ep, &raw mut info_ptr) },
+        TENDRIL_OK
+    );
+    let info_orig = unsafe { take_cstr(info_ptr) };
+    unsafe { tendril_endpoint_free(mem_ep) };
+
+    let id_c = CString::new(id_json).unwrap();
+    let rst_c = CString::new(rst_json).unwrap();
+    let restored =
+        unsafe { tendril_endpoint_new_from_state(id_c.as_ptr(), rst_c.as_ptr(), ptr::null()) };
+    assert!(!restored.is_null(), "restore failed: {}", read_last_err());
+    let mut info2_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(restored, &raw mut info2_ptr) },
+        TENDRIL_OK
+    );
+    assert_eq!(unsafe { take_cstr(info2_ptr) }, info_orig);
+
+    // SEC-17 (Endpoint): tendril_endpoint_close wakes blocked tendril_session_accept immediately.
+    let ep_usize = restored as usize;
+    let accept_t0 = Instant::now();
+    let acc_thr = thread::spawn(move || {
+        unsafe { tendril_session_accept(ep_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) }
+            .is_null()
+    });
+    thread::sleep(Duration::from_millis(60));
+    assert_eq!(unsafe { tendril_endpoint_close(restored) }, TENDRIL_OK);
+    assert!(acc_thr.join().unwrap());
+    assert!(accept_t0.elapsed() < Duration::from_secs(1));
+    unsafe { tendril_endpoint_free(restored) };
+
+    // Pair + establish session to test SEC-17 full-duplex, SEC-32 len guard, SEC-37 UTF-8 error alignment.
+    let tmp = TempDir::new().unwrap();
+    let host_dir = tmp.path().join("host");
+    let cli_dir = tmp.path().join("cli");
+    let grant_str = pair_and_mint_c(
+        host_dir.to_str().unwrap(),
+        cli_dir.to_str().unwrap(),
+        "ffi-sec17-host",
+        "[\"fs.read\"]",
+    );
+
+    let hd_c = CString::new(host_dir.to_str().unwrap()).unwrap();
+    let cd_c = CString::new(cli_dir.to_str().unwrap()).unwrap();
+    let hn_c = CString::new("ffi-sec17-host").unwrap();
+    let host_ep = unsafe { tendril_endpoint_new(hd_c.as_ptr(), hn_c.as_ptr()) };
+    let cli_ep = unsafe { tendril_endpoint_new(cd_c.as_ptr(), ptr::null()) };
+
+    let mut ep_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, ptr::null(), &raw mut ep_ptr) },
+        TENDRIL_OK
+    );
+    let ep_str = unsafe { take_cstr(ep_ptr) };
+
+    let hep_usize = host_ep as usize;
+    let acc_sess_thr = thread::spawn(move || {
+        unsafe { tendril_session_accept(hep_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) }
+            .addr()
+    });
+    let ep_c = CString::new(ep_str).unwrap();
+    let grant_c = CString::new(grant_str).unwrap();
+    let cli_sess = unsafe {
+        tendril_session_connect(
+            cli_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            hn_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(!cli_sess.is_null());
+    let host_sess = acc_sess_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess.is_null());
+
+    // SEC-32: len > isize::MAX and len > MAX_APP_DATA_LEN return TENDRIL_ERR_PROTOCOL without panic/abort.
+    let dummy = 1u8;
+    assert_eq!(
+        unsafe { tendril_session_send_data(cli_sess, &raw const dummy, usize::MAX) },
+        TENDRIL_ERR_PROTOCOL
+    );
+    assert_eq!(
+        unsafe {
+            tendril_session_send_data(
+                cli_sess,
+                &raw const dummy,
+                tendril_core::MAX_APP_DATA_LEN + 1,
+            )
+        },
+        TENDRIL_ERR_PROTOCOL
+    );
+
+    // SEC-37: tendril_last_error backs down to valid UTF-8 char boundary when cap splits 4-byte emoji.
+    let mut emoji_peer = String::from("dev_missing_");
+    emoji_peer.push('\u{1F600}');
+    let emoji_c = CString::new(emoji_peer).unwrap();
+    let mut small = vec![0u8; 41];
+    assert_eq!(
+        unsafe { tendril_endpoint_revoke_peer(host_ep, emoji_c.as_ptr()) },
+        TENDRIL_ERR_NOT_FOUND
+    );
+    unsafe {
+        let needed = tendril_last_error(small.as_mut_ptr().cast::<c_char>(), small.len());
+        assert!(needed > small.len() as i32);
+        let cstr = CStr::from_ptr(small.as_ptr().cast::<c_char>());
+        assert_eq!(
+            cstr.to_str().unwrap(),
+            "peer not found in roster: dev_missing_"
+        );
+    }
+
+    // Export session roster JSON cleanly.
+    let mut sr_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_export_roster_json(host_sess, &raw mut sr_ptr) },
+        TENDRIL_OK
+    );
+    let _ = unsafe { take_cstr(sr_ptr) };
+
+    // SEC-17 (Session): poll_event(5000) does NOT block authorize, send_data, or shutdown.
+    let hs_usize = host_sess as usize;
+    let poll_thr = thread::spawn(move || {
+        let mut ev_ptr: *mut c_char = ptr::null_mut();
+        unsafe {
+            tendril_session_poll_event(
+                hs_usize as *mut tendril_ffi::TendrilSession,
+                5_000,
+                &raw mut ev_ptr,
+            )
+        }
+    });
+    thread::sleep(Duration::from_millis(60));
+
+    let conc_t0 = Instant::now();
+    let cap_ok = CString::new("fs.read").unwrap();
+    let mut allowed = 0u8;
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess, cap_ok.as_ptr(), &raw mut allowed) },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed, 1);
+    assert_eq!(
+        unsafe { tendril_session_send_data(host_sess, b"host-to-cli".as_ptr(), 11) },
+        TENDRIL_OK
+    );
+    assert!(conc_t0.elapsed() < Duration::from_millis(500));
+
+    let mut cli_ev_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_poll_event(cli_sess, 2_000, &raw mut cli_ev_ptr) },
+        TENDRIL_OK
+    );
+    let cli_ev: Value = serde_json::from_str(&unsafe { take_cstr(cli_ev_ptr) }).unwrap();
+    assert_eq!(cli_ev["event"], "data");
+
+    assert_eq!(unsafe { tendril_session_shutdown(host_sess) }, TENDRIL_OK);
+    assert_eq!(poll_thr.join().unwrap(), TENDRIL_EOF);
+    assert!(conc_t0.elapsed() < Duration::from_secs(1));
+
+    // SEC-31: grant expiring while tendril_session_poll_event is parked must reject incoming REKEY.
+    let exp_host_info: Value = {
+        let mut info_p: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_info_json(host_ep, &raw mut info_p) },
+            TENDRIL_OK
+        );
+        serde_json::from_str(&unsafe { take_cstr(info_p) }).unwrap()
+    };
+    let cli_id_info: Value = {
+        let mut info_p: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_info_json(cli_ep, &raw mut info_p) },
+            TENDRIL_OK
+        );
+        serde_json::from_str(&unsafe { take_cstr(info_p) }).unwrap()
+    };
+    let cli_dev_c = CString::new(cli_id_info["device_id"].as_str().unwrap()).unwrap();
+    let short_caps_c = CString::new("[\"fs.read\"]").unwrap();
+    let mut short_grant_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                cli_dev_c.as_ptr(),
+                short_caps_c.as_ptr(),
+                1,
+                &raw mut short_grant_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let short_grant_c = CString::new(unsafe { take_cstr(short_grant_p) }).unwrap();
+    let hep2_usize = host_ep as usize;
+    let acc2_thr = thread::spawn(move || {
+        unsafe { tendril_session_accept(hep2_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) }
+            .addr()
+    });
+    let hn2_c = CString::new(exp_host_info["host_id"].as_str().unwrap()).unwrap();
+    let cli_sess2 = unsafe {
+        tendril_session_connect(
+            cli_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            hn2_c.as_ptr(),
+            short_grant_c.as_ptr(),
+        )
+    };
+    assert!(!cli_sess2.is_null(), "connect2 failed: {}", read_last_err());
+    let host_sess2 = acc2_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess2.is_null());
+
+    let hs2_usize = host_sess2 as usize;
+    let poll2_thr = thread::spawn(move || {
+        let mut ev_p: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_session_poll_event(
+                hs2_usize as *mut tendril_ffi::TendrilSession,
+                5_000,
+                &raw mut ev_p,
+            )
+        };
+        if !ev_p.is_null() {
+            unsafe { tendril_string_free(ev_p) };
+        }
+        rc
+    });
+    thread::sleep(Duration::from_millis(2_200));
+    assert_eq!(unsafe { tendril_session_rekey(cli_sess2) }, TENDRIL_OK);
+    assert_eq!(poll2_thr.join().unwrap(), TENDRIL_ERR_PROTOCOL);
+
+    unsafe {
+        tendril_session_close(cli_sess2, 1000, ptr::null());
+        tendril_session_free(cli_sess2);
+        tendril_session_free(host_sess2);
         tendril_session_close(cli_sess, 1000, ptr::null());
         tendril_session_free(cli_sess);
         tendril_session_free(host_sess);

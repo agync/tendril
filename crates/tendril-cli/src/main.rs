@@ -548,7 +548,7 @@ async fn await_pong(
     driver.send_ping(cookie).await?;
     let wait = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match driver.next_event(now_unix(), roster).await? {
+            match driver.next_event_now(roster).await? {
                 Some(SessionEvent::PongReceived(got)) if got == cookie => {
                     return Ok::<(), Box<dyn std::error::Error>>(());
                 }

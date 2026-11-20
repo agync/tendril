@@ -19,6 +19,7 @@ serde_json.workspace = true
 tendril-core.workspace = true
 tendril-runtime.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 snow.workspace = true

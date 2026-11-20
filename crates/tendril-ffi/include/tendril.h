@@ -61,8 +61,16 @@ int32_t tendril_verify_grant_json(
 
 /* Endpoint lifecycle and operations. */
 TendrilEndpoint *tendril_endpoint_new(const char *state_dir, const char *host_id);
+TendrilEndpoint *tendril_endpoint_new_from_state(
+    const char *identity_json_opt,
+    const char *roster_json_opt,
+    const char *host_id_opt
+);
+int32_t tendril_endpoint_close(TendrilEndpoint *ep);
 void tendril_endpoint_free(TendrilEndpoint *ep);
 
+int32_t tendril_endpoint_export_identity_json(const TendrilEndpoint *ep, char **out_json);
+int32_t tendril_endpoint_export_roster_json(const TendrilEndpoint *ep, char **out_json);
 int32_t tendril_endpoint_info_json(const TendrilEndpoint *ep, char **out_json);
 int32_t tendril_endpoint_serve_direct(TendrilEndpoint *ep, const char *listen_addr, char **out_endpoint);
 int32_t tendril_endpoint_serve_relay(
@@ -112,6 +120,8 @@ TendrilSession *tendril_session_connect(
     const char *grant_json
 );
 TendrilSession *tendril_session_accept(TendrilEndpoint *ep, uint64_t timeout_ms);
+int32_t tendril_session_shutdown(TendrilSession *sess);
+int32_t tendril_session_export_roster_json(const TendrilSession *sess, char **out_json);
 void tendril_session_free(TendrilSession *sess);
 
 int32_t tendril_session_send_data(TendrilSession *sess, const uint8_t *data, size_t len);

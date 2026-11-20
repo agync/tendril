@@ -9,14 +9,15 @@ pub mod router;
 pub mod store;
 
 pub use driver::{
-    DEFAULT_PRE_AUTH_TIMEOUT, SessionDriver, SessionEvent, dial_with_policy,
+    ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, SessionDriver, SessionEvent, dial_with_policy,
     dial_with_policy_verified, drive_pair_initiator, drive_pair_initiator_with_timeout,
     drive_pair_responder, drive_pair_responder_with_options, pairing_path_kind_for_provider,
 };
 pub use error::RuntimeError;
 pub use provider::{
-    DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathStream,
-    PrefixedPathStream, peek_exact, recv_tendril_frame, send_tendril_frame,
+    DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathReader, PathStream,
+    PathWriter, PrefixedPathStream, peek_exact, recv_tendril_frame, send_tendril_frame,
+    split_path_stream_fallback,
 };
 pub use providers::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DirectDialer, DirectListener, EmbeddedRelay,
@@ -33,4 +34,4 @@ pub use providers::{
 };
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
-pub use store::{RosterStamp, StateStore};
+pub use store::{RosterStamp, StateStore, deserialize_identity_json, serialize_identity_json};

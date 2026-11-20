@@ -46,6 +46,49 @@ impl Drop for PersistedIdentity {
     }
 }
 
+/// Serializes `identity` as versioned JSON with zeroized secret buffers.
+pub fn serialize_identity_json(
+    identity: &EndpointIdentity,
+) -> Result<Zeroizing<String>, RuntimeError> {
+    let static_b64 = Zeroizing::new(b64url_encode(identity.static_key().secret_bytes()));
+    let signing_b64 = Zeroizing::new(b64url_encode(identity.signing_key().seed_bytes()));
+    let payload = PersistedIdentity {
+        version: 1,
+        host_id: identity.host_id().to_owned(),
+        static_secret_b64: static_b64.to_string(),
+        signing_seed_b64: signing_b64.to_string(),
+        rotation_chain: identity.rotation_chain().to_vec(),
+        rotation_seq: identity.rotation_seq(),
+    };
+    let json = serde_json::to_string_pretty(&payload)
+        .map_err(|err| RuntimeError::Storage(format!("serialize identity failed: {err}")))?;
+    Ok(Zeroizing::new(json))
+}
+
+/// Deserializes and validates a versioned [`EndpointIdentity`] JSON document.
+pub fn deserialize_identity_json(raw: &str) -> Result<EndpointIdentity, RuntimeError> {
+    let disk: PersistedIdentity = serde_json::from_str(raw)
+        .map_err(|err| RuntimeError::Storage(format!("invalid identity json: {err}")))?;
+    if disk.version != 1 {
+        return Err(RuntimeError::Storage(format!(
+            "unsupported identity version {}",
+            disk.version
+        )));
+    }
+    let static_scalar = Zeroizing::new(b64url_decode_array::<32>(&disk.static_secret_b64)?);
+    let signing_seed = Zeroizing::new(b64url_decode_array::<32>(&disk.signing_seed_b64)?);
+    let static_key = StaticKeypair::from_scalar(*static_scalar);
+    let signing_key = SigningKeypair::from_seed(*signing_seed);
+    let identity = EndpointIdentity::from_persisted(
+        disk.host_id.clone(),
+        static_key,
+        signing_key,
+        disk.rotation_chain.clone(),
+        disk.rotation_seq,
+    )?;
+    Ok(identity)
+}
+
 /// Persistent identity and roster store rooted at a caller-supplied directory.
 #[derive(Debug, Clone)]
 pub struct StateStore {
@@ -89,45 +132,13 @@ impl StateStore {
         let path = self.identity_path();
         verify_private_file_0600(&path)?;
         let raw = Zeroizing::new(fs::read_to_string(&path)?);
-        let disk: PersistedIdentity = serde_json::from_str(&raw)
-            .map_err(|err| RuntimeError::Storage(format!("invalid identity json: {err}")))?;
-        if disk.version != 1 {
-            return Err(RuntimeError::Storage(format!(
-                "unsupported identity version {}",
-                disk.version
-            )));
-        }
-        let static_scalar = Zeroizing::new(b64url_decode_array::<32>(&disk.static_secret_b64)?);
-        let signing_seed = Zeroizing::new(b64url_decode_array::<32>(&disk.signing_seed_b64)?);
-        let static_key = StaticKeypair::from_scalar(*static_scalar);
-        let signing_key = SigningKeypair::from_seed(*signing_seed);
-        let identity = EndpointIdentity::from_persisted(
-            disk.host_id.clone(),
-            static_key,
-            signing_key,
-            disk.rotation_chain.clone(),
-            disk.rotation_seq,
-        )?;
-        Ok(identity)
+        deserialize_identity_json(&raw)
     }
 
     /// Atomically persists [`EndpointIdentity`] with `0o600` file mode on Unix.
     pub fn save_identity(&self, identity: &EndpointIdentity) -> Result<(), RuntimeError> {
-        let static_b64 = Zeroizing::new(b64url_encode(identity.static_key().secret_bytes()));
-        let signing_b64 = Zeroizing::new(b64url_encode(identity.signing_key().seed_bytes()));
-        let payload = PersistedIdentity {
-            version: 1,
-            host_id: identity.host_id().to_owned(),
-            static_secret_b64: static_b64.to_string(),
-            signing_seed_b64: signing_b64.to_string(),
-            rotation_chain: identity.rotation_chain().to_vec(),
-            rotation_seq: identity.rotation_seq(),
-        };
-        let json =
-            Zeroizing::new(serde_json::to_vec_pretty(&payload).map_err(|err| {
-                RuntimeError::Storage(format!("serialize identity failed: {err}"))
-            })?);
-        self.atomic_write_0600(&self.identity_path(), &json)
+        let json = serialize_identity_json(identity)?;
+        self.atomic_write_0600(&self.identity_path(), json.as_bytes())
     }
 
     /// Loads the existing identity or generates, optionally assigns `host_id`, and saves one

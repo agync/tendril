@@ -23,8 +23,62 @@ use tokio::task::AbortHandle;
 use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
 
 use crate::error::RuntimeError;
-use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathStream};
+use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, PathWriter};
 use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn write_protocol_chunks(
+    writer: &mut dyn PathWriter,
+    bytes: &[u8],
+) -> Result<(), RuntimeError> {
+    for chunk in bytes.chunks(MAX_OUTER_FRAME_LEN) {
+        writer.send_chunk(chunk).await?;
+    }
+    Ok(())
+}
+
+fn push_non_write_action(
+    pending_events: &mut VecDeque<SessionEvent>,
+    action: SessionAction,
+) -> (bool, bool) {
+    match action {
+        SessionAction::WriteBytes(_) | SessionAction::Established { .. } => (false, false),
+        SessionAction::AppData(data) => {
+            pending_events.push_back(SessionEvent::AppData(data));
+            (true, false)
+        }
+        SessionAction::GrantUpdated(grant) => {
+            pending_events.push_back(SessionEvent::GrantUpdated(grant));
+            (true, false)
+        }
+        SessionAction::RevocationUpdated { issuer, seq } => {
+            pending_events.push_back(SessionEvent::RevocationUpdated { issuer, seq });
+            (true, false)
+        }
+        SessionAction::Rekeyed { direction } => {
+            pending_events.push_back(SessionEvent::Rekeyed { direction });
+            (true, false)
+        }
+        SessionAction::PongReceived(cookie) => {
+            pending_events.push_back(SessionEvent::PongReceived(cookie));
+            (true, false)
+        }
+        SessionAction::Audit(ev) => {
+            pending_events.push_back(SessionEvent::Audit(ev));
+            (true, false)
+        }
+        SessionAction::CloseTransport { code, reason } => {
+            pending_events.push_back(SessionEvent::Closed { code, reason });
+            (true, true)
+        }
+    }
+}
 
 /// Default pre-authentication handshake deadline guarding responder paths (`10 s`).
 pub const DEFAULT_PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -617,13 +671,48 @@ impl SessionDriver {
         self.stream.provider_id()
     }
 
+    /// Converts this established [`SessionDriver`] into a full-duplex [`ConcurrentSession`].
+    #[must_use]
+    pub fn into_concurrent(self) -> ConcurrentSession {
+        let provider_id = self.stream.provider_id();
+        let is_closed = self.machine.is_closed();
+        let (reader, writer) = self.stream.into_split();
+        let (shutdown_tx, _) = tokio::sync::watch::channel(is_closed);
+        ConcurrentSession {
+            machine: Mutex::new(self.machine),
+            reader: tokio::sync::Mutex::new(SessionReadHalf {
+                reader,
+                recv_buf: self.recv_buf,
+            }),
+            writer: tokio::sync::Mutex::new(writer),
+            pending_events: Mutex::new(self.pending_events),
+            event_notify: tokio::sync::Notify::new(),
+            shutdown_tx,
+            started_at: self.started_at,
+            provider_id,
+            _half_open: self._half_open,
+        }
+    }
+
     /// Returns the next semantic event, reading and decrypting transport frames as needed.
     pub async fn next_event(
         &mut self,
         now_unix: u64,
         roster: &mut Roster,
     ) -> Result<Option<SessionEvent>, RuntimeError> {
-        self.next_event_with_roster(now_unix, RosterRef::Direct(roster))
+        let call_start = Instant::now();
+        self.next_event_with_roster(RosterRef::Direct(roster), move || {
+            now_unix.saturating_add(call_start.elapsed().as_secs())
+        })
+        .await
+    }
+
+    /// Returns the next semantic event using wall-clock time sampled when each frame arrives.
+    pub async fn next_event_now(
+        &mut self,
+        roster: &mut Roster,
+    ) -> Result<Option<SessionEvent>, RuntimeError> {
+        self.next_event_with_roster(RosterRef::Direct(roster), current_unix_secs)
             .await
     }
 
@@ -634,7 +723,20 @@ impl SessionDriver {
         now_unix: u64,
         roster: &Mutex<Roster>,
     ) -> Result<Option<SessionEvent>, RuntimeError> {
-        self.next_event_with_roster(now_unix, RosterRef::Locked(roster))
+        let call_start = Instant::now();
+        self.next_event_with_roster(RosterRef::Locked(roster), move || {
+            now_unix.saturating_add(call_start.elapsed().as_secs())
+        })
+        .await
+    }
+
+    /// Returns the next semantic event using a mutex-guarded roster and wall-clock time sampled
+    /// when each frame arrives.
+    pub async fn next_event_locked_now(
+        &mut self,
+        roster: &Mutex<Roster>,
+    ) -> Result<Option<SessionEvent>, RuntimeError> {
+        self.next_event_with_roster(RosterRef::Locked(roster), current_unix_secs)
             .await
     }
 
@@ -651,10 +753,7 @@ impl SessionDriver {
     {
         loop {
             if !self.pending_events.is_empty() {
-                let now_unix = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let now_unix = current_unix_secs();
                 if refresh_roster(roster)? {
                     self.tick(now_unix, roster).await?;
                 }
@@ -666,10 +765,7 @@ impl SessionDriver {
                 return Ok(None);
             }
             let recv_res = timeout(poll_interval, self.stream.recv_chunk(&mut self.recv_buf)).await;
-            let now_unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now_unix = current_unix_secs();
             let now_ms = self.elapsed_ms();
             match recv_res {
                 Ok(Ok(0)) => return Ok(None),
@@ -694,8 +790,8 @@ impl SessionDriver {
 
     async fn next_event_with_roster(
         &mut self,
-        now_unix: u64,
         mut roster: RosterRef<'_>,
+        mut now_fn: impl FnMut() -> u64,
     ) -> Result<Option<SessionEvent>, RuntimeError> {
         loop {
             if let Some(ev) = self.pending_events.pop_front() {
@@ -708,6 +804,7 @@ impl SessionDriver {
             if n == 0 {
                 return Ok(None);
             }
+            let now_unix = now_fn();
             let now_ms = self.elapsed_ms();
             let chunk = self.recv_buf[..n].to_vec();
             let actions = self.feed_with_roster(&chunk, now_unix, now_ms, &mut roster)?;
@@ -778,42 +875,271 @@ impl SessionDriver {
     }
 
     async fn apply_actions(&mut self, actions: Vec<SessionAction>) -> Result<(), RuntimeError> {
+        let mut should_close = false;
         for action in actions {
-            match action {
-                SessionAction::WriteBytes(bytes) => {
-                    write_protocol_bytes(self.stream.as_mut(), &bytes).await?;
-                }
-                SessionAction::Established { .. } => {}
-                SessionAction::AppData(data) => {
-                    self.pending_events.push_back(SessionEvent::AppData(data));
-                }
-                SessionAction::GrantUpdated(grant) => {
-                    self.pending_events
-                        .push_back(SessionEvent::GrantUpdated(grant));
-                }
-                SessionAction::RevocationUpdated { issuer, seq } => {
-                    self.pending_events
-                        .push_back(SessionEvent::RevocationUpdated { issuer, seq });
-                }
-                SessionAction::Rekeyed { direction } => {
-                    self.pending_events
-                        .push_back(SessionEvent::Rekeyed { direction });
-                }
-                SessionAction::PongReceived(cookie) => {
-                    self.pending_events
-                        .push_back(SessionEvent::PongReceived(cookie));
-                }
-                SessionAction::Audit(ev) => {
-                    self.pending_events.push_back(SessionEvent::Audit(ev));
-                }
-                SessionAction::CloseTransport { code, reason } => {
-                    self.pending_events
-                        .push_back(SessionEvent::Closed { code, reason });
-                    let _ = self.stream.close().await;
+            if let SessionAction::WriteBytes(bytes) = action {
+                write_protocol_bytes(self.stream.as_mut(), &bytes).await?;
+            } else {
+                let (_, close_transport) = push_non_write_action(&mut self.pending_events, action);
+                if close_transport {
+                    should_close = true;
                 }
             }
         }
+        if should_close {
+            let _ = self.stream.close().await;
+        }
         Ok(())
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+struct SessionReadHalf {
+    reader: Box<dyn PathReader>,
+    recv_buf: Vec<u8>,
+}
+
+/// Full-duplex concurrent driver for one established [`SessionMachine`].
+///
+/// Locks follow a strict total order: `reader` -> `writer` -> `machine` -> `roster` ->
+/// `pending_events`. Neither `machine`, `roster`, nor `pending_events` is held across `.await`.
+pub struct ConcurrentSession {
+    machine: Mutex<SessionMachine>,
+    reader: tokio::sync::Mutex<SessionReadHalf>,
+    writer: tokio::sync::Mutex<Box<dyn PathWriter>>,
+    pending_events: Mutex<VecDeque<SessionEvent>>,
+    event_notify: tokio::sync::Notify,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    started_at: Instant,
+    provider_id: ProviderId,
+    _half_open: Option<HalfOpenGuard>,
+}
+
+impl ConcurrentSession {
+    /// Signals any parked `next_event_*` callers to exit immediately with `Ok(None)`.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.event_notify.notify_waiters();
+    }
+
+    /// Evaluates default-deny capability authorization without waiting on session I/O.
+    pub fn authorize(
+        &self,
+        requested_cap: &str,
+        now_unix: u64,
+        roster: &Roster,
+    ) -> (Result<(), CoreError>, AuditEvent) {
+        let machine = self.machine.lock().expect("session machine mutex poisoned");
+        machine.authorize(requested_cap, now_unix, roster)
+    }
+
+    /// Returns the authenticated peer device ID if established.
+    #[must_use]
+    pub fn peer_device_id(&self) -> Option<String> {
+        self.machine
+            .lock()
+            .expect("session machine mutex poisoned")
+            .peer_device_id()
+            .map(ToOwned::to_owned)
+    }
+
+    /// Returns the provider ID backing the active stream.
+    #[must_use]
+    pub fn provider_id(&self) -> ProviderId {
+        self.provider_id
+    }
+
+    /// Sends encrypted `0x01 DATA` concurrently with inbound polling.
+    pub async fn send_data(&self, payload: &[u8]) -> Result<(), RuntimeError> {
+        self.run_write_op(|machine, now_ms| machine.send_data(payload, now_ms))
+            .await
+    }
+
+    /// Sends encrypted `0x02 GRANT` concurrently with inbound polling.
+    pub async fn send_grant(&self, grant: &Grant) -> Result<(), RuntimeError> {
+        self.run_write_op(|machine, now_ms| machine.send_grant(grant, now_ms))
+            .await
+    }
+
+    /// Sends encrypted `0x03 REVOCATION` concurrently with inbound polling.
+    pub async fn send_revocation(&self, crl: &RevocationList) -> Result<(), RuntimeError> {
+        self.run_write_op(|machine, now_ms| machine.send_revocation(crl, now_ms))
+            .await
+    }
+
+    /// Sends encrypted `0x04 REKEY` concurrently with inbound polling.
+    pub async fn send_rekey(&self) -> Result<(), RuntimeError> {
+        self.run_write_op(|machine, now_ms| machine.send_rekey(now_ms))
+            .await
+    }
+
+    /// Sends encrypted `0x05 PING` concurrently with inbound polling.
+    pub async fn send_ping(&self, cookie: u64) -> Result<(), RuntimeError> {
+        self.run_write_op(|machine, now_ms| machine.send_ping(cookie, now_ms))
+            .await
+    }
+
+    /// Sends encrypted `0x07 CLOSE` and shuts down the transport writer.
+    pub async fn send_close(&self, code: u16, reason: &str) -> Result<(), RuntimeError> {
+        let mut writer = self.writer.lock().await;
+        let actions = {
+            let mut machine = self.machine.lock().expect("session machine mutex poisoned");
+            machine.send_close(code, reason)?
+        };
+        let res = self.dispatch_actions_locked(&mut writer, actions).await;
+        let _ = writer.close().await;
+        res
+    }
+
+    /// Advances timer and grant checks against `roster`.
+    pub async fn tick(&self, now_unix: u64, roster: &Roster) -> Result<(), RuntimeError> {
+        let mut writer = self.writer.lock().await;
+        let tick_res = {
+            let now_ms = self.elapsed_ms();
+            let mut machine = self.machine.lock().expect("session machine mutex poisoned");
+            machine.tick(now_unix, now_ms, roster)
+        };
+        match tick_res {
+            Ok(actions) => self.dispatch_actions_locked(&mut writer, actions).await,
+            Err(err) => {
+                let _ = writer.close().await;
+                self.event_notify.notify_waiters();
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Waits for the next semantic event using fresh wall-clock `now_unix` on frame arrival,
+    /// without blocking outbound sends or authorization checks while awaiting bytes.
+    pub async fn next_event_locked_now(
+        &self,
+        roster: &Mutex<Roster>,
+    ) -> Result<Option<SessionEvent>, RuntimeError> {
+        self.next_event_with_clock(roster, current_unix_secs).await
+    }
+
+    /// Waits for the next semantic event using an explicit clock callback sampled on frame arrival.
+    pub async fn next_event_with_clock(
+        &self,
+        roster: &Mutex<Roster>,
+        mut now_fn: impl FnMut() -> u64,
+    ) -> Result<Option<SessionEvent>, RuntimeError> {
+        let mut read_half = self.reader.lock().await;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        loop {
+            let notified = self.event_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if *shutdown_rx.borrow() {
+                return Ok(None);
+            }
+            if let Some(ev) = self.pop_pending_event() {
+                return Ok(Some(ev));
+            }
+            if self
+                .machine
+                .lock()
+                .expect("session machine mutex poisoned")
+                .is_closed()
+            {
+                return Ok(None);
+            }
+
+            let read_half_ref = &mut *read_half;
+            let n = tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    return Ok(None);
+                }
+                _ = &mut notified => continue,
+                res = read_half_ref.reader.recv_chunk(&mut read_half_ref.recv_buf) => res?,
+            };
+            if n == 0 {
+                return Ok(None);
+            }
+
+            let now_unix = now_fn();
+            let now_ms = self.elapsed_ms();
+            let mut writer = self.writer.lock().await;
+            let feed_res = {
+                let mut machine = self.machine.lock().expect("session machine mutex poisoned");
+                let mut roster_guard = roster.lock().expect("roster mutex poisoned");
+                machine.feed_bytes(
+                    &read_half_ref.recv_buf[..n],
+                    now_unix,
+                    now_ms,
+                    &mut roster_guard,
+                )
+            };
+            match feed_res {
+                Ok(actions) => {
+                    self.dispatch_actions_locked(&mut writer, actions).await?;
+                }
+                Err(err) => {
+                    let _ = writer.close().await;
+                    self.event_notify.notify_waiters();
+                    return Err(err.into());
+                }
+            }
+        }
+    }
+
+    async fn run_write_op<F>(&self, op: F) -> Result<(), RuntimeError>
+    where
+        F: FnOnce(&mut SessionMachine, u64) -> Result<Vec<SessionAction>, CoreError>,
+    {
+        let mut writer = self.writer.lock().await;
+        let actions = {
+            let now_ms = self.elapsed_ms();
+            let mut machine = self.machine.lock().expect("session machine mutex poisoned");
+            op(&mut machine, now_ms)?
+        };
+        self.dispatch_actions_locked(&mut writer, actions).await
+    }
+
+    async fn dispatch_actions_locked(
+        &self,
+        writer: &mut Box<dyn PathWriter>,
+        actions: Vec<SessionAction>,
+    ) -> Result<(), RuntimeError> {
+        let mut new_events = VecDeque::new();
+        let mut should_close = false;
+        for action in actions {
+            if let SessionAction::WriteBytes(bytes) = action {
+                write_protocol_chunks(writer.as_mut(), &bytes).await?;
+            } else {
+                let (_, close_transport) = push_non_write_action(&mut new_events, action);
+                if close_transport {
+                    should_close = true;
+                }
+            }
+        }
+        let notify = !new_events.is_empty();
+        if notify {
+            let mut q = self
+                .pending_events
+                .lock()
+                .expect("pending_events mutex poisoned");
+            q.extend(new_events);
+        }
+        if notify || should_close {
+            self.event_notify.notify_waiters();
+        }
+        if should_close {
+            let _ = writer.close().await;
+        }
+        Ok(())
+    }
+
+    fn pop_pending_event(&self) -> Option<SessionEvent> {
+        self.pending_events
+            .lock()
+            .expect("pending_events mutex poisoned")
+            .pop_front()
     }
 
     fn elapsed_ms(&self) -> u64 {

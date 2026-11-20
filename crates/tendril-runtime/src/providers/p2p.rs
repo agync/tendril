@@ -2,8 +2,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,7 +17,8 @@ use zeroize::Zeroizing;
 
 use crate::error::RuntimeError;
 use crate::provider::{
-    DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathStream,
+    DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathReader, PathStream,
+    PathWriter,
 };
 
 /// ALPN registered on iroh endpoints carrying Tendril `Intent::Pair` and `Intent::Session`.
@@ -373,13 +374,66 @@ pub fn parse_p2p_endpoint_filtered(
     Ok(EndpointAddr::from_parts(id, addrs))
 }
 
+struct P2pConnDropper {
+    guard: StdMutex<Option<Arc<EndpointGuard>>>,
+    conn: StdMutex<Option<Connection>>,
+}
+
+impl P2pConnDropper {
+    fn new(guard: Arc<EndpointGuard>, conn: Connection) -> Self {
+        Self {
+            guard: StdMutex::new(Some(guard)),
+            conn: StdMutex::new(Some(conn)),
+        }
+    }
+
+    async fn close_now(&self) {
+        let conn = self.conn.lock().expect("p2p conn mutex poisoned").take();
+        drop(conn);
+        let guard = self.guard.lock().expect("p2p guard mutex poisoned").take();
+        if let Some(g_arc) = guard
+            && let Ok(g) = Arc::try_unwrap(g_arc)
+        {
+            g.close_now().await;
+        }
+    }
+}
+
+impl Drop for P2pConnDropper {
+    fn drop(&mut self) {
+        let conn = self.conn.get_mut().expect("p2p conn mutex poisoned").take();
+        let guard = self
+            .guard
+            .get_mut()
+            .expect("p2p guard mutex poisoned")
+            .take();
+        if let (Some(conn), Some(guard)) = (conn, guard)
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                // Keep QUIC connection open briefly so flushed stream frames and FIN deliver.
+                let _ = timeout(Duration::from_millis(250), conn.closed()).await;
+                drop(conn);
+                drop(guard);
+            });
+        }
+    }
+}
+
+struct P2pFinishSend(SendStream);
+
+impl Drop for P2pFinishSend {
+    fn drop(&mut self) {
+        let _ = self.0.finish();
+    }
+}
+
 /// Bidirectional QUIC stream over an `iroh` P2P connection implementing [`PathStream`].
 pub struct P2pStream {
-    guard: Option<Arc<EndpointGuard>>,
-    conn: Option<Connection>,
+    conn_drop: Arc<P2pConnDropper>,
     peer_ip: Option<IpAddr>,
     peer_transport_id: String,
-    send: SendStream,
+    send: P2pFinishSend,
     recv: RecvStream,
     write_timeout: Duration,
 }
@@ -394,30 +448,78 @@ impl P2pStream {
     ) -> Self {
         let peer_transport_id = conn.remote_id().to_string();
         Self {
-            guard: Some(guard),
-            conn: Some(conn),
+            conn_drop: Arc::new(P2pConnDropper::new(guard, conn)),
             peer_ip: None,
             peer_transport_id,
-            send,
+            send: P2pFinishSend(send),
             recv,
             write_timeout,
         }
     }
 }
 
-impl Drop for P2pStream {
-    fn drop(&mut self) {
-        let _ = self.send.finish();
-        if let (Some(conn), Some(guard)) = (self.conn.take(), self.guard.take())
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            handle.spawn(async move {
-                // Keep QUIC connection open briefly so flushed stream frames and FIN deliver.
-                let _ = timeout(Duration::from_millis(250), conn.closed()).await;
-                drop(conn);
-                drop(guard);
-            });
-        }
+async fn p2p_send_chunk(
+    send: &mut SendStream,
+    write_timeout: Duration,
+    bytes: &[u8],
+) -> Result<(), RuntimeError> {
+    if bytes.len() > MAX_OUTER_FRAME_LEN {
+        return Err(RuntimeError::FrameTooLarge {
+            size: bytes.len(),
+            max: MAX_OUTER_FRAME_LEN,
+        });
+    }
+    match timeout(write_timeout, send.write_all(bytes)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(RuntimeError::Protocol(err.to_string())),
+        Err(_) => Err(RuntimeError::Timeout("p2p stream write timed out")),
+    }
+}
+
+async fn p2p_recv_chunk(recv: &mut RecvStream, buf: &mut [u8]) -> Result<usize, RuntimeError> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    match recv.read(buf).await {
+        Ok(Some(n)) => Ok(n),
+        Ok(None) => Ok(0),
+        Err(err) => Err(RuntimeError::Protocol(err.to_string())),
+    }
+}
+
+async fn p2p_close_write(send: &mut SendStream, conn_drop: &P2pConnDropper) {
+    let _ = send.finish();
+    let _ = timeout(Duration::from_millis(50), send.stopped()).await;
+    conn_drop.close_now().await;
+}
+
+struct P2pReadHalf {
+    recv: RecvStream,
+    _conn_drop: Arc<P2pConnDropper>,
+}
+
+struct P2pWriteHalf {
+    send: P2pFinishSend,
+    write_timeout: Duration,
+    conn_drop: Arc<P2pConnDropper>,
+}
+
+#[async_trait]
+impl PathReader for P2pReadHalf {
+    async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, RuntimeError> {
+        p2p_recv_chunk(&mut self.recv, buf).await
+    }
+}
+
+#[async_trait]
+impl PathWriter for P2pWriteHalf {
+    async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        p2p_send_chunk(&mut self.send.0, self.write_timeout, bytes).await
+    }
+
+    async fn close(&mut self) -> Result<(), RuntimeError> {
+        p2p_close_write(&mut self.send.0, &self.conn_drop).await;
+        Ok(())
     }
 }
 
@@ -436,40 +538,31 @@ impl PathStream for P2pStream {
     }
 
     async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
-        if bytes.len() > MAX_OUTER_FRAME_LEN {
-            return Err(RuntimeError::FrameTooLarge {
-                size: bytes.len(),
-                max: MAX_OUTER_FRAME_LEN,
-            });
-        }
-        match timeout(self.write_timeout, self.send.write_all(bytes)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(RuntimeError::Protocol(err.to_string())),
-            Err(_) => Err(RuntimeError::Timeout("p2p stream write timed out")),
-        }
+        p2p_send_chunk(&mut self.send.0, self.write_timeout, bytes).await
     }
 
     async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, RuntimeError> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        match self.recv.read(buf).await {
-            Ok(Some(n)) => Ok(n),
-            Ok(None) => Ok(0),
-            Err(err) => Err(RuntimeError::Protocol(err.to_string())),
-        }
+        p2p_recv_chunk(&mut self.recv, buf).await
     }
 
     async fn close(&mut self) -> Result<(), RuntimeError> {
-        let _ = self.send.finish();
-        let _ = timeout(Duration::from_millis(50), self.send.stopped()).await;
-        drop(self.conn.take());
-        if let Some(guard) = self.guard.take()
-            && let Ok(g) = Arc::try_unwrap(guard)
-        {
-            g.close_now().await;
-        }
+        p2p_close_write(&mut self.send.0, &self.conn_drop).await;
         Ok(())
+    }
+
+    fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
+        let this = *self;
+        (
+            Box::new(P2pReadHalf {
+                recv: this.recv,
+                _conn_drop: Arc::clone(&this.conn_drop),
+            }),
+            Box::new(P2pWriteHalf {
+                send: this.send,
+                write_timeout: this.write_timeout,
+                conn_drop: this.conn_drop,
+            }),
+        )
     }
 }
 

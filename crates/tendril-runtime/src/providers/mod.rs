@@ -16,7 +16,8 @@ use std::sync::Once;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tendril_core::policy::ProviderId;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
@@ -25,7 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::error::RuntimeError;
-use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathStream};
+use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, PathWriter};
 
 pub use broker::{BrokerDialer, BrokerListener, BrokerServerConfig};
 pub use direct::{DirectDialer, DirectListener};
@@ -284,10 +285,132 @@ impl<S> WsBinaryPathStream<S> {
     }
 }
 
+async fn ws_send_chunk<Snk, E>(
+    sink: &mut Snk,
+    write_timeout: Duration,
+    bytes: &[u8],
+) -> Result<(), RuntimeError>
+where
+    Snk: Sink<Message, Error = E> + Unpin,
+    E: std::fmt::Display,
+{
+    if bytes.len() > MAX_OUTER_FRAME_LEN {
+        return Err(RuntimeError::FrameTooLarge {
+            size: bytes.len(),
+            max: MAX_OUTER_FRAME_LEN,
+        });
+    }
+    match timeout(
+        write_timeout,
+        sink.send(Message::Binary(bytes.to_vec().into())),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(RuntimeError::Protocol(err.to_string())),
+        Err(_) => Err(RuntimeError::Timeout("websocket stream write timed out")),
+    }
+}
+
+async fn ws_recv_chunk<Strm, E>(
+    stream: &mut Strm,
+    pending_read: &mut VecDeque<u8>,
+    max_recv_len: usize,
+    buf: &mut [u8],
+) -> Result<usize, RuntimeError>
+where
+    Strm: Stream<Item = Result<Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    if !pending_read.is_empty() {
+        let take = buf.len().min(pending_read.len());
+        for slot in &mut buf[..take] {
+            *slot = pending_read.pop_front().expect("checked non-empty");
+        }
+        return Ok(take);
+    }
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(Message::Binary(data)) => {
+                if data.len() > max_recv_len {
+                    return Err(RuntimeError::FrameTooLarge {
+                        size: data.len(),
+                        max: max_recv_len,
+                    });
+                }
+                if data.is_empty() {
+                    continue;
+                }
+                let take = buf.len().min(data.len());
+                buf[..take].copy_from_slice(&data[..take]);
+                if take < data.len() {
+                    pending_read.extend(&data[take..]);
+                }
+                return Ok(take);
+            }
+            Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+            Ok(Message::Close(_)) => return Ok(0),
+            Ok(other) => {
+                return Err(RuntimeError::Protocol(format!(
+                    "unexpected non-binary websocket frame: {other:?}"
+                )));
+            }
+            Err(err) => return Err(RuntimeError::Protocol(err.to_string())),
+        }
+    }
+    Ok(0)
+}
+
+struct WsReadHalf<S> {
+    stream: SplitStream<WebSocketStream<S>>,
+    max_recv_len: usize,
+    pending_read: VecDeque<u8>,
+}
+
+struct WsWriteHalf<S> {
+    sink: SplitSink<WebSocketStream<S>, Message>,
+    write_timeout: Duration,
+}
+
+#[async_trait]
+impl<S> PathReader for WsReadHalf<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+{
+    async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, RuntimeError> {
+        ws_recv_chunk(
+            &mut self.stream,
+            &mut self.pending_read,
+            self.max_recv_len,
+            buf,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl<S> PathWriter for WsWriteHalf<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+{
+    async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        ws_send_chunk(&mut self.sink, self.write_timeout, bytes).await
+    }
+
+    async fn close(&mut self) -> Result<(), RuntimeError> {
+        let _ = timeout(self.write_timeout, self.sink.close()).await;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl<S> PathStream for WsBinaryPathStream<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
 {
     fn provider_id(&self) -> ProviderId {
         self.provider
@@ -298,71 +421,31 @@ where
     }
 
     async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
-        if bytes.len() > MAX_OUTER_FRAME_LEN {
-            return Err(RuntimeError::FrameTooLarge {
-                size: bytes.len(),
-                max: MAX_OUTER_FRAME_LEN,
-            });
-        }
-        match timeout(
-            self.write_timeout,
-            self.ws.send(Message::Binary(bytes.to_vec().into())),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(RuntimeError::Protocol(err.to_string())),
-            Err(_) => Err(RuntimeError::Timeout("websocket stream write timed out")),
-        }
+        ws_send_chunk(&mut self.ws, self.write_timeout, bytes).await
     }
 
     async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, RuntimeError> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if !self.pending_read.is_empty() {
-            let take = buf.len().min(self.pending_read.len());
-            for slot in &mut buf[..take] {
-                *slot = self.pending_read.pop_front().expect("checked non-empty");
-            }
-            return Ok(take);
-        }
-
-        while let Some(item) = self.ws.next().await {
-            match item {
-                Ok(Message::Binary(data)) => {
-                    if data.len() > self.max_recv_len {
-                        return Err(RuntimeError::FrameTooLarge {
-                            size: data.len(),
-                            max: self.max_recv_len,
-                        });
-                    }
-                    if data.is_empty() {
-                        continue;
-                    }
-                    let take = buf.len().min(data.len());
-                    buf[..take].copy_from_slice(&data[..take]);
-                    if take < data.len() {
-                        self.pending_read.extend(&data[take..]);
-                    }
-                    return Ok(take);
-                }
-                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
-                Ok(Message::Close(_)) => return Ok(0),
-                Ok(other) => {
-                    return Err(RuntimeError::Protocol(format!(
-                        "unexpected non-binary websocket frame: {other:?}"
-                    )));
-                }
-                Err(err) => return Err(RuntimeError::Protocol(err.to_string())),
-            }
-        }
-        Ok(0)
+        ws_recv_chunk(&mut self.ws, &mut self.pending_read, self.max_recv_len, buf).await
     }
 
     async fn close(&mut self) -> Result<(), RuntimeError> {
         let _ = timeout(self.write_timeout, self.ws.close(None)).await;
         Ok(())
+    }
+
+    fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
+        let (sink, stream) = self.ws.split();
+        (
+            Box::new(WsReadHalf {
+                stream,
+                max_recv_len: self.max_recv_len,
+                pending_read: self.pending_read,
+            }),
+            Box::new(WsWriteHalf {
+                sink,
+                write_timeout: self.write_timeout,
+            }),
+        )
     }
 }
 

@@ -19,14 +19,16 @@ use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_c
 use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
 use tendril_core::roster::Roster;
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener, InboundRouter, PathListener,
-    RelayListener, SessionDriver, SessionEvent, StateStore, dial_endpoint, drive_pair_initiator,
-    drive_pair_responder_with_options, pairing_path_kind_for_provider,
+    ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
+    InboundRouter, PathListener, RelayListener, SessionDriver, SessionEvent, StateStore,
+    deserialize_identity_json, dial_endpoint, drive_pair_initiator,
+    drive_pair_responder_with_options, pairing_path_kind_for_provider, serialize_identity_json,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{P2pListener, parse_p2p_relay_mode};
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
+use zeroize::Zeroize;
 
 pub const TENDRIL_OK: i32 = 0;
 pub const TENDRIL_WOULD_BLOCK: i32 = 1;
@@ -161,12 +163,51 @@ impl TendrilEndpoint {
     }
 }
 
+fn build_endpoint_handle(
+    store: Option<Arc<StateStore>>,
+    identity: EndpointIdentity,
+    roster: Roster,
+) -> *mut TendrilEndpoint {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => Arc::new(rt),
+        Err(e) => {
+            set_last_error(format!("failed to create tokio runtime: {e}"));
+            return ptr::null_mut();
+        }
+    };
+    Box::into_raw(Box::new(TendrilEndpoint {
+        rt,
+        store,
+        identity,
+        roster: Arc::new(StdMutex::new(roster)),
+        pair_mgr: StdMutex::new(PairingManager::new(PairingConfig::default())),
+        router: InboundRouter::new(),
+    }))
+}
+
+unsafe fn write_roster_json_out(roster_arc: &StdMutex<Roster>, out_json: *mut *mut c_char) -> i32 {
+    let json = {
+        let guard = roster_arc.lock().expect("roster mutex poisoned");
+        match serde_json::to_string(&*guard) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(format!("failed to serialize roster: {e}"));
+                return TENDRIL_ERR_INTERNAL;
+            }
+        }
+    };
+    unsafe { write_out_cstring(out_json, &json) }
+}
+
 /// Opaque authenticated session handle sharing the endpoint's Tokio runtime and roster state.
 pub struct TendrilSession {
     rt: Arc<Runtime>,
     store: Option<Arc<StateStore>>,
     roster: Arc<StdMutex<Roster>>,
-    driver: SessionDriver,
+    session: ConcurrentSession,
 }
 
 /// Copies the last thread-local FFI error string into `buf`.
@@ -183,7 +224,10 @@ pub unsafe extern "C" fn tendril_last_error(buf: *mut c_char, cap: usize) -> i32
             if buf.is_null() || cap == 0 {
                 return i32::try_from(needed).unwrap_or(i32::MAX);
             }
-            let copy_len = bytes.len().min(cap - 1);
+            let mut copy_len = bytes.len().min(cap - 1);
+            while copy_len > 0 && !msg.is_char_boundary(copy_len) {
+                copy_len -= 1;
+            }
             unsafe {
                 ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), copy_len);
                 *buf.add(copy_len) = 0;
@@ -194,7 +238,7 @@ pub unsafe extern "C" fn tendril_last_error(buf: *mut c_char, cap: usize) -> i32
     .unwrap_or(-1)
 }
 
-/// Frees a NUL-terminated string returned by `tendril-ffi`.
+/// Frees a NUL-terminated string returned by `tendril-ffi` after zeroizing its buffer.
 ///
 /// # Safety
 /// `ptr` must be null or a pointer previously allocated by `tendril-ffi` and not yet freed.
@@ -202,7 +246,8 @@ pub unsafe extern "C" fn tendril_last_error(buf: *mut c_char, cap: usize) -> i32
 pub unsafe extern "C" fn tendril_string_free(ptr: *mut c_char) {
     if !ptr.is_null() {
         let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-            drop(CString::from_raw(ptr));
+            let mut bytes = CString::from_raw(ptr).into_bytes();
+            bytes.zeroize();
         }));
     }
 }
@@ -508,17 +553,6 @@ pub unsafe extern "C" fn tendril_endpoint_new(
             return ptr::null_mut();
         };
 
-        let rt = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => Arc::new(rt),
-            Err(e) => {
-                set_last_error(format!("failed to create tokio runtime: {e}"));
-                return ptr::null_mut();
-            }
-        };
-
         let (store, identity, roster) = if let Some(dir) = dir_opt.filter(|d| !d.is_empty()) {
             let store = match StateStore::open_or_create(dir) {
                 Ok(s) => Arc::new(s),
@@ -558,14 +592,135 @@ pub unsafe extern "C" fn tendril_endpoint_new(
             (None, identity, Roster::new())
         };
 
-        Box::into_raw(Box::new(TendrilEndpoint {
-            rt,
-            store,
-            identity,
-            roster: Arc::new(StdMutex::new(roster)),
-            pair_mgr: StdMutex::new(PairingManager::new(PairingConfig::default())),
-            router: InboundRouter::new(),
-        }))
+        build_endpoint_handle(store, identity, roster)
+    })
+}
+
+/// Creates an in-memory endpoint handle restored from optional sealed identity/roster JSON without
+/// touching plaintext storage on disk.
+///
+/// # Safety
+/// `identity_json_opt`, `roster_json_opt`, and `host_id_opt` must be null or valid NUL-terminated UTF-8 C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_new_from_state(
+    identity_json_opt: *const c_char,
+    roster_json_opt: *const c_char,
+    host_id_opt: *const c_char,
+) -> *mut TendrilEndpoint {
+    ffi_ptr(|| {
+        let Ok(id_json) = (unsafe { opt_cstr_to_str(identity_json_opt, "identity_json_opt") })
+        else {
+            return ptr::null_mut();
+        };
+        let Ok(roster_json) = (unsafe { opt_cstr_to_str(roster_json_opt, "roster_json_opt") })
+        else {
+            return ptr::null_mut();
+        };
+        let Ok(host_opt) = (unsafe { opt_cstr_to_str(host_id_opt, "host_id_opt") }) else {
+            return ptr::null_mut();
+        };
+
+        let identity = match id_json.filter(|s| !s.is_empty()) {
+            Some(raw) => match deserialize_identity_json(raw) {
+                Ok(id) => id,
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return ptr::null_mut();
+                }
+            },
+            None => {
+                let mut id = match EndpointIdentity::generate() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        set_last_error(e.to_string());
+                        return ptr::null_mut();
+                    }
+                };
+                if let Some(h) = host_opt
+                    && !h.is_empty()
+                {
+                    id = id.with_host_id(h);
+                }
+                id
+            }
+        };
+
+        let roster = match roster_json.filter(|s| !s.is_empty()) {
+            Some(raw) => match serde_json::from_str::<Roster>(raw) {
+                Ok(r) => r,
+                Err(e) => {
+                    set_last_error(format!("invalid roster json: {e}"));
+                    return ptr::null_mut();
+                }
+            },
+            None => Roster::new(),
+        };
+
+        build_endpoint_handle(None, identity, roster)
+    })
+}
+
+/// Closes the endpoint's inbound router and wakes any parked `pair_accept`/`session_accept` calls.
+///
+/// Safe to invoke concurrently with blocked accept calls prior to calling [`tendril_endpoint_free`].
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_close(ep: *mut TendrilEndpoint) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let ep = unsafe { &*ep };
+        ep.router.close();
+        TENDRIL_OK
+    })
+}
+
+/// Serializes the endpoint's private identity JSON for caller-managed sealed storage.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer and `out_json` must be non-null; free result with [`tendril_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_export_identity_json(
+    ep: *const TendrilEndpoint,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let ep = unsafe { &*ep };
+        let json = match serialize_identity_json(&ep.identity) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return TENDRIL_ERR_INTERNAL;
+            }
+        };
+        unsafe { write_out_cstring(out_json, &json) }
+    })
+}
+
+/// Serializes the endpoint's current roster JSON for caller-managed sealed storage.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer and `out_json` must be non-null; free result with [`tendril_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_export_roster_json(
+    ep: *const TendrilEndpoint,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let ep = unsafe { &*ep };
+        unsafe { write_roster_json_out(&ep.roster, out_json) }
     })
 }
 
@@ -1182,7 +1337,7 @@ pub unsafe extern "C" fn tendril_session_connect(
                     rt: Arc::clone(&ep.rt),
                     store: ep.store.clone(),
                     roster: Arc::clone(&ep.roster),
-                    driver,
+                    session: driver.into_concurrent(),
                 }))
             }
             Err(e) => {
@@ -1238,13 +1393,51 @@ pub unsafe extern "C" fn tendril_session_accept(
                 rt: Arc::clone(&ep.rt),
                 store: ep.store.clone(),
                 roster: Arc::clone(&ep.roster),
-                driver,
+                session: driver.into_concurrent(),
             })),
             Err(e) => {
                 set_last_error(e);
                 ptr::null_mut()
             }
         }
+    })
+}
+
+/// Signals parked [`tendril_session_poll_event`] calls on `sess` to exit immediately with `TENDRIL_EOF`.
+///
+/// Safe to invoke concurrently prior to exclusive [`tendril_session_free`].
+///
+/// # Safety
+/// `sess` must be a valid session pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_shutdown(sess: *mut TendrilSession) -> i32 {
+    ffi_i32(|| {
+        if sess.is_null() {
+            set_last_error("null session");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let sess = unsafe { &*sess };
+        sess.session.shutdown();
+        TENDRIL_OK
+    })
+}
+
+/// Serializes the session's shared roster JSON for caller-managed sealed storage.
+///
+/// # Safety
+/// `sess` must be a valid session pointer and `out_json` must be non-null; free result with [`tendril_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_export_roster_json(
+    sess: *const TendrilSession,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if sess.is_null() || out_json.is_null() {
+            set_last_error("null session or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let sess = unsafe { &*sess };
+        unsafe { write_roster_json_out(&sess.roster, out_json) }
     })
 }
 
@@ -1264,7 +1457,7 @@ pub unsafe extern "C" fn tendril_session_free(sess: *mut TendrilSession) {
 /// Sends an encrypted `0x01 DATA` payload over an established session.
 ///
 /// # Safety
-/// `sess` must be a valid mutable session pointer; if `len > 0`, `data` must point to `len` readable bytes.
+/// `sess` must be a valid session pointer; if `len > 0` and `len <= MAX_APP_DATA_LEN`, `data` must point to `len` readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_session_send_data(
     sess: *mut TendrilSession,
@@ -1276,13 +1469,20 @@ pub unsafe extern "C" fn tendril_session_send_data(
             set_last_error("invalid session or data pointer");
             return TENDRIL_ERR_INVALID_ARG;
         }
+        if len > tendril_core::MAX_APP_DATA_LEN {
+            set_last_error(format!(
+                "payload length {len} exceeds max {}",
+                tendril_core::MAX_APP_DATA_LEN
+            ));
+            return TENDRIL_ERR_PROTOCOL;
+        }
         let slice = if len == 0 {
             &[]
         } else {
             unsafe { std::slice::from_raw_parts(data, len) }
         };
-        let sess = unsafe { &mut *sess };
-        match sess.rt.block_on(sess.driver.send_data(slice)) {
+        let sess = unsafe { &*sess };
+        match sess.rt.block_on(sess.session.send_data(slice)) {
             Ok(()) => TENDRIL_OK,
             Err(e) => {
                 set_last_error(e.to_string());
@@ -1295,7 +1495,7 @@ pub unsafe extern "C" fn tendril_session_send_data(
 /// Polls the next decrypted session event as JSON (`0=event`, `1=would_block`, `2=eof`).
 ///
 /// # Safety
-/// `sess` must be a valid mutable session pointer; `out_event_json` must be non-null.
+/// `sess` must be a valid session pointer; `out_event_json` must be non-null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_session_poll_event(
     sess: *mut TendrilSession,
@@ -1307,12 +1507,12 @@ pub unsafe extern "C" fn tendril_session_poll_event(
             set_last_error("null session or out_event_json");
             return TENDRIL_ERR_INVALID_ARG;
         }
-        let sess = unsafe { &mut *sess };
+        let sess = unsafe { &*sess };
         let wait = Duration::from_millis(timeout_ms);
         let roster_ref = Arc::clone(&sess.roster);
 
         match sess.rt.block_on(async {
-            timeout(wait, sess.driver.next_event_locked(now_unix(), &roster_ref)).await
+            timeout(wait, sess.session.next_event_locked_now(&roster_ref)).await
         }) {
             Ok(Ok(Some(ev))) => {
                 let val = match ev {
@@ -1389,7 +1589,7 @@ pub unsafe extern "C" fn tendril_session_authorize(
         };
         let sess = unsafe { &*sess };
         let roster = sess.roster.lock().expect("roster mutex poisoned");
-        let (res, _audit) = sess.driver.authorize(cap_s, now_unix(), &roster);
+        let (res, _audit) = sess.session.authorize(cap_s, now_unix(), &roster);
         unsafe {
             *out_allowed = u8::from(res.is_ok());
         }
@@ -1400,7 +1600,7 @@ pub unsafe extern "C" fn tendril_session_authorize(
 /// Initiates a Noise `0x04 REKEY` ratchet on the outgoing session cipher state.
 ///
 /// # Safety
-/// `sess` must be a valid mutable session pointer.
+/// `sess` must be a valid session pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_session_rekey(sess: *mut TendrilSession) -> i32 {
     ffi_i32(|| {
@@ -1408,8 +1608,8 @@ pub unsafe extern "C" fn tendril_session_rekey(sess: *mut TendrilSession) -> i32
             set_last_error("null session");
             return TENDRIL_ERR_INVALID_ARG;
         }
-        let sess = unsafe { &mut *sess };
-        match sess.rt.block_on(sess.driver.send_rekey()) {
+        let sess = unsafe { &*sess };
+        match sess.rt.block_on(sess.session.send_rekey()) {
             Ok(()) => TENDRIL_OK,
             Err(e) => {
                 set_last_error(e.to_string());
@@ -1422,7 +1622,7 @@ pub unsafe extern "C" fn tendril_session_rekey(sess: *mut TendrilSession) -> i32
 /// Sends an encrypted `0x07 CLOSE` frame and closes the underlying transport stream.
 ///
 /// # Safety
-/// `sess` must be a valid mutable session pointer; `reason` may be null or UTF-8.
+/// `sess` must be a valid session pointer; `reason` may be null or UTF-8.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_session_close(
     sess: *mut TendrilSession,
@@ -1437,11 +1637,11 @@ pub unsafe extern "C" fn tendril_session_close(
         let Ok(reason_opt) = (unsafe { opt_cstr_to_str(reason, "reason") }) else {
             return TENDRIL_ERR_INVALID_ARG;
         };
-        let sess = unsafe { &mut *sess };
-        match sess
-            .rt
-            .block_on(sess.driver.send_close(code, reason_opt.unwrap_or("normal")))
-        {
+        let sess = unsafe { &*sess };
+        match sess.rt.block_on(
+            sess.session
+                .send_close(code, reason_opt.unwrap_or("normal")),
+        ) {
             Ok(()) => TENDRIL_OK,
             Err(e) => {
                 set_last_error(e.to_string());

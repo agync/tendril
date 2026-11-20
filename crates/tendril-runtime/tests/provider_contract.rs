@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tempfile::TempDir;
 use tendril_core::MAX_FRAME_LEN;
-use tendril_core::crypto::{SigningKeypair, StaticKeypair};
+use tendril_core::crypto::{SigningKeypair, StaticKeypair, random_bytes};
 use tendril_core::grants::AuditEvent;
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::pairing::{
@@ -18,14 +18,15 @@ use tendril_core::roster::{PeerState, Roster};
 use tendril_core::wire::ResumableFrameReader;
 use tendril_relay::{RelayConfig, RelayHandle, RelayServer};
 use tendril_runtime::{
-    BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
+    BrokerDialer, BrokerListener, BrokerServerConfig, ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT,
     DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, EmbeddedRelay, LocalDialer, LocalListener,
     MAX_OUTER_FRAME_LEN, OverlayConfig, OverlayDialer, OverlayHelperDialer, OverlayHelperListener,
-    OverlayListener, OverlayMode, OverlayResolvedMode, PathDialer, PathListener, PathStream,
-    PreAuthConfig, PreAuthRateLimiter, RelayDialer, RelayListener, RuntimeError, SessionDriver,
-    SessionEvent, StateStore, dial_with_policy, drive_pair_initiator, drive_pair_responder,
-    drive_pair_responder_with_options, is_tailnet_ip, pairing_path_kind_for_provider,
-    recv_tendril_frame, select_overlay_mode, send_tendril_frame,
+    OverlayListener, OverlayMode, OverlayResolvedMode, PathDialer, PathListener, PathReader,
+    PathStream, PathWriter, PreAuthConfig, PreAuthRateLimiter, RelayDialer, RelayListener,
+    RuntimeError, SessionDriver, SessionEvent, StateStore, dial_with_policy, drive_pair_initiator,
+    drive_pair_responder, drive_pair_responder_with_options, is_tailnet_ip,
+    pairing_path_kind_for_provider, recv_tendril_frame, select_overlay_mode, send_tendril_frame,
+    split_path_stream_fallback,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{P2pDialer, P2pListener, P2pRelayMode};
@@ -182,6 +183,10 @@ impl PathStream for WireTapStream {
 
     async fn close(&mut self) -> Result<(), RuntimeError> {
         self.inner.close().await
+    }
+
+    fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
+        split_path_stream_fallback(self)
     }
 }
 
@@ -1609,6 +1614,10 @@ impl PathStream for MockPeerIdEofStream {
     async fn close(&mut self) -> Result<(), RuntimeError> {
         Ok(())
     }
+
+    fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
+        split_path_stream_fallback(self)
+    }
 }
 
 #[test]
@@ -2539,4 +2548,199 @@ async fn batch2a_sec30_drive_pair_initiator_times_out_on_stalled_peer() {
     assert!(matches!(res, Err(RuntimeError::Timeout(_))));
     assert!(started.elapsed() < Duration::from_secs(1));
     hold.abort();
+}
+
+#[tokio::test]
+async fn batch2b_sec17_sec31_concurrent_session_and_fresh_now_unix() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    for provider in [
+        ProviderId::Direct,
+        ProviderId::Relay,
+        #[cfg(feature = "p2p-iroh")]
+        ProviderId::P2p,
+    ] {
+        let mut pair = setup_provider(provider).await;
+        let ep = pair.endpoint.clone();
+        let (acc_s, dial_s) = tokio::join!(pair.listener.accept(), pair.dialer.dial(&ep));
+        let acc_s = acc_s.expect("accept");
+        let dial_s = dial_s.expect("dial");
+
+        let host_id = EndpointIdentity::generate()
+            .unwrap()
+            .with_host_id("conc-host");
+        let cli_id = EndpointIdentity::generate().unwrap();
+        let mut host_roster = Roster::new();
+        host_roster
+            .insert_pinned_host(
+                cli_id.device_id(),
+                "cli".to_owned(),
+                *cli_id.static_key().public_bytes(),
+                Some(*cli_id.signing_key().public_bytes()),
+                0,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut cli_roster = Roster::new();
+        cli_roster
+            .insert_pinned_host(
+                "conc-host".to_owned(),
+                "conc-host".to_owned(),
+                *host_id.static_key().public_bytes(),
+                Some(*host_id.signing_key().public_bytes()),
+                0,
+                Vec::new(),
+            )
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let grant = host_roster
+            .mint_grant(
+                &host_id,
+                &cli_id.device_id(),
+                vec!["fs.read".to_owned()],
+                now.saturating_sub(10),
+                now + 600,
+                random_bytes::<16>().unwrap(),
+            )
+            .unwrap();
+
+        let (host_drv, cli_drv) = tokio::join!(
+            SessionDriver::accept(acc_s, &host_id, &mut host_roster, now, None),
+            SessionDriver::connect(
+                dial_s,
+                &cli_id,
+                "conc-host",
+                Some(grant),
+                &mut cli_roster,
+                now
+            )
+        );
+        let host_conc: Arc<ConcurrentSession> =
+            Arc::new(host_drv.expect("host accept").into_concurrent());
+        let cli_conc: Arc<ConcurrentSession> =
+            Arc::new(cli_drv.expect("cli connect").into_concurrent());
+        let host_roster_mux = Arc::new(Mutex::new(host_roster));
+
+        let hc = Arc::clone(&host_conc);
+        let hr = Arc::clone(&host_roster_mux);
+        let poll_task = tokio::spawn(async move {
+            timeout(Duration::from_secs(5), hc.next_event_locked_now(&hr)).await
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let t0 = Instant::now();
+        {
+            let rg = host_roster_mux.lock().unwrap();
+            assert!(host_conc.authorize("fs.read", now, &rg).0.is_ok());
+        }
+        host_conc
+            .send_data(b"full-duplex-host")
+            .await
+            .expect("send while polling");
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "concurrent write/auth stalled on {provider:?}"
+        );
+
+        let cli_roster_mux = Arc::new(Mutex::new(cli_roster));
+        let ev_cli = timeout(
+            Duration::from_secs(2),
+            cli_conc.next_event_locked_now(&cli_roster_mux),
+        )
+        .await
+        .expect("cli recv")
+        .expect("ok")
+        .expect("some");
+        assert_eq!(ev_cli, SessionEvent::AppData(b"full-duplex-host".to_vec()));
+
+        host_conc.shutdown();
+        let poll_res = poll_task
+            .await
+            .expect("join")
+            .expect("no timeout")
+            .expect("ok");
+        assert!(
+            poll_res.is_none(),
+            "shutdown must unblock poll with None on {provider:?}"
+        );
+    }
+
+    // SEC-31: ConcurrentSession and SessionDriver sample fresh now_unix when frame arrives.
+    let mut pair = setup_provider(ProviderId::Direct).await;
+    let ep = pair.endpoint.clone();
+    let (acc_s, dial_s) = tokio::join!(pair.listener.accept(), pair.dialer.dial(&ep));
+    let host_id = EndpointIdentity::generate()
+        .unwrap()
+        .with_host_id("exp-host");
+    let cli_id = EndpointIdentity::generate().unwrap();
+    let mut host_roster = Roster::new();
+    host_roster
+        .insert_pinned_host(
+            cli_id.device_id(),
+            "cli".to_owned(),
+            *cli_id.static_key().public_bytes(),
+            Some(*cli_id.signing_key().public_bytes()),
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+    let mut cli_roster = Roster::new();
+    cli_roster
+        .insert_pinned_host(
+            "exp-host".to_owned(),
+            "exp-host".to_owned(),
+            *host_id.static_key().public_bytes(),
+            Some(*host_id.signing_key().public_bytes()),
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+    let base_now = 1_795_564_800u64;
+    let grant = host_roster
+        .mint_grant(
+            &host_id,
+            &cli_id.device_id(),
+            vec!["fs.read".to_owned()],
+            base_now - 10,
+            base_now + 5,
+            random_bytes::<16>().unwrap(),
+        )
+        .unwrap();
+    let (host_drv, cli_drv) = tokio::join!(
+        SessionDriver::accept(acc_s.unwrap(), &host_id, &mut host_roster, base_now, None),
+        SessionDriver::connect(
+            dial_s.unwrap(),
+            &cli_id,
+            "exp-host",
+            Some(grant),
+            &mut cli_roster,
+            base_now
+        )
+    );
+    let host_conc = host_drv.unwrap().into_concurrent();
+    let cli_conc = cli_drv.unwrap().into_concurrent();
+    let host_roster_mux = Arc::new(Mutex::new(host_roster));
+
+    let fake_clock = Arc::new(AtomicU64::new(base_now));
+    let clock_c = Arc::clone(&fake_clock);
+    let poll_fut =
+        host_conc.next_event_with_clock(&host_roster_mux, move || clock_c.load(Ordering::SeqCst));
+    tokio::pin!(poll_fut);
+    tokio::select! {
+        _ = &mut poll_fut => panic!("unexpected early completion"),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+            fake_clock.store(base_now + 20, Ordering::SeqCst);
+            cli_conc.send_rekey().await.unwrap();
+        }
+    }
+    let res = timeout(Duration::from_secs(2), poll_fut)
+        .await
+        .expect("timeout");
+    assert!(
+        res.is_err(),
+        "expired grant must be rejected on REKEY when clock advanced mid-poll"
+    );
 }

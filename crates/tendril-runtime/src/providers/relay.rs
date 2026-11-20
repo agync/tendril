@@ -178,6 +178,15 @@ impl PathStream for RelayStream {
     async fn close(&mut self) -> Result<(), RuntimeError> {
         self.inner.close().await
     }
+
+    fn into_split(
+        self: Box<Self>,
+    ) -> (
+        Box<dyn crate::provider::PathReader>,
+        Box<dyn crate::provider::PathWriter>,
+    ) {
+        Box::new(self.inner).into_split()
+    }
 }
 
 /// Listener holding an authenticated mailbox control WebSocket and accepting relayed streams.
