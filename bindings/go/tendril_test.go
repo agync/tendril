@@ -469,6 +469,90 @@ func TestConcurrencyLifetimeRekeyAndWouldBlock(t *testing.T) {
 	wg.Wait()
 }
 
+func TestServeP2pDisabledLoopback(t *testing.T) {
+	hostEp, err := tendril.NewEndpoint("", "go-p2p-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint host: %v", err)
+	}
+	defer hostEp.Close()
+
+	cliEp, err := tendril.NewEndpoint("", "go-p2p-cli")
+	if err != nil {
+		t.Fatalf("NewEndpoint cli: %v", err)
+	}
+	defer cliEp.Close()
+
+	p2pAddr, err := hostEp.ServeP2p("disabled")
+	if err != nil {
+		t.Fatalf("ServeP2p: %v", err)
+	}
+	code, err := hostEp.IssueCode("remote")
+	if err != nil {
+		t.Fatalf("IssueCode: %v", err)
+	}
+
+	pairCh := make(chan tendril.PairAcceptResult, 1)
+	pairErrCh := make(chan error, 1)
+	go func() {
+		res, err := hostEp.PairAccept(8000)
+		if err != nil {
+			pairErrCh <- err
+			return
+		}
+		pairCh <- res
+	}()
+
+	cliPair, err := cliEp.PairInitiate(p2pAddr, "disabled", code, "go-p2p-dev", "go")
+	if err != nil {
+		t.Fatalf("PairInitiate p2p: %v", err)
+	}
+	var acc tendril.PairAcceptResult
+	select {
+	case err := <-pairErrCh:
+		t.Fatalf("PairAccept p2p: %v", err)
+	case acc = <-pairCh:
+	}
+	if err := hostEp.ConfirmPeer(acc.DeviceID, cliPair.SAS); err != nil {
+		t.Fatalf("ConfirmPeer: %v", err)
+	}
+	grant, err := hostEp.MintGrant(acc.DeviceID, []string{"fs.read"}, 3600)
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+
+	sessCh := make(chan *tendril.Session, 1)
+	sessErrCh := make(chan error, 1)
+	go func() {
+		s, err := hostEp.AcceptSession(8000)
+		if err != nil {
+			sessErrCh <- err
+			return
+		}
+		sessCh <- s
+	}()
+
+	cliSess, err := cliEp.Connect(p2pAddr, "disabled", "go-p2p-host", grant)
+	if err != nil {
+		t.Fatalf("Connect p2p: %v", err)
+	}
+	defer cliSess.Close()
+	var hostSess *tendril.Session
+	select {
+	case err := <-sessErrCh:
+		t.Fatalf("AcceptSession p2p: %v", err)
+	case hostSess = <-sessCh:
+	}
+	defer hostSess.Close()
+
+	if err := cliSess.SendData([]byte("go-p2p-ok")); err != nil {
+		t.Fatalf("SendData p2p: %v", err)
+	}
+	ev, err := hostSess.PollEvent(2000)
+	if err != nil || ev.Event != "data" {
+		t.Fatalf("expected p2p data event, got %+v err=%v", ev, err)
+	}
+}
+
 func BenchmarkFFIOverhead(b *testing.B) {
 	var key [32]byte
 	key[0] = 0x42

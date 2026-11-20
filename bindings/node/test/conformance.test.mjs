@@ -263,3 +263,37 @@ test("Node N-API bidirectional async interop with Rust tendril-conformance-peer"
     peer2.close();
   }
 });
+
+test("Node binding pairs and connects over local P2p (disabled relay mode)", async () => {
+  const hostEp = new tendril.Endpoint(null, "node-p2p-host");
+  const cliEp = new tendril.Endpoint(null, "node-p2p-cli");
+  try {
+    const p2pAddr = await hostEp.serveP2p("disabled");
+    assert.ok(p2pAddr.startsWith("iroh://"), `expected iroh:// endpoint, got ${p2pAddr}`);
+    const code = hostEp.issueCode("remote");
+    const [pairRaw, accRaw] = await Promise.all([
+      cliEp.pairInitiate(p2pAddr, code, "disabled", "node-p2p-dev", "node"),
+      hostEp.pairAccept(8000),
+    ]);
+    const pairCli = JSON.parse(pairRaw);
+    const acc = JSON.parse(accRaw);
+    assert.equal(pairCli.sas, acc.sas);
+
+    hostEp.confirmPeer(acc.device_id, pairCli.sas);
+    const grantJson = hostEp.mintGrant(acc.device_id, ["fs.read"], 3600);
+    const [cliSess, hostSess] = await Promise.all([
+      cliEp.connect(p2pAddr, "node-p2p-host", grantJson, "disabled"),
+      hostEp.acceptSession(8000),
+    ]);
+    await cliSess.sendData(Buffer.from("node-p2p-ok", "utf8"));
+    const ev = JSON.parse(await hostSess.pollEvent(2000));
+    assert.equal(ev.event, "data");
+    assert.equal(Buffer.from(ev.data_b64, "base64url").toString("utf8"), "node-p2p-ok");
+    await cliSess.close(1000, "done");
+    const closeEv = JSON.parse(await hostSess.pollEvent(2000));
+    assert.ok(closeEv.event === "closed" || closeEv.status === "eof", `expected close/eof, got ${JSON.stringify(closeEv)}`);
+  } finally {
+    hostEp.close();
+    cliEp.close();
+  }
+});

@@ -21,9 +21,10 @@ use tendril_core::pairing::{
 use tendril_core::policy::ProviderId;
 use tendril_core::roster::Roster;
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, InboundRouter,
-    LocalDialer, PathDialer, PathListener, PathStream, RelayDialer, RelayListener, SessionDriver,
-    SessionEvent, StateStore, drive_pair_initiator, drive_pair_responder_with_options,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener, InboundRouter, P2pListener,
+    PathListener, PathStream, RelayListener, SessionDriver, SessionEvent, StateStore,
+    dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
+    drive_pair_responder_with_options, parse_p2p_relay_mode,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -58,23 +59,9 @@ async fn dial_endpoint(
     endpoint: &str,
     relay_host: Option<&str>,
 ) -> Result<Box<dyn PathStream>, String> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        let mut dialer = RelayDialer::new();
-        if let Some(host) = relay_host {
-            dialer = dialer.with_expected_host(host);
-        }
-        dialer.dial(endpoint).await.map_err(|e| e.to_string())
-    } else if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
-        LocalDialer::new()
-            .dial(endpoint)
-            .await
-            .map_err(|e| e.to_string())
-    } else {
-        DirectDialer::new()
-            .dial(endpoint)
-            .await
-            .map_err(|e| e.to_string())
-    }
+    runtime_dial_endpoint(endpoint, relay_host)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[pyfunction]
@@ -276,6 +263,23 @@ impl Endpoint {
         })
     }
 
+    #[pyo3(signature = (relay_mode=None))]
+    fn serve_p2p(&self, py: Python<'_>, relay_mode: Option<&str>) -> PyResult<String> {
+        let mode =
+            parse_p2p_relay_mode(relay_mode).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let seed = self.identity.derive_p2p_identity_seed();
+        let rt = Arc::clone(&self.rt);
+        let router = Arc::clone(&self.router);
+        py.detach(move || {
+            let listener = rt
+                .block_on(P2pListener::bind_with_secret(mode, *seed))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let ep = listener.local_endpoint();
+            router.spawn_listener(rt.handle(), Box::new(listener));
+            Ok(ep)
+        })
+    }
+
     #[pyo3(signature = (kind="lan"))]
     fn issue_code(&self, py: Python<'_>, kind: &str) -> PyResult<String> {
         let pk = match kind {
@@ -321,9 +325,12 @@ impl Endpoint {
                 let mut stream = dial_endpoint(&ep_s, rh_s.as_deref())
                     .await
                     .map_err(PyRuntimeError::new_err)?;
-                drive_pair_initiator(stream.as_mut(), &identity, name_s, kind_s, code_s, None)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                let pair_res =
+                    drive_pair_initiator(stream.as_mut(), &identity, name_s, kind_s, code_s, None)
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                let _ = stream.close().await;
+                pair_res
             })?;
 
             match res.outcome {

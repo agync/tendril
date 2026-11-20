@@ -45,6 +45,8 @@ final class TendrilNative {
   public static native String endpointServeRelay(
       long ptr, String relayUrl, String expectedHost);
 
+  public static native String endpointServeP2p(long ptr, String relayMode);
+
   public static native String endpointIssueCode(long ptr, String kind);
 
   public static native String endpointPairInitiate(

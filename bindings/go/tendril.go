@@ -331,6 +331,24 @@ func (ep *Endpoint) ServeRelay(relayURL, expectedHost string) (string, error) {
 	return endpoint, err
 }
 
+// ServeP2p binds an iroh P2P listener ("default", "disabled", or relay URL) using the endpoint's derived P2P key.
+func (ep *Endpoint) ServeP2p(relayMode string) (string, error) {
+	var endpoint string
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		var out *C.char
+		var rc C.int32_t
+		withOptCStr(relayMode, func(cm *C.char) {
+			rc = C.tendril_endpoint_serve_p2p(h, cm, &out)
+		})
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		endpoint = takeOutCStr(out)
+		return nil
+	})
+	return endpoint, err
+}
+
 // IssueCode creates a one-time pairing code ("lan" or "remote").
 func (ep *Endpoint) IssueCode(kind string) (string, error) {
 	var code string

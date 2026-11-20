@@ -275,6 +275,24 @@ public final class TendrilEndpoint {
     }
   }
 
+  public func serveP2p(relayMode: String? = nil) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc: Int32
+      if let relayMode {
+        rc = relayMode.withCString { cMode in
+          tendril_endpoint_serve_p2p(h, cMode, &out)
+        }
+      } else {
+        rc = tendril_endpoint_serve_p2p(h, nil, &out)
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_serve_p2p failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
   public func issueCode(kind: String = "remote") throws -> String {
     try withHandle { h in
       var out: UnsafeMutablePointer<CChar>?

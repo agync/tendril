@@ -307,6 +307,46 @@ class TendrilPythonTests(unittest.TestCase):
             py_host.close()
             peer2.close()
 
+    def test_serve_p2p_disabled_loopback(self) -> None:
+        host_ep = tendril.Endpoint(None, "py-p2p-host")
+        cli_ep = tendril.Endpoint(None, "py-p2p-cli")
+        try:
+            p2p_addr = host_ep.serve_p2p("disabled")
+            self.assertTrue(p2p_addr.startswith("iroh://"))
+            code = host_ep.issue_code("remote")
+            accepted: dict = {}
+
+            def accept_pair() -> None:
+                accepted["res"] = json.loads(host_ep.pair_accept(8000))
+
+            t = threading.Thread(target=accept_pair)
+            t.start()
+            cli_pair = json.loads(cli_ep.pair_initiate(p2p_addr, code, relay_host="disabled"))
+            t.join(timeout=10)
+            self.assertEqual(accepted["res"]["sas"], cli_pair["sas"])
+            host_ep.confirm_peer(accepted["res"]["device_id"], cli_pair["sas"])
+            grant = host_ep.mint_grant(accepted["res"]["device_id"], ["fs.read"], 3600)
+
+            sess_holder: dict = {}
+
+            def accept_sess() -> None:
+                sess_holder["sess"] = host_ep.accept_session(8000)
+
+            t2 = threading.Thread(target=accept_sess)
+            t2.start()
+            cli_sess = cli_ep.connect(p2p_addr, "py-p2p-host", grant, relay_host="disabled")
+            t2.join(timeout=10)
+            host_sess = sess_holder["sess"]
+            cli_sess.send_data(b"py-p2p-ok")
+            ev = json.loads(host_sess.poll_event(2000))
+            self.assertEqual(ev["event"], "data")
+            cli_sess.close()
+            ev_close = json.loads(host_sess.poll_event(2000))
+            self.assertIn(ev_close.get("event") or ev_close.get("status"), ("closed", "eof"))
+        finally:
+            host_ep.close()
+            cli_ep.close()
+
 
 if __name__ == "__main__":
     unittest.main()

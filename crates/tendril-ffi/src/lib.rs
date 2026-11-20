@@ -22,10 +22,12 @@ use tendril_core::pairing::{
 use tendril_core::policy::ProviderId;
 use tendril_core::roster::Roster;
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, InboundRouter,
-    LocalDialer, PathDialer, PathListener, PathStream, RelayDialer, RelayListener, SessionDriver,
-    SessionEvent, StateStore, drive_pair_initiator, drive_pair_responder_with_options,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener, InboundRouter, PathListener,
+    RelayListener, SessionDriver, SessionEvent, StateStore, dial_endpoint, drive_pair_initiator,
+    drive_pair_responder_with_options,
 };
+#[cfg(feature = "p2p-iroh")]
+use tendril_runtime::{P2pListener, parse_p2p_relay_mode};
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
 
@@ -168,29 +170,6 @@ pub struct TendrilSession {
     store: Option<Arc<StateStore>>,
     roster: Arc<StdMutex<Roster>>,
     driver: SessionDriver,
-}
-
-async fn dial_endpoint(
-    endpoint: &str,
-    relay_host: Option<&str>,
-) -> Result<Box<dyn PathStream>, String> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        let mut dialer = RelayDialer::new();
-        if let Some(host) = relay_host {
-            dialer = dialer.with_expected_host(host);
-        }
-        dialer.dial(endpoint).await.map_err(|e| e.to_string())
-    } else if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
-        LocalDialer::new()
-            .dial(endpoint)
-            .await
-            .map_err(|e| e.to_string())
-    } else {
-        DirectDialer::new()
-            .dial(endpoint)
-            .await
-            .map_err(|e| e.to_string())
-    }
 }
 
 /// Copies the last thread-local FFI error string into `buf`.
@@ -717,6 +696,59 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay(
     })
 }
 
+/// Binds an `iroh` P2P listener using this endpoint's HKDF-derived P2P identity seed.
+///
+/// `relay_mode_opt` may be null/`""`/`"default"`, `"disabled"`/`"local"`, or a relay `https://` URL.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer; `relay_mode_opt` may be null or UTF-8; `out_endpoint` must be non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_serve_p2p(
+    ep: *mut TendrilEndpoint,
+    relay_mode_opt: *const c_char,
+    out_endpoint: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_endpoint.is_null() {
+            set_last_error("null endpoint or out_endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let mode_opt = match unsafe { opt_cstr_to_str(relay_mode_opt, "relay_mode_opt") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let ep = unsafe { &*ep };
+        #[cfg(feature = "p2p-iroh")]
+        {
+            let mode = match parse_p2p_relay_mode(mode_opt) {
+                Ok(m) => m,
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return TENDRIL_ERR_INVALID_ARG;
+                }
+            };
+            let seed = ep.identity.derive_p2p_identity_seed();
+            match ep.rt.block_on(P2pListener::bind_with_secret(mode, *seed)) {
+                Ok(listener) => {
+                    let local_ep = listener.local_endpoint();
+                    ep.spawn_listener(Box::new(listener));
+                    unsafe { write_out_cstring(out_endpoint, &local_ep) }
+                }
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    TENDRIL_ERR_PROTOCOL
+                }
+            }
+        }
+        #[cfg(not(feature = "p2p-iroh"))]
+        {
+            let _ = (ep, mode_opt);
+            set_last_error("tendril-ffi built without p2p-iroh feature");
+            TENDRIL_ERR_PROTOCOL
+        }
+    })
+}
+
 /// Issues a one-time pairing code (`"lan"` or `"remote"`, defaults to `"lan"`).
 ///
 /// # Safety
@@ -795,8 +827,8 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
         let res = ep.rt.block_on(async {
             let mut stream = dial_endpoint(endpoint_s, relay_host_s)
                 .await
-                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e))?;
-            drive_pair_initiator(
+                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
+            let pair_res = drive_pair_initiator(
                 stream.as_mut(),
                 &ep.identity,
                 name_s.unwrap_or("ffi-device").to_owned(),
@@ -805,7 +837,9 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
                 None,
             )
             .await
-            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
+            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()));
+            let _ = stream.close().await;
+            pair_res
         });
 
         match res {

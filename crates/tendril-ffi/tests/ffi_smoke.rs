@@ -15,6 +15,8 @@ use tendril_core::roster::PeerState;
 use tendril_core::wire::{
     HostHello, Intent, NOISE_PATTERN, Preamble, ResumableFrameReader, encode_frame,
 };
+#[cfg(feature = "p2p-iroh")]
+use tendril_ffi::tendril_endpoint_serve_p2p;
 use tendril_ffi::{
     TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_PROTOCOL, TENDRIL_OK, TENDRIL_WOULD_BLOCK,
     tendril_compute_code_mac, tendril_device_id, tendril_endpoint_confirm_peer,
@@ -806,4 +808,158 @@ fn ffi_persists_session_terminating_crl_across_restart() {
     let crl = persisted.crl("crl-host").expect("persisted CRL on error");
     assert_eq!(crl.seq, 1);
     assert_eq!(crl.revoked_nonces, vec![expected_nonce]);
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[test]
+fn ffi_serve_p2p_deterministic_pair_mint_session_roundtrip() {
+    let host_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+    let host_path = host_dir.path().to_str().unwrap().to_owned();
+    let cli_path = cli_dir.path().to_str().unwrap().to_owned();
+
+    let hd_c = CString::new(host_path.clone()).unwrap();
+    let cd_c = CString::new(cli_path).unwrap();
+    let hname_c = CString::new("ffi-p2p-host").unwrap();
+    let disabled_c = CString::new("disabled").unwrap();
+    let remote_c = CString::new("remote").unwrap();
+
+    let host_ep = unsafe { tendril_endpoint_new(hd_c.as_ptr(), hname_c.as_ptr()) };
+    let cli_ep = unsafe { tendril_endpoint_new(cd_c.as_ptr(), ptr::null()) };
+    assert!(!host_ep.is_null() && !cli_ep.is_null());
+
+    let mut p2p_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_p2p(host_ep, disabled_c.as_ptr(), &raw mut p2p_ptr) },
+        TENDRIL_OK,
+        "serve_p2p failed: {}",
+        read_last_err()
+    );
+    let p2p_ep = unsafe { take_cstr(p2p_ptr) };
+    assert!(p2p_ep.starts_with("iroh://"), "got: {p2p_ep}");
+
+    let mut code_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, remote_c.as_ptr(), &raw mut code_ptr) },
+        TENDRIL_OK
+    );
+    let code = unsafe { take_cstr(code_ptr) };
+
+    let host_ep_usize = host_ep as usize;
+    let accept_pair = thread::spawn(move || unsafe {
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = tendril_endpoint_pair_accept(
+            host_ep_usize as *mut tendril_ffi::TendrilEndpoint,
+            8_000,
+            &raw mut out,
+        );
+        assert_eq!(rc, TENDRIL_OK, "pair accept failed: {}", read_last_err());
+        take_cstr(out)
+    });
+
+    let p2p_c = CString::new(p2p_ep.clone()).unwrap();
+    let code_c = CString::new(code).unwrap();
+    let mut pair_out_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_initiate(
+                cli_ep,
+                p2p_c.as_ptr(),
+                disabled_c.as_ptr(),
+                code_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &raw mut pair_out_ptr,
+            )
+        },
+        TENDRIL_OK,
+        "pair initiate over p2p failed: {}",
+        read_last_err()
+    );
+    let pair_cli: Value = serde_json::from_str(&unsafe { take_cstr(pair_out_ptr) }).unwrap();
+    let pair_srv: Value = serde_json::from_str(&accept_pair.join().unwrap()).unwrap();
+    assert_eq!(pair_cli["sas"], pair_srv["sas"]);
+
+    let dev_id = pair_srv["device_id"].as_str().unwrap();
+    let dev_c = CString::new(dev_id).unwrap();
+    let sas_c = CString::new(pair_cli["sas"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, dev_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+
+    let caps_c = CString::new("[\"fs.read\"]").unwrap();
+    let mut grant_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                dev_c.as_ptr(),
+                caps_c.as_ptr(),
+                3600,
+                &raw mut grant_ptr,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_c = CString::new(unsafe { take_cstr(grant_ptr) }).unwrap();
+
+    let host_ep_usize2 = host_ep as usize;
+    let accept_sess = thread::spawn(move || unsafe {
+        let s = tendril_session_accept(host_ep_usize2 as *mut tendril_ffi::TendrilEndpoint, 8_000);
+        assert!(!s.is_null(), "session accept failed: {}", read_last_err());
+        s as usize
+    });
+
+    let cli_sess = unsafe {
+        tendril_session_connect(
+            cli_ep,
+            p2p_c.as_ptr(),
+            disabled_c.as_ptr(),
+            hname_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(
+        !cli_sess.is_null(),
+        "p2p session connect failed: {}",
+        read_last_err()
+    );
+    let host_sess = accept_sess.join().unwrap() as *mut tendril_ffi::TendrilSession;
+
+    let msg = b"hello-ffi-p2p";
+    assert_eq!(
+        unsafe { tendril_session_send_data(cli_sess, msg.as_ptr(), msg.len()) },
+        TENDRIL_OK
+    );
+    let mut ev_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_poll_event(host_sess, 2_000, &raw mut ev_ptr) },
+        TENDRIL_OK
+    );
+    let ev: Value = serde_json::from_str(&unsafe { take_cstr(ev_ptr) }).unwrap();
+    assert_eq!(ev["event"], "data");
+    assert_eq!(ev["data_b64"], b64url_encode(msg));
+
+    unsafe {
+        tendril_session_close(cli_sess, 1000, ptr::null());
+        tendril_session_free(cli_sess);
+        tendril_session_free(host_sess);
+        tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
+
+    // Reopen host endpoint from same state_dir and confirm P2P EndpointId stays identical.
+    let host_ep_reopened = unsafe { tendril_endpoint_new(hd_c.as_ptr(), ptr::null()) };
+    assert!(!host_ep_reopened.is_null());
+    let mut p2p_ptr2: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_p2p(host_ep_reopened, disabled_c.as_ptr(), &raw mut p2p_ptr2)
+        },
+        TENDRIL_OK
+    );
+    let p2p_ep2 = unsafe { take_cstr(p2p_ptr2) };
+    assert_eq!(p2p_ep.split('?').next(), p2p_ep2.split('?').next());
+    unsafe { tendril_endpoint_free(host_ep_reopened) };
 }

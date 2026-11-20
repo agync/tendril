@@ -26,6 +26,7 @@ export class Endpoint {
   infoJson(): string;
   serveDirect(listenAddr?: string | null): Promise<string>;
   serveRelay(relayUrl: string, expectedHost?: string | null): Promise<string>;
+  serveP2p(relayMode?: string | null): Promise<string>;
   issueCode(kind?: string | null): string;
   pairInitiate(
     endpoint: string,

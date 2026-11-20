@@ -9,6 +9,10 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["p2p-iroh"]
+p2p-iroh = ["tendril-runtime/p2p-iroh"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

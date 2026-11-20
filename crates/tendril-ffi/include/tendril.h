@@ -71,6 +71,11 @@ int32_t tendril_endpoint_serve_relay(
     const char *expected_host,
     char **out_endpoint
 );
+int32_t tendril_endpoint_serve_p2p(
+    TendrilEndpoint *ep,
+    const char *relay_mode_opt,
+    char **out_endpoint
+);
 int32_t tendril_endpoint_issue_code(TendrilEndpoint *ep, const char *kind, char **out_code);
 
 int32_t tendril_endpoint_pair_initiate(

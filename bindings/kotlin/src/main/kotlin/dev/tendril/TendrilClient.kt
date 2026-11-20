@@ -86,6 +86,9 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
   fun serveRelay(relayUrl: String, expectedHost: String? = null): String =
     withHandle { TendrilNative.endpointServeRelay(it, relayUrl, expectedHost) }
 
+  fun serveP2p(relayMode: String? = null): String =
+    withHandle { TendrilNative.endpointServeP2p(it, relayMode) }
+
   fun issueCode(kind: String = "remote"): String =
     withHandle { TendrilNative.endpointIssueCode(it, kind) }
 

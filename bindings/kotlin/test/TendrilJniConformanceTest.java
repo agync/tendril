@@ -512,12 +512,91 @@ public final class TendrilJniConformanceTest {
     }
   }
 
+  private static void verifyServeP2pLoopback() throws Exception {
+    long hostEp = TendrilNative.endpointNew(null, "jni-p2p-host");
+    long cliEp = TendrilNative.endpointNew(null, "jni-p2p-cli");
+    try {
+      String p2pEp = TendrilNative.endpointServeP2p(hostEp, "disabled");
+      check(p2pEp.startsWith("iroh://"), "expected iroh:// endpoint, got " + p2pEp);
+      String code = TendrilNative.endpointIssueCode(hostEp, "remote");
+
+      final Map<String, Object>[] accepted = new Map[1];
+      final Throwable[] acceptErr = new Throwable[1];
+      Thread pairThread =
+          new Thread(
+              () -> {
+                try {
+                  accepted[0] = asObj(Json.parse(TendrilNative.endpointPairAccept(hostEp, 8000)));
+                } catch (Throwable t) {
+                  acceptErr[0] = t;
+                }
+              });
+      pairThread.start();
+
+      Map<String, Object> cliPair =
+          asObj(
+              Json.parse(
+                  TendrilNative.endpointPairInitiate(
+                      cliEp, p2pEp, "disabled", code, "jni-p2p-dev", "android")));
+      pairThread.join(10000);
+      check(acceptErr[0] == null && accepted[0] != null, "p2p pair accept failed: " + acceptErr[0]);
+      check(asStr(cliPair.get("sas")).equals(asStr(accepted[0].get("sas"))), "p2p SAS mismatch");
+
+      String devId = asStr(accepted[0].get("device_id"));
+      TendrilNative.endpointConfirmPeer(hostEp, devId, asStr(cliPair.get("sas")));
+      String grant =
+          TendrilNative.endpointMintGrant(hostEp, devId, Json.stringify(List.of("fs.read")), 3600);
+
+      final long[] hostSessHolder = new long[1];
+      final Throwable[] sessErr = new Throwable[1];
+      Thread sessThread =
+          new Thread(
+              () -> {
+                try {
+                  hostSessHolder[0] = TendrilNative.sessionAccept(hostEp, 8000);
+                } catch (Throwable t) {
+                  sessErr[0] = t;
+                }
+              });
+      sessThread.start();
+
+      long cliSess =
+          TendrilNative.sessionConnect(cliEp, p2pEp, "disabled", "jni-p2p-host", grant);
+      try {
+        sessThread.join(10000);
+        check(
+            sessErr[0] == null && hostSessHolder[0] != 0,
+            "p2p session accept failed: " + sessErr[0]);
+        long hostSess = hostSessHolder[0];
+        try {
+          TendrilNative.sessionSendData(
+              cliSess, "hello-jni-p2p".getBytes(StandardCharsets.UTF_8));
+          Map<String, Object> ev =
+              asObj(Json.parse(TendrilNative.sessionPollEvent(hostSess, 2000)));
+          check("data".equals(ev.get("event")), "expected p2p data event: " + ev);
+          String got =
+              new String(b64UrlDecode(asStr(ev.get("data_b64"))), StandardCharsets.UTF_8);
+          check("hello-jni-p2p".equals(got), "p2p data mismatch: " + got);
+          TendrilNative.sessionClose(cliSess, 1000, "done");
+        } finally {
+          TendrilNative.sessionFree(hostSess);
+        }
+      } finally {
+        TendrilNative.sessionFree(cliSess);
+      }
+    } finally {
+      TendrilNative.endpointFree(cliEp);
+      TendrilNative.endpointFree(hostEp);
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     Path root = Paths.get("").toAbsolutePath().normalize();
     Path peerBin = root.resolve("target").resolve("debug").resolve("tendril-conformance-peer");
     verifyVectors(root);
     System.out.println("JNI_VECTORS_OK=true");
     verifyLiveInterop(peerBin);
+    verifyServeP2pLoopback();
     System.out.println("JNI_LIVE_INTEROP_OK=true");
   }
 }

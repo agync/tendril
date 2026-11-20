@@ -20,9 +20,10 @@ use tendril_core::pairing::{
 use tendril_core::policy::ProviderId;
 use tendril_core::roster::Roster;
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, InboundRouter,
-    LocalDialer, PathDialer, PathListener, PathStream, RelayDialer, RelayListener, SessionDriver,
-    SessionEvent, StateStore, drive_pair_initiator, drive_pair_responder_with_options,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener, InboundRouter, P2pListener,
+    PathListener, PathStream, RelayListener, SessionDriver, SessionEvent, StateStore,
+    dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
+    drive_pair_responder_with_options, parse_p2p_relay_mode,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
@@ -62,23 +63,9 @@ async fn dial_endpoint(
     endpoint: &str,
     relay_host: Option<&str>,
 ) -> std::result::Result<Box<dyn PathStream>, String> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        let mut dialer = RelayDialer::new();
-        if let Some(host) = relay_host {
-            dialer = dialer.with_expected_host(host);
-        }
-        dialer.dial(endpoint).await.map_err(|e| e.to_string())
-    } else if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
-        LocalDialer::new()
-            .dial(endpoint)
-            .await
-            .map_err(|e| e.to_string())
-    } else {
-        DirectDialer::new()
-            .dial(endpoint)
-            .await
-            .map_err(|e| e.to_string())
-    }
+    runtime_dial_endpoint(endpoint, relay_host)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[napi]
@@ -272,6 +259,19 @@ impl Endpoint {
         Ok(ep)
     }
 
+    #[napi(js_name = "serveP2p")]
+    pub async fn serve_p2p(&self, relay_mode: Option<String>) -> Result<String> {
+        let mode = parse_p2p_relay_mode(relay_mode.as_deref())
+            .map_err(|e| Error::new(Status::InvalidArg, e.to_string()))?;
+        let seed = self.identity.derive_p2p_identity_seed();
+        let listener = P2pListener::bind_with_secret(mode, *seed)
+            .await
+            .map_err(to_generic_err)?;
+        let ep = listener.local_endpoint();
+        self.spawn_listener(Box::new(listener));
+        Ok(ep)
+    }
+
     #[napi]
     pub fn issue_code(&self, kind: Option<String>) -> Result<String> {
         let pk = match kind.as_deref() {
@@ -308,8 +308,9 @@ impl Endpoint {
             code,
             None,
         )
-        .await
-        .map_err(to_generic_err)?;
+        .await;
+        let _ = stream.close().await;
+        let res = res.map_err(to_generic_err)?;
 
         match res.outcome {
             PairOutcome::InitiatorPending {
