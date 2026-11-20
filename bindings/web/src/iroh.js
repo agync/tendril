@@ -1,32 +1,49 @@
-import initP2pWasm, {
-  WasmIrohStream,
-  parse_p2p_endpoint_json,
-} from "../pkg-p2p/tendril_wasm.js";
-
 const MAX_IROH_FRAME_LEN = 65521;
+const MAX_QUEUED_BYTES = 16 * MAX_IROH_FRAME_LEN;
 
+let p2pModule = null;
 let p2pWasmReadyPromise = null;
 
-export async function initTendrilP2p(wasmUrl) {
+async function ensureP2pModule() {
+  if (!p2pModule) {
+    p2pModule = await import("../pkg-p2p/tendril_wasm.js");
+  }
+  return p2pModule;
+}
+
+async function ensureP2pReady(wasmUrl) {
   if (!p2pWasmReadyPromise) {
-    p2pWasmReadyPromise = initP2pWasm(wasmUrl).then(() => {});
+    p2pWasmReadyPromise = ensureP2pModule()
+      .then((mod) => mod.default(wasmUrl))
+      .then(() => p2pModule)
+      .catch((err) => {
+        p2pWasmReadyPromise = null;
+        throw err;
+      });
   }
   return p2pWasmReadyPromise;
 }
 
+export async function initTendrilP2p(wasmUrl) {
+  await ensureP2pReady(wasmUrl);
+}
+
 export async function parseP2pEndpoint(endpoint) {
-  await initTendrilP2p();
-  return JSON.parse(parse_p2p_endpoint_json(endpoint));
+  const mod = await ensureP2pReady();
+  return JSON.parse(mod.parse_p2p_endpoint_json(endpoint));
 }
 
 class IrohStream {
   #inner;
   #queue = [];
+  #queuedBytes = 0;
+  #drainWaiter = null;
   #waiters = [];
   #eof = false;
   #error = null;
   #closed = false;
   #freed = false;
+  #closePromise = null;
   #writeChain = Promise.resolve();
   #readLoopPromise = null;
 
@@ -39,9 +56,36 @@ class IrohStream {
     return MAX_IROH_FRAME_LEN;
   }
 
+  _shiftChunk() {
+    const chunk = this.#queue.shift();
+    if (chunk) {
+      this.#queuedBytes = Math.max(0, this.#queuedBytes - chunk.byteLength);
+      if (this.#drainWaiter && this.#queuedBytes < MAX_QUEUED_BYTES) {
+        const wake = this.#drainWaiter;
+        this.#drainWaiter = null;
+        wake();
+      }
+    }
+    return chunk;
+  }
+
+  _wakeDrain() {
+    if (this.#drainWaiter) {
+      const wake = this.#drainWaiter;
+      this.#drainWaiter = null;
+      wake();
+    }
+  }
+
   async _runReadLoop() {
     try {
       while (!this.#closed) {
+        if (this.#queuedBytes >= MAX_QUEUED_BYTES) {
+          await new Promise((resolve) => {
+            this.#drainWaiter = resolve;
+          });
+          continue;
+        }
         const chunk = await this.#inner.recv_chunk();
         if (!chunk || chunk.length === 0) {
           this._closeRead();
@@ -49,16 +93,14 @@ class IrohStream {
         }
         const copy = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
         this.#queue.push(copy);
+        this.#queuedBytes += copy.byteLength;
         this._wakeNext();
       }
     } catch (err) {
-      this._fail(err instanceof Error ? err : new Error(String(err)));
-    } finally {
-      if (this.#closed && !this.#freed) {
-        this.#freed = true;
-        try {
-          this.#inner.free();
-        } catch {}
+      if (!this.#closed) {
+        this._fail(err instanceof Error ? err : new Error(String(err)));
+      } else {
+        this._closeRead();
       }
     }
   }
@@ -80,7 +122,7 @@ class IrohStream {
   _wakeNext() {
     if (this.#waiters.length > 0 && this.#queue.length > 0) {
       const w = this.#waiters.shift();
-      w.resolve({ status: "data", bytes: this.#queue.shift() });
+      w.resolve({ status: "data", bytes: this._shiftChunk() });
     }
   }
 
@@ -88,7 +130,7 @@ class IrohStream {
     while (this.#waiters.length > 0) {
       const w = this.#waiters.shift();
       if (this.#queue.length > 0) {
-        w.resolve({ status: "data", bytes: this.#queue.shift() });
+        w.resolve({ status: "data", bytes: this._shiftChunk() });
       } else if (this.#error) {
         w.reject(this.#error);
       } else {
@@ -108,14 +150,19 @@ class IrohStream {
       throw new Error("iroh stream is closed");
     }
     const copy = new Uint8Array(bytes);
-    const job = this.#writeChain.then(() => this.#inner.send_chunk(copy));
+    const job = this.#writeChain.then(() => {
+      if (this.#closed || this.#freed) {
+        throw new Error("iroh stream is closed");
+      }
+      return this.#inner.send_chunk(copy);
+    });
     this.#writeChain = job.catch(() => {});
     return job;
   }
 
   recv(timeoutMs = 5000) {
     if (this.#queue.length > 0) {
-      return Promise.resolve({ status: "data", bytes: this.#queue.shift() });
+      return Promise.resolve({ status: "data", bytes: this._shiftChunk() });
     }
     if (this.#error) {
       return Promise.reject(this.#error);
@@ -148,17 +195,28 @@ class IrohStream {
     });
   }
 
-  async close() {
-    if (this.#closed) {
-      return;
+  close() {
+    if (!this.#closePromise) {
+      this.#closePromise = this._closeInternal();
     }
+    return this.#closePromise;
+  }
+
+  async _closeInternal() {
     this.#closed = true;
+    this._wakeDrain();
     this._closeRead();
     try {
-      await this.#writeChain;
+      await Promise.race([
+        this.#writeChain,
+        new Promise((resolve) => setTimeout(resolve, 150)),
+      ]);
     } catch {}
     try {
       await this.#inner.close();
+    } catch {}
+    try {
+      await this.#writeChain;
     } catch {}
     if (this.#readLoopPromise) {
       try {
@@ -167,9 +225,7 @@ class IrohStream {
     }
     if (!this.#freed) {
       this.#freed = true;
-      try {
-        this.#inner.free();
-      } catch {}
+      this.#inner.free();
     }
   }
 }
@@ -182,22 +238,30 @@ export async function dialIrohStream({
   if (!endpoint || !endpoint.startsWith("iroh://")) {
     throw new Error(`iroh endpoint must start with iroh://: ${endpoint}`);
   }
-  await initTendrilP2p();
+  const mod = await ensureP2pReady();
   let timer = null;
   let timedOut = false;
-  const dialPromise = WasmIrohStream.dial(endpoint, relayUrlOverride || null).then(
-    async (stream) => {
+  const dialPromise = mod.WasmIrohStream.dial(
+    endpoint,
+    relayUrlOverride || null,
+    timeoutMs
+  )
+    .then(async (stream) => {
       if (timedOut) {
         try {
           await stream.close();
         } catch {}
-        try {
-          stream.free();
-        } catch {}
+        stream.free();
+        return null;
       }
       return stream;
-    }
-  );
+    })
+    .catch((err) => {
+      if (timedOut) {
+        return null;
+      }
+      throw err;
+    });
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(() => {
       timedOut = true;

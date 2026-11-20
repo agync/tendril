@@ -12,10 +12,24 @@ import initWasm, {
   verify_grant_json,
   verify_rotation_chain_json,
 } from "../pkg/tendril_wasm.js";
-import { dialIrohStream, initTendrilP2p, parseP2pEndpoint } from "./iroh.js";
 import { dialRelayStream } from "./relay.js";
 
-export { dialIrohStream, dialRelayStream, initTendrilP2p, parseP2pEndpoint };
+export { dialRelayStream };
+
+export async function initTendrilP2p(wasmUrl) {
+  const { initTendrilP2p: init } = await import("./iroh.js");
+  return init(wasmUrl);
+}
+
+export async function parseP2pEndpoint(endpoint) {
+  const { parseP2pEndpoint: parse } = await import("./iroh.js");
+  return parse(endpoint);
+}
+
+export async function dialIrohStream(options) {
+  const { dialIrohStream: dial } = await import("./iroh.js");
+  return dial(options);
+}
 
 const SESSION_TOKEN = Symbol("TendrilWebSession");
 const CLIENT_TOKEN = Symbol("TendrilWebClient");

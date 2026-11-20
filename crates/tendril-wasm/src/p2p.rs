@@ -2,11 +2,12 @@
 
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use futures_util::lock::Mutex as AsyncMutex;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAddr};
+use n0_future::time::{Duration, timeout};
 use tendril_core::MAX_FRAME_LEN;
 use wasm_bindgen::prelude::*;
 
@@ -75,7 +76,7 @@ pub fn parse_p2p_endpoint_json(endpoint: &str) -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub struct WasmIrohStream {
     endpoint: Endpoint,
-    conn: Arc<AsyncMutex<Option<Connection>>>,
+    conn: StdMutex<Option<Connection>>,
     send: Arc<AsyncMutex<Option<SendStream>>>,
     recv: Arc<AsyncMutex<Option<RecvStream>>>,
 }
@@ -87,7 +88,10 @@ impl WasmIrohStream {
     pub async fn dial(
         endpoint: String,
         relay_url_override: Option<String>,
+        timeout_ms: Option<u32>,
     ) -> Result<WasmIrohStream, JsValue> {
+        let budget =
+            Duration::from_millis(u64::from(timeout_ms.unwrap_or(15_000).clamp(100, 120_000)));
         let addr = parse_p2p_endpoint_uri(&endpoint).map_err(to_js_err)?;
         let builder = match relay_url_override
             .as_deref()
@@ -101,43 +105,47 @@ impl WasmIrohStream {
             }
             None => Endpoint::builder(presets::N0).relay_mode(RelayMode::Default),
         };
-        let ep = builder
-            .bind()
+        let ep = timeout(budget, builder.bind())
             .await
+            .map_err(|_| to_js_err("iroh endpoint bind timed out"))?
             .map_err(|e| to_js_err(format!("iroh endpoint bind failed: {e}")))?;
 
-        let conn = match ep.connect(addr, TENDRIL_P2P_ALPN).await {
-            Ok(c) => c,
-            Err(e) => {
-                ep.close().await;
-                return Err(to_js_err(format!("iroh connect failed: {e}")));
-            }
-        };
+        let dial_res = timeout(budget, async {
+            let conn = ep
+                .connect(addr, TENDRIL_P2P_ALPN)
+                .await
+                .map_err(|e| format!("iroh connect failed: {e}"))?;
 
-        let (mut send, recv) = match conn.open_bi().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                drop(conn);
-                ep.close().await;
-                return Err(to_js_err(format!("iroh open_bi failed: {e}")));
-            }
-        };
+            let (mut send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| format!("iroh open_bi failed: {e}"))?;
 
-        // Write a 1-byte stream marker immediately so the peer's accept_bi() resolves.
-        if let Err(e) = send.write_all(&[P2P_STREAM_MAGIC]).await {
-            drop(send);
-            drop(recv);
-            drop(conn);
-            ep.close().await;
-            return Err(to_js_err(format!("iroh opener write failed: {e}")));
-        }
+            // Write a 1-byte stream marker immediately so the peer's accept_bi() resolves.
+            send.write_all(&[P2P_STREAM_MAGIC])
+                .await
+                .map_err(|e| format!("iroh opener write failed: {e}"))?;
 
-        Ok(Self {
-            endpoint: ep,
-            conn: Arc::new(AsyncMutex::new(Some(conn))),
-            send: Arc::new(AsyncMutex::new(Some(send))),
-            recv: Arc::new(AsyncMutex::new(Some(recv))),
+            Ok::<_, String>((conn, send, recv))
         })
+        .await;
+
+        match dial_res {
+            Ok(Ok((conn, send, recv))) => Ok(Self {
+                endpoint: ep,
+                conn: StdMutex::new(Some(conn)),
+                send: Arc::new(AsyncMutex::new(Some(send))),
+                recv: Arc::new(AsyncMutex::new(Some(recv))),
+            }),
+            Ok(Err(msg)) => {
+                ep.close().await;
+                Err(to_js_err(msg))
+            }
+            Err(_) => {
+                ep.close().await;
+                Err(to_js_err("timed out connecting to iroh endpoint"))
+            }
+        }
     }
 
     /// Sends one bounded chunk over the open QUIC stream.
@@ -177,24 +185,24 @@ impl WasmIrohStream {
         }
     }
 
-    /// Gracefully finishes the stream and closes the ephemeral `iroh` endpoint.
+    /// Gracefully finishes the stream when idle and closes the ephemeral `iroh` endpoint.
     #[wasm_bindgen]
     pub async fn close(&self) {
+        if let Some(mut sg) = self.send.try_lock()
+            && let Some(mut s) = sg.take()
         {
-            let mut sg = self.send.lock().await;
-            if let Some(mut s) = sg.take() {
-                let _ = s.finish();
-            }
+            let _ = s.finish();
+            let _ = timeout(Duration::from_millis(200), s.stopped()).await;
         }
-        {
-            let mut rg = self.recv.lock().await;
-            rg.take();
+        if let Some(conn) = self.conn.lock().ok().and_then(|mut cg| cg.take()) {
+            conn.close(0u32.into(), b"closed");
         }
-        {
-            let mut cg = self.conn.lock().await;
-            cg.take();
-        }
+        // Close the endpoint before awaiting send/recv locks so parked I/O futures unblock immediately.
         self.endpoint.close().await;
+        if let Some(mut s) = self.send.lock().await.take() {
+            let _ = s.finish();
+        }
+        self.recv.lock().await.take();
     }
 }
 

@@ -14,6 +14,24 @@ export interface ParsedPairingUri {
   endpoints: string[];
 }
 
+export interface ParsedP2pEndpoint {
+  endpoint_id: string;
+  addrs: string[];
+  relays: string[];
+}
+
+export type WebStreamRecvResult =
+  | { status: "data"; bytes: Uint8Array }
+  | { status: "would_block" }
+  | { status: "eof" };
+
+export interface TendrilStream {
+  maxFrame(): number;
+  send(bytes: Uint8Array): Promise<void> | void;
+  recv(timeoutMs?: number): Promise<WebStreamRecvResult>;
+  close(): Promise<void> | void;
+}
+
 export interface EndpointInfo {
   host_id: string;
   device_id: string;
@@ -42,6 +60,21 @@ export interface PollEvent {
 }
 
 export function initTendril(wasmUrl?: string | URL | RequestInfo | BufferSource): Promise<void>;
+export function initTendrilP2p(
+  wasmUrl?: string | URL | RequestInfo | BufferSource
+): Promise<void>;
+export function parseP2pEndpoint(endpoint: string): Promise<ParsedP2pEndpoint>;
+export function dialRelayStream(options: {
+  relayUrl: string;
+  targetPub: string;
+  expectedHost?: string | null;
+  timeoutMs?: number;
+}): Promise<TendrilStream>;
+export function dialIrohStream(options: {
+  endpoint: string;
+  relayUrlOverride?: string | null;
+  timeoutMs?: number;
+}): Promise<TendrilStream>;
 export function b64urlEncode(bytes: Uint8Array): string;
 export function b64urlDecode(str: string): Uint8Array;
 export function deviceId(staticPub: Uint8Array): string;
@@ -88,9 +121,11 @@ export class TendrilWebClient {
   exportRosterJson(): string;
   getPeer(peerId: string): unknown | null;
   pair(options: {
-    relayUrl: string;
-    targetPub: string;
+    endpoint?: string | null;
+    relayUrl?: string | null;
+    targetPub?: string | null;
     expectedHost?: string | null;
+    relayUrlOverride?: string | null;
     code?: string;
     pairingUri?: string | null;
     deviceName?: string;
@@ -98,9 +133,11 @@ export class TendrilWebClient {
     timeoutMs?: number;
   }): Promise<PairResult>;
   connect(options: {
-    relayUrl: string;
-    targetPub: string;
+    endpoint?: string | null;
+    relayUrl?: string | null;
+    targetPub?: string | null;
     expectedHost?: string | null;
+    relayUrlOverride?: string | null;
     targetHostId: string;
     grantJson?: string | null;
     crlSeq?: number | null;

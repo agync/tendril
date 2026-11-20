@@ -340,19 +340,6 @@ async function main() {
       const benchMain = await sdk.benchmarkArgon2(3, { useWorker: false });
       const benchWorker = await sdk.benchmarkArgon2(2, { useWorker: true });
 
-      const sampleId = '0'.repeat(64);
-      const parsedP2p = await sdk.parseP2pEndpoint('iroh://' + sampleId + '?relay=https://relay.example/');
-      if (parsedP2p.endpoint_id !== sampleId || parsedP2p.relays.length !== 1) {
-        throw new Error('parseP2pEndpoint valid mismatch: ' + JSON.stringify(parsedP2p));
-      }
-      let p2pBadRejected = false;
-      try {
-        await sdk.parseP2pEndpoint('https://not-iroh.example');
-      } catch {
-        p2pBadRejected = true;
-      }
-      if (!p2pBadRejected) throw new Error('invalid iroh URI was not rejected');
-
       return { benchMain, benchWorker };
     `);
 
@@ -470,6 +457,31 @@ async function main() {
     const evClosed = await peer.call({ op: "recv", timeout_ms: 2000 });
     assert.equal(evClosed.event, "closed");
     await peer.call({ op: "shutdown" });
+
+    // Verify default sans-I/O + relay flows never eagerly load iroh.js or pkg-p2p.
+    const eagerP2pUrls = await cdp.evalAsync(`
+      return performance
+        .getEntriesByType('resource')
+        .map((e) => e.name)
+        .filter((u) => u.includes('iroh.js') || u.includes('pkg-p2p'));
+    `);
+    assert.deepEqual(eagerP2pUrls, []);
+
+    // Now invoke opt-in parseP2pEndpoint and verify lazy loading works.
+    await cdp.evalAsync(`
+      const sampleId = '0'.repeat(64);
+      const parsedP2p = await window.__e2eSdk.parseP2pEndpoint('iroh://' + sampleId + '?relay=https://relay.example/');
+      if (parsedP2p.endpoint_id !== sampleId || parsedP2p.relays.length !== 1) {
+        throw new Error('parseP2pEndpoint valid mismatch: ' + JSON.stringify(parsedP2p));
+      }
+      let p2pBadRejected = false;
+      try {
+        await window.__e2eSdk.parseP2pEndpoint('https://not-iroh.example');
+      } catch {
+        p2pBadRejected = true;
+      }
+      if (!p2pBadRejected) throw new Error('invalid iroh URI was not rejected');
+    `);
     console.log("CHROME_LIVE_RELAY_E2E_OK=true");
 
     if (process.env.TENDRIL_WEB_P2P_LIVE === "1") {
@@ -571,6 +583,27 @@ async function main() {
         assert.equal(p2pData.utf8, "hello-from-chrome-iroh");
         const p2pClosed = await nextServeEvent(10000);
         assert.equal(p2pClosed.event, "closed");
+
+        // Verify idempotent concurrent close() unblocks a parked recv_chunk() with zero borrow panic.
+        const parkCloseRes = await cdp.evalAsync(`
+          const errs = [];
+          const onErr = (ev) => errs.push(String(ev.error || ev.message || ev));
+          window.addEventListener('error', onErr);
+          const parkedStream = await window.__e2eSdk.dialIrohStream({
+            endpoint: ${JSON.stringify(bareP2p)},
+            timeoutMs: 25000,
+          });
+          const pendingRecv = parkedStream.recv(60000);
+          const t0 = performance.now();
+          await Promise.all([parkedStream.close(), parkedStream.close()]);
+          const closeElapsedMs = performance.now() - t0;
+          const recvAfterClose = await pendingRecv;
+          window.removeEventListener('error', onErr);
+          return { closeElapsedMs, recvStatus: recvAfterClose.status, errors: errs };
+        `);
+        assert.equal(parkCloseRes.recvStatus, "eof");
+        assert.deepEqual(parkCloseRes.errors, []);
+        assert.ok(parkCloseRes.closeElapsedMs < 15000, `parked close took ${parkCloseRes.closeElapsedMs}ms`);
         console.log("CHROME_LIVE_IROH_P2P_E2E_OK=true");
       } finally {
         serveRl.close();
