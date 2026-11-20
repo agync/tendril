@@ -13,7 +13,7 @@ JNI_OS := $(if $(filter Darwin,$(shell uname -s)),darwin,linux)
 override MSG := $(value MSG)
 export MSG
 
-.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check bindings/go bindings/python bindings/node bindings/wasm bindings/web bindings/jni bindings/android bindings/check docs/check docs/build docs/serve docs/log hooks/require hooks/update
+.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check bindings/go bindings/python bindings/node bindings/wasm bindings/wasm-p2p bindings/web bindings/jni bindings/android bindings/check docs/check docs/build docs/serve docs/log hooks/require hooks/update
 
 ##@ Bootstrap
 
@@ -65,7 +65,7 @@ clean: ## Remove build artifacts
 	cargo clean --manifest-path bindings/python/Cargo.toml
 	cargo clean --manifest-path bindings/node/Cargo.toml
 	rm -f bindings/python/tendril/_tendril.so bindings/node/index.node
-	rm -rf bindings/web/pkg bindings/kotlin/build-jni
+	rm -rf bindings/web/pkg bindings/web/pkg-p2p bindings/kotlin/build-jni
 
 ##@ Bindings
 
@@ -90,7 +90,13 @@ bindings/wasm: ## Build tendril-wasm for wasm32-unknown-unknown and generate bro
 	cargo build --release --target wasm32-unknown-unknown -p tendril-wasm
 	wasm-bindgen --target web --out-dir bindings/web/pkg target/wasm32-unknown-unknown/release/tendril_wasm.wasm
 
-bindings/web: bindings/wasm ## Run headless Chrome Web SDK conformance and live relay E2E tests
+bindings/wasm-p2p: ## Build opt-in p2p-iroh browser WASM module into bindings/web/pkg-p2p
+	CC_wasm32_unknown_unknown=clang \
+	AR_wasm32_unknown_unknown="$$(command -v llvm-ar || command -v ar)" \
+	cargo build --release --target wasm32-unknown-unknown -p tendril-wasm --features p2p-iroh
+	wasm-bindgen --target web --out-dir bindings/web/pkg-p2p target/wasm32-unknown-unknown/release/tendril_wasm.wasm
+
+bindings/web: bindings/wasm bindings/wasm-p2p ## Run headless Chrome Web SDK conformance and live relay E2E tests
 	cargo build -p tendril-relay --bin tendril-relay
 	cargo build -p tendril-cli --bin tendril-conformance-peer
 	node bindings/web/test/browser_e2e.mjs

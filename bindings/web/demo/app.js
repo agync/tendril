@@ -41,6 +41,8 @@ async function initClient() {
 async function applyPreconfig() {
   $("relay-url").value = defaultRelayUrl();
   const params = new URLSearchParams(window.location.search);
+  if (params.get("endpoint")) $("relay-url").value = params.get("endpoint");
+  if (params.get("relay")) $("relay-url").value = params.get("relay");
   if (params.get("pub")) $("target-pub").value = params.get("pub");
   if (params.get("host")) $("target-host-id").value = params.get("host");
   if (params.get("code")) $("pair-code").value = params.get("code");
@@ -48,12 +50,21 @@ async function applyPreconfig() {
     const resp = await fetch("/demo-config.json", { cache: "no-store" });
     if (resp.ok) {
       const cfg = await resp.json();
-      if (cfg.relayUrl) $("relay-url").value = cfg.relayUrl;
+      if (cfg.endpoint) $("relay-url").value = cfg.endpoint;
+      else if (cfg.relayUrl) $("relay-url").value = cfg.relayUrl;
       if (cfg.targetPub && !$("target-pub").value) $("target-pub").value = cfg.targetPub;
       if (cfg.hostId) $("target-host-id").value = cfg.hostId;
       if (cfg.code && !$("pair-code").value) $("pair-code").value = cfg.code;
     }
   } catch {}
+}
+
+function transportArgsFromUi() {
+  const target = $("relay-url").value.trim();
+  if (target.startsWith("iroh://")) {
+    return { endpoint: target, relayUrl: null, targetPub: null };
+  }
+  return { endpoint: null, relayUrl: target, targetPub: $("target-pub").value.trim() };
 }
 
 async function pollLoop(activeSession) {
@@ -87,12 +98,12 @@ async function connectSession() {
     } catch {}
     session = null;
   }
-  const relayUrl = $("relay-url").value.trim();
-  const targetPub = $("target-pub").value.trim();
+  const { endpoint, relayUrl, targetPub } = transportArgsFromUi();
   const targetHostId = $("target-host-id").value.trim();
   const grantRaw = $("grant-json").value.trim();
   const t0 = performance.now();
   session = await client.connect({
+    endpoint,
     relayUrl,
     targetPub,
     targetHostId,
@@ -130,9 +141,11 @@ $("bench-worker-btn").addEventListener("click", async () => {
 $("pair-btn").addEventListener("click", async () => {
   const t0 = performance.now();
   try {
+    const { endpoint, relayUrl, targetPub } = transportArgsFromUi();
     const res = await client.pair({
-      relayUrl: $("relay-url").value.trim(),
-      targetPub: $("target-pub").value.trim(),
+      endpoint,
+      relayUrl,
+      targetPub,
       code: $("pair-code").value.trim(),
       pairingUri: $("pair-uri").value.trim() || null,
       deviceName: $("device-name").value.trim() || "phone-browser",

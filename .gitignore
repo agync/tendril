@@ -45,6 +45,7 @@ wheels/
 node_modules/
 dist/
 pkg/
+pkg-p2p/
 *.node
 bindings/*/target/
 bindings/python/tendril/_tendril.*

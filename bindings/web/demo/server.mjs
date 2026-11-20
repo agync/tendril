@@ -91,6 +91,8 @@ const server = http.createServer((req, res) => {
     filePath = resolveSafe(path.join(WEB_ROOT, "src"), pathname.slice("/src/".length));
   } else if (pathname.startsWith("/pkg/")) {
     filePath = resolveSafe(path.join(WEB_ROOT, "pkg"), pathname.slice("/pkg/".length));
+  } else if (pathname.startsWith("/pkg-p2p/")) {
+    filePath = resolveSafe(path.join(WEB_ROOT, "pkg-p2p"), pathname.slice("/pkg-p2p/".length));
   } else if (cfg.serveVectors && pathname.startsWith("/spec/vectors/")) {
     filePath = resolveSafe(
       path.join(REPO_ROOT, "spec", "vectors"),

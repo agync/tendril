@@ -12,7 +12,10 @@ import initWasm, {
   verify_grant_json,
   verify_rotation_chain_json,
 } from "../pkg/tendril_wasm.js";
+import { dialIrohStream, initTendrilP2p, parseP2pEndpoint } from "./iroh.js";
 import { dialRelayStream } from "./relay.js";
+
+export { dialIrohStream, dialRelayStream, initTendrilP2p, parseP2pEndpoint };
 
 const SESSION_TOKEN = Symbol("TendrilWebSession");
 const CLIENT_TOKEN = Symbol("TendrilWebClient");
@@ -31,14 +34,29 @@ function nowUnixSecs() {
   return Math.floor(Date.now() / 1000);
 }
 
-function sendProtocolBytes(stream, bytes) {
+async function sendProtocolBytes(stream, bytes) {
   if (!bytes || bytes.length === 0) {
     return;
   }
   const maxFrame = stream.maxFrame();
   for (let offset = 0; offset < bytes.length; offset += maxFrame) {
-    stream.send(bytes.subarray(offset, offset + maxFrame));
+    await stream.send(bytes.subarray(offset, offset + maxFrame));
   }
+}
+
+async function dialWebStream({
+  endpoint = null,
+  relayUrl = null,
+  targetPub = null,
+  expectedHost = null,
+  relayUrlOverride = null,
+  timeoutMs,
+}) {
+  const target = endpoint || relayUrl;
+  if (target && target.startsWith("iroh://")) {
+    return dialIrohStream({ endpoint: target, relayUrlOverride, timeoutMs });
+  }
+  return dialRelayStream({ relayUrl: target, targetPub, expectedHost, timeoutMs });
 }
 
 function remainingBudgetMs(deadlineMs, label) {
@@ -229,9 +247,11 @@ export class TendrilWebClient {
   }
 
   async pair({
-    relayUrl,
-    targetPub,
+    endpoint = null,
+    relayUrl = null,
+    targetPub = null,
     expectedHost = null,
+    relayUrlOverride = null,
     code = "",
     pairingUri = null,
     deviceName = "web-device",
@@ -260,15 +280,17 @@ export class TendrilWebClient {
       hostStaticPin,
       hostSigningPin
     );
-    const stream = await dialRelayStream({
+    const stream = await dialWebStream({
+      endpoint,
       relayUrl,
       targetPub,
       expectedHost,
-      timeoutMs: remainingBudgetMs(deadlineMs, "pairing timed out connecting to relay"),
+      relayUrlOverride,
+      timeoutMs: remainingBudgetMs(deadlineMs, "pairing timed out connecting to transport"),
     });
     try {
       const startBytes = initiator.start();
-      sendProtocolBytes(stream, startBytes);
+      await sendProtocolBytes(stream, startBytes);
       while (true) {
         const waitMs = remainingBudgetMs(deadlineMs, "pairing timed out waiting for host response");
         const frame = await stream.recv(waitMs);
@@ -280,7 +302,7 @@ export class TendrilWebClient {
         }
         const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
         if (res.write_b64) {
-          sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+          await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
         }
         if (res.outcome) {
           if (res.outcome.status === "pending") {
@@ -299,14 +321,16 @@ export class TendrilWebClient {
       }
     } finally {
       initiator.free();
-      stream.close();
+      await stream.close();
     }
   }
 
   async connect({
-    relayUrl,
-    targetPub,
+    endpoint = null,
+    relayUrl = null,
+    targetPub = null,
     expectedHost = null,
+    relayUrlOverride = null,
     targetHostId,
     grantJson = null,
     crlSeq = null,
@@ -320,16 +344,18 @@ export class TendrilWebClient {
       grantJson,
       seq ?? null
     );
-    const stream = await dialRelayStream({
+    const stream = await dialWebStream({
+      endpoint,
       relayUrl,
       targetPub,
       expectedHost,
-      timeoutMs: remainingBudgetMs(deadlineMs, "session handshake timed out connecting to relay"),
+      relayUrlOverride,
+      timeoutMs: remainingBudgetMs(deadlineMs, "session handshake timed out connecting to transport"),
     });
     const startedMs = performance.now();
     try {
       const m1 = session.start();
-      sendProtocolBytes(stream, m1);
+      await sendProtocolBytes(stream, m1);
       while (!session.is_established()) {
         const waitMs = remainingBudgetMs(deadlineMs, "session handshake timed out");
         const frame = await stream.recv(waitMs);
@@ -352,7 +378,7 @@ export class TendrilWebClient {
           throw err;
         }
         if (step.write_b64) {
-          sendProtocolBytes(stream, b64urlDecode(step.write_b64));
+          await sendProtocolBytes(stream, b64urlDecode(step.write_b64));
         }
         if (step.established) {
           await this.#persistRoster();
@@ -379,7 +405,7 @@ export class TendrilWebClient {
       );
     } catch (err) {
       session.free();
-      stream.close();
+      await stream.close();
       throw err;
     }
   }
@@ -433,19 +459,19 @@ export class TendrilWebSession {
     this.#ensureOpen();
     const bytes = typeof payload === "string" ? encoder.encode(payload) : payload;
     const out = this.#session.send_data(bytes, this.#elapsedMs());
-    sendProtocolBytes(this.#stream, out);
+    await sendProtocolBytes(this.#stream, out);
   }
 
   async rekey() {
     this.#ensureOpen();
     const out = this.#session.send_rekey(this.#elapsedMs());
-    sendProtocolBytes(this.#stream, out);
+    await sendProtocolBytes(this.#stream, out);
   }
 
   async ping(cookie = 1) {
     this.#ensureOpen();
     const out = this.#session.send_ping(cookie, this.#elapsedMs());
-    sendProtocolBytes(this.#stream, out);
+    await sendProtocolBytes(this.#stream, out);
   }
 
   async tick() {
@@ -459,7 +485,7 @@ export class TendrilWebSession {
       } catch {}
       throw err;
     }
-    sendProtocolBytes(this.#stream, out);
+    await sendProtocolBytes(this.#stream, out);
   }
 
   authorize(requestedCap) {
@@ -499,7 +525,7 @@ export class TendrilWebSession {
         throw err;
       }
       if (step.write_b64) {
-        sendProtocolBytes(this.#stream, b64urlDecode(step.write_b64));
+        await sendProtocolBytes(this.#stream, b64urlDecode(step.write_b64));
       }
       if (step.events && step.events.length > 0) {
         if (step.events.some((ev) => ev.event === "revocation_updated")) {
@@ -521,10 +547,10 @@ export class TendrilWebSession {
     try {
       if (!this.#session.is_closed()) {
         const out = this.#session.send_close(code, reason);
-        sendProtocolBytes(this.#stream, out);
+        await sendProtocolBytes(this.#stream, out);
       }
     } catch {}
-    this.#stream.close();
+    await this.#stream.close();
     this.#session.free();
   }
 }

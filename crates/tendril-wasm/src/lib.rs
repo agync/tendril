@@ -1,4 +1,8 @@
-//! Sans-I/O WebAssembly bindings exposing `tendril-core` primitives and state machines.
+//! Sans-I/O WebAssembly bindings exposing `tendril-core` primitives and state machines,
+//! plus opt-in `p2p-iroh` browser WebSocket relay transport.
+
+#[cfg(feature = "p2p-iroh")]
+pub mod p2p;
 
 use std::collections::HashMap;
 use std::fmt;

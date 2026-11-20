@@ -115,14 +115,14 @@
     </section>
 
     <section>
-      <h2>2. Pair via Relay (Gate #9)</h2>
-      <label>Relay URL
-        <input id="relay-url" placeholder="wss://host/v1/relay" />
+      <h2>2. Pair via Relay or iroh P2P (Gate #9)</h2>
+      <label>Endpoint or Relay URL (`iroh://...` or `wss://.../v1/relay`)
+        <input id="relay-url" placeholder="iroh://... or wss://host/v1/relay" />
       </label>
       <label>Pairing URI (optional tendril://pair?...)</label>
       <input id="pair-uri" placeholder="tendril://pair?v=1&..." />
-      <label>Host Mailbox Pub (b64url signing_pub)
-        <input id="target-pub" placeholder="b64url 32-byte Ed25519 key" />
+      <label>Host Mailbox Pub (Relay only: b64url signing_pub)
+        <input id="target-pub" placeholder="Required only for wss://.../v1/relay" />
       </label>
       <label>Target Host ID
         <input id="target-host-id" value="tendril-host" />

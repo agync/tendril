@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 const RELAY_BIN = path.join(REPO_ROOT, "target", "debug", "tendril-relay");
 const PEER_BIN = path.join(REPO_ROOT, "target", "debug", "tendril-conformance-peer");
+const CLI_BIN = path.join(REPO_ROOT, "target", "debug", "tendril");
 const SERVER_SCRIPT = path.join(REPO_ROOT, "bindings", "web", "demo", "server.mjs");
 
 function findChrome() {
@@ -338,6 +339,20 @@ async function main() {
 
       const benchMain = await sdk.benchmarkArgon2(3, { useWorker: false });
       const benchWorker = await sdk.benchmarkArgon2(2, { useWorker: true });
+
+      const sampleId = '0'.repeat(64);
+      const parsedP2p = await sdk.parseP2pEndpoint('iroh://' + sampleId + '?relay=https://relay.example/');
+      if (parsedP2p.endpoint_id !== sampleId || parsedP2p.relays.length !== 1) {
+        throw new Error('parseP2pEndpoint valid mismatch: ' + JSON.stringify(parsedP2p));
+      }
+      let p2pBadRejected = false;
+      try {
+        await sdk.parseP2pEndpoint('https://not-iroh.example');
+      } catch {
+        p2pBadRejected = true;
+      }
+      if (!p2pBadRejected) throw new Error('invalid iroh URI was not rejected');
+
       return { benchMain, benchWorker };
     `);
 
@@ -456,6 +471,113 @@ async function main() {
     assert.equal(evClosed.event, "closed");
     await peer.call({ op: "shutdown" });
     console.log("CHROME_LIVE_RELAY_E2E_OK=true");
+
+    if (process.env.TENDRIL_WEB_P2P_LIVE === "1") {
+      assert.ok(fs.existsSync(CLI_BIN), `missing tendril binary at ${CLI_BIN}`);
+      const p2pHostDir = fs.mkdtempSync(path.join(os.tmpdir(), "tendril-web-p2p-host-"));
+      execFileSync(CLI_BIN, ["--state-dir", p2pHostDir, "init", "--host-id", "web-p2p-host"], {
+        stdio: "pipe",
+      });
+      const serveChild = spawn(
+        CLI_BIN,
+        ["--state-dir", p2pHostDir, "serve", "--p2p", "--issue-code", "remote"],
+        { stdio: ["ignore", "pipe", "pipe"] }
+      );
+      const serveRl = readline.createInterface({ input: serveChild.stdout });
+      const serveLines = [];
+      const serveWaiters = [];
+      serveRl.on("line", (line) => {
+        const obj = JSON.parse(line);
+        if (serveWaiters.length > 0) serveWaiters.shift()(obj);
+        else serveLines.push(obj);
+      });
+      const nextServeEvent = (timeoutMs = 20000) => {
+        if (serveLines.length > 0) return Promise.resolve(serveLines.shift());
+        return new Promise((resolve, reject) => {
+          const t = setTimeout(
+            () => reject(new Error("timed out waiting for tendril serve stdout event")),
+            timeoutMs
+          );
+          serveWaiters.push((obj) => {
+            clearTimeout(t);
+            resolve(obj);
+          });
+        });
+      };
+
+      try {
+        const listening = await nextServeEvent(15000);
+        assert.equal(listening.event, "listening");
+        const bareP2p = listening.p2p_endpoint.split("?")[0];
+        assert.ok(bareP2p.startsWith("iroh://"), `missing iroh endpoint: ${listening.p2p_endpoint}`);
+
+        const p2pPairPromise = cdp.evalAsync(`
+          window.__p2pClient = await window.__e2eSdk.TendrilWebClient.create({ hostId: 'chrome-p2p' });
+          return await window.__p2pClient.pair({
+            endpoint: ${JSON.stringify(bareP2p)},
+            code: ${JSON.stringify(listening.pairing_code)},
+            deviceName: 'chrome-iroh',
+            deviceKind: 'web',
+            timeoutMs: 25000,
+          });
+        `);
+        const [p2pBrowserPair, p2pServerPair] = await Promise.all([
+          p2pPairPromise,
+          nextServeEvent(25000),
+        ]);
+        assert.equal(p2pServerPair.event, "paired");
+        assert.equal(p2pBrowserPair.sas, p2pServerPair.sas);
+
+        execFileSync(
+          CLI_BIN,
+          ["--state-dir", p2pHostDir, "confirm", p2pBrowserPair.device_id, "--sas", p2pBrowserPair.sas],
+          { stdio: "pipe" }
+        );
+        const p2pGrant = execFileSync(
+          CLI_BIN,
+          ["--state-dir", p2pHostDir, "mint", p2pBrowserPair.device_id, "--cap", "fs.read"],
+          { encoding: "utf8" }
+        ).trim();
+
+        const connInfo = await cdp.evalAsync(`
+          const sess = await window.__p2pClient.connect({
+            endpoint: ${JSON.stringify(bareP2p)},
+            targetHostId: 'web-p2p-host',
+            grantJson: ${JSON.stringify(p2pGrant)},
+            timeoutMs: 25000,
+          });
+          await sess.ping(77);
+          let gotPong = false;
+          for (let i = 0; i < 4; i += 1) {
+            const ev = await sess.pollEvent(2000);
+            if (ev.event === 'pong' && ev.cookie === 77) { gotPong = true; break; }
+          }
+          await sess.rekey();
+          await sess.sendData('hello-from-chrome-iroh');
+          const pendingClose = sess.pollEvent(3000);
+          await sess.close(1000, 'done');
+          const closeRes = await pendingClose;
+          window.__p2pClient.free();
+          return { established: true, gotPong, closeStatus: closeRes.status };
+        `);
+        assert.equal(connInfo.gotPong, true);
+        assert.equal(connInfo.closeStatus, "eof");
+
+        const p2pEst = await nextServeEvent(10000);
+        assert.equal(p2pEst.event, "session_established");
+        assert.equal(p2pEst.provider, "P2p");
+        const p2pData = await nextServeEvent(10000);
+        assert.equal(p2pData.event, "data");
+        assert.equal(p2pData.utf8, "hello-from-chrome-iroh");
+        const p2pClosed = await nextServeEvent(10000);
+        assert.equal(p2pClosed.event, "closed");
+        console.log("CHROME_LIVE_IROH_P2P_E2E_OK=true");
+      } finally {
+        serveRl.close();
+        serveChild.kill();
+        fs.rmSync(p2pHostDir, { recursive: true, force: true });
+      }
+    }
   } finally {
     if (cdp) {
       try {
