@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use snow::params::NoiseParams;
 use snow::{HandshakeState, TransportState};
@@ -9,8 +10,8 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{
     CODE_ALPHABET, b64url_decode_array, b64url_encode, compute_code_mac, device_id,
-    fingerprint_device, is_valid_ed25519_public_key, is_valid_x25519_public_key, new_noise_builder,
-    pairing_sas, random_bytes, verify_code_mac,
+    fingerprint_device, has_control_chars, is_valid_ed25519_public_key, is_valid_x25519_public_key,
+    new_noise_builder, pairing_sas, random_bytes, verify_code_mac,
 };
 use crate::error::CoreError;
 use crate::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
@@ -338,6 +339,11 @@ impl PairingUri {
             let (k, v) = pair
                 .split_once('=')
                 .ok_or_else(|| CoreError::InvalidPairingUri("malformed query pair".into()))?;
+            if !matches!(k, "v" | "host" | "code" | "k" | "s" | "id" | "seq" | "ep") {
+                return Err(CoreError::InvalidPairingUri(format!(
+                    "unknown query parameter {k}"
+                )));
+            }
             if params.insert(k, v).is_some() {
                 return Err(CoreError::InvalidPairingUri(format!(
                     "duplicate query parameter {k}"
@@ -354,12 +360,19 @@ impl PairingUri {
             .get("host")
             .ok_or_else(|| CoreError::InvalidPairingUri("missing host parameter".into()))?;
         let host_name = pct_decode(host_raw)?;
+        if host_name.is_empty() || has_control_chars(&host_name) {
+            return Err(CoreError::InvalidPairingUri(
+                "invalid or empty host parameter".into(),
+            ));
+        }
         let code_raw = params
             .get("code")
             .ok_or_else(|| CoreError::InvalidPairingUri("missing code parameter".into()))?;
         let code = pct_decode(code_raw)?;
-        if code.is_empty() {
-            return Err(CoreError::InvalidPairingUri("empty code".into()));
+        if has_control_chars(&code) || !is_valid_pairing_code_format(&code) {
+            return Err(CoreError::InvalidPairingUri(
+                "invalid pairing code format".into(),
+            ));
         }
 
         let k_raw = params
@@ -386,8 +399,8 @@ impl PairingUri {
             None => None,
             Some(id_raw) => {
                 let dec = pct_decode(id_raw)?;
-                if dec.is_empty() {
-                    return Err(CoreError::InvalidPairingUri("empty id parameter".into()));
+                if dec.is_empty() || has_control_chars(&dec) {
+                    return Err(CoreError::InvalidPairingUri("invalid id parameter".into()));
                 }
                 Some(dec)
             }
@@ -412,9 +425,12 @@ impl PairingUri {
                 let mut list = Vec::new();
                 for part in ep_raw.split(',') {
                     let dec = pct_decode(part)?;
-                    if dec.is_empty() {
+                    if dec.is_empty()
+                        || has_control_chars(&dec)
+                        || !is_valid_pairing_endpoint_hint(&dec)
+                    {
                         return Err(CoreError::InvalidPairingUri(
-                            "empty endpoint in ep list".into(),
+                            "invalid endpoint in ep list".into(),
                         ));
                     }
                     list.push(dec);
@@ -433,6 +449,213 @@ impl PairingUri {
             rotation_seq,
         })
     }
+}
+
+fn is_valid_pairing_code_format(code: &str) -> bool {
+    let mut parts = code.split('-');
+    if parts.next() != Some("TND") {
+        return false;
+    }
+    let groups: Vec<&str> = parts.collect();
+    if !matches!(groups.len(), 2 | 3) {
+        return false;
+    }
+    groups.iter().all(|g| {
+        g.len() == 4
+            && g.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    })
+}
+
+fn is_disallowed_hint_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified() || v4.is_multicast(),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_disallowed_hint_ip(IpAddr::V4(mapped));
+            }
+            let seg = v6.segments();
+            let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
+            let is_aws_metadata = v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+            is_link_local || is_aws_metadata || v6.is_unspecified() || v6.is_multicast()
+        }
+    }
+}
+
+fn is_loopback_authority_host(host: &str) -> bool {
+    let clean = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if clean.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    clean.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn is_valid_url_hint(url: &str, secure_scheme: &str, loopback_scheme: &str) -> bool {
+    if url
+        .bytes()
+        .any(|b| b < 0x20 || b == 0x7f || b.is_ascii_whitespace())
+        || url.contains('#')
+    {
+        return false;
+    }
+    let (is_insecure, rest) = if let Some(r) = url.strip_prefix(secure_scheme) {
+        (false, r)
+    } else if let Some(r) = url.strip_prefix(loopback_scheme) {
+        (true, r)
+    } else {
+        return false;
+    };
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let (host, port_opt) = if let Some(bracket_rest) = authority.strip_prefix('[') {
+        let Some((inner, after)) = bracket_rest.split_once(']') else {
+            return false;
+        };
+        if inner.parse::<Ipv6Addr>().is_err() {
+            return false;
+        }
+        let port_str = after.strip_prefix(':');
+        if !after.is_empty() && port_str.is_none() {
+            return false;
+        }
+        (authority.split(']').next().unwrap_or(authority), port_str)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        if h.contains(':') {
+            return false;
+        }
+        (h, Some(p))
+    } else {
+        (authority, None)
+    };
+    if let Some(p) = port_opt
+        && p.parse::<u16>().ok().filter(|&n| n > 0).is_none()
+    {
+        return false;
+    }
+    let bare_host = host.strip_prefix('[').unwrap_or(host);
+    if bare_host.is_empty()
+        || (!bare_host.contains(':')
+            && !bare_host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')))
+    {
+        return false;
+    }
+    if let Ok(ip) = bare_host.parse::<IpAddr>()
+        && is_disallowed_hint_ip(ip)
+    {
+        return false;
+    }
+    if is_insecure && !is_loopback_authority_host(bare_host) {
+        return false;
+    }
+    true
+}
+
+fn is_valid_host_port_hint(target: &str) -> bool {
+    if target.is_empty()
+        || target
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || b.is_ascii_whitespace())
+    {
+        return false;
+    }
+    if let Ok(sock) = target.parse::<SocketAddr>() {
+        return sock.port() > 0 && !is_disallowed_hint_ip(sock.ip());
+    }
+    let Some((host, port_str)) = target.rsplit_once(':') else {
+        return false;
+    };
+    if host.is_empty()
+        || host.contains([':', '/', '?', '#', '@'])
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return false;
+    }
+    port_str.parse::<u16>().ok().filter(|&n| n > 0).is_some()
+}
+
+fn is_valid_pairing_endpoint_hint(ep: &str) -> bool {
+    if ep.is_empty()
+        || ep
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || b.is_ascii_whitespace())
+        || ep.contains('@')
+    {
+        return false;
+    }
+    if let Some(ws) = ep.strip_prefix("relay:") {
+        return is_valid_url_hint(ws, "wss://", "ws://");
+    }
+    if ep.starts_with("wss://") || ep.starts_with("ws://") {
+        return is_valid_url_hint(ep, "wss://", "ws://");
+    }
+    if let Some(broker_ws) = ep.strip_prefix("broker+") {
+        return is_valid_url_hint(broker_ws, "wss://", "ws://");
+    }
+    if let Some(direct) = ep.strip_prefix("direct:") {
+        return is_valid_host_port_hint(direct);
+    }
+    if let Some(local) = ep
+        .strip_prefix("local:")
+        .or_else(|| ep.strip_prefix("unix://"))
+    {
+        return !local.is_empty() && !local.contains(['?', '#']);
+    }
+    if let Some(overlay) = ep.strip_prefix("overlay://") {
+        if overlay.is_empty() || overlay.contains(['?', '#']) {
+            return false;
+        }
+        return overlay
+            .parse::<SocketAddr>()
+            .map_or(true, |s| s.port() > 0 && !is_disallowed_hint_ip(s.ip()));
+    }
+    let iroh_cand = ep.strip_prefix("p2p:").unwrap_or(ep);
+    if let Some(rest) = iroh_cand.strip_prefix("iroh://") {
+        if rest.contains('#') {
+            return false;
+        }
+        let (node_id, query) = rest.split_once('?').unwrap_or((rest, ""));
+        if node_id.is_empty()
+            || !node_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return false;
+        }
+        if !query.is_empty() {
+            for pair in query.split('&') {
+                let Some((k, v)) = pair.split_once('=') else {
+                    return false;
+                };
+                match k {
+                    "addr" => {
+                        let Ok(sock) = v.parse::<SocketAddr>() else {
+                            return false;
+                        };
+                        if sock.port() == 0 || is_disallowed_hint_ip(sock.ip()) {
+                            return false;
+                        }
+                    }
+                    "relay" => {
+                        if !is_valid_url_hint(v, "https://", "http://") {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        return true;
+    }
+    is_valid_host_port_hint(ep)
 }
 
 fn pct_encode(input: &str) -> String {
@@ -683,7 +906,7 @@ impl PairingInitiator {
         let phase = std::mem::replace(&mut self.phase, InitiatorPhase::Closed);
         match phase {
             InitiatorPhase::AwaitMsg2(mut hs) => {
-                let mut pt = vec![0u8; MAX_FRAME_LEN];
+                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
                 let n_pt = hs
                     .read_message(body, &mut pt)
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
@@ -691,6 +914,9 @@ impl PairingInitiator {
                     .map_err(|err| CoreError::Json(err.to_string()))?;
                 if host_hello.proto_version != 1 {
                     return Err(CoreError::UnsupportedVersion(host_hello.proto_version));
+                }
+                if host_hello.host_id.is_empty() || has_control_chars(&host_hello.host_id) {
+                    return Err(CoreError::ProtocolViolation("invalid host_id in HostHello"));
                 }
 
                 let remote_static: [u8; 32] = hs
@@ -774,8 +1000,9 @@ impl PairingInitiator {
                     kind: self.device_kind.clone(),
                     code_mac: b64url_encode(&mac),
                 };
-                let claim_json =
-                    serde_json::to_vec(&claim).map_err(|err| CoreError::Json(err.to_string()))?;
+                let claim_json = Zeroizing::new(
+                    serde_json::to_vec(&claim).map_err(|err| CoreError::Json(err.to_string()))?,
+                );
                 let mut msg3 = vec![0u8; MAX_FRAME_LEN];
                 let n3 = hs
                     .write_message(&claim_json, &mut msg3)
@@ -808,7 +1035,7 @@ impl PairingInitiator {
                 pairing_sas,
                 host_pin_verified,
             } => {
-                let mut pt = vec![0u8; MAX_FRAME_LEN];
+                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
                 let n = transport
                     .read_message(body, &mut pt)
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
@@ -1020,7 +1247,7 @@ impl PairingResponder {
         let phase = std::mem::replace(&mut self.phase, ResponderPhase::Closed);
         match phase {
             ResponderPhase::AwaitMsg1(mut hs) => {
-                let mut pt = vec![0u8; MAX_FRAME_LEN];
+                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
                 let n = hs
                     .read_message(body, &mut pt)
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
@@ -1030,8 +1257,10 @@ impl PairingResponder {
                     ));
                 }
 
-                let hello_json = serde_json::to_vec(&self.host_hello)
-                    .map_err(|err| CoreError::Json(err.to_string()))?;
+                let hello_json = Zeroizing::new(
+                    serde_json::to_vec(&self.host_hello)
+                        .map_err(|err| CoreError::Json(err.to_string()))?,
+                );
                 let mut msg2 = vec![0u8; MAX_FRAME_LEN];
                 let n2 = hs
                     .write_message(&hello_json, &mut msg2)
@@ -1049,7 +1278,7 @@ impl PairingResponder {
                 mut hs,
                 post_msg2_hash,
             } => {
-                let mut pt = vec![0u8; MAX_FRAME_LEN];
+                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
                 let n_pt = hs
                     .read_message(body, &mut pt)
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
@@ -1080,6 +1309,8 @@ impl PairingResponder {
                     || claim.kind.is_empty()
                     || claim.name.len() > 256
                     || claim.kind.len() > 64
+                    || has_control_chars(&claim.name)
+                    || has_control_chars(&claim.kind)
                 {
                     return write_pair_error(&mut transport, "protocol_error", actions);
                 }
@@ -1118,8 +1349,9 @@ impl PairingResponder {
                     status: "pending".to_string(),
                     host_signing_pub: b64url_encode(&self.host_signing_pub),
                 };
-                let resp_json =
-                    serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?;
+                let resp_json = Zeroizing::new(
+                    serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?,
+                );
                 let mut out_ct = vec![0u8; MAX_FRAME_LEN];
                 let n_ct = transport
                     .write_message(&resp_json, &mut out_ct)
@@ -1157,7 +1389,8 @@ fn write_pair_error(
     let resp = PairResponse::Error {
         error: error_code.to_string(),
     };
-    let resp_json = serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?;
+    let resp_json =
+        Zeroizing::new(serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?);
     let mut out_ct = vec![0u8; MAX_FRAME_LEN];
     let n_ct = transport
         .write_message(&resp_json, &mut out_ct)

@@ -5,6 +5,8 @@ use std::fmt;
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chacha20poly1305::aead::{AeadInPlace, KeyInit as AeadKeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hmac::{Hmac, KeyInit, Mac};
@@ -15,7 +17,7 @@ use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::types::{Cipher, Dh, Hash, Random};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::CoreError;
 
@@ -93,53 +95,181 @@ pub fn is_valid_ed25519_public_key(pub_bytes: &[u8; 32]) -> bool {
         && VerifyingKey::from_bytes(pub_bytes).is_ok_and(|vk| !vk.is_weak())
 }
 
-struct ContributoryDh {
-    inner: Box<dyn Dh>,
+#[derive(Default, Zeroize, ZeroizeOnDrop)]
+struct ZeroizingCurve25519Dh {
+    privkey: [u8; 32],
+    #[zeroize(skip)]
+    pubkey: [u8; 32],
 }
 
-impl Dh for ContributoryDh {
+impl Dh for ZeroizingCurve25519Dh {
     fn name(&self) -> &'static str {
-        self.inner.name()
+        "25519"
     }
 
     fn pub_len(&self) -> usize {
-        self.inner.pub_len()
+        32
     }
 
     fn priv_len(&self) -> usize {
-        self.inner.priv_len()
+        32
     }
 
     fn set(&mut self, privkey: &[u8]) {
-        self.inner.set(privkey);
+        self.privkey.zeroize();
+        let take = privkey.len().min(32);
+        self.privkey[..take].copy_from_slice(&privkey[..take]);
+        self.pubkey = x25519_public_from_scalar(&self.privkey);
     }
 
     fn generate(&mut self, rng: &mut dyn Random) -> Result<(), snow::Error> {
-        self.inner.generate(rng)
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        rng.try_fill_bytes(&mut *bytes)?;
+        self.set(&*bytes);
+        Ok(())
     }
 
     fn pubkey(&self) -> &[u8] {
-        self.inner.pubkey()
+        &self.pubkey
     }
 
     fn privkey(&self) -> &[u8] {
-        self.inner.privkey()
+        &self.privkey
     }
 
     fn dh(&self, pubkey: &[u8], out: &mut [u8]) -> Result<(), snow::Error> {
         if pubkey.len() < 32 || out.len() < 32 {
             return Err(snow::Error::Input);
         }
-        self.inner.dh(pubkey, out)?;
-        if bool::from(out[..32].ct_eq(&[0u8; 32])) {
+        let mut peer_bytes = [0u8; 32];
+        peer_bytes.copy_from_slice(&pubkey[..32]);
+        let secret = X25519StaticSecret::from(self.privkey);
+        let shared = secret.diffie_hellman(&X25519PublicKey::from(peer_bytes));
+        if !shared.was_contributory() || bool::from(shared.as_bytes().ct_eq(&[0u8; 32])) {
             out[..32].zeroize();
             return Err(snow::Error::Dh);
         }
+        out[..32].copy_from_slice(shared.as_bytes());
         Ok(())
     }
 
     fn dh_len(&self) -> usize {
-        self.inner.dh_len()
+        32
+    }
+}
+
+#[derive(Default, Zeroize, ZeroizeOnDrop)]
+struct ZeroizingChaChaPoly {
+    key: [u8; 32],
+}
+
+impl Cipher for ZeroizingChaChaPoly {
+    fn name(&self) -> &'static str {
+        "ChaChaPoly"
+    }
+
+    fn set(&mut self, key: &[u8; 32]) {
+        self.key.zeroize();
+        self.key.copy_from_slice(key);
+    }
+
+    fn encrypt(&self, nonce: u64, authtext: &[u8], plaintext: &[u8], out: &mut [u8]) -> usize {
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..].copy_from_slice(&nonce.to_le_bytes());
+        out[..plaintext.len()].copy_from_slice(plaintext);
+        let aead = ChaCha20Poly1305::new((&self.key).into());
+        let tag = aead
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&nonce_bytes),
+                authtext,
+                &mut out[..plaintext.len()],
+            )
+            .expect("ChaChaPoly encryption within Noise frame bounds");
+        out[plaintext.len()..plaintext.len() + 16].copy_from_slice(tag.as_slice());
+        plaintext.len() + tag.len()
+    }
+
+    fn decrypt(
+        &self,
+        nonce: u64,
+        authtext: &[u8],
+        ciphertext: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, snow::Error> {
+        let Some(msg_len) = ciphertext.len().checked_sub(16) else {
+            return Err(snow::Error::Decrypt);
+        };
+        if out.len() < msg_len {
+            return Err(snow::Error::Input);
+        }
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..].copy_from_slice(&nonce.to_le_bytes());
+        out[..msg_len].copy_from_slice(&ciphertext[..msg_len]);
+        let aead = ChaCha20Poly1305::new((&self.key).into());
+        if aead
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce_bytes),
+                authtext,
+                &mut out[..msg_len],
+                Tag::from_slice(&ciphertext[msg_len..]),
+            )
+            .is_err()
+        {
+            out[..msg_len].zeroize();
+            return Err(snow::Error::Decrypt);
+        }
+        Ok(msg_len)
+    }
+
+    fn rekey(&mut self) {
+        let mut out = Zeroizing::new([0u8; 48]);
+        let len = self.encrypt(u64::MAX, &[], &[0u8; 32], &mut out[..]);
+        debug_assert_eq!(len, 48);
+        self.key.zeroize();
+        self.key.copy_from_slice(&out[..32]);
+    }
+}
+
+#[derive(Default)]
+struct ZeroizingSha256 {
+    hasher: Sha256,
+}
+
+impl Drop for ZeroizingSha256 {
+    fn drop(&mut self) {
+        let _: &dyn ZeroizeOnDrop = &self.hasher;
+    }
+}
+
+impl ZeroizeOnDrop for ZeroizingSha256 {}
+
+impl Hash for ZeroizingSha256 {
+    fn block_len(&self) -> usize {
+        64
+    }
+
+    fn hash_len(&self) -> usize {
+        32
+    }
+
+    fn name(&self) -> &'static str {
+        "SHA256"
+    }
+
+    fn reset(&mut self) {
+        self.hasher = Sha256::default();
+    }
+
+    fn input(&mut self, data: &[u8]) {
+        self.hasher.update(data);
+    }
+
+    fn result(&mut self, out: &mut [u8]) {
+        let mut digest = Zeroizing::new([0u8; 32]);
+        digest.copy_from_slice(&self.hasher.finalize_reset());
+        let take = out.len().min(32);
+        out[..take].copy_from_slice(&digest[..take]);
+        self.reset();
     }
 }
 
@@ -151,23 +281,28 @@ impl CryptoResolver for TendrilCryptoResolver {
     }
 
     fn resolve_dh(&self, choice: &DHChoice) -> Option<Box<dyn Dh>> {
-        let inner = DefaultResolver.resolve_dh(choice)?;
         match choice {
-            DHChoice::Curve25519 => Some(Box::new(ContributoryDh { inner })),
-            _ => Some(inner),
+            DHChoice::Curve25519 => Some(Box::new(ZeroizingCurve25519Dh::default())),
+            _ => DefaultResolver.resolve_dh(choice),
         }
     }
 
     fn resolve_hash(&self, choice: &HashChoice) -> Option<Box<dyn Hash>> {
-        DefaultResolver.resolve_hash(choice)
+        match choice {
+            HashChoice::SHA256 => Some(Box::new(ZeroizingSha256::default())),
+            _ => DefaultResolver.resolve_hash(choice),
+        }
     }
 
     fn resolve_cipher(&self, choice: &CipherChoice) -> Option<Box<dyn Cipher>> {
-        DefaultResolver.resolve_cipher(choice)
+        match choice {
+            CipherChoice::ChaChaPoly => Some(Box::new(ZeroizingChaChaPoly::default())),
+            _ => DefaultResolver.resolve_cipher(choice),
+        }
     }
 }
 
-/// Builds a `snow` handshake builder enforcing RFC 7748 contributory X25519 DH checks.
+/// Builds a `snow` handshake builder enforcing RFC 7748 contributory DH and zeroizing primitives.
 #[must_use]
 pub(crate) fn new_noise_builder(params: NoiseParams) -> Builder<'static> {
     Builder::with_resolver(params, Box::new(TendrilCryptoResolver))
@@ -431,6 +566,12 @@ pub fn hkdf_sha256_32(ikm: &[u8], salt: &[u8], info: &[u8]) -> Zeroizing<[u8; 32
     expand.update(info);
     expand.update(&[0x01u8]);
     Zeroizing::new(expand.finalize().into_bytes().into())
+}
+
+/// Reports whether `s` contains ASCII control bytes (`0x00..=0x1F` or `0x7F`).
+#[must_use]
+pub(crate) fn has_control_chars(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
 #[cfg(test)]

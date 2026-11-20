@@ -41,7 +41,7 @@ Capability `granted` covers `requested` if and only if:
    - If `granted.resource` is `Some(prefix + "*")`: `requested.resource` MUST be `Some(r)`:
      - When `requested` is a concrete action (no trailing `'*'`), `r` MUST start with `prefix`.
      - When `requested` is itself a delegated wildcard `req_prefix + "*"`, `req_prefix` MUST start with `prefix`.
-- Resource matching operates on opaque ASCII strings; path-scoped applications MUST canonicalize paths (resolving `.`, `..`, and duplicate separators) before authorization checks.
+- Resource matching operates on opaque ASCII strings; path-scoped applications MUST canonicalize paths (resolving `.`, `..`, and duplicate separators) before authorization checks. `tendril-core` exposes `canonicalize_capability_path`, `Capability::covers_path`, `authorize_path_capability`, and `SessionMachine::authorize_path` to enforce leading `/`, reject control characters/backslashes/empty or dot segments/`//`/trailing slashes, and match prefix wildcards at `/` segment boundaries (`/public*` and `/public/*` never cover `/public_secrets/key.pem`).
 
 ---
 

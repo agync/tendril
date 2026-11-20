@@ -81,6 +81,122 @@ impl Capability {
             _ => false,
         }
     }
+
+    /// Reports whether `self` covers `requested` under canonical path and segment-boundary rules.
+    ///
+    /// Both resources must be valid paths passing [`canonicalize_capability_path`] (with an
+    /// optional trailing `*` on prefixes), preventing traversal (`..`, `//`) and partial-segment
+    /// confusion (`/public*` never matches `/public_secrets/key.pem`).
+    #[must_use]
+    pub fn covers_path(&self, requested: &Self) -> bool {
+        if self.namespace != requested.namespace || self.verb != requested.verb {
+            return false;
+        }
+        let (Some(granted_res), Some(req_res)) = (&self.resource, &requested.resource) else {
+            return false;
+        };
+        if granted_res == "/*" {
+            return if let Some(req_prefix) = req_res.strip_suffix('*') {
+                parse_path_prefix(req_prefix).is_ok()
+            } else {
+                canonicalize_capability_path(req_res).is_ok()
+            };
+        }
+
+        match granted_res.strip_suffix('*') {
+            None => {
+                let (Ok(canon_g), Ok(canon_r)) = (
+                    canonicalize_capability_path(granted_res),
+                    canonicalize_capability_path(req_res),
+                ) else {
+                    return false;
+                };
+                canon_g == canon_r
+            }
+            Some(granted_prefix) => {
+                let Ok((canon_dir, requires_child_slash)) = parse_path_prefix(granted_prefix)
+                else {
+                    return false;
+                };
+                match req_res.strip_suffix('*') {
+                    None => {
+                        let Ok(canon_r) = canonicalize_capability_path(req_res) else {
+                            return false;
+                        };
+                        path_matches_segment_prefix(&canon_dir, requires_child_slash, &canon_r)
+                    }
+                    Some(req_prefix) => {
+                        let Ok((req_dir, req_requires_child)) = parse_path_prefix(req_prefix)
+                        else {
+                            return false;
+                        };
+                        if req_dir == canon_dir {
+                            return !requires_child_slash || req_requires_child;
+                        }
+                        path_is_strict_child_of(&canon_dir, &req_dir)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Canonicalizes a path capability resource, rejecting empty strings, relative paths, control
+/// characters, wildcards, backslashes, duplicate slashes, dot segments, and trailing slashes
+/// (except root `"/"`).
+pub fn canonicalize_capability_path(raw: &str) -> Result<String, CoreError> {
+    if !raw.starts_with('/')
+        || raw.is_empty()
+        || raw.bytes().any(|b| b < 0x20 || b == 0x7f)
+        || raw.contains('\\')
+        || raw.contains('*')
+        || raw.contains("//")
+    {
+        return Err(CoreError::InvalidCapability(format!("unsafe path '{raw}'")));
+    }
+    if raw == "/" {
+        return Ok("/".to_string());
+    }
+    if raw.ends_with('/') {
+        return Err(CoreError::InvalidCapability(format!(
+            "trailing slash disallowed in path '{raw}'"
+        )));
+    }
+    for seg in raw[1..].split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(CoreError::InvalidCapability(format!(
+                "invalid path segment in '{raw}'"
+            )));
+        }
+    }
+    Ok(raw.to_string())
+}
+
+fn parse_path_prefix(prefix: &str) -> Result<(String, bool), CoreError> {
+    if prefix == "/" {
+        return Ok(("/".to_string(), false));
+    }
+    if let Some(dir) = prefix.strip_suffix('/') {
+        Ok((canonicalize_capability_path(dir)?, true))
+    } else {
+        Ok((canonicalize_capability_path(prefix)?, false))
+    }
+}
+
+fn path_is_strict_child_of(base: &str, candidate: &str) -> bool {
+    if base == "/" {
+        return candidate != "/" && candidate.starts_with('/');
+    }
+    candidate
+        .strip_prefix(base)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn path_matches_segment_prefix(base: &str, requires_child_slash: bool, target: &str) -> bool {
+    if target == base {
+        return !requires_child_slash;
+    }
+    path_is_strict_child_of(base, target)
 }
 
 impl fmt::Display for Capability {
@@ -526,6 +642,92 @@ pub fn authorize_grant<F>(
 where
     F: FnMut(&str) -> Option<[u8; 32]>,
 {
+    authorize_grant_inner(
+        grant,
+        expected_subject,
+        expected_root_issuer,
+        requested_cap,
+        false,
+        now_unix,
+        crl,
+        lookup_issuer_key,
+    )
+}
+
+/// Evaluates `grant` for a path-scoped action after strictly canonicalizing `raw_path` via
+/// [`canonicalize_capability_path`], enforcing segment boundaries via [`Capability::covers_path`].
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_path_capability<F>(
+    grant: Option<&Grant>,
+    expected_subject: &str,
+    expected_root_issuer: &str,
+    action: &str,
+    raw_path: &str,
+    now_unix: u64,
+    crl: Option<&RevocationList>,
+    lookup_issuer_key: F,
+) -> (Result<(), CoreError>, AuditEvent)
+where
+    F: FnMut(&str) -> Option<[u8; 32]>,
+{
+    let raw_display = format!("{action}:{raw_path}");
+    if action.contains(':') {
+        let err = CoreError::InvalidCapability(raw_display.clone());
+        return (
+            Err(err.clone()),
+            AuditEvent {
+                ts: now_unix,
+                subject: expected_subject.to_string(),
+                cap: raw_display,
+                grant_nonce: grant.map(|g| g.nonce.clone()),
+                allow: false,
+                reason: err.to_string(),
+            },
+        );
+    }
+    let canon = match canonicalize_capability_path(raw_path) {
+        Ok(p) => p,
+        Err(err) => {
+            return (
+                Err(err.clone()),
+                AuditEvent {
+                    ts: now_unix,
+                    subject: expected_subject.to_string(),
+                    cap: raw_display,
+                    grant_nonce: grant.map(|g| g.nonce.clone()),
+                    allow: false,
+                    reason: err.to_string(),
+                },
+            );
+        }
+    };
+    let req_cap = format!("{action}:{canon}");
+    authorize_grant_inner(
+        grant,
+        expected_subject,
+        expected_root_issuer,
+        &req_cap,
+        true,
+        now_unix,
+        crl,
+        lookup_issuer_key,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authorize_grant_inner<F>(
+    grant: Option<&Grant>,
+    expected_subject: &str,
+    expected_root_issuer: &str,
+    requested_cap: &str,
+    path_mode: bool,
+    now_unix: u64,
+    crl: Option<&RevocationList>,
+    lookup_issuer_key: F,
+) -> (Result<(), CoreError>, AuditEvent)
+where
+    F: FnMut(&str) -> Option<[u8; 32]>,
+{
     let deny = |err: CoreError, nonce: Option<String>| -> (Result<(), CoreError>, AuditEvent) {
         let audit = AuditEvent {
             ts: now_unix,
@@ -562,7 +764,12 @@ where
         Err(err) => return deny(err, nonce),
     };
 
-    match grant_allows(g, &req) {
+    let allowed_res = if path_mode {
+        grant_allows_path(g, &req)
+    } else {
+        grant_allows(g, &req)
+    };
+    match allowed_res {
         Ok(true) => (
             Ok(()),
             AuditEvent {
@@ -586,6 +793,13 @@ where
 pub fn grant_allows(grant: &Grant, requested: &Capability) -> Result<bool, CoreError> {
     let caps = parse_caps(&grant.caps)?;
     Ok(caps.iter().any(|c| c.covers(requested)))
+}
+
+/// Checks if a grant covers a path-scoped `requested` capability using canonical segment boundaries
+/// (without re-verifying signatures; run after [`verify_grant_with_chain`]).
+pub fn grant_allows_path(grant: &Grant, requested: &Capability) -> Result<bool, CoreError> {
+    let caps = parse_caps(&grant.caps)?;
+    Ok(caps.iter().any(|c| c.covers_path(requested)))
 }
 
 fn parse_caps(raw: &[String]) -> Result<Vec<Capability>, CoreError> {
@@ -1070,5 +1284,55 @@ mod tests {
         assert!(matches!(deny_res, Err(CoreError::GrantDenied(_))));
         assert!(!deny_audit.allow);
         assert_eq!(deny_audit.grant_nonce.as_deref(), Some("au_1"));
+    }
+
+    #[test]
+    fn sec24_canonical_path_and_segment_boundary_matching() {
+        for bad in [
+            "",
+            "photos/a.jpg",
+            "/photos/../etc/passwd",
+            "/photos/./a",
+            "/photos//a",
+            "/photos/",
+            "/photos\\secret",
+            "/photos/*",
+            "/a\0b",
+            "/a\nb",
+        ] {
+            assert!(
+                canonicalize_capability_path(bad).is_err(),
+                "expected invalid path for {bad:?}"
+            );
+        }
+        assert_eq!(canonicalize_capability_path("/").unwrap(), "/");
+        assert_eq!(
+            canonicalize_capability_path("/photos/a.jpg").unwrap(),
+            "/photos/a.jpg"
+        );
+
+        let public_prefix = Capability::parse("fs.read:/public*").unwrap();
+        let photos_dir = Capability::parse("fs.read:/photos/*").unwrap();
+        let root_wild = Capability::parse("fs.read:/*").unwrap();
+        let exact_dir = Capability::parse("fs.read:/photos").unwrap();
+
+        assert!(public_prefix.covers_path(&Capability::parse("fs.read:/public").unwrap()));
+        assert!(public_prefix.covers_path(&Capability::parse("fs.read:/public/a.txt").unwrap()));
+        assert!(public_prefix.covers_path(&Capability::parse("fs.read:/public/sub/*").unwrap()));
+        assert!(
+            !public_prefix
+                .covers_path(&Capability::parse("fs.read:/public_secrets/key.pem").unwrap())
+        );
+
+        assert!(photos_dir.covers_path(&Capability::parse("fs.read:/photos/a.jpg").unwrap()));
+        assert!(photos_dir.covers_path(&Capability::parse("fs.read:/photos/sub/b.jpg").unwrap()));
+        assert!(photos_dir.covers_path(&Capability::parse("fs.read:/photos/sub/*").unwrap()));
+        assert!(!photos_dir.covers_path(&Capability::parse("fs.read:/photos").unwrap()));
+        assert!(!photos_dir.covers_path(&Capability::parse("fs.read:/photos*").unwrap()));
+        assert!(!photos_dir.covers_path(&Capability::parse("fs.read:/photos_other/x").unwrap()));
+
+        assert!(root_wild.covers_path(&Capability::parse("fs.read:/anything/here").unwrap()));
+        assert!(exact_dir.covers_path(&Capability::parse("fs.read:/photos").unwrap()));
+        assert!(!exact_dir.covers_path(&Capability::parse("fs.read:/photos/a.jpg").unwrap()));
     }
 }

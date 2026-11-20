@@ -4,12 +4,17 @@ use std::fmt;
 
 use snow::params::NoiseParams;
 use snow::{HandshakeState, TransportState};
+use zeroize::Zeroizing;
 
 use crate::crypto::{
-    b64url_decode_array, device_id, is_valid_x25519_public_key, new_noise_builder,
+    b64url_decode_array, device_id, has_control_chars, is_valid_x25519_public_key,
+    new_noise_builder,
 };
 use crate::error::CoreError;
-use crate::grants::{AuditEvent, Grant, RevocationList, authorize_grant, verify_grant_with_chain};
+use crate::grants::{
+    AuditEvent, Grant, RevocationList, authorize_grant, authorize_path_capability,
+    verify_grant_with_chain,
+};
 use crate::identity::{EndpointIdentity, RotationRecord};
 use crate::roster::{PeerState, Roster};
 use crate::wire::{
@@ -322,7 +327,9 @@ impl SessionMachine {
         grant: &Grant,
         now_ms: u64,
     ) -> Result<Vec<SessionAction>, CoreError> {
-        let json = serde_json::to_vec(grant).map_err(|err| CoreError::Json(err.to_string()))?;
+        let json = Zeroizing::new(
+            serde_json::to_vec(grant).map_err(|err| CoreError::Json(err.to_string()))?,
+        );
         self.send_inner(InnerFrameType::Grant, &json, now_ms)
     }
 
@@ -332,7 +339,9 @@ impl SessionMachine {
         crl: &RevocationList,
         now_ms: u64,
     ) -> Result<Vec<SessionAction>, CoreError> {
-        let json = serde_json::to_vec(crl).map_err(|err| CoreError::Json(err.to_string()))?;
+        let json = Zeroizing::new(
+            serde_json::to_vec(crl).map_err(|err| CoreError::Json(err.to_string()))?,
+        );
         self.send_inner(InnerFrameType::Revocation, &json, now_ms)
     }
 
@@ -406,55 +415,88 @@ impl SessionMachine {
         now_unix: u64,
         roster: &Roster,
     ) -> (Result<(), CoreError>, AuditEvent) {
+        self.authorize_inner(requested_cap, None, now_unix, roster)
+    }
+
+    /// Authorizes path-scoped `action` on `raw_path` after strictly canonicalizing `raw_path`
+    /// and enforcing segment-boundary wildcards (default-deny).
+    pub fn authorize_path(
+        &self,
+        action: &str,
+        raw_path: &str,
+        now_unix: u64,
+        roster: &Roster,
+    ) -> (Result<(), CoreError>, AuditEvent) {
+        self.authorize_inner(action, Some(raw_path), now_unix, roster)
+    }
+
+    fn authorize_inner(
+        &self,
+        action_or_cap: &str,
+        raw_path: Option<&str>,
+        now_unix: u64,
+        roster: &Roster,
+    ) -> (Result<(), CoreError>, AuditEvent) {
         let peer_subj = self.peer_device_id.as_deref().unwrap_or("");
         let audit_subj = self.incoming_grant_subject().unwrap_or(peer_subj);
-        if !self.is_established() {
-            let err = CoreError::NotReady("session not established");
-            let audit = AuditEvent {
-                ts: now_unix,
-                subject: audit_subj.to_string(),
-                cap: requested_cap.to_string(),
-                grant_nonce: self.active_grant.as_ref().map(|g| g.nonce.clone()),
-                allow: false,
-                reason: err.to_string(),
-            };
-            return (Err(err), audit);
-        }
-        if let Err(err) = self.ensure_peer_active_in_roster(roster) {
-            let audit = AuditEvent {
-                ts: now_unix,
-                subject: audit_subj.to_string(),
-                cap: requested_cap.to_string(),
-                grant_nonce: self.active_grant.as_ref().map(|g| g.nonce.clone()),
-                allow: false,
-                reason: err.to_string(),
-            };
-            return (Err(err), audit);
-        }
-        let Ok(root_id) = self.authoritative_root_id() else {
-            let err = CoreError::NotReady("missing authoritative root");
-            return (
+        let audit_cap = match raw_path {
+            Some(path) => format!("{action_or_cap}:{path}"),
+            None => action_or_cap.to_string(),
+        };
+        let deny = |err: CoreError| -> (Result<(), CoreError>, AuditEvent) {
+            (
                 Err(err.clone()),
                 AuditEvent {
                     ts: now_unix,
                     subject: audit_subj.to_string(),
-                    cap: requested_cap.to_string(),
-                    grant_nonce: None,
+                    cap: audit_cap.clone(),
+                    grant_nonce: self.active_grant.as_ref().map(|g| g.nonce.clone()),
                     allow: false,
                     reason: err.to_string(),
+                },
+            )
+        };
+        if !self.is_established() {
+            return deny(CoreError::NotReady("session not established"));
+        }
+        if let Err(err) = self.ensure_peer_active_in_roster(roster) {
+            return deny(err);
+        }
+        let Ok(root_id) = self.authoritative_root_id() else {
+            return (
+                Err(CoreError::NotReady("missing authoritative root")),
+                AuditEvent {
+                    ts: now_unix,
+                    subject: audit_subj.to_string(),
+                    cap: audit_cap,
+                    grant_nonce: None,
+                    allow: false,
+                    reason: CoreError::NotReady("missing authoritative root").to_string(),
                 },
             );
         };
         let crl = roster.crl(root_id);
-        authorize_grant(
-            self.active_grant.as_ref(),
-            audit_subj,
-            root_id,
-            requested_cap,
-            now_unix,
-            crl,
-            |issuer| self.lookup_issuer_key(roster, issuer),
-        )
+        match raw_path {
+            Some(path) => authorize_path_capability(
+                self.active_grant.as_ref(),
+                audit_subj,
+                root_id,
+                action_or_cap,
+                path,
+                now_unix,
+                crl,
+                |issuer| self.lookup_issuer_key(roster, issuer),
+            ),
+            None => authorize_grant(
+                self.active_grant.as_ref(),
+                audit_subj,
+                root_id,
+                action_or_cap,
+                now_unix,
+                crl,
+                |issuer| self.lookup_issuer_key(roster, issuer),
+            ),
+        }
     }
 
     fn send_inner(
@@ -474,7 +516,7 @@ impl SessionMachine {
             return Err(CoreError::NotReady("session not in transport mode"));
         }
         // Validate and encode the requested frame BEFORE mutating outgoing rekey state.
-        let inner = encode_inner_frame(kind, payload)?;
+        let inner = Zeroizing::new(encode_inner_frame(kind, payload)?);
         let SessionPhase::Transport(ref mut tx) = self.phase else {
             return Err(CoreError::NotReady("session not in transport mode"));
         };
@@ -511,7 +553,7 @@ impl SessionMachine {
         let phase = std::mem::replace(&mut self.phase, SessionPhase::Closed);
         match phase {
             SessionPhase::AwaitMsg2(mut hs) => {
-                let mut pt = vec![0u8; MAX_FRAME_LEN];
+                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
                 let n = hs
                     .read_message(body, &mut pt)
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
@@ -519,6 +561,9 @@ impl SessionMachine {
                     .map_err(|err| CoreError::Json(err.to_string()))?;
                 if host_hello.proto_version != 1 {
                     return Err(CoreError::UnsupportedVersion(host_hello.proto_version));
+                }
+                if host_hello.host_id.is_empty() || has_control_chars(&host_hello.host_id) {
+                    return Err(CoreError::ProtocolViolation("invalid host_id in HostHello"));
                 }
 
                 let target_id = self
@@ -587,8 +632,9 @@ impl SessionMachine {
                     grant: self.initial_grant.clone(),
                     crl_seq: self.initial_crl_seq,
                 };
-                let hello_json =
-                    serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?;
+                let hello_json = Zeroizing::new(
+                    serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
+                );
                 let mut msg3 = vec![0u8; MAX_FRAME_LEN];
                 let n3 = hs
                     .write_message(&hello_json, &mut msg3)
@@ -615,7 +661,7 @@ impl SessionMachine {
                 Ok(())
             }
             SessionPhase::AwaitMsg1(mut hs) => {
-                let mut pt = vec![0u8; MAX_FRAME_LEN];
+                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
                 let n = hs
                     .read_message(body, &mut pt)
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
@@ -629,8 +675,9 @@ impl SessionMachine {
                     proto_version: 1,
                     rotation: self.local_rotation_chain.clone(),
                 };
-                let hello_json =
-                    serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?;
+                let hello_json = Zeroizing::new(
+                    serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
+                );
                 let mut msg2 = vec![0u8; MAX_FRAME_LEN];
                 let n2 = hs
                     .write_message(&hello_json, &mut msg2)
@@ -640,7 +687,7 @@ impl SessionMachine {
                 Ok(())
             }
             SessionPhase::AwaitMsg3(mut hs) => {
-                let mut pt = vec![0u8; MAX_FRAME_LEN];
+                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
                 let n = hs
                     .read_message(body, &mut pt)
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
@@ -709,16 +756,16 @@ impl SessionMachine {
                 Ok(())
             }
             SessionPhase::Transport(mut tx) => {
-                let mut pt = vec![0u8; MAX_FRAME_LEN];
+                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
                 let n = tx
                     .read_message(body, &mut pt)
                     .map_err(|err| CoreError::Noise(format!("{err}")))?;
                 let (kind, payload) = decode_inner_frame(&pt[..n])?;
-                let payload_owned = payload.to_vec();
+                let payload_owned = Zeroizing::new(payload.to_vec());
                 self.phase = SessionPhase::Transport(tx);
 
                 match kind {
-                    InnerFrameType::Data => actions.push(SessionAction::AppData(payload_owned)),
+                    InnerFrameType::Data => actions.push(SessionAction::AppData(payload.to_vec())),
                     InnerFrameType::Grant => {
                         let grant: Grant = serde_json::from_slice(&payload_owned)
                             .map_err(|err| CoreError::Json(err.to_string()))?;
@@ -919,7 +966,7 @@ fn encrypt_inner(
     kind: InnerFrameType,
     payload: &[u8],
 ) -> Result<Vec<u8>, CoreError> {
-    let inner = encode_inner_frame(kind, payload)?;
+    let inner = Zeroizing::new(encode_inner_frame(kind, payload)?);
     encrypt_encoded_inner(tx, &inner)
 }
 

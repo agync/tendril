@@ -13,6 +13,7 @@ pub mod roster;
 pub mod session;
 pub mod wire;
 
+pub use grants::{authorize_path_capability, canonicalize_capability_path};
 pub use wire::{
     AEAD_TAG_LEN, MAX_APP_DATA_LEN, MAX_FRAME_LEN, MAX_TRANSPORT_PLAINTEXT, NOISE_PATTERN,
     PREAMBLE_LEN, PREAMBLE_MAGIC, WIRE_VERSION,

@@ -2132,3 +2132,224 @@ fn batch1_sec01_manual_pairing_gates_on_client_sas_and_prevents_pin_hijack() {
     )
     .unwrap();
 }
+
+#[test]
+fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
+    use tendril_core::crypto::b64url_encode;
+    use tendril_core::grants::{GrantUnsigned, sign_grant};
+    use tendril_core::pairing::PairingUri;
+    use tendril_core::wire::{Intent, MAX_FRAME_LEN, PairClaim, Preamble};
+
+    // SEC-24: SessionMachine::authorize_path blocks traversal, double slashes, and segment spoofing.
+    let host = mk_identity(81);
+    let cli = mk_identity(82);
+    let mut host_roster = Roster::new();
+    let mut cli_roster = Roster::new();
+    host_roster
+        .record_pending_pair(
+            *cli.static_key().public_bytes(),
+            None,
+            "Cli".into(),
+            "cli".into(),
+            "sas".into(),
+        )
+        .unwrap();
+    host_roster.confirm_peer(&cli.device_id(), None).unwrap();
+    cli_roster
+        .insert_pinned_host(
+            host.host_id().to_string(),
+            "Host".into(),
+            *host.static_key().public_bytes(),
+            Some(*host.signing_key().public_bytes()),
+            0,
+            vec![],
+        )
+        .unwrap();
+
+    let grant = sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: host.host_id().to_string(),
+            subject: cli.device_id(),
+            caps: vec!["fs.read:/photos/*".into(), "fs.read:/public*".into()],
+            not_before: "2026-11-20T00:00:00Z".into(),
+            not_after: "2026-12-20T00:00:00Z".into(),
+            nonce: "pathnonce01".into(),
+            delegated_from: vec![],
+            uses: None,
+            machine: None,
+        },
+        &host.signing_key().signing_key(),
+    )
+    .unwrap();
+
+    let mut s_cli =
+        SessionMachine::new_initiator(&cli, host.host_id(), Some(grant), None, None).unwrap();
+    let mut s_srv = SessionMachine::new_responder(&host, None).unwrap();
+    connect_session(
+        &mut s_cli,
+        &mut s_srv,
+        &mut cli_roster,
+        &mut host_roster,
+        NOW_UNIX,
+        10,
+        128,
+    )
+    .unwrap();
+
+    assert!(
+        s_srv
+            .authorize_path("fs.read", "/photos/2026/a.jpg", NOW_UNIX, &host_roster)
+            .0
+            .is_ok()
+    );
+    assert!(
+        s_srv
+            .authorize_path("fs.read", "/public/readme.md", NOW_UNIX, &host_roster)
+            .0
+            .is_ok()
+    );
+    for denied in [
+        "/photos/../etc/passwd",
+        "/photos//a.jpg",
+        "/public_secrets/key.pem",
+        "/photos/",
+        "photos/a.jpg",
+    ] {
+        let (res, audit) = s_srv.authorize_path("fs.read", denied, NOW_UNIX, &host_roster);
+        assert!(res.is_err(), "expected denial for {denied}");
+        assert!(!audit.allow);
+    }
+
+    // SEC-28: End-to-end encrypted data & explicit rekey under Zeroizing CryptoResolver primitives.
+    let rekey_acts = s_cli.send_rekey(20).unwrap();
+    let mut rekey_wire = Vec::new();
+    for a in rekey_acts {
+        if let SessionAction::WriteBytes(b) = a {
+            rekey_wire.extend_from_slice(&b);
+        }
+    }
+    let srv_rekey_acts = s_srv
+        .feed_bytes(&rekey_wire, NOW_UNIX, 21, &mut host_roster)
+        .unwrap();
+    assert!(srv_rekey_acts.iter().any(|a| matches!(
+        a,
+        SessionAction::Rekeyed {
+            direction: RekeyDirection::Incoming
+        }
+    )));
+    let data_acts = s_cli.send_data(b"post-rekey secret", 22).unwrap();
+    let mut data_wire = Vec::new();
+    for a in data_acts {
+        if let SessionAction::WriteBytes(b) = a {
+            data_wire.extend_from_slice(&b);
+        }
+    }
+    let srv_data_acts = s_srv
+        .feed_bytes(&data_wire, NOW_UNIX, 23, &mut host_roster)
+        .unwrap();
+    assert!(srv_data_acts.iter().any(|a| match a {
+        SessionAction::AppData(d) => d == b"post-rekey secret",
+        _ => false,
+    }));
+
+    // SEC-29: PairingUri rejects unknown params, empty hosts, control chars, bad codes, and unsafe ep hints.
+    let k_b64 = b64url_encode(host.static_key().public_bytes());
+    let s_b64 = b64url_encode(host.signing_key().public_bytes());
+    for bad_uri in [
+        format!("tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&extra=1"),
+        format!("tendril://pair?v=1&host=&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}"),
+        format!("tendril://pair?v=1&host=h%1b[31m&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}"),
+        format!("tendril://pair?v=1&host=h&code=tnd-aaaa-bbbb&k={k_b64}&s={s_b64}"),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=javascript:alert(1)"
+        ),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=file:/etc/passwd"
+        ),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=relay:ws://evil.example/v1/relay"
+        ),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=direct:169.254.169.254:80"
+        ),
+        format!(
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=iroh://abc?relay=http://169.254.169.254"
+        ),
+    ] {
+        assert!(
+            PairingUri::parse(&bad_uri).is_err(),
+            "expected invalid PairingUri rejection for {bad_uri}"
+        );
+    }
+    let ok_uri = format!(
+        "tendril://pair?v=1&host=Studio&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=direct:192.168.1.50:7000,relay:wss://relay.example/v1/relay"
+    );
+    assert!(PairingUri::parse(&ok_uri).is_ok());
+
+    // SEC-29: PairingResponder rejects PairClaim carrying control / ANSI escape bytes.
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Lan2Group, NOW_UNIX)
+        .unwrap();
+    let mut p_resp = PairingResponder::new(&host, PairingPathKind::Lan, None).unwrap();
+    let mut hs_i = snow::Builder::new("Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap())
+        .local_private_key(cli.static_key().secret_bytes())
+        .unwrap()
+        .prologue(&Preamble::v1(Intent::Pair).encode())
+        .unwrap()
+        .build_initiator()
+        .unwrap();
+    let mut m1 = vec![0u8; MAX_FRAME_LEN];
+    let n1 = hs_i.write_message(&[], &mut m1).unwrap();
+    let mut w1 = Preamble::v1(Intent::Pair).encode().to_vec();
+    w1.extend_from_slice(&tendril_core::wire::encode_frame(&m1[..n1]).unwrap());
+    let r2 = p_resp
+        .feed_bytes(&w1, NOW_UNIX, &mut mgr, &mut host_roster)
+        .unwrap();
+    let f2 = match r2
+        .into_iter()
+        .find(|a| matches!(a, PairAction::WriteBytes(_)))
+    {
+        Some(PairAction::WriteBytes(b)) => b,
+        other => panic!("unexpected responder output: {other:?}"),
+    };
+    let mut reader = tendril_core::wire::ResumableFrameReader::new();
+    reader.push(&f2).unwrap();
+    let body2 = reader.next_frame().unwrap().unwrap();
+    let mut pt2 = vec![0u8; MAX_FRAME_LEN];
+    hs_i.read_message(&body2, &mut pt2).unwrap();
+    let h_pair: [u8; 32] = hs_i.get_handshake_hash().try_into().unwrap();
+    let mac = tendril_core::crypto::compute_code_mac(&code, &h_pair).unwrap();
+    let bad_claim = PairClaim {
+        name: "Evil\x1b[31mDevice".into(),
+        kind: "cli\n".into(),
+        code_mac: b64url_encode(&mac),
+    };
+    let mut m3 = vec![0u8; MAX_FRAME_LEN];
+    let n3 = hs_i
+        .write_message(&serde_json::to_vec(&bad_claim).unwrap(), &mut m3)
+        .unwrap();
+    let f3 = tendril_core::wire::encode_frame(&m3[..n3]).unwrap();
+    let mut tx_i = hs_i.into_transport_mode().unwrap();
+    let r3 = p_resp
+        .feed_bytes(&f3, NOW_UNIX, &mut mgr, &mut host_roster)
+        .unwrap();
+    let err_frame = match r3
+        .into_iter()
+        .find(|a| matches!(a, PairAction::WriteBytes(_)))
+    {
+        Some(PairAction::WriteBytes(b)) => b,
+        other => panic!("expected PairResponse::Error frame, got {other:?}"),
+    };
+    let mut er = tendril_core::wire::ResumableFrameReader::new();
+    er.push(&err_frame).unwrap();
+    let eb = er.next_frame().unwrap().unwrap();
+    let mut ept = vec![0u8; MAX_FRAME_LEN];
+    let ne = tx_i.read_message(&eb, &mut ept).unwrap();
+    assert!(
+        String::from_utf8_lossy(&ept[..ne]).contains("protocol_error"),
+        "expected protocol_error response, got {}",
+        String::from_utf8_lossy(&ept[..ne])
+    );
+}
