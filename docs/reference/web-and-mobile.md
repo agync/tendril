@@ -34,7 +34,7 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 ### `@tendril/web` (`bindings/web`)
 
 - `bindings/web/src/relay.js` implements the `spec/relay-v1.md` client WebSocket handshake (`challenge`, `dial`, `ready`) and binary frame bounds (`65,521` bytes max).
-- `bindings/web/src/iroh.js` lazy-loads `bindings/web/pkg-p2p/` on demand for `iroh://` endpoints (`dialIrohStream`, `parseP2pEndpoint`), keeping default page loads on the smaller sans-I/O bundle unless `iroh://` is used.
+- `bindings/web/src/index.js` dynamically imports `./iroh.js`, which in turn lazily imports `bindings/web/pkg-p2p/` on demand when `iroh://` or opt-in P2P helpers (`initTendrilP2p`, `parseP2pEndpoint`, `dialIrohStream`) are used, keeping default page loads strictly on the sans-I/O bundle without fetching P2P WASM or glue assets.
 - `bindings/web/src/worker.js` and `computeCodeMacWorker` move Argon2id pairing-code proof computation off the UI thread.
 - `bindings/web/demo/` provides an interactive pairing/session web page supporting both `wss://.../v1/relay` and `iroh://...` endpoints (`?endpoint=iroh://...` or `demo-config.json`), plus a Node HTTP/WebSocket `/v1/relay` reverse-proxy server (`server.mjs`) with zero third-party npm runtime dependencies.
 - `bindings/web/test/browser_e2e.mjs` runs all four helper `spec/vectors/` files, `parseP2pEndpoint` validation, and a live Noise handshake, encrypted data exchange, `rekey`, `ping`/`pong`, `authorize`, `revoke`, and `close` flow in headless Chrome against `tendril-relay` and `tendril-conformance-peer` (plus live `iroh://` browser-to-host E2E over n0 public relays when `TENDRIL_WEB_P2P_LIVE=1`).
@@ -49,15 +49,15 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 
 ## Apple Swift (`bindings/swift`)
 
-- `bindings/swift/Package.swift` declares `CTendril` (`module.modulemap` + `shim.h` referencing `crates/tendril-ffi/include/tendril.h`), the synchronized `Tendril` wrapper module (`TendrilCrypto`, `TendrilEndpoint`, `TendrilSession`, including `serveRelay`), `TendrilKeychainStore` (standalone Keychain + `CryptoKit` AES-GCM master-key sealing helper), and `TendrilTests` (offline vectors, fork rejection, and local endpoint lifecycle).
+- `bindings/swift/Package.swift` declares `CTendril` (`module.modulemap` + `shim.h` referencing `crates/tendril-ffi/include/tendril.h`), the synchronized `Tendril` wrapper module (`TendrilCrypto`, `TendrilEndpoint`, `TendrilSession`, including `serveDirect`, `serveRelay`, and `serveP2p`), `TendrilKeychainStore` (standalone Keychain + `CryptoKit` AES-GCM master-key sealing helper), and `TendrilTests` (offline vectors, fork rejection, and local endpoint lifecycle).
 - Verification note: SwiftPM compilation and `XCTest` execution (`TendrilConformanceTests.swift`) require Apple macOS/iOS toolchains and were not executed on Linux.
 
 ## Gate #7 baselines
 
 | Artifact | Target | Raw Size | Stripped / Compressed | Measurement Method |
 |---|---|---|---|---|
-| `bindings/web/pkg/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, default sans-I/O) | 782,671 bytes (764.3 KiB) | 293,229 bytes (286.4 KiB) gzipped | `wasm-bindgen --target web` after release build |
-| `bindings/web/pkg-p2p/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, `--features p2p-iroh`) | 4,111,913 bytes (3.92 MiB) | 1,522,618 bytes (1.45 MiB) gzipped | `wasm-bindgen --target web` after release build with `p2p-iroh` |
+| `bindings/web/pkg/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, default sans-I/O) | 782,671 bytes (764.3 KiB) | 292,452 bytes (285.6 KiB) gzipped | `wasm-bindgen --target web` + `gzip -c -9` |
+| `bindings/web/pkg-p2p/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, `--features p2p-iroh`) | 4,116,121 bytes (3.93 MiB) | 1,519,232 bytes (1.45 MiB) gzipped | `wasm-bindgen --target web` (`p2p-iroh`) + `gzip -c -9` |
 | `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26, `--no-default-features`) | 3,434,576 bytes | 3,434,248 bytes (3.28 MiB) stripped | `stat -c%s` before and after `llvm-strip` |
 | `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26, default `p2p-iroh`) | 12,291,992 bytes | 12,291,664 bytes (11.72 MiB) stripped | `stat -c%s` before and after `llvm-strip` |
 | `aarch64-apple-ios` static archive | `aarch64-apple-ios` | Not measured on Linux | Not measured on Linux | Requires Apple Xcode toolchain |

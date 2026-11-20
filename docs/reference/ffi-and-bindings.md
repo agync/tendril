@@ -52,7 +52,7 @@ Host app (Go / Python / Node.js)
 
 ### Python (`bindings/python`)
 
-- Exposes `Endpoint` (including `serve_direct`, `serve_relay`, `serve_p2p`, and unified `dial_endpoint` for `iroh://`, `overlay://`, `broker+ws(s)://`, `ws(s)://`, local, and direct targets), `Session`, `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, and `verify_grant_json` from `tendril`.
+- Exposes `Endpoint` (including `serve_direct`, `serve_relay`, `serve_p2p`, plus `pair_initiate` and `connect` delegating dialing internally to `tendril-runtime::dial_endpoint` for `iroh://`, `overlay://`, `broker+ws(s)://`, `ws(s)://`, local, and direct targets), `Session`, `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, and `verify_grant_json` from `tendril`.
 - `compute_code_mac` and all blocking, mutex-acquiring, or disk-persisting `Endpoint` and `Session` methods release the GIL via `py.detach`, verified by a multi-threaded heartbeat test during concurrent `compute_code_mac` Argon2 execution and concurrent handshake threads.
 
 ### Node.js (`bindings/node`)
@@ -66,10 +66,11 @@ Measured against stripped release builds (`lto = "thin"`, `codegen-units = 1`, `
 
 | Binding / Crate | Stripped Release Size | Per-Call FFI Overhead (`device_id`) | Measurement Method |
 |---|---|---|---|
-| `tendril-ffi` (`target/release/libtendril_ffi.so`) | 4,023,576 bytes (3.84 MiB) | Included via Go cgo measurement | `stat -c%s` on `libtendril_ffi.so` |
-| Go (`bindings/go`) | Links `libtendril_ffi.so` | 363.1 ns/op (`2,924,054` iterations in 1s) | `go test -run=^$ -bench=BenchmarkFFIOverhead -benchtime=1s` (`ldd` verified release library, including `runtime.LockOSThread`) |
-| Python (`bindings/python`, `lib_tendril.so`) | 4,274,248 bytes (4.08 MiB) | 255.2 ns/op (`100,000` calls in `0.0255s`) | `timeit` calling `tendril.device_id(k)` |
-| Node.js (`bindings/node`, `libtendril_node.so`) | 4,405,064 bytes (4.20 MiB) | 475.6 ns/op (`100,000` calls in `47.56ms`) | `performance.now()` calling `deviceId(k)` |
+| `tendril-ffi` (`--no-default-features`) | 4,052,248 bytes (3.86 MiB) | Core-only baseline | `stat -c%s` on `libtendril_ffi.so` built with `--no-default-features` |
+| `tendril-ffi` (default `p2p-iroh`) | 14,606,424 bytes (13.93 MiB) | Included via Go cgo baseline | `stat -c%s` on `target/release/libtendril_ffi.so` |
+| Go (`bindings/go`) | Links `libtendril_ffi.so` | 363.1 ns/op (`2,924,054` iterations in 1s) | Phase 3 `go test -run=^$ -bench=BenchmarkFFIOverhead -benchtime=1s` (`runtime.LockOSThread`) |
+| Python (`bindings/python`, `lib_tendril.so`, `p2p-iroh`) | 16,270,208 bytes (15.52 MiB) | 255.2 ns/op (`100,000` calls in `0.0255s`) | `stat -c%s` on release `.so`; Phase 3 `timeit` calling `tendril.device_id(k)` |
+| Node.js (`bindings/node`, `libtendril_node.so`, `p2p-iroh`) | 16,441,984 bytes (15.68 MiB) | 475.6 ns/op (`100,000` calls in `47.56ms`) | `stat -c%s` on release `.node`; Phase 3 `performance.now()` calling `deviceId(k)` |
 
 For mobile (`aarch64-linux-android`, Swift) and browser WASM bundle budgets and Argon2id timings, see [Web and mobile bindings](web-and-mobile.md).
 
