@@ -1252,7 +1252,7 @@ pub unsafe extern "C" fn tendril_session_send_data(
 /// Polls the next decrypted session event as JSON (`0=event`, `1=would_block`, `2=eof`).
 ///
 /// # Safety
-/// `sess` must be a valid mutable session pointer; `out_event_json` must be non-null when events are returned.
+/// `sess` must be a valid mutable session pointer; `out_event_json` must be non-null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_session_poll_event(
     sess: *mut TendrilSession,

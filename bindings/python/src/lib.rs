@@ -179,12 +179,6 @@ struct Endpoint {
     router: Arc<InboundRouter>,
 }
 
-impl Endpoint {
-    fn spawn_listener(&self, listener: Box<dyn PathListener>) {
-        self.router.spawn_listener(self.rt.handle(), listener);
-    }
-}
-
 #[pymethods]
 impl Endpoint {
     #[new]
@@ -249,12 +243,15 @@ impl Endpoint {
             .parse()
             .map_err(|e| PyValueError::new_err(format!("invalid address: {e}")))?;
         let rt = Arc::clone(&self.rt);
-        let listener = py
-            .detach(move || rt.block_on(DirectListener::bind(addr, None)))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let ep = listener.local_endpoint();
-        self.spawn_listener(Box::new(listener));
-        Ok(ep)
+        let router = Arc::clone(&self.router);
+        py.detach(move || {
+            let listener = rt
+                .block_on(DirectListener::bind(addr, None))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let ep = listener.local_endpoint();
+            router.spawn_listener(rt.handle(), Box::new(listener));
+            Ok(ep)
+        })
     }
 
     #[pyo3(signature = (relay_url, expected_host=None))]
@@ -265,15 +262,18 @@ impl Endpoint {
         expected_host: Option<&str>,
     ) -> PyResult<String> {
         let rt = Arc::clone(&self.rt);
+        let router = Arc::clone(&self.router);
         let url = relay_url.to_owned();
         let exp = expected_host.map(ToOwned::to_owned);
         let key = self.identity.signing_key().signing_key();
-        let listener = py
-            .detach(move || rt.block_on(RelayListener::bind(url, exp, key, DEFAULT_WRITE_TIMEOUT)))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let ep = listener.local_endpoint();
-        self.spawn_listener(Box::new(listener));
-        Ok(ep)
+        py.detach(move || {
+            let listener = rt
+                .block_on(RelayListener::bind(url, exp, key, DEFAULT_WRITE_TIMEOUT))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let ep = listener.local_endpoint();
+            router.spawn_listener(rt.handle(), Box::new(listener));
+            Ok(ep)
+        })
     }
 
     #[pyo3(signature = (kind="lan"))]

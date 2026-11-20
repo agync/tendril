@@ -101,6 +101,9 @@ impl InboundRouter {
                 let s_tx = session_tx.clone();
                 let mut conn_shut = shutdown_tx.subscribe();
                 handle_clone.spawn(async move {
+                    if *conn_shut.borrow() {
+                        return;
+                    }
                     let peeked = tokio::select! {
                         biased;
                         _ = conn_shut.changed() => return,
@@ -189,14 +192,17 @@ pub async fn recv_routed(
     rx_mutex: &AsyncMutex<mpsc::Receiver<RoutedInbound>>,
     wait: Duration,
 ) -> Result<Option<RoutedInbound>, ()> {
-    let mut rx = rx_mutex.lock().await;
     if wait.is_zero() {
+        let Ok(mut rx) = rx_mutex.try_lock() else {
+            return Err(());
+        };
         return match rx.try_recv() {
             Ok(item) => Ok(Some(item)),
             Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
             Err(mpsc::error::TryRecvError::Empty) => Err(()),
         };
     }
+    let mut rx = rx_mutex.lock().await;
     match timeout(wait, rx.recv()).await {
         Ok(Some(item)) => Ok(Some(item)),
         Ok(None) => Ok(None),

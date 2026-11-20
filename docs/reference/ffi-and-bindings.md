@@ -75,7 +75,7 @@ Mobile (`aarch64-apple-ios`, `aarch64-linux-android`) and browser WASM bundle bu
 
 ## Verification
 
-Each binding verifies all canonical `spec/vectors/` files offline and runs bidirectional client/host live interop against `tendril-conformance-peer` (covering pairing, SAS confirmation, capability minting, encrypted data exchange, authorization, revocation, plus `rekey` in Python/Node bidirectional runs and Go concurrency tests):
+Each binding verifies the four helper-level `spec/vectors/` files (`fingerprints.json`, `pairing_mac.json`, `rotation.json`, and `grants.json`) offline (while `spec/vectors/handshake.json` is verified in Rust and Go via `make vectors/check`) and runs bidirectional client/host live interop against `tendril-conformance-peer` (covering pairing, SAS confirmation, capability minting, encrypted data exchange, authorization, revocation, plus `rekey` in Python/Node bidirectional runs and Go concurrency tests):
 
 ```bash
 make bindings/go      # build tendril-ffi and run Go cgo tests with -race
