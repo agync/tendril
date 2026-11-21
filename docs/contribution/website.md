@@ -72,8 +72,8 @@ Cloudflare Workers Builds, connected to the repository in the dashboard:
 |---|---|
 | Root directory | `site` |
 | Build command | `make site` |
-| Deploy command | `npx wrangler@4.158.0 deploy` |
-| Preview command | `npx wrangler@4.158.0 preview` |
+| Deploy command | `npx wrangler deploy` |
+| Preview command | `npx wrangler preview` |
 
 The Worker name in the dashboard must equal `name` in `wrangler.jsonc`. Setting up the connection and the custom domain is an owner step.
 
