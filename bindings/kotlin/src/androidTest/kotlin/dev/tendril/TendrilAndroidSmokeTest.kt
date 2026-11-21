@@ -93,4 +93,50 @@ class TendrilAndroidSmokeTest {
       deleteKeystoreAlias(alias)
     }
   }
+
+  @Test
+  fun configureTransportsAndMintRelayTicket() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val stateDir = File(context.noBackupFilesDir, "tendril-smoke-cfg-${UUID.randomUUID()}")
+    val alias = "tendril.smoke.cfg.${UUID.randomUUID()}"
+    val cipher = KeystoreStateCipher(alias)
+
+    try {
+      TendrilEndpoint.create(
+          stateDir = stateDir.absolutePath,
+          hostId = "android-smoke-cfg-host",
+          stateCipher = cipher,
+        )
+        .use { ep ->
+          val ticketJson =
+            ep.mintRelayTicket(
+              relayHost = "relay.example",
+              role = "dial",
+              targetPubOrWildcard = "*",
+              ttlSecs = 300,
+            )
+          val ticketObj = JSONObject(ticketJson)
+          assertEquals("relay.example", ticketObj.getString("relay_host"))
+          assertEquals("dial", ticketObj.getString("role"))
+          assertEquals("*", ticketObj.getString("target_pub"))
+          assertFalse(ticketObj.getString("issuer_pub").isEmpty())
+          assertFalse(ticketObj.getString("sig").isEmpty())
+
+          val unknownResult =
+            runCatching { ep.configureTransportsJson("""{"unknown_field":true}""") }
+          assertTrue(unknownResult.isFailure)
+
+          val scalarResult =
+            runCatching { ep.configureTransportsJson("""{"relay_auth_secret":123456}""") }
+          assertTrue(scalarResult.isFailure)
+          val scalarMsg = scalarResult.exceptionOrNull()?.message.orEmpty()
+          assertFalse(scalarMsg.contains("123456"))
+
+          ep.configureTransportsJson("""{"relay_ticket":$ticketJson}""")
+        }
+    } finally {
+      stateDir.deleteRecursively()
+      deleteKeystoreAlias(alias)
+    }
+  }
 }

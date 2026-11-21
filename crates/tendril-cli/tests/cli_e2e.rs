@@ -1779,6 +1779,23 @@ async fn cli_e2e_relay_auth_ticket_and_hmac_gate() {
     }
     let ticket_file = client_dir.path().join("relay-ticket.json");
     std::fs::write(&ticket_file, &ticket_out.stdout).expect("write ticket file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ticket_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let world_readable_ticket = client_dir.path().join("world-readable-ticket.json");
+    std::fs::write(&world_readable_ticket, &ticket_out.stdout)
+        .expect("write world-readable ticket file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &world_readable_ticket,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+    }
 
     let relay = RelayServer::bind(RelayConfig {
         host: "localhost".to_owned(),
@@ -1820,6 +1837,31 @@ async fn cli_e2e_relay_auth_ticket_and_hmac_gate() {
                 String::from_utf8_lossy(&bad_perm_serve.stderr).contains("0600"),
                 "stderr should recommend 0600: {}",
                 String::from_utf8_lossy(&bad_perm_serve.stderr)
+            );
+            let bad_perm_ticket = Command::new(tendril_bin())
+                .arg("--state-dir")
+                .arg(client_dir.path())
+                .args([
+                    "pair",
+                    "--endpoint",
+                    &relay_url,
+                    "--relay-host",
+                    "localhost",
+                    "--code",
+                    "TND-0000-0000",
+                    "--relay-ticket-file",
+                ])
+                .arg(&world_readable_ticket)
+                .output()
+                .expect("run bad perm ticket pair");
+            assert!(
+                !bad_perm_ticket.status.success(),
+                "0644 ticket file must be rejected"
+            );
+            assert!(
+                String::from_utf8_lossy(&bad_perm_ticket.stderr).contains("0600"),
+                "stderr should recommend 0600: {}",
+                String::from_utf8_lossy(&bad_perm_ticket.stderr)
             );
         }
 
@@ -2081,6 +2123,11 @@ async fn cli_e2e_wire_v2_pair_relay_v2_downgrade_guard_and_http_wake() {
     assert!(ticket_out.status.success());
     let ticket_file = client_dir.path().join("v2-ticket.json");
     std::fs::write(&ticket_file, &ticket_out.stdout).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ticket_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     let secret_file = host_dir.path().join("v2-hmac.txt");
     std::fs::write(&secret_file, "v2-cli-hmac-secret\n").unwrap();

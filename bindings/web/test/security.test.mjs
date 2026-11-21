@@ -1251,3 +1251,61 @@ test("WasmV2PakePairInitiator emits v2 PAKE preamble and connectV2 fails closed 
     client.free();
   }
 });
+
+test("TendrilWebSession v2 tick() self-terminates when grant expires", async () => {
+  await ensureWasm();
+  const relay = await spawnRelay();
+  const peer = spawnPeer();
+  const client = await TendrilWebClient.create({ hostId: "web-v2-tick" });
+  let sess = null;
+  try {
+    const init = await peer.call({ op: "init", host_id: "sec-v2-tick-host" });
+    await peer.call({
+      op: "serve_relay",
+      relay_url: relay.wsUrl,
+      expected_host: "127.0.0.1",
+    });
+    const code = (await peer.call({ op: "issue_code", kind: "remote" })).code;
+    const pairPromise = peer.call({ op: "pair_v2_accept", timeout_ms: 10000 });
+    const bound = await client.pairV2({
+      relayUrl: relay.wsUrl,
+      targetPub: init.relay_pub,
+      expectedHost: "127.0.0.1",
+      code,
+      allowInsecureWs: true,
+    });
+    const hostBound = await pairPromise;
+    await client.confirmPeer("sec-v2-tick-host", bound.sas);
+    await peer.call({ op: "confirm", peer_id: hostBound.device_id, sas: hostBound.sas });
+
+    const { grant } = await peer.call({
+      op: "mint",
+      peer_id: hostBound.device_id,
+      caps: ["fs.read"],
+      ttl_secs: 1,
+    });
+    const acceptPromise = peer.call({ op: "accept_v2", timeout_ms: 10000 });
+    sess = await client.connectV2({
+      relayUrl: relay.wsUrl,
+      targetPub: init.relay_pub,
+      expectedHost: "127.0.0.1",
+      targetHostId: "sec-v2-tick-host",
+      grantJson: JSON.stringify(grant),
+      allowInsecureWs: true,
+    });
+    await acceptPromise;
+
+    await new Promise((r) => setTimeout(r, 1500));
+    await assert.rejects(() => sess.tick(), /expired|grant|closed/i);
+    assert.equal(sess.isClosed(), true);
+    assert.equal(sess.authorize("fs.read"), false);
+    await assert.rejects(() => sess.sendData("late"), /closed/i);
+  } finally {
+    if (sess && !sess.isClosed()) {
+      await sess.close(1000, "done").catch(() => {});
+    }
+    client.free();
+    peer.close();
+    relay.child.kill();
+  }
+});

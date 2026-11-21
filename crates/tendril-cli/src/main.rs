@@ -434,7 +434,11 @@ fn resolve_relay_auth(args: &RelayAuthArgs) -> Result<RelayClientAuth, Box<dyn s
         return Ok(RelayClientAuth::HmacSecret(secret));
     }
     if let Some(path) = &args.relay_ticket_file {
-        let raw = Zeroizing::new(std::fs::read_to_string(path)?);
+        let raw_bytes = read_private_secret_bytes(path, "relay ticket")?;
+        let raw = Zeroizing::new(
+            String::from_utf8(raw_bytes.to_vec())
+                .map_err(|_| "relay ticket file must be valid UTF-8")?,
+        );
         let ticket: RelayTicket = serde_json::from_str(raw.trim())?;
         let _ = canonical_relay_host(&ticket.relay_host)?;
         if ticket.issuer_pub.is_empty() || ticket.target_pub.is_empty() || ticket.sig.is_empty() {

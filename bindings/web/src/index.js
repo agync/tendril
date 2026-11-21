@@ -1346,9 +1346,6 @@ export class TendrilWebSession {
 
   tick() {
     this.#ensureOpen();
-    if (this.#isV2) {
-      return Promise.resolve();
-    }
     return this.#enqueueSend(async () => {
       this.#ensureOpen();
       let out;

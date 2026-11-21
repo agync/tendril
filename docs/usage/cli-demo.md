@@ -62,7 +62,7 @@ tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --issue-code lan
 #  --relay-v2 requires --wire-v2 AND --relay or --embedded-relay (--relay-host alone errors);
 #  pass --wake-url (requires --wire-v2), --wake-adapter <webhook|apns|fcm|unified-push> (default webhook),
 #  --wake-secret-file (or TENDRIL_WAKE_SECRET), --wake-auth-header-file, and --wake-pre-wake on dial for opaque wake hints;
-#  CLI secret files enforce regular non-symlink files <= 16 KiB with Unix 0600 permissions (mode & 0o077 == 0);
+#  CLI secret files and --relay-ticket-file enforce regular non-symlink files <= 16 KiB with Unix 0600 permissions (mode & 0o077 == 0);
 #  pass --no-pkarr on default relay mode to opt out of Pkarr/DNS, or --include-direct-addrs for non-metadata ?addr= hints.)
 
 # 3. Pair client using printed endpoint and code (prefer --code-stdin, --code-file, or TENDRIL_PAIR_CODE
