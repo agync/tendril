@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import test from "node:test";
@@ -13,6 +15,68 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..", "..", "..");
 const VECTORS = path.join(ROOT, "spec", "vectors");
 const PEER_BIN = path.join(ROOT, "target", "debug", "tendril-conformance-peer");
+const RELAY_BIN = path.join(ROOT, "target", "debug", "tendril-relay");
+
+function ensureRelayBin() {
+  if (!fs.existsSync(RELAY_BIN)) {
+    const res = spawnSync("cargo", ["build", "-p", "tendril-relay", "--bin", "tendril-relay"], {
+      cwd: ROOT,
+      stdio: "inherit",
+    });
+    assert.equal(res.status, 0, "failed to build tendril-relay");
+  }
+}
+
+function stripAnsi(s) {
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function spawnGatedRelay(authSecretFile, issuerPub) {
+  ensureRelayBin();
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      RELAY_BIN,
+      [
+        "--listen",
+        "127.0.0.1:0",
+        "--host",
+        "127.0.0.1",
+        "--auth-secret-file",
+        authSecretFile,
+        "--issuer-pub",
+        issuerPub,
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, RUST_LOG: "info" },
+      }
+    );
+    let acc = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`tendril-relay startup timed out: ${acc}`));
+    }, 10000);
+    const onData = (chunk) => {
+      acc += stripAnsi(chunk.toString("utf8"));
+      const m = acc.match(/ws:\/\/127\.0\.0\.1:(\d+)\/v1\/relay/);
+      if (m) {
+        clearTimeout(timer);
+        resolve({
+          child,
+          v1Url: m[0],
+          v2Url: `ws://127.0.0.1:${m[1]}/v2/relay`,
+          port: Number(m[1]),
+        });
+      }
+    };
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`tendril-relay exited early (${code}): ${acc}`));
+    });
+  });
+}
 
 function readVec(name) {
   return JSON.parse(fs.readFileSync(path.join(VECTORS, name), "utf8"));
@@ -588,5 +652,275 @@ test("Node M2M enrollment, single-use replay, and anchor revocation", async () =
     cliEp.close();
     anchorEp.close();
     hostEp.close();
+  }
+});
+
+test("Node binding configures transports strictly, redacts scalar secrets, and validates v2 bounds", async () => {
+  const ep = new tendril.Endpoint(null, "node-cfg-host");
+  try {
+    // Unknown field rejected
+    assert.throws(() => ep.configureTransportsJson(JSON.stringify({ unknown_field: true })));
+
+    // Scalar secret redaction: error must NOT contain the secret value
+    let caughtMsg = "";
+    try {
+      ep.configureTransportsJson('{"relay_auth_secret":123456}');
+      assert.fail("expected configureTransportsJson to throw");
+    } catch (err) {
+      caughtMsg = String(err);
+    }
+    assert.ok(!caughtMsg.includes("123456"), `scalar secret leaked in error: ${caughtMsg}`);
+
+    // Mutual-exclusion checks
+    const ticketJson = ep.mintRelayTicket("127.0.0.1", "any", "*", 300);
+    const ticket = JSON.parse(ticketJson);
+    assert.throws(() =>
+      ep.configureTransportsJson(
+        JSON.stringify({ relay_auth_secret: "shared-secret", relay_ticket: ticket })
+      )
+    );
+    assert.throws(() =>
+      ep.configureTransportsJson(
+        JSON.stringify({ p2p_relay_auth_token: "tok", p2p_api_secret: "sec" })
+      )
+    );
+    assert.throws(() =>
+      ep.configureTransportsJson(
+        JSON.stringify({ p2p_relay_mode: "disabled", p2p_relay_urls: ["https://relay.example"] })
+      )
+    );
+
+    // Valid configuration succeeds
+    ep.configureTransportsJson(JSON.stringify({ relay_ticket: ticket }));
+    ep.configureTransportsJson(JSON.stringify({}));
+
+    // Safe integer bounds on ttlSecs & timeoutMs
+    for (const bad of [-1, NaN, Infinity, 1.5, 2 ** 53]) {
+      assert.throws(() => ep.mintRelayTicket("127.0.0.1", "any", "*", bad));
+    }
+    assert.throws(() => ep.mintRelayTicket("127.0.0.1", "bogus-role", "*", 60));
+
+    for (const badTimeout of [-1, NaN, Infinity, 1.5, 2 ** 32]) {
+      await assert.rejects(ep.pairV2Accept(badTimeout));
+      await assert.rejects(ep.acceptV2(badTimeout));
+    }
+  } finally {
+    ep.close();
+  }
+});
+
+test("Node binding enforces mintRelayTicket and relay auth across /v1/relay and /v2/relay", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tendril-node-relay-"));
+  const secretFile = path.join(tmpDir, "relay-secret.txt");
+  const secretValue = crypto.randomBytes(32).toString("hex");
+  fs.writeFileSync(secretFile, secretValue, { mode: 0o600 });
+
+  const issuerEp = new tendril.Endpoint(null, "node-relay-issuer");
+  const hostEp = new tendril.Endpoint(null, "node-relay-host");
+  const cliEp = new tendril.Endpoint(null, "node-relay-cli");
+  let relay;
+  try {
+    const issuerInfo = JSON.parse(issuerEp.infoJson());
+    relay = await spawnGatedRelay(secretFile, issuerInfo.relay_pub);
+
+    // 1. /v1/relay gating: unauth, wrong secret, and wrong-role ticket must fail closed.
+    await assert.rejects(hostEp.serveRelay(relay.v1Url, "127.0.0.1"));
+
+    hostEp.configureTransportsJson(JSON.stringify({ relay_auth_secret: "wrong-secret" }));
+    await assert.rejects(hostEp.serveRelay(relay.v1Url, "127.0.0.1"));
+
+    const dialOnlyTicket = JSON.parse(issuerEp.mintRelayTicket("127.0.0.1", "dial", "*", 300));
+    hostEp.configureTransportsJson(JSON.stringify({ relay_ticket: dialOnlyTicket }));
+    await assert.rejects(hostEp.serveRelay(relay.v1Url, "127.0.0.1"));
+
+    // Matching register ticket succeeds on /v1/relay
+    const regTicket = JSON.parse(issuerEp.mintRelayTicket("127.0.0.1", "register", "*", 300));
+    hostEp.configureTransportsJson(JSON.stringify({ relay_ticket: regTicket }));
+    const v1HostEp = await hostEp.serveRelay(relay.v1Url, "127.0.0.1");
+
+    // Client with wrong-role (register) ticket fails closed on /v1/relay dial
+    const code1 = hostEp.issueCode("remote");
+    cliEp.configureTransportsJson(JSON.stringify({ relay_ticket: regTicket }));
+    await assert.rejects(cliEp.pairInitiate(v1HostEp, code1, "127.0.0.1", "cli-bad", "node"));
+
+    // Client with matching dial ticket succeeds on /v1/relay
+    cliEp.configureTransportsJson(JSON.stringify({ relay_ticket: dialOnlyTicket }));
+    const [p1CliRaw, p1AccRaw] = await Promise.all([
+      cliEp.pairInitiate(v1HostEp, code1, "127.0.0.1", "cli-v1", "node"),
+      hostEp.pairAccept(5000),
+    ]);
+    const p1Cli = JSON.parse(p1CliRaw);
+    const p1Acc = JSON.parse(p1AccRaw);
+    assert.equal(p1Cli.sas, p1Acc.sas);
+
+    // 2. Establish Wire v2 pairing over direct so both sides have v2_secrets, then test /v2/relay gating.
+    const directAddr = await hostEp.serveDirect("127.0.0.1:0");
+    const v2Code = hostEp.issueCode("lan");
+    const [v2PairRaw, v2AccRaw] = await Promise.all([
+      cliEp.pairV2Initiate(directAddr, v2Code, null, "cli-v2", "node", null),
+      hostEp.pairV2Accept(5000),
+    ]);
+    const v2Pair = JSON.parse(v2PairRaw);
+    const v2Acc = JSON.parse(v2AccRaw);
+    assert.equal(v2Pair.sas, v2Acc.sas);
+    hostEp.confirmPeer(v2Acc.device_id, v2Pair.sas);
+    cliEp.confirmPeer("node-relay-host", v2Pair.sas);
+    const grantJson = hostEp.mintGrant(v2Acc.device_id, ["fs.read"], 3600);
+
+    // /v2/relay unauth, wrong secret, and wrong-role ticket fail closed
+    hostEp.configureTransportsJson(JSON.stringify({}));
+    await assert.rejects(hostEp.serveRelayV2(relay.v2Url, "127.0.0.1", v2Acc.device_id));
+
+    hostEp.configureTransportsJson(JSON.stringify({ relay_auth_secret: "wrong-secret" }));
+    await assert.rejects(hostEp.serveRelayV2(relay.v2Url, "127.0.0.1", v2Acc.device_id));
+
+    hostEp.configureTransportsJson(JSON.stringify({ relay_ticket: dialOnlyTicket }));
+    await assert.rejects(hostEp.serveRelayV2(relay.v2Url, "127.0.0.1", v2Acc.device_id));
+
+    // Matching HMAC secret succeeds on serveRelayV2
+    hostEp.configureTransportsJson(JSON.stringify({ relay_auth_secret: secretValue }));
+    const v2MailboxEp = await hostEp.serveRelayV2(relay.v2Url, "127.0.0.1", null);
+    assert.ok(v2MailboxEp.includes("/v2/relay#"), `expected /v2/relay# ep, got ${v2MailboxEp}`);
+
+    // Client with wrong-role (register) ticket fails closed on connectV2 over /v2/relay
+    cliEp.configureTransportsJson(JSON.stringify({ relay_ticket: regTicket }));
+    await assert.rejects(cliEp.connectV2(relay.v2Url, "node-relay-host", grantJson, "127.0.0.1"));
+
+    // Client with matching dial ticket succeeds on connectV2 over /v2/relay
+    cliEp.configureTransportsJson(JSON.stringify({ relay_ticket: dialOnlyTicket }));
+    const [cliSess, hostSess] = await Promise.all([
+      cliEp.connectV2(relay.v2Url, "node-relay-host", grantJson, "127.0.0.1"),
+      hostEp.acceptV2(5000),
+    ]);
+    await cliSess.sendData(Buffer.from("v2-gated-relay-ok", "utf8"));
+    const ev = JSON.parse(await hostSess.pollEvent(3000));
+    assert.equal(ev.event, "data");
+    assert.equal(Buffer.from(ev.data_b64, "base64url").toString("utf8"), "v2-gated-relay-ok");
+    await cliSess.close(1000, "done");
+  } finally {
+    cliEp.close();
+    hostEp.close();
+    issuerEp.close();
+    if (relay && !relay.child.killed) {
+      relay.child.kill();
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("Node binding runs Wire v2 PAKE pairing, session ops, and wrong-code rejection with tendril-conformance-peer", async () => {
+  const peer = spawnPeer();
+  const hostEp = new tendril.Endpoint(null, "node-v2-host");
+  const cliEp = new tendril.Endpoint(null, "node-v2-cli");
+  try {
+    const addr = await hostEp.serveDirect("127.0.0.1:0");
+    await peer.call({ op: "init", host_id: "rust-v2-cli" });
+
+    // Wrong-code rejection
+    const goodCode = hostEp.issueCode("lan");
+    const wrongCode = goodCode === "0000-0000" ? "1111-1111" : "0000-0000";
+    const [wrongHostRes, wrongPeerRes] = await Promise.allSettled([
+      hostEp.pairV2Accept(5000),
+      peer.call({
+        op: "pair_v2_initiate",
+        endpoint: addr,
+        code: wrongCode,
+        name: "rust-v2-cli",
+      }),
+    ]);
+    assert.equal(wrongHostRes.status, "rejected");
+    assert.equal(wrongPeerRes.status, "rejected");
+
+    // Valid Wire v2 PAKE pairing (Rust peer -> Node host)
+    const code = hostEp.issueCode("lan");
+    const [accRaw, peerPair] = await Promise.all([
+      hostEp.pairV2Accept(5000),
+      peer.call({
+        op: "pair_v2_initiate",
+        endpoint: addr,
+        code,
+        name: "rust-v2-cli",
+      }),
+    ]);
+    const acc = JSON.parse(accRaw);
+    assert.equal(acc.wire_version, 2);
+    assert.equal(acc.sas, peerPair.sas);
+
+    hostEp.confirmPeer(acc.device_id, acc.sas);
+    await peer.call({ op: "confirm", peer_id: "node-v2-host", sas: acc.sas });
+    const grantJson = hostEp.mintGrant(acc.device_id, ["fs.read"], 3600);
+    const grantObj = JSON.parse(grantJson);
+
+    const [hostSess, peerConn] = await Promise.all([
+      hostEp.acceptV2(5000),
+      peer.call({
+        op: "connect_v2",
+        endpoint: addr,
+        target_host_id: "node-v2-host",
+        grant: grantObj,
+      }),
+    ]);
+    assert.equal(peerConn.ok, true);
+    assert.equal(await hostSess.authorize("fs.read"), true);
+    assert.equal(await hostSess.authorize("shell.exec"), false);
+
+    await peer.call({ op: "send", data_utf8: "v2-hello-to-node" });
+    const ev = JSON.parse(await hostSess.pollEvent(2000));
+    assert.equal(ev.event, "data");
+    assert.equal(Buffer.from(ev.data_b64, "base64url").toString("utf8"), "v2-hello-to-node");
+
+    await hostSess.rekey();
+    const rkLocal = JSON.parse(await hostSess.pollEvent(2000));
+    assert.equal(rkLocal.event, "rekeyed");
+    const rkPeer = await peer.call({ op: "recv", timeout_ms: 2000 });
+    assert.equal(rkPeer.event, "rekeyed");
+
+    await hostSess.sendData(Buffer.from("v2-reply-from-node", "utf8"));
+    const peerEv = await peer.call({ op: "recv", timeout_ms: 2000 });
+    assert.equal(peerEv.data_utf8, "v2-reply-from-node");
+
+    hostEp.revokePeer(acc.device_id);
+    assert.equal(await hostSess.authorize("fs.read"), false);
+
+    await hostSess.close(1000, "done");
+    await peer.call({ op: "shutdown" });
+
+    // Direction 2: Node client -> Rust conformance peer host (pairV2Initiate + connectV2 + accept_v2)
+    const peer2 = spawnPeer();
+    try {
+      await peer2.call({ op: "init", host_id: "rust-v2-host" });
+      const srv2 = await peer2.call({ op: "serve_direct" });
+      const code2 = (await peer2.call({ op: "issue_code", kind: "lan" })).code;
+      const [cliPairRaw, hostAcc2] = await Promise.all([
+        cliEp.pairV2Initiate(srv2.endpoint, code2, null, "node-v2-dev", "node", null),
+        peer2.call({ op: "pair_v2_accept", timeout_ms: 5000 }),
+      ]);
+      const cliPair = JSON.parse(cliPairRaw);
+      assert.equal(cliPair.wire_version, 2);
+      assert.equal(cliPair.sas, hostAcc2.sas);
+
+      await peer2.call({ op: "confirm", peer_id: hostAcc2.device_id, sas: cliPair.sas });
+      cliEp.confirmPeer("rust-v2-host", cliPair.sas);
+      const grant2 = (
+        await peer2.call({ op: "mint", peer_id: hostAcc2.device_id, caps: ["fs.read"] })
+      ).grant;
+
+      const [cliSess2, hostConn2] = await Promise.all([
+        cliEp.connectV2(srv2.endpoint, "rust-v2-host", JSON.stringify(grant2), null),
+        peer2.call({ op: "accept_v2", timeout_ms: 5000 }),
+      ]);
+      assert.equal(hostConn2.ok, true);
+      await cliSess2.sendData(Buffer.from("v2-node-to-rust", "utf8"));
+      const r2 = await peer2.call({ op: "recv", timeout_ms: 2000 });
+      assert.equal(r2.data_utf8, "v2-node-to-rust");
+      await cliSess2.close(1000, "done");
+      await peer2.call({ op: "shutdown" });
+    } finally {
+      peer2.close();
+    }
+  } finally {
+    cliEp.close();
+    hostEp.close();
+    peer.close();
   }
 });

@@ -64,6 +64,34 @@ export class Endpoint {
     relayHost?: string | null
   ): Promise<Session>;
   acceptSession(timeoutMs?: number | null): Promise<Session>;
+  configureTransportsJson(transportConfigJson: string): void;
+  mintRelayTicket(
+    relayHost: string,
+    role?: string | null,
+    targetPubOrWildcard?: string | null,
+    ttlSecs?: number | null
+  ): string;
+  serveRelayV2(
+    relayUrl: string,
+    expectedHost?: string | null,
+    peerId?: string | null
+  ): Promise<string>;
+  pairV2Initiate(
+    endpoint: string,
+    code: string,
+    relayHost?: string | null,
+    name?: string | null,
+    kind?: string | null,
+    pinnedHostJson?: string | null
+  ): Promise<string>;
+  pairV2Accept(timeoutMs?: number | null): Promise<string>;
+  connectV2(
+    endpoint: string,
+    targetHostId: string,
+    grantJson?: string | null,
+    relayHost?: string | null
+  ): Promise<Session>;
+  acceptV2(timeoutMs?: number | null): Promise<Session>;
   close(): void;
 }
 

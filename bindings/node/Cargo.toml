@@ -18,6 +18,11 @@ serde_json = "1"
 tendril-core = { path = "../../crates/tendril-core" }
 tendril-runtime = { path = "../../crates/tendril-runtime", features = ["p2p-iroh"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+zeroize = { version = "1.9", features = ["derive"] }
+
+[features]
+default = []
+p2p-iroh-services = ["tendril-runtime/p2p-iroh-services"]
 
 [build-dependencies]
 napi-build = "2"
