@@ -130,7 +130,7 @@ Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `
 
 Relays MAY enforce admission control without maintaining user accounts or per-session databases across three composable tiers:
 
-1. **Tier 1 (Static Mailbox Allowlist):** The relay holds an explicit set of permitted 32-byte Ed25519 mailbox keys (`pub`) for `register` (and `accept`).
+1. **Tier 1 (Static Mailbox Allowlist):** The relay holds an explicit set of permitted 32-byte Ed25519 mailbox keys (`pub`) for `register` (and `accept`). Tier 1 allowlisted keys (`--allow-mailbox` / `--allow-mailboxes-file`) are an **alternative** to Tier 2/3 proofs (`allowlist OR proof`, not additive): allowlisted identities are admitted on `register` and `accept` without requiring an additional HMAC or `RelayTicket` proof.
 2. **Tier 2 (Shared HMAC Secret):** Clients present `auth` with `"kind": "hmac"` proven under a shared secret (`1..=4096` bytes, `MAX_RELAY_AUTH_SECRET_BYTES = 4096`):
    ```jsonc
    { "kind": "hmac", "mac": string } // b64url 32-byte HMAC-SHA256
@@ -179,7 +179,7 @@ Relays MAY enforce admission control without maintaining user accounts or per-se
 - `auth_scope = "all"` (default whenever a shared HMAC secret or trusted ticket issuers are configured): requires valid admission proof on `register`, `accept`, AND `dial`. `challenge.auth_required` MUST be `["register", "dial"]`.
 - `auth_scope = "register-only"` (default when ONLY a Tier 1 mailbox allowlist is configured, or explicitly configured for Tier 2/3 when open dialing is desired): requires admission on `register` (and `accept` when Tier 2/3 is active); `dial` does not require `auth`. `challenge.auth_required` MUST be `["register"]`.
 - When no admission controls are configured (open relay), `auth_required` is omitted from `challenge`.
-- **Zero Mailbox Presence Leak on `dial`:** Whenever `auth_scope` covers `dial` (`"all"`), the relay MUST validate `dial.auth` BEFORE looking up `target_pub` in the active mailbox table. Any missing or invalid proof MUST fail closed immediately with `{ "op": "error", "code": "unauthorized" }` so unauthenticated callers cannot probe whether a mailbox is currently online (`"offline"` vs `"unauthorized"`).
+- **Zero Mailbox Presence Leak on `dial`:** Whenever `auth_scope` covers `dial` (`"all"`), the relay MUST validate `dial.auth` right after frame decode, BEFORE mailbox lookup (`target_pub` in the active mailbox table) or epoch skew checks. Any missing or invalid proof MUST fail closed immediately with `{ "op": "error", "code": "unauthorized" }` so unauthenticated callers cannot probe whether a mailbox is currently online (`"offline"` vs `"unauthorized"`).
 
 ---
 

@@ -18,7 +18,22 @@ Launch `tendril-relay` locally or build the rootless container defined in `crate
 cargo run -p tendril-relay -- --listen 127.0.0.1:8443 --host localhost
 ```
 
-In production deployments, terminate TLS directly on `tendril-relay` (`--tls-cert` and `--tls-key`, serving `wss://<host>/v1/relay`) or behind a trusted reverse proxy configured with `--trusted-proxy <CIDR>`. Right-to-left RFC 7239 `Forwarded` (falling back to `X-Forwarded-For` if absent) extraction runs only when the TCP peer matches `--trusted-proxy`, so reverse proxies should strip or overwrite untrusted client forwarding headers. Rate limits normalize IPv4-mapped addresses and group IPv6 addresses by `/64` prefix alongside global `--max-connections` and `--max-mailboxes` caps.
+In production deployments, terminate TLS directly on `tendril-relay` (`--tls-cert` and `--tls-key`, serving `wss://<host>/v1/relay` and `wss://<host>/v2/relay`) or behind a trusted reverse proxy configured with `--trusted-proxy <CIDR>`. Right-to-left RFC 7239 `Forwarded` (falling back to `X-Forwarded-For` if absent) extraction runs only when the TCP peer matches `--trusted-proxy`, so reverse proxies should strip or overwrite untrusted client forwarding headers. Rate limits normalize IPv4-mapped addresses and group IPv6 addresses by `/64` prefix alongside global `--max-connections` and `--max-mailboxes` caps.
+
+### Managed relay admission (Tiers 1-3 and `--auth-scope`)
+
+Both `/v1/relay` and `/v2/relay` support stateless admission control (`allowlist OR proof`, not additive):
+
+- **Tier 1 (Allowlist):** `--allow-mailbox <b64url_pub>` or `--allow-mailboxes-file <path>` admits listed mailbox keys on `register` and `accept` without an additional HMAC or ticket proof. An empty or comment-only file (`0` valid keys) fails closed at startup.
+- **Tier 2 (Shared HMAC):** `--auth-secret-file <path>` (`0600` file permissions recommended) or `TENDRIL_RELAY_AUTH_SECRET` verifies `tendril-relay-auth-v1\0` HMAC-SHA256 proofs. `tendril-relay` reads `TENDRIL_RELAY_AUTH_SECRET` once at startup rather than stripping the process environment.
+- **Tier 3 (`RelayTicket`):** `--issuer-pub <b64url_pub>` verifies JCS-canonical Ed25519 `RelayTicket` proofs (`tendril-relay-ticket-v1\0`, `role: register | dial | any`, `1..=86400s` TTL, `+-30s` skew). Treat a `RelayTicket` as a **bearer credential** when shared over untrusted channels or logs unless scoped to `target_pub` and a short TTL.
+- **`--auth-scope <all|register-only>`:** Defaults to `all` whenever any admission mechanism is active (requiring admission on both `register` and `dial`, checking `auth` right after decode before mailbox lookup or epoch skew checks). Passing `--auth-scope` with no allowlist, secret, or issuer fails closed; `--auth-scope register-only` with Tier 1 alone leaves `dial` open because Tier 1 is peer-mailbox allowlisting.
+
+```bash
+# Mint a Tier 3 RelayTicket using tendril relay-ticket
+tendril --state-dir ./issuer-state relay-ticket \
+  --relay-host relay.example --role dial --target-pub "<b64url_pub>" --ttl-secs 300
+```
 
 ## Endpoint lifecycle with `tendril`
 
@@ -32,14 +47,23 @@ tendril --state-dir ./cli-state init
 # 2. Start host listener (direct TCP, optional relay/embedded-relay/p2p/overlay/broker, and pairing code)
 tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --issue-code lan
 
-# Optional multi-rung host serving (zero-setup P2P or embedded relay):
-# tendril --state-dir ./host-state serve --p2p --embedded-relay --issue-code remote
-# tendril --state-dir ./host-state serve --p2p-relay https://relay.example/ --ephemeral-p2p
+# Optional multi-rung host serving (zero-setup P2P, managed relays, Wire v2, or wake hints):
+# tendril --state-dir ./host-state serve --p2p --embedded-relay --wire-v2 --issue-code remote
+# tendril --state-dir ./host-state serve --p2p-relay https://relay.example/ --p2p-relay-token-file ./p2p.tok --p2p-pkarr --ephemeral-p2p
+# tendril --state-dir ./host-state serve --relay wss://relay.example --wire-v2 --relay-v2 --relay-auth-secret-file ./relay.sec
 # tendril --state-dir ./host-state serve --p2p-local --overlay 127.0.0.1:0 --overlay-allow-non-tailnet --broker 127.0.0.1:0 --issue-code remote
 # (Pass --p2p-local or TENDRIL_P2P_LOCAL=1 on serve/pair/dial for offline local P2P;
 #  --overlay rejects non-Tailscale CGNAT/ULA peer IPs by default unless --overlay-allow-non-tailnet is passed;
-#  custom --p2p-relay URLs disable n0 Pkarr/DNS publishing by default; pass --no-pkarr on default relay mode
-#  to opt out of Pkarr/DNS, or --include-direct-addrs to explicitly include non-metadata ?addr= hints.)
+#  --p2p-relay is repeatable (1..=8 URLs, or default/disabled) and disables n0 Pkarr/DNS by default unless --p2p-pkarr is passed;
+#  pass --p2p-relay-token-file (or TENDRIL_P2P_RELAY_TOKEN) for static iroh-relay bearer tokens, or
+#  --p2p-api-secret-file (or TENDRIL_P2P_API_SECRET) when built with p2p-iroh-services for RCAN tokens;
+#  pass --relay-auth-secret-file (or TENDRIL_RELAY_AUTH_SECRET) or --relay-ticket-file on serve/pair/dial for managed Tendril relays;
+#  pass --wire-v2 on serve/pair/dial for Wire 0x02 PAKE/pseudonymous sessions;
+#  --relay-v2 requires --wire-v2 AND --relay or --embedded-relay (--relay-host alone errors);
+#  pass --wake-url (requires --wire-v2), --wake-adapter <webhook|apns|fcm|unified-push> (default webhook),
+#  --wake-secret-file (or TENDRIL_WAKE_SECRET), --wake-auth-header-file, and --wake-pre-wake on dial for opaque wake hints;
+#  CLI secret files enforce regular non-symlink files <= 16 KiB with Unix 0600 permissions (mode & 0o077 == 0);
+#  pass --no-pkarr on default relay mode to opt out of Pkarr/DNS, or --include-direct-addrs for non-metadata ?addr= hints.)
 
 # 3. Pair client using printed endpoint and code (prefer --code-stdin, --code-file, or TENDRIL_PAIR_CODE
 #    over --code in multi-user environments), then confirm SAS on both host and client

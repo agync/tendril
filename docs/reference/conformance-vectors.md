@@ -20,6 +20,7 @@ Every language binding and independent implementation must match all canonical v
 | `spec/vectors/grants.json` | RFC 8785 JCS canonicalization, hybrid signature, valid delegation, signed CRL | Widened child scope and forged non-root issuer rejection |
 | `spec/vectors/handshake.json` | Full deterministic `pair` and `session` `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` transcripts, `DATA`, and `REKEY` | Unverified `msg2` host key or pin mismatch abort before `msg3` |
 | `spec/vectors/m2m_enrollment.json` | Signed single-use `pair.enroll` token, 3373-byte hybrid `enroll_proof`, M2M `PairClaim` and `PairResponse` | Single-use replay rejection and session-grant purpose-separation rejection |
+| `spec/vectors/wire_v2.json` | Wire `0x02` preamble binding, PAKE `Argon2id` + HKDF derivation, pseudonymous rendezvous MAC, `/v2/relay` epoch `mailbox_id`/`dial_token`, `0x09 PADDED` buckets | Stale/replayed rendezvous rejection, downgrade floor rejection, and invalid padding rejection |
 
 ## Verification commands
 

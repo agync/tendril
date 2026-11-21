@@ -44,3 +44,8 @@ Optional bearer tokens attached via `WakeTarget::with_auth_token` reject control
 - **Pre-connect DNS check:** `HttpWakeProvider` resolves socket addresses immediately before connecting and rejects any resolved metadata/link-local address or non-loopback address for `http://` URLs.
 - **Bounded timeouts and responses:** Outbound requests enforce `DEFAULT_WAKE_TIMEOUT` (`3s`) and cap HTTP response reads at 4096 bytes.
 - **Per-target coalescing (`WakeCoalescer`):** Suppresses duplicate wake hints to the same `(adapter, endpoint)` within `DEFAULT_WAKE_COALESCE_INTERVAL_SECS` (`5s`), bounded to `MAX_WAKE_COALESCE_TARGETS` (`1024`) entries with oldest-entry eviction.
+
+## CLI and FFI configuration
+
+- **CLI flags (`tendril`):** `dial` accepts `--wake-url` (requires `--wire-v2`), `--wake-adapter <webhook|apns|fcm|unified-push>` (default `webhook`), `--wake-secret-file` (or `TENDRIL_WAKE_SECRET`), `--wake-auth-header-file`, and `--wake-pre-wake` to emit a best-effort opaque wake hint prior to dialing. Secret files enforce regular non-symlink files `<= 16 KiB` with Unix `0600` (`mode & 0o077 == 0`) permissions.
+- **FFI (`tendril-ffi`):** `tendril_endpoint_configure_transports_json` configures wake-provider targets (`wake_url`, `wake_adapter`, `wake_secret_b64`, `wake_auth_token`, `wake_pre_wake`, `wake_retry_delay_ms`, `wake_max_attempts`, `wake_timeout_ms`) alongside managed relay/P2P transport credentials on a `TendrilEndpoint` without passing inline secrets on the command line.
