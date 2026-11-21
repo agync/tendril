@@ -19,20 +19,20 @@ bytes / commands + (now_unix, now_ms) ---> StateMachine ---> Vec<Action>
 ```
 
 - `ResumableFrameReader` bounds buffered bytes at `MAX_READ_BUFFER_LEN`, decodes the 6-byte cleartext preamble first, and rejects declared outer frame lengths above `65519` before payload allocation.
-- Private key scalars (`StaticKeypair`, `SigningKeypair`), pairing codes, Argon2id outputs, `snow` Noise DH/cipher/hash resolvers, and decoded handshake/transport plaintext buffers use `zeroize` wrappers and redact secrets from `Debug` output.
+- Private key scalars (`StaticKeypair`, `SigningKeypair` covering Ed25519 and ML-DSA-65 seeds), pairing codes, Argon2id outputs, pure-Rust `Noise_XXhfs` DH/KEM/cipher/chaining states (`x25519-dalek` + `fips203`), and decoded handshake/transport plaintext buffers use `zeroize` wrappers and redact secrets from `Debug` output.
 
 ## Pairing and roster trust transitions
 
 | Component | Key Rules |
 |---|---|
 | `PairingManager` | Unbiased 31-char code sampling, `900 s` default TTL, `5` failed claims burn all live codes, single-use burn even when a `revoked` peer claims a live code, 2-group LAN codes rejected on `Remote` paths |
-| `PairingUri` | `tendril://pair?v=1&...` codec validating scheme, version, non-zero static and signing keys, strict query parameters, control-character absence, and validated endpoint hints |
-| `PairingInitiator` / `PairingResponder` | Decouples `pair` (`pending`) from host `confirm_peer` and `mint_grant`; validates optional QR pins before emitting `msg3` |
-| `Roster` | Indexes peer entries cleanly, matches inbound `Session` peers strictly on full 32-byte `static_pub`, enforces non-zero pins (`IncompletePin`), transitions immediately to `revoked` on trust-root rotation forks, and ingests monotonic signed CRLs |
+| `PairingUri` | `tendril://pair?v=1&...` codec validating scheme, version, non-zero static key, 32-byte `sh=` signing hash pin, strict query parameters, control-character absence, and validated endpoint hints |
+| `PairingInitiator` / `PairingResponder` | Decouples `pair` (`pending`) from host `confirm_peer` and `mint_grant`; validates `HostHello.signing_pub` against optional QR `sh=` hash or full key pins before emitting `msg3` |
+| `Roster` | Indexes peer entries cleanly, matches inbound `Session` peers strictly on full 32-byte `static_pub`, enforces non-zero pins (`IncompletePin`), stores `1984`-byte hybrid signing keys, transitions immediately to `revoked` on trust-root rotation forks, and ingests monotonic signed CRLs |
 
 ## Sealed session and path planner
 
-- **`SessionMachine`:** Drives `Noise_XX_25519_ChaChaPoly_SHA256`, executes the initiator `msg2` pin/rotation abort gate before disclosing client static keys in `msg3`, enforces grants via `authorize_grant` returning structured `AuditEvent` records, and automatically triggers `0x04 REKEY` at `1_048_576` sent frames or `15` minutes while re-validating grants and CRLs on `REKEY` and `0x03 REVOCATION`.
+- **`SessionMachine`:** Drives in-tree pure-Rust `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256`, executes the initiator `msg2` `HostHello.signing_pub` + static pin/rotation abort gate before disclosing client static keys in `msg3`, enforces `MAX_FRAME_LEN` pre-encryption so oversized plaintexts never advance nonces, checks grants via `authorize_grant` returning structured `AuditEvent` records, and automatically triggers `0x04 REKEY` at `1_048_576` sent frames or `15` minutes while re-validating grants and CRLs on `REKEY` and `0x03 REVOCATION`.
 - **`PathPlanner`:** Orders candidates strictly by `(provider.rank(), !is_numeric_host, id)` across `local < direct < overlay < p2p < relay < broker`, staggers Happy Eyeballs probes every `250 ms`, delays cold `p2p` probing (`500 ms`) so higher rungs race unblocked, holds pinned paths for `10 s` before probing fall-up every `30 s`, and fails over immediately on active path faults.
 
 ## Adversarial verification

@@ -22,7 +22,7 @@ tags: [adr, wire, pairing, architecture, relay]
 
 ### 1. Tendril-native wire domain separators and handshake-bound salt
 
-Tendril defines its own neutral v1 wire domain separators while retaining the `Noise_XX_25519_ChaChaPoly_SHA256` handshake and bounded `uint16_be` framing model.
+Tendril defines its own neutral v1 wire domain separators with a single fixed cryptographic suite and bounded `uint16_be` framing model (amended from pure classical X25519/Ed25519 to mandatory hybrid `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` and hybrid `Ed25519 + ML-DSA-65` in [ADR 0004](0004-hybrid-post-quantum-v1.md)).
 
 | Element | V1 Specification |
 |---|---|

@@ -28,7 +28,7 @@ Host app (Go / Python / Node.js)
 
 ## C ABI surface (`crates/tendril-ffi`)
 
-`crates/tendril-ffi/include/tendril.h` is manually maintained in lockstep with `crates/tendril-ffi/src/lib.rs` and defines a callback-free polled C ABI backed by a multi-threaded Tokio runtime:
+`crates/tendril-ffi/include/tendril.h` is manually maintained in lockstep with `crates/tendril-ffi/src/lib.rs`, exports key-length constants (`TENDRIL_KEY_LEN = 32`, `TENDRIL_SIGNING_PUB_LEN = 1984`, `TENDRIL_SIGNING_HASH_LEN = 32`), and defines a callback-free polled C ABI backed by a multi-threaded Tokio runtime:
 
 | Symbol Group | Representative Functions | Ownership & Error Contract |
 |---|---|---|
@@ -48,17 +48,17 @@ Host app (Go / Python / Node.js)
 
 ### Go (`bindings/go`)
 
-- Exposes typed wrappers (`Endpoint`, `Session`, `EndpointInfo`, `PairInitiateResult`, `PairAcceptResult`, `EnrollInitiateResult`, `SessionEvent` including `Audit`, `ErrWouldBlock`), `ServeDirect`, `ServeRelay`, `ServeP2p`, M2M methods (`AddTrustAnchor`, `RevokeTrustAnchor`, `MintEnrollmentToken`, `EnrollInitiate`), and pure helper functions (`DeviceID`, `FingerprintHost`, `FingerprintDevice`, `PairingSAS`, `ComputeCodeMAC`, `VerifyRotationChainJSON`, `VerifyGrantJSON`).
+- Exposes size constants (`SigningPubLen = 1984`, `SigningHashLen = 32`), typed wrappers (`Endpoint`, `Session`, `EndpointInfo` including `SigningPubHash` and `RelayPub`, `PairInitiateResult`, `PairAcceptResult`, `EnrollInitiateResult`, `SessionEvent` including `Audit`, `ErrWouldBlock`), `ServeDirect`, `ServeRelay`, `ServeP2p`, M2M methods (`AddTrustAnchor` taking `1984` bytes, `RevokeTrustAnchor`, `MintEnrollmentToken`, `EnrollInitiate` accepting `1984`-byte keys or `32`-byte SHA-256 hash pins), and pure helper functions (`DeviceID`, `FingerprintHost`, `FingerprintDevice`, `PairingSAS`, `ComputeCodeMAC`, `VerifyRotationChainJSON`, `VerifyGrantJSON`).
 - Guards `Endpoint` with `sync.RWMutex` (so `Close()` signals `tendril_endpoint_close` while releasing in-flight calls before taking exclusive `Lock()` to free), guards `Session` with `sync.RWMutex` + `tendril_session_shutdown` (allowing concurrent full-duplex `SendData`/`Rekey`/`PollEvent`/`Close`), validates strings against embedded NUL bytes, pairs pointer and byte-slice reads with `runtime.KeepAlive`, and pins OS threads via `runtime.LockOSThread()` / `runtime.UnlockOSThread()` around cgo calls and `tendril_last_error()` reads under `go test -race`.
 
 ### Python (`bindings/python`)
 
-- Exposes `Endpoint` (including `serve_direct`, `serve_relay`, `serve_p2p`, `pair_initiate`, `connect` delegating dialing internally to `tendril-runtime::dial_endpoint` for `iroh://`, `overlay://`, `broker+ws(s)://`, `ws(s)://`, local, and direct targets, plus M2M methods `add_trust_anchor`, `revoke_trust_anchor`, `mint_enrollment_token`, and `enroll_initiate`), `Session`, `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, and `verify_grant_json` from `tendril`.
+- Exposes `Endpoint` (with `info_json` returning `signing_pub`, `signing_pub_hash`, and `relay_pub`; `serve_direct`, `serve_relay` using the 32-byte Ed25519 relay prefix, `serve_p2p`, `pair_initiate`, `connect` delegating dialing internally to `tendril-runtime::dial_endpoint` for `iroh://`, `overlay://`, `broker+ws(s)://`, `ws(s)://`, local, and direct targets, plus M2M methods `add_trust_anchor` taking `1984` bytes, `revoke_trust_anchor`, `mint_enrollment_token`, and `enroll_initiate` accepting `1984`-byte keys or `32`-byte hash pins), `Session`, `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, and `verify_grant_json` from `tendril`.
 - `compute_code_mac` and all blocking, mutex-acquiring, or disk-persisting `Endpoint` and `Session` methods release the GIL via `py.detach`, verified by a multi-threaded heartbeat test during concurrent `compute_code_mac` Argon2 execution, M2M replay/revocation tests, and concurrent handshake threads.
 
 ### Node.js (`bindings/node`)
 
-- Exposes `Endpoint`, `Session` (non-constructible directly via `private constructor()` in `bindings/node/index.d.ts`), synchronous hash/verifier helpers (`deviceId`, `fingerprintHost`, `fingerprintDevice`, `pairingSas`, `verifyRotationChainJson`, `verifyGrantJson`), synchronous M2M management methods (`addTrustAnchor`, `revokeTrustAnchor`, `mintEnrollmentToken`), and async `Promise` methods (`computeCodeMac`, `serveDirect`, `serveRelay`, `serveP2p`, `pairInitiate`, `pairAccept`, `enrollInitiate`, `connect`, `acceptSession`, `sendData`, `pollEvent`, `authorize`, `rekey`, `close`).
+- Exposes `Endpoint` (`infoJson` returning `signing_pub`, `signing_pub_hash`, and `relay_pub`), `Session` (non-constructible directly via `private constructor()` in `bindings/node/index.d.ts`), synchronous hash/verifier helpers (`deviceId`, `fingerprintHost`, `fingerprintDevice`, `pairingSas`, `verifyRotationChainJson`, `verifyGrantJson`), synchronous M2M management methods (`addTrustAnchor` taking `1984` bytes, `revokeTrustAnchor`, `mintEnrollmentToken`), and async `Promise` methods (`computeCodeMac`, `serveDirect`, `serveRelay`, `serveP2p`, `pairInitiate`, `pairAccept`, `enrollInitiate` accepting `1984`-byte keys or `32`-byte hash pins, `connect`, `acceptSession`, `sendData`, `pollEvent`, `authorize`, `rekey`, `close`).
 - Verified by a `setInterval` timer responsiveness test running alongside concurrent `computeCodeMac` Argon2 promises, local P2P (`serveP2p("disabled")`) loopback tests, and M2M enrollment/replay/revocation conformance tests.
 
 Full M2M enrollment parity (`addTrustAnchor`, `revokeTrustAnchor`, `mintEnrollmentToken`, and `enroll` / `enrollInitiate`) also extends across browser WebAssembly, Android Kotlin JNI, and Apple Swift; see [Web and mobile bindings](web-and-mobile.md).
@@ -69,11 +69,11 @@ Measured against stripped release builds (`lto = "thin"`, `codegen-units = 1`, `
 
 | Binding / Crate | Stripped Release Size | Per-Call FFI Overhead (`device_id`) | Measurement Method |
 |---|---|---|---|
-| `tendril-ffi` (`--no-default-features`) | 4,052,248 bytes (3.86 MiB) | Core-only baseline | `stat -c%s` on `libtendril_ffi.so` built with `--no-default-features` |
-| `tendril-ffi` (default `p2p-iroh`) | 14,606,424 bytes (13.93 MiB) | Included via Go cgo baseline | `stat -c%s` on `target/release/libtendril_ffi.so` |
+| `tendril-ffi` (`--no-default-features`, hybrid PQ) | 4,834,416 bytes (4.61 MiB) | Core-only Wave 2 PQ baseline | `stat -c%s` on `libtendril_ffi.so` built with `--no-default-features` |
+| `tendril-ffi` (default `p2p-iroh`, hybrid PQ) | 15,196,176 bytes (14.49 MiB) | Included via Go cgo baseline | `stat -c%s` on `target/release/libtendril_ffi.so` |
 | Go (`bindings/go`) | Links `libtendril_ffi.so` | 363.1 ns/op (`2,924,054` iterations in 1s) | Phase 3 `go test -run=^$ -bench=BenchmarkFFIOverhead -benchtime=1s` (`runtime.LockOSThread`) |
-| Python (`bindings/python`, `lib_tendril.so`, `p2p-iroh`) | 16,270,208 bytes (15.52 MiB) | 255.2 ns/op (`100,000` calls in `0.0255s`) | `stat -c%s` on release `.so`; Phase 3 `timeit` calling `tendril.device_id(k)` |
-| Node.js (`bindings/node`, `libtendril_node.so`, `p2p-iroh`) | 16,441,984 bytes (15.68 MiB) | 475.6 ns/op (`100,000` calls in `47.56ms`) | `stat -c%s` on release `.node`; Phase 3 `performance.now()` calling `deviceId(k)` |
+| Python (`bindings/python`, `lib_tendril.so`, `p2p-iroh`) | 16,270,208 bytes (15.52 MiB, Phase 3 pre-PQ) | 255.2 ns/op (`100,000` calls in `0.0255s`) | Phase 3 `stat -c%s` on release `.so`; Phase 3 `timeit` calling `tendril.device_id(k)` |
+| Node.js (`bindings/node`, `libtendril_node.so`, `p2p-iroh`) | 16,441,984 bytes (15.68 MiB, Phase 3 pre-PQ) | 475.6 ns/op (`100,000` calls in `47.56ms`) | Phase 3 `stat -c%s` on release `.node`; Phase 3 `performance.now()` calling `deviceId(k)` |
 
 For mobile (`aarch64-linux-android`, Swift) and browser WASM bundle budgets and Argon2id timings, see [Web and mobile bindings](web-and-mobile.md).
 

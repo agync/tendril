@@ -41,7 +41,7 @@ flowchart TB
 | `identity` | Static and signing keypairs, device IDs, fingerprints, signed rotations | Platform keystore I/O, user accounts |
 | `roster` | Known peers, device status (`pending`, `active`, `revoked`), grants, rotation chain | Network discovery, live presence inference |
 | `pairing` | Pairing code proof, handshake binding, confirmation state, minting split | Socket dialing, UI rendering |
-| `session` | Noise XX handshake, length-prefixed framing, rekeying, close on fault | Path ranking, retries |
+| `session` | Noise XXhfs handshake, length-prefixed framing, rekeying, close on fault | Path ranking, retries |
 | `grants` | Capability grammar, signature verification, subset delegation, revocation lists | App authorization prompts |
 | `path policy` | Provider registry, locality ranking, probing, fall-up triggers, rebuild on failure | Provider transport internals |
 

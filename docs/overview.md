@@ -8,7 +8,7 @@ tags: [overview, architecture]
 
 # What Tendril is
 
-Tendril is a reusable SDK for establishing private, end-to-end encrypted links between devices without relying on a trusted third party. A single Rust core owns device identity, pairing verification, sealed Noise sessions, default-deny capability grants, and path selection, while thin bindings expose that core to host languages over pluggable, untrusted path providers.
+Tendril is a reusable SDK for establishing private, end-to-end encrypted links between devices without relying on a trusted third party. A single Rust core owns device identity, pairing verification, sealed hybrid post-quantum Noise sessions (`Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256`, hybrid Ed25519 + ML-DSA-65 signatures), default-deny capability grants, and path selection, while thin bindings expose that core to host languages over pluggable, untrusted path providers.
 
 ## Design summary
 

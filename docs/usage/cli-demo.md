@@ -64,19 +64,20 @@ Autonomous devices enroll without SAS interaction using `serve --allow-enroll`, 
 
 ```bash
 # Register an external trust anchor (optional; omit for self-issued host tokens)
-tendril --state-dir ./host-state anchor add ci-admin --signing-pub "<b64url_ed25519_pub>"
+tendril --state-dir ./host-state anchor add ci-admin --signing-pub "<b64url_1984b_hybrid_pub>"
 tendril --state-dir ./host-state anchor list
 
 # Serve with opt-in M2M enrollment and redacted stdout event logs
 tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --allow-enroll --redact-logs
 
 # Mint a single-use token (0o600 --out file) and enroll with mandatory host key pinning
+# (--host-signing-pub accepts either the 1984 B b64url key or 32 B signing_pub_hash)
 tendril --state-dir ./host-state enroll-token --target-host my-host --ttl-secs 900 --out ./token.json
 tendril --state-dir ./runner-state enroll \
   --endpoint 127.0.0.1:PORT \
   --host-id my-host \
   --host-static-pub "<b64url_host_static>" \
-  --host-signing-pub "<b64url_host_signing>" \
+  --host-signing-pub "<b64url_host_signing_or_hash>" \
   --token-file ./token.json
 
 # Mint application grants after enrollment (still default deny), revoke unused nonces, or rotate keys
@@ -97,10 +98,10 @@ Cross-language SDK bindings spawn `tendril-conformance-peer` and exchange single
 | `init` | Initialize in-memory or `state_dir`-backed identity and roster |
 | `serve_direct`, `serve_relay` | Bind direct TCP or relay WSS listener onto background accept queue |
 | `issue_code` | Issue single-use LAN or remote pairing code |
-| `add_trust_anchor`, `revoke_trust_anchor` | Manage M2M Ed25519 trust anchors and responder policy |
+| `add_trust_anchor`, `revoke_trust_anchor` | Manage M2M hybrid signing trust anchors and responder policy |
 | `mint_enrollment_token` | Mint single-use M2M enrollment token JSON (enables self-M2M when targeting self) |
 | `pair` | Run initiator (`endpoint` + `code`) or responder pairing/M2M exchange |
 | `confirm`, `mint`, `revoke` | Transition peer state and mint default-deny signed grants |
-| `connect`, `send`, `recv`, `rekey`, `close` | Drive Noise XX session, data exchange, key ratchet, and close |
+| `connect`, `send`, `recv`, `rekey`, `close` | Drive Noise XXhfs session, data exchange, key ratchet, and close |
 | `authorize` | Evaluate capability check and return structured `AuditEvent` |
 | `shutdown` | Close active listeners/session cleanly and exit |

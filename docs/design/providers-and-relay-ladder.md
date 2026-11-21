@@ -8,7 +8,7 @@ tags: [design, providers, relay, p2p, overlay, broker]
 
 # Six-rung path providers and relay ladder
 
-Tendril treats every transport path as an untrusted byte pipe below Noise XX (`Noise_XX_25519_ChaChaPoly_SHA256`). Phase 5 completes all six rungs of `ProviderId` inside `tendril-runtime` and exposes them in `tendril-cli`.
+Tendril treats every transport path as an untrusted byte pipe below hybrid post-quantum Noise (`Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256`). Phase 5 completes all six rungs of `ProviderId` inside `tendril-runtime` and exposes them in `tendril-cli`.
 
 ## Provider ladder and dialing policy
 
@@ -49,7 +49,7 @@ Applications can move between public relays, self-hosted `tendril-relay` contain
 
 ## Verification status
 
-- `tendril-runtime` verifies the 6-point provider contract, deterministic HKDF-derived `P2pListener` `EndpointId` persistence and rotation, `peer_transport_id` pre-auth rate limiting, and full Noise XX pairing/confirm/mint/data/rekey/revoke lifecycle across all six rungs (`local`, `direct`, `overlay`, `p2p`, `relay`, `broker`), `select_overlay_mode` + scoped Unix helper IPC, broker rejection paths, `p2p` cold-delay policy failover, and `public -> self-hosted -> embedded` `relay_hints` migration.
+- `tendril-runtime` verifies the 6-point provider contract, deterministic HKDF-derived `P2pListener` `EndpointId` persistence and rotation, `peer_transport_id` pre-auth rate limiting, and full `Noise_XXhfs` pairing/confirm/mint/data/rekey/revoke lifecycle across all six rungs (`local`, `direct`, `overlay`, `p2p`, `relay`, `broker`), `select_overlay_mode` + scoped Unix helper IPC, broker rejection paths, `p2p` cold-delay policy failover, and `public -> self-hosted -> embedded` `relay_hints` migration.
 - `tendril-cli` verifies live subprocess `tendril serve --embedded-relay --p2p-local --overlay --broker` pairing over `iroh` P2P, identical `iroh://<endpoint_id>` across host restarts, clean client endpoint shutdown, and dialing across `P2p`, `Overlay`, `Broker`, and `Relay` (`EmbeddedRelay`).
 - `bindings/web` (`TENDRIL_WEB_P2P_LIVE=1 node bindings/web/test/browser_e2e.mjs`) verifies headless Chrome WASM (`WasmIrohStream` over `ws_stream_wasm` + `PkarrResolver::n0_dns()`) pairing and dialing a live `tendril serve --p2p` host using a bare `iroh://<endpoint_id>` URI over public `iroh-relay` WebSockets.
 - Physical 30-minute mobile battery draw (`Gate #11`) requires dedicated iOS/Android hardware runs outside headless Linux CI.

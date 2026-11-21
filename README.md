@@ -10,7 +10,7 @@ Tendril extracts the pairing ceremony, sealed session protocol, capability grant
 |---|---|---|
 | Host App | Keystore storage, roster persistence, pairing UI | Supplies platform storage and renders code/fingerprint checks |
 | Thin Bindings | Rust, Go, Python, TypeScript (Node and Web WASM), Swift, Kotlin | Translates types and errors only; zero duplicated protocol logic |
-| Tendril Core | Identity, pairing proof, Noise XX session, capability grants, path policy | Sole trust boundary; default-deny grants; conformance-tested |
+| Tendril Core | Identity, pairing proof, Noise XXhfs hybrid PQ session, capability grants, path policy | Sole trust boundary; default-deny grants; conformance-tested |
 | Path Providers | Local, Direct, Overlay, P2P, Relay, Broker | Untrusted byte pipes; cannot decrypt, forge, or widen grants |
 
 ## Repository layout

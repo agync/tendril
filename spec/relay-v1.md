@@ -17,6 +17,8 @@ Conventions follow `spec/wire-v1.md`. The relay is an untrusted byte forwarder: 
 
 ## 2. Challenge-Response Control Protocol
 
+Relay mailbox registration and dial acceptance intentionally use the 32-byte Ed25519 prefix (`relay_pub`) of an endpoint's hybrid signing keypair rather than the full 1984-byte hybrid key. Relays are untrusted byte forwarders with no access to plaintext, grants, or Noise session keys; keeping mailbox challenge-response compact avoids inflating control frames while end-to-end `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` and hybrid `Ed25519 + ML-DSA-65` protect session confidentiality and endpoint identity. Handshake frames (`1216 B` `msg1` and `~4 KiB` `msg2` including `HostHello.signing_pub`) fit within the existing `max_frame = 65521` ceiling.
+
 Upon opening `/v1/relay`, the server sends one JSON text frame (`challenge`) binding the connection to the relay's canonical `host` identity and a fresh 32-byte random `nonce`:
 
 ```jsonc

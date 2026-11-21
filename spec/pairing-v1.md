@@ -13,9 +13,9 @@ Each Tendril endpoint maintains two long-lived cryptographic keypairs:
 | Key | Algorithm | Size | Role |
 |---|---|---|---|
 | Static keypair | X25519 | 32 B private scalar, 32 B public | Noise `s` key; identifies peer across sessions |
-| Signing keypair | Ed25519 | 32 B private seed, 32 B public | Signs grants, rotation records, CRLs, and relay registrations |
+| Signing keypair | Hybrid Ed25519 + ML-DSA-65 | 32 B Ed25519 seed + 32 B ML-DSA-65 seed; `1984 B` public (`32 B` Ed25519 \|\| `1952 B` ML-DSA-65) | Signs grants, rotation records, CRLs, and M2M proofs (`3373 B` sig with context `"tendril-hybrid-v1"`); `32 B` Ed25519 prefix authenticates relay mailboxes |
 
-On platforms whose hardware enclaves do not support Curve25519 directly (for example Apple Secure Enclave or Android StrongBox P-256 enclaves), X25519 and Ed25519 keys are generated in `tendril-core`, persisted wrapped by OS Keychain or Android Keystore AES keys, and zeroized from memory on drop.
+On platforms whose hardware enclaves do not support Curve25519 or ML-DSA-65 directly (for example Apple Secure Enclave or Android StrongBox P-256 enclaves), X25519, Ed25519, and ML-DSA-65 keys are generated in `tendril-core`, persisted wrapped by OS Keychain or Android Keystore AES keys, and zeroized from memory on drop.
 
 ---
 
@@ -133,11 +133,11 @@ code_mac = HMAC-SHA256(key = K, msg = "tendril-pair-v1" || h)
 ## 6. Pairing URI Scheme
 
 ```text
-tendril://pair?v=1&host=<url_encoded_name>&code=<code>&k=<b64url_host_static>&s=<b64url_host_signing>[&id=<url_encoded_host_id>][&seq=<u64>][&ep=<csv>]
+tendril://pair?v=1&host=<url_encoded_name>&code=<code>&k=<b64url_host_static>&sh=<b64url_host_signing_hash>[&id=<url_encoded_host_id>][&seq=<u64>][&ep=<csv>]
 ```
 
 - `k` pins the host's valid full-order 32-byte X25519 static public key prior to `msg1` (small-subgroup points MUST be rejected).
-- `s` pins the host's valid 32-byte Ed25519 signing public key as the rotation chain root (or current key at `seq`).
+- `sh` pins the 32-byte `SHA-256` hash of the host's 1984-byte hybrid signing public key (`SHA-256(Ed25519_pub || MLDSA65_pub)`) as the rotation chain root (or current key at `seq`), keeping QR payloads compact while binding `HostHello.signing_pub` at `msg2` before `msg3` is sent.
 - `id` optionally pins the host's expected `host_id` carried in `HostHello`.
 - `seq` optionally carries the host's current `rotation_seq` corresponding to `(k, s)`. When `seq` is omitted on a legacy URI for an already-rotated host presenting a contiguous chain from `seq == 1` ending at `(k, s)`, initiators MAY verify that chain and initialize the pin at `last.seq`.
 - `ep` carries comma-separated endpoint hints (`<provider>:<addr>`), which are dialing hints only and never grant authorization.
@@ -163,7 +163,7 @@ An enrollment token is a signed `Grant` (`grants-v1.md`) satisfying ALL of the f
 
 ### 7.2 Channel-Binding Proof (`enroll_proof`)
 
-In `msg3`, an M2M initiator omits `code_mac` and populates `enrollment_token`, `signing_pub` (b64url 32-byte Ed25519 public key matching `enroll_proof`), and `enroll_proof` (b64url 64-byte Ed25519 signature over the Noise transcript binding `h`, initiator static public key `peer_static_pub`, and `token.nonce`):
+In `msg3`, an M2M initiator omits `code_mac` and populates `enrollment_token`, `signing_pub` (`b64url` 1984-byte hybrid Ed25519 || ML-DSA-65 public key matching `enroll_proof`), and `enroll_proof` (`b64url` 3373-byte hybrid signature using ML-DSA-65 context `"tendril-hybrid-v1"` over the Noise transcript binding `h`, initiator static public key `peer_static_pub`, and `token.nonce`):
 
 ```text
 enroll_proof_bytes = "tendril-enroll-v1\0" (18 B)
@@ -171,14 +171,15 @@ enroll_proof_bytes = "tendril-enroll-v1\0" (18 B)
                   || peer_static_pub (32 B)
                   || UTF-8(enrollment_token.nonce)
 
-enroll_proof = Ed25519(peer_signing_priv, enroll_proof_bytes)
+enroll_proof = Ed25519(peer_ed25519_priv, enroll_proof_bytes)
+            || ML-DSA-65(peer_mldsa65_priv, enroll_proof_bytes, ctx = "tendril-hybrid-v1")
 ```
 
-Responders MUST verify `enroll_proof` strictly against `signing_pub` before accepting enrollment, ensuring the claim cannot be replayed into a different Noise session or substituted for a different static identity.
+Responders MUST verify both signature halves of `enroll_proof` strictly against `signing_pub` before accepting enrollment, ensuring the claim cannot be replayed into a different Noise session or substituted for a different static identity.
 
 ### 7.3 Initiator Pinning Requirement
 
-M2M initiators MUST supply an out-of-band `PinnedHost` (static key, root/current signing key, `host_id`, optional `rotation_seq`) and verify the responder's `HostHello` (and `RotationRecord` chain if rotated) at `msg2` before transmitting `msg3`. Unpinned TOFU is forbidden in M2M mode.
+M2M initiators MUST supply an out-of-band `PinnedHost` (static X25519 key, root/current hybrid signing key pin as either full 1984-byte key or 32-byte SHA-256 hash, `host_id`, optional `rotation_seq`) and verify the responder's `HostHello.signing_pub` (and `RotationRecord` chain if rotated) at `msg2` before transmitting `msg3`. Unpinned TOFU is forbidden in M2M mode.
 
 ### 7.4 Atomic Single-Use Burn Log and Default-Deny Roster Entry
 

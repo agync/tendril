@@ -60,7 +60,7 @@ Grant = {
   "delegated_from"?: [Grant],       // optional 1-element array containing the immediate parent Grant (nested recursively)
   "uses"?: uint64,                  // optional max uses (reserved for single-use enrollment tokens)
   "machine"?: bool,                 // optional machine enrollment marker
-  "sig": string                     // b64url 64-byte Ed25519 signature by issuer signing key
+  "sig": string                     // b64url 3373-byte hybrid Ed25519 || ML-DSA-65 signature by issuer signing key
 }
 ```
 
@@ -79,7 +79,7 @@ Canonical encoding and strict JSON decoding rules:
 - Regular session authorization and session grant verification MUST reject any grant (leaf or ancestor) that specifies `uses` or `machine`, preventing single-use enrollment tokens or non-canonical `machine` flags from bypassing session grant checks.
 - Enrollment tokens (`pairing-v1.md` Section 7) MUST set `machine: true` and `uses: 1` on the leaf grant; any ancestor links in `delegated_from` MUST omit `uses` and `machine`.
 - Verifiers MUST reject unknown JSON fields (`deny_unknown_fields`) on `Grant` and `RevocationList`.
-- Verification MUST use strict Ed25519 signature verification against the issuer's pinned Ed25519 signing public key.
+- Verification MUST check both strict Ed25519 verification and ML-DSA-65 verification (`ctx = "tendril-hybrid-v1"`) against the issuer's pinned 1984-byte hybrid signing public key.
 
 ---
 
@@ -106,7 +106,7 @@ RevocationList = {
   "revoked_devices": [string],      // revoked device_ids
   "revoked_nonces": [string],       // revoked grant nonces (b64url)
   "ts": string,                     // RFC 3339 UTC instant at whole-second precision (YYYY-MM-DDTHH:MM:SSZ, no fractional seconds or numeric offsets)
-  "sig": string                     // b64url 64-byte Ed25519 signature
+  "sig": string                     // b64url 3373-byte hybrid Ed25519 || ML-DSA-65 signature
 }
 ```
 
@@ -122,9 +122,9 @@ Verifiers MUST reject any `RevocationList` with a `seq` lower than the highest v
 
 ## 5. Fail-Closed Evaluation Order
 
-Every grant check (at session connect, on `0x04 REKEY`, and on `authorize(requested_cap)`) executes the following checks in order and denies on the first failure (performing cheap structural, time, CRL, and root checks before Ed25519 signature verification):
+Every grant check (at session connect, on `0x04 REKEY`, and on `authorize(requested_cap)`) executes the following checks in order and denies on the first failure (performing cheap structural, time, CRL, and root checks before hybrid Ed25519 + ML-DSA-65 signature verification):
 
-1. Validate `grant.v == 1`, non-empty `nonce`, `grant.uses != Some(0)`, purpose separation (session evaluation forbids `uses` and `machine` across leaf and ancestors; enrollment evaluation requires `machine == true`, `uses == 1`, and 16-byte `b64url` `nonce` on the leaf while forbidding `uses` and `machine` on ancestors), delegation depth `<= 4`, no nonce or subject cycles, and syntactically valid `caps`. When a `RevocationList` is supplied, also fail closed if `crl.v != 1`, `crl.issuer != root_issuer`, `crl.ts` is invalid UTC, or strict Ed25519 verification of `crl.sig` under `root_issuer`'s pinned signing key fails.
+1. Validate `grant.v == 1`, non-empty `nonce`, `grant.uses != Some(0)`, purpose separation (session evaluation forbids `uses` and `machine` across leaf and ancestors; enrollment evaluation requires `machine == true`, `uses == 1`, and 16-byte `b64url` `nonce` on the leaf while forbidding `uses` and `machine` on ancestors), delegation depth `<= 4`, no nonce or subject cycles, and syntactically valid `caps`. When a `RevocationList` is supplied, also fail closed if `crl.v != 1`, `crl.issuer != root_issuer`, `crl.ts` is invalid UTC, or hybrid Ed25519 + ML-DSA-65 verification of `crl.sig` under `root_issuer`'s pinned 1984-byte signing key fails.
 2. Verify `grant.subject` matches the authenticated session peer `device_id` (or `child.issuer` during recursion). Wildcard `subject: "*"` is forbidden on session grants and delegated ancestors; it is allowed ONLY on a direct leaf enrollment token when responder policy permits unbound enrollment subjects.
 3. Check time bounds with a maximum `30 s` clock-skew allowance: `grant.not_before.saturating_sub(30s) <= now < grant.not_after` and `grant.not_before < grant.not_after`.
 4. Check `RevocationList` for `grant.subject`, `grant.issuer`, and `grant.nonce`.

@@ -1,20 +1,20 @@
 ---
 type: Design
 title: Machine-to-machine enrollment
-description: Autonomous headless device enrollment via trust anchors, channel-bound Ed25519 proofs, atomic single-use nonce burning, and default-deny grants.
+description: Autonomous headless device enrollment via trust anchors, channel-bound hybrid Ed25519 + ML-DSA-65 proofs, atomic single-use nonce burning, and default-deny grants.
 status: stable
 tags: [design, pairing, m2m, security]
 ---
 
 # Machine-to-machine enrollment
 
-Machine-to-machine (M2M) enrollment allows headless servers, CI runners, and workload agents to pair without interactive human Short Authentication String (SAS) comparison while preserving `Noise_XX` key authentication, default-deny capability isolation, and single-use replay resistance.
+Machine-to-machine (M2M) enrollment allows headless servers, CI runners, and workload agents to pair without interactive human Short Authentication String (SAS) comparison while preserving `Noise_XXhfs` key authentication, default-deny capability isolation, and single-use replay resistance.
 
 ## Threat model and prerequisites
 
 - **Opt-in responder policy:** M2M enrollment is disabled by default (`EnrollmentPolicy::default().enabled == false`). Hosts enable it explicitly via `serve --allow-enroll` in `tendril-cli` or by registering active trust anchors or minting self-targeted enrollment tokens across `tendril-ffi`, Go, Python, Node.js, Android Kotlin JNI, and Apple Swift (while revoking the last active anchor with no self-issued token returns the host policy to disabled/`unauthorized`). On the sans-I/O browser SDK, `WasmIdentity`, `WasmRoster`, `WasmPairInitiator`, and `TendrilWebClient.{addTrustAnchor, revokeTrustAnchor, mintEnrollmentToken, enroll}` provide initiator enrollment, token minting, and roster trust-anchor management.
-- **Mandatory out-of-band initiator pinning:** Initiators MUST hold a `PinnedHost` (`host_id`, static X25519 key, Ed25519 signing key, and `rotation_seq`) and verify `HostHello` (and any `RotationRecord` chain) in `msg2` before sending `msg3`. Unpinned Trust On First Use (TOFU) is forbidden in M2M mode.
-- **Channel-bound proof (`enroll_proof`):** In `msg3`, the initiator sends a `PairClaim` carrying `enrollment_token`, `signing_pub`, and `enroll_proof = Ed25519(peer_signing_priv, "tendril-enroll-v1\0" || h || peer_static_pub || UTF-8(token.nonce))`, binding the token to the exact handshake transcript and peer identity.
+- **Mandatory out-of-band initiator pinning:** Initiators MUST hold a `PinnedHost` (`host_id`, static X25519 key, hybrid signing key pin `SigningKeyPin` as either the full `1984`-byte public key or its `32`-byte SHA-256 hash, and `rotation_seq`) and verify `HostHello.signing_pub` (and any `RotationRecord` chain) in `msg2` before sending `msg3`. Unpinned Trust On First Use (TOFU) is forbidden in M2M mode.
+- **Channel-bound proof (`enroll_proof`):** In `msg3`, the initiator sends a `PairClaim` carrying `enrollment_token`, `signing_pub` (`1984`-byte hybrid public key), and `enroll_proof` (`3373`-byte hybrid `Ed25519 || ML-DSA-65` signature with context `"tendril-hybrid-v1"` over `"tendril-enroll-v1\0" || h || peer_static_pub || UTF-8(token.nonce)`), binding the token to the exact handshake transcript and peer identity.
 
 ## Token rules and trust anchors
 

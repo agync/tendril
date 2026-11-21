@@ -8,7 +8,8 @@ Conventions: `b64url` means unpadded URL-safe base64 (RFC 4648 Section 5, no `=`
 
 ## 1. Cipher Suite and Versioning
 
-- Noise pattern (fixed): `Noise_XX_25519_ChaChaPoly_SHA256`.
+- Noise pattern (fixed): `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` (`fips203` ML-KEM-768 + X25519 + ChaCha20-Poly1305 + SHA-256).
+- Identity signing suite (fixed): Hybrid `Ed25519 (32 B pub / 64 B sig) || ML-DSA-65 (1952 B pub / 3309 B sig)` = `1984`-byte public keys (`SHA-256` pin `32` bytes) and `3373`-byte signatures with ML-DSA-65 context `"tendril-hybrid-v1"`.
 - Wire version: `0x01`.
 - Peers MUST reject any connection carrying an unsupported version or unknown intent.
 - Outer transport security (TLS, WireGuard, peer-to-peer stream encryption, WSS) is treated as untrusted byte plumbing. Only the inner Noise session authenticates peers and carries authorization.
@@ -41,19 +42,19 @@ frame = uint16_be len || body (len bytes)
 ```
 
 - `len` MUST satisfy `0 <= len <= 65519` (`0xFFEF`).
-- The ceiling `65519` reserves 16 bytes for the ChaCha20-Poly1305 AEAD tag beneath the 65535-byte Noise message ceiling.
+- The ceiling `65519` reserves 16 bytes for the ChaCha20-Poly1305 AEAD tag beneath the 65535-byte Noise message ceiling. Both handshake and transport writers MUST verify this frame length ceiling before advancing AEAD cipher state or incrementing nonces.
 - Receivers MUST inspect `len` and reject `len > 65519` before allocating a frame buffer.
-- `len == 0` is a valid empty frame body (for example, an empty `Noise_XX` `msg1`).
+- `len == 0` is a valid empty frame body at the framing layer (note that `Noise_XXhfs` `msg1` is `1216` bytes).
 - Transport readers MUST support resumable partial-frame reads across I/O deadlines so an interrupted read never desynchronizes frame boundaries.
 
 ---
 
-## 3. Noise XX Handshake
+## 3. Noise XXhfs Handshake
 
 ```text
-msg1  ->  e                  payload: empty (0-length frame body)
-msg2  <-  e, ee, s, es       payload: HostHello (compact UTF-8 JSON, encrypted)
-msg3  ->  s, se              payload: SessionHello | PairClaim (compact UTF-8 JSON, encrypted)
+msg1  ->  e, e1                 1216 B (32 B X25519 e || 1184 B ML-KEM-768 e1; empty payload)
+msg2  <-  e, ee, ekem1, s, es   1200 + len(HostHello) B (32 B e || 1104 B ct || 48 B s || payload + 16 B tag)
+msg3  ->  s, se                 64 + len(payload) B (48 B s || payload + 16 B tag)
 ```
 
 ### 3.1 Handshake Payloads
@@ -63,6 +64,7 @@ msg3  ->  s, se              payload: SessionHello | PairClaim (compact UTF-8 JS
 HostHello = {
   "host_id": string,                // stable host identifier
   "proto_version": 1,               // must equal 1
+  "signing_pub": string,            // b64url 1984-byte hybrid Ed25519 || ML-DSA-65 public key
   "rotation"?: [RotationRecord]     // present only when extending a pinned key
 }
 
@@ -81,8 +83,8 @@ PairClaim = {
   "kind": string,                   // platform kind (e.g. "ios", "android", "cli", "web", "machine")
   "code_mac"?: string,              // b64url 32-byte HMAC-SHA256 proof (human pairing, pairing-v1)
   "enrollment_token"?: Grant,       // signed M2M enrollment Grant (grants-v1, pairing-v1 Section 7)
-  "signing_pub"?: string,           // b64url 32-byte Ed25519 peer signing key (M2M enrollment)
-  "enroll_proof"?: string           // b64url 64-byte Ed25519 channel-binding signature (M2M enrollment)
+  "signing_pub"?: string,           // b64url 1984-byte hybrid Ed25519 || ML-DSA-65 peer signing key (M2M enrollment)
+  "enroll_proof"?: string           // b64url 3373-byte hybrid Ed25519 || ML-DSA-65 channel-binding signature (M2M enrollment)
 }
 ```
 
@@ -95,7 +97,7 @@ When `intent == 0x02` (`pair`), after decrypting and processing `msg3`, the resp
 {
   "device_id": string,
   "status": "pending" | "active",
-  "host_signing_pub": string        // b64url 32-byte Ed25519 public key to pin
+  "host_signing_pub": string        // b64url 1984-byte hybrid Ed25519 || ML-DSA-65 public key to pin
 }
 
 // failure
@@ -110,9 +112,9 @@ For human pairing, confirming the peer (`pair.confirm`) and minting capabilities
 
 **Initiator at `msg2` (before writing `msg3`):**
 
-1. Decrypt `msg2` and decode `HostHello`; verify `proto_version == 1`.
-2. For `intent = session`: verify responder static `s` (`current_static`) and `current_signing` (`pinned_signing` when `HostHello.rotation` is absent or empty, or `rotation.last().new_signing_pub` when non-empty): either `current_static == pinned_static` AND `current_signing == pinned_signing`, OR `HostHello.rotation` is a valid, contiguous `RotationRecord` chain linking `(pinned_signing, pinned_static)` to `(current_signing, current_static)` (where `current_static == rotation.last().new_static_pub`). If neither holds, MUST abort immediately (`HostKeyUnverified`) before sending `msg3` so the initiator's static key is never disclosed to an unverified peer.
-3. For `intent = pair`: if a pinned host key was supplied out of band (for example via QR URI or mandatory M2M enrollment configuration), apply the same check as step 2 before sending `msg3`. M2M enrollment MUST NOT use unpinned TOFU. On manual human pairing with no pin, proceed using the post-`msg2` handshake hash `h` to bind `code_mac` and verify the transcript SAS.
+1. Decrypt `msg2` and decode `HostHello`; verify `proto_version == 1` and decode `HostHello.signing_pub` as a valid `1984`-byte hybrid signing key (`current_signing`).
+2. For `intent = session`: verify responder static `s` (`current_static`) and `current_signing` against the stored pin `(pinned_signing, pinned_static, pinned_seq)` (where `pinned_signing` may be a full `1984`-byte key or a `32`-byte `SHA-256` hash pin): either `current_static == pinned_static` AND `pinned_signing` matches `current_signing`, OR `HostHello.rotation` is a valid, contiguous `RotationRecord` chain linking `(pinned_signing, pinned_static)` at `pinned_seq` to `(current_signing, current_static)` (where `current_static == rotation.last().new_static_pub` and `current_signing == rotation.last().new_signing_pub`). If neither holds, MUST abort immediately (`HostKeyUnverified`) before sending `msg3` so the initiator's static key is never disclosed to an unverified peer.
+3. For `intent = pair`: if a pinned host key was supplied out of band (for example via QR URI `sh=` hash pin or mandatory M2M enrollment configuration), apply the same check as step 2 before sending `msg3` (and persist the newly resolved full `1984`-byte `current_signing` key when verified from a hash pin). M2M enrollment MUST NOT use unpinned TOFU. On manual human pairing with no pin, proceed using the post-`msg2` handshake hash `h` to bind `code_mac` and verify the transcript SAS.
 
 **Responder:**
 
@@ -125,30 +127,30 @@ For human pairing, confirming the peer (`pair.confirm`) and minting capabilities
 
 ## 4. Signed Key Rotation (`RotationRecord`)
 
-A host rotates its `(X25519 static, Ed25519 signing)` keypair by signing a `RotationRecord` with the outgoing Ed25519 signing key.
+A host rotates its `(X25519 static, hybrid Ed25519 + ML-DSA-65 signing)` keypair by signing a `RotationRecord` with the outgoing hybrid signing key.
 
 ```jsonc
 RotationRecord = {
   "seq": uint64,                    // strictly monotonic counter (>= 1, prev_seq + 1)
-  "prev_signing_pub": string,       // b64url 32-byte outgoing Ed25519 public key
-  "new_signing_pub": string,        // b64url 32-byte new Ed25519 public key
+  "prev_signing_pub": string,       // b64url 1984-byte outgoing hybrid public key
+  "new_signing_pub": string,        // b64url 1984-byte new hybrid public key
   "new_static_pub": string,         // b64url 32-byte new X25519 public key
   "ts": string,                     // RFC 3339 UTC timestamp at whole-second precision (YYYY-MM-DDTHH:MM:SSZ, no fractional seconds or numeric offsets)
-  "sig": string                     // b64url 64-byte Ed25519 signature by prev_signing_pub
+  "sig": string                     // b64url 3373-byte hybrid Ed25519 || ML-DSA-65 signature by prev_signing_pub
 }
 ```
 
-### 4.1 Exact Signed Bytes (127 bytes)
+### 4.1 Exact Signed Bytes (4031 bytes)
 
-Signatures MUST cover the raw concatenated bytes below (NOT the JSON text), verified using strict Ed25519 verification:
+Signatures MUST cover the raw concatenated bytes below (NOT the JSON text), verified using both strict Ed25519 verification and ML-DSA-65 verification with context `"tendril-hybrid-v1"`:
 
 ```text
-domain_prefix      (15 B) = ASCII "tendril-rot-v1\0" (0x74..0x31 0x00)
-seq_be8            ( 8 B) = big-endian uint64(seq)
-prev_signing_pub   (32 B) = raw outgoing Ed25519 public key
-new_signing_pub    (32 B) = raw new Ed25519 public key
-new_static_pub     (32 B) = raw new X25519 static public key
-ts_be8             ( 8 B) = big-endian uint64 Unix seconds of ts (>= 1970-01-01T00:00:00Z)
+domain_prefix      (  15 B) = ASCII "tendril-rot-v1\0" (0x74..0x31 0x00)
+seq_be8            (   8 B) = big-endian uint64(seq)
+prev_signing_pub   (1984 B) = raw outgoing hybrid public key (32 B Ed25519 || 1952 B ML-DSA-65)
+new_signing_pub    (1984 B) = raw new hybrid public key (32 B Ed25519 || 1952 B ML-DSA-65)
+new_static_pub     (  32 B) = raw new X25519 static public key
+ts_be8             (   8 B) = big-endian uint64 Unix seconds of ts (>= 1970-01-01T00:00:00Z)
 ```
 
 ### 4.2 Chain and Fork Detection Rules

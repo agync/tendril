@@ -20,7 +20,7 @@ Capabilities follow `namespace.verb` or `namespace.verb:resource`:
 
 ## Signing and delegation
 
-Grants are serialized without `sig` using RFC 8785 JSON Canonicalization Scheme (JCS), prefixed with `"tendril-grant-v1\0"`, and signed with the issuer's Ed25519 signing key. Optional `uses` (`uses == 1`) and `machine: true` are reserved exclusively for single-use enrollment tokens (`uses == 0` fails closed everywhere). Regular `intent = session` authorization (`verify_grant_with_chain` and `authorize_grant`) rejects any grant (leaf or ancestor) specifying `uses` or `machine: true`, preventing single-use enrollment tokens from crossing into application sessions. `delegated_from` carries the single immediate parent nested recursively up to the authoritative root verifier.
+Grants are serialized without `sig` using RFC 8785 JSON Canonicalization Scheme (JCS), prefixed with `"tendril-grant-v1\0"`, and signed with the issuer's hybrid `Ed25519 + ML-DSA-65` signing key (`1984`-byte public key, `3373`-byte signature, ML-DSA-65 context `"tendril-hybrid-v1"`). Optional `uses` (`uses == 1`) and `machine: true` are reserved exclusively for single-use enrollment tokens (`uses == 0` fails closed everywhere). Regular `intent = session` authorization (`verify_grant_with_chain` and `authorize_grant`) rejects any grant (leaf or ancestor) specifying `uses` or `machine: true`, preventing single-use enrollment tokens from crossing into application sessions. `delegated_from` carries the single immediate parent nested recursively up to the authoritative root verifier.
 
 Delegation chains (`delegated_from`) require every link to:
 
@@ -39,7 +39,7 @@ Delegation chains (`delegated_from`) require every link to:
 | 3 | Check `not_before.saturating_sub(30s) <= now < not_after` and `not_before < not_after` | Deny |
 | 4 | Check verified `RevocationList` for `grant.subject`, `grant.issuer`, and `grant.nonce` | Deny |
 | 5 | Require authoritative root `issuer` when empty, or `delegated_from.len() == 1` | Deny |
-| 6 | Confirm `grant.issuer` is `active` in roster and strictly verify Ed25519 signature | Deny |
+| 6 | Confirm `grant.issuer` is `active` in roster and verify both Ed25519 and ML-DSA-65 signatures | Deny |
 | 7 | Check subset rules and recursively evaluate `delegated_from[0]` from step 1 | Deny |
 | 8 | Match requested capability against `caps` and emit structured `AuditEvent` record | Return result |
 
