@@ -16,11 +16,11 @@ Capabilities follow `namespace.verb` or `namespace.verb:resource`:
 
 - `namespace` and `verb` match `^[a-z][a-z0-9_]{0,31}$`.
 - `resource` uses printable non-whitespace ASCII and allows at most one trailing `'*'` prefix wildcard; matching operates on opaque ASCII strings, while `canonicalize_capability_path`, `Capability::covers_path`, `grant_allows_path`, `authorize_path_capability`, and `SessionMachine::authorize_path` reject traversal, dot segments, backslashes, `//`, and trailing slashes for path-scoped checks.
-- Reserved core capabilities are `session.open`, `pair.confirm`, `pair.mint`, `roster.read`, and `roster.revoke`.
+- Reserved core capabilities are `session.open`, `pair.confirm`, `pair.enroll` (optional `:<host_id>` scope), `pair.mint`, `roster.read`, and `roster.revoke`.
 
 ## Signing and delegation
 
-Grants are serialized without `sig` using RFC 8785 JSON Canonicalization Scheme (JCS), prefixed with `"tendril-grant-v1\0"`, and signed with the issuer's Ed25519 signing key. Optional `uses` is reserved for single-use machine enrollment tokens. `delegated_from` carries the single immediate parent nested recursively up to the authoritative root verifier.
+Grants are serialized without `sig` using RFC 8785 JSON Canonicalization Scheme (JCS), prefixed with `"tendril-grant-v1\0"`, and signed with the issuer's Ed25519 signing key. Optional `uses` (`uses == 1`) and `machine: true` are reserved exclusively for single-use enrollment tokens (`uses == 0` fails closed everywhere). Regular `intent = session` authorization (`verify_grant_with_chain` and `authorize_grant`) rejects any grant (leaf or ancestor) specifying `uses` or `machine: true`, preventing single-use enrollment tokens from crossing into application sessions. `delegated_from` carries the single immediate parent nested recursively up to the authoritative root verifier.
 
 Delegation chains (`delegated_from`) require every link to:
 

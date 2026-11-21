@@ -19,6 +19,7 @@ Every language binding and independent implementation must match all canonical v
 | `spec/vectors/rotation.json` | `seq = 1` and `seq = 2` 127-byte binary signatures and chain bridge | Duplicate `seq` fork detection and unanchored fork rejection |
 | `spec/vectors/grants.json` | RFC 8785 JCS canonicalization, grant signature, valid delegation, signed CRL | Widened child scope and forged non-root issuer rejection |
 | `spec/vectors/handshake.json` | Full deterministic `pair` and `session` Noise XX transcripts, `DATA`, and `REKEY` | Unverified `msg2` host key abort before `msg3` |
+| `spec/vectors/m2m_enrollment.json` | Signed single-use `pair.enroll` token, `enroll_proof`, M2M `PairClaim` and `PairResponse` | Single-use replay rejection and session-grant purpose-separation rejection |
 
 ## Verification commands
 

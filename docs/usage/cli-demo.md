@@ -44,9 +44,11 @@ tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --issue-code lan
 #    over --code in multi-user environments), then confirm SAS on both host and client
 tendril --state-dir ./cli-state pair --endpoint 127.0.0.1:PORT --code-stdin <<< "TND-XXXX-XXXX"
 
-# 4. Confirm peer on host and host pin on client (default deny), then mint scoped grant
+# 4. Confirm peer on host and host pin on client (default deny; --sas is required unless passing --allow-no-sas), then mint scoped grant
 tendril --state-dir ./host-state confirm <client_device_id> --sas "<sas>"
 tendril --state-dir ./cli-state confirm my-host --sas "<sas>"
+# Out-of-band fingerprint-only override:
+# tendril --state-dir ./host-state confirm <client_device_id> --allow-no-sas
 tendril --state-dir ./host-state mint <client_device_id> --cap fs.read
 
 # 5. Connect, send data, verify liveness via encrypted PING/PONG, then revoke
@@ -55,7 +57,35 @@ tendril --state-dir ./cli-state dial --target my-host --endpoint 127.0.0.1:PORT 
 tendril --state-dir ./host-state revoke <client_device_id>
 ```
 
-Once revoked, subsequent `dial` attempts fail closed on the host listener during session establishment, and active `tendril serve` sessions reload `roster.json` updates (under `.roster.lock` advisory locking) to terminate revoked peers immediately across ticks or incoming frames (`0x04 REKEY`, `0x01 DATA`).
+## Headless M2M enrollment and log redaction
+
+Autonomous devices enroll without SAS interaction using `serve --allow-enroll`, single-use enrollment tokens (`--token-file`, `--token-stdin`, or `TENDRIL_ENROLL_TOKEN`, avoiding shell history / argv exposure), and optional external trust anchors. Pass `--redact-logs` to `tendril serve` in shared environments so `pairing_code`, decrypted application payload `utf8`, and `token_nonce` are emitted as `"<redacted>"` instead of plaintext on stdout JSON logs:
+
+```bash
+# Register an external trust anchor (optional; omit for self-issued host tokens)
+tendril --state-dir ./host-state anchor add ci-admin --signing-pub "<b64url_ed25519_pub>"
+tendril --state-dir ./host-state anchor list
+
+# Serve with opt-in M2M enrollment and redacted stdout event logs
+tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --allow-enroll --redact-logs
+
+# Mint a single-use token (0o600 --out file) and enroll with mandatory host key pinning
+tendril --state-dir ./host-state enroll-token --target-host my-host --ttl-secs 900 --out ./token.json
+tendril --state-dir ./runner-state enroll \
+  --endpoint 127.0.0.1:PORT \
+  --host-id my-host \
+  --host-static-pub "<b64url_host_static>" \
+  --host-signing-pub "<b64url_host_signing>" \
+  --token-file ./token.json
+
+# Mint application grants after enrollment (still default deny), revoke unused nonces, or rotate keys
+tendril --state-dir ./host-state mint <runner_device_id> --cap fs.read
+tendril --state-dir ./host-state revoke-token "<token_nonce>"
+tendril --state-dir ./host-state anchor revoke ci-admin
+tendril --state-dir ./host-state rotate
+```
+
+Once revoked, subsequent `dial` attempts fail closed on the host listener during session establishment, and active `tendril serve` sessions reload `roster.json` updates (under `.roster.lock` advisory locking) to terminate revoked peers immediately across ticks or incoming frames (`0x04 REKEY`, `0x01 DATA`). `tendril rotate` re-signs any persisted self-issued CRL automatically under the new key so revoked tokens stay blocked across key rotation.
 
 ## JSON stdio conformance peer (`tendril-conformance-peer`)
 

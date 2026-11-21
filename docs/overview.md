@@ -25,20 +25,20 @@ Tendril is a reusable SDK for establishing private, end-to-end encrypted links b
 In scope:
 
 - Pairwise encrypted links between desktop, phone, browser, and server endpoints
-- Human-verified pairing via short code and fingerprint comparison, plus later machine-to-machine token enrollment
+- Human-verified pairing via short code and SAS/fingerprint comparison, plus opt-in machine-to-machine (M2M) single-use token enrollment with trust anchors
 - Signed, expiring, revocable capability grants checked on connection and on every authorized action
 - Pluggable providers spanning local, direct, overlay, peer-to-peer, relay, and broker paths
 
-Out of scope for v1:
+Out of scope for v1 (tracked in [ADR 0003](adr/0003-v2-privacy-profile.md) for v2):
 
 - Multi-party group encryption and shared group rosters
-- Anonymous routing or traffic-analysis resistance
+- Anonymous routing, epoch-blinded relay mailboxes, packet padding, and timing-resistant cover traffic
 - Hosted user accounts or mandatory cloud control planes
 - Replacing TLS for general public web browsing
 
-## Explicit limits
+## Explicit limits and v1 tradeoffs
 
 - **Sleeping mobile devices.** Operating systems suspend background sockets; pull works when awake, and push is an optional wake signal only.
 - **Browser platform limits.** Web clients run the core in WASM over WebSockets and polling without raw UDP or reliable background links.
-- **Relay visibility.** Relays cannot read or forge sealed frames, but they observe endpoints, frame counts, sizes, and timing.
+- **Relay visibility and v1 metadata.** Relays cannot read or forge sealed frames, but v1 observes static mailbox `device_id` strings, unpadded ciphertext lengths, and keepalive/rekey timing; operators should use self-hosted relays and `serve --redact-logs` where event log confidentiality matters, with wire-level privacy hardening scoped to v2 ([ADR 0003](adr/0003-v2-privacy-profile.md)).
 - **Offline revocation.** A revoked peer cannot learn of its revocation until it attempts to reconnect or rekey.

@@ -40,7 +40,7 @@ sequenceDiagram
 | `pairing_sas` | `group4(first16(lower(base32_nopad(SHA-256("tendril-sas-v1" \|\| h)))))` | `xxxx xxxx xxxx xxxx` |
 | `code_mac` | `HMAC-SHA256(argon2id(code_norm, h[..16], t=3, m=65536, p=1, v=0x13), "tendril-pair-v1" \|\| h)` | 32 bytes (`b64url`) |
 
-Codes default to a 15-minute TTL and burn after 5 failed claim attempts across live codes.
+Codes default to a 15-minute TTL and burn after 5 failed claim attempts across live codes. Manual pairing requires explicit SAS confirmation before leaving `pending` state unless an operator opts in via fingerprint-only confirmation. For opt-in headless deployment without interactive SAS, `PairClaim` carries `enrollment_token`, `signing_pub`, and `enroll_proof` instead of `code_mac`, requires an out-of-band host pin (`PinnedHost`), burns the token nonce atomically, and transitions directly to `"active"` with zero application grants; see [Machine-to-machine enrollment](m2m-enrollment.md).
 
 ## Inner encrypted frames and rotation
 
