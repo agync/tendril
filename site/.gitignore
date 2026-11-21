@@ -1,0 +1,6 @@
+/dist/
+/build/
+# The renderer and Mermaid runtime for hosts without podman; toolchain.sh regenerates it.
+/.toolchain/
+/.wrangler/
+/node_modules/

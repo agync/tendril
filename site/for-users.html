@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your app uses Tendril</title>
+<meta name="description" content="For people using an app built on Tendril: what it does for your data, what you will see when you pair, what you control, and what it cannot promise.">
+<link rel="canonical" href="{{SITE_URL}}/for-users">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Tendril">
+<meta property="og:title" content="Your app uses Tendril">
+<meta property="og:url" content="{{SITE_URL}}/for-users">
+<meta property="og:description" content="What Tendril does for your data, what you will see, what you control, and what it cannot promise. In plain words.">
+<meta property="og:image" content="{{SITE_URL}}/assets/img/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Tendril logo with the words &quot;Pair two devices. No account, no server to trust.&quot; and &quot;Open source SDK. Rust core. Apache-2.0.&quot; Along the bottom, a filled square is linked to an outlined square.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="{{SITE_URL}}/assets/img/og.png">
+<meta name="twitter:image:alt" content="The Tendril logo with the words &quot;Pair two devices. No account, no server to trust.&quot; and &quot;Open source SDK. Rust core. Apache-2.0.&quot; Along the bottom, a filled square is linked to an outlined square.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/assets/css/fonts.css">
+<link rel="stylesheet" href="/assets/css/tokens.css">
+<link rel="stylesheet" href="/assets/css/site.css">
+<link rel="stylesheet" href="/assets/css/how.css">
+<link rel="stylesheet" href="/assets/css/users.css">
+<script src="/assets/js/theme.js"></script>
+<script src="/assets/js/how.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="/" aria-label="Tendril home">
+      <span class="mark" aria-hidden="true"><span class="mark-a"></span><span class="mark-l"></span><span class="mark-b"></span></span>
+      <span class="wordmark">tendril</span>
+    </a>
+    <nav class="top-nav" aria-label="Site">
+      <a href="/use-cases">Use cases</a>
+      <a href="/how-it-works">How it works</a>
+      <a class="nav-wide" href="/#trust">Security</a>
+      <a href="/docs/">Docs</a>
+      <a class="nav-mid" href="https://github.com/agync/tendril">GitHub</a>
+    </nav>
+    <span class="tag">v0.1</span>
+    <button class="theme-toggle" type="button" aria-label="Switch colour theme" data-theme-toggle>
+      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M8 1.75a6.25 6.25 0 0 1 0 12.5z" fill="currentColor"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<header class="doc-head wrap">
+  <p class="eyebrow">For people using an app</p>
+  <h1>Your app uses Tendril</h1>
+  <p class="doc-lede">An app on your devices says it is secured by Tendril. Here is what that means for your data, in plain words, including what it cannot promise.</p>
+  <ol class="jump" aria-label="On this page">
+    <li><a href="#does"><span class="n">01</span>What it does</a></li>
+    <li><a href="#see"><span class="n">02</span>What you will see</a></li>
+    <li><a href="#control"><span class="n">03</span>What you control</a></li>
+    <li><a href="#limits"><span class="n">04</span>What it cannot promise</a></li>
+    <li><a href="#check"><span class="n">05</span>How to check</a></li>
+  </ol>
+</header>
+
+<div class="doc doc-one wrap">
+  <div class="doc-body">
+
+<section id="does" class="part" aria-labelledby="h-does">
+  <p class="part-n">01</p>
+  <h2 id="h-does">What it does for you</h2>
+  <p class="part-lead">Your devices talk to each other, not to an account in someone's cloud. What passes between them is sealed, so only those two devices can read it.</p>
+  <figure class="fig">
+    <svg class="dia" viewBox="0 0 400 176" role="img" aria-label="A laptop at home and a phone with you, linked by a sealed connection. They connect directly when they can. If they cannot, a relay passes the sealed data along without being able to read it.">
+      <rect class="b b-acc" x="4" y="28" width="112" height="56"/>
+      <text class="t-s t-strong" x="60" y="52" text-anchor="middle">laptop</text>
+      <text class="t-xs t-mut" x="60" y="68" text-anchor="middle">runs the app</text>
+      <rect class="b b-acc" x="284" y="28" width="112" height="56"/>
+      <text class="t-s t-strong" x="340" y="52" text-anchor="middle">phone</text>
+      <text class="t-xs t-mut" x="340" y="68" text-anchor="middle">with you</text>
+      <path class="w-acc" d="M116 56H284"/>
+      <text class="t-xs t-acc" x="200" y="48" text-anchor="middle">sealed</text>
+      <text class="t-xs t-mut" x="200" y="72" text-anchor="middle">directly, when it can</text>
+      <path class="w w-dash" d="M60 84V146H160M240 146H340V84"/>
+      <rect class="b b-dash" x="160" y="132" width="80" height="28"/>
+      <text class="t-xs" x="200" y="150" text-anchor="middle">relay</text>
+      <text class="t-xs t-mut" x="200" y="124" text-anchor="middle">only if needed</text>
+      <text class="t-xs t-mut" x="200" y="174" text-anchor="middle">passes it along, cannot read it</text>
+    </svg>
+    <figcaption>Illustrative. A laptop and a phone stand in for your devices.</figcaption>
+  </figure>
+  <ul class="facts">
+    <li><p class="facts-h">No account</p><p>Tendril pairs your devices with a code, not a sign-in.</p></li>
+    <li><p class="facts-h">Nobody in between reads it</p><p>Not your network, not a relay, not the app's maker.</p></li>
+    <li><p class="facts-h">Keys stay on your devices</p><p>They are made there. The maker's servers never hold them.</p></li>
+  </ul>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>The seal.</strong> Each connection starts with a handshake, <code>Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256</code>, that proves each device holds the keys it paired with, then encrypts everything after it. A path counts only once that proof succeeds.</p>
+      <p><strong>Paths.</strong> On the same network the devices connect directly. Away from home they can try hole punching through iroh, and if nothing direct gets through, a relay forwards sealed frames. A relay can be the maker's, a public one, or one you run.</p>
+      <p><strong>Keys.</strong> Each device makes its own keys. On desktops they sit in files only your user account can read. On phones they are sealed with a key from the Keychain or the Android Keystore, stay on that phone, and are not restored to another device from a backup. The Swift and Android test suites do not yet run in CI.</p>
+      <p class="more-link">Read more: <a href="/how-it-works#identity">Keys</a>, <a href="/how-it-works#paths">Paths</a> and <a href="/how-it-works#relays">What a relay can see</a> on How it works</p>
+    </div>
+  </details>
+</section>
+
+<section id="see" class="part" aria-labelledby="h-see">
+  <p class="part-n">02</p>
+  <h2 id="h-see">What you will see</h2>
+  <p class="part-lead">Pairing happens once per device and takes three steps.</p>
+  <figure class="fig">
+    <ol class="see">
+      <li class="see-step">
+        <div class="see-text">
+          <p class="see-n">01</p>
+          <h3>Type or scan a code</h3>
+          <p>The laptop shows a code. Scan it with your phone, or type it. It works once, for 15 minutes.</p>
+        </div>
+        <div class="see-pair">
+          <div class="device">
+            <div class="device-bar"><span>laptop</span></div>
+            <div class="device-body see-body">
+              <svg class="qr see-qr" viewBox="-1 -1 23 23" role="img" aria-label="Pairing QR code, illustrative"><rect x="-1" y="-1" width="23" height="23" fill="#FFFFFF"/><path d="M0 0h1v1h-1zM1 0h1v1h-1zM2 0h1v1h-1zM3 0h1v1h-1zM4 0h1v1h-1zM5 0h1v1h-1zM6 0h1v1h-1zM10 0h1v1h-1zM12 0h1v1h-1zM14 0h1v1h-1zM15 0h1v1h-1zM16 0h1v1h-1zM17 0h1v1h-1zM18 0h1v1h-1zM19 0h1v1h-1zM20 0h1v1h-1zM0 1h1v1h-1zM6 1h1v1h-1zM14 1h1v1h-1zM20 1h1v1h-1zM0 2h1v1h-1zM2 2h1v1h-1zM3 2h1v1h-1zM4 2h1v1h-1zM6 2h1v1h-1zM11 2h1v1h-1zM14 2h1v1h-1zM16 2h1v1h-1zM17 2h1v1h-1zM18 2h1v1h-1zM20 2h1v1h-1zM0 3h1v1h-1zM2 3h1v1h-1zM3 3h1v1h-1zM4 3h1v1h-1zM6 3h1v1h-1zM9 3h1v1h-1zM10 3h1v1h-1zM11 3h1v1h-1zM14 3h1v1h-1zM16 3h1v1h-1zM17 3h1v1h-1zM18 3h1v1h-1zM20 3h1v1h-1zM0 4h1v1h-1zM2 4h1v1h-1zM3 4h1v1h-1zM4 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM10 4h1v1h-1zM14 4h1v1h-1zM16 4h1v1h-1zM17 4h1v1h-1zM18 4h1v1h-1zM20 4h1v1h-1zM0 5h1v1h-1zM6 5h1v1h-1zM10 5h1v1h-1zM12 5h1v1h-1zM14 5h1v1h-1zM20 5h1v1h-1zM0 6h1v1h-1zM1 6h1v1h-1zM2 6h1v1h-1zM3 6h1v1h-1zM4 6h1v1h-1zM5 6h1v1h-1zM6 6h1v1h-1zM8 6h1v1h-1zM10 6h1v1h-1zM14 6h1v1h-1zM15 6h1v1h-1zM16 6h1v1h-1zM17 6h1v1h-1zM18 6h1v1h-1zM19 6h1v1h-1zM20 6h1v1h-1zM9 7h1v1h-1zM12 7h1v1h-1zM2 8h1v1h-1zM3 8h1v1h-1zM5 8h1v1h-1zM6 8h1v1h-1zM7 8h1v1h-1zM8 8h1v1h-1zM10 8h1v1h-1zM13 8h1v1h-1zM17 8h1v1h-1zM18 8h1v1h-1zM19 8h1v1h-1zM20 8h1v1h-1zM1 9h1v1h-1zM2 9h1v1h-1zM3 9h1v1h-1zM5 9h1v1h-1zM6 9h1v1h-1zM8 9h1v1h-1zM10 9h1v1h-1zM11 9h1v1h-1zM12 9h1v1h-1zM13 9h1v1h-1zM16 9h1v1h-1zM1 10h1v1h-1zM5 10h1v1h-1zM8 10h1v1h-1zM9 10h1v1h-1zM10 10h1v1h-1zM11 10h1v1h-1zM15 10h1v1h-1zM16 10h1v1h-1zM1 11h1v1h-1zM6 11h1v1h-1zM7 11h1v1h-1zM8 11h1v1h-1zM10 11h1v1h-1zM11 11h1v1h-1zM13 11h1v1h-1zM14 11h1v1h-1zM15 11h1v1h-1zM16 11h1v1h-1zM20 11h1v1h-1zM11 12h1v1h-1zM12 12h1v1h-1zM18 12h1v1h-1zM19 12h1v1h-1zM13 13h1v1h-1zM16 13h1v1h-1zM17 13h1v1h-1zM19 13h1v1h-1zM0 14h1v1h-1zM1 14h1v1h-1zM2 14h1v1h-1zM3 14h1v1h-1zM4 14h1v1h-1zM5 14h1v1h-1zM6 14h1v1h-1zM8 14h1v1h-1zM9 14h1v1h-1zM10 14h1v1h-1zM11 14h1v1h-1zM15 14h1v1h-1zM16 14h1v1h-1zM17 14h1v1h-1zM20 14h1v1h-1zM0 15h1v1h-1zM6 15h1v1h-1zM8 15h1v1h-1zM9 15h1v1h-1zM10 15h1v1h-1zM11 15h1v1h-1zM12 15h1v1h-1zM20 15h1v1h-1zM0 16h1v1h-1zM2 16h1v1h-1zM3 16h1v1h-1zM4 16h1v1h-1zM6 16h1v1h-1zM8 16h1v1h-1zM10 16h1v1h-1zM11 16h1v1h-1zM12 16h1v1h-1zM18 16h1v1h-1zM19 16h1v1h-1zM20 16h1v1h-1zM0 17h1v1h-1zM2 17h1v1h-1zM3 17h1v1h-1zM4 17h1v1h-1zM6 17h1v1h-1zM9 17h1v1h-1zM10 17h1v1h-1zM12 17h1v1h-1zM13 17h1v1h-1zM14 17h1v1h-1zM15 17h1v1h-1zM18 17h1v1h-1zM20 17h1v1h-1zM0 18h1v1h-1zM2 18h1v1h-1zM3 18h1v1h-1zM4 18h1v1h-1zM6 18h1v1h-1zM8 18h1v1h-1zM11 18h1v1h-1zM12 18h1v1h-1zM16 18h1v1h-1zM17 18h1v1h-1zM19 18h1v1h-1zM20 18h1v1h-1zM0 19h1v1h-1zM6 19h1v1h-1zM8 19h1v1h-1zM10 19h1v1h-1zM13 19h1v1h-1zM14 19h1v1h-1zM15 19h1v1h-1zM16 19h1v1h-1zM18 19h1v1h-1zM19 19h1v1h-1zM0 20h1v1h-1zM1 20h1v1h-1zM2 20h1v1h-1zM3 20h1v1h-1zM4 20h1v1h-1zM5 20h1v1h-1zM6 20h1v1h-1zM11 20h1v1h-1zM15 20h1v1h-1zM18 20h1v1h-1zM19 20h1v1h-1z" fill="#1C1917"/></svg>
+              <span class="see-code">TND-4F9K-22XQ</span>
+            </div>
+          </div>
+          <div class="device">
+            <div class="device-bar"><span>phone</span></div>
+            <div class="device-body see-body">
+              <span class="viewfinder see-vf" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+              <span class="faint small">Scan, or type</span>
+            </div>
+          </div>
+        </div>
+      </li>
+      <li class="see-step">
+        <div class="see-text">
+          <p class="see-n">02</p>
+          <h3>Compare a short string</h3>
+          <p>Both screens show the same 16 characters. Confirm only if every one matches.</p>
+        </div>
+        <div class="see-pair">
+          <div class="device">
+            <div class="device-bar"><span>laptop</span></div>
+            <div class="device-body see-body">
+              <span class="see-sas">k7qm 4xrt<br>3fpa 2wnc</span>
+              <span class="fake-btn">They match</span>
+            </div>
+          </div>
+          <div class="device">
+            <div class="device-bar"><span>phone</span></div>
+            <div class="device-body see-body">
+              <span class="see-sas">k7qm 4xrt<br>3fpa 2wnc</span>
+              <span class="fake-btn fake-btn-primary">They match</span>
+            </div>
+          </div>
+        </div>
+      </li>
+      <li class="see-step">
+        <div class="see-text">
+          <p class="see-n">03</p>
+          <h3>See your devices</h3>
+          <p>The laptop now lists your phone. The app can show you this list, and what each device may do.</p>
+        </div>
+        <div class="see-pair">
+          <div class="device">
+            <div class="device-bar"><span>laptop</span></div>
+            <div class="device-body see-body">
+              <span class="pane-title">Your devices</span>
+              <dl class="kv">
+                <div><dt>phone</dt><dd><span class="dot dot-ok"></span>active</dd></div>
+                <div><dt>May</dt><dd>sync notes</dd></div>
+              </dl>
+              <span class="fake-btn">Remove</span>
+            </div>
+          </div>
+          <div class="device">
+            <div class="device-bar"><span>phone</span></div>
+            <div class="device-body see-body">
+              <span class="pane-title">Paired with laptop</span>
+              <span class="muted small">Notes are syncing.</span>
+            </div>
+          </div>
+        </div>
+      </li>
+    </ol>
+    <figcaption>Example screens. Each app draws its own.</figcaption>
+  </figure>
+  <p class="callout"><strong>Why compare?</strong> If the strings differ, someone is between your devices. Cancel, and that device gets no access.</p>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>The code.</strong> It is bound to this one handshake and never crosses the network itself. The QR code also carries the laptop's key, so the phone turns away an impostor before it says anything. Pairing across the internet uses a longer code, <code>TND-XXXX-XXXX-XXXX</code>.</p>
+      <p><strong>The string.</strong> Both devices work it out from the handshake they just ran. A device in the middle would have run a different handshake with each side, so the two screens would not match.</p>
+      <p><strong>After pairing.</strong> The new device can open a sealed connection and nothing else, until the app grants it something.</p>
+      <p class="more-link">Read more: <a href="/how-it-works#pairing">Pairing</a> on How it works</p>
+    </div>
+  </details>
+</section>
+
+<section id="control" class="part" aria-labelledby="h-control">
+  <p class="part-n">03</p>
+  <h2 id="h-control">What you control</h2>
+  <p class="part-lead">The laptop keeps the list of your devices and decides what each may do. A new device can do nothing until the app allows it.</p>
+  <figure class="fig">
+    <div class="grants">
+      <div class="grant">
+        <p class="grant-h">phone<span>on the laptop's list</span></p>
+        <dl class="kl kl-plain">
+          <div><dt>State</dt><dd>active</dd></div>
+          <div><dt>May</dt><dd>sync notes</dd></div>
+          <div><dt>Until</dt><dd>30 days from now</dd></div>
+        </dl>
+      </div>
+      <table class="checks">
+        <caption>The phone asks, the laptop checks</caption>
+        <thead><tr><th scope="col">The phone asks to</th><th scope="col">Result</th></tr></thead>
+        <tbody>
+          <tr><td>Sync notes</td><td><span class="st st-ok">allowed</span></td></tr>
+          <tr><td>Read your photos</td><td><span class="st st-no">refused</span> <span class="why">never allowed</span></td></tr>
+          <tr><td>Anything, once you remove the phone</td><td><span class="st st-no">refused</span> <span class="why">removed</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Illustrative. Each app names what its devices may do.</figcaption>
+  </figure>
+  <ul class="gains">
+    <li>Permissions can run out on their own, for example after an evening.</li>
+    <li>Lost a phone? Remove it on the laptop. Its next request is refused, even mid-connection, and it cannot connect again.</li>
+    <li>Remove it soon. Until you do, an unlocked phone can still do what it was allowed.</li>
+  </ul>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>The list.</strong> The device that runs the app keeps a roster: every device it has paired, whether each is pending, active or removed, and its grants. A grant is a signed permission with an end time.</p>
+      <p><strong>Checks.</strong> The app asks Tendril before it acts on a request. The answer is no unless an active device holds a grant that covers it.</p>
+      <p><strong>Removing.</strong> A removed device is marked revoked and its grants are cleared, so its next request is denied, even in a connection that is already open. It cannot open a new one, or pair again with the same key. A phone that is offline learns of it when it next connects.</p>
+      <p class="more-link">Read more: <a href="/how-it-works#grants">Grants</a> and <a href="/how-it-works#revocation">Revocation</a> on How it works</p>
+    </div>
+  </details>
+</section>
+
+<section id="limits" class="part" aria-labelledby="h-limits">
+  <p class="part-n">04</p>
+  <h2 id="h-limits">What it cannot promise</h2>
+  <p class="part-lead">Tendril protects what you send. These four things it does not, or not yet.</p>
+  <dl class="limits">
+    <div>
+      <dt>Who talks to whom</dt>
+      <dd>Networks and relays still see your devices' addresses, when they connect and how much they send. They cannot see what.</dd>
+    </div>
+    <div>
+      <dt>New code</dt>
+      <dd>Tendril is new. Its code has had no outside security review yet.</dd>
+    </div>
+    <div>
+      <dt>Future quantum computers</dt>
+      <dd>The link uses two kinds of encryption together, a long-standing one and a newer one designed to resist quantum computers. It stays secure as long as either one holds.</dd>
+    </div>
+    <div>
+      <dt>The app itself</dt>
+      <dd>The app on your devices still sees your data, as it must to show it to you. Tendril protects the link, not the app. Ask the app's maker what it does with your data.</dd>
+    </div>
+  </dl>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>Metadata.</strong> By default, a relay sees the same mailbox key each time a device waits for connections, so it can link that device's sessions, and exact message sizes and regular keepalives show patterns. An app can turn on Wire v2, which changes that key every hour, rounds message sizes up to fixed steps and varies the timing of keepalives. Even then, networks see when your devices talk and roughly how much.</p>
+      <p><strong>Hybrid post-quantum.</strong> The handshake pairs X25519 with ML-KEM-768, and signatures pair Ed25519 with ML-DSA-65. Two parts are not covered: relay mailbox proofs use Ed25519 only, and the iroh transport under the peer-to-peer path is classic. Your data inside the session is covered on every path.</p>
+      <p><strong>Waking a phone.</strong> An app can wake a sleeping phone through a push service such as Apple's or Google's. The push carries only a tag that changes every hour, never your data, device names or keys. The push service still sees that your phone was woken, and when.</p>
+      <p><strong>Review.</strong> The algorithms are standard. The Noise code that runs the handshake is Tendril's own, checked against a separate Go version, and not yet audited.</p>
+      <p class="more-link">Read more: <a href="/how-it-works#limits">Limits</a> on How it works, and <a href="/docs/adr/0004-hybrid-post-quantum-v1.html">why the handshake is hybrid</a></p>
+    </div>
+  </details>
+</section>
+
+<section id="check" class="part" aria-labelledby="h-check">
+  <p class="part-n">05</p>
+  <h2 id="h-check">Why you can check</h2>
+  <p class="part-lead">You do not have to take this page's word for it. You, or someone you trust, can check each claim.</p>
+  <ul class="further-l">
+    <li><a href="https://github.com/agync/tendril">The source</a><span>Open source under Apache-2.0. Anyone can read it.</span></li>
+    <li><a href="https://github.com/agync/tendril/tree/main/spec">The spec</a><span>The rules every device follows, written down in public.</span></li>
+    <li><a href="/how-it-works">How it works</a><span>The design in nine parts, with the details.</span></li>
+    <li><a href="https://github.com/agync/tendril/security">Report a problem</a><span>Found a security issue? Tell us privately.</span></li>
+  </ul>
+  <p class="aside check-note">Every claim on this site is checked against the code before it goes up.</p>
+</section>
+
+  </div>
+</div>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-row">
+    <span><span class="wordmark">tendril</span> Apache-2.0. No analytics, no cookies.</span>
+    <nav aria-label="Footer">
+      <a href="/for-users" aria-current="page">For app users</a>
+      <a href="/docs/overview.html">Overview</a>
+      <a href="/docs/architecture/">Architecture</a>
+      <a href="/docs/reference/">Reference</a>
+      <a href="/docs/usage/cli-demo.html">CLI demo</a>
+      <a href="https://github.com/agync/tendril">GitHub</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

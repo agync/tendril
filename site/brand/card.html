@@ -1,0 +1,96 @@
+<!doctype html>
+<!--
+  The social card: the Open Graph image (1200 x 630) and the GitHub social preview (1280 x 640),
+  each light and dark. scripts/brand.mjs fills the {{...}} slots from brand/mark.svg and
+  brand/wordmark.svg, opens it at each size and captures it. Sizes are in --u, one pixel of the
+  1200 wide card; --pad-x widens the side margins so the GitHub crop keeps everything.
+-->
+<html lang="en-GB" data-theme="{{THEME}}">
+<head>
+<meta charset="utf-8">
+<title>Tendril social card</title>
+<style>
+  @font-face {
+    font-family: "IBM Plex Sans";
+    font-weight: 100 700;
+    src: url("/assets/fonts/ibm-plex-sans-latin-var.woff2") format("woff2");
+  }
+  @font-face {
+    font-family: "IBM Plex Mono";
+    font-weight: 400;
+    src: url("/assets/fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+  }
+
+  :root {
+    --u: calc(100vh / 630);
+    --pad-x: calc(var(--u) * {{PAD_X}});
+    --bg: #FAFAF9;
+    --ink: #1C1917;
+    --ink-3: #57534E;
+    --line: #D6D3D1;
+    --accent: #4A6B14;
+  }
+  :root[data-theme="dark"] {
+    --bg: #111114;
+    --ink: #F4F4F5;
+    --ink-3: #A1A1AA;
+    --line: #3A3A40;
+    --accent: #A9C76B;
+  }
+
+  html, body { margin: 0; height: 100%; }
+  body {
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .card {
+    box-sizing: border-box;
+    height: 100%;
+    padding: calc(var(--u) * 72) var(--pad-x) calc(var(--u) * 72);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .lockup { display: block; height: calc(var(--u) * 46); width: auto; align-self: flex-start; }
+  .lockup .m { fill: var(--accent); }
+  .lockup .w { fill: var(--ink); }
+
+  h1 {
+    margin: auto 0 0;
+    font-weight: 600;
+    font-size: calc(var(--u) * 72);
+    line-height: 1.1;
+    letter-spacing: -0.025em;
+  }
+  p {
+    margin: calc(var(--u) * 26) 0 0;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: calc(var(--u) * 26);
+    color: var(--ink-3);
+  }
+
+  /* The two-device link: the mark at 3 px to the unit, its link stretched across the card. */
+  .link {
+    margin-top: calc(var(--u) * 60);
+    display: flex;
+    align-items: center;
+  }
+  .link i { display: block; flex: none; width: calc(var(--u) * 24); height: calc(var(--u) * 24); box-sizing: border-box; }
+  .link .host { background: var(--accent); }
+  .link .peer { border: calc(var(--u) * 6) solid var(--accent); }
+  .link .path { flex: 1; height: calc(var(--u) * 6); width: auto; background: var(--accent); }
+</style>
+</head>
+<body>
+<div class="card">
+  {{LOCKUP}}
+  <h1>Pair two devices.<br>No account, no server to trust.</h1>
+  <p>Open source SDK. Rust core. Apache-2.0.</p>
+  <div class="link" aria-hidden="true"><i class="host"></i><i class="path"></i><i class="peer"></i></div>
+</div>
+</body>
+</html>

@@ -13,7 +13,7 @@ JNI_OS := $(if $(filter Darwin,$(shell uname -s)),darwin,linux)
 override MSG := $(value MSG)
 export MSG
 
-.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check bindings/go bindings/python bindings/node bindings/wasm bindings/wasm-p2p bindings/web bindings/jni bindings/android bindings/check docs/check docs/build docs/serve docs/log hooks/require hooks/update
+.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check bindings/go bindings/python bindings/node bindings/wasm bindings/wasm-p2p bindings/web bindings/jni bindings/android bindings/check docs/check docs/build docs/serve docs/log site site/serve site/check site/brand site/clean hooks/require hooks/update
 
 ##@ Bootstrap
 
@@ -150,6 +150,23 @@ docs/log: ## Add a wiki log entry page: make docs/log MSG="..." [KIND=Update]
 	@[ -n "$$MSG" ] || { printf '\n  ERROR: set MSG="..."\n\n' >&2; exit 2; }
 	@[ -f "$(OKF_WIKI)/scripts/log-entry.py" ] || { printf 'docs/log: okf-wiki skill not found at %s (set OKF_WIKI)\n' "$(OKF_WIKI)" >&2; exit 1; }
 	python3 "$(OKF_WIKI)/scripts/log-entry.py" add --bundle "$(DOCS)" --kind "$(KIND)" "$$MSG"
+
+##@ Site
+
+site: ## Build the landing page and the themed docs into site/dist (the Cloudflare deploy directory)
+	$(MAKE) -C site site
+
+site/serve: ## Serve site/dist on 127.0.0.1:4180 with its _headers applied
+	$(MAKE) -C site serve
+
+site/check: ## Run axe, console, and keyboard checks against the served site in the Playwright container (needs site/serve)
+	$(MAKE) -C site check
+
+site/brand: ## Render the logos, icons and social cards from site/brand/ in the Playwright container
+	$(MAKE) -C site brand
+
+site/clean: ## Remove the site build output
+	$(MAKE) -C site clean
 
 ##@ Utilities
 

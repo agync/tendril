@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Where Tendril fits</title>
+<meta name="description" content="Four apps Tendril fits: a desktop app you reach from your phone, devices that sync with no account, home appliances that need no vendor cloud, and machines with no screen. Plus when to use something else.">
+<link rel="canonical" href="{{SITE_URL}}/use-cases">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Tendril">
+<meta property="og:title" content="Where Tendril fits">
+<meta property="og:url" content="{{SITE_URL}}/use-cases">
+<meta property="og:description" content="A desktop app you reach from your phone, devices that sync with no account, appliances with no vendor cloud, and machines with no screen.">
+<meta property="og:image" content="{{SITE_URL}}/assets/img/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Tendril logo with the words &quot;Pair two devices. No account, no server to trust.&quot; and &quot;Open source SDK. Rust core. Apache-2.0.&quot; Along the bottom, a filled square is linked to an outlined square.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="{{SITE_URL}}/assets/img/og.png">
+<meta name="twitter:image:alt" content="The Tendril logo with the words &quot;Pair two devices. No account, no server to trust.&quot; and &quot;Open source SDK. Rust core. Apache-2.0.&quot; Along the bottom, a filled square is linked to an outlined square.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/assets/css/fonts.css">
+<link rel="stylesheet" href="/assets/css/tokens.css">
+<link rel="stylesheet" href="/assets/css/site.css">
+<link rel="stylesheet" href="/assets/css/how.css">
+<link rel="stylesheet" href="/assets/css/uses.css">
+<script src="/assets/js/theme.js"></script>
+<script src="/assets/js/how.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="/" aria-label="Tendril home">
+      <span class="mark" aria-hidden="true"><span class="mark-a"></span><span class="mark-l"></span><span class="mark-b"></span></span>
+      <span class="wordmark">tendril</span>
+    </a>
+    <nav class="top-nav" aria-label="Site">
+      <a href="/use-cases" aria-current="page">Use cases</a>
+      <a href="/how-it-works">How it works</a>
+      <a class="nav-wide" href="/#trust">Security</a>
+      <a href="/docs/">Docs</a>
+      <a class="nav-mid" href="https://github.com/agync/tendril">GitHub</a>
+    </nav>
+    <span class="tag">v0.1</span>
+    <button class="theme-toggle" type="button" aria-label="Switch colour theme" data-theme-toggle>
+      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M8 1.75a6.25 6.25 0 0 1 0 12.5z" fill="currentColor"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<header class="doc-head wrap">
+  <p class="eyebrow">Use cases</p>
+  <h1>Where Tendril fits</h1>
+  <p class="doc-lede">Tendril is for apps that link devices one person or one team already owns, where an account or a cloud server would add cost and risk but nothing else. Here are four such apps, most common first, and the jobs where something else fits better.</p>
+  <p class="doc-note">Each case starts with a moment, then the problem and what changes. Open <em>The details</em> for the mechanism and the limits.</p>
+</header>
+
+<div class="doc wrap">
+  <nav class="toc" aria-label="On this page">
+    <details class="toc-d" data-toc>
+      <summary>On this page</summary>
+      <ol>
+        <li><a href="#desktop"><span class="n">01</span>Desktop app</a></li>
+        <li><a href="#sync"><span class="n">02</span>Your devices</a></li>
+        <li><a href="#appliances"><span class="n">03</span>Appliances</a></li>
+        <li><a href="#machines"><span class="n">04</span>Machines</a></li>
+        <li><a href="#elsewhere"><span class="n">05</span>Something else</a></li>
+      </ol>
+    </details>
+  </nav>
+
+  <div class="doc-body">
+
+<section id="desktop" class="part" aria-labelledby="h-desktop">
+  <p class="part-n">01<span class="part-dev">Mac mini and phone</span></p>
+  <h2 id="h-desktop">Reach your desktop app from your phone</h2>
+  <p class="part-moment">You are out, and the agent at home needs a yes.</p>
+  <p class="part-lead"><span class="lab">The problem.</span> A coding agent on the Mac mini stops to ask before it acts, and you have only your phone. The usual fixes are an open port, a VPN, or a cloud dashboard that sees your code.</p>
+  <p class="part-lead"><span class="lab">With Tendril.</span> The app on the Mac mini pairs with your phone once: scan a code, compare a check string. After that the phone reaches the Mac mini directly at home, or through hole punching or a relay when away, and it can do only what you granted.</p>
+  <figure class="fig">
+    <div class="grants">
+      <div class="grant">
+        <p class="grant-h">Grant<span>signed by Mac mini</span></p>
+        <dl class="kl">
+          <div><dt>For</dt><dd>your phone</dd></div>
+          <div><dt>May</dt><dd><code>agent.status</code><br><code>agent.approve</code><br><code>logs.read:/builds/*</code></dd></div>
+          <div><dt>Until</dt><dd>30 days from now</dd></div>
+        </dl>
+      </div>
+      <table class="checks">
+        <caption>The phone asks, the Mac mini checks</caption>
+        <thead><tr><th scope="col">Request</th><th scope="col">Result</th></tr></thead>
+        <tbody>
+          <tr><td><code>agent.approve</code></td><td><span class="st st-ok">allow</span></td></tr>
+          <tr><td><code>logs.read:/builds/142.log</code></td><td><span class="st st-ok">allow</span></td></tr>
+          <tr><td><code>shell.exec</code></td><td><span class="st st-no">deny</span> <span class="why">not granted</span></td></tr>
+          <tr><td><code>logs.read:/etc/hosts</code></td><td><span class="st st-no">deny</span> <span class="why">outside /builds/</span></td></tr>
+          <tr><td>Anything, once you revoke the phone</td><td><span class="st st-no">deny</span> <span class="why">revoked</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Illustrative. Your app names its own grants.</figcaption>
+  </figure>
+  <div class="for">
+    <div>
+      <p class="for-h">For the person using it</p>
+      <ul>
+        <li>No account to make and no port to open.</li>
+        <li>The phone can approve and read logs. It can never run a shell.</li>
+        <li>Phone lost? Revoke it on the Mac mini.</li>
+      </ul>
+    </div>
+    <div>
+      <p class="for-h">For you, building it</p>
+      <ul>
+        <li>No sign-in server to run, and no user data on your servers.</li>
+        <li>Pairing, keys, grants and revocation come from one library.</li>
+        <li>You draw the screens. Tendril supplies the code, the check string and the result.</li>
+      </ul>
+    </div>
+  </div>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>Paths.</strong> On the same network the phone can use the direct path. Away from home it can use the p2p path, hole punching through iroh, or a relay that forwards sealed frames it cannot read. In Rust, <code>dial_with_policy</code> tries the paths nearest first and keeps the first one that proves the Mac mini. The other bindings and the CLI dial the one address you give them today.</p>
+      <p><strong>Changing networks.</strong> Reconnecting is up to your app. When the phone leaves Wi-Fi, the app dials again, the devices run a new handshake on another path, and the pairing and grants carry over. Phones suspend background sockets while asleep, so the phone reaches the Mac mini again when it wakes.</p>
+      <p><strong>A phone asleep.</strong> With Wire v2, the Mac mini can send a sleeping phone a wake hint through a push service, such as FCM or an APNs gateway, then dial it once it is back. The hint carries a tag that changes every hour, and no data.</p>
+      <p><strong>Checks.</strong> The Mac mini checks the grant when a session opens, on every rekey and on every <code>authorize</code> call. Plain checks treat a resource as an opaque string. For file paths, the Rust core's <code>authorize_path</code> cleans the path first and matches only at <code>/</code> boundaries.</p>
+      <p><strong>Revoking.</strong> Once the Mac mini marks the phone revoked, its next request is denied, even in a session that is already open, and it cannot open a new one.</p>
+      <p class="more-link">Read more: <a href="/how-it-works#grants">Grants</a>, <a href="/how-it-works#revocation">Revocation</a> and <a href="/how-it-works#paths">Paths</a> on How it works</p>
+    </div>
+  </details>
+</section>
+
+<section id="sync" class="part" aria-labelledby="h-sync">
+  <p class="part-n">02<span class="part-dev">laptop, phone and a browser tab</span></p>
+  <h2 id="h-sync">Keep your own devices in sync, with no account</h2>
+  <p class="part-moment">You write a note on the laptop and want it on your phone, with no sign-up.</p>
+  <p class="part-lead"><span class="lab">The problem.</span> Most notes apps sync through sign-in, a database and cloud storage, and end up holding every user's notes.</p>
+  <p class="part-lead"><span class="lab">With Tendril.</span> The laptop and the phone pair once and sync with each other. On home Wi-Fi they connect directly, with no internet needed. A browser tab on a work computer can join through a relay, with a grant that ends the same evening.</p>
+  <figure class="fig">
+    <svg class="dia" viewBox="0 0 400 220" role="img" aria-label="The laptop, as host, links to the phone over the direct path on home Wi-Fi, with the grant notes.sync. It links to a browser tab on a work computer through a relay, with the grant notes.read, which ends in 8 hours.">
+      <rect class="b b-acc" x="4" y="80" width="112" height="60"/>
+      <text class="t-s t-strong" x="60" y="105" text-anchor="middle">laptop</text>
+      <text class="t-xs t-mut" x="60" y="121" text-anchor="middle">host · keeps the notes</text>
+      <rect class="b" x="284" y="12" width="112" height="56"/>
+      <text class="t-s t-strong" x="340" y="36" text-anchor="middle">phone</text>
+      <text class="t-xs t-mut" x="340" y="52" text-anchor="middle">home Wi-Fi</text>
+      <rect class="b" x="284" y="152" width="112" height="56"/>
+      <text class="t-s t-strong" x="340" y="176" text-anchor="middle">browser tab</text>
+      <text class="t-xs t-mut" x="340" y="192" text-anchor="middle">work computer</text>
+      <path class="w-acc" d="M116 96H160V40H284"/>
+      <text class="t-s" x="222" y="32" text-anchor="middle">direct</text>
+      <text class="t-xs t-m t-mut" x="222" y="56" text-anchor="middle">notes.sync</text>
+      <path class="w" d="M116 124H160V180H284"/>
+      <rect class="b b-dash" x="196" y="170" width="52" height="20"/>
+      <text class="t-xs" x="222" y="184" text-anchor="middle">relay</text>
+      <text class="t-xs t-m t-mut" x="222" y="160" text-anchor="middle">notes.read</text>
+      <text class="t-xs t-mut" x="222" y="206" text-anchor="middle">ends in 8 hours</text>
+    </svg>
+    <figcaption>Illustrative. Grant names and times are examples.</figcaption>
+  </figure>
+  <div class="for">
+    <div>
+      <p class="for-h">For the person using it</p>
+      <ul>
+        <li>Notes stay on their own devices.</li>
+        <li>Sync works on a home network with no internet.</li>
+        <li>The browser's access ends on its own.</li>
+      </ul>
+    </div>
+    <div>
+      <p class="for-h">For you, building it</p>
+      <ul>
+        <li>No accounts, password resets or user database.</li>
+        <li>No copy of anyone's notes to secure or hand over.</li>
+        <li>The browser needs a relay, and the relay cannot read what it carries.</li>
+      </ul>
+    </div>
+  </div>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>No internet needed.</strong> A pairing QR code carries the laptop's key and its address on the local network, so the phone can pair and connect over the direct path with no outside server.</p>
+      <p><strong>The browser.</strong> A browser joins only as a client, over WebSockets, through a Tendril relay or, with the opt-in p2p build, an iroh relay. It cannot open UDP sockets, so it cannot hole punch, or hold a connection while the browser suspends the tab. Pairing across the internet uses the long code, <code>TND-XXXX-XXXX-XXXX</code>, with 12 random characters. By default, hosts reject the short form on remote paths.</p>
+      <p><strong>Grants that end.</strong> The host sets a lifetime each time it grants something. In Python, for example, <code>host.mint_grant(tab, ["notes.read"], ttl_secs=28800)</code> grants reading for 8 hours.</p>
+      <p><strong>Merging edits.</strong> Tendril carries the bytes and checks the grant. Merging notes edited on two devices is a job for a sync library such as Automerge or Yjs, run over the session in chunks of at most 65,499 bytes, with no second network stack.</p>
+      <p><strong>What a relay sees.</strong> IP addresses, when devices connect and how much they send, and the waiting device's mailbox key. By default that key never changes, so a relay can link that device's sessions. With Wire v2 it changes every hour. A relay cannot see the notes, the grants or the pairing code.</p>
+      <p class="more-link">Read more: <a href="/how-it-works#pairing">Pairing</a> and <a href="/how-it-works#relays">What a relay can see</a> on How it works, and <a href="/docs/usage/layering-sync-engines.html">Layering sync engines</a></p>
+    </div>
+  </details>
+</section>
+
+<section id="appliances" class="part" aria-labelledby="h-appliances">
+  <p class="part-n">03<span class="part-dev">NAS and phone</span></p>
+  <h2 id="h-appliances">Appliances that do not need the maker's cloud</h2>
+  <p class="part-moment">You are away and want the photos on your NAS, not a copy in the maker's cloud.</p>
+  <p class="part-lead"><span class="lab">The problem.</span> A home NAS or camera usually reaches its owner through the maker's cloud. Every byte passes through the maker, often for a monthly fee, and if the service shuts down the box stops working away from home.</p>
+  <p class="part-lead"><span class="lab">With Tendril.</span> The box and the owner's phone pair at setup. At home they talk directly. Away, the maker runs at most a relay, which passes sealed frames it cannot read, and owners can move to another relay without pairing again.</p>
+  <figure class="fig">
+    <svg class="dia" viewBox="0 0 400 200" role="img" aria-label="A NAS at home and a phone away from home. The maker's relay has shut down. The connection now runs through a relay the owner runs, with the same pairing and the same grants.">
+      <rect class="b" x="4" y="70" width="100" height="60"/>
+      <text class="t-s t-strong" x="54" y="96" text-anchor="middle">NAS</text>
+      <text class="t-xs t-mut" x="54" y="112" text-anchor="middle">at home</text>
+      <rect class="b" x="296" y="70" width="100" height="60"/>
+      <text class="t-s t-strong" x="346" y="96" text-anchor="middle">phone</text>
+      <text class="t-xs t-mut" x="346" y="112" text-anchor="middle">away</text>
+      <path class="w w-dot" d="M104 86H128V44H150M250 44H272V86H296"/>
+      <rect class="b b-dash" x="150" y="24" width="100" height="40"/>
+      <text class="t-xs" x="200" y="40" text-anchor="middle">maker's relay</text>
+      <text class="t-xs t-mut" x="200" y="55" text-anchor="middle">shut down</text>
+      <path class="w-acc" d="M104 114H128V156H150M250 156H272V114H296"/>
+      <rect class="b b-acc" x="150" y="136" width="100" height="40"/>
+      <text class="t-xs t-strong" x="200" y="152" text-anchor="middle">your relay</text>
+      <text class="t-xs t-mut" x="200" y="167" text-anchor="middle">in use</text>
+      <text class="t-xs t-acc" x="200" y="104" text-anchor="middle">same pairing, same grants</text>
+      <text class="t-xs t-mut" x="200" y="196" text-anchor="middle">either relay passes sealed frames it cannot read</text>
+    </svg>
+    <figcaption>Illustrative. At home, the two talk directly and no relay is used.</figcaption>
+  </figure>
+  <div class="for">
+    <div>
+      <p class="for-h">For the person using it</p>
+      <ul>
+        <li>The maker never holds the files.</li>
+        <li>The box keeps working if the maker's service closes.</li>
+        <li>A friend can get <code>photos.read:/albums/trip/*</code> for a week. It ends on its own.</li>
+      </ul>
+    </div>
+    <div>
+      <p class="for-h">For you, building it</p>
+      <ul>
+        <li>No accounts to run.</li>
+        <li>Your relay can admit only your own devices, and carries sealed traffic only when nothing direct gets through.</li>
+        <li>The Rust core runs on the box, the Swift and Kotlin bindings on the phones.</li>
+      </ul>
+    </div>
+  </div>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>Pairing needs a screen.</strong> The host shows the code and the check string, so pairing by eye fits a box with a small display. A machine with no screen enrolls with a token instead, as in case 04.</p>
+      <p><strong>Moving relays.</strong> Moving from one relay to another changes only the relay address each device keeps on its roster. Keys, pairing and grants stay as they are. A relay can be public, one you run, or one embedded in your app, all on the same protocol.</p>
+      <p><strong>Who may use the relay.</strong> The maker can run <code>tendril-relay</code> so that it admits only its own devices, with a shared secret or with short-lived tickets it signs. With admission on, the relay checks a device before it says whether a mailbox is online. An owner who moves to their own relay sets their own rule.</p>
+      <p><strong>Peer-to-peer.</strong> The p2p path uses iroh, which by default finds peers through the free public relay and discovery servers run by n0. You can point it at an iroh relay you run or a hosted one, pass it a token, or turn discovery off.</p>
+      <p><strong>Guests.</strong> The box grants a friend's phone one album with an end time, after the friend's phone has paired with it. Revoking the friend's phone ends it sooner.</p>
+      <p class="more-link">Read more: <a href="/how-it-works#relays">What a relay can see</a> and <a href="/docs/design/providers-and-relay-ladder.html">Paths and the relay ladder</a></p>
+    </div>
+  </details>
+</section>
+
+<section id="machines" class="part" aria-labelledby="h-machines">
+  <p class="part-n">04<span class="part-dev">server and CI runner</span></p>
+  <h2 id="h-machines">Let machines with no screen join, one job at a time</h2>
+  <p class="part-moment">You push a fix, and the deploy needs the server for ten minutes, not a key for months.</p>
+  <p class="part-lead"><span class="lab">The problem.</span> Reaching a production server from CI usually means an SSH key or an API secret stored there, valid for months, and useful to anyone who copies it from a log.</p>
+  <p class="part-lead"><span class="lab">With Tendril.</span> The server trusts your CI's signing key. Each job gets a token that works once and expires in 15 minutes. The runner enrolls with it, joins with no grants, and the server grants it one thing for the length of the deploy.</p>
+  <figure class="fig">
+    <p class="flow-h">One deploy job</p>
+    <ol class="flow">
+      <li>
+        <p class="flow-k">CI signs a token</p>
+        <code>pair.enroll:prod-1</code>
+        <p class="flow-m">single use · 15 min</p>
+      </li>
+      <li>
+        <p class="flow-k">The runner enrolls</p>
+        <code>active · 0 grants</code>
+        <p class="flow-m">after checking the server's pinned keys</p>
+      </li>
+      <li class="flow-us">
+        <p class="flow-k">The server grants one thing</p>
+        <code>deploy.push:/srv/app/*</code>
+        <p class="flow-m">10 min</p>
+      </li>
+    </ol>
+    <figcaption>Illustrative. Names and times are examples.</figcaption>
+  </figure>
+  <div class="for">
+    <div>
+      <p class="for-h">For the people running it</p>
+      <ul>
+        <li>No long-lived deploy key on the server.</li>
+        <li>A token copied from a log is useless once used.</li>
+        <li>One command stops every token a CI key signed.</li>
+      </ul>
+    </div>
+    <div>
+      <p class="for-h">For you, building it</p>
+      <ul>
+        <li>The same roster, grants and revocation as the phone cases.</li>
+        <li>Enrollment works from the CLI and from every binding.</li>
+        <li>Off until the server's owner turns it on.</li>
+      </ul>
+    </div>
+  </div>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>Trusting the CI.</strong> The server registers the CI's signing key as a trust anchor with <code>tendril anchor add</code> and accepts machines with <code>tendril serve --allow-enroll</code>. <code>tendril anchor revoke</code> stops every token that key signed.</p>
+      <p><strong>The enrollment token.</strong> A signed grant for one use that may hold only <code>pair.enroll</code> or <code>pair.enroll:&lt;host_id&gt;</code>. It lasts 900 seconds by default. The CLI host accepts tokens of up to 900 seconds, as do the hosts in the language bindings. The CLI reads the token from a file, standard input or <code>TENDRIL_ENROLL_TOKEN</code>, never from the command line.</p>
+      <p><strong>Pinning.</strong> The runner must hold the server's id and keys in advance. If another host answers, the runner stops before it says anything about itself.</p>
+      <p><strong>The burn log.</strong> The server records the token and saves it before it replies, so a second use fails with <code>token_replayed</code>. The runner joins active with zero grants, and the deploy grant comes from <code>pair.mint</code>, as for any device. A token can never open a session.</p>
+      <p class="more-link">Read more: <a href="/how-it-works#machines">Machines with no screen</a> and <a href="/docs/design/m2m-enrollment.html">Machine enrollment design</a></p>
+    </div>
+  </details>
+  <p class="poly"><strong>Mixed languages?</strong> A desktop app in Go, phone apps in Swift and Kotlin, a script in Python: each binding wraps the same Rust core and checks the same test vectors, so pairing and grants behave the same in all of them.</p>
+</section>
+
+<section id="elsewhere" class="part" aria-labelledby="h-elsewhere">
+  <p class="part-n">05</p>
+  <h2 id="h-elsewhere">When something else fits better</h2>
+  <p class="part-lead">Tendril links two devices that each prove who they are. Some jobs have a different shape.</p>
+  <dl class="alt">
+    <div>
+      <dt>A public website or API</dt>
+      <dd class="alt-use">HTTPS, often behind a CDN</dd>
+      <dd class="alt-why">The server is meant to read every request, from anyone.</dd>
+    </div>
+    <div>
+      <dt>A group chat with many members</dt>
+      <dd class="alt-use">MLS, Messaging Layer Security</dd>
+      <dd class="alt-why">Tendril links are between two devices. Group encryption is out of scope for v1.</dd>
+    </div>
+    <div>
+      <dt>Hiding who talks to whom</dt>
+      <dd class="alt-use">Tor or a mixnet</dd>
+      <dd class="alt-why">Relays and networks still see addresses, timing and sizes. Tendril is not an anonymity network.</dd>
+    </div>
+  </dl>
+  <p class="aside">Need only a connection, with your own pairing and permissions? Use <a href="https://www.iroh.computer/">iroh</a> directly.</p>
+</section>
+
+  </div>
+</div>
+
+<section class="further wrap" aria-labelledby="h-further">
+  <h2 id="h-further">Go deeper</h2>
+  <ul class="further-l">
+    <li><a href="/how-it-works">How it works</a><span>Pairing, grants, paths and limits, in nine parts</span></li>
+    <li><a href="/docs/usage/cli-demo.html">CLI demo</a><span>Pair two devices on your own machine</span></li>
+    <li><a href="/docs/design/grants.html">Grants design</a><span>Names, delegation, revocation</span></li>
+    <li><a href="/docs/design/m2m-enrollment.html">Machine enrollment</a><span>Tokens, pinning, the burn log</span></li>
+    <li><a href="/docs/overview.html">Scope and limits</a><span>What v1 covers, and what it does not</span></li>
+    <li><a href="https://github.com/agync/tendril">Source on GitHub</a><span>Apache-2.0, specs in <code>spec/</code></span></li>
+  </ul>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-row">
+    <span><span class="wordmark">tendril</span> Apache-2.0. No analytics, no cookies.</span>
+    <nav aria-label="Footer">
+      <a href="/for-users">For app users</a>
+      <a href="/docs/overview.html">Overview</a>
+      <a href="/docs/architecture/">Architecture</a>
+      <a href="/docs/reference/">Reference</a>
+      <a href="/docs/usage/cli-demo.html">CLI demo</a>
+      <a href="https://github.com/agync/tendril">GitHub</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

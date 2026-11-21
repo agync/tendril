@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tendril: pair two devices, with no account and no server to trust</title>
+<meta name="description" content="Tendril is an open source SDK for private links between two devices. A Rust core handles pairing, keys, permissions and revocation, with bindings for Go, Python, TypeScript, Swift and Kotlin.">
+<link rel="canonical" href="{{SITE_URL}}/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Tendril">
+<meta property="og:title" content="Tendril: pair two devices, with no account and no server to trust">
+<meta property="og:url" content="{{SITE_URL}}/">
+<meta property="og:description" content="An open source SDK for private links between two devices, with no account and no server to trust. A Rust core handles pairing, keys, permissions and revocation.">
+<meta property="og:image" content="{{SITE_URL}}/assets/img/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Tendril logo with the words &quot;Pair two devices. No account, no server to trust.&quot; and &quot;Open source SDK. Rust core. Apache-2.0.&quot; Along the bottom, a filled square is linked to an outlined square.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="{{SITE_URL}}/assets/img/og.png">
+<meta name="twitter:image:alt" content="The Tendril logo with the words &quot;Pair two devices. No account, no server to trust.&quot; and &quot;Open source SDK. Rust core. Apache-2.0.&quot; Along the bottom, a filled square is linked to an outlined square.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/assets/css/fonts.css">
+<link rel="stylesheet" href="/assets/css/tokens.css">
+<link rel="stylesheet" href="/assets/css/site.css">
+<script src="/assets/js/theme.js"></script>
+<script src="/assets/js/tour.js" defer></script>
+<script src="/assets/js/code.js" defer></script>
+<script src="/assets/js/net.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="/" aria-label="Tendril home">
+      <span class="mark" aria-hidden="true"><span class="mark-a"></span><span class="mark-l"></span><span class="mark-b"></span></span>
+      <span class="wordmark">tendril</span>
+    </a>
+    <nav class="top-nav" aria-label="Site">
+      <a href="/use-cases">Use cases</a>
+      <a href="/how-it-works">How it works</a>
+      <a class="nav-wide" href="#trust">Security</a>
+      <a href="/docs/">Docs</a>
+      <a class="nav-mid" href="https://github.com/agync/tendril">GitHub</a>
+    </nav>
+    <span class="tag">v0.1</span>
+    <button class="theme-toggle" type="button" aria-label="Switch colour theme" data-theme-toggle>
+      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M8 1.75a6.25 6.25 0 0 1 0 12.5z" fill="currentColor"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero wrap" aria-labelledby="h-hero">
+  <p class="eyebrow">Open source SDK · Apache-2.0</p>
+  <h1 id="h-hero">Pair two devices. No account, no server to trust.</h1>
+  <div class="hero-row">
+    <div class="hero-text">
+      <p class="lede">A phone that syncs with a laptop. A desktop app you reach from your phone. Every app like this rebuilds pairing, keys, permissions and revocation.</p>
+      <p class="lede-2">Tendril is those parts, built once in a Rust core. You show a code, a person compares a check string, and the two devices talk directly.</p>
+    </div>
+    <div class="hero-cta">
+      <div class="cta-row">
+        <a class="btn btn-primary" href="/docs/usage/cli-demo.html">Try the CLI demo</a>
+        <a class="btn" href="/docs/">Read the docs</a>
+      </div>
+      <p class="note hero-user">Using an app built on Tendril? <a href="/for-users">What it means for you</a></p>
+    </div>
+  </div>
+
+  <figure class="tour" aria-label="A pairing, step by step" data-tour>
+    <div class="tour-stage">
+      <div class="device">
+        <div class="device-bar"><span>laptop</span><span class="faint">host</span></div>
+        <div class="device-body">
+          <div class="pane pane-qr" data-step="0">
+            <svg class="qr" viewBox="-1 -1 23 23" role="img" aria-label="Pairing QR code, illustrative"><rect x="-1" y="-1" width="23" height="23" fill="#FFFFFF"/><path d="M0 0h1v1h-1zM1 0h1v1h-1zM2 0h1v1h-1zM3 0h1v1h-1zM4 0h1v1h-1zM5 0h1v1h-1zM6 0h1v1h-1zM10 0h1v1h-1zM12 0h1v1h-1zM14 0h1v1h-1zM15 0h1v1h-1zM16 0h1v1h-1zM17 0h1v1h-1zM18 0h1v1h-1zM19 0h1v1h-1zM20 0h1v1h-1zM0 1h1v1h-1zM6 1h1v1h-1zM14 1h1v1h-1zM20 1h1v1h-1zM0 2h1v1h-1zM2 2h1v1h-1zM3 2h1v1h-1zM4 2h1v1h-1zM6 2h1v1h-1zM11 2h1v1h-1zM14 2h1v1h-1zM16 2h1v1h-1zM17 2h1v1h-1zM18 2h1v1h-1zM20 2h1v1h-1zM0 3h1v1h-1zM2 3h1v1h-1zM3 3h1v1h-1zM4 3h1v1h-1zM6 3h1v1h-1zM9 3h1v1h-1zM10 3h1v1h-1zM11 3h1v1h-1zM14 3h1v1h-1zM16 3h1v1h-1zM17 3h1v1h-1zM18 3h1v1h-1zM20 3h1v1h-1zM0 4h1v1h-1zM2 4h1v1h-1zM3 4h1v1h-1zM4 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM10 4h1v1h-1zM14 4h1v1h-1zM16 4h1v1h-1zM17 4h1v1h-1zM18 4h1v1h-1zM20 4h1v1h-1zM0 5h1v1h-1zM6 5h1v1h-1zM10 5h1v1h-1zM12 5h1v1h-1zM14 5h1v1h-1zM20 5h1v1h-1zM0 6h1v1h-1zM1 6h1v1h-1zM2 6h1v1h-1zM3 6h1v1h-1zM4 6h1v1h-1zM5 6h1v1h-1zM6 6h1v1h-1zM8 6h1v1h-1zM10 6h1v1h-1zM14 6h1v1h-1zM15 6h1v1h-1zM16 6h1v1h-1zM17 6h1v1h-1zM18 6h1v1h-1zM19 6h1v1h-1zM20 6h1v1h-1zM9 7h1v1h-1zM12 7h1v1h-1zM2 8h1v1h-1zM3 8h1v1h-1zM5 8h1v1h-1zM6 8h1v1h-1zM7 8h1v1h-1zM8 8h1v1h-1zM10 8h1v1h-1zM13 8h1v1h-1zM17 8h1v1h-1zM18 8h1v1h-1zM19 8h1v1h-1zM20 8h1v1h-1zM1 9h1v1h-1zM2 9h1v1h-1zM3 9h1v1h-1zM5 9h1v1h-1zM6 9h1v1h-1zM8 9h1v1h-1zM10 9h1v1h-1zM11 9h1v1h-1zM12 9h1v1h-1zM13 9h1v1h-1zM16 9h1v1h-1zM1 10h1v1h-1zM5 10h1v1h-1zM8 10h1v1h-1zM9 10h1v1h-1zM10 10h1v1h-1zM11 10h1v1h-1zM15 10h1v1h-1zM16 10h1v1h-1zM1 11h1v1h-1zM6 11h1v1h-1zM7 11h1v1h-1zM8 11h1v1h-1zM10 11h1v1h-1zM11 11h1v1h-1zM13 11h1v1h-1zM14 11h1v1h-1zM15 11h1v1h-1zM16 11h1v1h-1zM20 11h1v1h-1zM11 12h1v1h-1zM12 12h1v1h-1zM18 12h1v1h-1zM19 12h1v1h-1zM13 13h1v1h-1zM16 13h1v1h-1zM17 13h1v1h-1zM19 13h1v1h-1zM0 14h1v1h-1zM1 14h1v1h-1zM2 14h1v1h-1zM3 14h1v1h-1zM4 14h1v1h-1zM5 14h1v1h-1zM6 14h1v1h-1zM8 14h1v1h-1zM9 14h1v1h-1zM10 14h1v1h-1zM11 14h1v1h-1zM15 14h1v1h-1zM16 14h1v1h-1zM17 14h1v1h-1zM20 14h1v1h-1zM0 15h1v1h-1zM6 15h1v1h-1zM8 15h1v1h-1zM9 15h1v1h-1zM10 15h1v1h-1zM11 15h1v1h-1zM12 15h1v1h-1zM20 15h1v1h-1zM0 16h1v1h-1zM2 16h1v1h-1zM3 16h1v1h-1zM4 16h1v1h-1zM6 16h1v1h-1zM8 16h1v1h-1zM10 16h1v1h-1zM11 16h1v1h-1zM12 16h1v1h-1zM18 16h1v1h-1zM19 16h1v1h-1zM20 16h1v1h-1zM0 17h1v1h-1zM2 17h1v1h-1zM3 17h1v1h-1zM4 17h1v1h-1zM6 17h1v1h-1zM9 17h1v1h-1zM10 17h1v1h-1zM12 17h1v1h-1zM13 17h1v1h-1zM14 17h1v1h-1zM15 17h1v1h-1zM18 17h1v1h-1zM20 17h1v1h-1zM0 18h1v1h-1zM2 18h1v1h-1zM3 18h1v1h-1zM4 18h1v1h-1zM6 18h1v1h-1zM8 18h1v1h-1zM11 18h1v1h-1zM12 18h1v1h-1zM16 18h1v1h-1zM17 18h1v1h-1zM19 18h1v1h-1zM20 18h1v1h-1zM0 19h1v1h-1zM6 19h1v1h-1zM8 19h1v1h-1zM10 19h1v1h-1zM13 19h1v1h-1zM14 19h1v1h-1zM15 19h1v1h-1zM16 19h1v1h-1zM18 19h1v1h-1zM19 19h1v1h-1zM0 20h1v1h-1zM1 20h1v1h-1zM2 20h1v1h-1zM3 20h1v1h-1zM4 20h1v1h-1zM5 20h1v1h-1zM6 20h1v1h-1zM11 20h1v1h-1zM15 20h1v1h-1zM18 20h1v1h-1zM19 20h1v1h-1z" fill="#1C1917"/></svg>
+            <div class="stack">
+              <span class="faint small">Scan, or type</span>
+              <span class="code-big">TND-4F9K-22XQ</span>
+              <span class="faint small">Single use · 15 minutes</span>
+            </div>
+          </div>
+          <div class="pane mono-list" data-step="1" hidden>
+            <span class="pane-title">Joining device found</span>
+            <span><span class="faint">msg1 ← </span>two one-time keys</span>
+            <span><span class="faint">msg2 → </span>host identity, sealed</span>
+            <span><span class="faint">msg3 ← </span>device identity + code proof</span>
+            <span class="strong">Code proof matches this connection</span>
+            <span class="faint sans">The code itself never crossed the network.</span>
+          </div>
+          <div class="pane" data-step="2" hidden>
+            <span class="pane-title">Check the other screen shows</span>
+            <span class="sas">k7qm 4xrt 3fpa 2wnc</span>
+            <span class="muted small">Different? Someone is in the middle. Cancel.</span>
+            <span class="fake-btn">They match</span>
+          </div>
+          <div class="pane" data-step="3" hidden>
+            <span class="pane-title">Devices</span>
+            <dl class="kv">
+              <div><dt>phone <span class="faint mono small">dev_7a91c04e2b6d3f18</span></dt><dd><span class="dot dot-ok"></span>active</dd></div>
+              <div><dt>Grants</dt><dd class="mono">none</dd></div>
+            </dl>
+            <span class="muted small">Paired devices can open an encrypted session. Nothing else.</span>
+          </div>
+          <div class="pane" data-step="4" hidden>
+            <span class="pane-title">Grants</span>
+            <dl class="kv">
+              <div><dt class="mono">notes.sync</dt><dd>expires in 60 min</dd></div>
+              <div class="faint"><dt class="mono">fs.read:/photos/*</dt><dd>not granted</dd></div>
+            </dl>
+            <span class="mono small">authorize("notes.sync") → <span class="strong">allow</span></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="link" aria-hidden="true">
+        <span class="link-label" data-link-label>not connected</span>
+        <span class="link-track"><span class="link-fill" data-link-fill></span></span>
+        <span class="link-sub faint" data-link-sub></span>
+      </div>
+
+      <div class="device">
+        <div class="device-bar"><span>phone</span><span class="faint">joining</span></div>
+        <div class="device-body">
+          <div class="pane" data-step="0">
+            <span class="pane-title">Pair with a device</span>
+            <span class="viewfinder"><span></span><span></span><span></span><span></span></span>
+            <span class="muted small">No account. No sign-in.</span>
+          </div>
+          <div class="pane" data-step="1" hidden>
+            <span class="pane-title">Checking the host</span>
+            <span class="muted small">The QR code carries the host's key, so an impostor is turned away early.</span>
+          </div>
+          <div class="pane" data-step="2" hidden>
+            <span class="pane-title">Does the other screen show</span>
+            <span class="sas">k7qm 4xrt 3fpa 2wnc</span>
+            <span class="muted small">Derived from this exact connection.</span>
+            <span class="fake-btn fake-btn-primary">They match</span>
+          </div>
+          <div class="pane" data-step="3" hidden>
+            <span class="pane-title">Paired with laptop</span>
+            <span class="muted small">Waiting for the host to grant something.</span>
+          </div>
+          <div class="pane" data-step="4" hidden>
+            <span class="pane-title">Notes are syncing</span>
+            <span class="muted small">Directly, over the home network.</span>
+            <span class="mono small faint">path: direct</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <figcaption class="tour-steps">
+      <div class="steps" role="group" aria-label="Pairing steps">
+        <button type="button" data-goto="0" aria-pressed="true"><span class="n">01</span>Show a code</button>
+        <button type="button" data-goto="1" aria-pressed="false"><span class="n">02</span>Handshake</button>
+        <button type="button" data-goto="2" aria-pressed="false"><span class="n">03</span>A person checks</button>
+        <button type="button" data-goto="3" aria-pressed="false"><span class="n">04</span>Paired, nothing granted</button>
+        <button type="button" data-goto="4" aria-pressed="false"><span class="n">05</span>Grant one thing</button>
+      </div>
+      <button class="play" type="button" data-play hidden>Pause</button>
+    </figcaption>
+    <p class="caption faint">Example screens. Your app draws its own. Tendril supplies the code, the check string and the result.</p>
+  </figure>
+</section>
+
+<section id="problems" class="band wrap" aria-labelledby="h-six">
+  <h2 id="h-six">Six things every <span class="nowrap">device-to-device</span> app rebuilds.</h2>
+  <p class="sub">A socket is the easy part. Apps most often get 02 and 04 wrong.</p>
+  <ol class="six">
+    <li><span class="n">01</span><h3>Finding each other</h3><p>Six ways to connect, from a local socket to a relay. Every path is untrusted. It counts only once the peer proves who it is.</p></li>
+    <li><span class="n">02</span><h3>Knowing it is the right device</h3><p>The code is bound to this one handshake. Then a person compares a 16-character check string on both screens. Machines with no screen enroll with a signed, <span class="nowrap">single-use</span> token instead.</p></li>
+    <li><span class="n">03</span><h3>Where keys live</h3><p>Files only your user account can read on desktops and servers, wiped from memory after use. Keychain and Android Keystore adapters for mobile.</p></li>
+    <li><span class="n">04</span><h3>Revoking a lost device</h3><p>Each device is pending, active or revoked. Signed revocation lists also reach sessions that are already open.</p></li>
+    <li><span class="n">05</span><h3>What the link may do</h3><p>Nothing, until a signed grant (a permission) says so. Grants expire. They can be passed on, but only narrower, and at most four times.</p></li>
+    <li><span class="n">06</span><h3>When the network changes</h3><p>The pairing belongs to the devices, not the path. A new path needs a new handshake, never a new pairing.</p></li>
+  </ol>
+  <a class="more" href="/docs/overview.html">How each one works</a>
+</section>
+
+<section id="uses" class="band wrap" aria-labelledby="h-uses">
+  <h2 id="h-uses">Where it fits.</h2>
+  <p class="sub">Apps that link devices one person or one team already owns.</p>
+  <ul class="uses">
+    <li><p class="uses-dev">Mac mini and phone</p><h3><a href="/use-cases#desktop">Reach your desktop app from your phone</a></h3><p>No open port, no cloud dashboard. The phone gets only what you grant.</p></li>
+    <li><p class="uses-dev">laptop, phone, browser</p><h3><a href="/use-cases#sync">Sync your own devices, with no account</a></h3><p>Directly on home Wi-Fi, with no internet needed.</p></li>
+    <li><p class="uses-dev">NAS and phone</p><h3><a href="/use-cases#appliances">Appliances without the maker's cloud</a></h3><p>The maker runs at most a relay that cannot read what it carries.</p></li>
+    <li><p class="uses-dev">server and CI runner</p><h3><a href="/use-cases#machines">Machines with no screen</a></h3><p>A token that works once, instead of a key that lasts for months.</p></li>
+  </ul>
+  <a class="more" href="/use-cases">See the use cases</a>
+</section>
+
+<section id="paths" class="band wrap" aria-labelledby="h-paths">
+  <h2 id="h-paths">Six ways to connect, nearest first.</h2>
+  <p class="sub">Every path is untrusted. A path counts only once the other device proves who it is inside the handshake, so a captive portal or a wrong host that answers never wins.</p>
+  <figure class="net" data-net>
+    <svg class="net-defs" aria-hidden="true" focusable="false">
+      <symbol id="ni-laptop" viewBox="0 0 32 32"><path d="M7 8.5h18v12H7zM3.5 24.5h25"/></symbol>
+      <symbol id="ni-phone" viewBox="0 0 32 32"><path d="M10.5 3.5h11v25h-11zM14 25h4"/></symbol>
+      <symbol id="ni-browser" viewBox="0 0 32 32"><path d="M4.5 6.5h23v19h-23zM4.5 11.5h23M7.5 9h2"/></symbol>
+    </svg>
+    <div class="net-pick" role="tablist" aria-label="Scenario" hidden>
+      <button type="button" role="tab" id="nt-lan" aria-controls="np-lan" aria-selected="true" data-scene="0"><span class="n">01</span>Same network</button>
+      <button type="button" role="tab" id="nt-wan" aria-controls="np-wan" aria-selected="false" tabindex="-1" data-scene="1"><span class="n">02</span>Across the internet</button>
+      <button type="button" role="tab" id="nt-nat" aria-controls="np-nat" aria-selected="false" tabindex="-1" data-scene="2"><span class="n">03</span>Strict NAT or firewall</button>
+      <button type="button" role="tab" id="nt-move" aria-controls="np-move" aria-selected="false" tabindex="-1" data-scene="3"><span class="n">04</span>Network changes</button>
+      <button type="button" role="tab" id="nt-web" aria-controls="np-web" aria-selected="false" tabindex="-1" data-scene="4"><span class="n">05</span>In a browser</button>
+    </div>
+    <div class="net-stage" role="img" aria-label="Diagram of the six paths between two devices, ranked nearest first">
+      <div class="net-dev" data-dev="a">
+        <svg class="net-ic" viewBox="0 0 32 32" aria-hidden="true"><use href="#ni-phone" data-dev-ic/></svg>
+        <span class="net-dev-n" data-dev-name>phone</span>
+        <span class="net-dev-r" data-dev-role>client</span>
+        <span class="net-dev-w" data-dev-net>home Wi-Fi</span>
+      </div>
+      <svg class="net-fan" data-fan="a" viewBox="0 0 56 240" aria-hidden="true"><path class="is-idle" d="M7 120C31 120 32 28.5 56 28.5"/><path class="is-win" d="M7 120C31 120 32 68.5 56 68.5"/><path class="is-idle" d="M7 120C31 120 32 108.5 56 108.5"/><path class="is-idle" d="M7 120C31 120 32 148.5 56 148.5"/><path class="is-idle" d="M7 120C31 120 32 188.5 56 188.5"/><path class="is-idle" d="M7 120C31 120 32 228.5 56 228.5"/><rect class="port-a" x="0.5" y="116.5" width="7" height="7"/></svg>
+      <ol class="net-lanes">
+        <li class="lane is-idle" data-lane="local"><span class="lane-k"><span class="lane-n">01</span>local <span class="lane-d">same machine</span></span><span class="lane-s">other machine</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+        <li class="lane is-win" data-lane="direct"><span class="lane-k"><span class="lane-n">02</span>direct <span class="lane-d">home or office LAN</span></span><span class="lane-s">in use</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+        <li class="lane is-idle" data-lane="overlay"><span class="lane-k"><span class="lane-n">03</span>overlay <span class="lane-d">an existing tailnet</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+        <li class="lane is-idle" data-lane="p2p"><span class="lane-k"><span class="lane-n">04</span>p2p <span class="lane-d">hole punching via iroh</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+        <li class="lane is-idle" data-lane="relay"><span class="lane-k"><span class="lane-n">05</span>relay <span class="lane-d">blind, sealed packets</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i><span class="lane-box">relay</span></span></li>
+        <li class="lane is-idle" data-lane="broker"><span class="lane-k"><span class="lane-n">06</span>broker <span class="lane-d">WebSocket via a proxy</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+      </ol>
+      <svg class="net-fan" data-fan="b" viewBox="0 0 56 240" aria-hidden="true"><path class="is-idle" d="M49 120C25 120 24 28.5 0 28.5"/><path class="is-win" d="M49 120C25 120 24 68.5 0 68.5"/><path class="is-idle" d="M49 120C25 120 24 108.5 0 108.5"/><path class="is-idle" d="M49 120C25 120 24 148.5 0 148.5"/><path class="is-idle" d="M49 120C25 120 24 188.5 0 188.5"/><path class="is-idle" d="M49 120C25 120 24 228.5 0 228.5"/><rect class="port-b" x="48.5" y="116.5" width="7" height="7"/></svg>
+      <div class="lane lane-pair"><span class="lane-k">pairing <span class="lane-d">held by the devices, not the path</span></span><span class="lane-s" data-pair>paired</span><span class="lane-t"></span></div>
+      <div class="net-dev" data-dev="b">
+        <svg class="net-ic" viewBox="0 0 32 32" aria-hidden="true"><use href="#ni-laptop"/></svg>
+        <span class="net-dev-n">laptop</span>
+        <span class="net-dev-r">host</span>
+        <span class="net-dev-w">home network</span>
+      </div>
+    </div>
+    <div class="net-foot">
+      <div class="net-caps">
+        <div class="net-cap" id="np-lan">
+          <p><span class="net-cap-k">Same network. </span>On one network, the direct path proves the other device first and wins.</p>
+          <p class="vh">The phone and the laptop share a home network. Local does not apply, as they are different machines. The direct path completes the handshake and is in use. Overlay, peer-to-peer, relay and broker are not used.</p>
+        </div>
+        <div class="net-cap" id="np-wan">
+          <p><span class="net-cap-k">Across the internet. </span>Away from home, the direct path fails and hole punching through iroh wins.</p>
+          <p class="vh">A phone on mobile data reaches the laptop at home. Local does not apply. On the direct path a wrong host answers and fails the handshake, so it does not count. There is no tailnet. The peer-to-peer path through iroh completes the handshake and is in use.</p>
+        </div>
+        <div class="net-cap" id="np-nat">
+          <p><span class="net-cap-k">Strict NAT or firewall. </span>When nothing direct gets through, a relay carries sealed packets it cannot read.</p>
+          <dl class="net-sees">
+            <div><dt>The relay sees</dt><dd>IP addresses, timing, sizes, a mailbox key</dd></div>
+            <div><dt>It cannot see</dt><dd>Your data, grants, device names, the pairing code</dd></div>
+          </dl>
+          <p class="vh">A phone on an office network reaches the laptop at home. The direct path and the peer-to-peer path are blocked, and there is no tailnet. The relay path is in use. The broker path is not used.</p>
+        </div>
+        <div class="net-cap" id="np-move">
+          <p><span class="net-cap-k">Network changes. </span>The phone leaves Wi-Fi, so the devices handshake again on another path and keep their pairing.</p>
+          <p class="vh">A phone on home Wi-Fi uses the direct path to the laptop. The phone moves to mobile data and the direct path drops. The devices handshake again, and the peer-to-peer path is now in use. The pairing is the same, with no new pairing needed.</p>
+        </div>
+        <div class="net-cap" id="np-web">
+          <p><span class="net-cap-k">In a browser. </span>A browser tab joins only as a client and cannot hole punch, so it always goes through a relay.</p>
+          <dl class="net-sees">
+            <div><dt>The relay sees</dt><dd>IP addresses, timing, sizes, a mailbox key</dd></div>
+            <div><dt>It cannot see</dt><dd>Your data, grants, device names, the pairing code</dd></div>
+          </dl>
+          <p class="vh">A browser tab reaches the laptop through the relay path, which is in use. Local, direct, overlay and broker are not available in a browser. With the opt-in p2p build, a tab can also take the p2p path, but only through an iroh relay, as a browser cannot open UDP sockets.</p>
+        </div>
+      </div>
+      <button class="play net-play" type="button" data-net-play hidden>Pause</button>
+    </div>
+    <p class="caption faint net-note"><span>Illustrative. Device names, networks and timing are examples.</span><span class="net-key" aria-hidden="true"><i></i>handshake<i class="key-pk"></i>sealed data</span></p>
+  </figure>
+</section>
+
+<section class="band wrap" aria-labelledby="h-stack">
+  <h2 id="h-stack">Built on other projects, not in place of them.</h2>
+  <p class="sub">Tendril does not replace iroh, Noise or the platform keystores. It uses them, and adds the layer every app ends up writing itself, everything between your app and the network.</p>
+  <ol class="stack-diagram" aria-label="Where Tendril sits">
+    <li class="layer"><span class="layer-k">Your app</span><span class="layer-v">Screens, and the names of its grants</span></li>
+    <li class="layer layer-us"><span class="layer-k">Tendril</span><span class="layer-v">Pairing · check string · grants · revocation · choosing a path</span></li>
+    <li class="layer"><span class="layer-k">Built on</span><span class="layer-v mono">iroh · Noise · ML-KEM · ML-DSA · Argon2id · Ed25519 · Keychain · Android Keystore</span></li>
+  </ol>
+  <p class="small muted stack-foot">Need only a connection, with your own pairing and permissions? Use <a href="https://www.iroh.computer/">iroh</a> directly.</p>
+</section>
+
+<section id="start" class="band wrap" aria-labelledby="h-code">
+  <div class="code-head">
+    <h2 id="h-code">Serve, pair, confirm, grant.</h2>
+    <p class="sub">The same steps in every language. Your app owns the screens and the names of its grants. Tendril owns everything with a key in it.</p>
+  </div>
+  <div class="code-card" data-tabs>
+    <div class="code-tabs" role="tablist" aria-label="Language">
+      <button type="button" role="tab" id="tab-python" aria-controls="panel-python" aria-selected="true" data-lang="python">Python</button>
+      <button type="button" role="tab" id="tab-typescript" aria-controls="panel-typescript" aria-selected="false" tabindex="-1" data-lang="typescript">TypeScript</button>
+      <button type="button" role="tab" id="tab-go" aria-controls="panel-go" aria-selected="false" tabindex="-1" data-lang="go">Go</button>
+      <button type="button" role="tab" id="tab-swift" aria-controls="panel-swift" aria-selected="false" tabindex="-1" data-lang="swift">Swift</button>
+      <button type="button" role="tab" id="tab-kotlin" aria-controls="panel-kotlin" aria-selected="false" tabindex="-1" data-lang="kotlin">Kotlin</button>
+      <button type="button" role="tab" id="tab-rust" aria-controls="panel-rust" aria-selected="false" tabindex="-1" data-lang="rust">Rust</button>
+      <button type="button" role="tab" id="tab-cli" aria-controls="panel-cli" aria-selected="false" tabindex="-1" data-lang="cli">CLI</button>
+    </div>
+    <div class="code-panel" role="tabpanel" id="panel-python" aria-labelledby="tab-python" data-lang="python">
+<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>uv add tendril</code><button type="button" class="copy" data-copy="uv add tendril">Copy</button></div>
+<pre tabindex="0" aria-label="Python example"><code>import json, tendril
+
+host = tendril.Endpoint(&quot;./laptop-state&quot;, &quot;laptop&quot;)
+addr = host.serve_direct(&quot;127.0.0.1:0&quot;)
+code = host.issue_code(&quot;lan&quot;)                     # show as text or a QR
+
+req = json.loads(host.pair_accept(5000))
+host.confirm_peer(req[&quot;device_id&quot;], req[&quot;sas&quot;])   # after a person compares the check string
+grant = host.mint_grant(req[&quot;device_id&quot;], [&quot;notes.sync&quot;], ttl_secs=3600)
+
+session = host.accept_session(5000)
+session.authorize(&quot;notes.sync&quot;)                   # True</code></pre>
+</div>
+<div class="code-panel" role="tabpanel" id="panel-typescript" aria-labelledby="tab-typescript" data-lang="typescript">
+<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>npm install @tendril/node</code><button type="button" class="copy" data-copy="npm install @tendril/node">Copy</button></div>
+<pre tabindex="0" aria-label="TypeScript example"><code>import tendril from &quot;@tendril/node&quot;;
+
+const host = new tendril.Endpoint(&quot;./laptop-state&quot;, &quot;laptop&quot;);
+const addr = await host.serveDirect(&quot;127.0.0.1:0&quot;);
+const code = host.issueCode(&quot;lan&quot;); // show as text or a QR
+
+const req = JSON.parse(await host.pairAccept(5000));
+host.confirmPeer(req.device_id, req.sas); // after a person compares the check string
+const grant = host.mintGrant(req.device_id, [&quot;notes.sync&quot;], 3600);
+
+const session = await host.acceptSession(5000);
+await session.authorize(&quot;notes.sync&quot;); // true</code></pre>
+</div>
+<div class="code-panel" role="tabpanel" id="panel-go" aria-labelledby="tab-go" data-lang="go">
+<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>go get tendril.dev/bindings/go</code><button type="button" class="copy" data-copy="go get tendril.dev/bindings/go">Copy</button></div>
+<pre tabindex="0" aria-label="Go example"><code>import tendril &quot;tendril.dev/bindings/go&quot;
+
+host, err := tendril.NewEndpoint(&quot;./laptop-state&quot;, &quot;laptop&quot;)
+if err != nil { return err }
+addr, err := host.ServeDirect(&quot;127.0.0.1:0&quot;)
+if err != nil { return err }
+code, err := host.IssueCode(&quot;lan&quot;) // show as text or a QR
+if err != nil { return err }
+
+req, err := host.PairAccept(5000)
+if err != nil { return err }
+// after a person compares the check string
+if err := host.ConfirmPeer(req.DeviceID, req.SAS); err != nil { return err }
+grant, err := host.MintGrant(req.DeviceID, []string{&quot;notes.sync&quot;}, 3600)
+if err != nil { return err }
+
+sess, err := host.AcceptSession(5000)
+if err != nil { return err }
+ok, err := sess.Authorize(&quot;notes.sync&quot;) // true</code></pre>
+</div>
+<div class="code-panel" role="tabpanel" id="panel-swift" aria-labelledby="tab-swift" data-lang="swift">
+<div class="install"><code><span class="c-p" aria-hidden="true"></span>.package(url: &quot;https://github.com/agync/tendril&quot;, from: &quot;0.1.0&quot;)</code><button type="button" class="copy" data-copy=".package(url: &quot;https://github.com/agync/tendril&quot;, from: &quot;0.1.0&quot;)">Copy</button></div>
+<pre tabindex="0" aria-label="Swift example"><code>import Foundation
+import Tendril
+
+let host = try TendrilEndpoint(stateDir: &quot;./laptop-state&quot;, hostId: &quot;laptop&quot;)
+let addr = try host.serveDirect(listenAddr: &quot;127.0.0.1:0&quot;)
+let code = try host.issueCode(kind: &quot;lan&quot;) // show as text or a QR
+
+let json = Data(try host.pairAccept(timeoutMs: 5000).utf8)
+let req = try JSONSerialization.jsonObject(with: json) as! [String: Any]
+let device = req[&quot;device_id&quot;] as! String
+try host.confirmPeer(peerId: device, sas: req[&quot;sas&quot;] as? String) // after a person compares the check string
+let grant = try host.mintGrant(peerId: device, capsJson: #&quot;[&quot;notes.sync&quot;]&quot;#, ttlSecs: 3600)
+
+let session = try host.acceptSession(timeoutMs: 5000)
+let ok = try session.authorize(&quot;notes.sync&quot;) // true</code></pre>
+</div>
+<div class="code-panel" role="tabpanel" id="panel-kotlin" aria-labelledby="tab-kotlin" data-lang="kotlin">
+<div class="install"><code><span class="c-p" aria-hidden="true"></span>implementation(&quot;dev.tendril:tendril-kotlin:0.1.0&quot;)</code><button type="button" class="copy" data-copy="implementation(&quot;dev.tendril:tendril-kotlin:0.1.0&quot;)">Copy</button></div>
+<pre tabindex="0" aria-label="Kotlin example"><code>import dev.tendril.TendrilEndpoint
+import org.json.JSONObject
+
+val host = TendrilEndpoint.create(stateDir = &quot;./laptop-state&quot;, hostId = &quot;laptop&quot;)
+val addr = host.serveDirect(&quot;127.0.0.1:0&quot;)
+val code = host.issueCode(&quot;lan&quot;) // show as text or a QR
+
+val req = JSONObject(host.pairAccept(5000))
+val device = req.getString(&quot;device_id&quot;)
+host.confirmPeer(device, req.getString(&quot;sas&quot;)) // after a person compares the check string
+val grant = host.mintGrant(device, &quot;&quot;&quot;[&quot;notes.sync&quot;]&quot;&quot;&quot;, 3600)
+
+val session = host.acceptSession(5000)
+session.authorize(&quot;notes.sync&quot;) // true</code></pre>
+</div>
+<div class="code-panel" role="tabpanel" id="panel-rust" aria-labelledby="tab-rust" data-lang="rust">
+<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>cargo add tendril-runtime tendril-core</code><button type="button" class="copy" data-copy="cargo add tendril-runtime tendril-core">Copy</button></div>
+<pre tabindex="0" aria-label="Rust example"><code>// tendril-runtime is the async layer the other bindings wrap; it is lower level.
+let store = StateStore::open_or_create(&quot;./laptop-state&quot;)?;
+let identity = store.load_or_generate_identity(Some(&quot;laptop&quot;))?;
+let roster = Mutex::new(store.load_roster()?);
+let pairing = Mutex::new(PairingManager::new(PairingConfig::default()));
+let router = InboundRouter::new();
+
+let listener = DirectListener::bind(&quot;127.0.0.1:0&quot;.parse()?, None).await?;
+router.spawn_listener(&amp;Handle::current(), Box::new(listener));
+let code = pairing.lock().unwrap().issue_code(PairingCodeKind::Lan2Group, now())?;
+
+let (mut stream, guard) = router.recv_pair(wait).await?.ok_or(&quot;closed&quot;)?;
+let kind = pairing_path_kind_for_provider(stream.provider_id());
+let res = drive_pair_responder_with_options(stream.as_mut(), &amp;identity, &amp;pairing, &amp;roster,
+    kind, now(), Some(router.rate_limiter()), Some(guard), DEFAULT_PRE_AUTH_TIMEOUT).await?;
+let PairOutcome::ResponderPending { device_id, pairing_sas, .. } = res.outcome else { bail!() };
+
+// after a person compares the check string
+roster.lock().unwrap().confirm_peer(&amp;device_id, Some(&amp;pairing_sas))?;
+let grant = roster.lock().unwrap().mint_grant(&amp;identity, &amp;device_id,
+    vec![&quot;notes.sync&quot;.into()], now(), now() + 3600, random_bytes::&lt;16&gt;()?)?;
+store.save_roster(&amp;roster.lock().unwrap())?;</code></pre>
+</div>
+<div class="code-panel" role="tabpanel" id="panel-cli" aria-labelledby="tab-cli" data-lang="cli">
+<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>cargo install tendril-cli</code><button type="button" class="copy" data-copy="cargo install tendril-cli">Copy</button></div>
+<pre tabindex="0" aria-label="CLI example"><code>tendril --state-dir ./laptop-state init --host-id laptop
+tendril --state-dir ./laptop-state serve --listen 127.0.0.1:0 --issue-code lan
+
+# on the host, after a person compares the check string
+tendril --state-dir ./laptop-state confirm &lt;device_id&gt; --sas &quot;&lt;check string&gt;&quot;
+tendril --state-dir ./laptop-state mint &lt;device_id&gt; --cap notes.sync --ttl-secs 3600</code></pre>
+<p class="code-sub">Enroll a server<span>machine to machine, no check string</span></p>
+<pre tabindex="0" aria-label="CLI example, enroll a server"><code># on the Mac mini, accept machines and mint one single-use token
+tendril --state-dir ./mac-mini-state serve --listen 0.0.0.0:7000 --allow-enroll
+tendril --state-dir ./mac-mini-state enroll-token --target-host mac-mini --out ./token.json
+
+# on the NAS, with the Mac mini's keys from init pinned in advance
+tendril --state-dir ./nas-state enroll --endpoint 192.168.1.20:7000 --host-id mac-mini \
+  --host-static-pub &quot;&lt;static_pub&gt;&quot; --host-signing-pub &quot;&lt;signing_pub_hash&gt;&quot; \
+  --token-file ./token.json
+
+# on the Mac mini, the NAS joined with no grants
+tendril --state-dir ./mac-mini-state mint &lt;device_id&gt; --cap backup.write</code></pre>
+</div>
+  </div>
+  <p class="small muted code-foot">Events are polled, not called back, so nothing re-enters your event loop. In the browser, Tendril joins as a client through a relay.</p>
+</section>
+
+<section id="trust" class="band wrap" aria-labelledby="h-trust">
+  <h2 id="h-trust">What we borrow, and what we own.</h2>
+  <p class="sub">The algorithms are standard and used unchanged. The new parts are named, so review effort can go there. There has been no third-party audit yet.</p>
+  <div class="cols">
+    <div>
+      <p class="col-head">Borrowed, proven elsewhere</p>
+      <dl class="rows">
+        <div><dt>Key exchange</dt><dd>X25519 and ML-KEM-768 (NIST FIPS 203)</dd></div>
+        <div><dt>Signatures</dt><dd>Ed25519 and ML-DSA-65 (NIST FIPS 204), used together. Both must verify</dd></div>
+        <div><dt>Signed bytes</dt><dd>Canonical JSON (RFC 8785)</dd></div>
+        <div><dt>Code proof</dt><dd>Argon2id: 64 MiB and 3 passes, or 19 MiB and 2 passes in Wire v2 pairing</dd></div>
+        <div><dt>Peer-to-peer path</dt><dd>QUIC and hole punching, via iroh</dd></div>
+      </dl>
+    </div>
+    <div>
+      <p class="col-head col-head-us">New, and ours</p>
+      <dl class="rows">
+        <div><dt>Hybrid handshake</dt><dd><code class="mono small">Noise_XXhfs_25519+<wbr>MLKEM768_ChaChaPoly_SHA256</code>, in our own Noise code. Checked against a separate Go version</dd></div>
+        <div><dt>Code proof</dt><dd>Works only on the connection it was made for</dd></div>
+        <div><dt>Confirm, then grant</dt><dd>Approving a device and granting it anything are separate steps</dd></div>
+        <div><dt>Grants</dt><dd>Default deny. Exact names or a prefix, no patterns</dd></div>
+        <div><dt>Revocation</dt><dd>Signed lists that only move forward, pushed into live sessions</dd></div>
+        <div><dt>Wire v2</dt><dd>An opt-in privacy mode: hourly mailbox keys, padded sizes, and a decoy reply for strangers who probe a host</dd></div>
+      </dl>
+    </div>
+  </div>
+  <div class="relay">
+    <div class="relay-col"><p class="col-head">A relay cannot see</p><ul><li>Your data</li><li>Which grants exist</li><li>Device names</li><li>The pairing code</li></ul></div>
+    <div class="relay-col"><p class="col-head">A relay can see</p><ul><li>IP addresses</li><li>When devices connect, and how much they send</li><li>The key a waiting device uses as its mailbox. By default it never changes, so a relay can link that device's sessions</li></ul></div>
+  </div>
+  <p class="small muted relay-foot">Wire v2, an opt-in mode, changes the mailbox key every hour, rounds sizes up to fixed steps and varies the timing of keepalives. Addresses, and when devices send, stay visible. <a href="/how-it-works#limits">What it hides</a></p>
+  <p class="more-row"><a class="more" href="/docs/design/wire-and-pairing.html">Read the pairing design</a><a class="more" href="/docs/adr/0004-hybrid-post-quantum-v1.html">Why the handshake is hybrid</a></p>
+</section>
+
+<section class="band wrap split" aria-labelledby="h-plat">
+  <div class="split-text">
+    <h2 id="h-plat">One core, thin bindings.</h2>
+    <p class="sub">Every security decision is made in one Rust core that forbids unsafe code. Bindings translate types and nothing else.</p>
+    <p class="small muted">All bindings check the same shared test vectors.</p>
+  </div>
+  <dl class="plat">
+    <div><dt>Rust</dt><dd class="mono">tendril-core, tendril-runtime</dd></div>
+    <div><dt>Go</dt><dd class="mono">cgo</dd></div>
+    <div><dt>Python</dt><dd class="mono">PyO3</dd></div>
+    <div><dt>Node.js</dt><dd class="mono">N-API</dd></div>
+    <div><dt>Browser</dt><dd class="mono">WebAssembly</dd></div>
+    <div><dt>Swift</dt><dd class="mono">iOS, macOS</dd></div>
+    <div><dt>Kotlin</dt><dd class="mono">Android, JNI</dd></div>
+  </dl>
+</section>
+
+
+<section class="end wrap" aria-labelledby="h-end">
+  <h2 id="h-end">Pair two devices on your own machine.</h2>
+  <div class="end-cta">
+    <div class="cta-row">
+      <a class="btn btn-primary" href="/docs/usage/cli-demo.html">Try the CLI demo</a>
+      <a class="btn" href="https://github.com/agync/tendril">Source on GitHub</a>
+    </div>
+    <p class="note">Found a security problem? <a href="https://github.com/agync/tendril/security">Report it privately</a> on GitHub.</p>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-row">
+    <span><span class="wordmark">tendril</span> Apache-2.0. No analytics, no cookies.</span>
+    <nav aria-label="Footer">
+      <a href="/for-users">For app users</a>
+      <a href="/docs/overview.html">Overview</a>
+      <a href="/docs/architecture/">Architecture</a>
+      <a href="/docs/reference/">Reference</a>
+      <a href="/docs/usage/cli-demo.html">CLI demo</a>
+      <a href="https://github.com/agync/tendril">GitHub</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

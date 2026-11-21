@@ -1,0 +1,48 @@
+/* Use cases. Builds on site.css and how.css: the same parts, figures and details panels, plus a
+   problem and answer label, a two column "who it helps" block, a step flow and a short table. */
+
+.part-dev { margin-left: 12px; padding-left: 12px; border-left: 1px solid var(--line-strong); color: var(--text-3); }
+.part-lead .lab { font-weight: 600; color: var(--text); }
+.part-moment { max-width: 52ch; margin-bottom: 20px; padding-left: 14px; border-left: 2px solid var(--accent); font: 500 clamp(17px, 1.6vw, 19px)/1.5 var(--sans); color: var(--text); }
+
+/* Who it helps: two hairline lists with square markers, as in Limits */
+.for { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 32px; margin: 0 0 24px; }
+.for-h { padding-bottom: 8px; border-bottom: 1px solid var(--line-strong); font: 500 13px var(--sans); color: var(--text-4); }
+.for li { position: relative; padding: 9px 0 9px 18px; border-bottom: 1px solid var(--line); font-size: 15px; line-height: 1.5; color: var(--text-2); }
+.for li::before { content: ""; position: absolute; left: 1px; top: 1.05em; width: 6px; height: 6px; background: var(--text-3); }
+
+/* A job in three steps */
+.flow-h { margin-bottom: 12px; font: 500 13px var(--sans); color: var(--text-4); }
+.flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px; }
+.flow li { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 14px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--surface); }
+.flow li + li::before { content: ""; position: absolute; left: -16px; top: calc(50% - 4px); width: 6px; height: 6px; border: solid var(--text-4); border-width: 1.5px 1.5px 0 0; transform: rotate(45deg); }
+.flow li + li::after { content: ""; position: absolute; left: -27px; top: 50%; width: 18px; border-top: 1px solid var(--text-4); }
+.flow-us { border-color: var(--accent) !important; }
+.flow-k { font: 500 14px/1.4 var(--sans); color: var(--text); }
+.flow code { white-space: nowrap; overflow-wrap: normal; padding: 3px 7px; border: 1px solid var(--line); background: var(--sunken); font-size: 12.5px; }
+.flow-us code { border-color: var(--accent); }
+.flow-m { font: 12px/1.5 var(--mono); color: var(--text-3); }
+
+/* Mixed languages, one line under the last case */
+.poly { max-width: 64ch; margin-top: 32px; padding: 14px 16px; border-left: 2px solid var(--accent); background: var(--sunken); font-size: 15px; line-height: 1.6; color: var(--text-3); }
+.poly strong { font-weight: 600; color: var(--text); }
+
+/* Something else: need, what to use, why */
+.alt { margin: 4px 0 28px; border-top: 1px solid var(--line-strong); }
+.alt > div { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 4fr) minmax(0, 6fr); gap: 4px 24px; padding: 14px 0; border-bottom: 1px solid var(--line); align-items: baseline; }
+.alt dt { font: 500 15.5px/1.45 var(--sans); color: var(--text); }
+.alt-use { font: 500 14px/1.5 var(--mono); color: var(--accent-text); }
+.alt-why { font-size: 14.5px; line-height: 1.55; color: var(--text-3); }
+
+/* Three steps in a row need the full column; with the contents rail beside them they stack. */
+@media (max-width: 1180px) {
+  .flow { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .flow li + li::before { left: 22px; top: -11px; transform: rotate(135deg); }
+  .flow li + li::after { left: 25px; top: -22px; width: 0; height: 18px; border-top: 0; border-left: 1px solid var(--text-4); }
+}
+@media (max-width: 760px) {
+  .alt > div { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .for { grid-template-columns: minmax(0, 1fr); }
+}

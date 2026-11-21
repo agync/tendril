@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 26 8">
+  <!-- The one source of the mark, on a grid of 26 by 8 units: the host, a filled 8 unit square;
+       the link, 10 by 2 units on the centre line; the joining device, an 8 unit square outlined
+       2 units thick. brand.mjs builds every logo, icon and card from this path. -->
+  <path fill="currentColor" fill-rule="evenodd" d="M0 0H8V8H0Z M8 3H18V5H8Z M18 0H26V8H18Z M20 2V6H24V2Z"/>
+</svg>

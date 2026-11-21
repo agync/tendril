@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How Tendril works</title>
+<meta name="description" content="How Tendril links two devices: keys made on each device, pairing with a code and a check string, default-deny grants, revocation, a hybrid post-quantum handshake, enrolling machines with no screen, six network paths, blind relays, and the limits of what it protects.">
+<link rel="canonical" href="{{SITE_URL}}/how-it-works">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Tendril">
+<meta property="og:title" content="How Tendril works">
+<meta property="og:url" content="{{SITE_URL}}/how-it-works">
+<meta property="og:description" content="How Tendril links two devices: keys made on each device, pairing with a check string, default-deny grants, a hybrid post-quantum handshake, and blind relays.">
+<meta property="og:image" content="{{SITE_URL}}/assets/img/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Tendril logo with the words &quot;Pair two devices. No account, no server to trust.&quot; and &quot;Open source SDK. Rust core. Apache-2.0.&quot; Along the bottom, a filled square is linked to an outlined square.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="{{SITE_URL}}/assets/img/og.png">
+<meta name="twitter:image:alt" content="The Tendril logo with the words &quot;Pair two devices. No account, no server to trust.&quot; and &quot;Open source SDK. Rust core. Apache-2.0.&quot; Along the bottom, a filled square is linked to an outlined square.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/assets/css/fonts.css">
+<link rel="stylesheet" href="/assets/css/tokens.css">
+<link rel="stylesheet" href="/assets/css/site.css">
+<link rel="stylesheet" href="/assets/css/how.css">
+<script src="/assets/js/theme.js"></script>
+<script src="/assets/js/how.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="/" aria-label="Tendril home">
+      <span class="mark" aria-hidden="true"><span class="mark-a"></span><span class="mark-l"></span><span class="mark-b"></span></span>
+      <span class="wordmark">tendril</span>
+    </a>
+    <nav class="top-nav" aria-label="Site">
+      <a href="/use-cases">Use cases</a>
+      <a href="/how-it-works" aria-current="page">How it works</a>
+      <a class="nav-wide" href="/#trust">Security</a>
+      <a href="/docs/">Docs</a>
+      <a class="nav-mid" href="https://github.com/agync/tendril">GitHub</a>
+    </nav>
+    <span class="tag">v0.1</span>
+    <button class="theme-toggle" type="button" aria-label="Switch colour theme" data-theme-toggle>
+      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M8 1.75a6.25 6.25 0 0 1 0 12.5z" fill="currentColor"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<header class="doc-head wrap">
+  <p class="eyebrow">How it works</p>
+  <h1>How Tendril links two devices</h1>
+  <p class="doc-lede">A phone and a laptop want to talk privately, with no account and no server in charge. Each must know the other is the right device, know what the other may do, and find a way to reach it. This page takes those in order, in nine short parts.</p>
+  <p class="doc-note">Each part starts with the short version. Open <em>The details</em> for the exact mechanism, the numbers and a link to the design docs.</p>
+</header>
+
+<div class="doc wrap">
+  <nav class="toc" aria-label="On this page">
+    <details class="toc-d" data-toc>
+      <summary>On this page</summary>
+      <ol>
+        <li><a href="#idea"><span class="n">01</span>The idea</a></li>
+        <li><a href="#identity"><span class="n">02</span>Identity</a></li>
+        <li><a href="#pairing"><span class="n">03</span>Pairing</a></li>
+        <li><a href="#grants"><span class="n">04</span>Grants</a></li>
+        <li><a href="#revocation"><span class="n">05</span>Revocation</a></li>
+        <li><a href="#paths"><span class="n">06</span>Paths</a></li>
+        <li><a href="#relays"><span class="n">07</span>Relays</a></li>
+        <li><a href="#limits"><span class="n">08</span>Limits</a></li>
+        <li><a href="#core"><span class="n">09</span>One core</a></li>
+      </ol>
+    </details>
+  </nav>
+
+  <div class="doc-body">
+
+<section id="idea" class="part" aria-labelledby="h-idea">
+  <p class="part-n">01</p>
+  <h2 id="h-idea">The pair is a key, the path is a hint</h2>
+  <p class="part-lead">Most apps tie trust to an account or a network address. Accounts need a server you must trust, and addresses change every time a phone leaves Wi-Fi. Tendril ties trust to the two devices instead. Each one keeps the other's public key and the grants it was given. The route the bytes take, called a path, can change at any time without touching either.</p>
+  <p class="part-lead">Every connection starts with a handshake, a short exchange in which each device proves it holds its key and both agree on fresh keys for this connection. What follows is an encrypted session.</p>
+  <p class="part-lead">The handshake is hybrid post-quantum. It mixes a classic key exchange with a newer one built to resist future quantum computers. A hybrid stays secure as long as either one holds.</p>
+  <figure class="fig">
+    <svg class="dia" viewBox="0 0 400 200" role="img" aria-label="A phone and a laptop. Between them, the pairing, held by both devices, carries keys and grants. Below it, three paths, direct, peer-to-peer and relay, any of which can carry the session.">
+      <rect class="b" x="4" y="24" width="112" height="152"/>
+      <text class="t-s t-strong" x="60" y="96" text-anchor="middle">phone</text>
+      <text class="t-xs t-mut" x="60" y="112" text-anchor="middle">keeps laptop's key</text>
+      <rect class="b" x="284" y="24" width="112" height="152"/>
+      <text class="t-s t-strong" x="340" y="96" text-anchor="middle">laptop</text>
+      <text class="t-xs t-mut" x="340" y="112" text-anchor="middle">keeps phone's key</text>
+      <text class="t-s t-acc" x="200" y="44" text-anchor="middle">pairing</text>
+      <path class="w-acc" d="M116 56H284M116 61H284"/>
+      <text class="t-xs t-mut" x="200" y="78" text-anchor="middle">keys and grants, held by both</text>
+      <path class="w w-dot" d="M116 112H284M116 136H284M116 160H284"/>
+      <rect class="b-gap" x="176" y="104" width="48" height="16"/>
+      <text class="t-xs" x="200" y="116" text-anchor="middle">direct</text>
+      <rect class="b-gap" x="182" y="128" width="36" height="16"/>
+      <text class="t-xs" x="200" y="140" text-anchor="middle">p2p</text>
+      <rect class="b-gap" x="178" y="152" width="44" height="16"/>
+      <text class="t-xs" x="200" y="164" text-anchor="middle">relay</text>
+      <text class="t-xs t-mut" x="200" y="194" text-anchor="middle">paths come and go, the pairing stays</text>
+    </svg>
+  </figure>
+  <ul class="gains" aria-label="What this means">
+    <li>A new network means a new handshake, never a new pairing.</li>
+    <li>An address can only say where to try. It never grants anything.</li>
+  </ul>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p>Every path is an untrusted byte pipe below the session. TLS, WireGuard, QUIC or a secure WebSocket around it count as plumbing. Only the inner Noise session, <code>Noise_XXhfs_25519+<wbr>MLKEM768_ChaChaPoly_SHA256</code>, proves who the other device is and carries its grants.</p>
+      <p>A pairing link can carry endpoint hints (<code>ep</code>). They say where to dial and never grant anything. The key the peer-to-peer path uses for routing is derived from the device's own key and is routing metadata only.</p>
+      <p>Reconnecting after a network change is up to your app. It dials again, and the pairing and grants carry over unchanged.</p>
+      <p class="more-link">Why every path is treated as hostile: <a href="/docs/adr/0001-one-core-hostile-paths.html">One core, hostile paths</a></p>
+    </div>
+  </details>
+</section>
+
+<section id="identity" class="part" aria-labelledby="h-identity">
+  <p class="part-n">02</p>
+  <h2 id="h-identity">Each device makes its own keys</h2>
+  <p class="part-lead">Nobody hands a device its identity. No server issues it a certificate and no account holds a password for it. On first run, each device makes its own keys, and the private halves stay on that device.</p>
+  <figure class="fig">
+    <div class="keys">
+      <div class="keybox">
+        <p class="keybox-h">On the phone</p>
+        <dl class="kl">
+          <div><dt>X25519 key</dt><dd>Proves who it is in every handshake</dd></div>
+          <div><dt>Signing key</dt><dd>Ed25519 and ML-DSA-65 together. Signs grants and revocation lists</dd></div>
+        </dl>
+      </div>
+      <div class="derive" aria-label="How a device id is made">
+        <span class="derive-s">public key</span>
+        <span class="derive-a" aria-hidden="true">SHA-256, first 8 bytes</span>
+        <span class="derive-id"><code>dev_7a91c04e2b6d3f18</code><span>the device id</span></span>
+      </div>
+    </div>
+    <table class="where">
+      <caption>Where the private keys are kept</caption>
+      <tbody>
+        <tr><th scope="row">Desktop and server</th><td>Files only your user account can read</td></tr>
+        <tr><th scope="row">iPhone and Mac</th><td>Keychain</td></tr>
+        <tr><th scope="row">Android</th><td>Android Keystore</td></tr>
+        <tr><th scope="row">Browser</th><td>Wherever your app chooses</td></tr>
+      </tbody>
+    </table>
+    <figcaption>Illustrative id. Every device id is worked out the same way from its key.</figcaption>
+  </figure>
+  <ul class="gains" aria-label="What this means">
+    <li>There is no account to steal and no central list of devices.</li>
+    <li>A device id comes from the device's key, so one device cannot claim another's id.</li>
+  </ul>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p>Each device has two long-lived key pairs. An X25519 static key identifies it in every Noise handshake. A signing key, an Ed25519 key and an ML-DSA-65 key used together, signs grants, revocation lists and key rotation records. A signature counts only if both halves verify. Relay mailboxes use Ed25519 alone: the Ed25519 half of this key by default, or a key made fresh each hour with Wire v2.</p>
+      <p>Keys are made in <code>tendril-core</code> and wiped from memory when they are dropped. The device id is <code>dev_</code> and the first 8 bytes of the SHA-256 of the static public key, as 16 lowercase hex characters. A host rejects a session whose claimed id does not match the key that proved itself.</p>
+      <p>On desktops and servers, the state directory is created with mode <code>0700</code> and the identity and roster files with <code>0600</code>. The Apple and Android secure chips do not support these curves or ML-DSA-65, so there the keys are made in the core and stored wrapped by a Keychain or Android Keystore AES key. The Keychain item opens only after first unlock and only on that device, and the Android binding turns off app backups. The Swift and Android test suites do not yet run in CI.</p>
+      <p>In the browser, your app keeps the identity and roster wherever it chooses. The SDK exports them and takes them back on start. The browser demo seals them under a WebCrypto key that cannot be exported.</p>
+      <p class="more-link">Read more: <a href="/docs/design/wire-and-pairing.html">Wire and pairing design</a></p>
+    </div>
+  </details>
+</section>
+
+<section id="pairing" class="part" aria-labelledby="h-pairing">
+  <p class="part-n">03</p>
+  <h2 id="h-pairing">Pairing, step by step</h2>
+  <p class="part-lead">Pairing has one job. It must make sure the device on the other end is the one in front of you, and not someone pretending to be it. Tendril does this with a short code, a handshake, and a check a person makes with their own eyes. Here the laptop is the host, the device that waits, and the phone is the joining device.</p>
+  <figure class="fig seq" data-seq>
+    <svg class="dia" viewBox="0 0 400 316" aria-hidden="true" focusable="false">
+      <rect class="b" x="4" y="4" width="136" height="40"/>
+      <text class="t-s t-strong" x="72" y="21" text-anchor="middle">phone</text>
+      <text class="t-xs t-mut" x="72" y="36" text-anchor="middle">joining device</text>
+      <rect class="b" x="260" y="4" width="136" height="40"/>
+      <text class="t-s t-strong" x="328" y="21" text-anchor="middle">laptop</text>
+      <text class="t-xs t-mut" x="328" y="36" text-anchor="middle">host</text>
+      <path class="w w-life" d="M72 44V276M328 44V276"/>
+      <g class="sq" data-sq="0">
+        <path class="w w-dash" d="M322 80H78"/><path class="w" d="M84 76 78 80 84 84"/>
+        <text class="t-s t-m t-lab" x="200" y="72" text-anchor="middle">TND-4F9K-22XQ</text>
+        <text class="t-xs t-mut" x="200" y="96" text-anchor="middle">read by eye or camera</text>
+      </g>
+      <g class="sq" data-sq="1">
+        <path class="w" d="M78 122H322M316 118 322 122 316 126"/>
+        <text class="t-s t-lab" x="200" y="114" text-anchor="middle">1 · two fresh one-time keys</text>
+      </g>
+      <g class="sq" data-sq="2">
+        <path class="w" d="M322 160H78M84 156 78 160 84 164"/>
+        <text class="t-s t-lab" x="200" y="152" text-anchor="middle">2 · laptop's identity, encrypted</text>
+        <text class="t-xs t-mut" x="200" y="176" text-anchor="middle">a scanned QR code lets the phone check it</text>
+      </g>
+      <g class="sq" data-sq="3">
+        <path class="w" d="M78 204H322M316 200 322 204 316 208"/>
+        <text class="t-s t-lab" x="200" y="196" text-anchor="middle">3 · phone's identity + code proof</text>
+        <text class="t-xs t-mut" x="200" y="220" text-anchor="middle">the code itself is never sent</text>
+      </g>
+      <g class="sq" data-sq="4">
+        <path class="w" d="M322 248H78M84 244 78 248 84 252"/>
+        <text class="t-s t-lab" x="200" y="240" text-anchor="middle">reply · pending, then hang up</text>
+        <path class="w" d="M66 268H78M322 268H334"/>
+      </g>
+      <g class="sq" data-sq="5">
+        <rect class="b" x="4" y="280" width="136" height="30"/>
+        <text class="t-xs t-m t-lab" x="72" y="299" text-anchor="middle">k7qm 4xrt 3fpa 2wnc</text>
+        <rect class="b" x="260" y="280" width="136" height="30"/>
+        <text class="t-xs t-m t-lab" x="328" y="299" text-anchor="middle">k7qm 4xrt 3fpa 2wnc</text>
+        <text class="t-xs t-mut" x="200" y="299" text-anchor="middle">a person compares</text>
+      </g>
+    </svg>
+    <ol class="seq-list">
+      <li data-sq="0"><p><strong>The laptop shows a code.</strong> As text or a QR code. It works once and expires after 15 minutes. It moves by eye or camera, never over the network.</p></li>
+      <li data-sq="1"><p><strong>The phone says hello.</strong> Its first message carries two keys made for this one connection, a classic one and a post-quantum one. Nothing in it says which phone this is.</p></li>
+      <li data-sq="2"><p><strong>The laptop proves who it is.</strong> Its reply carries its identity, encrypted. If the phone scanned a QR code, it already knows the laptop's key and checks it now. A decoy is dropped here, before the phone reveals anything about itself.</p></li>
+      <li data-sq="3"><p><strong>The phone proves it has the code.</strong> It sends its own identity and a code proof, a value only someone with the code can work out, and only for this connection. The code itself is never sent.</p></li>
+      <li data-sq="4"><p><strong>The laptop answers and hangs up.</strong> It checks the proof, lists the phone as pending, sends one reply and closes the connection. Nothing waits on an open connection while a person decides.</p></li>
+      <li data-sq="5"><p><strong>A person compares two strings.</strong> Both screens show a 16-character check string worked out from this exact handshake. A person checks they match and confirms. The phone can now open a session, but it has no grants yet.</p></li>
+    </ol>
+    <div class="seq-ctl" hidden>
+      <button type="button" data-seq-prev>Back</button>
+      <span class="seq-pos" aria-live="polite" data-seq-pos>Step 1 of 6</span>
+      <button type="button" data-seq-next>Next</button>
+    </div>
+    <figcaption>Illustrative. The code and the check string are examples.</figcaption>
+  </figure>
+  <p class="part-lead">The check string is what stops someone in the middle. To sit between the two devices, they must run one handshake with the phone and another with the laptop. Two handshakes give two different check strings.</p>
+  <figure class="fig">
+    <svg class="dia" viewBox="0 0 400 140" role="img" aria-label="Someone in the middle runs handshake 1 with the phone and handshake 2 with the laptop. The phone shows k7qm 4xrt 3fpa 2wnc and the laptop shows p3ze 6hya q2mb tr5d. The strings differ, so the person cancels.">
+      <rect class="b" x="4" y="8" width="116" height="40"/>
+      <text class="t-s t-strong" x="62" y="32" text-anchor="middle">phone</text>
+      <rect class="b b-dash" x="160" y="8" width="80" height="40"/>
+      <text class="t-xs" x="200" y="25" text-anchor="middle">someone in</text>
+      <text class="t-xs" x="200" y="39" text-anchor="middle">the middle</text>
+      <rect class="b" x="280" y="8" width="116" height="40"/>
+      <text class="t-s t-strong" x="338" y="32" text-anchor="middle">laptop</text>
+      <path class="w" d="M120 28H160M240 28H280"/>
+      <text class="t-xs t-mut" x="62" y="68" text-anchor="middle">handshake 1</text>
+      <text class="t-xs t-mut" x="338" y="68" text-anchor="middle">handshake 2</text>
+      <rect class="b" x="4" y="78" width="136" height="30"/>
+      <text class="t-xs t-m" x="72" y="97" text-anchor="middle">k7qm 4xrt 3fpa 2wnc</text>
+      <rect class="b" x="260" y="78" width="136" height="30"/>
+      <text class="t-xs t-m" x="328" y="97" text-anchor="middle">p3ze 6hya q2mb tr5d</text>
+      <text class="t-s t-crit" x="200" y="97" text-anchor="middle">different</text>
+      <text class="t-xs t-mut" x="200" y="132" text-anchor="middle">the strings do not match, so the person cancels</text>
+    </svg>
+    <figcaption>Illustrative. The strings are examples.</figcaption>
+  </figure>
+  <ul class="gains" aria-label="What this means">
+    <li>The code is never sent, not even encrypted.</li>
+    <li>A code proof only works on the connection it was made for, so it cannot be copied onto another.</li>
+    <li>Someone in the middle shows up as two check strings that do not match.</li>
+  </ul>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>The code.</strong> Characters come from a 31-character alphabet with no 0, 1, I, L or O, so nothing is misread: <code>23456789ABCDEFGHJKMNPQRSTUVWXYZ</code></p>
+      <table class="spec">
+        <thead><tr><th scope="col">Form</th><th scope="col">Random characters</th><th scope="col">Used for</th></tr></thead>
+        <tbody>
+          <tr><td><code>TND-XXXX-XXXX</code></td><td>8, about 40 bits</td><td>QR codes and the local network</td></tr>
+          <tr><td><code>TND-XXXX-XXXX-XXXX</code></td><td>12, about 59 bits</td><td>Typing across the internet</td></tr>
+        </tbody>
+      </table>
+      <p>Hosts reject the short form on remote paths. A code works once and lasts 15 minutes by default, and the host can change that. Every failed attempt counts against all live codes, and a code is burned after 5 failures.</p>
+      <p><strong>The handshake.</strong> <code>Noise_XXhfs_25519+<wbr>MLKEM768_ChaChaPoly_SHA256</code>, a hybrid post-quantum handshake in three messages. It is the only one Tendril speaks, in both versions of the wire format. There is no fallback, so a peer on an older version without it is turned away.</p>
+      <table class="spec spec-msg">
+        <thead><tr><th scope="col">Message</th><th scope="col">Carries</th><th scope="col">Size</th></tr></thead>
+        <tbody>
+          <tr><td>1, to the host</td><td>Two one-time public keys, X25519 and <span class="nowrap">ML-KEM-768</span>. Nothing about the device</td><td>1216 B</td></tr>
+          <tr><td>2, to the joining device</td><td>The host's key, its id and its 1984 byte signing key, encrypted</td><td>1200 B + hello</td></tr>
+          <tr><td>3, to the host</td><td>The joining device's key, its name and the code proof, encrypted</td><td>64 B + claim</td></tr>
+        </tbody>
+      </table>
+      <p>In version 1, the default, the whole handshake is about 6 KiB. A pairing link or QR code (<code>tendril://pair?...</code>) carries the host's X25519 key and a 32 byte hash of its signing key, which keeps the QR code small. The joining device checks both on message 2 and stops before message 3 if they differ, so its own key is never shown to the wrong host.</p>
+      <p><strong>The code proof.</strong> <code>K = Argon2id(code, salt = first 16 bytes of h)</code> with 64 MiB of memory, 3 passes and 1 lane, where <code>h</code> is the handshake hash after message 2. The proof is <code>HMAC-SHA256(K, "tendril-pair-v1" || h)</code>, compared in constant time. Argon2id makes each guess slow and memory hungry. Binding to <code>h</code> ties the proof to this one handshake.</p>
+      <p><strong>Wire v2 pairing.</strong> When both devices turn on Wire v2, the joining device proves it has the code in message 1 instead, with Argon2id at 19 MiB and 2 passes. The host then shows its identity only to a device that has the code. Anyone else gets a decoy reply of the same size, and no code is used up. The check string and the pending step stay the same.</p>
+      <p><strong>The check string.</strong> The first 16 characters of the lowercase base32 SHA-256 of <code>"tendril-sas-v1" || h</code>, in groups of four.</p>
+      <p><strong>After the reply.</strong> The host sends one encrypted reply and closes. The new device stays pending and cannot open a session. Confirming it (<code>pair.confirm</code>) makes it active with no grants. Without a QR code, the joining device also keeps the host pending until a person confirms there. A revoked device cannot pair again with the same key.</p>
+      <p class="more-link">Read more: <a href="/docs/design/wire-and-pairing.html">Wire and pairing design</a> and <a href="/docs/adr/0004-hybrid-post-quantum-v1.html">why the handshake is hybrid</a></p>
+    </div>
+  </details>
+  <div class="sub-part" id="machines">
+    <h3>Machines with no screen</h3>
+    <p class="part-lead">Say an app runs on a Mac mini at home, and a NAS should back it up. The NAS has no screen. Nobody can read a check string off it, so pairing by eye does not fit. Instead, the Mac mini, as host, mints an enrollment token, a signed permission to join that works once and expires after 15 minutes by default. The NAS must already know the host's keys, so it never trusts whoever answers first.</p>
+    <p class="part-lead">Hosts refuse all of this until their owner turns it on. A machine that enrolls is active but holds no grants, so granting it something is still a separate step.</p>
+    <figure class="fig m2m">
+      <svg class="dia" viewBox="0 0 400 360" aria-hidden="true" focusable="false">
+        <rect class="b" x="4" y="4" width="136" height="40"/>
+        <text class="t-s t-strong" x="72" y="21" text-anchor="middle">NAS</text>
+        <text class="t-xs t-mut" x="72" y="36" text-anchor="middle">joining machine</text>
+        <rect class="b" x="260" y="4" width="136" height="40"/>
+        <text class="t-s t-strong" x="328" y="21" text-anchor="middle">Mac mini</text>
+        <text class="t-xs t-mut" x="328" y="36" text-anchor="middle">host · runs the app</text>
+        <rect class="b" x="4" y="56" width="136" height="40"/>
+        <text class="t-xs" x="72" y="72" text-anchor="middle">Mac mini's keys, pinned</text>
+        <text class="t-xs t-mut" x="72" y="87" text-anchor="middle">token, from a file</text>
+        <rect class="b b-acc" x="260" y="56" width="136" height="40"/>
+        <text class="t-xs t-strong" x="328" y="72" text-anchor="middle">enrollment token</text>
+        <text class="t-xs t-mut" x="328" y="87" text-anchor="middle">single use · 15 min</text>
+        <path class="w w-dash" d="M258 84H142"/><path class="w" d="M148 80 142 84 148 88"/>
+        <text class="t-xs t-mut" x="200" y="76" text-anchor="middle">copied over</text>
+        <path class="w w-life" d="M72 96V324M328 96V324"/>
+        <path class="w" d="M78 128H322M316 124 322 128 316 132"/>
+        <text class="t-s" x="200" y="120" text-anchor="middle">1 · two one-time keys</text>
+        <path class="w" d="M322 170H78M84 166 78 170 84 174"/>
+        <text class="t-s" x="200" y="162" text-anchor="middle">2 · Mac mini's keys, encrypted</text>
+        <text class="t-xs t-mut" x="200" y="186" text-anchor="middle">checked against the pin</text>
+        <path class="w" d="M78 224H322M316 220 322 224 316 228"/>
+        <text class="t-s" x="200" y="216" text-anchor="middle">3 · token + enrollment proof</text>
+        <text class="t-xs t-mut" x="200" y="240" text-anchor="middle">bound to this one handshake</text>
+        <rect class="b" x="260" y="256" width="136" height="36"/>
+        <text class="t-xs t-strong" x="328" y="271" text-anchor="middle">burn log</text>
+        <text class="t-xs t-mut" x="328" y="285" text-anchor="middle">token used, saved</text>
+        <path class="w" d="M322 312H78M84 308 78 312 84 316"/>
+        <text class="t-s" x="200" y="304" text-anchor="middle">reply · then hang up</text>
+        <rect class="b" x="4" y="326" width="136" height="30"/>
+        <text class="t-xs t-m" x="72" y="345" text-anchor="middle">active · 0 grants</text>
+      </svg>
+      <ol class="m2m-list">
+        <li><p><strong>The Mac mini mints a token.</strong> It is signed by the Mac mini, works once and expires after 15 minutes. It is copied to the NAS as a file.</p></li>
+        <li><p><strong>The NAS checks the host.</strong> It already holds the Mac mini's keys, pinned in advance. If message 2 shows other keys, it stops before it says anything about itself.</p></li>
+        <li><p><strong>The NAS proves the token is its own.</strong> Message 3 carries the token and a proof signed with the NAS's key over this handshake, so a copied token cannot be used on another connection.</p></li>
+        <li><p><strong>The Mac mini burns the token, then answers.</strong> It writes the token to its burn log and saves it before it replies. The NAS is now active, with no grants.</p></li>
+      </ol>
+      <figcaption>Illustrative. Any machine with no screen enrolls the same way.</figcaption>
+    </figure>
+    <ul class="gains" aria-label="What this means">
+      <li>No check string, and still no trust in whoever answers first.</li>
+      <li>A token works once. A copy is useless after that.</li>
+      <li>An enrolled machine can do nothing until you grant it something.</li>
+    </ul>
+    <details class="more">
+      <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+      <div class="more-body">
+        <p><strong>Off by default.</strong> A host accepts enrollment only once its owner turns it on, with <code>tendril serve --allow-enroll</code> in the CLI, or in the SDKs by adding a trust anchor or minting a token for itself.</p>
+        <p><strong>The enrollment token.</strong> A signed grant for one use (<code>uses: 1</code>), marked for machines, with a 16 byte nonce as its id. It may hold only <code>pair.enroll</code> or <code>pair.enroll:&lt;host_id&gt;</code>. It lasts 900 seconds by default and never more than 86,400. The CLI host accepts tokens of up to 900 seconds, as do the hosts in the language bindings. A longer lifetime needs a Rust host that sets its own enrollment policy. The host signs it, or an outside key the host trusts, called a trust anchor (<code>tendril anchor add</code>). The CLI reads it from a file, standard input or an environment variable, never from the command line.</p>
+        <p><strong>Pinning.</strong> The joining machine must be given the host's id, X25519 key and signing key in advance, as the full 1984 bytes or a 32 byte hash. There is no trust on first use.</p>
+        <p><strong>The proof.</strong> In message 3 the machine sends the token, its signing key and <code>enroll_proof</code>, a hybrid signature over <code>"tendril-enroll-v1\0" || h || its static key || the token nonce</code>. That ties the token to this one handshake and this one device.</p>
+        <p><strong>The burn log.</strong> The host records the nonce and saves its roster before it writes the reply. The log holds up to 16,384 unexpired tokens. When it is full, the host refuses new enrollments rather than forget old ones. A revoked machine still burns the token it presents.</p>
+        <p><strong>The result.</strong> The machine joins active, with zero grants. Grants come from <code>pair.mint</code>, as for any device. Session checks reject any grant marked for one use or for machines, so a token can never open a session.</p>
+        <p><strong>Taking it back.</strong> <code>tendril revoke-token</code> revokes an unused token by its nonce, and <code>tendril anchor revoke</code> stops every token an anchor signed.</p>
+        <p class="more-link">Read more: <a href="/docs/design/m2m-enrollment.html">Machine enrollment design</a></p>
+      </div>
+    </details>
+  </div>
+</section>
+
+<section id="grants" class="part" aria-labelledby="h-grants">
+  <p class="part-n">04</p>
+  <h2 id="h-grants">Nothing is allowed until a grant says so</h2>
+  <p class="part-lead">Pairing proves who a device is. It does not decide what that device may do. A paired device can open an encrypted session and nothing else. Each thing it may do is a grant, signed by the host, with an end time. Confirming a device and granting it something are two separate steps, so one never implies the other.</p>
+  <figure class="fig">
+    <div class="grants">
+      <div class="grant">
+        <p class="grant-h">Grant<span>signed by laptop</span></p>
+        <dl class="kl">
+          <div><dt>For</dt><dd>phone <code>dev_7a91c04e2b6d3f18</code></dd></div>
+          <div><dt>May</dt><dd><code>notes.sync</code><br><code>fs.read:/photos/*</code></dd></div>
+          <div><dt>Until</dt><dd>60 minutes from now</dd></div>
+        </dl>
+      </div>
+      <table class="checks">
+        <caption>The phone asks, the laptop checks</caption>
+        <thead><tr><th scope="col">Request</th><th scope="col">Result</th></tr></thead>
+        <tbody>
+          <tr><td><code>notes.sync</code></td><td><span class="st st-ok">allow</span></td></tr>
+          <tr><td><code>fs.read:/photos/2026/beach.jpg</code></td><td><span class="st st-ok">allow</span></td></tr>
+          <tr><td><code>fs.write:/photos/2026/beach.jpg</code></td><td><span class="st st-no">deny</span> <span class="why">not granted</span></td></tr>
+          <tr><td><code>fs.read:/documents/tax.pdf</code></td><td><span class="st st-no">deny</span> <span class="why">outside /photos/</span></td></tr>
+          <tr><td><code>notes.sync</code>, an hour later</td><td><span class="st st-no">deny</span> <span class="why">expired</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figcaption>Illustrative. Your app names its own grants.</figcaption>
+  </figure>
+  <ul class="gains" aria-label="What this means">
+    <li>A new device can do nothing until your app grants it something.</li>
+    <li>A grant is an exact name or a prefix. There are no patterns that match more than you meant.</li>
+    <li>Grants end on their own.</li>
+  </ul>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>Names.</strong> A grant names <code>namespace.verb</code> or <code>namespace.verb:resource</code>. A resource may end in one <code>*</code>, which matches any resource with that prefix. There are no wildcards in the middle, no negation and no regular expressions.</p>
+      <p><strong>Paths.</strong> Plain checks treat a resource as an opaque string. For file paths, the Rust core has a path check, <code>authorize_path</code>, that cleans the path first and matches only at <code>/</code> boundaries, so <code>/public/*</code> never covers <code>/public_secrets/key.pem</code>. Apps that guard files should use it.</p>
+      <p><strong>Checks.</strong> A grant is checked when a session opens, on every rekey and on every <code>authorize</code> call. It denies at the first problem, checking in this order: shape, subject, time, revocation, issuer and signature, the chain it was passed down, then the name. It allows 30 seconds of clock difference. In Rust, each check also returns an audit event your app can record. The other bindings return allow or deny.</p>
+      <p><strong>Signatures.</strong> Ed25519 and ML-DSA-65 over RFC 8785 canonical JSON with a fixed prefix, so the same grant always signs to the same bytes. A grant is valid only if both signatures verify.</p>
+      <p><strong>Passing a grant on.</strong> A device whose grant includes <code>pair.mint</code> can grant a narrower one to another device. Every name must be covered by its own grant, the time window must sit inside its own, and the chain can be at most 4 hops long. Revoking a grant also revokes everything passed on from it.</p>
+      <ol class="chain" aria-label="An example chain">
+        <li><span>laptop</span><code>pair.mint, fs.read:/photos/*</code><span class="faint">24 hours</span></li>
+        <li><span>phone</span><code>fs.read:/photos/2026/*</code><span class="faint">1 hour</span></li>
+      </ol>
+      <p class="more-link">Read more: <a href="/docs/design/grants.html">Grants design</a></p>
+    </div>
+  </details>
+</section>
+
+<section id="revocation" class="part" aria-labelledby="h-revocation">
+  <p class="part-n">05</p>
+  <h2 id="h-revocation">Taking access back</h2>
+  <p class="part-lead">A phone gets lost. It has to be cut off now, including any session it already has open. The host keeps a roster, a list of every device it knows and the state of each. Revoking a device changes its state and sends a signed revocation list into live sessions.</p>
+  <figure class="fig">
+    <svg class="dia" viewBox="0 0 400 168" role="img" aria-label="A device moves from pending to active when a person confirms it, and from active to revoked when it is revoked. In a live session, revocation list 41 is followed by list 42, which revokes the phone. After that the phone's requests are denied.">
+      <rect class="b" x="4" y="8" width="100" height="44"/>
+      <text class="t-s t-strong" x="54" y="27" text-anchor="middle">pending</text>
+      <text class="t-xs t-mut" x="54" y="42" text-anchor="middle">no sessions</text>
+      <rect class="b" x="150" y="8" width="100" height="44"/>
+      <text class="t-s t-strong" x="200" y="27" text-anchor="middle">active</text>
+      <text class="t-xs t-mut" x="200" y="42" text-anchor="middle">sessions, grants</text>
+      <rect class="b b-crit" x="296" y="8" width="100" height="44"/>
+      <text class="t-s t-crit" x="346" y="27" text-anchor="middle">revoked</text>
+      <text class="t-xs t-mut" x="346" y="42" text-anchor="middle">nothing</text>
+      <path class="w" d="M104 30H150M144 26 150 30 144 34M250 30H296M290 26 296 30 290 34"/>
+      <text class="t-xs" x="127" y="66" text-anchor="middle">confirm</text>
+      <text class="t-xs" x="273" y="66" text-anchor="middle">revoke</text>
+      <text class="t-xs t-mut" x="4" y="98">a live session</text>
+      <path class="w w-sess" d="M4 116H236"/>
+      <path class="w w-dash" d="M236 116H396"/>
+      <rect class="b" x="64" y="106" width="56" height="20"/>
+      <text class="t-xs t-m" x="92" y="120" text-anchor="middle">list 41</text>
+      <rect class="b b-acc" x="180" y="106" width="56" height="20"/>
+      <text class="t-xs t-m t-strong" x="208" y="120" text-anchor="middle">list 42</text>
+      <text class="t-xs t-mut" x="92" y="146" text-anchor="middle">signed by laptop</text>
+      <text class="t-xs t-mut" x="208" y="146" text-anchor="middle">revokes the phone</text>
+      <text class="t-xs t-crit" x="316" y="106" text-anchor="middle">phone's requests denied</text>
+    </svg>
+    <figcaption>Illustrative. List numbers are examples.</figcaption>
+  </figure>
+  <ul class="gains" aria-label="What this means">
+    <li>Revoking a device also ends what it can do in sessions that are already open.</li>
+    <li>An older list cannot undo a newer one.</li>
+    <li>A revoked device cannot pair again with the same key.</li>
+  </ul>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>States.</strong> Devices paired by a person start pending. A machine enrolled with a token starts active, with no grants. Pending devices cannot open sessions. Active devices can, and hold whatever grants they were given. Revoked devices are refused, and trying to pair again with the same key fails while still burning the code.</p>
+      <p><strong>Revocation lists.</strong> A list names revoked devices and revoked grants, carries a sequence number, and is signed with the host's signing key, Ed25519 and ML-DSA-65 together, over RFC 8785 JSON. A device rejects any list whose number is lower than the highest it has already seen. Lists travel inside a live session as their own frame type.</p>
+      <p><strong>Rekeying.</strong> Every 15 minutes or 2<sup>20</sup> frames, whichever comes first, a session switches to fresh keys. With Wire v2, each switch comes at a random point between 75 and 100 percent of those limits. The receiving side then checks its active grants again against the latest list.</p>
+      <p><strong>Key rotation.</strong> A host can replace its keys by signing a numbered rotation record with the old key. Peers follow the chain of records one number at a time. Two valid records with the same number mean someone else may hold the key. The peer is then marked revoked, its grants are cleared, and the check returns an error.</p>
+      <p><strong>Offline devices.</strong> Revocation is not instant for a device that is offline. It learns of it only when it reconnects or rekeys.</p>
+      <p class="more-link">Read more: <a href="/docs/design/grants.html">Grants design</a></p>
+    </div>
+  </details>
+</section>
+
+<section id="paths" class="part" aria-labelledby="h-paths">
+  <p class="part-n">06</p>
+  <h2 id="h-paths">Six paths, nearest first</h2>
+  <p class="part-lead">Two devices may sit on one desk, share one home network, or be on two networks behind firewalls. Tendril has six ways to connect and tries the nearest first. Every path is untrusted. A path counts only once the other device proves who it is in the handshake, so a wrong host that answers on an address never wins.</p>
+  <figure class="fig">
+    <p class="tl-h">The phone, away from home, dials the laptop</p>
+    <ol class="tl">
+      <li class="tl-row is-off"><span class="tl-k"><span class="n">01</span>local</span><span class="tl-d">same machine</span><span class="tl-s">not here</span><span class="tl-t"></span></li>
+      <li class="tl-row is-fail"><span class="tl-k"><span class="n">02</span>direct</span><span class="tl-d">local network</span><span class="tl-s">no answer</span><span class="tl-t"><i class="tl-run r-direct"></i><i class="tl-dot at-0"></i><span class="vh">Dialled at 0 ms.</span></span></li>
+      <li class="tl-row is-off"><span class="tl-k"><span class="n">03</span>overlay</span><span class="tl-d">an existing tailnet</span><span class="tl-s">no tailnet</span><span class="tl-t"></span></li>
+      <li class="tl-row is-win"><span class="tl-k"><span class="n">04</span>p2p</span><span class="tl-d">hole punching via iroh</span><span class="tl-s">in use</span><span class="tl-t"><i class="tl-wait"></i><i class="tl-run r-p2p"></i><i class="tl-dot at-500"></i><i class="tl-ok at-850"></i><span class="vh">Waits, then dialled at 500 ms, and proves the laptop at about 850 ms.</span></span></li>
+      <li class="tl-row is-cut"><span class="tl-k"><span class="n">05</span>relay</span><span class="tl-d">through a relay</span><span class="tl-s">cancelled</span><span class="tl-t"><i class="tl-run r-relay"></i><i class="tl-dot at-750"></i><span class="vh">Dialled at 750 ms, cancelled when p2p wins.</span></span></li>
+      <li class="tl-row is-off"><span class="tl-k"><span class="n">06</span>broker</span><span class="tl-d">WebSocket via a proxy</span><span class="tl-s">not here</span><span class="tl-t"></span></li>
+    </ol>
+    <div class="tl-axis" aria-hidden="true"><div class="tl-scale"><span>0</span><span>250</span><span>500</span><span>750</span><span>1000 ms</span></div></div>
+    <figcaption class="tl-cap"><span>Illustrative. Dial start times follow the defaults. The handshake time is an example.</span><span class="tl-key" aria-hidden="true"><i></i>dial starts<i class="k-ok"></i>handshake proves the laptop</span></figcaption>
+  </figure>
+  <ul class="gains" aria-label="What this means">
+    <li>A nearby path gets a head start, so finding a peer across the internet never slows a local connection.</li>
+    <li>When the network changes, the devices handshake again on another path and keep their pairing.</li>
+  </ul>
+  <p class="aside">See all six paths at work in five situations in the <a href="/#paths">paths diagram on the home page</a>.</p>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <table class="spec">
+        <thead><tr><th scope="col">Rank</th><th scope="col">Path</th><th scope="col">What it is</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td><code>local</code></td><td>A Unix socket only your user can open, for two apps on one machine</td></tr>
+          <tr><td>1</td><td><code>direct</code></td><td>TCP on a local network or to a reachable address</td></tr>
+          <tr><td>2</td><td><code>overlay</code></td><td>An existing tailnet</td></tr>
+          <tr><td>3</td><td><code>p2p</code></td><td>QUIC with hole punching, through iroh</td></tr>
+          <tr><td>4</td><td><code>relay</code></td><td>A WebSocket relay, described below</td></tr>
+          <tr><td>5</td><td><code>broker</code></td><td>A WebSocket through an authenticated reverse proxy</td></tr>
+        </tbody>
+      </table>
+      <p><strong>Staggered dialling.</strong> Dials start nearest first, 250 ms apart, like Happy Eyeballs, the method browsers use to try two kinds of address side by side. Peer-to-peer starts no sooner than 500 ms after the first other dial, because finding a peer takes longer and should not hold up a nearer path. The first path to finish the handshake wins and the rest are cancelled.</p>
+      <p><strong>Where this runs.</strong> Ranking and racing run in the Rust runtime (<code>dial_with_policy</code>). The other bindings and the CLI dial the one address you give them today.</p>
+      <p><strong>Peer-to-peer.</strong> The p2p path uses iroh. By default it uses the free public relay and discovery servers run by n0, which are rate limited and carry no uptime guarantee. You can point it at any iroh relay instead: one you run, or a <a href="https://www.iroh.computer/pricing">hosted one from n0</a>. Tendril takes up to eight relay URLs and can pass them a token, for relays that admit only your devices. You can also turn discovery off. These relays carry only the p2p path. The <code>relay</code> path below is Tendril's own.</p>
+      <p class="more-link">Read more: <a href="/docs/design/providers-and-relay-ladder.html">Paths and the relay ladder</a></p>
+    </div>
+  </details>
+</section>
+
+<section id="relays" class="part" aria-labelledby="h-relays">
+  <p class="part-n">07</p>
+  <h2 id="h-relays">What a relay can see</h2>
+  <p class="part-lead">Sometimes nothing direct gets through. A strict NAT, a router that shares one public address and turns away incoming connections, or a firewall can block every other path. Then a relay, a server both devices can reach, passes the bytes between them. The session runs end to end through it, so the relay forwards sealed frames it cannot open.</p>
+  <figure class="fig fig-relay" data-relay>
+    <svg class="dia" viewBox="0 0 400 150" role="img" aria-label="The phone and the laptop each connect to a relay. The encrypted session runs from the phone to the laptop through the relay, which forwards sealed frames. The laptop waits at a mailbox named by its public key.">
+      <text class="t-xs t-acc" x="200" y="18" text-anchor="middle">encrypted session, phone to laptop</text>
+      <rect class="b" x="4" y="44" width="88" height="56"/>
+      <text class="t-s t-strong" x="48" y="70" text-anchor="middle">phone</text>
+      <text class="t-xs t-mut" x="48" y="86" text-anchor="middle">office network</text>
+      <rect class="b" x="308" y="44" width="88" height="56"/>
+      <text class="t-s t-strong" x="352" y="70" text-anchor="middle">laptop</text>
+      <text class="t-xs t-mut" x="352" y="86" text-anchor="middle">home network</text>
+      <rect class="b b-dash" x="146" y="30" width="108" height="88"/>
+      <text class="t-s" x="200" y="48" text-anchor="middle">relay</text>
+      <text class="t-xs t-mut" x="200" y="108" text-anchor="middle">laptop's mailbox</text>
+      <path class="w-acc" d="M92 64H308M92 80H308"/>
+      <g class="pks"><rect class="pk pk1" x="92" y="69" width="6" height="6"/><rect class="pk pk2" x="92" y="69" width="6" height="6"/><rect class="pk pk3" x="92" y="69" width="6" height="6"/></g>
+      <text class="t-xs t-mut" x="200" y="142" text-anchor="middle">the relay copies sealed frames across unchanged</text>
+    </svg>
+    <div class="sees">
+      <div><p class="sees-h">A relay can see</p><ul><li>IP addresses</li><li>When devices connect, and how much they send</li><li>The key a waiting device uses as its mailbox. By default it never changes, so a relay can link that device's sessions. Wire v2 changes it every hour</li></ul></div>
+      <div><p class="sees-h">A relay cannot see</p><ul><li>Your data</li><li>Which grants exist</li><li>Device names</li><li>The pairing code</li></ul></div>
+    </div>
+  </figure>
+  <ul class="gains" aria-label="What this means">
+    <li>A relay cannot read your data or change it without the change being caught.</li>
+    <li>You can use a public relay, run your own or embed one in your app, and move between them without pairing again.</li>
+    <li>A relay you run can admit only your own devices, so strangers cannot use it.</li>
+  </ul>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>Mailboxes.</strong> A relay speaks WebSocket. At <code>/v1/relay</code>, the default, a waiting device registers a mailbox, which is the Ed25519 half of its signing key (32 bytes), and proves it holds the key by signing a fresh challenge from the relay. The key stays the same across sessions and addresses, so a relay can tell when the same device comes back. A device that wants to connect asks for that mailbox. The relay tells the waiting device, and once it accepts, copies each frame across unchanged.</p>
+      <p><strong>Hourly mailboxes.</strong> With Wire v2, devices use <code>/v2/relay</code>. Two paired devices share a secret from their pairing and derive a new mailbox key from it every hour, on a fresh connection each hour, so the relay cannot link one hour's mailbox to the next by its key. It can still link them by IP address.</p>
+      <p><strong>Who may use it.</strong> A relay is open by default. <code>tendril-relay</code> can instead admit only some devices, in one of three ways:</p>
+      <table class="spec">
+        <thead><tr><th scope="col">Admit by</th><th scope="col">How it works</th></tr></thead>
+        <tbody>
+          <tr><td>A list of mailbox keys</td><td>Only listed keys may wait for connections. Version 1 only, as Wire v2 keys change every hour</td></tr>
+          <tr><td>A shared secret</td><td>Each device proves it holds a secret you gave it</td></tr>
+          <tr><td>A signed ticket</td><td>Signed by a key you choose, valid for a day at most, and can be limited to dialing one mailbox</td></tr>
+        </tbody>
+      </table>
+      <p>With a secret or tickets, the relay checks a device that dials before it says whether the mailbox is online, so a stranger cannot even learn that. Treat a ticket like a password while it is valid.</p>
+      <p><strong>What it may keep.</strong> A relay must not log application data, device names or pairing codes. It does see IP addresses, when devices connect, how many frames they send and how large they are, and the mailbox key.</p>
+      <p><strong>Moving relays.</strong> Moving from a public relay to your own, or to one embedded in your app, changes only the relay hints on the roster. Keys, pairing and grants stay as they are.</p>
+      <p class="more-link">Read more: <a href="/docs/design/relay-and-runtime.html">Relay and runtime design</a></p>
+    </div>
+  </details>
+</section>
+
+<section id="limits" class="part" aria-labelledby="h-limits">
+  <p class="part-n">08</p>
+  <h2 id="h-limits">What Tendril does not protect against</h2>
+  <p class="part-lead">Every security tool has edges. Knowing Tendril's helps you design around them.</p>
+  <figure class="fig fig-limits">
+    <div class="lim">
+      <div class="lim-col">
+        <p class="lim-h">Tendril makes sure</p>
+        <ul>
+          <li>Each device proves its key to the other on every connection.</li>
+          <li>Each session has its own keys, so a key stolen later does not open past sessions.</li>
+          <li>A recorded session stays closed to a future quantum computer, unless both the classic and the post-quantum exchange break.</li>
+          <li>Data in a session cannot be read, or changed without it being caught.</li>
+          <li>Nothing is allowed unless a valid grant says so.</li>
+        </ul>
+      </div>
+      <div class="lim-col lim-no">
+        <p class="lim-h">Tendril does not protect against</p>
+        <dl>
+          <div><dt>A stolen, unlocked device</dt><dd>It can use its grants until you revoke it.</dd></div>
+          <div><dt>A hostile operating system</dt><dd>Malware on the device sees what your app sees.</dd></div>
+          <div><dt>Approving the wrong device</dt><dd>If a person confirms without comparing the check string, Tendril cannot tell.</dd></div>
+          <div><dt>Metadata</dt><dd>Relays, tailnets and networks still see addresses, timing and sizes. Wire v2, which is opt-in, pads sizes and varies keepalive timing, but cannot hide when or how much you send.</dd></div>
+          <div><dt>Being traced</dt><dd>It is not an anonymity network and does not hide who talks to whom.</dd></div>
+          <div><dt>Quantum computers, in two places</dt><dd>Relay mailbox proofs use Ed25519 only. The iroh transport under the peer-to-peer path is not post-quantum, though the session inside it is.</dd></div>
+          <div><dt>Unreviewed code</dt><dd>There has been no third-party audit yet, including of the new post-quantum code.</dd></div>
+        </dl>
+      </div>
+    </div>
+  </figure>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p>A revoked device that is offline learns of it only when it reconnects or rekeys. Browser tabs run over WebSockets, through a Tendril relay or, with the opt-in p2p build, an iroh relay. They cannot open UDP sockets or hold a connection while the browser suspends them. Phones suspend background sockets while asleep, so a phone reaches its peer again when it wakes.</p>
+      <p><strong>Waking a peer.</strong> With Wire v2, a device that dials a sleeping peer can first send it a wake hint through a push service the app sets up, such as UnifiedPush, FCM or an APNs gateway. The hint carries only a tag that changes every hour: no data, no names, no keys and no permission. If a hint is lost, nothing breaks: the peer comes back when it next wakes on its own.</p>
+      <p><strong>What is post-quantum.</strong> The session key exchange (X25519 with ML-KEM-768), and the signatures on grants, key rotation, revocation lists and enrollment (Ed25519 with ML-DSA-65). <strong>What is not.</strong> Relay mailbox proofs, which use Ed25519 alone, and the iroh transport below the peer-to-peer path. Data inside the session is still covered on every path. The Noise code is Tendril's own and is checked against a separate Go implementation. A peer without the hybrid handshake is rejected, so every device must run a current version.</p>
+      <p><strong>Metadata.</strong> Tendril hides your data, not who talks to whom. Wire v2 is an opt-in mode that narrows what the default, version 1 of the wire format, gives away.</p>
+      <table class="spec spec-v2">
+        <thead><tr><th scope="col">What leaks</th><th scope="col">Version 1, the default</th><th scope="col">Wire v2, opt-in</th></tr></thead>
+        <tbody>
+          <tr><td>Relay mailbox key</td><td>The same every time</td><td>New every hour</td></tr>
+          <tr><td>Message sizes</td><td>Exact</td><td>Rounded up to fixed steps, 256 bytes to 64 KiB</td></tr>
+          <tr><td>Keepalives and rekeys</td><td>On a fixed schedule</td><td>At random points within a range</td></tr>
+          <tr><td>A stranger who probes a host</td><td>Learns its id and keys</td><td>Gets a decoy reply of the same size</td></tr>
+        </tbody>
+      </table>
+      <p>Wire v2 still leaves IP addresses, when devices send and roughly how much in view. Both devices must turn it on. A host with it on still answers version 1 for older peers, so a stranger can still learn its id that way. Two devices that have used Wire v2 refuse to fall back. Padding frames that hide idle time exist, but your app has to send them. <code>tendril serve --redact-logs</code> keeps pairing codes, payloads and token nonces out of the CLI's own logs.</p>
+      <p>Group encryption, hosted accounts and replacing TLS for the web are out of scope for v1.</p>
+      <p class="more-link">Read more: <a href="/docs/overview.html">Scope and explicit limits</a>, <a href="/docs/adr/0004-hybrid-post-quantum-v1.html">the hybrid post-quantum decision</a>, <a href="/docs/design/wire-v2-privacy.html">Wire v2 privacy</a> and <a href="/docs/design/wake-providers.html">wake hints</a>. Found a problem? <a href="https://github.com/agync/tendril/security">Report it privately</a> on GitHub.</p>
+    </div>
+  </details>
+</section>
+
+<section id="core" class="part" aria-labelledby="h-core">
+  <p class="part-n">09</p>
+  <h2 id="h-core">One core, thin bindings</h2>
+  <p class="part-lead">Security code copied into six languages drifts apart. Tendril keeps every security decision in one Rust core. The bindings for other languages translate types and pass calls through.</p>
+  <figure class="fig">
+    <div class="core">
+      <ul class="core-b" aria-label="Bindings">
+        <li><b>Go</b><span>C ABI</span></li>
+        <li><b>Swift</b><span>C ABI</span></li>
+        <li><b>Kotlin</b><span>JNI</span></li>
+        <li><b>Python</b><span>PyO3</span></li>
+        <li><b>Node.js</b><span>N-API</span></li>
+        <li><b>Browser</b><span>WebAssembly</span></li>
+      </ul>
+      <div class="core-l"><span class="core-k">tendril-runtime</span><span class="core-v">Sockets, the six paths, state on disk</span></div>
+      <div class="core-l core-us"><span class="core-k">tendril-core</span><span class="core-v">Keys, pairing, roster, grants, sessions. Every security decision, with no I/O and no unsafe code.</span></div>
+    </div>
+    <figcaption>The browser build uses the core directly and brings its own transport.</figcaption>
+  </figure>
+  <ul class="gains" aria-label="What this means">
+    <li>One place to review for every security decision.</li>
+    <li>Every binding checks the same shared test vectors.</li>
+  </ul>
+  <details class="more">
+    <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+    <div class="more-body">
+      <p><strong>The core.</strong> <code>tendril-core</code> holds identity, pairing, the roster, grants, the session state machine and path ranking. It does no network or file I/O. The caller feeds it bytes and the time, and it returns actions. <code>tendril-runtime</code> adds sockets, the six paths and state on disk.</p>
+      <p><strong>Unsafe code.</strong> The workspace forbids unsafe Rust. The one exception is the C ABI crate, <code>tendril-ffi</code>, because a C boundary cannot be written without it.</p>
+      <p><strong>Bindings.</strong> Go and Swift link the C ABI, and Kotlin reaches it through a small JNI layer. Python uses PyO3 and Node.js uses N-API. The browser runs the core as WebAssembly. Events are polled, not called back, so nothing re-enters your event loop.</p>
+      <p><strong>Test vectors.</strong> Every binding checks four shared vector files: fingerprints, code proof, key rotation and grants. Rust and Go also check the handshake, machine enrollment and Wire v2 vectors. The Go checker is a separate implementation, with its own Noise code, and shares no code with the Rust core. The Swift and Android suites do not yet run in CI.</p>
+      <p class="more-link">Read more: <a href="/docs/design/sans-io-core.html">The sans-I/O core</a> and <a href="/docs/reference/ffi-and-bindings.html">FFI and bindings</a></p>
+    </div>
+  </details>
+</section>
+
+  </div>
+</div>
+
+<section class="further wrap" aria-labelledby="h-further">
+  <h2 id="h-further">Go deeper</h2>
+  <ul class="further-l">
+    <li><a href="/docs/">Docs</a><span>Guides, design and reference</span></li>
+    <li><a href="/docs/design/wire-and-pairing.html">Pairing design</a><span>Handshake, code proof, check string</span></li>
+    <li><a href="/docs/design/grants.html">Grants design</a><span>Names, delegation, revocation</span></li>
+    <li><a href="/docs/design/m2m-enrollment.html">Machine enrollment</a><span>Tokens, pinning, the burn log</span></li>
+    <li><a href="/docs/design/providers-and-relay-ladder.html">Paths design</a><span>Six paths and the relay ladder</span></li>
+    <li><a href="/docs/adr/0004-hybrid-post-quantum-v1.html">Hybrid post-quantum</a><span>Why the handshake and signatures are hybrid</span></li>
+    <li><a href="https://github.com/agync/tendril">Source on GitHub</a><span>Apache-2.0, specs in <code>spec/</code></span></li>
+  </ul>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-row">
+    <span><span class="wordmark">tendril</span> Apache-2.0. No analytics, no cookies.</span>
+    <nav aria-label="Footer">
+      <a href="/for-users">For app users</a>
+      <a href="/docs/overview.html">Overview</a>
+      <a href="/docs/architecture/">Architecture</a>
+      <a href="/docs/reference/">Reference</a>
+      <a href="/docs/usage/cli-demo.html">CLI demo</a>
+      <a href="https://github.com/agync/tendril">GitHub</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>
