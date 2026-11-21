@@ -121,7 +121,7 @@ code_mac = HMAC-SHA256(key = K, msg = "tendril-pair-v1" || h)
 - **Re-pairing rules:**
   - Re-pairing an already `active` static key updates metadata if needed and stays `active`.
   - Re-pairing a `revoked` static key MUST fail (`Revoked`) and keep the peer `revoked`; the matched pairing code still burns so an attacker cannot probe live codes with a revoked device.
-  - A peer in `pending` state MUST NOT open `intent = session` connections until an operator runs `pair.confirm` after comparing `device_fingerprint` and `pairing_sas`.
+  - A peer in `pending` state MUST NOT open `intent = session` connections until an operator runs `pair.confirm` after comparing `device_fingerprint` and `pairing_sas`. Whenever a live pairing SAS was recorded during pairing, `pair.confirm` MUST require explicit SAS matching and MUST fail closed if omitted; out-of-band fingerprint-only confirmation requires an explicit opt-in API or flag (`--allow-no-sas`).
 - **Grant separation:** `pair.confirm` marks the roster entry `active` with zero non-session grants by default. Minting capabilities (`pair.mint`) is an independent operation.
 - **Symmetric client-side SAS gate & pin protection:**
   - When initiating pairing via an out-of-band pinned URI (`PinnedHost`), the initiator cryptographically verifies the responder's static/signing keys and rotation chain in `msg2` and may record the host pin directly as `active`.
@@ -142,3 +142,46 @@ tendril://pair?v=1&host=<url_encoded_name>&code=<code>&k=<b64url_host_static>&s=
 - `seq` optionally carries the host's current `rotation_seq` corresponding to `(k, s)`. When `seq` is omitted on a legacy URI for an already-rotated host presenting a contiguous chain from `seq == 1` ending at `(k, s)`, initiators MAY verify that chain and initialize the pin at `last.seq`.
 - `ep` carries comma-separated endpoint hints (`<provider>:<addr>`), which are dialing hints only and never grant authorization.
 - Strict URI validation: parsers MUST reject unknown query parameters, duplicate parameters, empty `host`/`code`/`id` values, ASCII control characters (`0x00..=0x1F`, `0x7F`), malformed pairing codes (expecting `TND-XXXX-XXXX` or `TND-XXXX-XXXX-XXXX`), and unsafe/unrecognized endpoint hints (`javascript:`, `file:`, `data:`, non-loopback cleartext `ws://`/`http://`, userinfo `@`, fragments, or link-local/metadata IP hints). `PairClaim` and `HostHello` display/identifier fields with control characters or empty required names MUST likewise fail closed.
+
+---
+
+## 7. Machine-to-Machine Enrollment Profile
+
+Autonomous headless hosts and workload agents (Phase 6) may enroll without interactive human SAS comparison using a signed single-use enrollment token (`grants-v1.md`) trusted via a pinned host key on the initiator and registered trust anchors on the responder. M2M enrollment is disabled by default and MUST be enabled explicitly by responder policy.
+
+### 7.1 Enrollment Token Format
+
+An enrollment token is a signed `Grant` (`grants-v1.md`) satisfying ALL of the following:
+
+- `v == 1`, `machine == true`, and `uses == 1`.
+- `nonce` is a valid 16-byte `b64url` (unpadded, 22-character) unique token identifier.
+- `not_after > not_before` and `not_after - not_before <= max_enrollment_ttl_secs` (default `900 s`, hard upper bound `86400 s`). Evaluation uses the standard `30 s` clock-skew tolerance on `not_before`.
+- `caps` is non-empty and every capability MUST match `pair.enroll` or `pair.enroll:<host_id>`, where `<host_id>` equals the responder `host_id`. Zero application capabilities or other reserved capabilities are permitted on the leaf enrollment token.
+- `subject` equals the enrolling peer's `device_id`, OR `"*"` when responder policy permits wildcard unbound subjects.
+- Root signer (`issuer` of the root link when `delegated_from` is absent, or of the deepest ancestor link when `delegated_from` is present) MUST be either the responder itself (when responder policy allows self-issued enrollment tokens) or an `active` `TrustAnchor` registered in the responder `Roster`. Ancestor delegation links MUST hold `pair.mint`, MUST NOT set `uses` or `machine: true`, and MUST NOT share a signing key with any `revoked` trust anchor.
+- All links and token `nonce` MUST pass verification against the active persisted `RevocationList` (`revoked_devices`, `revoked_nonces`) for the root issuer.
+
+### 7.2 Channel-Binding Proof (`enroll_proof`)
+
+In `msg3`, an M2M initiator omits `code_mac` and populates `enrollment_token`, `signing_pub` (b64url 32-byte Ed25519 public key matching `enroll_proof`), and `enroll_proof` (b64url 64-byte Ed25519 signature over the Noise transcript binding `h`, initiator static public key `peer_static_pub`, and `token.nonce`):
+
+```text
+enroll_proof_bytes = "tendril-enroll-v1\0" (18 B)
+                  || h (32 B)
+                  || peer_static_pub (32 B)
+                  || UTF-8(enrollment_token.nonce)
+
+enroll_proof = Ed25519(peer_signing_priv, enroll_proof_bytes)
+```
+
+Responders MUST verify `enroll_proof` strictly against `signing_pub` before accepting enrollment, ensuring the claim cannot be replayed into a different Noise session or substituted for a different static identity.
+
+### 7.3 Initiator Pinning Requirement
+
+M2M initiators MUST supply an out-of-band `PinnedHost` (static key, root/current signing key, `host_id`, optional `rotation_seq`) and verify the responder's `HostHello` (and `RotationRecord` chain if rotated) at `msg2` before transmitting `msg3`. Unpinned TOFU is forbidden in M2M mode.
+
+### 7.4 Atomic Single-Use Burn Log and Default-Deny Roster Entry
+
+- Responders persist `burned_enrollment_nonces` (`nonce -> not_after_unix`) alongside `Roster`, bounded at `16_384` active entries (`MAX_BURNED_ENROLLMENT_NONCES`). Expired entries (`not_after <= now`) are pruned before capacity checks; if all `16_384` slots remain unexpired, new enrollments fail closed (`EnrollmentBurnLogFull` / `"rate_limited"`).
+- On a valid M2M `PairClaim`, the responder MUST atomically check and record `token.nonce` in `burned_enrollment_nonces` and persist the `Roster` BEFORE calling `record_enrolled_machine` and BEFORE writing `PairResponse` to the wire. If the enrolling peer static key is `Revoked` or collides with an existing entry, registration fails closed (`Revoked`), while the token nonce remains burned so a revoked device cannot probe live tokens.
+- `record_enrolled_machine` transitions the peer directly into `Active` state with `(static_pub, signing_pub)` and zero application grants (`PairResponse.status = "active"`). Application authorization still requires separate `pair.mint` delegation.

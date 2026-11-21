@@ -11,6 +11,7 @@ Noise XX handshake transcripts.
 - `rotation.json`: signed `RotationRecord` links (`seq = 1`, `seq = 2`) and fork rejection vector
 - `grants.json`: JCS canonical grant signing, valid delegation, invalid widened delegation, and `RevocationList`
 - `handshake.json`: full deterministic `pair` and `session` Noise XX transcripts including `0x04 REKEY`
+- `m2m_enrollment.json`: signed M2M `pair.enroll` token, `enroll_proof`, `PairClaim`, and replay rejection vectors
 - `verify_go/`: independent Go test suite reproducing every vector byte-for-byte
 
 ## Commands

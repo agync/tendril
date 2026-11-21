@@ -27,6 +27,7 @@ Every vector file is generated deterministically from real cryptographic primiti
 | `rotation.json` | Sequential signed `RotationRecord` links (`seq = 1`, `seq = 2`), exact 127-byte raw signed payloads, plus a conflicting `seq = 2` fork vector that MUST trigger revocation |
 | `grants.json` | Unsorted input grant -> exact RFC 8785 JCS canonical bytes + signature; valid delegated child grant; invalid widened-scope child grant that MUST fail; signed `RevocationList` |
 | `handshake.json` | Deterministic `intent = pair` and `intent = session` `Noise_XX` transcripts (`preamble`, `msg1`, `msg2`, post-`msg2` `h`, `pairing_sas`, `code_mac`, `msg3`, final hash, encrypted `DATA`, encrypted `REKEY`, and post-rekey encrypted `DATA`) |
+| `m2m_enrollment.json` | Signed single-use `pair.enroll` token, Ed25519 channel-binding `enroll_proof`, post-`msg2` M2M `PairClaim`, verified `"active"` `PairResponse`, and negative replay / wrong-purpose rejection cases |
 
 ---
 

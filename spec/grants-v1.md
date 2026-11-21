@@ -26,6 +26,7 @@ namespace.verb:resource
 |---|---|
 | `session.open` | Open an authenticated session (always required; empty `caps` denies all app actions) |
 | `pair.confirm` | Confirm a `pending` peer on the roster |
+| `pair.enroll` | Enroll a machine peer autonomously (`pair.enroll` or host-scoped `pair.enroll:<host_id>`) |
 | `pair.mint` | Issue or delegate a narrower capability grant |
 | `roster.read` | Inspect known peers and grant status |
 | `roster.revoke` | Revoke a peer or grant nonce |
@@ -74,6 +75,9 @@ signed_bytes = "tendril-grant-v1\0" (17 B) || UTF-8(RFC8785_JCS(grant_without_si
 Canonical encoding and strict JSON decoding rules:
 
 - Optional fields (`delegated_from` when empty, `uses` and `machine` when unset) MUST be omitted from Grant JSON (not encoded as `[]` or `null`).
+- `uses` MUST NOT be `0` on any grant (`uses == 0` fails closed everywhere).
+- Regular session authorization and session grant verification MUST reject any grant (leaf or ancestor) that specifies `uses` or `machine`, preventing single-use enrollment tokens or non-canonical `machine` flags from bypassing session grant checks.
+- Enrollment tokens (`pairing-v1.md` Section 7) MUST set `machine: true` and `uses: 1` on the leaf grant; any ancestor links in `delegated_from` MUST omit `uses` and `machine`.
 - Verifiers MUST reject unknown JSON fields (`deny_unknown_fields`) on `Grant` and `RevocationList`.
 - Verification MUST use strict Ed25519 signature verification against the issuer's pinned Ed25519 signing public key.
 
@@ -120,8 +124,8 @@ Verifiers MUST reject any `RevocationList` with a `seq` lower than the highest v
 
 Every grant check (at session connect, on `0x04 REKEY`, and on `authorize(requested_cap)`) executes the following checks in order and denies on the first failure (performing cheap structural, time, CRL, and root checks before Ed25519 signature verification):
 
-1. Validate `grant.v == 1`, non-empty `nonce`, delegation depth `<= 4`, no nonce or subject cycles, and syntactically valid `caps`. When a `RevocationList` is supplied, also fail closed if `crl.v != 1`, `crl.issuer != root_issuer`, `crl.ts` is invalid UTC, or strict Ed25519 verification of `crl.sig` under `root_issuer`'s pinned signing key fails.
-2. Verify `grant.subject` matches the authenticated session peer `device_id` (or `child.issuer` during recursion).
+1. Validate `grant.v == 1`, non-empty `nonce`, `grant.uses != Some(0)`, purpose separation (session evaluation forbids `uses` and `machine == true` across leaf and ancestors; enrollment evaluation requires `machine == true`, `uses == 1`, and 16-byte `b64url` `nonce` on the leaf while forbidding `uses` and `machine == true` on ancestors), delegation depth `<= 4`, no nonce or subject cycles, and syntactically valid `caps`. When a `RevocationList` is supplied, also fail closed if `crl.v != 1`, `crl.issuer != root_issuer`, `crl.ts` is invalid UTC, or strict Ed25519 verification of `crl.sig` under `root_issuer`'s pinned signing key fails.
+2. Verify `grant.subject` matches the authenticated session peer `device_id` (or `child.issuer` during recursion). Wildcard `subject: "*"` is forbidden on session grants and delegated ancestors; it is allowed ONLY on a direct leaf enrollment token when responder policy permits unbound enrollment subjects.
 3. Check time bounds with a maximum `30 s` clock-skew allowance: `grant.not_before.saturating_sub(30s) <= now < grant.not_after` and `grant.not_before < grant.not_after`.
 4. Check `RevocationList` for `grant.subject`, `grant.issuer`, and `grant.nonce`.
 5. If `delegated_from` is omitted (root grant), verify `grant.issuer` equals the authoritative root verifier; otherwise require `delegated_from.len() == 1`.

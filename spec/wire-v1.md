@@ -74,10 +74,15 @@ SessionHello = {
 }
 
 // msg3 payload, intent = pair (initiator -> responder)
+// Human pairing sets code_mac and omits M2M fields.
+// M2M enrollment omits code_mac and sets enrollment_token, signing_pub, and enroll_proof.
 PairClaim = {
   "name": string,                   // human-readable device label
-  "kind": string,                   // platform kind (e.g. "ios", "android", "cli", "web")
-  "code_mac": string                // b64url 32-byte HMAC-SHA256 proof (pairing-v1)
+  "kind": string,                   // platform kind (e.g. "ios", "android", "cli", "web", "machine")
+  "code_mac"?: string,              // b64url 32-byte HMAC-SHA256 proof (human pairing, pairing-v1)
+  "enrollment_token"?: Grant,       // signed M2M enrollment Grant (grants-v1, pairing-v1 Section 7)
+  "signing_pub"?: string,           // b64url 32-byte Ed25519 peer signing key (M2M enrollment)
+  "enroll_proof"?: string           // b64url 64-byte Ed25519 channel-binding signature (M2M enrollment)
 }
 ```
 
@@ -86,20 +91,20 @@ PairClaim = {
 When `intent == 0x02` (`pair`), after decrypting and processing `msg3`, the responder enters transport mode, writes **exactly one** encrypted outer frame carrying a compact UTF-8 JSON `PairResponse`, and closes the connection:
 
 ```jsonc
-// success
+// success (human pairing: status == "pending"; M2M enrollment: status == "active")
 {
   "device_id": string,
-  "status": "pending",
+  "status": "pending" | "active",
   "host_signing_pub": string        // b64url 32-byte Ed25519 public key to pin
 }
 
 // failure
 {
-  "error": string                   // typed error code (e.g. "unauthorized", "code_expired", "rate_limited")
+  "error": string                   // typed error code (e.g. "unauthorized", "code_expired", "token_expired", "token_replayed", "untrusted_anchor", "revoked", "rate_limited")
 }
 ```
 
-Confirming the peer (`pair.confirm`) and minting capabilities (`pair.mint`) happen asynchronously on the host after human verification; the pairing connection is never held open waiting for operator input.
+For human pairing, confirming the peer (`pair.confirm`) and minting capabilities (`pair.mint`) happen asynchronously on the host after human verification; the pairing connection is never held open waiting for operator input. For M2M enrollment (`pairing-v1.md` Section 7), a verified enrollment token transitions the peer directly to `"active"` with zero application grants (`pair.mint` remains a separate step).
 
 ### 3.3 Verification Order
 
@@ -107,14 +112,14 @@ Confirming the peer (`pair.confirm`) and minting capabilities (`pair.mint`) happ
 
 1. Decrypt `msg2` and decode `HostHello`; verify `proto_version == 1`.
 2. For `intent = session`: verify responder static `s` (`current_static`) and `current_signing` (`pinned_signing` when `HostHello.rotation` is absent or empty, or `rotation.last().new_signing_pub` when non-empty): either `current_static == pinned_static` AND `current_signing == pinned_signing`, OR `HostHello.rotation` is a valid, contiguous `RotationRecord` chain linking `(pinned_signing, pinned_static)` to `(current_signing, current_static)` (where `current_static == rotation.last().new_static_pub`). If neither holds, MUST abort immediately (`HostKeyUnverified`) before sending `msg3` so the initiator's static key is never disclosed to an unverified peer.
-3. For `intent = pair`: if a pinned host key was supplied out of band (for example via QR URI), apply the same check as step 2 before sending `msg3`. On manual pairing with no pin, proceed using the post-`msg2` handshake hash `h` to bind `code_mac` and verify the transcript SAS.
+3. For `intent = pair`: if a pinned host key was supplied out of band (for example via QR URI or mandatory M2M enrollment configuration), apply the same check as step 2 before sending `msg3`. M2M enrollment MUST NOT use unpinned TOFU. On manual human pairing with no pin, proceed using the post-`msg2` handshake hash `h` to bind `code_mac` and verify the transcript SAS.
 
 **Responder:**
 
 1. Validate the 6-byte preamble; drop and rate-limit on any invalid field.
 2. Execute Noise `msg1`..`msg3`. Any AEAD failure drops the connection before interpreting payload fields.
 3. For `intent = session`: verify the peer static key `s` from `msg3` belongs to an `active` roster entry and `SessionHello.device_id` equals the derived `device_id` of `s`. Reject `pending` or `revoked` peers.
-4. For `intent = pair`: verify `PairClaim.code_mac` per `pairing-v1.md`, register or update the peer as `pending`, send `PairResponse`, and close.
+4. For `intent = pair`: enforce mutual exclusion between `code_mac` and M2M enrollment fields (`enrollment_token`, `signing_pub`, `enroll_proof`). For human claims, verify `PairClaim.code_mac` per `pairing-v1.md` and register or update the peer as `pending`. For M2M claims (only when M2M enrollment is enabled by responder policy), verify the trust-anchored enrollment token, CRL, single-use nonce burn, and channel-bound `enroll_proof` per `pairing-v1.md` Section 7, burn the nonce atomically, and register the peer as `active` with zero application grants. Send `PairResponse` and close.
 
 ---
 
