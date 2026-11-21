@@ -16,13 +16,26 @@ public final class TendrilKeychainStore {
   private let lock = NSLock()
   private let service: String
   private let account: String
+  private let customKeyProvider: (@Sendable () throws -> SymmetricKey)?
 
-  public init(service: String = "dev.tendril.state", account: String = "master-key-v1") {
+  public convenience init(service: String = "dev.tendril.state", account: String = "master-key-v1") {
+    self.init(service: service, account: account, customKeyProvider: nil)
+  }
+
+  internal init(
+    service: String = "dev.tendril.state",
+    account: String = "master-key-v1",
+    customKeyProvider: (@Sendable () throws -> SymmetricKey)?
+  ) {
     self.service = service
     self.account = account
+    self.customKeyProvider = customKeyProvider
   }
 
   public func loadOrCreateMasterKey() throws -> SymmetricKey {
+    if let customKeyProvider {
+      return try customKeyProvider()
+    }
     lock.lock()
     defer { lock.unlock() }
     if var existing = try readKeyData() {

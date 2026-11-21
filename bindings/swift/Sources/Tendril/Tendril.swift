@@ -28,10 +28,10 @@ private func lastFfiError() -> String {
 }
 
 private func ffiError(_ code: Int32, fallback: String) -> TendrilError {
-  if code == TENDRIL_WOULD_BLOCK {
+  if code == TENDRIL_WOULD_BLOCK.rawValue {
     return .wouldBlock
   }
-  if code == TENDRIL_EOF {
+  if code == TENDRIL_EOF.rawValue {
     return .eof
   }
   let msg = lastFfiError()
@@ -178,7 +178,7 @@ internal final class SealedSwiftStateStore {
 private func exportEndpointRosterJson(_ h: OpaquePointer) throws -> String {
   var out: UnsafeMutablePointer<CChar>?
   let rc = tendril_endpoint_export_roster_json(h, &out)
-  guard rc == TENDRIL_OK else {
+  guard rc == TENDRIL_OK.rawValue else {
     throw ffiError(rc, fallback: "tendril_endpoint_export_roster_json failed")
   }
   return takeOutCString(out)
@@ -194,7 +194,7 @@ public enum TendrilCrypto {
     let rc = staticPub.withUnsafeBytes { raw in
       tendril_device_id(raw.bindMemory(to: UInt8.self).baseAddress, &out)
     }
-    guard rc == TENDRIL_OK else {
+    guard rc == TENDRIL_OK.rawValue else {
       throw ffiError(rc, fallback: "tendril_device_id failed")
     }
     return takeOutCString(out)
@@ -208,7 +208,7 @@ public enum TendrilCrypto {
     let rc = staticPub.withUnsafeBytes { raw in
       tendril_fingerprint_host(raw.bindMemory(to: UInt8.self).baseAddress, &out)
     }
-    guard rc == TENDRIL_OK else {
+    guard rc == TENDRIL_OK.rawValue else {
       throw ffiError(rc, fallback: "tendril_fingerprint_host failed")
     }
     return takeOutCString(out)
@@ -222,7 +222,7 @@ public enum TendrilCrypto {
     let rc = staticPub.withUnsafeBytes { raw in
       tendril_fingerprint_device(raw.bindMemory(to: UInt8.self).baseAddress, &out)
     }
-    guard rc == TENDRIL_OK else {
+    guard rc == TENDRIL_OK.rawValue else {
       throw ffiError(rc, fallback: "tendril_fingerprint_device failed")
     }
     return takeOutCString(out)
@@ -236,7 +236,7 @@ public enum TendrilCrypto {
     let rc = handshakeHash.withUnsafeBytes { raw in
       tendril_pairing_sas(raw.bindMemory(to: UInt8.self).baseAddress, &out)
     }
-    guard rc == TENDRIL_OK else {
+    guard rc == TENDRIL_OK.rawValue else {
       throw ffiError(rc, fallback: "tendril_pairing_sas failed")
     }
     return takeOutCString(out)
@@ -258,7 +258,7 @@ public enum TendrilCrypto {
         }
       }
     }
-    guard rc == TENDRIL_OK else {
+    guard rc == TENDRIL_OK.rawValue else {
       throw ffiError(rc, fallback: "tendril_compute_code_mac failed")
     }
     return mac
@@ -286,7 +286,7 @@ public enum TendrilCrypto {
         }
       }
     }
-    guard rc == TENDRIL_OK else {
+    guard rc == TENDRIL_OK.rawValue else {
       throw ffiError(rc, fallback: "tendril_verify_rotation_chain_json failed")
     }
     return finalSeq
@@ -317,7 +317,7 @@ public enum TendrilCrypto {
         }
       }
     }
-    guard rc == TENDRIL_OK else {
+    guard rc == TENDRIL_OK.rawValue else {
       throw ffiError(rc, fallback: "tendril_verify_grant_json failed")
     }
     return allowed == 1
@@ -354,13 +354,13 @@ public final class TendrilEndpoint {
         }
       }
       guard let raw else {
-        throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_endpoint_new_from_state failed")
+        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new_from_state failed")
       }
       do {
         if idJson == nil {
           var out: UnsafeMutablePointer<CChar>?
           let rc = tendril_endpoint_export_identity_json(raw, &out)
-          guard rc == TENDRIL_OK else {
+          guard rc == TENDRIL_OK.rawValue else {
             throw ffiError(rc, fallback: "tendril_endpoint_export_identity_json failed")
           }
           try store.saveIdentityJson(takeOutCString(out))
@@ -381,7 +381,7 @@ public final class TendrilEndpoint {
         tendril_endpoint_new_from_state(nil, nil, cHost)
       }
       guard let raw else {
-        throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_endpoint_new_from_state failed")
+        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new_from_state failed")
       }
       self.stateStore = nil
       self.handle = raw
@@ -395,7 +395,7 @@ public final class TendrilEndpoint {
       }
     }
     guard let raw else {
-      throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_endpoint_new failed")
+      throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new failed")
     }
     self.handle = raw
   }
@@ -473,7 +473,7 @@ public final class TendrilEndpoint {
     try withHandle { h in
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_endpoint_info_json(h, &out)
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_info_json failed")
       }
       return takeOutCString(out)
@@ -486,7 +486,7 @@ public final class TendrilEndpoint {
       let rc = try withValidatedCString(listenAddr, name: "listenAddr") { cAddr in
         tendril_endpoint_serve_direct(h, cAddr, &out)
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_serve_direct failed")
       }
       return takeOutCString(out)
@@ -501,7 +501,7 @@ public final class TendrilEndpoint {
           tendril_endpoint_serve_relay(h, cUrl, cHost, &out)
         }
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_serve_relay failed")
       }
       return takeOutCString(out)
@@ -514,7 +514,7 @@ public final class TendrilEndpoint {
       let rc = try withOptionalValidatedCString(relayMode, name: "relayMode") { cMode in
         tendril_endpoint_serve_p2p(h, cMode, &out)
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_serve_p2p failed")
       }
       return takeOutCString(out)
@@ -527,7 +527,7 @@ public final class TendrilEndpoint {
       let rc = try withValidatedCString(kind, name: "kind") { cKind in
         tendril_endpoint_issue_code(h, cKind, &out)
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_issue_code failed")
       }
       return takeOutCString(out)
@@ -554,7 +554,7 @@ public final class TendrilEndpoint {
           }
         }
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_pair_initiate failed")
       }
       let result = takeOutCString(out)
@@ -567,9 +567,9 @@ public final class TendrilEndpoint {
     try withHandle { h in
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_endpoint_pair_accept(h, timeoutMs, &out)
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         let acceptErr = ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
-        if rc != TENDRIL_WOULD_BLOCK && rc != TENDRIL_ERR_CLOSED {
+        if rc != TENDRIL_WOULD_BLOCK.rawValue && rc != TENDRIL_ERR_CLOSED.rawValue {
           do {
             try persistRoster(h)
           } catch {
@@ -594,7 +594,7 @@ public final class TendrilEndpoint {
           tendril_endpoint_confirm_peer(h, cPeer, cSas)
         }
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_confirm_peer failed")
       }
       try persistRoster(h)
@@ -609,7 +609,7 @@ public final class TendrilEndpoint {
           tendril_endpoint_mint_grant(h, cPeer, cCaps, ttlSecs, &out)
         }
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_mint_grant failed")
       }
       let result = takeOutCString(out)
@@ -623,7 +623,7 @@ public final class TendrilEndpoint {
       let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
         tendril_endpoint_revoke_peer(h, cPeer)
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_revoke_peer failed")
       }
       try persistRoster(h)
@@ -644,7 +644,7 @@ public final class TendrilEndpoint {
           )
         }
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_add_trust_anchor failed")
       }
       try persistRoster(h)
@@ -656,7 +656,7 @@ public final class TendrilEndpoint {
       let rc = try withValidatedCString(anchorId, name: "anchorId") { cAnchor in
         tendril_endpoint_revoke_trust_anchor(h, cAnchor)
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_revoke_trust_anchor failed")
       }
       try persistRoster(h)
@@ -675,7 +675,7 @@ public final class TendrilEndpoint {
           tendril_endpoint_mint_enrollment_token(h, cTarget, cSubj, ttlSecs, &out)
         }
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_mint_enrollment_token failed")
       }
       return takeOutCString(out)
@@ -735,7 +735,7 @@ public final class TendrilEndpoint {
           }
         }
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_enroll_initiate failed")
       }
       let result = takeOutCString(out)
@@ -761,12 +761,12 @@ public final class TendrilEndpoint {
         }
       }
       guard let raw else {
-        let connectErr = ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_session_connect failed")
+        let connectErr = ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect failed")
         do {
           try persistRoster(h)
         } catch {
           throw TendrilError.ffi(
-            code: TENDRIL_ERR_INTERNAL,
+            code: TENDRIL_ERR_INTERNAL.rawValue,
             message: "\(connectErr) (roster persist error: \(error))"
           )
         }
@@ -789,7 +789,7 @@ public final class TendrilEndpoint {
   public func acceptSession(timeoutMs: UInt64) throws -> TendrilSession {
     try withHandle { h in
       guard let raw = tendril_session_accept(h, timeoutMs) else {
-        throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_session_accept failed")
+        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept failed")
       }
       #if canImport(CryptoKit) && canImport(Security)
       return TendrilSession(handle: raw, stateStore: stateStore)
@@ -886,7 +886,7 @@ public final class TendrilSession {
     try store.saveRoster {
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_session_export_roster_json(h, &out)
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_session_export_roster_json failed")
       }
       return takeOutCString(out)
@@ -901,7 +901,7 @@ public final class TendrilSession {
       let rc = data.withUnsafeBytes { raw in
         tendril_session_send_data(h, raw.bindMemory(to: UInt8.self).baseAddress, data.count)
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_session_send_data failed")
       }
     }
@@ -917,8 +917,8 @@ public final class TendrilSession {
     return try withHandle { h in
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_session_poll_event(h, timeoutMs, &out)
-      guard rc == TENDRIL_OK else {
-        if rc != TENDRIL_WOULD_BLOCK && rc != TENDRIL_EOF {
+      guard rc == TENDRIL_OK.rawValue else {
+        if rc != TENDRIL_WOULD_BLOCK.rawValue && rc != TENDRIL_EOF.rawValue {
           do {
             try persistRoster(h)
           } catch {
@@ -953,7 +953,7 @@ public final class TendrilSession {
       let rc = try withValidatedCString(requestedCap, name: "requestedCap") { cCap in
         tendril_session_authorize(h, cCap, &allowed)
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_session_authorize failed")
       }
       return allowed == 1
@@ -963,7 +963,7 @@ public final class TendrilSession {
   public func rekey() throws {
     try withHandle { h in
       let rc = tendril_session_rekey(h)
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_session_rekey failed")
       }
     }
@@ -974,7 +974,7 @@ public final class TendrilSession {
       let rc = try withValidatedCString(reason, name: "reason") { cReason in
         tendril_session_close(h, code, cReason)
       }
-      guard rc == TENDRIL_OK else {
+      guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_session_close failed")
       }
     }

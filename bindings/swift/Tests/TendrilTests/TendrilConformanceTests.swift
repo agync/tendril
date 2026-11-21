@@ -1,8 +1,35 @@
+import Dispatch
 import Foundation
-import XCTest
+#if canImport(CryptoKit) && canImport(Security)
+import CryptoKit
+import Security
+#endif
+import Testing
 @testable import Tendril
 
-final class TendrilConformanceTests: XCTestCase {
+private final class SendableBox<T>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: T
+
+  init(_ value: T) {
+    self.value = value
+  }
+
+  func set(_ newValue: T) {
+    lock.lock()
+    defer { lock.unlock() }
+    value = newValue
+  }
+
+  func get() -> T {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
+}
+
+@Suite
+struct TendrilConformanceTests {
   private func vectorsDir() -> URL {
     let fileUrl = URL(fileURLWithPath: #filePath)
     return fileUrl
@@ -40,27 +67,26 @@ final class TendrilConformanceTests: XCTestCase {
       .replacingOccurrences(of: "=", with: "")
   }
 
-  func testConformanceVectors() throws {
+  @Test
+  func conformanceVectors() throws {
     let fp = try loadJson("fingerprints.json")
     let rawPub = hexData(fp["raw_pubkey_hex"] as! String)
     let hh = hexData(fp["handshake_hash_hex"] as! String)
-    XCTAssertEqual(try TendrilCrypto.deviceId(staticPub: rawPub), fp["raw_device_id"] as? String)
-    XCTAssertEqual(
-      try TendrilCrypto.fingerprintHost(staticPub: rawPub),
-      fp["raw_host_fingerprint"] as? String
+    #expect(try TendrilCrypto.deviceId(staticPub: rawPub) == (fp["raw_device_id"] as? String))
+    #expect(
+      try TendrilCrypto.fingerprintHost(staticPub: rawPub) == (fp["raw_host_fingerprint"] as? String)
     )
-    XCTAssertEqual(
-      try TendrilCrypto.fingerprintDevice(staticPub: rawPub),
-      fp["raw_device_fingerprint"] as? String
+    #expect(
+      try TendrilCrypto.fingerprintDevice(staticPub: rawPub) == (fp["raw_device_fingerprint"] as? String)
     )
-    XCTAssertEqual(try TendrilCrypto.pairingSas(handshakeHash: hh), fp["pairing_sas"] as? String)
+    #expect(try TendrilCrypto.pairingSas(handshakeHash: hh) == (fp["pairing_sas"] as? String))
 
     let pm = try loadJson("pairing_mac.json")
     let pmHh = hexData(pm["handshake_hash_hex"] as! String)
     let r3 = pm["remote_3group"] as! [String: Any]
-    XCTAssertEqual(
-      try TendrilCrypto.computeCodeMac(code: r3["code"] as! String, handshakeHash: pmHh),
-      hexData(r3["code_mac_hex"] as! String)
+    #expect(
+      try TendrilCrypto.computeCodeMac(code: r3["code"] as! String, handshakeHash: pmHh)
+        == hexData(r3["code_mac_hex"] as! String)
     )
 
     let rot = try loadJson("rotation.json")
@@ -78,15 +104,15 @@ final class TendrilConformanceTests: XCTestCase {
       curStaticB64: lastRec["new_static_pub"] as! String,
       curSigningB64: lastRec["new_signing_pub"] as! String
     )
-    XCTAssertEqual(finalSeq, 2)
+    #expect(finalSeq == 2)
 
     let forkEntry = (rot["fork_record"] as! [String: Any])["record"] as! [String: Any]
     let forkJson = String(
       data: try JSONSerialization.data(withJSONObject: [records[0], forkEntry]),
       encoding: .utf8
     )!
-    XCTAssertThrowsError(
-      try TendrilCrypto.verifyRotationChainJson(
+    #expect(throws: Error.self) {
+      _ = try TendrilCrypto.verifyRotationChainJson(
         pinnedSigningB64: pSig,
         pinnedStaticB64: pStat,
         pinnedSeq: 0,
@@ -94,7 +120,7 @@ final class TendrilConformanceTests: XCTestCase {
         curStaticB64: lastRec["new_static_pub"] as! String,
         curSigningB64: lastRec["new_signing_pub"] as! String
       )
-    )
+    }
 
     let gv = try loadJson("grants.json")
     let keys: [String: String] = [
@@ -112,7 +138,7 @@ final class TendrilConformanceTests: XCTestCase {
     )!
     let leafId = gv["leaf_id"] as! String
     let rootId = gv["root_issuer_id"] as! String
-    XCTAssertTrue(
+    #expect(
       try TendrilCrypto.verifyGrantJson(
         grantJson: validJson,
         issuerKeysJson: keysJson,
@@ -122,19 +148,20 @@ final class TendrilConformanceTests: XCTestCase {
         nowUnix: 1795564800
       )
     )
-    XCTAssertFalse(
-      try TendrilCrypto.verifyGrantJson(
+    #expect(
+      !(try TendrilCrypto.verifyGrantJson(
         grantJson: widenedJson,
         issuerKeysJson: keysJson,
         expectedSubject: leafId,
         expectedRootIssuer: rootId,
         requestedCap: "fs.read:/photos/2026/a.jpg",
         nowUnix: 1795564800
-      )
+      ))
     )
   }
 
-  func testLocalEndpointLifecycle() throws {
+  @Test
+  func localEndpointLifecycle() throws {
     let host = try TendrilEndpoint(hostId: "swift-host")
     let client = try TendrilEndpoint(hostId: "swift-client")
     defer {
@@ -146,50 +173,51 @@ final class TendrilConformanceTests: XCTestCase {
     let code = try host.issueCode(kind: "lan")
 
     let pairQueue = DispatchQueue(label: "tendril.swift.pair")
-    let pairExp = expectation(description: "pair accept")
-    var acceptJson = ""
+    let pairSem = DispatchSemaphore(value: 0)
+    let acceptBox = SendableBox<String>("")
     pairQueue.async {
-      acceptJson = (try? host.pairAccept(timeoutMs: 5000)) ?? ""
-      pairExp.fulfill()
+      acceptBox.set((try? host.pairAccept(timeoutMs: 5000)) ?? "")
+      pairSem.signal()
     }
     let initJson = try client.pairInitiate(endpoint: addr, code: code, deviceName: "swift-phone", deviceKind: "ios")
-    wait(for: [pairExp], timeout: 5.0)
+    #expect(pairSem.wait(timeout: .now() + 5.0) == .success)
 
     let initObj = try JSONSerialization.jsonObject(with: Data(initJson.utf8)) as! [String: Any]
-    let accObj = try JSONSerialization.jsonObject(with: Data(acceptJson.utf8)) as! [String: Any]
-    XCTAssertEqual(initObj["sas"] as? String, accObj["sas"] as? String)
+    let accObj = try JSONSerialization.jsonObject(with: Data(acceptBox.get().utf8)) as! [String: Any]
+    #expect(initObj["sas"] as? String == accObj["sas"] as? String)
     let devId = accObj["device_id"] as! String
 
     try host.confirmPeer(peerId: devId, sas: accObj["sas"] as? String)
     try client.confirmPeer(peerId: "swift-host", sas: initObj["sas"] as? String)
     let grantJson = try host.mintGrant(peerId: devId, capsJson: "[\"fs.read\"]", ttlSecs: 3600)
 
-    let sessExp = expectation(description: "session accept")
-    var hostSess: TendrilSession?
+    let sessSem = DispatchSemaphore(value: 0)
+    let sessBox = SendableBox<TendrilSession?>(nil)
     pairQueue.async {
-      hostSess = try? host.acceptSession(timeoutMs: 5000)
-      sessExp.fulfill()
+      sessBox.set(try? host.acceptSession(timeoutMs: 5000))
+      sessSem.signal()
     }
     let cliSess = try client.connect(endpoint: addr, targetHostId: "swift-host", grantJson: grantJson)
-    wait(for: [sessExp], timeout: 5.0)
-    let srvSess = try XCTUnwrap(hostSess)
+    #expect(sessSem.wait(timeout: .now() + 5.0) == .success)
+    let srvSess = try #require(sessBox.get())
     defer {
       cliSess.free()
       srvSess.free()
     }
 
-    XCTAssertTrue(try srvSess.authorize("fs.read"))
-    XCTAssertFalse(try srvSess.authorize("shell.exec"))
+    #expect(try srvSess.authorize("fs.read"))
+    #expect(!(try srvSess.authorize("shell.exec")))
     try cliSess.sendData(Data("hello-swift".utf8))
     let evJson = try srvSess.pollEvent(timeoutMs: 2000)
     let evObj = try JSONSerialization.jsonObject(with: Data(evJson.utf8)) as! [String: Any]
-    XCTAssertEqual(evObj["event"] as? String, "data")
+    #expect(evObj["event"] as? String == "data")
     try host.revokePeer(peerId: devId)
-    XCTAssertFalse(try srvSess.authorize("fs.read"))
+    #expect(!(try srvSess.authorize("fs.read")))
     try cliSess.close(code: 1000, reason: "done")
   }
 
-  func testM2mEnrollmentAndReplay() throws {
+  @Test
+  func m2mEnrollmentAndReplay() throws {
     let host = try TendrilEndpoint(hostId: "swift-m2m-host")
     let anchor = try TendrilEndpoint(hostId: "swift-m2m-anchor")
     let client = try TendrilEndpoint(hostId: "swift-m2m-cli")
@@ -211,20 +239,20 @@ final class TendrilConformanceTests: XCTestCase {
     let hostSigning = decodeB64Url(hostInfo["signing_pub"] as! String)
     let hostSigningHash = decodeB64Url(hostInfo["signing_pub_hash"] as! String)
     let anchorSigning = decodeB64Url(anchorInfo["signing_pub"] as! String)
-    XCTAssertEqual(hostSigning.count, 1984)
-    XCTAssertEqual(hostSigningHash.count, 32)
-    XCTAssertEqual(anchorSigning.count, 1984)
+    #expect(hostSigning.count == 1984)
+    #expect(hostSigningHash.count == 32)
+    #expect(anchorSigning.count == 1984)
 
     try host.addTrustAnchor(anchorId: "swift-m2m-anchor", signingPub: anchorSigning)
     let addr = try host.serveDirect(listenAddr: "127.0.0.1:0")
     let tokJson = try anchor.mintEnrollmentToken(targetHostId: "swift-m2m-host", subject: nil, ttlSecs: 900)
 
     let queue = DispatchQueue(label: "tendril.swift.m2m")
-    let pairExp = expectation(description: "m2m accept")
-    var accJson = ""
+    let pairSem = DispatchSemaphore(value: 0)
+    let accBox = SendableBox<String>("")
     queue.async {
-      accJson = (try? host.pairAccept(timeoutMs: 5000)) ?? ""
-      pairExp.fulfill()
+      accBox.set((try? host.pairAccept(timeoutMs: 5000)) ?? "")
+      pairSem.signal()
     }
     let initJson = try client.enrollInitiate(
       endpoint: addr,
@@ -233,26 +261,95 @@ final class TendrilConformanceTests: XCTestCase {
       hostSigningPub: hostSigning,
       tokenJson: tokJson
     )
-    wait(for: [pairExp], timeout: 5.0)
+    #expect(pairSem.wait(timeout: .now() + 5.0) == .success)
     let initObj = try JSONSerialization.jsonObject(with: Data(initJson.utf8)) as! [String: Any]
-    let accObj = try JSONSerialization.jsonObject(with: Data(accJson.utf8)) as! [String: Any]
-    XCTAssertEqual(initObj["status"] as? String, "active")
-    XCTAssertEqual(accObj["status"] as? String, "active")
+    let accObj = try JSONSerialization.jsonObject(with: Data(accBox.get().utf8)) as! [String: Any]
+    #expect(initObj["status"] as? String == "active")
+    #expect(accObj["status"] as? String == "active")
 
-    let repExp = expectation(description: "m2m replay accept")
+    let repSem = DispatchSemaphore(value: 0)
     queue.async {
       _ = try? host.pairAccept(timeoutMs: 5000)
-      repExp.fulfill()
+      repSem.signal()
     }
-    XCTAssertThrowsError(
-      try client.enrollInitiate(
+    #expect(throws: Error.self) {
+      _ = try client.enrollInitiate(
         endpoint: addr,
         hostId: "swift-m2m-host",
         hostStaticPub: hostStatic,
         hostSigningPub: hostSigningHash,
         tokenJson: tokJson
       )
-    )
-    wait(for: [repExp], timeout: 5.0)
+    }
+    #expect(repSem.wait(timeout: .now() + 5.0) == .success)
+  }
+
+  @Test
+  func keychainSealedStateRoundtrip() throws {
+    let tmpDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("tendril-swift-kc-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    let service = "dev.tendril.state.test"
+    let account = "test-\(UUID().uuidString)"
+    #if canImport(CryptoKit) && canImport(Security)
+    let realKc = TendrilKeychainStore(service: service, account: account)
+    defer {
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+      ]
+      SecItemDelete(query as CFDictionary)
+    }
+    let kc: TendrilKeychainStore
+    do {
+      _ = try realKc.loadOrCreateMasterKey()
+      kc = realKc
+    } catch TendrilKeychainError.osStatus(let status)
+      where status == errSecWrPerm || status == errSecInteractionNotAllowed || status == -34018
+    {
+      print("[TendrilTests] NOTICE: live Keychain unavailable in headless CLI (OSStatus \(status)); testing sealed state via @testable seam")
+      let testKey = SymmetricKey(size: .bits256)
+      kc = TendrilKeychainStore(service: service, account: account) { testKey }
+    }
+
+    let ep1 = try TendrilEndpoint(stateDir: tmpDir.path, hostId: "swift-kc-host", keychainStore: kc)
+    let info1 = try ep1.infoJson()
+    ep1.close()
+
+    let ep2 = try TendrilEndpoint(stateDir: tmpDir.path, hostId: "swift-kc-host", keychainStore: kc)
+    let info2 = try ep2.infoJson()
+    ep2.close()
+
+    // Deterministic AES-GCM seal/open + tamper rejection via @testable seam.
+    let seamKey = SymmetricKey(size: .bits256)
+    let seamKc = TendrilKeychainStore(service: service, account: account) { seamKey }
+    let aad = Data("tendril.test.aad".utf8)
+    let plaintext = Data("tendril-secret-state".utf8)
+    let sealed = try seamKc.sealState(plaintext, authenticating: aad)
+    #expect(try seamKc.openState(sealed, authenticating: aad) == plaintext)
+    #expect(throws: Error.self) {
+      _ = try seamKc.openState(sealed, authenticating: Data("wrong-aad".utf8))
+    }
+    var tampered = sealed
+    tampered[tampered.count - 1] ^= 0xFF
+    #expect(throws: Error.self) {
+      _ = try seamKc.openState(tampered, authenticating: aad)
+    }
+    #else
+    let ep1 = try TendrilEndpoint(stateDir: tmpDir.path, hostId: "swift-kc-host")
+    let info1 = try ep1.infoJson()
+    ep1.close()
+
+    let ep2 = try TendrilEndpoint(stateDir: tmpDir.path, hostId: "swift-kc-host")
+    let info2 = try ep2.infoJson()
+    ep2.close()
+    #endif
+
+    let obj1 = try JSONSerialization.jsonObject(with: Data(info1.utf8)) as! [String: Any]
+    let obj2 = try JSONSerialization.jsonObject(with: Data(info2.utf8)) as! [String: Any]
+    #expect(obj1["static_pub"] as? String == obj2["static_pub"] as? String)
+    #expect(obj1["signing_pub"] as? String == obj2["signing_pub"] as? String)
   }
 }
