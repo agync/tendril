@@ -100,7 +100,7 @@ When `intent == 0x02` (`pair`), after decrypting and processing `msg3`, the resp
 
 // failure
 {
-  "error": string                   // typed error code (e.g. "unauthorized", "code_expired", "token_expired", "token_replayed", "untrusted_anchor", "revoked", "rate_limited")
+  "error": string                   // typed error code (e.g. "unauthorized", "token_expired", "token_replayed", "untrusted_anchor", "revoked", "rate_limited")
 }
 ```
 

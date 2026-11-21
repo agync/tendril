@@ -18,7 +18,7 @@ Machine-to-machine (M2M) enrollment allows headless servers, CI runners, and wor
 
 ## Token rules and trust anchors
 
-An enrollment token is an RFC 8785 JCS signed `Grant` (`uses: 1`, `machine: true`, 16-byte `b64url` `nonce`, short expiry bounded by responder policy, default `900 s`, hard ceiling `86400 s`) holding exclusively `pair.enroll` or host-scoped `pair.enroll:<host_id>`. Application capabilities (`fs.read`, `pair.mint`, etc.) are rejected on enrollment tokens, and `verify_grant_with_chain` / `authorize_grant` reject any grant specifying `uses` or `machine: true` during `intent = session` authorization.
+An enrollment token is an RFC 8785 JCS signed `Grant` (`uses: 1`, `machine: true`, 16-byte `b64url` `nonce`, short expiry bounded by responder policy, default `900 s`, hard ceiling `86400 s`) holding exclusively `pair.enroll` or host-scoped `pair.enroll:<host_id>`. Application capabilities (`fs.read`, `pair.mint`, etc.) are rejected on enrollment tokens, and `verify_grant_with_chain` / `authorize_grant` reject any grant specifying `uses` or `machine` during `intent = session` authorization.
 
 Responders verify the root signer against either the responder itself (when `allow_self_issued` is enabled) or an active external `TrustAnchor` registered in `Roster`. Revoking a trust anchor propagates across sibling anchors or peers sharing its `signing_pub`. When delegated via `delegated_from`, intermediate links must hold `pair.mint`, omit `uses` and `machine`, and pass active CRL checks (`revoked_devices`, `revoked_nonces`).
 

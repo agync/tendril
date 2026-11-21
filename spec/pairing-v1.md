@@ -116,7 +116,7 @@ code_mac = HMAC-SHA256(key = K, msg = "tendril-pair-v1" || h)
 ```
 
 - **Default TTL:** 15 minutes (`900 s`), configurable by the host.
-- **Retry budget:** At most **5** failed `pair` claim attempts per code lifetime. Because a wrong-code or MITM-relayed claim cannot be attributed to a single live code in constant time without leaking existence, every failed `pair` claim increments the failure counter on all currently live codes and burns any code reaching 5 failures.
+- **Retry budget:** At most **5** failed `pair` claim attempts per code lifetime. Because a wrong-code or MITM-relayed claim cannot be attributed to a single live code in constant time without leaking existence, every failed `pair` claim increments the failure counter on all currently live codes and burns any code reaching 5 failures. To prevent pairing-window status oracles, responders run a uniform dummy KDF pass when zero live codes exist and return the uniform `"unauthorized"` error code across invalid, expired, or burned pairing codes.
 - **Single-use burn:** A successful `pair` claim immediately burns the matched code.
 - **Re-pairing rules:**
   - Re-pairing an already `active` static key updates metadata if needed and stays `active`.
@@ -158,7 +158,7 @@ An enrollment token is a signed `Grant` (`grants-v1.md`) satisfying ALL of the f
 - `not_after > not_before` and `not_after - not_before <= max_enrollment_ttl_secs` (default `900 s`, hard upper bound `86400 s`). Evaluation uses the standard `30 s` clock-skew tolerance on `not_before`.
 - `caps` is non-empty and every capability MUST match `pair.enroll` or `pair.enroll:<host_id>`, where `<host_id>` equals the responder `host_id`. Zero application capabilities or other reserved capabilities are permitted on the leaf enrollment token.
 - `subject` equals the enrolling peer's `device_id`, OR `"*"` when responder policy permits wildcard unbound subjects.
-- Root signer (`issuer` of the root link when `delegated_from` is absent, or of the deepest ancestor link when `delegated_from` is present) MUST be either the responder itself (when responder policy allows self-issued enrollment tokens) or an `active` `TrustAnchor` registered in the responder `Roster`. Ancestor delegation links MUST hold `pair.mint`, MUST NOT set `uses` or `machine: true`, and MUST NOT share a signing key with any `revoked` trust anchor.
+- Root signer (`issuer` of the root link when `delegated_from` is absent, or of the deepest ancestor link when `delegated_from` is present) MUST be either the responder itself (when responder policy allows self-issued enrollment tokens) or an `active` `TrustAnchor` registered in the responder `Roster`. Ancestor delegation links MUST hold `pair.mint`, MUST NOT set `uses` or `machine`, and MUST NOT share a signing key with any `revoked` trust anchor.
 - All links and token `nonce` MUST pass verification against the active persisted `RevocationList` (`revoked_devices`, `revoked_nonces`) for the root issuer.
 
 ### 7.2 Channel-Binding Proof (`enroll_proof`)

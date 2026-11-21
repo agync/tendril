@@ -1143,11 +1143,6 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
                     kind,
                     ..
                 } => {
-                    let roster = ep.roster.lock().expect("roster mutex poisoned");
-                    if let Err(e) = ep.persist_roster(&roster) {
-                        set_last_error(e);
-                        return TENDRIL_ERR_INTERNAL;
-                    }
                     let out = serde_json::json!({
                         "device_id": device_id,
                         "sas": pairing_sas,
@@ -1163,11 +1158,6 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
                     kind,
                     ..
                 } => {
-                    let roster = ep.roster.lock().expect("roster mutex poisoned");
-                    if let Err(e) = ep.persist_roster(&roster) {
-                        set_last_error(e);
-                        return TENDRIL_ERR_INTERNAL;
-                    }
                     let out = serde_json::json!({
                         "device_id": device_id,
                         "status": "active",

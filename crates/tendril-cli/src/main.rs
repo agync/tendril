@@ -92,6 +92,8 @@ enum Command {
         #[arg(long)]
         overlay: Option<SocketAddr>,
         #[arg(long)]
+        overlay_allow_non_tailnet: bool,
+        #[arg(long)]
         broker: Option<SocketAddr>,
         #[arg(long, value_enum)]
         issue_code: Option<PairKindArg>,
@@ -776,6 +778,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ephemeral_p2p,
             include_direct_addrs,
             overlay,
+            overlay_allow_non_tailnet,
             broker,
             issue_code,
             allow_enroll,
@@ -867,7 +870,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let overlay_ep = if let Some(overlay_addr) = overlay {
-                let ol = OverlayListener::bind(overlay_addr, None).await?;
+                let ol = OverlayListener::bind(overlay_addr, None)
+                    .await?
+                    .with_allow_non_tailnet(overlay_allow_non_tailnet);
                 let ep = ol.local_endpoint();
                 listeners.push(Box::new(ol));
                 Some(ep)

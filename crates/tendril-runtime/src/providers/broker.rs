@@ -198,11 +198,26 @@ impl PathListener for BrokerListener {
 }
 
 /// Dialer connecting through an HTTP/HTTPS WebSocket broker (`broker+ws://`, `broker+wss://`, `ws://`, `wss://`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BrokerDialer {
     headers: Vec<(String, String)>,
     write_timeout: Duration,
     allow_insecure_ws: bool,
+}
+
+impl std::fmt::Debug for BrokerDialer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(k, _)| (k.as_str(), "<redacted>"))
+            .collect();
+        f.debug_struct("BrokerDialer")
+            .field("headers", &redacted)
+            .field("write_timeout", &self.write_timeout)
+            .field("allow_insecure_ws", &self.allow_insecure_ws)
+            .finish()
+    }
 }
 
 impl Default for BrokerDialer {

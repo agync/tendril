@@ -4,6 +4,7 @@ import initWasm, {
   WasmRoster,
   WasmSessionClient,
   compute_code_mac,
+  compute_code_mac_bytes,
   device_id,
   fingerprint_device,
   fingerprint_host,
@@ -151,24 +152,68 @@ export function computeCodeMac(code, handshakeHash) {
   return compute_code_mac(code, handshakeHash);
 }
 
-export async function computeCodeMacWorker(code, handshakeHash) {
+export function computeCodeMacBytes(codeBytes, handshakeHash) {
+  if (!(codeBytes instanceof Uint8Array)) {
+    throw new TypeError("codeBytes must be a Uint8Array");
+  }
+  try {
+    return compute_code_mac_bytes(codeBytes, handshakeHash);
+  } finally {
+    codeBytes.fill(0);
+  }
+}
+
+export async function computeCodeMacWorker(code, handshakeHash, { timeoutMs = 15000 } = {}) {
   await initTendril();
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
     const id = 1;
-    worker.addEventListener("message", (ev) => {
+    let settled = false;
+    let timer = null;
+    const finish = (err, val) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
       worker.terminate();
-      if (ev.data && ev.data.ok) {
-        resolve(new Uint8Array(ev.data.mac));
+      if (err) {
+        reject(err);
       } else {
-        reject(new Error(ev.data ? ev.data.error : "worker failed"));
+        resolve(val);
+      }
+    };
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        finish(new Error(`computeCodeMacWorker timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+    }
+    worker.addEventListener("message", (ev) => {
+      if (ev.data && ev.data.ok) {
+        finish(null, new Uint8Array(ev.data.mac));
+      } else {
+        finish(new Error(ev.data ? ev.data.error : "worker failed"));
       }
     });
     worker.addEventListener("error", (ev) => {
-      worker.terminate();
-      reject(new Error(ev.message || "worker error"));
+      finish(new Error(ev.message || "worker error"));
     });
-    worker.postMessage({ id, op: "compute_code_mac", code, handshakeHash });
+    worker.addEventListener("messageerror", () => {
+      finish(new Error("worker message deserialization failed"));
+    });
+    let payloadBytes;
+    if (code instanceof Uint8Array) {
+      payloadBytes = new Uint8Array(code);
+      code.fill(0);
+    } else {
+      payloadBytes = encoder.encode(String(code));
+    }
+    worker.postMessage(
+      { id, op: "compute_code_mac", codeBytes: payloadBytes, handshakeHash },
+      [payloadBytes.buffer]
+    );
   });
 }
 

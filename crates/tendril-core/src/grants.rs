@@ -485,7 +485,7 @@ enum GrantCheckMode {
 /// root authority, signatures, subset rules).
 ///
 /// Rejects `uses == Some(0)` and rejects any grant (leaf or ancestor) specifying `uses` or
-/// `machine: Some(true)` so single-use enrollment tokens cannot be used as session grants.
+/// `machine` so single-use enrollment tokens cannot be used as session grants.
 ///
 /// When `crl` is `Some(list)`, this verifies `list.v == 1`, `list.issuer == expected_root_issuer`,
 /// valid whole-second UTC `list.ts`, and `verify_crl_signature(list, root_pub)` using the key
@@ -516,7 +516,7 @@ where
 /// Validates a delegated or root M2M enrollment grant chain (`machine == true`, `uses == 1` on leaf).
 ///
 /// Leaves with `subject == "*"` are accepted only when `allow_wildcard_subject` is `true`.
-/// Any ancestor delegation links MUST omit `uses` and `machine: true`.
+/// Any ancestor delegation links MUST omit `uses` and `machine`.
 pub fn verify_enrollment_grant_chain<F>(
     grant: &Grant,
     expected_subject: &str,

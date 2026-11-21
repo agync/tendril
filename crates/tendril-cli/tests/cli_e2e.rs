@@ -475,6 +475,7 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
                 "--p2p-local",
                 "--overlay",
                 "127.0.0.1:0",
+                "--overlay-allow-non-tailnet",
                 "--broker",
                 "127.0.0.1:0",
                 "--issue-code",

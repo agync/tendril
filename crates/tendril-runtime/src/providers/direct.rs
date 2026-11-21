@@ -75,10 +75,13 @@ impl PathListener for DirectListener {
     }
 }
 
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Dialer opening direct TCP streams (`direct`).
 #[derive(Debug, Clone)]
 pub struct DirectDialer {
     write_timeout: Duration,
+    connect_timeout: Duration,
 }
 
 impl Default for DirectDialer {
@@ -88,11 +91,12 @@ impl Default for DirectDialer {
 }
 
 impl DirectDialer {
-    /// Constructs a `DirectDialer` with [`DEFAULT_WRITE_TIMEOUT`].
+    /// Constructs a `DirectDialer` with [`DEFAULT_WRITE_TIMEOUT`] and a 10 s connect timeout.
     #[must_use]
     pub fn new() -> Self {
         Self {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 
@@ -103,9 +107,18 @@ impl DirectDialer {
         self
     }
 
+    /// Overrides the TCP connect timeout.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
     /// Connects directly to `addr`.
     pub async fn connect(&self, addr: SocketAddr) -> Result<Box<dyn PathStream>, RuntimeError> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| RuntimeError::Timeout("direct tcp connect timed out"))??;
         let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
         let _ = stream.set_nodelay(true);
         Ok(Box::new(IoPathStream::new(

@@ -7,20 +7,25 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tendril_core::policy::ProviderId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::error::RuntimeError;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, IoPathStream, PathDialer, PathListener, PathStream};
 
 const HELPER_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HELPER_LINE_LEN: usize = 1024;
+const MAX_CONCURRENT_HELPER_ACCEPTS: usize = 64;
 
 /// Requested overlay resolution strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -117,22 +122,33 @@ pub struct OverlayListener {
     local_addr: SocketAddr,
     write_timeout: Duration,
     allow_ips: Option<HashSet<IpAddr>>,
+    require_tailnet_ip: bool,
 }
 
 impl OverlayListener {
-    /// Binds an overlay listener on `addr` (optionally filtering inbound peer IPs).
+    /// Binds an overlay listener on `addr` (enforcing tailnet source IPs unless `allow_ips` or
+    /// [`Self::with_allow_non_tailnet`] overrides it).
     pub async fn bind(
         addr: SocketAddr,
         allow_ips: Option<HashSet<IpAddr>>,
     ) -> Result<Self, RuntimeError> {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
+        let require_tailnet_ip = allow_ips.is_none();
         Ok(Self {
             listener,
             local_addr,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             allow_ips,
+            require_tailnet_ip,
         })
+    }
+
+    /// Overrides whether non-tailnet source IPs are permitted when `allow_ips` is unset.
+    #[must_use]
+    pub fn with_allow_non_tailnet(mut self, allow: bool) -> Self {
+        self.require_tailnet_ip = !allow;
+        self
     }
 
     /// Overrides the write backpressure timeout applied to accepted streams.
@@ -154,9 +170,12 @@ impl PathListener for OverlayListener {
     async fn accept(&mut self) -> Result<Box<dyn PathStream>, RuntimeError> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
-            if let Some(allowed) = &self.allow_ips
-                && !allowed.contains(&peer.ip())
-            {
+            if let Some(allowed) = &self.allow_ips {
+                if !allowed.contains(&peer.ip()) {
+                    drop(stream);
+                    continue;
+                }
+            } else if self.require_tailnet_ip && !is_tailnet_ip(peer.ip()) {
                 drop(stream);
                 continue;
             }
@@ -179,6 +198,7 @@ impl PathListener for OverlayListener {
 #[derive(Debug, Clone)]
 pub struct OverlayDialer {
     write_timeout: Duration,
+    connect_timeout: Duration,
 }
 
 impl Default for OverlayDialer {
@@ -188,11 +208,12 @@ impl Default for OverlayDialer {
 }
 
 impl OverlayDialer {
-    /// Constructs an `OverlayDialer` with [`DEFAULT_WRITE_TIMEOUT`].
+    /// Constructs an `OverlayDialer` with [`DEFAULT_WRITE_TIMEOUT`] and a 10 s connect timeout.
     #[must_use]
     pub fn new() -> Self {
         Self {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 
@@ -200,6 +221,13 @@ impl OverlayDialer {
     #[must_use]
     pub fn with_write_timeout(mut self, write_timeout: Duration) -> Self {
         self.write_timeout = write_timeout;
+        self
+    }
+
+    /// Overrides the TCP connect timeout.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
         self
     }
 }
@@ -212,7 +240,9 @@ impl PathDialer for OverlayDialer {
 
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
         let target = endpoint.strip_prefix("overlay://").unwrap_or(endpoint);
-        let stream = TcpStream::connect(target).await?;
+        let stream = timeout(self.connect_timeout, TcpStream::connect(target))
+            .await
+            .map_err(|_| RuntimeError::Timeout("overlay tcp connect timed out"))??;
         let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
         let _ = stream.set_nodelay(true);
         Ok(Box::new(IoPathStream::new(
@@ -259,11 +289,39 @@ async fn read_line_bounded(
     }
 }
 
+async fn accept_one_helper(
+    mut stream: UnixStream,
+    write_timeout: Duration,
+) -> Option<Box<dyn PathStream>> {
+    let line = read_line_bounded(&mut stream, HELPER_CONTROL_TIMEOUT)
+        .await
+        .ok()?;
+    let ctrl = serde_json::from_slice::<HelperControlMsg>(&line).ok()?;
+    if ctrl.op.as_deref() != Some("accept") {
+        return None;
+    }
+    let peer_ip = ctrl
+        .peer_ip
+        .as_deref()
+        .and_then(|s| s.parse::<IpAddr>().ok());
+    let ack = b"{\"ok\":true}\n";
+    timeout(write_timeout, stream.write_all(ack))
+        .await
+        .ok()?
+        .ok()?;
+    Some(Box::new(IoPathStream::new(
+        ProviderId::Overlay,
+        peer_ip,
+        write_timeout,
+        stream,
+    )))
+}
+
 /// Scoped overlay listener receiving helper-bridged connections over a `0o600` Unix socket.
 pub struct OverlayHelperListener {
-    listener: UnixListener,
     socket_path: PathBuf,
-    write_timeout: Duration,
+    accepted_rx: mpsc::Receiver<Box<dyn PathStream>>,
+    accept_task: JoinHandle<()>,
 }
 
 impl OverlayHelperListener {
@@ -271,10 +329,38 @@ impl OverlayHelperListener {
     pub fn bind(socket_path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let socket_path = socket_path.as_ref().to_path_buf();
         let listener = super::bind_private_unix_listener(&socket_path, true)?;
+        let write_timeout = DEFAULT_WRITE_TIMEOUT;
+        let (accepted_tx, accepted_rx) = mpsc::channel(MAX_CONCURRENT_HELPER_ACCEPTS);
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HELPER_ACCEPTS));
+        let accept_task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _addr)) => {
+                        let Ok(permit) = Arc::clone(&sem).try_acquire_owned() else {
+                            drop(stream);
+                            continue;
+                        };
+                        let tx_c = accepted_tx.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Some(path_stream) =
+                                accept_one_helper(stream, write_timeout).await
+                            {
+                                let _ = tx_c.send(path_stream).await;
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "overlay helper unix accept error");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        });
         Ok(Self {
-            listener,
             socket_path,
-            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            accepted_rx,
+            accept_task,
         })
     }
 
@@ -287,6 +373,7 @@ impl OverlayHelperListener {
 
 impl Drop for OverlayHelperListener {
     fn drop(&mut self) {
+        self.accept_task.abort();
         let _ = fs::remove_file(&self.socket_path);
     }
 }
@@ -294,35 +381,7 @@ impl Drop for OverlayHelperListener {
 #[async_trait]
 impl PathListener for OverlayHelperListener {
     async fn accept(&mut self) -> Result<Box<dyn PathStream>, RuntimeError> {
-        loop {
-            let (mut stream, _addr) = self.listener.accept().await?;
-            let Ok(line) = read_line_bounded(&mut stream, HELPER_CONTROL_TIMEOUT).await else {
-                continue;
-            };
-            let Ok(ctrl) = serde_json::from_slice::<HelperControlMsg>(&line) else {
-                continue;
-            };
-            if ctrl.op.as_deref() != Some("accept") {
-                continue;
-            }
-            let peer_ip = ctrl
-                .peer_ip
-                .as_deref()
-                .and_then(|s| s.parse::<IpAddr>().ok());
-            let ack = b"{\"ok\":true}\n";
-            if !matches!(
-                timeout(self.write_timeout, stream.write_all(ack)).await,
-                Ok(Ok(()))
-            ) {
-                continue;
-            }
-            return Ok(Box::new(IoPathStream::new(
-                ProviderId::Overlay,
-                peer_ip,
-                self.write_timeout,
-                stream,
-            )));
-        }
+        self.accepted_rx.recv().await.ok_or(RuntimeError::Closed)
     }
 
     fn local_endpoint(&self) -> String {

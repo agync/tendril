@@ -21,6 +21,7 @@ use tendril_core::pairing::{PairAction, PairOutcome, PairingInitiator, PairingUr
 use tendril_core::roster::Roster;
 use tendril_core::session::{SessionAction, SessionMachine};
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroize as _;
 
 fn to_js_err(err: impl fmt::Display) -> JsValue {
     JsValue::from_str(&err.to_string())
@@ -92,6 +93,22 @@ pub fn compute_code_mac(code: &str, handshake_hash: &[u8]) -> Result<Vec<u8>, Js
     let hh = as_32(handshake_hash, "handshake_hash").map_err(to_js_err)?;
     let mac = core_compute_code_mac(code, &hh).map_err(to_js_err)?;
     Ok(mac.to_vec())
+}
+
+#[wasm_bindgen]
+pub fn compute_code_mac_bytes(
+    code_utf8: &mut [u8],
+    handshake_hash: &[u8],
+) -> Result<Vec<u8>, JsValue> {
+    let mac_res = match core::str::from_utf8(code_utf8) {
+        Ok(code) => as_32(handshake_hash, "handshake_hash")
+            .and_then(|hh| core_compute_code_mac(code, &hh).map_err(|e| e.to_string()))
+            .map(|mac| mac.to_vec())
+            .map_err(to_js_err),
+        Err(err) => Err(to_js_err(format!("invalid UTF-8 pairing code: {err}"))),
+    };
+    code_utf8.zeroize();
+    mac_res
 }
 
 #[wasm_bindgen]

@@ -814,16 +814,11 @@ fn adversarial_pairing_and_identity_faults() {
             NOW_UNIX + attempt,
             32,
         );
-        let expected_err = if attempt < 5 {
-            "unauthorized"
-        } else {
-            "code_burned"
-        };
-        assert!(init_ev.iter().any(|a| matches!(a, PairAction::Completed(PairOutcome::Rejected { error }) if error == expected_err)));
+        assert!(init_ev.iter().any(|a| matches!(a, PairAction::Completed(PairOutcome::Rejected { error }) if error == "unauthorized")));
     }
     assert_eq!(mgr.live_code_count(NOW_UNIX + 6), 0);
 
-    // Even the real code now fails with code_burned.
+    // Even the real code now fails uniformly with unauthorized (no burn oracle).
     let mut p_init_burned =
         PairingInitiator::new(&client_id, "Dev", "ios", &code, None, None).unwrap();
     let mut p_resp_burned = PairingResponder::new(&host_id, PairingPathKind::Remote, None).unwrap();
@@ -835,9 +830,9 @@ fn adversarial_pairing_and_identity_faults() {
         NOW_UNIX + 7,
         32,
     );
-    assert!(ev_b.iter().any(|a| matches!(a, PairAction::Completed(PairOutcome::Rejected { error }) if error == "code_burned")));
+    assert!(ev_b.iter().any(|a| matches!(a, PairAction::Completed(PairOutcome::Rejected { error }) if error == "unauthorized")));
 
-    // Expired code -> code_expired; 2-group LAN code over Remote -> path_disallowed.
+    // Expired code -> unauthorized; 2-group LAN code over Remote -> path_disallowed.
     let mut mgr2 = PairingManager::new(PairingConfig::default());
     let lan_code = mgr2
         .issue_code_with_entropy(PairingCodeKind::Lan2Group, NOW_UNIX, &[9u8; 32])
@@ -870,7 +865,8 @@ fn adversarial_pairing_and_identity_faults() {
         NOW_UNIX + 900,
         32,
     );
-    assert!(ev_exp.iter().any(|a| matches!(a, PairAction::Completed(PairOutcome::Rejected { error }) if error == "code_expired")));
+    assert!(ev_exp.iter().any(|a| matches!(a, PairAction::Completed(PairOutcome::Rejected { error }) if error == "unauthorized")));
+    assert_eq!(mgr2.live_code_count(NOW_UNIX + 900), 0);
 
     // Revoked peer attempting to re-pair with a LIVE code fails ("revoked"), stays Revoked, AND burns the code!
     let live_code = mgr2

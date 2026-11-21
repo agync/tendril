@@ -71,7 +71,8 @@ async fn setup_provider(provider: ProviderId) -> ProviderPair {
         ProviderId::Overlay => {
             let listener = OverlayListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)), None)
                 .await
-                .expect("bind overlay");
+                .expect("bind overlay")
+                .with_allow_non_tailnet(true);
             let endpoint = listener.local_endpoint();
             ProviderPair {
                 listener: Box::new(listener),
@@ -2781,4 +2782,104 @@ async fn batch2b_sec17_sec31_concurrent_session_and_fresh_now_unix() {
         res.is_err(),
         "expired grant must be rejected on REKEY when clock advanced mid-poll"
     );
+}
+
+#[tokio::test]
+async fn ws_binary_path_stream_rejects_zero_byte_binary_frame() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    let mut bl = BrokerListener::bind(BrokerServerConfig::default())
+        .await
+        .expect("bind broker");
+    let url = format!("ws://{}/tendril/v1/stream", bl.local_addr());
+    let (mut cli_ws, _) = connect_async(&url).await.expect("connect ws");
+    let mut srv_stream = bl.accept().await.expect("accept broker stream");
+
+    cli_ws
+        .send(Message::Binary(Vec::new().into()))
+        .await
+        .expect("send 0-byte frame");
+    let mut buf = [0u8; 64];
+    let err = timeout(Duration::from_secs(2), srv_stream.recv_chunk(&mut buf))
+        .await
+        .expect("recv before timeout")
+        .expect_err("0-byte binary frame must fail closed");
+    assert!(
+        matches!(err, RuntimeError::Protocol(_)),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn overlay_listener_requires_tailnet_by_default_and_helper_is_non_blocking() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpStream, UnixStream};
+
+    let mut default_ol = OverlayListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)), None)
+        .await
+        .expect("bind default overlay");
+    let ol_addr = default_ol.local_addr();
+    let _loopback_probe = TcpStream::connect(ol_addr).await.expect("connect loopback");
+    assert!(
+        timeout(Duration::from_millis(120), default_ol.accept())
+            .await
+            .is_err(),
+        "default OverlayListener must drop non-tailnet loopback sources"
+    );
+
+    let mut permissive_ol = OverlayListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)), None)
+        .await
+        .expect("bind permissive overlay")
+        .with_allow_non_tailnet(true);
+    let p_addr = permissive_ol.local_addr();
+    let _cli = OverlayDialer::new()
+        .with_connect_timeout(Duration::from_secs(2))
+        .dial(&format!("overlay://{p_addr}"))
+        .await
+        .expect("dial permissive overlay");
+    let accepted = timeout(Duration::from_secs(2), permissive_ol.accept())
+        .await
+        .expect("accept timeout")
+        .expect("accept stream");
+    assert_eq!(accepted.provider_id(), ProviderId::Overlay);
+
+    let tmp = TempDir::new().expect("tempdir");
+    let sock = tmp.path().join("accept.sock");
+    let mut helper = OverlayHelperListener::bind(&sock).expect("bind helper");
+
+    let _stalled = UnixStream::connect(&sock).await.expect("connect stalled");
+    let mut valid = UnixStream::connect(&sock).await.expect("connect valid");
+    valid
+        .write_all(b"{\"op\":\"accept\",\"peer_ip\":\"100.64.0.20\"}\n")
+        .await
+        .expect("write valid ctrl");
+
+    let stream = timeout(Duration::from_secs(1), helper.accept())
+        .await
+        .expect("stalled helper must not block valid accept")
+        .expect("accept valid helper stream");
+    assert_eq!(stream.peer_ip(), Some("100.64.0.20".parse().expect("ip")));
+}
+
+#[tokio::test]
+async fn broker_dialer_debug_redacts_secrets_and_direct_dialer_timeout_works() {
+    use tokio::net::TcpListener;
+
+    let dialer = BrokerDialer::new().with_header("Authorization", "Bearer super-secret-token");
+    let dbg = format!("{dialer:?}");
+    assert!(dbg.contains("Authorization"));
+    assert!(dbg.contains("<redacted>"));
+    assert!(!dbg.contains("super-secret-token"));
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let stream = DirectDialer::new()
+        .with_connect_timeout(Duration::from_secs(2))
+        .connect(addr)
+        .await
+        .expect("connect direct with timeout");
+    assert_eq!(stream.provider_id(), ProviderId::Direct);
 }

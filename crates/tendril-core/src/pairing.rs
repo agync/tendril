@@ -274,12 +274,7 @@ impl PairingManager {
             .collect();
 
         if live_indices.is_empty() {
-            if self.codes.iter().any(|c| c.expired && !c.burned) {
-                return Err(CoreError::PairingCodeExpired);
-            }
-            if self.codes.iter().any(|c| c.burned) {
-                return Err(CoreError::PairingCodeBurned);
-            }
+            let _ = verify_code_mac("TND-AAAA-AAAA-AAAA", handshake_hash, candidate_mac);
             return Err(CoreError::PairingCodeInvalid);
         }
 
@@ -314,11 +309,7 @@ impl PairingManager {
             }
         }
 
-        if live_indices.iter().all(|&i| self.codes[i].burned) {
-            Err(CoreError::PairingCodeBurned)
-        } else {
-            Err(CoreError::PairingCodeInvalid)
-        }
+        Err(CoreError::PairingCodeInvalid)
     }
 }
 
@@ -2042,23 +2033,26 @@ mod tests {
         let h = [0x42u8; 32];
         let mac = compute_code_mac(&code, &h).unwrap();
 
-        // Wrong attempts 1..=4 keep code alive, 5th burns it.
+        // Wrong attempts 1..=5 return uniform PairingCodeInvalid; 5th burns the code.
         let wrong = [0x99u8; 32];
-        for _ in 0..4 {
+        for t in 1..=5u64 {
             assert_eq!(
-                mgr.verify_claim(&h, &wrong, PairingPathKind::Lan, 1001),
+                mgr.verify_claim(&h, &wrong, PairingPathKind::Lan, 1000 + t),
                 Err(CoreError::PairingCodeInvalid)
             );
         }
+        assert_eq!(mgr.live_code_count(1006), 0);
+        // Valid claim after burn must fail uniformly.
         assert_eq!(
-            mgr.verify_claim(&h, &wrong, PairingPathKind::Lan, 1002),
-            Err(CoreError::PairingCodeBurned)
+            mgr.verify_claim(&h, &mac, PairingPathKind::Lan, 1007),
+            Err(CoreError::PairingCodeInvalid)
         );
-        assert_eq!(mgr.live_code_count(1002), 0);
-        // Valid claim after burn must fail.
+
+        // Fresh manager with zero live codes also returns uniform PairingCodeInvalid.
+        let mut empty_mgr = PairingManager::new(PairingConfig::default());
         assert_eq!(
-            mgr.verify_claim(&h, &mac, PairingPathKind::Lan, 1003),
-            Err(CoreError::PairingCodeBurned)
+            empty_mgr.verify_claim(&h, &wrong, PairingPathKind::Lan, 1000),
+            Err(CoreError::PairingCodeInvalid)
         );
 
         // Fresh 2-group code on remote path burns and returns PairingPathDisallowed.
@@ -2072,15 +2066,16 @@ mod tests {
         ));
         assert_eq!(mgr.live_code_count(2001), 0);
 
-        // TTL expiry after 900 seconds.
+        // TTL expiry after 900 seconds fails uniformly with PairingCodeInvalid and clears live count.
         let code3 = mgr
             .issue_code_with_entropy(PairingCodeKind::Remote3Group, 3000, &entropy)
             .unwrap();
         let mac3 = compute_code_mac(&code3, &h).unwrap();
         assert_eq!(
             mgr.verify_claim(&h, &mac3, PairingPathKind::Remote, 3900),
-            Err(CoreError::PairingCodeExpired)
+            Err(CoreError::PairingCodeInvalid)
         );
+        assert_eq!(mgr.live_code_count(3900), 0);
 
         let id = EndpointIdentity::from_keys(
             crate::crypto::StaticKeypair::from_scalar([0x41; 32]),

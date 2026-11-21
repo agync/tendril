@@ -343,7 +343,9 @@ where
                     });
                 }
                 if data.is_empty() {
-                    continue;
+                    return Err(RuntimeError::Protocol(
+                        "empty websocket binary frame".to_owned(),
+                    ));
                 }
                 let take = buf.len().min(data.len());
                 buf[..take].copy_from_slice(&data[..take]);

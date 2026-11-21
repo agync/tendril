@@ -60,8 +60,11 @@ pub fn serialize_identity_json(
         rotation_chain: identity.rotation_chain().to_vec(),
         rotation_seq: identity.rotation_seq(),
     };
-    let json = serde_json::to_string_pretty(&payload)
+    let mut buf = Zeroizing::new(Vec::new());
+    serde_json::to_writer_pretty(&mut *buf, &payload)
         .map_err(|err| RuntimeError::Storage(format!("serialize identity failed: {err}")))?;
+    let json = String::from_utf8(std::mem::take(&mut *buf))
+        .map_err(|err| RuntimeError::Storage(format!("serialize identity utf8 failed: {err}")))?;
     Ok(Zeroizing::new(json))
 }
 
@@ -245,13 +248,14 @@ impl StateStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Roster::new()),
             Err(err) => return Err(RuntimeError::Io(err)),
         }
-        let raw = fs::read_to_string(&path)?;
+        let raw = Zeroizing::new(fs::read_to_string(&path)?);
         serde_json::from_str(&raw)
             .map_err(|err| RuntimeError::Storage(format!("invalid roster json: {err}")))
     }
 
     fn save_roster_unlocked(&self, roster: &Roster) -> Result<(), RuntimeError> {
-        let json = serde_json::to_vec_pretty(roster)
+        let mut json = Zeroizing::new(Vec::new());
+        serde_json::to_writer_pretty(&mut *json, roster)
             .map_err(|err| RuntimeError::Storage(format!("serialize roster failed: {err}")))?;
         self.atomic_write_0600(&self.roster_path(), &json)
     }

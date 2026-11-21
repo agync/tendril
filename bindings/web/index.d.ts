@@ -103,7 +103,12 @@ export function fingerprintHost(staticPub: Uint8Array): string;
 export function fingerprintDevice(staticPub: Uint8Array): string;
 export function pairingSas(handshakeHash: Uint8Array): string;
 export function computeCodeMac(code: string, handshakeHash: Uint8Array): Uint8Array;
-export function computeCodeMacWorker(code: string, handshakeHash: Uint8Array): Promise<Uint8Array>;
+export function computeCodeMacBytes(codeBytes: Uint8Array, handshakeHash: Uint8Array): Uint8Array;
+export function computeCodeMacWorker(
+  code: string | Uint8Array,
+  handshakeHash: Uint8Array,
+  options?: { timeoutMs?: number }
+): Promise<Uint8Array>;
 export function benchmarkArgon2(
   runs?: number,
   options?: { useWorker?: boolean }

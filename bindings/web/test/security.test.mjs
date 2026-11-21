@@ -14,6 +14,9 @@ import {
   MAX_RELAY_FRAME_LEN,
   RelayStream,
   TendrilWebClient,
+  computeCodeMac,
+  computeCodeMacBytes,
+  computeCodeMacWorker,
   initTendril,
   validateRelayWsUrl,
 } from "../src/index.js";
@@ -534,5 +537,70 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
     mitmServer.close();
     peer.close();
     relay.child.kill();
+  }
+});
+
+test("computeCodeMacBytes matches computeCodeMac and zeroes caller buffer", async () => {
+  await ensureWasm();
+  const hh = new Uint8Array(32).fill(0x5a);
+  const expected = computeCodeMac("TND-4829-1704", hh);
+  const rawCode = new TextEncoder().encode("TND-4829-1704");
+  const actual = computeCodeMacBytes(rawCode, hh);
+  assert.deepEqual(actual, expected);
+  assert.deepEqual(rawCode, new Uint8Array(rawCode.length));
+});
+
+test("computeCodeMacWorker handles timeout and messageerror with termination", async () => {
+  await ensureWasm();
+  const hh = new Uint8Array(32).fill(0x33);
+  const savedWorker = globalThis.Worker;
+  let terminatedCount = 0;
+
+  class HangingWorker {
+    constructor() {
+      this.listeners = new Map();
+    }
+    addEventListener(name, fn) {
+      if (!this.listeners.has(name)) {
+        this.listeners.set(name, []);
+      }
+      this.listeners.get(name).push(fn);
+    }
+    postMessage(msg) {
+      assert.ok(msg.codeBytes instanceof Uint8Array);
+      assert.equal(msg.op, "compute_code_mac");
+    }
+    terminate() {
+      terminatedCount += 1;
+    }
+  }
+
+  class MessageErrorWorker extends HangingWorker {
+    postMessage() {
+      queueMicrotask(() => {
+        for (const fn of this.listeners.get("messageerror") || []) {
+          fn({});
+        }
+      });
+    }
+  }
+
+  try {
+    globalThis.Worker = HangingWorker;
+    const rawTimeout = new TextEncoder().encode("TND-AAAA-BBBB");
+    await assert.rejects(
+      () => computeCodeMacWorker(rawTimeout, hh, { timeoutMs: 25 }),
+      /timed out after 25 ms/
+    );
+    assert.deepEqual(rawTimeout, new Uint8Array(rawTimeout.length));
+
+    globalThis.Worker = MessageErrorWorker;
+    await assert.rejects(
+      () => computeCodeMacWorker("TND-AAAA-BBBB", hh, { timeoutMs: 5000 }),
+      /worker message deserialization failed/
+    );
+    assert.equal(terminatedCount, 2);
+  } finally {
+    globalThis.Worker = savedWorker;
   }
 });

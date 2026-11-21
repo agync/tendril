@@ -1,4 +1,4 @@
-import init, { compute_code_mac } from "../pkg/tendril_wasm.js";
+import init, { compute_code_mac, compute_code_mac_bytes } from "../pkg/tendril_wasm.js";
 
 let readyPromise = null;
 
@@ -10,11 +10,20 @@ function ensureReady() {
 }
 
 self.addEventListener("message", async (ev) => {
-  const { id, op, code, handshakeHash } = ev.data || {};
+  const { id, op, code, codeBytes, handshakeHash } = ev.data || {};
   try {
     await ensureReady();
     if (op === "compute_code_mac") {
-      const mac = compute_code_mac(code, handshakeHash);
+      let mac;
+      if (codeBytes instanceof Uint8Array) {
+        try {
+          mac = compute_code_mac_bytes(codeBytes, handshakeHash);
+        } finally {
+          codeBytes.fill(0);
+        }
+      } else {
+        mac = compute_code_mac(code, handshakeHash);
+      }
       self.postMessage({ id, ok: true, mac }, [mac.buffer]);
       return;
     }

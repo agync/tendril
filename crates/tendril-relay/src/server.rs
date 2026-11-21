@@ -1194,7 +1194,7 @@ async fn bridge_streams(
             };
             match msg {
                 Message::Binary(data) => {
-                    if data.len() > MAX_RELAY_FRAME_LEN {
+                    if data.is_empty() || data.len() > MAX_RELAY_FRAME_LEN {
                         break;
                     }
                     let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1220,7 +1220,7 @@ async fn bridge_streams(
             };
             match msg {
                 Message::Binary(data) => {
-                    if data.len() > MAX_RELAY_FRAME_LEN {
+                    if data.is_empty() || data.len() > MAX_RELAY_FRAME_LEN {
                         break;
                     }
                     let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);

@@ -384,3 +384,95 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
 
     handle.stop().await.expect("stop relay");
 }
+
+#[tokio::test]
+async fn relay_rejects_zero_byte_binary_frames_without_forwarding() {
+    let server = RelayServer::bind(RelayConfig {
+        accept_timeout: Duration::from_secs(5),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind relay");
+    let handle = server.spawn();
+    let url = handle.ws_url();
+
+    let key = SigningKey::from_bytes(&[0x33; 32]);
+    let (mut reg_ws, _) = connect_async(&url).await.expect("connect reg");
+    let RelayServerMsg::Challenge { nonce, host, .. } =
+        recv_server_msg(&mut reg_ws).await.expect("challenge")
+    else {
+        panic!("expected challenge");
+    };
+    let nonce_bytes = b64url_decode_array::<32>(&nonce).expect("nonce");
+    let (pub_b64, reg_sig) = sign_relay_register(&key, &host, &nonce_bytes);
+    send_client_msg(
+        &mut reg_ws,
+        &RelayClientMsg::Register {
+            pub_key: pub_b64.clone(),
+            sig: reg_sig,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut reg_ws).await,
+        Some(RelayServerMsg::Registered { .. })
+    ));
+
+    let conn_id_bytes = [0x44u8; 16];
+    let conn_id_b64 = b64url_encode(&conn_id_bytes);
+    let (mut dialer_ws, _) = connect_async(&url).await.expect("connect dialer");
+    assert!(recv_server_msg(&mut dialer_ws).await.is_some());
+    send_client_msg(
+        &mut dialer_ws,
+        &RelayClientMsg::Dial {
+            target_pub: pub_b64.clone(),
+            conn_id: conn_id_b64.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut reg_ws).await,
+        Some(RelayServerMsg::Incoming { .. })
+    ));
+
+    let (mut acc_ws, _) = connect_async(&url).await.expect("connect acc");
+    let RelayServerMsg::Challenge {
+        nonce: acc_nonce, ..
+    } = recv_server_msg(&mut acc_ws).await.expect("acc challenge")
+    else {
+        panic!("expected acc challenge");
+    };
+    let acc_nonce_bytes = b64url_decode_array::<32>(&acc_nonce).expect("acc nonce");
+    let acc_sig = sign_relay_accept(&key, &host, &acc_nonce_bytes, &conn_id_bytes);
+    send_client_msg(
+        &mut acc_ws,
+        &RelayClientMsg::Accept {
+            pub_key: pub_b64,
+            conn_id: conn_id_b64,
+            sig: acc_sig,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut acc_ws).await,
+        Some(RelayServerMsg::Ready { .. })
+    ));
+    assert!(matches!(
+        recv_server_msg(&mut dialer_ws).await,
+        Some(RelayServerMsg::Ready { .. })
+    ));
+
+    dialer_ws
+        .send(Message::Binary(Vec::new().into()))
+        .await
+        .expect("send 0-byte frame");
+    let next_on_acc = tokio::time::timeout(Duration::from_secs(2), acc_ws.next())
+        .await
+        .expect("bridge close before timeout");
+    match next_on_acc {
+        None | Some(Ok(Message::Close(_))) | Some(Err(_)) => {}
+        Some(Ok(other)) => panic!("0-byte binary frame must close bridge: {other:?}"),
+    }
+
+    handle.stop().await.expect("stop relay");
+}
