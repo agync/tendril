@@ -1,0 +1,71 @@
+---
+type: Design
+title: Wire v2 privacy profile and PAKE
+description: Wire 0x02 anti-downgrade floor, pseudonymous paired reconnect, opt-in Argon2id PAKE pairing, blinded /v2/relay epoch mailboxes, bucketed inner padding, and jittered scheduling.
+status: stable
+tags: [design, privacy, wire-v2, pake, relay]
+---
+
+# Wire v2 privacy profile and PAKE
+
+The Tendril v2 Privacy Profile (`WIRE_VERSION_V2 = 0x02`, specified in `spec/wire-v2.md` and `spec/relay-v2.md`) hardens handshake metadata, relay mailbox identifiers, inner frame lengths, and keepalive/rekey timing while preserving `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` and hybrid `Ed25519 + ML-DSA-65` identity signatures. Wire v1 (`0x01`) remains intact for backward compatibility with unupgraded peers.
+
+## Preamble binding and anti-downgrade floor
+
+Every v2 connection opens with a 6-byte cleartext preamble (`"TND" || 0x02 || intent || flags`) where `intent` is `0x01` (session) or `0x02` (pair) and `flags` is `0x00` (standard v2) or `0x01` (`FLAG_PAKE_PAIR`, permitted only when `intent == 0x02`).
+
+- **Prologue binding:** Standard v2 connections feed the 6-byte preamble verbatim as the Noise prologue. PAKE pairing feeds `preamble (6 B) || pake_context_tag (32 B)` so mutating any preamble byte or mode flag causes AEAD failure in `msg2` and `msg3`.
+- **Anti-downgrade (`min_wire_version`):** Persisted peer and pinned host records carry `min_wire_version` (`1` or `2`). Once a peer is recorded over `0x02` (or pinned with `min_wire_version = 2`), both sides persist `min_wire_version >= 2`, reject decreasing the floor without explicit revocation and re-pairing, and fail closed (`VersionDowngrade`) before disclosing `HostHello`, `SessionHello`, `PairClaim`, or burning pairing codes if `0x01` is offered. Because `PinnedHost` has no floor field and `PairingInitiator::new` / `new_m2m` default to floor `1`, initiator embedders MUST pass the persisted peer floor (via `Roster::pairing_floor` or `V2PinnedHost`) into `PairingInitiator::new_with_min_wire_version` / `PairingInitiator::new_m2m_with_min_wire_version`.
+
+## Pseudonymous paired reconnect
+
+In v1, `Noise_XXhfs` `msg2` is encrypted only under ephemeral `ee + ekem1`, allowing active scanners to read `HostHello` (`host_id`, `signing_pub`, `rotation`) and the responder's static X25519 key. In v2 session reconnect (`intent = 0x01`, `flags = 0x00`), both peers export `reconnect_secret` and `mailbox_secret` via `HKDF-SHA256` from the post-`se` chaining key and handshake hash after a completed v2 handshake.
+
+```mermaid
+sequenceDiagram
+  participant I as Initiator
+  participant R as Responder
+  I->>R: Preamble (0x02, 0x01, 0x00) + msg1 (e, e1, nonce || ts || rendezvous_mac [56 B])
+  Note over R: Check |ts - now| <= 300s, shared RendezvousReplayCache, constant-time MAC scan
+  alt Verified and fresh
+    R->>I: msg2 (real static_pub + ChaCha20Poly1305-sealed HostHello padded to V2_HANDSHAKE_BUCKETS)
+    I->>R: msg3 (padded SessionHello)
+  else Unauthenticated probe, stale (> 300s), or replayed
+    R->>I: msg2 (ephemeral decoy_static + CSPRNG decoy payload in identical V2_HANDSHAKE_BUCKETS size)
+    Note over I,R: Responder rejects msg3 unconditionally (HostKeyUnverified)
+  end
+```
+
+- **Timestamped proof (`56` B):** `msg1` carries `rendezvous_nonce (16 B) || ts_be8 (8 B) || rendezvous_mac (32 B)` authenticated with `reconnect_secret` over the preamble, `e_i_pub`, and `SHA-256(e1)`.
+- **Shared replay cache and constant-time scan:** Multi-connection listeners share one `RendezvousReplayCache` across concurrent inbound connections, enforcing `|ts_unix - now_unix| <= 300` seconds, evicting only expired entries at capacity, and failing closed to the decoy path when full. The responder evaluates `rendezvous_mac` across all roster entries without early exit regardless of payload length.
+- **Rotation-matched decoy `msg2`:** Both genuine sealed `HostHello` envelopes and unauthenticated CSPRNG decoy payloads pad to the same `V2_HANDSHAKE_BUCKETS` (`[4096, 16384, 32768, 63488]`) size computed for the responder's real `HostHello` (including any `RotationRecord` chain), hiding `static_pub`, `host_id`, `signing_pub`, and rotation state from active scanners.
+- **Post-establish floor and secret retention:** Pairing-derived `reconnect_secret` and `mailbox_secret` are retained across reconnects to prevent `msg3`-drop or concurrent-session secret desynchronization (session-exported secrets are informational/explicit-only). Reaching `Established` (`msg3` verified against an `Active` peer) raises `min_wire_version = 2`, never speculatively at `msg2`.
+
+## Opt-in PAKE pairing (`FLAG_PAKE_PAIR = 0x01`)
+
+For human-mediated pairing over untrusted paths, `intent = 0x02, flags = 0x01` derives `master_pake` from the normalized pairing code and a 16-byte CSPRNG `channel_salt` via `Argon2id` (`m = 19456` KiB, `t = 2`, `p = 1`, enforced minimum in production builds), then expands `pake_prologue_key`, `pake_init_key`, `pake_hello_key`, `pake_confirm_key`, and `pake_context_tag` via `HKDF-SHA256`.
+
+- **Replay-protected `msg1`:** `msg1` carries `channel_salt (16 B) || init_mac (32 B)`. The responder checks a bounded `(channel_salt, init_mac)` replay cache before accepting. Unmatched, replayed, or full-cache `msg1` attempts route to an ephemeral `decoy_static` + decoy prologue `msg2` of identical `V2_HANDSHAKE_BUCKETS` length (including the `32`-byte `resp_confirm_mac` overhead) without charging or burning live pairing codes.
+- **Authenticated `HostHello` and `msg3`:** On a valid match, `msg2` seals `HostHello` with `pake_hello_key` (AAD = `h_pre`) and appends `resp_confirm_mac`. Invalid `msg3` (`init_confirm_mac` mismatch) fails with `PairingAuthFailed` without burning live codes, preventing code-burn DoS.
+- **Passive dictionary work factor:** A passive observer capturing a legitimate `msg1 + msg2` exchange can test code guesses offline at one `Argon2id(19 MiB, t=2, p=1)` evaluation per guess. `Remote3Group` (`31^12 ~= 2^59.4`) resists offline brute force; shorter `Lan2Group` (`31^8 ~= 2^39.6`) codes MUST remain restricted to trusted local networks. Runtime embedders MUST bound concurrent `Argon2id` derivations.
+
+## Blinded hourly `/v2/relay` mailboxes
+
+`spec/relay-v2.md` replaces `/v1/relay`'s static `device_id` with hourly (`3600` s) HKDF-derived Ed25519 `mailbox_id` keys derived from `mailbox_secret` and `uint64_be(epoch)`:
+
+| Artifact | Derivation (`HKDF-SHA256`) | Purpose |
+|---|---|---|
+| `mailbox_id` | Ed25519 keypair from `info = "tendril-relay-v2-ed25519"` | Ephemeral per-epoch listener registration and `accept` signature |
+| `dial_auth_key` | Key from `info = "tendril-relay-v2-dial-auth"` | Computes `conn_id`-bound `dial_token` HMAC for `dial` and `incoming` verification |
+
+- **Host-bound challenges (`VerifiedRelayHost`):** Clients canonicalize `challenge.host` (lowercase, no trailing dot or `:port`) and verify it matches the dialed relay host before signing `register`, `dial`, or `accept` proofs.
+- **Atomic `incoming` verification:** Listeners verify `dial_token` across the active `RelayEpochWindow` (`+-1` hour skew) before recording `(epoch, dial_nonce, conn_id)` in `RelayDialReplayCache`, ignoring invalid or replayed notifications silently.
+- **Per-epoch socket isolation:** Clients requiring cross-epoch unlinkability MUST open a separate control WebSocket per epoch `mailbox_id` rather than registering `(epoch - 1, epoch, epoch + 1)` on one persistent control socket.
+
+## Bucketed inner frames and jittered scheduling
+
+| Mechanism | Specification (`spec/wire-v2.md`) | Privacy effect |
+|---|---|---|
+| `0x09 PADDED` | Wraps `0x01..=0x07` inner frames (`inner_type \|\| uint16_be(len) \|\| payload \|\| 0x00...`) padded to `[256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65503]` | Hides inner frame type boundaries and exact payload sizes; constant-time zero-padding check |
+| `0x08 PADDING` | Zero-filled cover frame silently discarded after AEAD decrypt and nonce advance | Supports cover traffic on v2 sessions (rejected on v1) |
+| Keepalive & `REKEY` jitter | `ScheduleJitterPolicy` samples `PING` intervals (`+-25%` default) and per-epoch `REKEY` thresholds (`75%..=100%` of max frames/age) via CSPRNG | Removes periodic beacon and fixed rekey timing fingerprints |

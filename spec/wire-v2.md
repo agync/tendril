@@ -77,8 +77,8 @@ mailbox_secret   = HKDF-SHA256(ikm = exporter_secret, salt = "tendril-mailbox-v2
 ```
 
 - Pairing-derived `mailbox_secret` and `reconnect_secret` MUST be persisted in an encrypted-at-rest keystore (OS Keychain / Keystore / sealed roster store) and zeroized on drop. They MUST NOT appear in debug or audit logs.
-- On reconnect, a responder MUST only persist `exported_v2_secrets` (and apply any updated `reconnect_secret`) after the session reaches `Established` (`msg3` verified against an `Active` peer), NEVER speculatively when emitting `msg2`.
-- Endpoints MAY retain the pairing-derived `mailbox_secret` across concurrent sessions until explicit re-pairing or coordinated key rotation so active relay epoch windows stay synchronized.
+- Pairing-derived `reconnect_secret` and `mailbox_secret` are retained across reconnects (preventing `msg3`-drop or concurrent-session secret desynchronization); session-exported secrets are informational/explicit-only and MUST NOT overwrite persisted pairing-derived secrets on normal reconnects.
+- On reconnect, reaching `Established` (`msg3` verified against an `Active` peer) raises `min_wire_version = 2` for that peer; responders MUST NOT mutate persisted peer state speculatively when emitting `msg2`.
 
 #### 3.1.2 `msg1` Timestamped Rendezvous Proof (56 bytes)
 

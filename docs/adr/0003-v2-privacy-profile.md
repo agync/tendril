@@ -1,12 +1,14 @@
 ---
 type: Decision
 title: "0003 V2 privacy profile"
-description: Planned Tendril v2 privacy hardening targeting relay mailbox linkability, unencrypted HostHello metadata leakage, packet-size correlation, and traffic timing fingerprinting.
-status: draft
-tags: [adr, privacy, relay, wire, roadmap]
+description: Tendril v2 privacy profile targeting relay mailbox linkability, unencrypted HostHello metadata leakage, packet-size correlation, and traffic timing fingerprinting.
+status: stable
+tags: [adr, privacy, relay, wire]
 ---
 
 # 0003 V2 privacy profile
+
+> **Status: Accepted.** Implemented in `spec/wire-v2.md`, `spec/relay-v2.md`, and [Wire v2 privacy profile and PAKE](../design/wire-v2-privacy.md).
 
 ## Context
 

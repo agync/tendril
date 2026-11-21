@@ -27,6 +27,7 @@ build: ## Build all workspace crates and targets
 
 test: ## Run the workspace test suite
 	cargo test --workspace --all-features
+	cargo test -p tendril-core --test v2_privacy
 
 rust/lint: ## Run rustfmt check and clippy with warnings denied
 	cargo fmt --all -- --check
