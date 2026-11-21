@@ -26,10 +26,27 @@ use tendril_core::pairing::{
     ENROLL_PROOF_DOMAIN, EnrollmentPolicy, enroll_proof_bytes, mint_enrollment_token_deterministic,
     sign_enroll_proof_deterministic, verify_enrollment_token,
 };
+use tendril_core::relay_auth::{
+    RelayAuthProof, RelayAuthRole, RelayTicket, compute_relay_auth_hmac,
+    compute_relay_auth_hmac_b64, mint_relay_ticket, relay_auth_hmac_input, relay_ticket_jcs,
+    relay_ticket_signed_bytes, verify_relay_auth_hmac, verify_relay_ticket,
+};
 use tendril_core::roster::Roster;
+use tendril_core::v2::{
+    PAKE_ARGON2_MEMORY_KIB, PAKE_ARGON2_PARALLELISM, PAKE_ARGON2_TIME, PaddingPolicy,
+    PakeArgon2Params, V2_PAKE_SALT_LEN, canonical_relay_host, compute_pake_init_mac,
+    compute_pake_msg1_mac, compute_pake_resp_mac, compute_rendezvous_mac, decode_v2_inner_frame,
+    derive_epoch_mailbox, derive_pake_keys, derive_pake_master, encode_dummy_cover_frame,
+    epoch_for_unix, pad_inner_frame, pad_msg3_payload, pake_msg2_bucket_for_hello_len,
+    pake_noise_prologue, seal_pake_host_hello, seal_v2_hello_envelope, sign_v2_relay_accept,
+    sign_v2_relay_dial, sign_v2_relay_register, unpad_inner_frame, unpad_msg3_payload,
+    unseal_pake_host_hello, unseal_v2_hello_envelope, v2_relay_accept_signed_bytes,
+    v2_relay_dial_signed_bytes, v2_relay_register_signed_bytes, verify_v2_relay_accept,
+    verify_v2_relay_dial, verify_v2_relay_register,
+};
 use tendril_core::wire::{
-    HostHello, InnerFrameType, Intent, NOISE_PATTERN, PairClaim, PairResponse, Preamble,
-    SessionHello, decode_frame, encode_frame, encode_inner_frame,
+    HostHello, InnerFrameType, Intent, NOISE_PATTERN, PREAMBLE_FLAG_NONE, PairClaim, PairResponse,
+    Preamble, SessionHello, WIRE_VERSION_V2, decode_frame, encode_frame, encode_inner_frame,
 };
 
 #[derive(Serialize)]
@@ -227,6 +244,161 @@ struct M2mEnrollmentVector {
     pair_response_json: String,
     pair_response_frame_hex: String,
     replayed_response_json: String,
+}
+
+#[derive(Serialize)]
+struct BlindedRelayVector {
+    mailbox_secret_hex: String,
+    unix_secs: u64,
+    epoch: u64,
+    epoch_signing_seed_hex: String,
+    dial_auth_key_hex: String,
+    mailbox_id_hex: String,
+    mailbox_id_b64url: String,
+    relay_host_raw: String,
+    relay_host_canonical: String,
+    challenge_nonce_hex: String,
+    conn_id_hex: String,
+    register_signed_bytes_hex: String,
+    register_sig_hex: String,
+    register_sig_b64url: String,
+    dial_mac_input_hex: String,
+    dial_token_hex: String,
+    dial_token_b64url: String,
+    accept_signed_bytes_hex: String,
+    accept_sig_hex: String,
+    accept_sig_b64url: String,
+}
+
+#[derive(Serialize)]
+struct RelayAdmissionVector {
+    shared_secret_hex: String,
+    op: String,
+    dial_op: String,
+    accept_op: String,
+    relay_host_raw: String,
+    relay_host_canonical: String,
+    challenge_nonce_hex: String,
+    pub_or_target_hex: String,
+    hmac_input_hex: String,
+    hmac_mac_hex: String,
+    hmac_mac_b64url: String,
+    dial_hmac_input_hex: String,
+    dial_hmac_mac_hex: String,
+    accept_hmac_input_hex: String,
+    accept_hmac_mac_hex: String,
+    ticket_issuer_seed_hex: String,
+    ticket_issuer_pub_hex: String,
+    ticket_now_unix: u64,
+    ticket_ttl_secs: u64,
+    ticket_jcs_json: String,
+    ticket_signed_bytes_hex: String,
+    ticket_sig_hex: String,
+    ticket: RelayTicket,
+    ticket_proof_json: String,
+    hmac_proof_json: String,
+}
+
+#[derive(Serialize)]
+struct V2ReconnectVector {
+    preamble_hex: String,
+    initiator_static_scalar_hex: String,
+    initiator_static_pub_hex: String,
+    initiator_ephem_scalar_hex: String,
+    initiator_mlkem768_keygen_seed_hex: String,
+    responder_static_scalar_hex: String,
+    responder_static_pub_hex: String,
+    responder_ephem_scalar_hex: String,
+    responder_mlkem768_encaps_seed_hex: String,
+    responder_signing_seed_hex: String,
+    responder_signing_mldsa_seed_hex: String,
+    responder_signing_pub_hex: String,
+    reconnect_secret_hex: String,
+    rendezvous_nonce_hex: String,
+    ts_unix: u64,
+    ekem_i_hash_hex: String,
+    rendezvous_mac_hex: String,
+    msg1_payload_hex: String,
+    msg1_frame_hex: String,
+    host_hello_json: String,
+    bucket_len: usize,
+    hello_seal_key_hex: String,
+    pre_msg2_handshake_hash_hex: String,
+    sealed_hello_envelope_hex: String,
+    msg2_frame_hex: String,
+    post_msg2_handshake_hash_hex: String,
+    session_hello_json: String,
+    msg3_padded_payload_hex: String,
+    msg3_frame_hex: String,
+    final_handshake_hash_hex: String,
+    padded_data_payload_hex: String,
+    padded_inner_hex: String,
+    padded_frame_hex: String,
+    cover_bucket_len: usize,
+    cover_inner_hex: String,
+    cover_frame_hex: String,
+    exported_reconnect_secret_hex: String,
+    exported_mailbox_secret_hex: String,
+}
+
+#[derive(Serialize)]
+struct V2PakeVector {
+    preamble_hex: String,
+    code: String,
+    code_normalized: String,
+    channel_salt_hex: String,
+    argon2id: Argon2ParamsSpec,
+    master_pake_hex: String,
+    pake_prologue_key_hex: String,
+    pake_init_key_hex: String,
+    pake_hello_key_hex: String,
+    pake_confirm_key_hex: String,
+    pake_context_tag_hex: String,
+    noise_prologue_hex: String,
+    initiator_static_scalar_hex: String,
+    initiator_static_pub_hex: String,
+    initiator_ephem_scalar_hex: String,
+    initiator_mlkem768_keygen_seed_hex: String,
+    responder_static_scalar_hex: String,
+    responder_static_pub_hex: String,
+    responder_ephem_scalar_hex: String,
+    responder_mlkem768_encaps_seed_hex: String,
+    responder_signing_seed_hex: String,
+    responder_signing_mldsa_seed_hex: String,
+    responder_signing_pub_hex: String,
+    ekem_i_hash_hex: String,
+    init_mac_hex: String,
+    msg1_payload_hex: String,
+    msg1_frame_hex: String,
+    host_hello_json: String,
+    msg2_bucket_len: usize,
+    pre_msg2_handshake_hash_hex: String,
+    sealed_host_hello_hex: String,
+    resp_confirm_mac_hex: String,
+    msg2_payload_hex: String,
+    msg2_frame_hex: String,
+    post_msg2_handshake_hash_hex: String,
+    pairing_sas: String,
+    pair_claim_json: String,
+    init_confirm_mac_hex: String,
+    msg3_payload_hex: String,
+    msg3_frame_hex: String,
+    final_handshake_hash_hex: String,
+    pair_response_json: String,
+    pair_response_frame_hex: String,
+    exported_reconnect_secret_hex: String,
+    exported_mailbox_secret_hex: String,
+}
+
+#[derive(Serialize)]
+struct WireV2Vector {
+    noise_pattern: String,
+    v2_session_preamble_hex: String,
+    v2_pake_pair_preamble_hex: String,
+    blinded_relay: BlindedRelayVector,
+    relay_admission: RelayAdmissionVector,
+    v2_reconnect: V2ReconnectVector,
+    pake_pairing: V2PakeVector,
 }
 
 fn concat64(a: &[u8; 32], b: &[u8; 32]) -> [u8; 64] {
@@ -510,8 +682,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let m2m_vec = build_m2m_enrollment_vector()?;
     write_json(&vectors_dir, "m2m_enrollment.json", &m2m_vec)?;
 
+    // 7. wire_v2.json
+    let wire_v2_vec = generate_wire_v2_vector()?;
+    write_json(&vectors_dir, "wire_v2.json", &wire_v2_vec)?;
+
     println!(
-        "Generated 6 canonical vector files under {}",
+        "Generated 7 canonical vector files under {}",
         vectors_dir.display()
     );
     Ok(())
@@ -969,5 +1145,628 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
         pair_response_json,
         pair_response_frame_hex: hex::encode(pair_response_frame),
         replayed_response_json,
+    })
+}
+
+fn generate_wire_v2_vector() -> Result<WireV2Vector, Box<dyn std::error::Error>> {
+    use ed25519_dalek::SigningKey;
+
+    let v2_session_preamble = Preamble::v2(Intent::Session, PREAMBLE_FLAG_NONE).encode();
+    let v2_pake_pair_preamble = Preamble::v2_pake_pair().encode();
+
+    // 1. Blinded /v2/relay hourly epoch
+    let mailbox_secret = seq_bytes(0x90);
+    let unix_secs = 1_795_134_200u64;
+    let epoch = epoch_for_unix(unix_secs);
+    let mailbox = derive_epoch_mailbox(&mailbox_secret, epoch);
+    let relay_host_raw = "RELAY.Tendril.Test.".to_string();
+    let relay_host_canonical = canonical_relay_host(&relay_host_raw)?;
+    let challenge_nonce = seq_bytes(0xA0);
+    let conn_id: [u8; 16] = [
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+        0x1F,
+    ];
+    let register_signed_bytes =
+        v2_relay_register_signed_bytes(&relay_host_raw, &challenge_nonce, epoch)?;
+    let register_sig = sign_v2_relay_register(&mailbox, &relay_host_raw, &challenge_nonce)?;
+    verify_v2_relay_register(
+        &mailbox.mailbox_id,
+        epoch,
+        &relay_host_canonical,
+        &challenge_nonce,
+        &register_sig,
+    )?;
+
+    let dial_mac_input = v2_relay_dial_signed_bytes(
+        &relay_host_raw,
+        &challenge_nonce,
+        &mailbox.mailbox_id,
+        &conn_id,
+        epoch,
+    )?;
+    let dial_token = sign_v2_relay_dial(&mailbox, &relay_host_raw, &challenge_nonce, &conn_id)?;
+    verify_v2_relay_dial(
+        &mailbox,
+        &relay_host_canonical,
+        &challenge_nonce,
+        &conn_id,
+        &dial_token,
+    )?;
+
+    let accept_signed_bytes =
+        v2_relay_accept_signed_bytes(&relay_host_raw, &challenge_nonce, &conn_id, epoch)?;
+    let accept_sig = sign_v2_relay_accept(&mailbox, &relay_host_raw, &challenge_nonce, &conn_id)?;
+    verify_v2_relay_accept(
+        &mailbox.mailbox_id,
+        epoch,
+        &relay_host_canonical,
+        &challenge_nonce,
+        &conn_id,
+        &accept_sig,
+    )?;
+
+    let blinded_relay = BlindedRelayVector {
+        mailbox_secret_hex: hex::encode(mailbox_secret),
+        unix_secs,
+        epoch,
+        epoch_signing_seed_hex: hex::encode(mailbox.signing_key().to_bytes()),
+        dial_auth_key_hex: hex::encode(mailbox.dial_auth_key()),
+        mailbox_id_hex: hex::encode(mailbox.mailbox_id),
+        mailbox_id_b64url: b64url_encode(&mailbox.mailbox_id),
+        relay_host_raw,
+        relay_host_canonical,
+        challenge_nonce_hex: hex::encode(challenge_nonce),
+        conn_id_hex: hex::encode(conn_id),
+        register_signed_bytes_hex: hex::encode(register_signed_bytes),
+        register_sig_hex: hex::encode(register_sig),
+        register_sig_b64url: b64url_encode(&register_sig),
+        dial_mac_input_hex: hex::encode(dial_mac_input),
+        dial_token_hex: hex::encode(dial_token),
+        dial_token_b64url: b64url_encode(&dial_token),
+        accept_signed_bytes_hex: hex::encode(accept_signed_bytes),
+        accept_sig_hex: hex::encode(accept_sig),
+        accept_sig_b64url: b64url_encode(&accept_sig),
+    };
+
+    // 2. Relay Admission (Tier 2 HMAC + Tier 3 Ed25519 JCS RelayTicket)
+    let shared_secret = seq_bytes(0xB0);
+    let adm_host_raw = "Relay.Example.COM.".to_string();
+    let adm_host_canon = canonical_relay_host(&adm_host_raw)?;
+    let adm_nonce = seq_bytes(0xC0);
+    let pub_or_target = SigningKey::from_bytes(&seq_bytes(0xD0))
+        .verifying_key()
+        .to_bytes();
+
+    let hmac_input = relay_auth_hmac_input("register", &adm_host_raw, &adm_nonce, &pub_or_target)?;
+    let hmac_mac = compute_relay_auth_hmac(
+        &shared_secret,
+        "register",
+        &adm_host_raw,
+        &adm_nonce,
+        &pub_or_target,
+    )?;
+    let hmac_mac_b64url = compute_relay_auth_hmac_b64(
+        &shared_secret,
+        "register",
+        &adm_host_raw,
+        &adm_nonce,
+        &pub_or_target,
+    )?;
+    verify_relay_auth_hmac(
+        &shared_secret,
+        "register",
+        &adm_host_canon,
+        &adm_nonce,
+        &pub_or_target,
+        &hmac_mac_b64url,
+    )?;
+
+    let dial_hmac_input = relay_auth_hmac_input("dial", &adm_host_raw, &adm_nonce, &pub_or_target)?;
+    let dial_hmac_mac = compute_relay_auth_hmac(
+        &shared_secret,
+        "dial",
+        &adm_host_raw,
+        &adm_nonce,
+        &pub_or_target,
+    )?;
+    let accept_hmac_input =
+        relay_auth_hmac_input("accept", &adm_host_raw, &adm_nonce, &pub_or_target)?;
+    let accept_hmac_mac = compute_relay_auth_hmac(
+        &shared_secret,
+        "accept",
+        &adm_host_raw,
+        &adm_nonce,
+        &pub_or_target,
+    )?;
+
+    let ticket_issuer_seed = seq_bytes(0xE0);
+    let ticket_issuer_sk = SigningKey::from_bytes(&ticket_issuer_seed);
+    let ticket_issuer_pub = ticket_issuer_sk.verifying_key().to_bytes();
+    let ticket_now_unix = 1_795_132_800u64;
+    let ticket_ttl_secs = 3_600u64;
+    let ticket = mint_relay_ticket(
+        &ticket_issuer_sk,
+        &adm_host_raw,
+        RelayAuthRole::Dial,
+        &b64url_encode(&pub_or_target),
+        ticket_now_unix,
+        ticket_ttl_secs,
+    )?;
+    let ticket_jcs_json = relay_ticket_jcs(&ticket)?;
+    let ticket_signed_bytes = relay_ticket_signed_bytes(&ticket)?;
+    let ticket_sig = tendril_core::crypto::b64url_decode_array::<64>(&ticket.sig)?;
+    verify_relay_ticket(
+        &ticket,
+        &[ticket_issuer_pub],
+        &adm_host_canon,
+        RelayAuthRole::Dial,
+        &pub_or_target,
+        ticket_now_unix + 60,
+    )?;
+
+    let hmac_proof_json = serde_json::to_string(&RelayAuthProof::Hmac {
+        mac: hmac_mac_b64url.clone(),
+    })?;
+    let ticket_proof_json = serde_json::to_string(&RelayAuthProof::Ticket {
+        ticket: ticket.clone(),
+    })?;
+
+    let relay_admission = RelayAdmissionVector {
+        shared_secret_hex: hex::encode(shared_secret),
+        op: "register".to_string(),
+        dial_op: "dial".to_string(),
+        accept_op: "accept".to_string(),
+        relay_host_raw: adm_host_raw,
+        relay_host_canonical: adm_host_canon,
+        challenge_nonce_hex: hex::encode(adm_nonce),
+        pub_or_target_hex: hex::encode(pub_or_target),
+        hmac_input_hex: hex::encode(hmac_input),
+        hmac_mac_hex: hex::encode(hmac_mac),
+        hmac_mac_b64url,
+        dial_hmac_input_hex: hex::encode(dial_hmac_input),
+        dial_hmac_mac_hex: hex::encode(dial_hmac_mac),
+        accept_hmac_input_hex: hex::encode(accept_hmac_input),
+        accept_hmac_mac_hex: hex::encode(accept_hmac_mac),
+        ticket_issuer_seed_hex: hex::encode(ticket_issuer_seed),
+        ticket_issuer_pub_hex: hex::encode(ticket_issuer_pub),
+        ticket_now_unix,
+        ticket_ttl_secs,
+        ticket_jcs_json,
+        ticket_signed_bytes_hex: hex::encode(ticket_signed_bytes),
+        ticket_sig_hex: hex::encode(ticket_sig),
+        ticket,
+        ticket_proof_json,
+        hmac_proof_json,
+    };
+
+    // 3. Pseudonymous v2 Reconnect
+    let v2_reconnect = build_v2_reconnect_vector(&v2_session_preamble)?;
+
+    // 4. Hybrid Argon2id PAKE + ML-KEM-768 Pairing
+    let pake_pairing = build_v2_pake_vector(&v2_pake_pair_preamble)?;
+
+    Ok(WireV2Vector {
+        noise_pattern: NOISE_PATTERN.to_string(),
+        v2_session_preamble_hex: hex::encode(v2_session_preamble),
+        v2_pake_pair_preamble_hex: hex::encode(v2_pake_pair_preamble),
+        blinded_relay,
+        relay_admission,
+        v2_reconnect,
+        pake_pairing,
+    })
+}
+
+fn build_v2_reconnect_vector(
+    preamble: &[u8; 6],
+) -> Result<V2ReconnectVector, Box<dyn std::error::Error>> {
+    use tendril_core::crypto::hkdf_sha256_32;
+
+    let init_static = seq_bytes(0x31);
+    let init_static_pub = x25519_public_from_scalar(&init_static);
+    let init_ephem = seq_bytes(0x32);
+    let init_d = seq_bytes(0x33);
+    let init_z = seq_bytes(0x34);
+
+    let resp_static = seq_bytes(0x41);
+    let resp_static_pub = x25519_public_from_scalar(&resp_static);
+    let resp_ephem = seq_bytes(0x42);
+    let resp_m = seq_bytes(0x43);
+    let resp_signing_seed = seq_bytes(0x44);
+    let resp_signing_mldsa_seed = seq_bytes(0x45);
+    let resp_signing = SigningKeypair::from_seeds(resp_signing_seed, resp_signing_mldsa_seed);
+
+    let reconnect_secret = seq_bytes(0x55);
+    let rendezvous_nonce: [u8; 16] = [
+        0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7,
+        0xB8,
+    ];
+    let ts_unix = 1_795_134_200u64;
+
+    let mut initiator = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(&init_static)
+        .prologue(preamble)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: init_ephem,
+            mlkem_d: init_d,
+            mlkem_z: init_z,
+            mlkem_m: [0u8; 32],
+        })
+        .build_initiator()?;
+    let mut responder = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(&resp_static)
+        .prologue(preamble)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: resp_ephem,
+            mlkem_d: [0u8; 32],
+            mlkem_z: [0u8; 32],
+            mlkem_m: resp_m,
+        })
+        .build_responder()?;
+
+    let mut ekem_i_hash = [0u8; 32];
+    let mut rendezvous_mac = [0u8; 32];
+    let mut msg1_payload = Vec::new();
+    let msg1_body = initiator.write_msg1_with_payload(|e_i_pub, ek_bytes| {
+        ekem_i_hash = Sha256::digest(ek_bytes).into();
+        rendezvous_mac = compute_rendezvous_mac(
+            &reconnect_secret,
+            preamble,
+            e_i_pub,
+            &ekem_i_hash,
+            &rendezvous_nonce,
+            ts_unix,
+        );
+        let mut p = Vec::with_capacity(56);
+        p.extend_from_slice(&rendezvous_nonce);
+        p.extend_from_slice(&ts_unix.to_be_bytes());
+        p.extend_from_slice(&rendezvous_mac);
+        msg1_payload = p.clone();
+        Ok(p)
+    })?;
+    let msg1_frame = encode_frame(&msg1_body)?;
+    let (body1, _) = decode_frame(&msg1_frame)?;
+    let dec1 = responder.read_message_vec(body1)?;
+    assert_eq!(&*dec1, msg1_payload.as_slice());
+
+    let host_hello = HostHello {
+        host_id: device_id(&resp_static_pub),
+        proto_version: WIRE_VERSION_V2,
+        signing_pub: resp_signing.public_key().to_b64url(),
+        rotation: vec![],
+    };
+    let host_hello_json = serde_json::to_string(&host_hello)?;
+
+    let hello_seal_key = hkdf_sha256_32(
+        &reconnect_secret,
+        &rendezvous_nonce,
+        b"tendril-v2-hello-seal",
+    );
+    let mut pre_msg2_hash = [0u8; 32];
+    let mut sealed_hello_envelope = Vec::new();
+    let msg2_body = responder.write_msg2_with_hash(|h_pre| {
+        pre_msg2_hash = *h_pre;
+        let env = seal_v2_hello_envelope(
+            &reconnect_secret,
+            &rendezvous_nonce,
+            h_pre,
+            host_hello_json.as_bytes(),
+        )?;
+        sealed_hello_envelope = env.clone();
+        Ok(env)
+    })?;
+    let bucket_len = sealed_hello_envelope.len();
+    let msg2_frame = encode_frame(&msg2_body)?;
+    let (body2, _) = decode_frame(&msg2_frame)?;
+    let (dec2, init_h_pre) = initiator.read_msg2_with_pre_payload_hash(body2)?;
+    assert_eq!(init_h_pre, pre_msg2_hash);
+    let unsealed_hello =
+        unseal_v2_hello_envelope(&reconnect_secret, &rendezvous_nonce, &init_h_pre, &dec2)?;
+    assert_eq!(&*unsealed_hello, host_hello_json.as_bytes());
+
+    let post_msg2_hash = *initiator.get_handshake_hash();
+    assert_eq!(post_msg2_hash, *responder.get_handshake_hash());
+
+    let session_hello = SessionHello {
+        device_id: device_id(&init_static_pub),
+        grant: None,
+        crl_seq: Some(0),
+    };
+    let session_hello_json = serde_json::to_string(&session_hello)?;
+    let msg3_padded_payload = pad_msg3_payload(session_hello_json.as_bytes())?;
+    let msg3_body = initiator.write_message_vec(&msg3_padded_payload)?;
+    let msg3_frame = encode_frame(&msg3_body)?;
+    let (body3, _) = decode_frame(&msg3_frame)?;
+    let dec3 = responder.read_message_vec(body3)?;
+    assert_eq!(unpad_msg3_payload(&dec3)?, session_hello_json.as_bytes());
+
+    let final_hash = *initiator.get_handshake_hash();
+    assert_eq!(final_hash, *responder.get_handshake_hash());
+
+    let mut init_tx = initiator.into_transport_mode()?;
+    let mut resp_tx = responder.into_transport_mode()?;
+    let (exported_reconnect, exported_mailbox) = init_tx.export_v2_secrets(&resp_static_pub);
+    assert_eq!(
+        resp_tx.export_v2_secrets(&resp_static_pub),
+        (exported_reconnect.clone(), exported_mailbox.clone())
+    );
+
+    let policy = PaddingPolicy::v2_default();
+    let padded_data_payload = b"hello-v2-padded".to_vec();
+    let padded_inner = pad_inner_frame(InnerFrameType::Data, &padded_data_payload, &policy)?;
+    let padded_ct = init_tx.write_message_vec(&padded_inner)?;
+    let padded_frame = encode_frame(&padded_ct)?;
+    let (pbody, _) = decode_frame(&padded_frame)?;
+    let dec_padded = resp_tx.read_message_vec(pbody)?;
+    assert_eq!(
+        unpad_inner_frame(&dec_padded)?,
+        (InnerFrameType::Data, padded_data_payload.clone())
+    );
+
+    let cover_bucket_len = 256usize;
+    let cover_inner = encode_dummy_cover_frame(cover_bucket_len)?;
+    let cover_ct = init_tx.write_message_vec(&cover_inner)?;
+    let cover_frame = encode_frame(&cover_ct)?;
+    let (cbody, _) = decode_frame(&cover_frame)?;
+    let dec_cover = resp_tx.read_message_vec(cbody)?;
+    assert!(matches!(
+        decode_v2_inner_frame(&dec_cover, false)?,
+        tendril_core::v2::V2InnerFrame::DummyCover { plaintext_len: 256 }
+    ));
+
+    Ok(V2ReconnectVector {
+        preamble_hex: hex::encode(preamble),
+        initiator_static_scalar_hex: hex::encode(init_static),
+        initiator_static_pub_hex: hex::encode(init_static_pub),
+        initiator_ephem_scalar_hex: hex::encode(init_ephem),
+        initiator_mlkem768_keygen_seed_hex: hex::encode(concat64(&init_d, &init_z)),
+        responder_static_scalar_hex: hex::encode(resp_static),
+        responder_static_pub_hex: hex::encode(resp_static_pub),
+        responder_ephem_scalar_hex: hex::encode(resp_ephem),
+        responder_mlkem768_encaps_seed_hex: hex::encode(resp_m),
+        responder_signing_seed_hex: hex::encode(resp_signing_seed),
+        responder_signing_mldsa_seed_hex: hex::encode(resp_signing_mldsa_seed),
+        responder_signing_pub_hex: hex::encode(resp_signing.public_bytes()),
+        reconnect_secret_hex: hex::encode(reconnect_secret),
+        rendezvous_nonce_hex: hex::encode(rendezvous_nonce),
+        ts_unix,
+        ekem_i_hash_hex: hex::encode(ekem_i_hash),
+        rendezvous_mac_hex: hex::encode(rendezvous_mac),
+        msg1_payload_hex: hex::encode(msg1_payload),
+        msg1_frame_hex: hex::encode(msg1_frame),
+        host_hello_json,
+        bucket_len,
+        hello_seal_key_hex: hex::encode(*hello_seal_key),
+        pre_msg2_handshake_hash_hex: hex::encode(pre_msg2_hash),
+        sealed_hello_envelope_hex: hex::encode(sealed_hello_envelope),
+        msg2_frame_hex: hex::encode(msg2_frame),
+        post_msg2_handshake_hash_hex: hex::encode(post_msg2_hash),
+        session_hello_json,
+        msg3_padded_payload_hex: hex::encode(msg3_padded_payload),
+        msg3_frame_hex: hex::encode(msg3_frame),
+        final_handshake_hash_hex: hex::encode(final_hash),
+        padded_data_payload_hex: hex::encode(padded_data_payload),
+        padded_inner_hex: hex::encode(padded_inner),
+        padded_frame_hex: hex::encode(padded_frame),
+        cover_bucket_len,
+        cover_inner_hex: hex::encode(cover_inner),
+        cover_frame_hex: hex::encode(cover_frame),
+        exported_reconnect_secret_hex: hex::encode(*exported_reconnect),
+        exported_mailbox_secret_hex: hex::encode(*exported_mailbox),
+    })
+}
+
+fn build_v2_pake_vector(preamble: &[u8; 6]) -> Result<V2PakeVector, Box<dyn std::error::Error>> {
+    let code = "TND-4F9K-22XQ-7M3P".to_string();
+    let code_normalized = normalize_code(&code);
+    let channel_salt: [u8; V2_PAKE_SALT_LEN] = [
+        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E,
+        0x6F,
+    ];
+    let params = PakeArgon2Params::production();
+    let master_pake = derive_pake_master(&code, &channel_salt, params)?;
+    let keys = derive_pake_keys(&code, &channel_salt, params)?;
+    let noise_prologue = pake_noise_prologue(&keys.pake_context_tag);
+
+    let init_static = seq_bytes(0x51);
+    let init_static_pub = x25519_public_from_scalar(&init_static);
+    let init_ephem = seq_bytes(0x52);
+    let init_d = seq_bytes(0x53);
+    let init_z = seq_bytes(0x54);
+
+    let resp_static = seq_bytes(0x61);
+    let resp_static_pub = x25519_public_from_scalar(&resp_static);
+    let resp_ephem = seq_bytes(0x62);
+    let resp_m = seq_bytes(0x63);
+    let resp_signing_seed = seq_bytes(0x64);
+    let resp_signing_mldsa_seed = seq_bytes(0x65);
+    let resp_signing = SigningKeypair::from_seeds(resp_signing_seed, resp_signing_mldsa_seed);
+
+    let mut initiator = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(&init_static)
+        .prologue(&noise_prologue)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: init_ephem,
+            mlkem_d: init_d,
+            mlkem_z: init_z,
+            mlkem_m: [0u8; 32],
+        })
+        .build_initiator()?;
+    let mut responder = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(&resp_static)
+        .prologue(&noise_prologue)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: resp_ephem,
+            mlkem_d: [0u8; 32],
+            mlkem_z: [0u8; 32],
+            mlkem_m: resp_m,
+        })
+        .build_responder()?;
+
+    let mut ekem_i_hash = [0u8; 32];
+    let mut init_mac = [0u8; 32];
+    let mut msg1_payload = Vec::new();
+    let msg1_body = initiator.write_msg1_with_payload(|e_i_pub, ek_bytes| {
+        ekem_i_hash = Sha256::digest(ek_bytes).into();
+        init_mac = compute_pake_msg1_mac(
+            &keys.pake_init_key,
+            preamble,
+            e_i_pub,
+            &ekem_i_hash,
+            &channel_salt,
+        );
+        let mut p = Vec::with_capacity(48);
+        p.extend_from_slice(&channel_salt);
+        p.extend_from_slice(&init_mac);
+        msg1_payload = p.clone();
+        Ok(p)
+    })?;
+    let msg1_frame = encode_frame(&msg1_body)?;
+    let (body1, _) = decode_frame(&msg1_frame)?;
+    let dec1 = responder.read_message_vec(body1)?;
+    assert_eq!(&*dec1, msg1_payload.as_slice());
+
+    let host_hello = HostHello {
+        host_id: device_id(&resp_static_pub),
+        proto_version: WIRE_VERSION_V2,
+        signing_pub: resp_signing.public_key().to_b64url(),
+        rotation: vec![],
+    };
+    let host_hello_json = serde_json::to_string(&host_hello)?;
+    let msg2_bucket_len = pake_msg2_bucket_for_hello_len(host_hello_json.len())?;
+
+    let mut pre_msg2_hash = [0u8; 32];
+    let mut sealed_host_hello = Vec::new();
+    let mut resp_confirm_mac = [0u8; 32];
+    let mut msg2_payload = Vec::new();
+    let msg2_body = responder.write_msg2_with_hash(|h_pre| {
+        pre_msg2_hash = *h_pre;
+        sealed_host_hello =
+            seal_pake_host_hello(&keys.pake_hello_key, h_pre, host_hello_json.as_bytes())?;
+        resp_confirm_mac = compute_pake_resp_mac(&keys.pake_confirm_key, h_pre, &sealed_host_hello);
+        let sealed_len = u16::try_from(sealed_host_hello.len()).map_err(|_| {
+            tendril_core::error::CoreError::FrameTooLarge {
+                len: sealed_host_hello.len(),
+                max: MAX_FRAME_LEN,
+            }
+        })?;
+        let mut out = vec![0u8; msg2_bucket_len];
+        out[..2].copy_from_slice(&sealed_len.to_be_bytes());
+        out[2..2 + sealed_host_hello.len()].copy_from_slice(&sealed_host_hello);
+        out[2 + sealed_host_hello.len()..2 + sealed_host_hello.len() + 32]
+            .copy_from_slice(&resp_confirm_mac);
+        msg2_payload = out.clone();
+        Ok(out)
+    })?;
+    let msg2_frame = encode_frame(&msg2_body)?;
+    let (body2, _) = decode_frame(&msg2_frame)?;
+    let (dec2, init_h_pre) = initiator.read_msg2_with_pre_payload_hash(body2)?;
+    assert_eq!(init_h_pre, pre_msg2_hash);
+    assert_eq!(&*dec2, msg2_payload.as_slice());
+    let unsealed = unseal_pake_host_hello(&keys.pake_hello_key, &init_h_pre, &sealed_host_hello)?;
+    assert_eq!(&*unsealed, host_hello_json.as_bytes());
+
+    let post_msg2_hash = *initiator.get_handshake_hash();
+    assert_eq!(post_msg2_hash, *responder.get_handshake_hash());
+    let sas = pairing_sas(&post_msg2_hash);
+
+    let claim = PairClaim {
+        name: "Laptop".to_string(),
+        kind: "linux".to_string(),
+        code_mac: None,
+        enrollment_token: None,
+        signing_pub: None,
+        enroll_proof: None,
+    };
+    let pair_claim_json = serde_json::to_string(&claim)?;
+    let init_confirm_mac = compute_pake_init_mac(
+        &keys.pake_confirm_key,
+        &post_msg2_hash,
+        pair_claim_json.as_bytes(),
+    );
+    let mut msg3_payload = Vec::with_capacity(32 + pair_claim_json.len());
+    msg3_payload.extend_from_slice(&init_confirm_mac);
+    msg3_payload.extend_from_slice(pair_claim_json.as_bytes());
+
+    let msg3_body = initiator.write_message_vec(&msg3_payload)?;
+    let msg3_frame = encode_frame(&msg3_body)?;
+    let (body3, _) = decode_frame(&msg3_frame)?;
+    let dec3 = responder.read_message_vec(body3)?;
+    assert_eq!(&*dec3, msg3_payload.as_slice());
+
+    let final_hash = *initiator.get_handshake_hash();
+    assert_eq!(final_hash, *responder.get_handshake_hash());
+
+    let mut init_tx = initiator.into_transport_mode()?;
+    let mut resp_tx = responder.into_transport_mode()?;
+    let (exported_reconnect, exported_mailbox) = init_tx.export_v2_secrets(&resp_static_pub);
+    assert_eq!(
+        resp_tx.export_v2_secrets(&resp_static_pub),
+        (exported_reconnect.clone(), exported_mailbox.clone())
+    );
+
+    let pair_resp = PairResponse::Success {
+        device_id: device_id(&init_static_pub),
+        status: "pending".to_string(),
+        host_signing_pub: resp_signing.public_key().to_b64url(),
+    };
+    let pair_response_json = serde_json::to_string(&pair_resp)?;
+    let resp_ct = resp_tx.write_message_vec(pair_response_json.as_bytes())?;
+    let pair_response_frame = encode_frame(&resp_ct)?;
+    let (body4, _) = decode_frame(&pair_response_frame)?;
+    let dec4 = init_tx.read_message_vec(body4)?;
+    assert_eq!(&*dec4, pair_response_json.as_bytes());
+
+    Ok(V2PakeVector {
+        preamble_hex: hex::encode(preamble),
+        code,
+        code_normalized,
+        channel_salt_hex: hex::encode(channel_salt),
+        argon2id: Argon2ParamsSpec {
+            t: PAKE_ARGON2_TIME,
+            m_kib: PAKE_ARGON2_MEMORY_KIB,
+            p: PAKE_ARGON2_PARALLELISM,
+            key_len: ARGON2_KEY_LEN,
+            version: "0x13".to_string(),
+        },
+        master_pake_hex: hex::encode(*master_pake),
+        pake_prologue_key_hex: hex::encode(keys.pake_prologue_key),
+        pake_init_key_hex: hex::encode(keys.pake_init_key),
+        pake_hello_key_hex: hex::encode(keys.pake_hello_key),
+        pake_confirm_key_hex: hex::encode(keys.pake_confirm_key),
+        pake_context_tag_hex: hex::encode(keys.pake_context_tag),
+        noise_prologue_hex: hex::encode(noise_prologue),
+        initiator_static_scalar_hex: hex::encode(init_static),
+        initiator_static_pub_hex: hex::encode(init_static_pub),
+        initiator_ephem_scalar_hex: hex::encode(init_ephem),
+        initiator_mlkem768_keygen_seed_hex: hex::encode(concat64(&init_d, &init_z)),
+        responder_static_scalar_hex: hex::encode(resp_static),
+        responder_static_pub_hex: hex::encode(resp_static_pub),
+        responder_ephem_scalar_hex: hex::encode(resp_ephem),
+        responder_mlkem768_encaps_seed_hex: hex::encode(resp_m),
+        responder_signing_seed_hex: hex::encode(resp_signing_seed),
+        responder_signing_mldsa_seed_hex: hex::encode(resp_signing_mldsa_seed),
+        responder_signing_pub_hex: hex::encode(resp_signing.public_bytes()),
+        ekem_i_hash_hex: hex::encode(ekem_i_hash),
+        init_mac_hex: hex::encode(init_mac),
+        msg1_payload_hex: hex::encode(msg1_payload),
+        msg1_frame_hex: hex::encode(msg1_frame),
+        host_hello_json,
+        msg2_bucket_len,
+        pre_msg2_handshake_hash_hex: hex::encode(pre_msg2_hash),
+        sealed_host_hello_hex: hex::encode(sealed_host_hello),
+        resp_confirm_mac_hex: hex::encode(resp_confirm_mac),
+        msg2_payload_hex: hex::encode(msg2_payload),
+        msg2_frame_hex: hex::encode(msg2_frame),
+        post_msg2_handshake_hash_hex: hex::encode(post_msg2_hash),
+        pairing_sas: sas,
+        pair_claim_json,
+        init_confirm_mac_hex: hex::encode(init_confirm_mac),
+        msg3_payload_hex: hex::encode(msg3_payload),
+        msg3_frame_hex: hex::encode(msg3_frame),
+        final_handshake_hash_hex: hex::encode(final_hash),
+        pair_response_json,
+        pair_response_frame_hex: hex::encode(pair_response_frame),
+        exported_reconnect_secret_hex: hex::encode(*exported_reconnect),
+        exported_mailbox_secret_hex: hex::encode(*exported_mailbox),
     })
 }

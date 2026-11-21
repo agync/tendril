@@ -11,6 +11,7 @@ use crate::crypto::{
     b64url_encode, hkdf_sha256_32, is_valid_x25519_public_key,
 };
 use crate::error::CoreError;
+use crate::relay_auth::{RelayAuthRole, RelayTicket};
 use zeroize::Zeroizing;
 
 /// 15-byte domain separator prefix for binary `RotationRecord` signatures.
@@ -198,6 +199,25 @@ impl EndpointIdentity {
         self.signing_key = new_signing;
         self.rotation_seq = next_seq;
         Ok(rec)
+    }
+
+    /// Mints a signed stateless [`RelayTicket`] using this identity's Ed25519 signing key.
+    pub fn mint_relay_ticket(
+        &self,
+        relay_host: &str,
+        role: RelayAuthRole,
+        target_pub: &str,
+        now_unix: u64,
+        ttl_secs: u64,
+    ) -> Result<RelayTicket, CoreError> {
+        crate::relay_auth::mint_relay_ticket(
+            &self.signing_key.ed25519_signing_key(),
+            relay_host,
+            role,
+            target_pub,
+            now_unix,
+            ttl_secs,
+        )
     }
 }
 

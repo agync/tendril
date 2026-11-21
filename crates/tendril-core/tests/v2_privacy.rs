@@ -1905,3 +1905,52 @@ fn initiator_v2_grant_revocation_post_rekey_crl_and_roster_rollback_and_pairing_
         Err(CoreError::PeerRevoked(_))
     ));
 }
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn pake_responder_pads_to_fixed_argon2_pass_floor() {
+    use tendril_core::v2::V2_PAKE_FIXED_ARGON2_PASSES;
+
+    assert_eq!(V2_PAKE_FIXED_ARGON2_PASSES, 4);
+    let (host, cli) = test_identities();
+    let now_unix = 1_795_132_800;
+    let params = PakeArgon2Params::for_testing_only();
+
+    for live_count in 0..=4usize {
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let mut last_code = "TND-AAAA-BBBB-CCCC".to_string();
+        for idx in 0..live_count {
+            let mut entropy = [0x10u8; 32];
+            entropy[0] = (idx as u8) + 1;
+            last_code = mgr
+                .issue_code_with_entropy(PairingCodeKind::Remote3Group, now_unix, &entropy)
+                .unwrap();
+        }
+        let mut host_roster = Roster::new();
+        let mut init =
+            V2PakePairInitiator::new(&cli, "Dev", "cli", &last_code, None, params).unwrap();
+        let mut resp = V2PakePairResponder::new(&host, PairingPathKind::Remote, params).unwrap();
+
+        let m1 = collect_v2_pair_bytes(&init.start().unwrap());
+        let m2 = collect_v2_pair_bytes(
+            &resp
+                .feed_bytes(&m1, now_unix + 1, &mut mgr, &mut host_roster)
+                .unwrap(),
+        );
+        if live_count == 0 {
+            assert_eq!(init.feed_bytes(&m2), Err(CoreError::PairingAuthFailed));
+        } else {
+            let m3 = collect_v2_pair_bytes(&init.feed_bytes(&m2).unwrap());
+            let m4 = collect_v2_pair_bytes(
+                &resp
+                    .feed_bytes(&m3, now_unix + 2, &mut mgr, &mut host_roster)
+                    .unwrap(),
+            );
+            let actions = init.feed_bytes(&m4).unwrap();
+            assert!(actions.iter().any(|a| matches!(
+                a,
+                V2PairAction::Completed(V2PairOutcome::InitiatorPending { .. })
+            )));
+        }
+    }
+}

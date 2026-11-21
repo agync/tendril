@@ -78,6 +78,9 @@ pub const PAKE_ARGON2_TIME: u32 = 2;
 /// Production Argon2id lane count for v2 PAKE key derivation.
 pub const PAKE_ARGON2_PARALLELISM: u32 = 1;
 
+/// Fixed minimum number of `Argon2id` derivations run on v2 PAKE `msg1` to prevent live-code count timing leaks.
+pub const V2_PAKE_FIXED_ARGON2_PASSES: usize = 4;
+
 /// Default keepalive base interval (`25` seconds) for [`ScheduleJitterPolicy`].
 pub const DEFAULT_PING_INTERVAL_MS: u64 = 25_000;
 
@@ -587,6 +590,45 @@ fn relay_accept_bytes(
     out.extend_from_slice(conn_id);
     out.extend_from_slice(&epoch.to_be_bytes());
     out
+}
+
+/// Builds the exact signed byte string for `/v2/relay` `register`.
+pub fn v2_relay_register_signed_bytes(
+    relay_host: &str,
+    challenge_nonce: &[u8; 32],
+    epoch: u64,
+) -> Result<Vec<u8>, CoreError> {
+    let host = canonical_relay_host(relay_host)?;
+    Ok(relay_register_bytes(&host, challenge_nonce, epoch))
+}
+
+/// Builds the exact HMAC input byte string for `/v2/relay` `dial`.
+pub fn v2_relay_dial_signed_bytes(
+    relay_host: &str,
+    challenge_nonce: &[u8; 32],
+    mailbox_id: &[u8; 32],
+    conn_id: &[u8; 16],
+    epoch: u64,
+) -> Result<Vec<u8>, CoreError> {
+    let host = canonical_relay_host(relay_host)?;
+    Ok(relay_dial_bytes(
+        &host,
+        challenge_nonce,
+        mailbox_id,
+        conn_id,
+        epoch,
+    ))
+}
+
+/// Builds the exact signed byte string for `/v2/relay` `accept`.
+pub fn v2_relay_accept_signed_bytes(
+    relay_host: &str,
+    challenge_nonce: &[u8; 32],
+    conn_id: &[u8; 16],
+    epoch: u64,
+) -> Result<Vec<u8>, CoreError> {
+    let host = canonical_relay_host(relay_host)?;
+    Ok(relay_accept_bytes(&host, challenge_nonce, conn_id, epoch))
 }
 
 /// Signs a `/v2/relay` `register` challenge proof using the epoch Ed25519 mailbox key.
@@ -1586,7 +1628,8 @@ impl RendezvousReplayCache {
     }
 }
 
-fn select_handshake_bucket(needed: usize) -> Result<usize, CoreError> {
+/// Selects the smallest `V2_HANDSHAKE_BUCKETS` size that accommodates `needed` bytes.
+pub fn select_handshake_bucket(needed: usize) -> Result<usize, CoreError> {
     V2_HANDSHAKE_BUCKETS
         .iter()
         .copied()
@@ -1597,7 +1640,8 @@ fn select_handshake_bucket(needed: usize) -> Result<usize, CoreError> {
         })
 }
 
-fn seal_v2_hello_envelope(
+/// Seals `host_hello_json` into a padded ChaCha20-Poly1305 envelope for v2 `msg2`.
+pub fn seal_v2_hello_envelope(
     reconnect_secret: &[u8; 32],
     rendezvous_nonce: &[u8; 16],
     h_pre: &[u8; 32],
@@ -1624,7 +1668,8 @@ fn seal_v2_hello_envelope(
     Ok(buf)
 }
 
-fn unseal_v2_hello_envelope(
+/// Unseals and constant-time-padding-checks a v2 `msg2` `HostHello` envelope.
+pub fn unseal_v2_hello_envelope(
     reconnect_secret: &[u8; 32],
     rendezvous_nonce: &[u8; 16],
     h_pre: &[u8; 32],
@@ -1661,7 +1706,8 @@ fn unseal_v2_hello_envelope(
     Ok(Zeroizing::new(pt[2..2 + json_len].to_vec()))
 }
 
-fn pad_msg3_payload(json: &[u8]) -> Result<Vec<u8>, CoreError> {
+/// Pads a v2 `msg3` `SessionHello` JSON payload into the smallest `V2_MSG3_BUCKETS` bucket.
+pub fn pad_msg3_payload(json: &[u8]) -> Result<Vec<u8>, CoreError> {
     let needed = 2 + json.len();
     let bucket = V2_MSG3_BUCKETS
         .iter()
@@ -1681,7 +1727,8 @@ fn pad_msg3_payload(json: &[u8]) -> Result<Vec<u8>, CoreError> {
     Ok(out)
 }
 
-fn unpad_msg3_payload(padded: &[u8]) -> Result<&[u8], CoreError> {
+/// Unpads a v2 `msg3` `SessionHello` payload, enforcing zero padding in constant time.
+pub fn unpad_msg3_payload(padded: &[u8]) -> Result<&[u8], CoreError> {
     if padded.len() < 2 {
         return Err(CoreError::ProtocolViolation("truncated v2 msg3 payload"));
     }
@@ -3191,6 +3238,20 @@ fn validate_pake_params(params: PakeArgon2Params) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Derives the 32-byte `Argon2id` `master_pake` key from normalized `code` and 16-byte `channel_salt`.
+///
+/// In production builds (without `test-utils`), rejects `params` below `PAKE_ARGON2_MEMORY_KIB`,
+/// `PAKE_ARGON2_TIME`, and `PAKE_ARGON2_PARALLELISM`.
+pub fn derive_pake_master(
+    code: &str,
+    channel_salt: &[u8; V2_PAKE_SALT_LEN],
+    params: PakeArgon2Params,
+) -> Result<Zeroizing<[u8; ARGON2_KEY_LEN]>, CoreError> {
+    validate_pake_params(params)?;
+    let normalized = Zeroizing::new(normalize_code(code));
+    derive_pake_master_from_bytes(normalized.as_bytes(), channel_salt, params)
+}
+
 /// Derives PAKE subkeys from normalized `code` and 16-byte `channel_salt`.
 ///
 /// In production builds (without `test-utils`), rejects `params` below `PAKE_ARGON2_MEMORY_KIB`,
@@ -3205,11 +3266,11 @@ pub fn derive_pake_keys(
     derive_pake_keys_from_bytes(normalized.as_bytes(), channel_salt, params)
 }
 
-fn derive_pake_keys_from_bytes(
+fn derive_pake_master_from_bytes(
     password_bytes: &[u8],
     channel_salt: &[u8; V2_PAKE_SALT_LEN],
     params: PakeArgon2Params,
-) -> Result<PakeKeys, CoreError> {
+) -> Result<Zeroizing<[u8; ARGON2_KEY_LEN]>, CoreError> {
     let argon_params = Params::new(
         params.memory_kib,
         params.time_cost,
@@ -3222,6 +3283,15 @@ fn derive_pake_keys_from_bytes(
     argon2
         .hash_password_into(password_bytes, channel_salt, &mut *master)
         .map_err(|err| CoreError::Argon2(err.to_string()))?;
+    Ok(master)
+}
+
+fn derive_pake_keys_from_bytes(
+    password_bytes: &[u8],
+    channel_salt: &[u8; V2_PAKE_SALT_LEN],
+    params: PakeArgon2Params,
+) -> Result<PakeKeys, CoreError> {
+    let master = derive_pake_master_from_bytes(password_bytes, channel_salt, params)?;
 
     let pake_prologue_key = hkdf_sha256_32(&*master, channel_salt, PAKE_PROLOGUE_INFO);
     let pake_init_key = hkdf_sha256_32(&*master, channel_salt, PAKE_INIT_KEY_INFO);
@@ -3238,7 +3308,9 @@ fn derive_pake_keys_from_bytes(
     })
 }
 
-fn pake_noise_prologue(pake_context_tag: &[u8; 32]) -> [u8; PREAMBLE_LEN + 32] {
+/// Builds the 38-byte PAKE Noise prologue `preamble (6 B) || pake_context_tag (32 B)`.
+#[must_use]
+pub fn pake_noise_prologue(pake_context_tag: &[u8; 32]) -> [u8; PREAMBLE_LEN + 32] {
     let pre = Preamble::v2_pake_pair().encode();
     let mut out = [0u8; PREAMBLE_LEN + 32];
     out[..PREAMBLE_LEN].copy_from_slice(&pre);
@@ -3246,7 +3318,9 @@ fn pake_noise_prologue(pake_context_tag: &[u8; 32]) -> [u8; PREAMBLE_LEN + 32] {
     out
 }
 
-fn compute_pake_msg1_mac(
+/// Computes the 32-byte `HMAC-SHA256` initiator `msg1` PAKE tag.
+#[must_use]
+pub fn compute_pake_msg1_mac(
     pake_init_key: &[u8; 32],
     preamble: &[u8; PREAMBLE_LEN],
     e_i_pub: &[u8; 32],
@@ -3263,7 +3337,9 @@ fn compute_pake_msg1_mac(
     mac.finalize().into_bytes().into()
 }
 
-fn compute_pake_resp_mac(
+/// Computes the 32-byte `HMAC-SHA256` responder `msg2` PAKE confirmation tag.
+#[must_use]
+pub fn compute_pake_resp_mac(
     pake_confirm_key: &[u8; 32],
     h_pre: &[u8; 32],
     sealed_hello: &[u8],
@@ -3276,7 +3352,9 @@ fn compute_pake_resp_mac(
     mac.finalize().into_bytes().into()
 }
 
-fn compute_pake_init_mac(
+/// Computes the 32-byte `HMAC-SHA256` initiator `msg3` PAKE confirmation tag.
+#[must_use]
+pub fn compute_pake_init_mac(
     pake_confirm_key: &[u8; 32],
     post_msg2_hash: &[u8; 32],
     claim_json: &[u8],
@@ -3289,7 +3367,8 @@ fn compute_pake_init_mac(
     mac.finalize().into_bytes().into()
 }
 
-fn seal_pake_host_hello(
+/// Seals `hello_json` with `ChaCha20Poly1305` under `pake_hello_key` and `aad = h_pre`.
+pub fn seal_pake_host_hello(
     pake_hello_key: &[u8; 32],
     h_pre: &[u8; 32],
     hello_json: &[u8],
@@ -3304,7 +3383,8 @@ fn seal_pake_host_hello(
     Ok(buf)
 }
 
-fn unseal_pake_host_hello(
+/// Unseals a PAKE `msg2` `sealed_host_hello` under `pake_hello_key` and `aad = h_pre`.
+pub fn unseal_pake_host_hello(
     pake_hello_key: &[u8; 32],
     h_pre: &[u8; 32],
     sealed: &[u8],
@@ -3318,7 +3398,8 @@ fn unseal_pake_host_hello(
     Ok(buf)
 }
 
-fn pake_msg2_bucket_for_hello_len(hello_json_len: usize) -> Result<usize, CoreError> {
+/// Selects the `V2_HANDSHAKE_BUCKETS` length for a PAKE `msg2` carrying `hello_json_len` bytes.
+pub fn pake_msg2_bucket_for_hello_len(hello_json_len: usize) -> Result<usize, CoreError> {
     // 2 B sealed_len + hello_json_len + 16 B tag + 32 B resp_mac
     select_handshake_bucket(2 + hello_json_len + AEAD_TAG_LEN + 32)
 }
@@ -3945,26 +4026,28 @@ impl V2PakePairResponder {
                 let msg1_cache_ok = manager.can_accept_pake_msg1(&salt, &candidate_mac, now_unix);
                 let live_codes = manager.live_codes(now_unix);
                 let mut matched: Option<(PakeKeys, Zeroizing<String>)> = None;
-                if live_codes.is_empty() {
+                let mut passes_run: usize = 0;
+                for (code, _) in live_codes {
+                    let candidate_keys = derive_pake_keys(&code, &salt, self.params)?;
+                    passes_run += 1;
+                    let expected_mac = compute_pake_msg1_mac(
+                        &candidate_keys.pake_init_key,
+                        &pre,
+                        &e_i_pub,
+                        &ek_hash,
+                        &salt,
+                    );
+                    if bool::from(expected_mac.ct_eq(&candidate_mac))
+                        && msg1_cache_ok
+                        && matched.is_none()
+                    {
+                        matched = Some((candidate_keys, code));
+                    }
+                }
+                while passes_run < V2_PAKE_FIXED_ARGON2_PASSES {
                     let dummy_secret = Zeroizing::new(random_bytes::<32>()?);
                     let _ = derive_pake_keys_from_bytes(&*dummy_secret, &salt, self.params)?;
-                } else {
-                    for (code, _) in live_codes {
-                        let candidate_keys = derive_pake_keys(&code, &salt, self.params)?;
-                        let expected_mac = compute_pake_msg1_mac(
-                            &candidate_keys.pake_init_key,
-                            &pre,
-                            &e_i_pub,
-                            &ek_hash,
-                            &salt,
-                        );
-                        if bool::from(expected_mac.ct_eq(&candidate_mac))
-                            && msg1_cache_ok
-                            && matched.is_none()
-                        {
-                            matched = Some((candidate_keys, code));
-                        }
-                    }
+                    passes_run += 1;
                 }
 
                 let authenticated_match = match matched {

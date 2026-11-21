@@ -24,7 +24,7 @@ use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::roster::{AnchorState, Roster};
 use crate::wire::{
     HostHello, Intent, PairClaim, PairResponse, Preamble, ResumableFrameReader, WIRE_VERSION,
-    encode_frame,
+    WIRE_VERSION_V2, encode_frame,
 };
 
 /// Default lifetime of a newly issued pairing code (`15` minutes).
@@ -1280,6 +1280,8 @@ pub struct PairingInitiator {
     device_kind: String,
     local_static_pub: [u8; 32],
     pinned_host: Option<PinnedHost>,
+    v2_floored_static_pubs: BTreeSet<[u8; 32]>,
+    v2_floored_host_ids: BTreeSet<String>,
 }
 
 impl fmt::Debug for PairingInitiator {
@@ -1341,6 +1343,8 @@ impl PairingInitiator {
             device_kind: device_kind.into(),
             local_static_pub: *identity.static_key().public_bytes(),
             pinned_host,
+            v2_floored_static_pubs: BTreeSet::new(),
+            v2_floored_host_ids: BTreeSet::new(),
         })
     }
 
@@ -1415,6 +1419,8 @@ impl PairingInitiator {
             device_kind,
             local_static_pub: *identity.static_key().public_bytes(),
             pinned_host: Some(pinned_host),
+            v2_floored_static_pubs: BTreeSet::new(),
+            v2_floored_host_ids: BTreeSet::new(),
         })
     }
 
@@ -1455,6 +1461,19 @@ impl PairingInitiator {
             });
         }
         Ok(self)
+    }
+
+    /// Collects every peer in `roster` with `min_wire_version >= 2` so unpinned v1 pairing
+    /// aborts at `msg2` before transmitting `PairClaim`.
+    #[must_use]
+    pub fn with_roster_floors(mut self, roster: &Roster) -> Self {
+        for (id, entry) in roster.entries() {
+            if entry.min_wire_version >= WIRE_VERSION_V2 {
+                self.v2_floored_host_ids.insert(id.clone());
+                self.v2_floored_static_pubs.insert(entry.static_pub);
+            }
+        }
+        self
     }
 
     /// Emits the 6-byte `Intent::Pair` preamble concatenated with Noise `msg1`.
@@ -1535,6 +1554,15 @@ impl PairingInitiator {
                 )?;
                 if !is_valid_x25519_public_key(&remote_static) {
                     return Err(CoreError::HostKeyUnverified);
+                }
+
+                if self.v2_floored_static_pubs.contains(&remote_static)
+                    || self.v2_floored_host_ids.contains(&host_hello.host_id)
+                {
+                    return Err(CoreError::VersionDowngrade {
+                        peer_min: WIRE_VERSION_V2,
+                        negotiated: WIRE_VERSION,
+                    });
                 }
 
                 let mut verified_seq = None;
@@ -2424,5 +2452,69 @@ mod tests {
                 ..
             } if host_signing_pub == host_id.signing_key().public_key()
         ));
+    }
+
+    #[test]
+    fn unpinned_v1_initiator_with_roster_floors_aborts_at_msg2_before_pair_claim() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+
+        let host_id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x71; 32]),
+            SigningKeypair::from_seed([0x72; 32]),
+        )
+        .with_host_id("floored-v2-host");
+        let dev_id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x81; 32]),
+            SigningKeypair::from_seed([0x82; 32]),
+        );
+
+        let mut client_roster = Roster::new();
+        client_roster
+            .insert_pinned_host(
+                host_id.host_id().to_string(),
+                "Floored Host".to_string(),
+                *host_id.static_key().public_bytes(),
+                Some(host_id.signing_key().public_key().clone()),
+                host_id.rotation_seq(),
+                vec![],
+            )
+            .unwrap();
+        client_roster
+            .set_peer_min_wire_version(host_id.host_id(), WIRE_VERSION_V2)
+            .unwrap();
+
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr
+            .issue_code_with_entropy(PairingCodeKind::Lan2Group, 1000, &[0x33; 32])
+            .unwrap();
+        let mut host_roster = Roster::new();
+
+        let mut init = PairingInitiator::new(&dev_id, "Dev", "cli", &code, None, None)
+            .unwrap()
+            .with_roster_floors(&client_roster);
+        let mut resp = PairingResponder::new(&host_id, PairingPathKind::Lan, None).unwrap();
+
+        let msg1 = match &init.start().unwrap()[0] {
+            PairAction::WriteBytes(b) => b.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        let msg2 = match &resp
+            .feed_bytes(&msg1, 1001, &mut mgr, &mut host_roster)
+            .unwrap()[0]
+        {
+            PairAction::WriteBytes(b) => b.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let err = init.feed_bytes(&msg2).unwrap_err();
+        assert_eq!(
+            err,
+            CoreError::VersionDowngrade {
+                peer_min: WIRE_VERSION_V2,
+                negotiated: WIRE_VERSION,
+            }
+        );
+        // Responder did not burn the code because msg3 PairClaim was never sent.
+        assert_eq!(mgr.live_code_count(1001), 1);
     }
 }

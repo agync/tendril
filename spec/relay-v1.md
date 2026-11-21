@@ -27,7 +27,8 @@ Upon opening `/v1/relay`, the server sends one JSON text frame (`challenge`) bin
   "op": "challenge",
   "nonce": string,        // b64url 32-byte CSPRNG challenge nonce
   "host": string,         // canonical relay host name bound into signatures
-  "max_frame": 65521      // maximum allowed binary frame byte length
+  "max_frame": 65521,     // maximum allowed binary frame byte length
+  "auth_required"?: string[] // optional: ["register"] or ["register", "dial"]; omitted when open
 }
 ```
 
@@ -40,7 +41,8 @@ A listening peer registers its 32-byte Ed25519 signing public key as a mailbox a
 {
   "op": "register",
   "pub": string,          // b64url 32-byte Ed25519 signing public key
-  "sig": string           // b64url 64-byte strict Ed25519 signature
+  "sig": string,          // b64url 64-byte strict Ed25519 signature
+  "auth"?: RelayAuthProof // optional stateless admission proof (required when challenge advertises "register")
 }
 ```
 
@@ -67,7 +69,8 @@ A dialing peer initiates a stream toward a target mailbox key:
 {
   "op": "dial",
   "target_pub": string,   // b64url 32-byte Ed25519 mailbox key
-  "conn_id": string       // b64url 16-byte unique stream identifier
+  "conn_id": string,      // b64url 16-byte unique stream identifier
+  "auth"?: RelayAuthProof // optional stateless admission proof (required when challenge advertises "dial")
 }
 ```
 
@@ -91,7 +94,8 @@ To claim a pending `conn_id`, the listener opens a fresh `/v1/relay` WebSocket c
   "op": "accept",
   "pub": string,          // b64url 32-byte Ed25519 mailbox key (MUST match dial.target_pub)
   "conn_id": string,      // b64url 16-byte pending stream identifier
-  "sig": string           // b64url 64-byte strict Ed25519 signature
+  "sig": string,          // b64url 64-byte strict Ed25519 signature
+  "auth"?: RelayAuthProof // optional stateless admission proof (required when admission covers "register")
 }
 ```
 
@@ -121,6 +125,61 @@ Before entering binary forwarding mode, control errors return one JSON text fram
 ```
 
 Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"capacity_exceeded"`, `"invalid_request"`, `"timeout"`.
+
+### 2.5 Stateless Admission Tiers 1-3 and Option 1A Scoping
+
+Relays MAY enforce admission control without maintaining user accounts or per-session databases across three composable tiers:
+
+1. **Tier 1 (Static Mailbox Allowlist):** The relay holds an explicit set of permitted 32-byte Ed25519 mailbox keys (`pub`) for `register` (and `accept`).
+2. **Tier 2 (Shared HMAC Secret):** Clients present `auth` with `"kind": "hmac"` proven under a shared secret (`1..=4096` bytes, `MAX_RELAY_AUTH_SECRET_BYTES = 4096`):
+   ```jsonc
+   { "kind": "hmac", "mac": string } // b64url 32-byte HMAC-SHA256
+   ```
+   HMAC-SHA256 input (`87 + len(op) + len(canonical_host)` bytes):
+   ```text
+   domain_prefix (22 B) = ASCII "tendril-relay-auth-v1\0"
+   op            (var)  = ASCII "register" | "dial" | "accept"
+   separator     ( 1 B) = 0x00
+   host_utf8     (var)  = UTF-8(canonical(challenge.host))
+   nonce         (32 B) = raw 32-byte decoded challenge.nonce
+   pub_or_target (32 B) = raw 32-byte pub (register/accept) or target_pub (dial)
+   ```
+   Relays MUST verify `mac` in constant time (`subtle::ConstantTimeEq`).
+3. **Tier 3 (Stateless Ed25519 Signed `RelayTicket`):** Clients present `auth` with `"kind": "ticket"` carrying a JCS-canonical Ed25519 capability ticket signed by a key in the relay's `trusted_issuers` list:
+   ```jsonc
+   {
+     "kind": "ticket",
+     "ticket": {
+       "v": 1,
+       "issuer_pub": string,  // b64url 32-byte Ed25519 issuer key
+       "relay_host": string,  // canonical relay host
+       "role": "register" | "dial" | "any",
+       "target_pub": string,  // "*" or b64url 32-byte Ed25519 key
+       "not_before": uint64,  // Unix seconds
+       "not_after": uint64,   // Unix seconds
+       "sig": string          // b64url 64-byte strict Ed25519 signature
+     }
+   }
+   ```
+   Signed byte input:
+   ```text
+   "tendril-relay-ticket-v1\0" (24 B) || RFC8785_JCS(ticket without "sig")
+   ```
+   Ticket verification MUST enforce all of:
+   - `v == 1`, `not_before < not_after`, and `not_after - not_before <= 86400` (`1..=86400 s` TTL).
+   - Clock check with `+-30 s` skew tolerance: `now_unix + 30 >= not_before` and `now_unix <= not_after + 30`.
+   - `canonical(ticket.relay_host) == canonical(relay_expected_host)` via `canonical_relay_host` (lowercase ASCII, trailing dot stripped, no `:port`, path, userinfo, or control chars).
+   - Role matching: `register` and `accept` require `role in {"register", "any"}`; `dial` requires `role in {"dial", "any"}`.
+   - Target binding: `ticket.target_pub == "*"` OR decoded 32-byte key equals `pub` (`register`/`accept`) or `target_pub` (`dial`) in constant time (a `dial` ticket with a concrete key authorizes ONLY that target key).
+   - Issuer trust: `trusted_issuers` MUST be non-empty and contain decoded `issuer_pub` (constant-time match), verified with strict Ed25519 (`verify_strict`).
+   - Unknown JSON fields inside `auth` or `ticket` MUST be rejected (`deny_unknown_fields`).
+
+**Option 1A Admission Scoping (`auth_scope`):**
+
+- `auth_scope = "all"` (default whenever a shared HMAC secret or trusted ticket issuers are configured): requires valid admission proof on `register`, `accept`, AND `dial`. `challenge.auth_required` MUST be `["register", "dial"]`.
+- `auth_scope = "register-only"` (default when ONLY a Tier 1 mailbox allowlist is configured, or explicitly configured for Tier 2/3 when open dialing is desired): requires admission on `register` (and `accept` when Tier 2/3 is active); `dial` does not require `auth`. `challenge.auth_required` MUST be `["register"]`.
+- When no admission controls are configured (open relay), `auth_required` is omitted from `challenge`.
+- **Zero Mailbox Presence Leak on `dial`:** Whenever `auth_scope` covers `dial` (`"all"`), the relay MUST validate `dial.auth` BEFORE looking up `target_pub` in the active mailbox table. Any missing or invalid proof MUST fail closed immediately with `{ "op": "error", "code": "unauthorized" }` so unauthenticated callers cannot probe whether a mailbox is currently online (`"offline"` vs `"unauthorized"`).
 
 ---
 

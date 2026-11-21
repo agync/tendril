@@ -61,7 +61,8 @@ Upon opening `/v2/relay`, the server sends one JSON text frame (`challenge`) bin
   "nonce": string,        // b64url 32-byte CSPRNG challenge nonce
   "host": string,         // canonical relay host name bound into proofs
   "epoch": uint64,        // current relay server epoch (unix_secs / 3600)
-  "max_frame": 65521      // maximum allowed binary frame byte length
+  "max_frame": 65521,     // maximum allowed binary frame byte length
+  "auth_required"?: string[] // optional: ["register"] or ["register", "dial"]; omitted when open
 }
 ```
 
@@ -77,7 +78,8 @@ A listening peer registers an ephemeral `mailbox_id` for `epoch` by sending one 
   "op": "register",
   "mailbox_id": string,   // b64url 32-byte per-epoch Ed25519 public key
   "epoch": uint64,        // epoch index covered by this mailbox_id
-  "sig": string           // b64url 64-byte strict Ed25519 signature under mailbox_sk
+  "sig": string,          // b64url 64-byte strict Ed25519 signature under mailbox_sk
+  "auth"?: RelayAuthProof // optional stateless admission proof (required when challenge advertises "register")
 }
 ```
 
@@ -121,7 +123,8 @@ The dialer sends:
   "target_mailbox_id": string,  // b64url 32-byte epoch Ed25519 mailbox key
   "epoch": uint64,              // epoch index used to derive target_mailbox_id
   "conn_id": string,            // b64url 16-byte unique stream identifier
-  "dial_token": string          // b64url 32-byte HMAC-SHA256 capability proof
+  "dial_token": string,         // b64url 32-byte HMAC-SHA256 capability proof
+  "auth"?: RelayAuthProof       // optional stateless admission proof (required when challenge advertises "dial")
 }
 ```
 
@@ -155,7 +158,8 @@ To claim a verified pending `conn_id`, the listener opens a fresh `/v2/relay` We
   "mailbox_id": string,   // b64url 32-byte epoch mailbox key (MUST match dial.target_mailbox_id)
   "epoch": uint64,        // epoch index (MUST match dial.epoch)
   "conn_id": string,      // b64url 16-byte pending stream identifier
-  "sig": string           // b64url 64-byte strict Ed25519 signature under mailbox_sk
+  "sig": string,          // b64url 64-byte strict Ed25519 signature under mailbox_sk
+  "auth"?: RelayAuthProof // optional stateless admission proof (required when admission covers "register")
 }
 ```
 
@@ -184,6 +188,19 @@ Control errors prior to binary bridge mode return one JSON text frame and close 
 ```
 
 Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"capacity_exceeded"`, `"invalid_request"`, `"timeout"`.
+
+### 3.5 Stateless Admission Tiers 1-3 and Option 1A Scoping on `/v2/relay`
+
+`/v2/relay` uses the same `RelayAuthProof` (`hmac` and `ticket`), canonical `relay_host` verification, strict `RelayTicket` bounds (`v = 1`, `1..=86400 s` TTL, `+-30 s` skew, RFC 8785 JCS `"tendril-relay-ticket-v1\0"`), and Option 1A `auth_scope` rules defined in `spec/relay-v1.md` Section 2.5, with the following `/v2/relay` bindings:
+
+- **Bound 32-byte key (`pub_or_target` / concrete `target_pub`):**
+  - On `register` (`op = "register"`, ticket `required_op = "register"`): binds to the 32-byte decoded `mailbox_id`.
+  - On `dial` (`op = "dial"`, ticket `required_op = "dial"`): binds to the 32-byte decoded `target_mailbox_id`.
+  - On `accept` (`op = "accept"`, ticket `required_op = "register"`): binds to the 32-byte decoded `mailbox_id`.
+- **Epoch unlinkability with Tiers 1-3:**
+  - Tier 1 static mailbox allowlists match concrete epoch `mailbox_id` keys and therefore only apply when explicitly configured per epoch (default `auth_scope = "register-only"` when only an allowlist is configured).
+  - Tier 2 (shared HMAC secret, `1..=4096` bytes) and Tier 3 (Ed25519 `RelayTicket` with `target_pub = "*"` or epoch `mailbox_id`) operate statelessly without per-epoch relay configuration or long-term client identity disclosure. Both default to Option 1A `auth_scope = "all"` (`challenge.auth_required = ["register", "dial"]`).
+- **Zero Mailbox Presence Leak on `dial`:** When `auth_scope` covers `dial` (`"all"`), the relay MUST verify `dial.auth` BEFORE checking whether `target_mailbox_id` is registered or online. Missing or invalid `dial.auth` MUST return `{ "op": "error", "code": "unauthorized" }` and close the socket without revealing mailbox presence.
 
 ---
 

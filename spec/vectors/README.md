@@ -12,6 +12,7 @@ Noise_XXhfs (hybrid X25519 + ML-KEM-768) handshake transcripts.
 - `grants.json`: JCS canonical grant signing (hybrid Ed25519 + ML-DSA-65), valid delegation, invalid widened delegation, and `RevocationList`
 - `handshake.json`: full deterministic `pair` and `session` `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` transcripts including `0x04 REKEY`
 - `m2m_enrollment.json`: signed M2M `pair.enroll` token, 3373-byte hybrid `enroll_proof`, `PairClaim`, and replay rejection vectors
+- `wire_v2.json`: Wire v2 preambles, blinded `/v2/relay` hourly epoch tokens, Tier 2 HMAC & Tier 3 Ed25519 JCS `RelayTicket` admission, pseudonymous v2 reconnect (`0x09 PADDED` / `0x08 PADDING`), and hybrid `Argon2id` PAKE + `ML-KEM-768` pairing vectors
 - `verify_go/`: independent Go test suite reproducing every vector byte-for-byte (`crypto/mlkem` + `circl/mldsa65`)
 
 ## Commands

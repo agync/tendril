@@ -3,6 +3,7 @@ package verify_go_test
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/mlkem"
 	"crypto/mlkem/mlkemtest"
@@ -322,6 +323,98 @@ func (hs *hfsHandshake) readMsg2(msg []byte) ([]byte, error) {
 	}
 	hs.mixKey(es)
 	return hs.decryptAndHash(msg[pos:])
+}
+
+func (hs *hfsHandshake) writeMsg2WithHash(buildPayload func(hPre []byte) ([]byte, error)) ([]byte, error) {
+	ePub, err := curve25519.X25519(hs.ephem, curve25519.Basepoint)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixHash(ePub)
+	ee, err := curve25519.X25519(hs.ephem, hs.re)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixKey(ee)
+	ss, ct, err := mlkemtest.Encapsulate768(hs.remoteEk, hs.mlkemSeed)
+	if err != nil {
+		return nil, err
+	}
+	ctEnc, err := hs.encryptAndHash(ct)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixKey(ss)
+	sEnc, err := hs.encryptAndHash(hs.localPub)
+	if err != nil {
+		return nil, err
+	}
+	es, err := curve25519.X25519(hs.localStatic, hs.re)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixKey(es)
+	hPre := make([]byte, 32)
+	copy(hPre, hs.h[:])
+	payload, err := buildPayload(hPre)
+	if err != nil {
+		return nil, err
+	}
+	payloadEnc, err := hs.encryptAndHash(payload)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(ePub)+len(ctEnc)+len(sEnc)+len(payloadEnc))
+	out = append(out, ePub...)
+	out = append(out, ctEnc...)
+	out = append(out, sEnc...)
+	out = append(out, payloadEnc...)
+	return out, nil
+}
+
+func (hs *hfsHandshake) readMsg2WithPreHash(msg []byte) ([]byte, []byte, error) {
+	const encCTLen = mlkem.CiphertextSize768 + 16
+	const encStaticLen = 32 + 16
+	if len(msg) < 32+encCTLen+encStaticLen+16 {
+		return nil, nil, fmt.Errorf("short msg2: %d", len(msg))
+	}
+	pos := 0
+	hs.re = msg[pos : pos+32]
+	pos += 32
+	hs.mixHash(hs.re)
+	ee, err := curve25519.X25519(hs.ephem, hs.re)
+	if err != nil {
+		return nil, nil, err
+	}
+	hs.mixKey(ee)
+	ctBytes, err := hs.decryptAndHash(msg[pos : pos+encCTLen])
+	pos += encCTLen
+	if err != nil {
+		return nil, nil, err
+	}
+	ss, err := hs.dk.Decapsulate(ctBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	hs.mixKey(ss)
+	rs, err := hs.decryptAndHash(msg[pos : pos+encStaticLen])
+	pos += encStaticLen
+	if err != nil {
+		return nil, nil, err
+	}
+	hs.rs = rs
+	es, err := curve25519.X25519(hs.ephem, hs.rs)
+	if err != nil {
+		return nil, nil, err
+	}
+	hs.mixKey(es)
+	hPre := make([]byte, 32)
+	copy(hPre, hs.h[:])
+	pt, err := hs.decryptAndHash(msg[pos:])
+	if err != nil {
+		return nil, nil, err
+	}
+	return pt, hPre, nil
 }
 
 func (hs *hfsHandshake) writeMsg3(payload []byte) ([]byte, *hfsCipher, *hfsCipher, error) {
@@ -1421,5 +1514,695 @@ func TestM2mEnrollment(t *testing.T) {
 	}
 	if repObj["error"] != "token_replayed" {
 		t.Fatalf("replayed error = %q, want token_replayed", repObj["error"])
+	}
+}
+
+func hkdf32(t *testing.T, ikm, salt, info []byte) []byte {
+	t.Helper()
+	out, err := hkdf.Key(sha256.New, ikm, salt, string(info), 32)
+	if err != nil {
+		t.Fatalf("hkdf.Key: %v", err)
+	}
+	return out
+}
+
+func hmacSHA256(key []byte, parts ...[]byte) []byte {
+	m := hmac.New(sha256.New, key)
+	for _, p := range parts {
+		m.Write(p)
+	}
+	return m.Sum(nil)
+}
+
+func canonicalRelayHostGo(host string) string {
+	return strings.ToLower(strings.TrimRight(host, "."))
+}
+
+func TestWireV2AndRelayAuth(t *testing.T) {
+	var v struct {
+		NoisePattern          string `json:"noise_pattern"`
+		V2SessionPreambleHex  string `json:"v2_session_preamble_hex"`
+		V2PakePairPreambleHex string `json:"v2_pake_pair_preamble_hex"`
+		BlindedRelay          struct {
+			MailboxSecretHex       string `json:"mailbox_secret_hex"`
+			UnixSecs               uint64 `json:"unix_secs"`
+			Epoch                  uint64 `json:"epoch"`
+			EpochSigningSeedHex    string `json:"epoch_signing_seed_hex"`
+			DialAuthKeyHex         string `json:"dial_auth_key_hex"`
+			MailboxIDHex           string `json:"mailbox_id_hex"`
+			MailboxIDB64URL        string `json:"mailbox_id_b64url"`
+			RelayHostRaw           string `json:"relay_host_raw"`
+			RelayHostCanonical     string `json:"relay_host_canonical"`
+			ChallengeNonceHex      string `json:"challenge_nonce_hex"`
+			ConnIDHex              string `json:"conn_id_hex"`
+			RegisterSignedBytesHex string `json:"register_signed_bytes_hex"`
+			RegisterSigHex         string `json:"register_sig_hex"`
+			RegisterSigB64URL      string `json:"register_sig_b64url"`
+			DialMacInputHex        string `json:"dial_mac_input_hex"`
+			DialTokenHex           string `json:"dial_token_hex"`
+			DialTokenB64URL        string `json:"dial_token_b64url"`
+			AcceptSignedBytesHex   string `json:"accept_signed_bytes_hex"`
+			AcceptSigHex           string `json:"accept_sig_hex"`
+			AcceptSigB64URL        string `json:"accept_sig_b64url"`
+		} `json:"blinded_relay"`
+		RelayAdmission struct {
+			SharedSecretHex      string          `json:"shared_secret_hex"`
+			Op                   string          `json:"op"`
+			DialOp               string          `json:"dial_op"`
+			AcceptOp             string          `json:"accept_op"`
+			RelayHostRaw         string          `json:"relay_host_raw"`
+			RelayHostCanonical   string          `json:"relay_host_canonical"`
+			ChallengeNonceHex    string          `json:"challenge_nonce_hex"`
+			PubOrTargetHex       string          `json:"pub_or_target_hex"`
+			HmacInputHex         string          `json:"hmac_input_hex"`
+			HmacMacHex           string          `json:"hmac_mac_hex"`
+			HmacMacB64URL        string          `json:"hmac_mac_b64url"`
+			DialHmacInputHex     string          `json:"dial_hmac_input_hex"`
+			DialHmacMacHex       string          `json:"dial_hmac_mac_hex"`
+			AcceptHmacInputHex   string          `json:"accept_hmac_input_hex"`
+			AcceptHmacMacHex     string          `json:"accept_hmac_mac_hex"`
+			TicketIssuerSeedHex  string          `json:"ticket_issuer_seed_hex"`
+			TicketIssuerPubHex   string          `json:"ticket_issuer_pub_hex"`
+			TicketNowUnix        uint64          `json:"ticket_now_unix"`
+			TicketTTLSecs        uint64          `json:"ticket_ttl_secs"`
+			TicketJCSJSON        string          `json:"ticket_jcs_json"`
+			TicketSignedBytesHex string          `json:"ticket_signed_bytes_hex"`
+			TicketSigHex         string          `json:"ticket_sig_hex"`
+			Ticket               json.RawMessage `json:"ticket"`
+			TicketProofJSON      string          `json:"ticket_proof_json"`
+			HmacProofJSON        string          `json:"hmac_proof_json"`
+		} `json:"relay_admission"`
+		V2Reconnect struct {
+			PreambleHex                string `json:"preamble_hex"`
+			InitiatorStaticScalarHex   string `json:"initiator_static_scalar_hex"`
+			InitiatorStaticPubHex      string `json:"initiator_static_pub_hex"`
+			InitiatorEphemScalarHex    string `json:"initiator_ephem_scalar_hex"`
+			InitiatorMLKEM768KeygenHex string `json:"initiator_mlkem768_keygen_seed_hex"`
+			ResponderStaticScalarHex   string `json:"responder_static_scalar_hex"`
+			ResponderStaticPubHex      string `json:"responder_static_pub_hex"`
+			ResponderEphemScalarHex    string `json:"responder_ephem_scalar_hex"`
+			ResponderMLKEM768EncapsHex string `json:"responder_mlkem768_encaps_seed_hex"`
+			ReconnectSecretHex         string `json:"reconnect_secret_hex"`
+			RendezvousNonceHex         string `json:"rendezvous_nonce_hex"`
+			TsUnix                     uint64 `json:"ts_unix"`
+			EkemIHashHex               string `json:"ekem_i_hash_hex"`
+			RendezvousMacHex           string `json:"rendezvous_mac_hex"`
+			Msg1PayloadHex             string `json:"msg1_payload_hex"`
+			Msg1FrameHex               string `json:"msg1_frame_hex"`
+			HostHelloJSON              string `json:"host_hello_json"`
+			BucketLen                  int    `json:"bucket_len"`
+			HelloSealKeyHex            string `json:"hello_seal_key_hex"`
+			PreMsg2HandshakeHashHex    string `json:"pre_msg2_handshake_hash_hex"`
+			SealedHelloEnvelopeHex     string `json:"sealed_hello_envelope_hex"`
+			Msg2FrameHex               string `json:"msg2_frame_hex"`
+			PostMsg2HandshakeHashHex   string `json:"post_msg2_handshake_hash_hex"`
+			SessionHelloJSON           string `json:"session_hello_json"`
+			Msg3PaddedPayloadHex       string `json:"msg3_padded_payload_hex"`
+			Msg3FrameHex               string `json:"msg3_frame_hex"`
+			FinalHandshakeHashHex      string `json:"final_handshake_hash_hex"`
+			PaddedDataPayloadHex       string `json:"padded_data_payload_hex"`
+			PaddedInnerHex             string `json:"padded_inner_hex"`
+			PaddedFrameHex             string `json:"padded_frame_hex"`
+			CoverBucketLen             int    `json:"cover_bucket_len"`
+			CoverInnerHex              string `json:"cover_inner_hex"`
+			CoverFrameHex              string `json:"cover_frame_hex"`
+			ExportedReconnectSecretHex string `json:"exported_reconnect_secret_hex"`
+			ExportedMailboxSecretHex   string `json:"exported_mailbox_secret_hex"`
+		} `json:"v2_reconnect"`
+		PakePairing struct {
+			PreambleHex    string `json:"preamble_hex"`
+			Code           string `json:"code"`
+			CodeNormalized string `json:"code_normalized"`
+			ChannelSaltHex string `json:"channel_salt_hex"`
+			Argon2id       struct {
+				T      uint32 `json:"t"`
+				MKiB   uint32 `json:"m_kib"`
+				P      uint32 `json:"p"`
+				KeyLen int    `json:"key_len"`
+			} `json:"argon2id"`
+			MasterPakeHex              string `json:"master_pake_hex"`
+			PakePrologueKeyHex         string `json:"pake_prologue_key_hex"`
+			PakeInitKeyHex             string `json:"pake_init_key_hex"`
+			PakeHelloKeyHex            string `json:"pake_hello_key_hex"`
+			PakeConfirmKeyHex          string `json:"pake_confirm_key_hex"`
+			PakeContextTagHex          string `json:"pake_context_tag_hex"`
+			NoisePrologueHex           string `json:"noise_prologue_hex"`
+			InitiatorStaticScalarHex   string `json:"initiator_static_scalar_hex"`
+			InitiatorStaticPubHex      string `json:"initiator_static_pub_hex"`
+			InitiatorEphemScalarHex    string `json:"initiator_ephem_scalar_hex"`
+			InitiatorMLKEM768KeygenHex string `json:"initiator_mlkem768_keygen_seed_hex"`
+			ResponderStaticScalarHex   string `json:"responder_static_scalar_hex"`
+			ResponderStaticPubHex      string `json:"responder_static_pub_hex"`
+			ResponderEphemScalarHex    string `json:"responder_ephem_scalar_hex"`
+			ResponderMLKEM768EncapsHex string `json:"responder_mlkem768_encaps_seed_hex"`
+			EkemIHashHex               string `json:"ekem_i_hash_hex"`
+			InitMacHex                 string `json:"init_mac_hex"`
+			Msg1PayloadHex             string `json:"msg1_payload_hex"`
+			Msg1FrameHex               string `json:"msg1_frame_hex"`
+			HostHelloJSON              string `json:"host_hello_json"`
+			Msg2BucketLen              int    `json:"msg2_bucket_len"`
+			PreMsg2HandshakeHashHex    string `json:"pre_msg2_handshake_hash_hex"`
+			SealedHostHelloHex         string `json:"sealed_host_hello_hex"`
+			RespConfirmMacHex          string `json:"resp_confirm_mac_hex"`
+			Msg2PayloadHex             string `json:"msg2_payload_hex"`
+			Msg2FrameHex               string `json:"msg2_frame_hex"`
+			PostMsg2HandshakeHashHex   string `json:"post_msg2_handshake_hash_hex"`
+			PairingSAS                 string `json:"pairing_sas"`
+			PairClaimJSON              string `json:"pair_claim_json"`
+			InitConfirmMacHex          string `json:"init_confirm_mac_hex"`
+			Msg3PayloadHex             string `json:"msg3_payload_hex"`
+			Msg3FrameHex               string `json:"msg3_frame_hex"`
+			FinalHandshakeHashHex      string `json:"final_handshake_hash_hex"`
+			PairResponseJSON           string `json:"pair_response_json"`
+			PairResponseFrameHex       string `json:"pair_response_frame_hex"`
+			ExportedReconnectSecretHex string `json:"exported_reconnect_secret_hex"`
+			ExportedMailboxSecretHex   string `json:"exported_mailbox_secret_hex"`
+		} `json:"pake_pairing"`
+	}
+	loadVector(t, "wire_v2.json", &v)
+
+	if v.NoisePattern != hfsPattern {
+		t.Fatalf("noise pattern mismatch: %s", v.NoisePattern)
+	}
+	if v.V2SessionPreambleHex != hex.EncodeToString([]byte("TND\x02\x01\x00")) {
+		t.Fatalf("v2 session preamble mismatch")
+	}
+	if v.V2PakePairPreambleHex != hex.EncodeToString([]byte("TND\x02\x02\x01")) {
+		t.Fatalf("v2 pake preamble mismatch")
+	}
+
+	// 1. Blinded /v2/relay hourly epoch
+	br := v.BlindedRelay
+	epoch := br.UnixSecs / 3600
+	if epoch != br.Epoch {
+		t.Fatalf("epoch mismatch: got %d want %d", epoch, br.Epoch)
+	}
+	var epochBE [8]byte
+	binary.BigEndian.PutUint64(epochBE[:], epoch)
+	mailboxSecret := mustHex(t, br.MailboxSecretHex)
+	epochSeed := hkdf32(t, mailboxSecret, epochBE[:], []byte("tendril-relay-v2-ed25519"))
+	dialAuthKey := hkdf32(t, mailboxSecret, epochBE[:], []byte("tendril-relay-v2-dial-auth"))
+	if hex.EncodeToString(epochSeed) != br.EpochSigningSeedHex {
+		t.Fatalf("epoch_signing_seed mismatch")
+	}
+	if hex.EncodeToString(dialAuthKey) != br.DialAuthKeyHex {
+		t.Fatalf("dial_auth_key mismatch")
+	}
+	mailboxSK := ed25519.NewKeyFromSeed(epochSeed)
+	mailboxID := mailboxSK.Public().(ed25519.PublicKey)
+	if hex.EncodeToString(mailboxID) != br.MailboxIDHex {
+		t.Fatalf("mailbox_id mismatch")
+	}
+	if base64.RawURLEncoding.EncodeToString(mailboxID) != br.MailboxIDB64URL {
+		t.Fatalf("mailbox_id b64url mismatch")
+	}
+	canonHost := canonicalRelayHostGo(br.RelayHostRaw)
+	if canonHost != br.RelayHostCanonical {
+		t.Fatalf("canonical relay host mismatch")
+	}
+	cNonce := mustHex(t, br.ChallengeNonceHex)
+	connID := mustHex(t, br.ConnIDHex)
+
+	var regInput []byte
+	regInput = append(regInput, []byte("tendril-relay-reg-v2\x00")...)
+	regInput = append(regInput, []byte(canonHost)...)
+	regInput = append(regInput, cNonce...)
+	regInput = append(regInput, epochBE[:]...)
+	if hex.EncodeToString(regInput) != br.RegisterSignedBytesHex {
+		t.Fatalf("register signed bytes mismatch")
+	}
+	regSig := ed25519.Sign(mailboxSK, regInput)
+	if hex.EncodeToString(regSig) != br.RegisterSigHex {
+		t.Fatalf("register sig mismatch")
+	}
+	if !ed25519.Verify(mailboxID, regInput, mustB64URL(t, br.RegisterSigB64URL)) {
+		t.Fatalf("register sig verify failed")
+	}
+
+	var dialInput []byte
+	dialInput = append(dialInput, []byte("tendril-relay-v2-dial\x00")...)
+	dialInput = append(dialInput, []byte(canonHost)...)
+	dialInput = append(dialInput, cNonce...)
+	dialInput = append(dialInput, mailboxID...)
+	dialInput = append(dialInput, connID...)
+	dialInput = append(dialInput, epochBE[:]...)
+	if hex.EncodeToString(dialInput) != br.DialMacInputHex {
+		t.Fatalf("dial mac input mismatch")
+	}
+	dialTok := hmacSHA256(dialAuthKey, dialInput)
+	if hex.EncodeToString(dialTok) != br.DialTokenHex {
+		t.Fatalf("dial token mismatch")
+	}
+
+	var acceptInput []byte
+	acceptInput = append(acceptInput, []byte("tendril-relay-accept-v2\x00")...)
+	acceptInput = append(acceptInput, []byte(canonHost)...)
+	acceptInput = append(acceptInput, cNonce...)
+	acceptInput = append(acceptInput, connID...)
+	acceptInput = append(acceptInput, epochBE[:]...)
+	if hex.EncodeToString(acceptInput) != br.AcceptSignedBytesHex {
+		t.Fatalf("accept signed bytes mismatch")
+	}
+	acceptSig := ed25519.Sign(mailboxSK, acceptInput)
+	if hex.EncodeToString(acceptSig) != br.AcceptSigHex {
+		t.Fatalf("accept sig mismatch")
+	}
+	if !ed25519.Verify(mailboxID, acceptInput, mustB64URL(t, br.AcceptSigB64URL)) {
+		t.Fatalf("accept sig verify failed")
+	}
+
+	// 2. Relay admission (Tier 2 + Tier 3)
+	ra := v.RelayAdmission
+	admCanon := canonicalRelayHostGo(ra.RelayHostRaw)
+	if admCanon != ra.RelayHostCanonical {
+		t.Fatalf("admission canonical host mismatch")
+	}
+	admSecret := mustHex(t, ra.SharedSecretHex)
+	admNonce := mustHex(t, ra.ChallengeNonceHex)
+	pubOrTarget := mustHex(t, ra.PubOrTargetHex)
+
+	checkAdmHmac := func(op, wantInHex, wantMacHex string) []byte {
+		var in []byte
+		in = append(in, []byte("tendril-relay-auth-v1\x00")...)
+		in = append(in, []byte(op)...)
+		in = append(in, 0x00)
+		in = append(in, []byte(admCanon)...)
+		in = append(in, admNonce...)
+		in = append(in, pubOrTarget...)
+		if hex.EncodeToString(in) != wantInHex {
+			t.Fatalf("hmac input mismatch for op %s", op)
+		}
+		mac := hmacSHA256(admSecret, in)
+		if hex.EncodeToString(mac) != wantMacHex {
+			t.Fatalf("hmac mac mismatch for op %s", op)
+		}
+		return mac
+	}
+	regMac := checkAdmHmac(ra.Op, ra.HmacInputHex, ra.HmacMacHex)
+	if base64.RawURLEncoding.EncodeToString(regMac) != ra.HmacMacB64URL {
+		t.Fatalf("hmac b64url mismatch")
+	}
+	checkAdmHmac(ra.DialOp, ra.DialHmacInputHex, ra.DialHmacMacHex)
+	checkAdmHmac(ra.AcceptOp, ra.AcceptHmacInputHex, ra.AcceptHmacMacHex)
+
+	var ticketMap map[string]any
+	if err := json.Unmarshal(ra.Ticket, &ticketMap); err != nil {
+		t.Fatal(err)
+	}
+	delete(ticketMap, "sig")
+	unsignedTicketBytes, err := json.Marshal(ticketMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jcsTicket, err := jsoncanonicalizer.Transform(unsignedTicketBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(jcsTicket) != ra.TicketJCSJSON {
+		t.Fatalf("ticket JCS mismatch:\ngot:  %s\nwant: %s", string(jcsTicket), ra.TicketJCSJSON)
+	}
+	signedTicket := append([]byte("tendril-relay-ticket-v1\x00"), jcsTicket...)
+	if hex.EncodeToString(signedTicket) != ra.TicketSignedBytesHex {
+		t.Fatalf("ticket signed bytes mismatch")
+	}
+	issuerSK := ed25519.NewKeyFromSeed(mustHex(t, ra.TicketIssuerSeedHex))
+	issuerPub := issuerSK.Public().(ed25519.PublicKey)
+	if hex.EncodeToString(issuerPub) != ra.TicketIssuerPubHex {
+		t.Fatalf("ticket issuer pub mismatch")
+	}
+	ticketSig := ed25519.Sign(issuerSK, signedTicket)
+	if hex.EncodeToString(ticketSig) != ra.TicketSigHex {
+		t.Fatalf("ticket sig mismatch")
+	}
+	if !ed25519.Verify(issuerPub, signedTicket, ticketSig) {
+		t.Fatalf("ticket ed25519 verify failed")
+	}
+
+	// 3. Pseudonymous v2 Reconnect
+	rc := v.V2Reconnect
+	rPre := mustHex(t, rc.PreambleHex)
+	rInitHS, err := newHfsHandshake(
+		true,
+		rPre,
+		mustHex(t, rc.InitiatorStaticScalarHex),
+		mustHex(t, rc.InitiatorEphemScalarHex),
+		mustHex(t, rc.InitiatorMLKEM768KeygenHex),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rRespHS, err := newHfsHandshake(
+		false,
+		rPre,
+		mustHex(t, rc.ResponderStaticScalarHex),
+		mustHex(t, rc.ResponderEphemScalarHex),
+		mustHex(t, rc.ResponderMLKEM768EncapsHex),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconnSecret := mustHex(t, rc.ReconnectSecretHex)
+	rNonce := mustHex(t, rc.RendezvousNonceHex)
+	var tsBE [8]byte
+	binary.BigEndian.PutUint64(tsBE[:], rc.TsUnix)
+
+	rInitEPub, err := curve25519.X25519(mustHex(t, rc.InitiatorEphemScalarHex), curve25519.Basepoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rDK, err := mlkem.NewDecapsulationKey768(mustHex(t, rc.InitiatorMLKEM768KeygenHex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rEKHash := sha256.Sum256(rDK.EncapsulationKey().Bytes())
+	if hex.EncodeToString(rEKHash[:]) != rc.EkemIHashHex {
+		t.Fatalf("reconnect ekem_i_hash mismatch")
+	}
+	rMac := hmacSHA256(reconnSecret, []byte("tendril-v2-rendezvous\x00"), rPre, rInitEPub, rEKHash[:], rNonce, tsBE[:])
+	if hex.EncodeToString(rMac) != rc.RendezvousMacHex {
+		t.Fatalf("rendezvous_mac mismatch")
+	}
+	var rMsg1Payload []byte
+	rMsg1Payload = append(rMsg1Payload, rNonce...)
+	rMsg1Payload = append(rMsg1Payload, tsBE[:]...)
+	rMsg1Payload = append(rMsg1Payload, rMac...)
+	if hex.EncodeToString(rMsg1Payload) != rc.Msg1PayloadHex {
+		t.Fatalf("reconnect msg1 payload mismatch")
+	}
+	rm1, err := rInitHS.writeMsg1(rMsg1Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(rm1)) != rc.Msg1FrameHex {
+		t.Fatalf("reconnect msg1 frame mismatch")
+	}
+	dec1, err := rRespHS.readMsg1(decodeFrame(t, mustHex(t, rc.Msg1FrameHex)))
+	if err != nil || !bytes.Equal(dec1, rMsg1Payload) {
+		t.Fatalf("reconnect readMsg1 failed: %v", err)
+	}
+
+	helloSealKey := hkdf32(t, reconnSecret, rNonce, []byte("tendril-v2-hello-seal"))
+	if hex.EncodeToString(helloSealKey) != rc.HelloSealKeyHex {
+		t.Fatalf("hello_seal_key mismatch")
+	}
+	rm2, err := rRespHS.writeMsg2WithHash(func(hPre []byte) ([]byte, error) {
+		if hex.EncodeToString(hPre) != rc.PreMsg2HandshakeHashHex {
+			return nil, fmt.Errorf("pre_msg2_hash mismatch")
+		}
+		ptLen := rc.BucketLen - 16
+		pt := make([]byte, ptLen)
+		binary.BigEndian.PutUint16(pt[:2], uint16(len(rc.HostHelloJSON)))
+		copy(pt[2:], rc.HostHelloJSON)
+		aead, err := chacha20poly1305.New(helloSealKey)
+		if err != nil {
+			return nil, err
+		}
+		env := aead.Seal(nil, make([]byte, 12), pt, hPre)
+		if hex.EncodeToString(env) != rc.SealedHelloEnvelopeHex {
+			return nil, fmt.Errorf("sealed_hello_envelope mismatch")
+		}
+		return env, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(rm2)) != rc.Msg2FrameHex {
+		t.Fatalf("reconnect msg2 frame mismatch")
+	}
+	dec2, rInitHPre, err := rInitHS.readMsg2WithPreHash(decodeFrame(t, mustHex(t, rc.Msg2FrameHex)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(rInitHPre) != rc.PreMsg2HandshakeHashHex {
+		t.Fatalf("reconnect init h_pre mismatch")
+	}
+	sealAEAD, err := chacha20poly1305.New(helloSealKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsealedEnv, err := sealAEAD.Open(nil, make([]byte, 12), dec2, rInitHPre)
+	if err != nil {
+		t.Fatalf("unseal hello envelope: %v", err)
+	}
+	helloLen := int(binary.BigEndian.Uint16(unsealedEnv[:2]))
+	if string(unsealedEnv[2:2+helloLen]) != rc.HostHelloJSON {
+		t.Fatalf("unsealed HostHello mismatch")
+	}
+	if hex.EncodeToString(rInitHS.h[:]) != rc.PostMsg2HandshakeHashHex {
+		t.Fatalf("reconnect post_msg2_hash mismatch")
+	}
+
+	rm3Payload := mustHex(t, rc.Msg3PaddedPayloadHex)
+	sLen := int(binary.BigEndian.Uint16(rm3Payload[:2]))
+	if string(rm3Payload[2:2+sLen]) != rc.SessionHelloJSON {
+		t.Fatalf("reconnect msg3 SessionHello mismatch")
+	}
+	rm3, rInitCS1, rInitCS2, err := rInitHS.writeMsg3(rm3Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rInitCS2
+	if hex.EncodeToString(encodeFrame(rm3)) != rc.Msg3FrameHex {
+		t.Fatalf("reconnect msg3 frame mismatch")
+	}
+	dec3, rRespCS1, rRespCS2, err := rRespHS.readMsg3(decodeFrame(t, mustHex(t, rc.Msg3FrameHex)))
+	if err != nil || !bytes.Equal(dec3, rm3Payload) {
+		t.Fatalf("reconnect readMsg3 failed: %v", err)
+	}
+	_ = rRespCS2
+	if hex.EncodeToString(rInitHS.h[:]) != rc.FinalHandshakeHashHex {
+		t.Fatalf("reconnect final hash mismatch")
+	}
+
+	rExporter := hkdf32(t, rInitHS.ck[:], rInitHS.h[:], []byte("tendril-v2-session-export"))
+	rRespStaticPub := mustHex(t, rc.ResponderStaticPubHex)
+	if hex.EncodeToString(hkdf32(t, rExporter, []byte("tendril-reconnect-v2"), rRespStaticPub)) != rc.ExportedReconnectSecretHex {
+		t.Fatalf("reconnect exported reconnect_secret mismatch")
+	}
+	if hex.EncodeToString(hkdf32(t, rExporter, []byte("tendril-mailbox-v2"), rRespStaticPub)) != rc.ExportedMailboxSecretHex {
+		t.Fatalf("reconnect exported mailbox_secret mismatch")
+	}
+
+	rawData := mustHex(t, rc.PaddedDataPayloadHex)
+	paddedInner := make([]byte, 256)
+	paddedInner[0] = 0x09
+	paddedInner[1] = 0x01
+	binary.BigEndian.PutUint16(paddedInner[2:4], uint16(len(rawData)))
+	copy(paddedInner[4:], rawData)
+	if hex.EncodeToString(paddedInner) != rc.PaddedInnerHex {
+		t.Fatalf("0x09 PADDED inner mismatch")
+	}
+	paddedCT, err := rInitCS1.encryptWithAD(nil, paddedInner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(paddedCT)) != rc.PaddedFrameHex {
+		t.Fatalf("padded frame mismatch")
+	}
+	decPadded, err := rRespCS1.decryptWithAD(nil, decodeFrame(t, mustHex(t, rc.PaddedFrameHex)))
+	if err != nil || !bytes.Equal(decPadded, paddedInner) {
+		t.Fatalf("padded decrypt mismatch: %v", err)
+	}
+
+	coverInner := make([]byte, rc.CoverBucketLen)
+	coverInner[0] = 0x08
+	if hex.EncodeToString(coverInner) != rc.CoverInnerHex {
+		t.Fatalf("0x08 PADDING inner mismatch")
+	}
+	coverCT, err := rInitCS1.encryptWithAD(nil, coverInner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(coverCT)) != rc.CoverFrameHex {
+		t.Fatalf("cover frame mismatch")
+	}
+	decCover, err := rRespCS1.decryptWithAD(nil, decodeFrame(t, mustHex(t, rc.CoverFrameHex)))
+	if err != nil || !bytes.Equal(decCover, coverInner) {
+		t.Fatalf("cover decrypt mismatch: %v", err)
+	}
+
+	// 4. Hybrid Argon2id PAKE + ML-KEM-768 Pairing
+	pk := v.PakePairing
+	pPre := mustHex(t, pk.PreambleHex)
+	pSalt := mustHex(t, pk.ChannelSaltHex)
+	if strings.ReplaceAll(strings.ToUpper(pk.Code), "-", "") != pk.CodeNormalized {
+		t.Fatalf("PAKE normalized code mismatch")
+	}
+	masterPake := argon2.IDKey(
+		[]byte(pk.CodeNormalized),
+		pSalt,
+		pk.Argon2id.T,
+		pk.Argon2id.MKiB,
+		uint8(pk.Argon2id.P),
+		uint32(pk.Argon2id.KeyLen),
+	)
+	if hex.EncodeToString(masterPake) != pk.MasterPakeHex {
+		t.Fatalf("master_pake mismatch")
+	}
+	pakePrologueKey := hkdf32(t, masterPake, pSalt, []byte("tendril-v2-pake-prologue"))
+	pakeInitKey := hkdf32(t, masterPake, pSalt, []byte("tendril-v2-pake-init-key"))
+	pakeHelloKey := hkdf32(t, masterPake, pSalt, []byte("tendril-v2-pake-hello"))
+	pakeConfirmKey := hkdf32(t, masterPake, pSalt, []byte("tendril-v2-pake-confirm"))
+	pakeContextTag := hkdf32(t, pakePrologueKey, pSalt, []byte("tendril-v2-pake-context"))
+	if hex.EncodeToString(pakePrologueKey) != pk.PakePrologueKeyHex ||
+		hex.EncodeToString(pakeInitKey) != pk.PakeInitKeyHex ||
+		hex.EncodeToString(pakeHelloKey) != pk.PakeHelloKeyHex ||
+		hex.EncodeToString(pakeConfirmKey) != pk.PakeConfirmKeyHex ||
+		hex.EncodeToString(pakeContextTag) != pk.PakeContextTagHex {
+		t.Fatalf("PAKE HKDF subkey mismatch")
+	}
+	noisePrologue := append(append([]byte(nil), pPre...), pakeContextTag...)
+	if hex.EncodeToString(noisePrologue) != pk.NoisePrologueHex {
+		t.Fatalf("PAKE noise prologue mismatch")
+	}
+
+	pInitHS, err := newHfsHandshake(
+		true,
+		noisePrologue,
+		mustHex(t, pk.InitiatorStaticScalarHex),
+		mustHex(t, pk.InitiatorEphemScalarHex),
+		mustHex(t, pk.InitiatorMLKEM768KeygenHex),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pRespHS, err := newHfsHandshake(
+		false,
+		noisePrologue,
+		mustHex(t, pk.ResponderStaticScalarHex),
+		mustHex(t, pk.ResponderEphemScalarHex),
+		mustHex(t, pk.ResponderMLKEM768EncapsHex),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pInitEPub, err := curve25519.X25519(mustHex(t, pk.InitiatorEphemScalarHex), curve25519.Basepoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pDK, err := mlkem.NewDecapsulationKey768(mustHex(t, pk.InitiatorMLKEM768KeygenHex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pEKHash := sha256.Sum256(pDK.EncapsulationKey().Bytes())
+	if hex.EncodeToString(pEKHash[:]) != pk.EkemIHashHex {
+		t.Fatalf("PAKE ekem_i_hash mismatch")
+	}
+	initMac := hmacSHA256(pakeInitKey, []byte("tendril-v2-pake-msg1\x00"), pPre, pInitEPub, pEKHash[:], pSalt)
+	if hex.EncodeToString(initMac) != pk.InitMacHex {
+		t.Fatalf("PAKE init_mac mismatch")
+	}
+	pMsg1Payload := append(append([]byte(nil), pSalt...), initMac...)
+	if hex.EncodeToString(pMsg1Payload) != pk.Msg1PayloadHex {
+		t.Fatalf("PAKE msg1 payload mismatch")
+	}
+	pm1, err := pInitHS.writeMsg1(pMsg1Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(pm1)) != pk.Msg1FrameHex {
+		t.Fatalf("PAKE msg1 frame mismatch")
+	}
+	pDec1, err := pRespHS.readMsg1(decodeFrame(t, mustHex(t, pk.Msg1FrameHex)))
+	if err != nil || !bytes.Equal(pDec1, pMsg1Payload) {
+		t.Fatalf("PAKE readMsg1 failed: %v", err)
+	}
+
+	pm2, err := pRespHS.writeMsg2WithHash(func(hPre []byte) ([]byte, error) {
+		if hex.EncodeToString(hPre) != pk.PreMsg2HandshakeHashHex {
+			return nil, fmt.Errorf("PAKE pre_msg2_hash mismatch")
+		}
+		helloAEAD, err := chacha20poly1305.New(pakeHelloKey)
+		if err != nil {
+			return nil, err
+		}
+		sealedHello := helloAEAD.Seal(nil, make([]byte, 12), []byte(pk.HostHelloJSON), hPre)
+		if hex.EncodeToString(sealedHello) != pk.SealedHostHelloHex {
+			return nil, fmt.Errorf("PAKE sealed_host_hello mismatch")
+		}
+		respMac := hmacSHA256(pakeConfirmKey, []byte("tendril-v2-pake-resp\x00"), hPre, sealedHello)
+		if hex.EncodeToString(respMac) != pk.RespConfirmMacHex {
+			return nil, fmt.Errorf("PAKE resp_confirm_mac mismatch")
+		}
+		out := make([]byte, pk.Msg2BucketLen)
+		binary.BigEndian.PutUint16(out[:2], uint16(len(sealedHello)))
+		copy(out[2:], sealedHello)
+		copy(out[2+len(sealedHello):], respMac)
+		if hex.EncodeToString(out) != pk.Msg2PayloadHex {
+			return nil, fmt.Errorf("PAKE msg2 payload mismatch")
+		}
+		return out, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(pm2)) != pk.Msg2FrameHex {
+		t.Fatalf("PAKE msg2 frame mismatch")
+	}
+	pDec2, pInitHPre, err := pInitHS.readMsg2WithPreHash(decodeFrame(t, mustHex(t, pk.Msg2FrameHex)))
+	if err != nil || !bytes.Equal(pDec2, mustHex(t, pk.Msg2PayloadHex)) {
+		t.Fatalf("PAKE readMsg2 failed: %v", err)
+	}
+	pHelloAEAD, err := chacha20poly1305.New(pakeHelloKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pSealedLen := int(binary.BigEndian.Uint16(pDec2[:2]))
+	unsealedPakeHello, err := pHelloAEAD.Open(nil, make([]byte, 12), pDec2[2:2+pSealedLen], pInitHPre)
+	if err != nil || string(unsealedPakeHello) != pk.HostHelloJSON {
+		t.Fatalf("PAKE unseal HostHello failed: %v", err)
+	}
+	if hex.EncodeToString(pInitHS.h[:]) != pk.PostMsg2HandshakeHashHex {
+		t.Fatalf("PAKE post_msg2_hash mismatch")
+	}
+	if goPairingSAS(pInitHS.h[:]) != pk.PairingSAS {
+		t.Fatalf("PAKE pairing_sas mismatch")
+	}
+
+	initConfirmMac := hmacSHA256(pakeConfirmKey, []byte("tendril-v2-pake-init\x00"), pInitHS.h[:], []byte(pk.PairClaimJSON))
+	if hex.EncodeToString(initConfirmMac) != pk.InitConfirmMacHex {
+		t.Fatalf("PAKE init_confirm_mac mismatch")
+	}
+	pMsg3Payload := append(append([]byte(nil), initConfirmMac...), []byte(pk.PairClaimJSON)...)
+	if hex.EncodeToString(pMsg3Payload) != pk.Msg3PayloadHex {
+		t.Fatalf("PAKE msg3 payload mismatch")
+	}
+	pm3, pInitCS1, pInitCS2, err := pInitHS.writeMsg3(pMsg3Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pInitCS1
+	if hex.EncodeToString(encodeFrame(pm3)) != pk.Msg3FrameHex {
+		t.Fatalf("PAKE msg3 frame mismatch")
+	}
+	pDec3, pRespCS1, pRespCS2, err := pRespHS.readMsg3(decodeFrame(t, mustHex(t, pk.Msg3FrameHex)))
+	if err != nil || !bytes.Equal(pDec3, pMsg3Payload) {
+		t.Fatalf("PAKE readMsg3 failed: %v", err)
+	}
+	_ = pRespCS1
+	if hex.EncodeToString(pInitHS.h[:]) != pk.FinalHandshakeHashHex {
+		t.Fatalf("PAKE final hash mismatch")
+	}
+
+	pExporter := hkdf32(t, pInitHS.ck[:], pInitHS.h[:], []byte("tendril-v2-session-export"))
+	pRespStaticPub := mustHex(t, pk.ResponderStaticPubHex)
+	if hex.EncodeToString(hkdf32(t, pExporter, []byte("tendril-reconnect-v2"), pRespStaticPub)) != pk.ExportedReconnectSecretHex {
+		t.Fatalf("PAKE exported reconnect_secret mismatch")
+	}
+	if hex.EncodeToString(hkdf32(t, pExporter, []byte("tendril-mailbox-v2"), pRespStaticPub)) != pk.ExportedMailboxSecretHex {
+		t.Fatalf("PAKE exported mailbox_secret mismatch")
+	}
+
+	pRespCT, err := pRespCS2.encryptWithAD(nil, []byte(pk.PairResponseJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(pRespCT)) != pk.PairResponseFrameHex {
+		t.Fatalf("PAKE pair_response frame mismatch")
+	}
+	pDec4, err := pInitCS2.decryptWithAD(nil, decodeFrame(t, mustHex(t, pk.PairResponseFrameHex)))
+	if err != nil || string(pDec4) != pk.PairResponseJSON {
+		t.Fatalf("PAKE pair_response decrypt mismatch: %v", err)
 	}
 }
