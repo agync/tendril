@@ -2366,6 +2366,46 @@ impl V2SessionInitiator {
         seal_cover_action(sealed, bucket, now_ms)
     }
 
+    /// Explicitly initiates a Noise `0x04 REKEY` transition on the outgoing cipher state.
+    pub fn seal_rekey(&mut self, now_ms: u64) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        seal_rekey_actions(sealed, now_ms)
+    }
+
+    /// Seals an encrypted `0x05 PING` keepalive probe with an 8-byte `cookie`.
+    pub fn seal_ping(
+        &mut self,
+        cookie: u64,
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        seal_transport_action(sealed, InnerFrameType::Ping, &cookie.to_be_bytes(), now_ms)
+    }
+
+    /// Seals an encrypted `0x07 CLOSE` frame and transitions to terminal closed state.
+    pub fn seal_close(
+        &mut self,
+        code: u16,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        let actions = seal_close_payload(sealed, code, reason, now_ms)?;
+        self.phase = V2InitPhase::Closed;
+        Ok(actions)
+    }
+
+    /// Samples the next jittered keepalive ping delay in milliseconds using the platform CSPRNG.
+    pub fn next_ping_delay_ms(&self) -> Result<u64, CoreError> {
+        self.jitter.next_ping_delay_ms()
+    }
+
     /// Advances virtual timers: fails closed if the peer or active grant became invalid.
     pub fn tick(
         &mut self,
@@ -2384,13 +2424,7 @@ impl V2SessionInitiator {
             return Ok(Vec::new());
         };
         if sealed.rekey_status(now_ms) == RekeyStatus::RekeyDue {
-            let rekey_ct = sealed.seal_rekey(now_ms)?;
-            return Ok(vec![
-                V2SessionAction::WriteBytes(encode_frame(&rekey_ct)?),
-                V2SessionAction::Rekeyed {
-                    direction: RekeyDirection::Outgoing,
-                },
-            ]);
+            return seal_rekey_actions(sealed, now_ms);
         }
         Ok(Vec::new())
     }
@@ -3079,6 +3113,46 @@ impl V2SessionResponder {
         seal_cover_action(sealed, bucket, now_ms)
     }
 
+    /// Explicitly initiates a Noise `0x04 REKEY` transition on the outgoing cipher state.
+    pub fn seal_rekey(&mut self, now_ms: u64) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2RespPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        seal_rekey_actions(sealed, now_ms)
+    }
+
+    /// Seals an encrypted `0x05 PING` keepalive probe with an 8-byte `cookie`.
+    pub fn seal_ping(
+        &mut self,
+        cookie: u64,
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2RespPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        seal_transport_action(sealed, InnerFrameType::Ping, &cookie.to_be_bytes(), now_ms)
+    }
+
+    /// Seals an encrypted `0x07 CLOSE` frame and transitions to terminal closed state.
+    pub fn seal_close(
+        &mut self,
+        code: u16,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2RespPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        let actions = seal_close_payload(sealed, code, reason, now_ms)?;
+        self.phase = V2RespPhase::Closed;
+        Ok(actions)
+    }
+
+    /// Samples the next jittered keepalive ping delay in milliseconds using the platform CSPRNG.
+    pub fn next_ping_delay_ms(&self) -> Result<u64, CoreError> {
+        self.jitter.next_ping_delay_ms()
+    }
+
     /// Advances virtual timers: fails closed if the peer or active grant became invalid.
     pub fn tick(
         &mut self,
@@ -3097,13 +3171,7 @@ impl V2SessionResponder {
             return Ok(Vec::new());
         };
         if sealed.rekey_status(now_ms) == RekeyStatus::RekeyDue {
-            let rekey_ct = sealed.seal_rekey(now_ms)?;
-            return Ok(vec![
-                V2SessionAction::WriteBytes(encode_frame(&rekey_ct)?),
-                V2SessionAction::Rekeyed {
-                    direction: RekeyDirection::Outgoing,
-                },
-            ]);
+            return seal_rekey_actions(sealed, now_ms);
         }
         Ok(Vec::new())
     }
@@ -3155,6 +3223,39 @@ fn seal_cover_action(
         &outcome.ciphertext,
     )?));
     Ok(actions)
+}
+
+fn seal_rekey_actions(
+    sealed: &mut SealedSession,
+    now_ms: u64,
+) -> Result<Vec<V2SessionAction>, CoreError> {
+    let rekey_ct = sealed.seal_rekey(now_ms)?;
+    Ok(vec![
+        V2SessionAction::WriteBytes(encode_frame(&rekey_ct)?),
+        V2SessionAction::Rekeyed {
+            direction: RekeyDirection::Outgoing,
+        },
+    ])
+}
+
+fn seal_close_payload(
+    sealed: &mut SealedSession,
+    code: u16,
+    reason: &str,
+    now_ms: u64,
+) -> Result<Vec<V2SessionAction>, CoreError> {
+    let mut payload = Vec::with_capacity(2 + reason.len());
+    payload.extend_from_slice(&code.to_be_bytes());
+    payload.extend_from_slice(reason.as_bytes());
+    let outcome = sealed.seal(InnerFrameType::Close, &payload, now_ms)?;
+    let frame = encode_frame(&outcome.ciphertext)?;
+    Ok(vec![
+        V2SessionAction::WriteBytes(frame),
+        V2SessionAction::CloseTransport {
+            code,
+            reason: reason.to_string(),
+        },
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -4291,4 +4392,364 @@ fn write_v2_pair_error(
     }));
     actions.push(V2PairAction::CloseTransport(code.to_string()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::SigningKeypair;
+    use crate::grants::{RevocationListUnsigned, sign_crl};
+    use crate::wire::MAX_APP_DATA_LEN;
+
+    const TEST_NOW_UNIX: u64 = 1_795_564_800;
+
+    fn collect_wire(actions: Vec<V2SessionAction>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for action in actions {
+            if let V2SessionAction::WriteBytes(bytes) = action {
+                out.extend_from_slice(&bytes);
+            }
+        }
+        out
+    }
+
+    fn established_v2_pair() -> (
+        EndpointIdentity,
+        EndpointIdentity,
+        Roster,
+        Roster,
+        V2SessionInitiator,
+        V2SessionResponder,
+    ) {
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x41; 32]),
+            SigningKeypair::from_seed([0x42; 32]),
+        )
+        .with_host_id("host-v2-unit");
+        let cli = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x51; 32]),
+            SigningKeypair::from_seed([0x52; 32]),
+        );
+        let secrets = V2PeerSecrets::new([0x66; 32], [0x77; 32]);
+
+        let mut host_roster = Roster::new();
+        host_roster
+            .record_pending_pair(
+                *cli.static_key().public_bytes(),
+                None,
+                "Cli".to_string(),
+                "cli".to_string(),
+                "abcd".to_string(),
+            )
+            .unwrap();
+        host_roster
+            .confirm_peer(&cli.device_id(), Some("abcd"))
+            .unwrap();
+        host_roster
+            .set_peer_v2_secrets(&cli.device_id(), secrets.clone())
+            .unwrap();
+        host_roster
+            .set_peer_min_wire_version(&cli.device_id(), WIRE_VERSION_V2)
+            .unwrap();
+
+        let mut cli_roster = Roster::new();
+        cli_roster
+            .insert_pinned_host(
+                host.host_id().to_string(),
+                "Host".to_string(),
+                *host.static_key().public_bytes(),
+                Some(host.signing_key().public_key().clone()),
+                host.rotation_seq(),
+                vec![],
+            )
+            .unwrap();
+        cli_roster
+            .set_peer_v2_secrets(host.host_id(), secrets.clone())
+            .unwrap();
+        cli_roster
+            .set_peer_min_wire_version(host.host_id(), WIRE_VERSION_V2)
+            .unwrap();
+
+        let mut init = V2SessionInitiator::new(
+            &cli,
+            host.host_id(),
+            *secrets.reconnect_secret(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut resp = V2SessionResponder::new(&host).unwrap();
+
+        let m1 = collect_wire(init.start(TEST_NOW_UNIX).unwrap());
+        let m2 = collect_wire(
+            resp.feed_bytes(&m1, TEST_NOW_UNIX, 1, &mut host_roster)
+                .unwrap(),
+        );
+        let m3 = collect_wire(
+            init.feed_bytes(&m2, TEST_NOW_UNIX, 2, &mut cli_roster)
+                .unwrap(),
+        );
+        resp.feed_bytes(&m3, TEST_NOW_UNIX, 3, &mut host_roster)
+            .unwrap();
+        assert!(init.is_established());
+        assert!(resp.is_established());
+
+        (host, cli, host_roster, cli_roster, init, resp)
+    }
+
+    fn assert_init_not_ready(init: &mut V2SessionInitiator, now_ms: u64) {
+        assert!(matches!(
+            init.seal_rekey(now_ms),
+            Err(CoreError::NotReady(_))
+        ));
+        assert!(matches!(
+            init.seal_ping(7, now_ms),
+            Err(CoreError::NotReady(_))
+        ));
+        assert!(matches!(
+            init.seal_close(SessionCloseCode::NORMAL, "not-ready", now_ms),
+            Err(CoreError::NotReady(_))
+        ));
+    }
+
+    fn assert_resp_not_ready(resp: &mut V2SessionResponder, now_ms: u64) {
+        assert!(matches!(
+            resp.seal_rekey(now_ms),
+            Err(CoreError::NotReady(_))
+        ));
+        assert!(matches!(
+            resp.seal_ping(7, now_ms),
+            Err(CoreError::NotReady(_))
+        ));
+        assert!(matches!(
+            resp.seal_close(SessionCloseCode::NORMAL, "not-ready", now_ms),
+            Err(CoreError::NotReady(_))
+        ));
+    }
+
+    #[test]
+    fn v2_session_control_send_ping_rekey_and_close_roundtrip() {
+        let (_host, _cli, mut host_roster, mut cli_roster, mut init, mut resp) =
+            established_v2_pair();
+
+        let (min_ping, max_ping) = ScheduleJitterPolicy::default().ping_bounds_ms();
+        let init_delay = init.next_ping_delay_ms().unwrap();
+        let resp_delay = resp.next_ping_delay_ms().unwrap();
+        assert!((min_ping..=max_ping).contains(&init_delay));
+        assert!((min_ping..=max_ping).contains(&resp_delay));
+
+        let ping_wire = collect_wire(init.seal_ping(0x1122_3344_5566_7788, 100).unwrap());
+        let pong_wire = collect_wire(
+            resp.feed_bytes(&ping_wire, TEST_NOW_UNIX, 101, &mut host_roster)
+                .unwrap(),
+        );
+        let init_pong = init
+            .feed_bytes(&pong_wire, TEST_NOW_UNIX, 102, &mut cli_roster)
+            .unwrap();
+        assert_eq!(
+            init_pong,
+            vec![V2SessionAction::PongReceived(0x1122_3344_5566_7788)]
+        );
+
+        let resp_ping_wire = collect_wire(resp.seal_ping(0xDEAD_BEEF_CAFE_BABE, 103).unwrap());
+        let resp_pong_wire = collect_wire(
+            init.feed_bytes(&resp_ping_wire, TEST_NOW_UNIX, 104, &mut cli_roster)
+                .unwrap(),
+        );
+        let resp_pong = resp
+            .feed_bytes(&resp_pong_wire, TEST_NOW_UNIX, 105, &mut host_roster)
+            .unwrap();
+        assert_eq!(
+            resp_pong,
+            vec![V2SessionAction::PongReceived(0xDEAD_BEEF_CAFE_BABE)]
+        );
+
+        let init_rekey_actions = init.seal_rekey(110).unwrap();
+        assert!(init_rekey_actions.contains(&V2SessionAction::Rekeyed {
+            direction: RekeyDirection::Outgoing,
+        }));
+        let init_rekey_wire = collect_wire(init_rekey_actions);
+        let resp_rekeyed = resp
+            .feed_bytes(&init_rekey_wire, TEST_NOW_UNIX, 111, &mut host_roster)
+            .unwrap();
+        assert_eq!(
+            resp_rekeyed,
+            vec![V2SessionAction::Rekeyed {
+                direction: RekeyDirection::Incoming,
+            }]
+        );
+
+        let resp_rekey_actions = resp.seal_rekey(112).unwrap();
+        assert!(resp_rekey_actions.contains(&V2SessionAction::Rekeyed {
+            direction: RekeyDirection::Outgoing,
+        }));
+        let resp_rekey_wire = collect_wire(resp_rekey_actions);
+        let init_rekeyed = init
+            .feed_bytes(&resp_rekey_wire, TEST_NOW_UNIX, 113, &mut cli_roster)
+            .unwrap();
+        assert_eq!(
+            init_rekeyed,
+            vec![V2SessionAction::Rekeyed {
+                direction: RekeyDirection::Incoming,
+            }]
+        );
+
+        let msg_wire = collect_wire(init.seal_data(b"post-rekey", 114).unwrap());
+        assert_eq!(
+            resp.feed_bytes(&msg_wire, TEST_NOW_UNIX, 115, &mut host_roster)
+                .unwrap(),
+            vec![V2SessionAction::AppData(b"post-rekey".to_vec())]
+        );
+
+        let close_actions = init
+            .seal_close(SessionCloseCode::NORMAL, "graceful-bye", 120)
+            .unwrap();
+        assert!(init.is_closed());
+        assert!(!init.is_established());
+        assert!(close_actions.contains(&V2SessionAction::CloseTransport {
+            code: SessionCloseCode::NORMAL,
+            reason: "graceful-bye".to_string(),
+        }));
+        let close_wire = collect_wire(close_actions);
+        let peer_close = resp
+            .feed_bytes(&close_wire, TEST_NOW_UNIX, 121, &mut host_roster)
+            .unwrap();
+        assert!(resp.is_closed());
+        assert!(!resp.is_established());
+        assert_eq!(
+            peer_close,
+            vec![V2SessionAction::CloseTransport {
+                code: SessionCloseCode::NORMAL,
+                reason: "graceful-bye".to_string(),
+            }]
+        );
+
+        let (_h2, _c2, _hr2, mut cr2, mut init2, mut resp2) = established_v2_pair();
+        let resp_close_actions = resp2
+            .seal_close(SessionCloseCode::PROTOCOL_ERROR, "peer-bye", 200)
+            .unwrap();
+        assert!(resp2.is_closed());
+        assert!(
+            resp_close_actions.contains(&V2SessionAction::CloseTransport {
+                code: SessionCloseCode::PROTOCOL_ERROR,
+                reason: "peer-bye".to_string(),
+            })
+        );
+        let resp_close_wire = collect_wire(resp_close_actions);
+        let init_close = init2
+            .feed_bytes(&resp_close_wire, TEST_NOW_UNIX, 201, &mut cr2)
+            .unwrap();
+        assert!(init2.is_closed());
+        assert_eq!(
+            init_close,
+            vec![V2SessionAction::CloseTransport {
+                code: SessionCloseCode::PROTOCOL_ERROR,
+                reason: "peer-bye".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn v2_session_oversized_seal_close_preserves_open_session() {
+        let (_host, _cli, mut host_roster, mut cli_roster, mut init, mut resp) =
+            established_v2_pair();
+        let oversized = "x".repeat(MAX_APP_DATA_LEN);
+        let over_padded = "y".repeat(MAX_PADDED_PAYLOAD_LEN - 1);
+
+        assert!(matches!(
+            init.seal_close(SessionCloseCode::NORMAL, &oversized, 100),
+            Err(CoreError::FrameTooLarge { .. })
+        ));
+        assert!(matches!(
+            init.seal_close(SessionCloseCode::NORMAL, &over_padded, 100),
+            Err(CoreError::FrameTooLarge { .. })
+        ));
+        assert!(!init.is_closed());
+        assert!(init.is_established());
+
+        let init_data = collect_wire(init.seal_data(b"init-still-open", 101).unwrap());
+        assert_eq!(
+            resp.feed_bytes(&init_data, TEST_NOW_UNIX, 102, &mut host_roster)
+                .unwrap(),
+            vec![V2SessionAction::AppData(b"init-still-open".to_vec())]
+        );
+
+        assert!(matches!(
+            resp.seal_close(SessionCloseCode::NORMAL, &oversized, 103),
+            Err(CoreError::FrameTooLarge { .. })
+        ));
+        assert!(matches!(
+            resp.seal_close(SessionCloseCode::NORMAL, &over_padded, 103),
+            Err(CoreError::FrameTooLarge { .. })
+        ));
+        assert!(!resp.is_closed());
+        assert!(resp.is_established());
+
+        let resp_data = collect_wire(resp.seal_data(b"resp-still-open", 104).unwrap());
+        assert_eq!(
+            init.feed_bytes(&resp_data, TEST_NOW_UNIX, 105, &mut cli_roster)
+                .unwrap(),
+            vec![V2SessionAction::AppData(b"resp-still-open".to_vec())]
+        );
+    }
+
+    #[test]
+    fn v2_session_send_helpers_require_established_transport() {
+        let (host, cli, mut host_roster, _cli_roster, mut init, mut resp) = established_v2_pair();
+
+        let mut fresh_init =
+            V2SessionInitiator::new(&cli, host.host_id(), [0x66; 32], None, None).unwrap();
+        assert_init_not_ready(&mut fresh_init, 1);
+
+        let m1 = collect_wire(fresh_init.start(TEST_NOW_UNIX).unwrap());
+        assert_init_not_ready(&mut fresh_init, 2);
+
+        let mut fresh_resp = V2SessionResponder::new(&host).unwrap();
+        assert_resp_not_ready(&mut fresh_resp, 1);
+
+        fresh_resp
+            .feed_bytes(&m1, TEST_NOW_UNIX, 2, &mut host_roster)
+            .unwrap();
+        assert_resp_not_ready(&mut fresh_resp, 3);
+
+        let close_wire = collect_wire(
+            init.seal_close(SessionCloseCode::NORMAL, "done", 50)
+                .unwrap(),
+        );
+        resp.feed_bytes(&close_wire, TEST_NOW_UNIX, 51, &mut host_roster)
+            .unwrap();
+
+        assert_init_not_ready(&mut init, 52);
+        assert_resp_not_ready(&mut resp, 52);
+    }
+
+    #[test]
+    fn v2_session_initiator_revocation_crl_for_local_device_closes_session() {
+        let (host, cli, _host_roster, mut cli_roster, mut init, mut resp) = established_v2_pair();
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: host.host_id().to_string(),
+                seq: 1,
+                revoked_devices: vec![cli.device_id()],
+                revoked_nonces: vec![],
+                ts: "2026-11-21T12:00:00Z".to_string(),
+            },
+            host.signing_key(),
+        )
+        .unwrap();
+        let crl_wire = collect_wire(resp.seal_revocation(&crl, 50).unwrap());
+
+        assert!(matches!(
+            init.feed_bytes(&crl_wire, TEST_NOW_UNIX, 51, &mut cli_roster),
+            Err(CoreError::PeerRevoked(_))
+        ));
+        assert!(init.is_closed());
+        assert!(!init.is_established());
+        assert!(matches!(init.seal_ping(1, 52), Err(CoreError::NotReady(_))));
+        assert!(matches!(
+            init.feed_bytes(&[], TEST_NOW_UNIX, 52, &mut cli_roster),
+            Err(CoreError::SessionClosed { .. })
+        ));
+    }
 }
