@@ -3,11 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ed25519_dalek::SigningKey;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use snow::Builder;
-use snow::params::NoiseParams;
 
 use tendril_core::MAX_FRAME_LEN;
 use tendril_core::crypto::{
@@ -18,14 +15,16 @@ use tendril_core::crypto::{
 };
 use tendril_core::grants::{
     CRL_DOMAIN, GRANT_DOMAIN, Grant, GrantUnsigned, RevocationList, RevocationListUnsigned,
-    canonical_json, crl_signed_bytes, grant_signed_bytes, sign_crl, sign_grant,
+    canonical_json, crl_signed_bytes, grant_signed_bytes, sign_crl_deterministic,
+    sign_grant_deterministic,
 };
 use tendril_core::identity::{
-    EndpointIdentity, RotationRecord, rotation_signed_bytes, sign_rotation,
+    EndpointIdentity, RotationRecord, rotation_signed_bytes, sign_rotation_deterministic,
 };
+use tendril_core::noise::{NoiseHfsHandshakeBuilder, NoiseHfsSeeds};
 use tendril_core::pairing::{
-    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, enroll_proof_bytes, mint_enrollment_token,
-    sign_enroll_proof, verify_enrollment_token,
+    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, enroll_proof_bytes, mint_enrollment_token_deterministic,
+    sign_enroll_proof_deterministic, verify_enrollment_token,
 };
 use tendril_core::roster::Roster;
 use tendril_core::wire::{
@@ -90,14 +89,18 @@ struct RotationStep {
 #[derive(Serialize)]
 struct RotationVector {
     pinned_signing_seed_hex: String,
+    pinned_signing_mldsa_seed_hex: String,
     pinned_signing_pub_hex: String,
     pinned_static_scalar_hex: String,
     pinned_static_pub_hex: String,
     step1_signing_seed_hex: String,
+    step1_signing_mldsa_seed_hex: String,
     step1_static_scalar_hex: String,
     step2_signing_seed_hex: String,
+    step2_signing_mldsa_seed_hex: String,
     step2_static_scalar_hex: String,
     fork_signing_seed_hex: String,
+    fork_signing_mldsa_seed_hex: String,
     fork_static_scalar_hex: String,
     chain: Vec<RotationStep>,
     fork_record: RotationStep,
@@ -107,9 +110,11 @@ struct RotationVector {
 struct GrantsVector {
     root_issuer_id: String,
     root_signing_seed_hex: String,
+    root_signing_mldsa_seed_hex: String,
     root_signing_pub_hex: String,
     delegate_id: String,
     delegate_signing_seed_hex: String,
+    delegate_signing_mldsa_seed_hex: String,
     delegate_signing_pub_hex: String,
     leaf_id: String,
     root_unsorted_json: String,
@@ -129,9 +134,11 @@ struct PairTranscriptVector {
     initiator_static_scalar_hex: String,
     initiator_static_pub_hex: String,
     initiator_ephem_scalar_hex: String,
+    initiator_mlkem768_keygen_seed_hex: String,
     responder_static_scalar_hex: String,
     responder_static_pub_hex: String,
     responder_ephem_scalar_hex: String,
+    responder_mlkem768_encaps_seed_hex: String,
     host_hello_json: String,
     msg1_frame_hex: String,
     msg2_frame_hex: String,
@@ -152,9 +159,11 @@ struct SessionTranscriptVector {
     initiator_static_scalar_hex: String,
     initiator_static_pub_hex: String,
     initiator_ephem_scalar_hex: String,
+    initiator_mlkem768_keygen_seed_hex: String,
     responder_static_scalar_hex: String,
     responder_static_pub_hex: String,
     responder_ephem_scalar_hex: String,
+    responder_mlkem768_encaps_seed_hex: String,
     host_hello_json: String,
     msg1_frame_hex: String,
     msg2_frame_hex: String,
@@ -184,17 +193,23 @@ struct M2mEnrollmentVector {
     now_unix: u64,
     anchor_id: String,
     anchor_signing_seed_hex: String,
+    anchor_signing_mldsa_seed_hex: String,
     anchor_signing_pub_hex: String,
     responder_host_id: String,
     responder_static_scalar_hex: String,
     responder_static_pub_hex: String,
     responder_ephem_scalar_hex: String,
+    responder_mlkem768_encaps_seed_hex: String,
+    responder_signing_seed_hex: String,
+    responder_signing_mldsa_seed_hex: String,
     responder_signing_pub_hex: String,
     initiator_static_scalar_hex: String,
     initiator_static_pub_hex: String,
     initiator_device_id: String,
     initiator_ephem_scalar_hex: String,
+    initiator_mlkem768_keygen_seed_hex: String,
     initiator_signing_seed_hex: String,
+    initiator_signing_mldsa_seed_hex: String,
     initiator_signing_pub_hex: String,
     token_jcs_json: String,
     token_signed_bytes_hex: String,
@@ -212,6 +227,13 @@ struct M2mEnrollmentVector {
     pair_response_json: String,
     pair_response_frame_hex: String,
     replayed_response_json: String,
+}
+
+fn concat64(a: &[u8; 32], b: &[u8; 32]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(a);
+    out[32..].copy_from_slice(b);
+    out
 }
 
 fn seq_bytes(start: u8) -> [u8; 32] {
@@ -307,22 +329,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. rotation.json
     let seed0 = seq_bytes(0x00);
-    let key0 = SigningKey::from_bytes(&seed0);
+    let mldsa_seed0 = seq_bytes(0x80);
+    let key0 = SigningKeypair::from_seeds(seed0, mldsa_seed0);
     let static0 = seq_bytes(0x40);
     let static0_pub = x25519_public_from_scalar(&static0);
 
     let seed1 = seq_bytes(0x10);
-    let key1 = SigningKey::from_bytes(&seed1);
+    let mldsa_seed1 = seq_bytes(0x90);
+    let key1 = SigningKeypair::from_seeds(seed1, mldsa_seed1);
     let static1 = seq_bytes(0x50);
     let static1_pub = x25519_public_from_scalar(&static1);
 
     let seed2 = seq_bytes(0x20);
-    let key2 = SigningKey::from_bytes(&seed2);
+    let mldsa_seed2 = seq_bytes(0xA0);
+    let key2 = SigningKeypair::from_seeds(seed2, mldsa_seed2);
     let static2 = seq_bytes(0x60);
     let static2_pub = x25519_public_from_scalar(&static2);
 
     let fork_seed = seq_bytes(0x30);
-    let fork_key = SigningKey::from_bytes(&fork_seed);
+    let fork_mldsa_seed = seq_bytes(0xB0);
+    let fork_key = SigningKeypair::from_seeds(fork_seed, fork_mldsa_seed);
     let fork_static = seq_bytes(0x70);
     let fork_static_pub = x25519_public_from_scalar(&fork_static);
 
@@ -330,59 +356,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ts2 = 1_795_219_200; // 2026-11-21T00:00:00Z
     let ts_fork = 1_795_219_260; // 2026-11-21T00:01:00Z
 
-    let rec1 = sign_rotation(
-        1,
-        &key0,
-        &key1.verifying_key().to_bytes(),
-        &static1_pub,
-        ts1,
-    )?;
-    let bytes1 = rotation_signed_bytes(
-        1,
-        &key0.verifying_key().to_bytes(),
-        &key1.verifying_key().to_bytes(),
-        &static1_pub,
-        ts1,
-    );
-    let rec2 = sign_rotation(
-        2,
-        &key1,
-        &key2.verifying_key().to_bytes(),
-        &static2_pub,
-        ts2,
-    )?;
-    let bytes2 = rotation_signed_bytes(
-        2,
-        &key1.verifying_key().to_bytes(),
-        &key2.verifying_key().to_bytes(),
-        &static2_pub,
-        ts2,
-    );
-    let rec_fork = sign_rotation(
-        2,
-        &key1,
-        &fork_key.verifying_key().to_bytes(),
-        &fork_static_pub,
-        ts_fork,
-    )?;
+    let rec1 = sign_rotation_deterministic(1, &key0, key1.public_key(), &static1_pub, ts1)?;
+    let bytes1 = rotation_signed_bytes(1, key0.public_key(), key1.public_key(), &static1_pub, ts1);
+    let rec2 = sign_rotation_deterministic(2, &key1, key2.public_key(), &static2_pub, ts2)?;
+    let bytes2 = rotation_signed_bytes(2, key1.public_key(), key2.public_key(), &static2_pub, ts2);
+    let rec_fork =
+        sign_rotation_deterministic(2, &key1, fork_key.public_key(), &fork_static_pub, ts_fork)?;
     let bytes_fork = rotation_signed_bytes(
         2,
-        &key1.verifying_key().to_bytes(),
-        &fork_key.verifying_key().to_bytes(),
+        key1.public_key(),
+        fork_key.public_key(),
         &fork_static_pub,
         ts_fork,
     );
 
     let rotation = RotationVector {
         pinned_signing_seed_hex: hex::encode(seed0),
-        pinned_signing_pub_hex: hex::encode(key0.verifying_key().to_bytes()),
+        pinned_signing_mldsa_seed_hex: hex::encode(mldsa_seed0),
+        pinned_signing_pub_hex: hex::encode(key0.public_bytes()),
         pinned_static_scalar_hex: hex::encode(static0),
         pinned_static_pub_hex: hex::encode(static0_pub),
         step1_signing_seed_hex: hex::encode(seed1),
+        step1_signing_mldsa_seed_hex: hex::encode(mldsa_seed1),
         step1_static_scalar_hex: hex::encode(static1),
         step2_signing_seed_hex: hex::encode(seed2),
+        step2_signing_mldsa_seed_hex: hex::encode(mldsa_seed2),
         step2_static_scalar_hex: hex::encode(static2),
         fork_signing_seed_hex: hex::encode(fork_seed),
+        fork_signing_mldsa_seed_hex: hex::encode(fork_mldsa_seed),
         fork_static_scalar_hex: hex::encode(fork_static),
         chain: vec![
             RotationStep {
@@ -403,12 +404,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. grants.json
     let root_seed = seq_bytes(0x80);
-    let root_signing = SigningKey::from_bytes(&root_seed);
+    let root_mldsa_seed = seq_bytes(0xC0);
+    let root_signing = SigningKeypair::from_seeds(root_seed, root_mldsa_seed);
     let root_static = x25519_public_from_scalar(&seq_bytes(0x90));
     let root_id = device_id(&root_static);
 
     let del_seed = seq_bytes(0xa0);
-    let del_signing = SigningKey::from_bytes(&del_seed);
+    let del_mldsa_seed = seq_bytes(0xE0);
+    let del_signing = SigningKeypair::from_seeds(del_seed, del_mldsa_seed);
     let del_static = x25519_public_from_scalar(&seq_bytes(0xb0));
     let del_id = device_id(&del_static);
 
@@ -422,7 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root_unsigned: GrantUnsigned = serde_json::from_str(&root_unsorted_json)?;
     let root_jcs_json = canonical_json(&root_unsigned)?;
     let root_signed_bytes = grant_signed_bytes(&root_unsigned)?;
-    let root_grant = sign_grant(root_unsigned, &root_signing)?;
+    let root_grant = sign_grant_deterministic(root_unsigned, &root_signing)?;
 
     let valid_child_unsigned = GrantUnsigned {
         v: 1,
@@ -439,7 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         uses: None,
         machine: None,
     };
-    let delegated_valid = sign_grant(valid_child_unsigned, &del_signing)?;
+    let delegated_valid = sign_grant_deterministic(valid_child_unsigned, &del_signing)?;
 
     let widened_child_unsigned = GrantUnsigned {
         v: 1,
@@ -453,7 +456,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         uses: None,
         machine: None,
     };
-    let delegated_widened = sign_grant(widened_child_unsigned, &del_signing)?;
+    let delegated_widened = sign_grant_deterministic(widened_child_unsigned, &del_signing)?;
 
     let crl_unsigned = RevocationListUnsigned {
         v: 1,
@@ -465,7 +468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let crl_jcs_json = canonical_json(&crl_unsigned)?;
     let crl_signed_bytes = crl_signed_bytes(&crl_unsigned)?;
-    let revocation_list = sign_crl(crl_unsigned, &root_signing)?;
+    let revocation_list = sign_crl_deterministic(crl_unsigned, &root_signing)?;
 
     assert!(root_signed_bytes.starts_with(GRANT_DOMAIN));
     assert!(crl_signed_bytes.starts_with(CRL_DOMAIN));
@@ -473,10 +476,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grants_vec = GrantsVector {
         root_issuer_id: root_id,
         root_signing_seed_hex: hex::encode(root_seed),
-        root_signing_pub_hex: hex::encode(root_signing.verifying_key().to_bytes()),
+        root_signing_mldsa_seed_hex: hex::encode(root_mldsa_seed),
+        root_signing_pub_hex: hex::encode(root_signing.public_bytes()),
         delegate_id: del_id,
         delegate_signing_seed_hex: hex::encode(del_seed),
-        delegate_signing_pub_hex: hex::encode(del_signing.verifying_key().to_bytes()),
+        delegate_signing_mldsa_seed_hex: hex::encode(del_mldsa_seed),
+        delegate_signing_pub_hex: hex::encode(del_signing.public_bytes()),
         leaf_id,
         root_unsorted_json,
         root_jcs_json,
@@ -519,19 +524,31 @@ fn build_pair_transcript(
     init_static_pub: &[u8; 32],
 ) -> Result<PairTranscriptVector, Box<dyn std::error::Error>> {
     let init_ephem = seq_bytes(0x51);
+    let init_d = seq_bytes(0x52);
+    let init_z = seq_bytes(0x53);
     let resp_ephem = seq_bytes(0x61);
+    let resp_m = seq_bytes(0x62);
     let preamble = Preamble::v1(Intent::Pair).encode();
-    let params: NoiseParams = NOISE_PATTERN.parse()?;
 
-    let mut initiator = Builder::new(params.clone())
-        .local_private_key(init_static)?
-        .prologue(&preamble)?
-        .fixed_ephemeral_key_for_testing_only(&init_ephem)
+    let mut initiator = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(init_static)
+        .prologue(&preamble)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: init_ephem,
+            mlkem_d: init_d,
+            mlkem_z: init_z,
+            mlkem_m: [0u8; 32],
+        })
         .build_initiator()?;
-    let mut responder = Builder::new(params)
-        .local_private_key(resp_static)?
-        .prologue(&preamble)?
-        .fixed_ephemeral_key_for_testing_only(&resp_ephem)
+    let mut responder = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(resp_static)
+        .prologue(&preamble)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: resp_ephem,
+            mlkem_d: [0u8; 32],
+            mlkem_z: [0u8; 32],
+            mlkem_m: resp_m,
+        })
         .build_responder()?;
 
     let mut buf = vec![0u8; MAX_FRAME_LEN];
@@ -542,9 +559,12 @@ fn build_pair_transcript(
     let (body1, _) = decode_frame(&msg1_frame)?;
     let _ = responder.read_message(body1, &mut pt)?;
 
+    let host_signing = SigningKeypair::from_seeds(seq_bytes(0x71), seq_bytes(0x75));
+    let host_signing_pub_b64 = host_signing.public_key().to_b64url();
     let host_hello = HostHello {
         host_id: device_id(resp_static_pub),
         proto_version: 1,
+        signing_pub: host_signing_pub_b64.clone(),
         rotation: vec![],
     };
     let host_hello_json = serde_json::to_string(&host_hello)?;
@@ -554,8 +574,8 @@ fn build_pair_transcript(
     let n_pt2 = initiator.read_message(body2, &mut pt)?;
     assert_eq!(&pt[..n_pt2], host_hello_json.as_bytes());
 
-    let post_msg2_hash: [u8; 32] = initiator.get_handshake_hash().try_into()?;
-    let resp_hash: [u8; 32] = responder.get_handshake_hash().try_into()?;
+    let post_msg2_hash: [u8; 32] = *initiator.get_handshake_hash();
+    let resp_hash: [u8; 32] = *responder.get_handshake_hash();
     assert_eq!(post_msg2_hash, resp_hash);
 
     let pairing_code = "TND-4F9K-22XQ-8N3P".to_string();
@@ -577,22 +597,18 @@ fn build_pair_transcript(
     let (body3, _) = decode_frame(&msg3_frame)?;
     let n_pt3 = responder.read_message(body3, &mut pt)?;
     assert_eq!(&pt[..n_pt3], pair_claim_json.as_bytes());
-    assert_eq!(
-        responder.get_remote_static(),
-        Some(init_static_pub.as_slice())
-    );
+    assert_eq!(responder.get_remote_static(), Some(init_static_pub));
 
-    let final_hash: [u8; 32] = initiator.get_handshake_hash().try_into()?;
-    assert_eq!(final_hash, responder.get_handshake_hash());
+    let final_hash: [u8; 32] = *initiator.get_handshake_hash();
+    assert_eq!(final_hash, *responder.get_handshake_hash());
 
     let mut init_tx = initiator.into_transport_mode()?;
     let mut resp_tx = responder.into_transport_mode()?;
 
-    let host_signing = SigningKey::from_bytes(&seq_bytes(0x71));
     let pair_resp = PairResponse::Success {
         device_id: device_id(init_static_pub),
         status: "pending".to_string(),
-        host_signing_pub: b64url_encode(&host_signing.verifying_key().to_bytes()),
+        host_signing_pub: host_signing_pub_b64,
     };
     let pair_response_json = serde_json::to_string(&pair_resp)?;
     let n4 = resp_tx.write_message(pair_response_json.as_bytes(), &mut buf)?;
@@ -606,9 +622,11 @@ fn build_pair_transcript(
         initiator_static_scalar_hex: hex::encode(init_static),
         initiator_static_pub_hex: hex::encode(init_static_pub),
         initiator_ephem_scalar_hex: hex::encode(init_ephem),
+        initiator_mlkem768_keygen_seed_hex: hex::encode(concat64(&init_d, &init_z)),
         responder_static_scalar_hex: hex::encode(resp_static),
         responder_static_pub_hex: hex::encode(resp_static_pub),
         responder_ephem_scalar_hex: hex::encode(resp_ephem),
+        responder_mlkem768_encaps_seed_hex: hex::encode(resp_m),
         host_hello_json,
         msg1_frame_hex: hex::encode(msg1_frame),
         msg2_frame_hex: hex::encode(msg2_frame),
@@ -631,19 +649,31 @@ fn build_session_transcript(
     init_static_pub: &[u8; 32],
 ) -> Result<SessionTranscriptVector, Box<dyn std::error::Error>> {
     let init_ephem = seq_bytes(0x81);
+    let init_d = seq_bytes(0x82);
+    let init_z = seq_bytes(0x83);
     let resp_ephem = seq_bytes(0x91);
+    let resp_m = seq_bytes(0x92);
     let preamble = Preamble::v1(Intent::Session).encode();
-    let params: NoiseParams = NOISE_PATTERN.parse()?;
 
-    let mut initiator = Builder::new(params.clone())
-        .local_private_key(init_static)?
-        .prologue(&preamble)?
-        .fixed_ephemeral_key_for_testing_only(&init_ephem)
+    let mut initiator = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(init_static)
+        .prologue(&preamble)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: init_ephem,
+            mlkem_d: init_d,
+            mlkem_z: init_z,
+            mlkem_m: [0u8; 32],
+        })
         .build_initiator()?;
-    let mut responder = Builder::new(params)
-        .local_private_key(resp_static)?
-        .prologue(&preamble)?
-        .fixed_ephemeral_key_for_testing_only(&resp_ephem)
+    let mut responder = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(resp_static)
+        .prologue(&preamble)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: resp_ephem,
+            mlkem_d: [0u8; 32],
+            mlkem_z: [0u8; 32],
+            mlkem_m: resp_m,
+        })
         .build_responder()?;
 
     let mut buf = vec![0u8; MAX_FRAME_LEN];
@@ -654,9 +684,11 @@ fn build_session_transcript(
     let (body1, _) = decode_frame(&msg1_frame)?;
     let _ = responder.read_message(body1, &mut pt)?;
 
+    let host_signing = SigningKeypair::from_seeds(seq_bytes(0x71), seq_bytes(0x75));
     let host_hello = HostHello {
         host_id: device_id(resp_static_pub),
         proto_version: 1,
+        signing_pub: host_signing.public_key().to_b64url(),
         rotation: vec![],
     };
     let host_hello_json = serde_json::to_string(&host_hello)?;
@@ -665,7 +697,7 @@ fn build_session_transcript(
     let (body2, _) = decode_frame(&msg2_frame)?;
     let _ = initiator.read_message(body2, &mut pt)?;
 
-    let post_msg2_hash: [u8; 32] = initiator.get_handshake_hash().try_into()?;
+    let post_msg2_hash: [u8; 32] = *initiator.get_handshake_hash();
 
     let session_hello = SessionHello {
         device_id: device_id(init_static_pub),
@@ -678,7 +710,7 @@ fn build_session_transcript(
     let (body3, _) = decode_frame(&msg3_frame)?;
     let _ = responder.read_message(body3, &mut pt)?;
 
-    let final_hash: [u8; 32] = initiator.get_handshake_hash().try_into()?;
+    let final_hash: [u8; 32] = *initiator.get_handshake_hash();
 
     let mut init_tx = initiator.into_transport_mode()?;
     let mut resp_tx = responder.into_transport_mode()?;
@@ -693,11 +725,11 @@ fn build_session_transcript(
     let rekey_inner = encode_inner_frame(InnerFrameType::Rekey, &[])?;
     let nr = init_tx.write_message(&rekey_inner, &mut buf)?;
     let rekey_frame = encode_frame(&buf[..nr])?;
-    init_tx.rekey_outgoing();
+    init_tx.rekey_outgoing()?;
     let (rbody, _) = decode_frame(&rekey_frame)?;
     let nr_pt = resp_tx.read_message(rbody, &mut pt)?;
     assert_eq!(&pt[..nr_pt], rekey_inner.as_slice());
-    resp_tx.rekey_incoming();
+    resp_tx.rekey_incoming()?;
 
     let post_rekey_inner = encode_inner_frame(InnerFrameType::Data, b"after rekey")?;
     let np = init_tx.write_message(&post_rekey_inner, &mut buf)?;
@@ -711,9 +743,11 @@ fn build_session_transcript(
         initiator_static_scalar_hex: hex::encode(init_static),
         initiator_static_pub_hex: hex::encode(init_static_pub),
         initiator_ephem_scalar_hex: hex::encode(init_ephem),
+        initiator_mlkem768_keygen_seed_hex: hex::encode(concat64(&init_d, &init_z)),
         responder_static_scalar_hex: hex::encode(resp_static),
         responder_static_pub_hex: hex::encode(resp_static_pub),
         responder_ephem_scalar_hex: hex::encode(resp_ephem),
+        responder_mlkem768_encaps_seed_hex: hex::encode(resp_m),
         host_hello_json,
         msg1_frame_hex: hex::encode(msg1_frame),
         msg2_frame_hex: hex::encode(msg2_frame),
@@ -734,37 +768,43 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
     let now_unix = 1_795_132_800u64;
     let resp_static_scalar = seq_bytes(0x71);
     let resp_signing_seed = seq_bytes(0x72);
+    let resp_signing_mldsa_seed = seq_bytes(0x76);
     let resp_ephem_scalar = seq_bytes(0x73);
+    let resp_m = seq_bytes(0x74);
     let resp_id = EndpointIdentity::from_keys(
         StaticKeypair::from_scalar(resp_static_scalar),
-        SigningKeypair::from_seed(resp_signing_seed),
+        SigningKeypair::from_seeds(resp_signing_seed, resp_signing_mldsa_seed),
     );
     let resp_static_pub = *resp_id.static_key().public_bytes();
-    let resp_signing_pub = *resp_id.signing_key().public_bytes();
+    let resp_signing_pub = resp_id.signing_key().public_key().clone();
     let responder_host_id = resp_id.host_id().to_string();
 
     let init_static_scalar = seq_bytes(0x81);
     let init_signing_seed = seq_bytes(0x82);
+    let init_signing_mldsa_seed = seq_bytes(0x86);
     let init_ephem_scalar = seq_bytes(0x83);
+    let init_d = seq_bytes(0x84);
+    let init_z = seq_bytes(0x85);
     let init_id = EndpointIdentity::from_keys(
         StaticKeypair::from_scalar(init_static_scalar),
-        SigningKeypair::from_seed(init_signing_seed),
+        SigningKeypair::from_seeds(init_signing_seed, init_signing_mldsa_seed),
     );
     let init_static_pub = *init_id.static_key().public_bytes();
-    let init_signing_pub = *init_id.signing_key().public_bytes();
+    let init_signing_pub = init_id.signing_key().public_key().clone();
     let initiator_device_id = init_id.device_id();
 
     let anchor_id = "anchor-ci".to_string();
     let anchor_signing_seed = seq_bytes(0x91);
+    let anchor_signing_mldsa_seed = seq_bytes(0x95);
     let anchor_identity = EndpointIdentity::from_keys(
         StaticKeypair::from_scalar(seq_bytes(0x92)),
-        SigningKeypair::from_seed(anchor_signing_seed),
+        SigningKeypair::from_seeds(anchor_signing_seed, anchor_signing_mldsa_seed),
     )
     .with_host_id(&anchor_id);
-    let anchor_signing_pub = *anchor_identity.signing_key().public_bytes();
+    let anchor_signing_pub = anchor_identity.signing_key().public_key().clone();
 
     let nonce = [0x5Au8; 16];
-    let enrollment_token = mint_enrollment_token(
+    let enrollment_token = mint_enrollment_token_deterministic(
         &anchor_identity,
         &responder_host_id,
         Some(&initiator_device_id),
@@ -776,17 +816,26 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
     let token_jcs_json = canonical_json(&token_unsigned)?;
     let token_signed_bytes = grant_signed_bytes(&token_unsigned)?;
 
-    let params: NoiseParams = NOISE_PATTERN.parse()?;
     let preamble = Preamble::v1(Intent::Pair).encode();
-    let mut initiator = Builder::new(params.clone())
-        .local_private_key(&init_static_scalar)?
-        .prologue(&preamble)?
-        .fixed_ephemeral_key_for_testing_only(&init_ephem_scalar)
+    let mut initiator = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(&init_static_scalar)
+        .prologue(&preamble)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: init_ephem_scalar,
+            mlkem_d: init_d,
+            mlkem_z: init_z,
+            mlkem_m: [0u8; 32],
+        })
         .build_initiator()?;
-    let mut responder = Builder::new(params)
-        .local_private_key(&resp_static_scalar)?
-        .prologue(&preamble)?
-        .fixed_ephemeral_key_for_testing_only(&resp_ephem_scalar)
+    let mut responder = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(&resp_static_scalar)
+        .prologue(&preamble)
+        .fixed_hfs_seeds_for_testing_only(NoiseHfsSeeds {
+            x25519: resp_ephem_scalar,
+            mlkem_d: [0u8; 32],
+            mlkem_z: [0u8; 32],
+            mlkem_m: resp_m,
+        })
         .build_responder()?;
 
     let mut buf = vec![0u8; MAX_FRAME_LEN];
@@ -800,6 +849,7 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
     let host_hello = HostHello {
         host_id: responder_host_id.clone(),
         proto_version: 1,
+        signing_pub: resp_signing_pub.to_b64url(),
         rotation: vec![],
     };
     let host_hello_json = serde_json::to_string(&host_hello)?;
@@ -809,17 +859,17 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
     let n_pt2 = initiator.read_message(body2, &mut pt)?;
     assert_eq!(&pt[..n_pt2], host_hello_json.as_bytes());
 
-    let post_msg2_hash: [u8; 32] = initiator.get_handshake_hash().try_into()?;
-    assert_eq!(post_msg2_hash, responder.get_handshake_hash());
+    let post_msg2_hash: [u8; 32] = *initiator.get_handshake_hash();
+    assert_eq!(post_msg2_hash, *responder.get_handshake_hash());
 
     let proof_bytes =
         enroll_proof_bytes(&post_msg2_hash, &init_static_pub, &enrollment_token.nonce);
-    let proof_sig = sign_enroll_proof(
-        &init_id.signing_key().signing_key(),
+    let proof_sig = sign_enroll_proof_deterministic(
+        init_id.signing_key(),
         &post_msg2_hash,
         &init_static_pub,
         &enrollment_token.nonce,
-    );
+    )?;
     let enroll_proof_b64url = b64url_encode(&proof_sig);
 
     let claim = PairClaim {
@@ -827,7 +877,7 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
         kind: "machine".to_string(),
         code_mac: None,
         enrollment_token: Some(enrollment_token.clone()),
-        signing_pub: Some(b64url_encode(&init_signing_pub)),
+        signing_pub: Some(init_signing_pub.to_b64url()),
         enroll_proof: Some(enroll_proof_b64url.clone()),
     };
     let pair_claim_json = serde_json::to_string(&claim)?;
@@ -837,11 +887,11 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
     let n_pt3 = responder.read_message(body3, &mut pt)?;
     assert_eq!(&pt[..n_pt3], pair_claim_json.as_bytes());
 
-    let final_hash: [u8; 32] = initiator.get_handshake_hash().try_into()?;
-    assert_eq!(final_hash, responder.get_handshake_hash());
+    let final_hash: [u8; 32] = *initiator.get_handshake_hash();
+    assert_eq!(final_hash, *responder.get_handshake_hash());
 
     let mut roster = Roster::new();
-    roster.add_trust_anchor(anchor_id.clone(), anchor_signing_pub)?;
+    roster.add_trust_anchor(anchor_id.clone(), anchor_signing_pub.clone())?;
     let policy = EnrollmentPolicy::enabled_default();
     let (_, na) = verify_enrollment_token(
         &enrollment_token,
@@ -853,14 +903,19 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
         &roster,
     )?;
     roster.burn_enrollment_nonce(&enrollment_token.nonce, na, now_unix)?;
-    roster.record_enrolled_machine(init_static_pub, init_signing_pub, claim.name, claim.kind)?;
+    roster.record_enrolled_machine(
+        init_static_pub,
+        init_signing_pub.clone(),
+        claim.name,
+        claim.kind,
+    )?;
 
     let mut init_tx = initiator.into_transport_mode()?;
     let mut resp_tx = responder.into_transport_mode()?;
     let pair_resp = PairResponse::Success {
         device_id: initiator_device_id.clone(),
         status: "active".to_string(),
-        host_signing_pub: b64url_encode(&resp_signing_pub),
+        host_signing_pub: resp_signing_pub.to_b64url(),
     };
     let pair_response_json = serde_json::to_string(&pair_resp)?;
     let n4 = resp_tx.write_message(pair_response_json.as_bytes(), &mut buf)?;
@@ -880,18 +935,24 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
         now_unix,
         anchor_id,
         anchor_signing_seed_hex: hex::encode(anchor_signing_seed),
-        anchor_signing_pub_hex: hex::encode(anchor_signing_pub),
+        anchor_signing_mldsa_seed_hex: hex::encode(anchor_signing_mldsa_seed),
+        anchor_signing_pub_hex: hex::encode(anchor_signing_pub.as_bytes()),
         responder_host_id,
         responder_static_scalar_hex: hex::encode(resp_static_scalar),
         responder_static_pub_hex: hex::encode(resp_static_pub),
         responder_ephem_scalar_hex: hex::encode(resp_ephem_scalar),
-        responder_signing_pub_hex: hex::encode(resp_signing_pub),
+        responder_mlkem768_encaps_seed_hex: hex::encode(resp_m),
+        responder_signing_seed_hex: hex::encode(resp_signing_seed),
+        responder_signing_mldsa_seed_hex: hex::encode(resp_signing_mldsa_seed),
+        responder_signing_pub_hex: hex::encode(resp_signing_pub.as_bytes()),
         initiator_static_scalar_hex: hex::encode(init_static_scalar),
         initiator_static_pub_hex: hex::encode(init_static_pub),
         initiator_device_id,
         initiator_ephem_scalar_hex: hex::encode(init_ephem_scalar),
+        initiator_mlkem768_keygen_seed_hex: hex::encode(concat64(&init_d, &init_z)),
         initiator_signing_seed_hex: hex::encode(init_signing_seed),
-        initiator_signing_pub_hex: hex::encode(init_signing_pub),
+        initiator_signing_mldsa_seed_hex: hex::encode(init_signing_mldsa_seed),
+        initiator_signing_pub_hex: hex::encode(init_signing_pub.as_bytes()),
         token_jcs_json,
         token_signed_bytes_hex: hex::encode(token_signed_bytes),
         enrollment_token,

@@ -4,14 +4,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use snow::Builder;
-use snow::params::NoiseParams;
 
 use tendril_core::MAX_FRAME_LEN;
 use tendril_core::crypto::{
-    argon2id_pairing_key, b64url_decode_array, b64url_encode, compute_code_mac, device_id,
-    fingerprint_device, fingerprint_host, normalize_code, pairing_sas, verify_code_mac,
-    x25519_public_from_scalar,
+    HYBRID_SIG_LEN, HybridSigningPublicKey, SigningKeypair, argon2id_pairing_key, b64url_decode,
+    b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
+    fingerprint_host, normalize_code, pairing_sas, verify_code_mac, x25519_public_from_scalar,
 };
 use tendril_core::error::CoreError;
 use tendril_core::grants::{
@@ -23,8 +21,9 @@ use tendril_core::identity::{
     RotationRecord, detect_rotation_fork, rotation_signed_bytes, sign_rotation,
     verify_rotation_chain, verify_rotation_record,
 };
+use tendril_core::noise::{NoiseHfsHandshakeBuilder, NoiseHfsSeeds};
 use tendril_core::pairing::{
-    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, enroll_proof_bytes, sign_enroll_proof,
+    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, enroll_proof_bytes, sign_enroll_proof_deterministic,
     verify_enroll_proof, verify_enrollment_token,
 };
 use tendril_core::roster::Roster;
@@ -40,6 +39,30 @@ fn vectors_dir() -> PathBuf {
 fn decode_hex_array<const N: usize>(s: &str) -> [u8; N] {
     let bytes = hex::decode(s).expect("valid hex");
     bytes.try_into().expect("exact length")
+}
+
+fn decode_hybrid_pub(s: &str) -> HybridSigningPublicKey {
+    let bytes = hex::decode(s).expect("valid hex");
+    HybridSigningPublicKey::from_bytes(&bytes).expect("valid hybrid signing public key")
+}
+
+fn init_hfs_seeds(ephem_hex: &str, keygen_seed_hex: &str) -> NoiseHfsSeeds {
+    let keygen = decode_hex_array::<64>(keygen_seed_hex);
+    NoiseHfsSeeds {
+        x25519: decode_hex_array::<32>(ephem_hex),
+        mlkem_d: keygen[..32].try_into().unwrap(),
+        mlkem_z: keygen[32..].try_into().unwrap(),
+        mlkem_m: [0u8; 32],
+    }
+}
+
+fn resp_hfs_seeds(ephem_hex: &str, encaps_seed_hex: &str) -> NoiseHfsSeeds {
+    NoiseHfsSeeds {
+        x25519: decode_hex_array::<32>(ephem_hex),
+        mlkem_d: [0u8; 32],
+        mlkem_z: [0u8; 32],
+        mlkem_m: decode_hex_array::<32>(encaps_seed_hex),
+    }
 }
 
 #[derive(Deserialize)]
@@ -88,6 +111,7 @@ struct RotationVector {
     pinned_signing_pub_hex: String,
     pinned_static_pub_hex: String,
     step2_signing_seed_hex: String,
+    step2_signing_mldsa_seed_hex: String,
     step2_static_scalar_hex: String,
     chain: Vec<RotationStep>,
     fork_record: RotationStep,
@@ -117,9 +141,11 @@ struct PairTranscriptVector {
     initiator_static_scalar_hex: String,
     initiator_static_pub_hex: String,
     initiator_ephem_scalar_hex: String,
+    initiator_mlkem768_keygen_seed_hex: String,
     responder_static_scalar_hex: String,
     responder_static_pub_hex: String,
     responder_ephem_scalar_hex: String,
+    responder_mlkem768_encaps_seed_hex: String,
     host_hello_json: String,
     msg1_frame_hex: String,
     msg2_frame_hex: String,
@@ -139,8 +165,10 @@ struct SessionTranscriptVector {
     preamble_hex: String,
     initiator_static_scalar_hex: String,
     initiator_ephem_scalar_hex: String,
+    initiator_mlkem768_keygen_seed_hex: String,
     responder_static_scalar_hex: String,
     responder_ephem_scalar_hex: String,
+    responder_mlkem768_encaps_seed_hex: String,
     host_hello_json: String,
     msg1_frame_hex: String,
     msg2_frame_hex: String,
@@ -233,12 +261,14 @@ fn rotation_chain_and_fork_detection_match() {
         assert_eq!(hex::encode(bytes), step.signed_bytes_hex);
     }
 
-    let pinned_signing: [u8; 32] = decode_hex_array(&v.pinned_signing_pub_hex);
+    let pinned_signing = decode_hybrid_pub(&v.pinned_signing_pub_hex);
     let pinned_static: [u8; 32] = decode_hex_array(&v.pinned_static_pub_hex);
-    let step2_seed: [u8; 32] = decode_hex_array(&v.step2_signing_seed_hex);
-    let step2_signing_pub = ed25519_dalek::SigningKey::from_bytes(&step2_seed)
-        .verifying_key()
-        .to_bytes();
+    let step2_signing_pub = SigningKeypair::from_seeds(
+        decode_hex_array::<32>(&v.step2_signing_seed_hex),
+        decode_hex_array::<32>(&v.step2_signing_mldsa_seed_hex),
+    )
+    .public_key()
+    .clone();
     let step2_static_pub = x25519_public_from_scalar(&decode_hex_array(&v.step2_static_scalar_hex));
 
     let records: Vec<RotationRecord> = v.chain.iter().map(|s| s.record.clone()).collect();
@@ -274,7 +304,7 @@ fn rotation_chain_and_fork_detection_match() {
     );
 
     // Unanchored colliding seq signed by an unrelated key must fail without fork revocation.
-    let rogue_sk = ed25519_dalek::SigningKey::from_bytes(&[0xAB; 32]);
+    let rogue_sk = SigningKeypair::from_seed([0xAB; 32]);
     let rogue_rec = sign_rotation(
         2,
         &rogue_sk,
@@ -313,8 +343,8 @@ fn grants_and_crl_vectors_match() {
         v.root_signed_bytes_hex
     );
 
-    let root_pub: [u8; 32] = decode_hex_array(&v.root_signing_pub_hex);
-    let del_pub: [u8; 32] = decode_hex_array(&v.delegate_signing_pub_hex);
+    let root_pub = decode_hybrid_pub(&v.root_signing_pub_hex);
+    let del_pub = decode_hybrid_pub(&v.delegate_signing_pub_hex);
     verify_grant_signature(&v.root_grant, &root_pub).unwrap();
     verify_grant_signature(&v.delegated_valid, &del_pub).unwrap();
     verify_delegation_subset(&v.delegated_valid, &v.root_grant).unwrap();
@@ -330,11 +360,11 @@ fn grants_and_crl_vectors_match() {
         v.crl_signed_bytes_hex
     );
 
-    let lookup = |issuer: &str| -> Option<[u8; 32]> {
+    let lookup = |issuer: &str| -> Option<HybridSigningPublicKey> {
         if issuer == v.root_issuer_id {
-            Some(root_pub)
+            Some(root_pub.clone())
         } else if issuer == v.delegate_id {
-            Some(del_pub)
+            Some(del_pub.clone())
         } else {
             None
         }
@@ -390,8 +420,8 @@ fn grants_and_crl_vectors_match() {
     ));
 
     // Active non-root peer cannot self-sign a forged root grant.
-    let rogue_sk = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
-    let rogue_pub = rogue_sk.verifying_key().to_bytes();
+    let rogue_sk = SigningKeypair::from_seed([0xEE; 32]);
+    let rogue_pub = rogue_sk.public_key().clone();
     let rogue_id = "dev_eeeeeeeeeeeeeeee";
     let rogue_grant = sign_grant(
         GrantUnsigned {
@@ -409,9 +439,9 @@ fn grants_and_crl_vectors_match() {
         &rogue_sk,
     )
     .unwrap();
-    let lookup_with_rogue = |issuer: &str| -> Option<[u8; 32]> {
+    let lookup_with_rogue = |issuer: &str| -> Option<HybridSigningPublicKey> {
         if issuer == rogue_id {
-            Some(rogue_pub)
+            Some(rogue_pub.clone())
         } else {
             lookup(issuer)
         }
@@ -435,7 +465,6 @@ fn handshake_transcript_vectors_match() {
     let v: HandshakeVector = serde_json::from_str(&raw).unwrap();
     assert_eq!(v.noise_pattern, NOISE_PATTERN);
 
-    let params: NoiseParams = v.noise_pattern.parse().unwrap();
     let mut buf = vec![0u8; MAX_FRAME_LEN];
     let mut pt = vec![0u8; MAX_FRAME_LEN];
 
@@ -448,24 +477,24 @@ fn handshake_transcript_vectors_match() {
     );
 
     let init_s = decode_hex_array::<32>(&p.initiator_static_scalar_hex);
-    let init_e = decode_hex_array::<32>(&p.initiator_ephem_scalar_hex);
     let resp_s = decode_hex_array::<32>(&p.responder_static_scalar_hex);
-    let resp_e = decode_hex_array::<32>(&p.responder_ephem_scalar_hex);
 
-    let mut init = Builder::new(params.clone())
+    let mut init = NoiseHfsHandshakeBuilder::new()
         .local_private_key(&init_s)
-        .unwrap()
         .prologue(&preamble)
-        .unwrap()
-        .fixed_ephemeral_key_for_testing_only(&init_e)
+        .fixed_hfs_seeds_for_testing_only(init_hfs_seeds(
+            &p.initiator_ephem_scalar_hex,
+            &p.initiator_mlkem768_keygen_seed_hex,
+        ))
         .build_initiator()
         .unwrap();
-    let mut resp = Builder::new(params.clone())
+    let mut resp = NoiseHfsHandshakeBuilder::new()
         .local_private_key(&resp_s)
-        .unwrap()
         .prologue(&preamble)
-        .unwrap()
-        .fixed_ephemeral_key_for_testing_only(&resp_e)
+        .fixed_hfs_seeds_for_testing_only(resp_hfs_seeds(
+            &p.responder_ephem_scalar_hex,
+            &p.responder_mlkem768_encaps_seed_hex,
+        ))
         .build_responder()
         .unwrap();
 
@@ -488,7 +517,7 @@ fn handshake_transcript_vectors_match() {
         p.responder_static_pub_hex
     );
 
-    let h: [u8; 32] = init.get_handshake_hash().try_into().unwrap();
+    let h: [u8; 32] = *init.get_handshake_hash();
     assert_eq!(hex::encode(h), p.post_msg2_handshake_hash_hex);
     assert_eq!(pairing_sas(&h), p.pairing_sas);
     let mac = b64url_decode_array::<32>(&p.code_mac_b64url).unwrap();
@@ -530,23 +559,21 @@ fn handshake_transcript_vectors_match() {
         Preamble::v1(Intent::Session)
     );
 
-    let mut s_init = Builder::new(params.clone())
+    let mut s_init = NoiseHfsHandshakeBuilder::new()
         .local_private_key(&decode_hex_array::<32>(&s.initiator_static_scalar_hex))
-        .unwrap()
         .prologue(&s_pre)
-        .unwrap()
-        .fixed_ephemeral_key_for_testing_only(&decode_hex_array::<32>(
+        .fixed_hfs_seeds_for_testing_only(init_hfs_seeds(
             &s.initiator_ephem_scalar_hex,
+            &s.initiator_mlkem768_keygen_seed_hex,
         ))
         .build_initiator()
         .unwrap();
-    let mut s_resp = Builder::new(params)
+    let mut s_resp = NoiseHfsHandshakeBuilder::new()
         .local_private_key(&decode_hex_array::<32>(&s.responder_static_scalar_hex))
-        .unwrap()
         .prologue(&s_pre)
-        .unwrap()
-        .fixed_ephemeral_key_for_testing_only(&decode_hex_array::<32>(
+        .fixed_hfs_seeds_for_testing_only(resp_hfs_seeds(
             &s.responder_ephem_scalar_hex,
+            &s.responder_mlkem768_encaps_seed_hex,
         ))
         .build_responder()
         .unwrap();
@@ -567,17 +594,18 @@ fn handshake_transcript_vectors_match() {
         .read_message(decode_frame(&sf2).unwrap().0, &mut pt)
         .unwrap();
     let s_host_hello: HostHello = serde_json::from_slice(&pt[..sn_pt2]).unwrap();
-    let presented_static: [u8; 32] = s_init.get_remote_static().unwrap().try_into().unwrap();
+    let presented_static: [u8; 32] = *s_init.get_remote_static().unwrap();
     // Initiator must verify host static pin or rotation before writing msg3.
-    let mismatched_pin = [0xFF; 32];
+    let mismatched_static = [0xFF; 32];
+    let mismatched_signing = SigningKeypair::from_seed([0xFF; 32]).public_key().clone();
     assert_eq!(
         verify_rotation_chain(
-            &mismatched_pin,
-            &mismatched_pin,
+            &mismatched_signing,
+            &mismatched_static,
             0,
             &s_host_hello.rotation,
             &presented_static,
-            &mismatched_pin,
+            &mismatched_signing,
         ),
         Err(CoreError::RotationEmptyChain)
     );
@@ -618,7 +646,7 @@ fn handshake_transcript_vectors_match() {
     let nr = s_init_tx.write_message(&rekey_pt, &mut buf).unwrap();
     let rf = encode_frame(&buf[..nr]).unwrap();
     assert_eq!(hex::encode(&rf), s.rekey_frame_hex);
-    s_init_tx.rekey_outgoing();
+    s_init_tx.rekey_outgoing().unwrap();
     let nr_pt = s_resp_tx
         .read_message(decode_frame(&rf).unwrap().0, &mut pt)
         .unwrap();
@@ -626,7 +654,7 @@ fn handshake_transcript_vectors_match() {
         decode_inner_frame(&pt[..nr_pt]).unwrap(),
         (InnerFrameType::Rekey, [].as_slice())
     );
-    s_resp_tx.rekey_incoming();
+    s_resp_tx.rekey_incoming().unwrap();
 
     let post_pt = hex::decode(&s.post_rekey_data_inner_hex).unwrap();
     let np = s_init_tx.write_message(&post_pt, &mut buf).unwrap();
@@ -652,12 +680,15 @@ struct M2mEnrollmentVector {
     responder_static_scalar_hex: String,
     responder_static_pub_hex: String,
     responder_ephem_scalar_hex: String,
+    responder_mlkem768_encaps_seed_hex: String,
     responder_signing_pub_hex: String,
     initiator_static_scalar_hex: String,
     initiator_static_pub_hex: String,
     initiator_device_id: String,
     initiator_ephem_scalar_hex: String,
+    initiator_mlkem768_keygen_seed_hex: String,
     initiator_signing_seed_hex: String,
+    initiator_signing_mldsa_seed_hex: String,
     initiator_signing_pub_hex: String,
     token_jcs_json: String,
     token_signed_bytes_hex: String,
@@ -679,8 +710,6 @@ struct M2mEnrollmentVector {
 
 #[test]
 fn m2m_enrollment_vectors_match() {
-    use tendril_core::crypto::SigningKeypair;
-
     let raw = fs::read_to_string(vectors_dir().join("m2m_enrollment.json")).unwrap();
     let v: M2mEnrollmentVector = serde_json::from_str(&raw).unwrap();
     assert_eq!(v.noise_pattern, NOISE_PATTERN);
@@ -688,11 +717,11 @@ fn m2m_enrollment_vectors_match() {
     let pre = hex::decode(&v.preamble_hex).unwrap();
     assert_eq!(Preamble::decode(&pre).unwrap(), Preamble::v1(Intent::Pair));
 
-    let anchor_pub = decode_hex_array::<32>(&v.anchor_signing_pub_hex);
+    let anchor_pub = decode_hybrid_pub(&v.anchor_signing_pub_hex);
     let resp_static_pub = decode_hex_array::<32>(&v.responder_static_pub_hex);
-    let resp_signing_pub = decode_hex_array::<32>(&v.responder_signing_pub_hex);
+    let resp_signing_pub = decode_hybrid_pub(&v.responder_signing_pub_hex);
     let init_static_pub = decode_hex_array::<32>(&v.initiator_static_pub_hex);
-    let init_signing_pub = decode_hex_array::<32>(&v.initiator_signing_pub_hex);
+    let init_signing_pub = decode_hybrid_pub(&v.initiator_signing_pub_hex);
     assert_eq!(device_id(&init_static_pub), v.initiator_device_id);
     assert_eq!(device_id(&resp_static_pub), v.responder_host_id);
 
@@ -711,30 +740,27 @@ fn m2m_enrollment_vectors_match() {
         &v.anchor_id,
         v.now_unix,
         None,
-        |id| (id == v.anchor_id).then_some(anchor_pub),
+        |id| (id == v.anchor_id).then(|| anchor_pub.clone()),
     );
     assert!(matches!(err, Err(CoreError::GrantDenied(_))));
 
-    let params: NoiseParams = v.noise_pattern.parse().unwrap();
     let mut buf = vec![0u8; MAX_FRAME_LEN];
     let mut pt = vec![0u8; MAX_FRAME_LEN];
-    let mut init = Builder::new(params.clone())
+    let mut init = NoiseHfsHandshakeBuilder::new()
         .local_private_key(&decode_hex_array::<32>(&v.initiator_static_scalar_hex))
-        .unwrap()
         .prologue(&pre)
-        .unwrap()
-        .fixed_ephemeral_key_for_testing_only(&decode_hex_array::<32>(
+        .fixed_hfs_seeds_for_testing_only(init_hfs_seeds(
             &v.initiator_ephem_scalar_hex,
+            &v.initiator_mlkem768_keygen_seed_hex,
         ))
         .build_initiator()
         .unwrap();
-    let mut resp = Builder::new(params)
+    let mut resp = NoiseHfsHandshakeBuilder::new()
         .local_private_key(&decode_hex_array::<32>(&v.responder_static_scalar_hex))
-        .unwrap()
         .prologue(&pre)
-        .unwrap()
-        .fixed_ephemeral_key_for_testing_only(&decode_hex_array::<32>(
+        .fixed_hfs_seeds_for_testing_only(resp_hfs_seeds(
             &v.responder_ephem_scalar_hex,
+            &v.responder_mlkem768_encaps_seed_hex,
         ))
         .build_responder()
         .unwrap();
@@ -755,12 +781,13 @@ fn m2m_enrollment_vectors_match() {
         .unwrap();
     assert_eq!(&pt[..npt2], v.host_hello_json.as_bytes());
 
-    let h: [u8; 32] = init.get_handshake_hash().try_into().unwrap();
+    let h: [u8; 32] = *init.get_handshake_hash();
     assert_eq!(hex::encode(h), v.post_msg2_handshake_hash_hex);
     assert_eq!(hex::encode(ENROLL_PROOF_DOMAIN), v.enroll_proof_domain_hex);
     let expected_proof_bytes = enroll_proof_bytes(&h, &init_static_pub, &v.enrollment_token.nonce);
     assert_eq!(hex::encode(&expected_proof_bytes), v.enroll_proof_bytes_hex);
-    let proof_sig = b64url_decode_array::<64>(&v.enroll_proof_b64url).unwrap();
+    let proof_sig = b64url_decode(&v.enroll_proof_b64url).unwrap();
+    assert_eq!(proof_sig.len(), HYBRID_SIG_LEN);
     verify_enroll_proof(
         &init_signing_pub,
         &h,
@@ -817,15 +844,18 @@ fn m2m_enrollment_vectors_match() {
     )
     .unwrap();
 
-    let init_signing =
-        SigningKeypair::from_seed(decode_hex_array::<32>(&v.initiator_signing_seed_hex));
-    assert_eq!(*init_signing.public_bytes(), init_signing_pub);
-    let expected_sig = sign_enroll_proof(
-        &init_signing.signing_key(),
+    let init_signing = SigningKeypair::from_seeds(
+        decode_hex_array::<32>(&v.initiator_signing_seed_hex),
+        decode_hex_array::<32>(&v.initiator_signing_mldsa_seed_hex),
+    );
+    assert_eq!(init_signing.public_key(), &init_signing_pub);
+    let expected_sig = sign_enroll_proof_deterministic(
+        &init_signing,
         &h,
         &init_static_pub,
         &v.enrollment_token.nonce,
-    );
+    )
+    .unwrap();
     assert_eq!(b64url_encode(&expected_sig), v.enroll_proof_b64url);
 
     let (_, na) = verify_enrollment_token(

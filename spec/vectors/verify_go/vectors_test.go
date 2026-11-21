@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/hmac"
+	"crypto/mlkem"
+	"crypto/mlkem/mlkemtest"
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/base64"
@@ -11,17 +13,368 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
-	"github.com/flynn/noise"
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 )
+
+const hfsPattern = "Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256"
+
+var hybridMLDSACtx = []byte("tendril-hybrid-v1")
+
+func verifyHybridSig(pub, msg, sig []byte) error {
+	if len(pub) != 32+mldsa65.PublicKeySize {
+		return fmt.Errorf("hybrid pub length = %d, want %d", len(pub), 32+mldsa65.PublicKeySize)
+	}
+	if len(sig) != 64+mldsa65.SignatureSize {
+		return fmt.Errorf("hybrid sig length = %d, want %d", len(sig), 64+mldsa65.SignatureSize)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pub[:32]), msg, sig[:64]) {
+		return fmt.Errorf("ed25519 verification failed")
+	}
+	var mldsaPub mldsa65.PublicKey
+	if err := mldsaPub.UnmarshalBinary(pub[32:]); err != nil {
+		return fmt.Errorf("mldsa65 pub unmarshal: %w", err)
+	}
+	if !mldsa65.Verify(&mldsaPub, msg, hybridMLDSACtx, sig[64:]) {
+		return fmt.Errorf("mldsa65 verification failed")
+	}
+	return nil
+}
+
+type hfsCipher struct {
+	hasKey bool
+	key    [32]byte
+	n      uint64
+}
+
+func makeHfsNonce(n uint64) []byte {
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], n)
+	return nonce[:]
+}
+
+func (c *hfsCipher) initKey(k []byte) {
+	copy(c.key[:], k)
+	c.n = 0
+	c.hasKey = true
+}
+
+func (c *hfsCipher) encryptWithAD(ad, pt []byte) ([]byte, error) {
+	if !c.hasKey {
+		out := make([]byte, len(pt))
+		copy(out, pt)
+		return out, nil
+	}
+	if c.n == math.MaxUint64 {
+		return nil, fmt.Errorf("nonce exhausted")
+	}
+	aead, err := chacha20poly1305.New(c.key[:])
+	if err != nil {
+		return nil, err
+	}
+	ct := aead.Seal(nil, makeHfsNonce(c.n), pt, ad)
+	c.n++
+	return ct, nil
+}
+
+func (c *hfsCipher) decryptWithAD(ad, ct []byte) ([]byte, error) {
+	if !c.hasKey {
+		out := make([]byte, len(ct))
+		copy(out, ct)
+		return out, nil
+	}
+	if c.n == math.MaxUint64 {
+		return nil, fmt.Errorf("nonce exhausted")
+	}
+	aead, err := chacha20poly1305.New(c.key[:])
+	if err != nil {
+		return nil, err
+	}
+	pt, err := aead.Open(nil, makeHfsNonce(c.n), ct, ad)
+	if err != nil {
+		return nil, err
+	}
+	c.n++
+	return pt, nil
+}
+
+func (c *hfsCipher) rekey() error {
+	if !c.hasKey {
+		return fmt.Errorf("rekey before init")
+	}
+	aead, err := chacha20poly1305.New(c.key[:])
+	if err != nil {
+		return err
+	}
+	ct := aead.Seal(nil, makeHfsNonce(math.MaxUint64), make([]byte, 32), nil)
+	copy(c.key[:], ct[:32])
+	return nil
+}
+
+type hfsHandshake struct {
+	initiator   bool
+	localStatic []byte
+	localPub    []byte
+	ephem       []byte
+	mlkemSeed   []byte // 64B d||z for initiator, 32B m for responder
+	dk          *mlkem.DecapsulationKey768
+	remoteEk    *mlkem.EncapsulationKey768
+	re          []byte
+	rs          []byte
+	ck          [32]byte
+	h           [32]byte
+	cipher      hfsCipher
+}
+
+func newHfsHandshake(initiator bool, prologue, localPriv, ephem, mlkemSeed []byte) (*hfsHandshake, error) {
+	localPub, err := curve25519.X25519(localPriv, curve25519.Basepoint)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256([]byte(hfsPattern))
+	hs := &hfsHandshake{
+		initiator:   initiator,
+		localStatic: localPriv,
+		localPub:    localPub,
+		ephem:       ephem,
+		mlkemSeed:   mlkemSeed,
+		ck:          sum,
+		h:           sum,
+	}
+	hs.mixHash(prologue)
+	return hs, nil
+}
+
+func (hs *hfsHandshake) mixHash(data []byte) {
+	d := sha256.New()
+	d.Write(hs.h[:])
+	d.Write(data)
+	copy(hs.h[:], d.Sum(nil))
+}
+
+func hkdfNoise2(ck, ikm []byte) ([32]byte, [32]byte) {
+	m0 := hmac.New(sha256.New, ck)
+	m0.Write(ikm)
+	temp := m0.Sum(nil)
+
+	m1 := hmac.New(sha256.New, temp)
+	m1.Write([]byte{0x01})
+	var o1 [32]byte
+	copy(o1[:], m1.Sum(nil))
+
+	m2 := hmac.New(sha256.New, temp)
+	m2.Write(o1[:])
+	m2.Write([]byte{0x02})
+	var o2 [32]byte
+	copy(o2[:], m2.Sum(nil))
+	return o1, o2
+}
+
+func (hs *hfsHandshake) mixKey(ikm []byte) {
+	ck, k := hkdfNoise2(hs.ck[:], ikm)
+	hs.ck = ck
+	hs.cipher.initKey(k[:])
+}
+
+func (hs *hfsHandshake) encryptAndHash(pt []byte) ([]byte, error) {
+	ct, err := hs.cipher.encryptWithAD(hs.h[:], pt)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixHash(ct)
+	return ct, nil
+}
+
+func (hs *hfsHandshake) decryptAndHash(ct []byte) ([]byte, error) {
+	pt, err := hs.cipher.decryptWithAD(hs.h[:], ct)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixHash(ct)
+	return pt, nil
+}
+
+func (hs *hfsHandshake) writeMsg1(payload []byte) ([]byte, error) {
+	ePub, err := curve25519.X25519(hs.ephem, curve25519.Basepoint)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixHash(ePub)
+	dk, err := mlkem.NewDecapsulationKey768(hs.mlkemSeed)
+	if err != nil {
+		return nil, err
+	}
+	hs.dk = dk
+	ekBytes := dk.EncapsulationKey().Bytes()
+	hs.mixHash(ekBytes)
+	encPayload, err := hs.encryptAndHash(payload)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(ePub)+len(ekBytes)+len(encPayload))
+	out = append(out, ePub...)
+	out = append(out, ekBytes...)
+	out = append(out, encPayload...)
+	return out, nil
+}
+
+func (hs *hfsHandshake) readMsg1(msg []byte) ([]byte, error) {
+	if len(msg) < 32+mlkem.EncapsulationKeySize768 {
+		return nil, fmt.Errorf("short msg1: %d", len(msg))
+	}
+	hs.re = msg[:32]
+	hs.mixHash(hs.re)
+	ekBytes := msg[32 : 32+mlkem.EncapsulationKeySize768]
+	ek, err := mlkem.NewEncapsulationKey768(ekBytes)
+	if err != nil {
+		return nil, err
+	}
+	hs.remoteEk = ek
+	hs.mixHash(ekBytes)
+	return hs.decryptAndHash(msg[32+mlkem.EncapsulationKeySize768:])
+}
+
+func (hs *hfsHandshake) writeMsg2(payload []byte) ([]byte, error) {
+	ePub, err := curve25519.X25519(hs.ephem, curve25519.Basepoint)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixHash(ePub)
+	ee, err := curve25519.X25519(hs.ephem, hs.re)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixKey(ee)
+	ss, ct, err := mlkemtest.Encapsulate768(hs.remoteEk, hs.mlkemSeed)
+	if err != nil {
+		return nil, err
+	}
+	ctEnc, err := hs.encryptAndHash(ct)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixKey(ss)
+	sEnc, err := hs.encryptAndHash(hs.localPub)
+	if err != nil {
+		return nil, err
+	}
+	es, err := curve25519.X25519(hs.localStatic, hs.re)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixKey(es)
+	payloadEnc, err := hs.encryptAndHash(payload)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(ePub)+len(ctEnc)+len(sEnc)+len(payloadEnc))
+	out = append(out, ePub...)
+	out = append(out, ctEnc...)
+	out = append(out, sEnc...)
+	out = append(out, payloadEnc...)
+	return out, nil
+}
+
+func (hs *hfsHandshake) readMsg2(msg []byte) ([]byte, error) {
+	const encCTLen = mlkem.CiphertextSize768 + 16
+	const encStaticLen = 32 + 16
+	if len(msg) < 32+encCTLen+encStaticLen+16 {
+		return nil, fmt.Errorf("short msg2: %d", len(msg))
+	}
+	pos := 0
+	hs.re = msg[pos : pos+32]
+	pos += 32
+	hs.mixHash(hs.re)
+	ee, err := curve25519.X25519(hs.ephem, hs.re)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixKey(ee)
+	ctBytes, err := hs.decryptAndHash(msg[pos : pos+encCTLen])
+	pos += encCTLen
+	if err != nil {
+		return nil, err
+	}
+	ss, err := hs.dk.Decapsulate(ctBytes)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixKey(ss)
+	rs, err := hs.decryptAndHash(msg[pos : pos+encStaticLen])
+	pos += encStaticLen
+	if err != nil {
+		return nil, err
+	}
+	hs.rs = rs
+	es, err := curve25519.X25519(hs.ephem, hs.rs)
+	if err != nil {
+		return nil, err
+	}
+	hs.mixKey(es)
+	return hs.decryptAndHash(msg[pos:])
+}
+
+func (hs *hfsHandshake) writeMsg3(payload []byte) ([]byte, *hfsCipher, *hfsCipher, error) {
+	sEnc, err := hs.encryptAndHash(hs.localPub)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	se, err := curve25519.X25519(hs.localStatic, hs.re)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	hs.mixKey(se)
+	payloadEnc, err := hs.encryptAndHash(payload)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	out := make([]byte, 0, len(sEnc)+len(payloadEnc))
+	out = append(out, sEnc...)
+	out = append(out, payloadEnc...)
+	c1, c2 := hkdfNoise2(hs.ck[:], nil)
+	cs1 := &hfsCipher{}
+	cs1.initKey(c1[:])
+	cs2 := &hfsCipher{}
+	cs2.initKey(c2[:])
+	return out, cs1, cs2, nil
+}
+
+func (hs *hfsHandshake) readMsg3(msg []byte) ([]byte, *hfsCipher, *hfsCipher, error) {
+	const encStaticLen = 32 + 16
+	if len(msg) < encStaticLen+16 {
+		return nil, nil, nil, fmt.Errorf("short msg3: %d", len(msg))
+	}
+	rs, err := hs.decryptAndHash(msg[:encStaticLen])
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	hs.rs = rs
+	se, err := curve25519.X25519(hs.ephem, rs)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	hs.mixKey(se)
+	pt, err := hs.decryptAndHash(msg[encStaticLen:])
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	c1, c2 := hkdfNoise2(hs.ck[:], nil)
+	cs1 := &hfsCipher{}
+	cs1.initKey(c1[:])
+	cs2 := &hfsCipher{}
+	cs2.initKey(c2[:])
+	return pt, cs1, cs2, nil
+}
 
 func loadVector(t *testing.T, name string, dst any) {
 	t.Helper()
@@ -254,17 +607,23 @@ func TestRotation(t *testing.T) {
 		Record         rotRecord `json:"record"`
 	}
 	var v struct {
-		PinnedSigningSeedHex string    `json:"pinned_signing_seed_hex"`
-		PinnedSigningPubHex  string    `json:"pinned_signing_pub_hex"`
-		Chain                []rotStep `json:"chain"`
-		ForkRecord           rotStep   `json:"fork_record"`
+		PinnedSigningSeedHex      string    `json:"pinned_signing_seed_hex"`
+		PinnedSigningMLDSASeedHex string    `json:"pinned_signing_mldsa_seed_hex"`
+		PinnedSigningPubHex       string    `json:"pinned_signing_pub_hex"`
+		Chain                     []rotStep `json:"chain"`
+		ForkRecord                rotStep   `json:"fork_record"`
 	}
 	loadVector(t, "rotation.json", &v)
 
 	seed0 := mustHex(t, v.PinnedSigningSeedHex)
 	key0 := ed25519.NewKeyFromSeed(seed0)
-	if hex.EncodeToString(key0.Public().(ed25519.PublicKey)) != v.PinnedSigningPubHex {
-		t.Fatalf("pinned signing pub mismatch")
+	var mldsaSeed0 [mldsa65.SeedSize]byte
+	copy(mldsaSeed0[:], mustHex(t, v.PinnedSigningMLDSASeedHex))
+	mldsaPK0, _ := mldsa65.NewKeyFromSeed(&mldsaSeed0)
+	pinnedPubBytes := append([]byte{}, key0.Public().(ed25519.PublicKey)...)
+	pinnedPubBytes = append(pinnedPubBytes, mldsaPK0.Bytes()...)
+	if hex.EncodeToString(pinnedPubBytes) != v.PinnedSigningPubHex {
+		t.Fatalf("pinned hybrid signing pub mismatch")
 	}
 
 	verifyStep := func(step rotStep) {
@@ -288,16 +647,19 @@ func TestRotation(t *testing.T) {
 		binary.BigEndian.PutUint64(tsB[:], uint64(parsedTS.Unix()))
 		buf.Write(tsB[:])
 
+		if buf.Len() != 4031 {
+			t.Fatalf("rotation signed bytes len = %d, want 4031", buf.Len())
+		}
 		if hex.EncodeToString(buf.Bytes()) != step.SignedBytesHex {
 			t.Fatalf("rotation signed bytes mismatch at seq %d", step.Record.Seq)
 		}
-		if !ed25519.Verify(ed25519.PublicKey(prevPub), buf.Bytes(), sig) {
-			t.Fatalf("rotation signature invalid at seq %d", step.Record.Seq)
+		if err := verifyHybridSig(prevPub, buf.Bytes(), sig); err != nil {
+			t.Fatalf("rotation signature invalid at seq %d: %v", step.Record.Seq, err)
 		}
 	}
 
 	seenSeq := map[uint64]rotRecord{}
-	pinnedPubB64 := base64.RawURLEncoding.EncodeToString(key0.Public().(ed25519.PublicKey))
+	pinnedPubB64 := base64.RawURLEncoding.EncodeToString(pinnedPubBytes)
 	for i, step := range v.Chain {
 		verifyStep(step)
 		if i == 0 {
@@ -373,12 +735,12 @@ func TestGrants(t *testing.T) {
 	if hex.EncodeToString(signedRoot) != v.RootSignedBytesHex {
 		t.Fatalf("root signed bytes mismatch")
 	}
-	rootPub := ed25519.PublicKey(mustHex(t, v.RootSigningPubHex))
-	if !ed25519.Verify(rootPub, signedRoot, mustB64URL(t, v.RootGrant.Sig)) {
-		t.Fatalf("root grant signature invalid")
+	rootPub := mustHex(t, v.RootSigningPubHex)
+	if err := verifyHybridSig(rootPub, signedRoot, mustB64URL(t, v.RootGrant.Sig)); err != nil {
+		t.Fatalf("root grant signature invalid: %v", err)
 	}
 
-	verifyGrant := func(g grantObj, pub ed25519.PublicKey) {
+	verifyGrant := func(g grantObj, pub []byte) {
 		raw, err := json.Marshal(g)
 		if err != nil {
 			t.Fatal(err)
@@ -397,12 +759,12 @@ func TestGrants(t *testing.T) {
 			t.Fatal(err)
 		}
 		msg := append([]byte("tendril-grant-v1\x00"), jcs...)
-		if !ed25519.Verify(pub, msg, mustB64URL(t, g.Sig)) {
-			t.Fatalf("grant signature invalid for nonce %s", g.Nonce)
+		if err := verifyHybridSig(pub, msg, mustB64URL(t, g.Sig)); err != nil {
+			t.Fatalf("grant signature invalid for nonce %s: %v", g.Nonce, err)
 		}
 	}
 
-	delPub := ed25519.PublicKey(mustHex(t, v.DelegateSigningPubHex))
+	delPub := mustHex(t, v.DelegateSigningPubHex)
 	verifyGrant(v.DelegatedValid, delPub)
 	verifyGrant(v.DelegatedWidened, delPub)
 
@@ -567,8 +929,8 @@ func TestGrants(t *testing.T) {
 	if hex.EncodeToString(crlMsg) != v.CRLSignedBytesHex {
 		t.Fatalf("CRL signed bytes mismatch")
 	}
-	if !ed25519.Verify(rootPub, crlMsg, mustB64URL(t, v.RevocationList.Sig)) {
-		t.Fatalf("CRL signature invalid")
+	if err := verifyHybridSig(rootPub, crlMsg, mustB64URL(t, v.RevocationList.Sig)); err != nil {
+		t.Fatalf("CRL signature invalid: %v", err)
 	}
 }
 
@@ -576,115 +938,119 @@ func TestHandshake(t *testing.T) {
 	var v struct {
 		NoisePattern   string `json:"noise_pattern"`
 		PairTranscript struct {
-			PreambleHex              string `json:"preamble_hex"`
-			InitiatorStaticScalarHex string `json:"initiator_static_scalar_hex"`
-			InitiatorStaticPubHex    string `json:"initiator_static_pub_hex"`
-			InitiatorEphemScalarHex  string `json:"initiator_ephem_scalar_hex"`
-			ResponderStaticScalarHex string `json:"responder_static_scalar_hex"`
-			ResponderStaticPubHex    string `json:"responder_static_pub_hex"`
-			ResponderEphemScalarHex  string `json:"responder_ephem_scalar_hex"`
-			HostHelloJSON            string `json:"host_hello_json"`
-			Msg1FrameHex             string `json:"msg1_frame_hex"`
-			Msg2FrameHex             string `json:"msg2_frame_hex"`
-			PostMsg2HandshakeHashHex string `json:"post_msg2_handshake_hash_hex"`
-			PairingCode              string `json:"pairing_code"`
-			PairingSAS               string `json:"pairing_sas"`
-			CodeMACB64URL            string `json:"code_mac_b64url"`
-			PairClaimJSON            string `json:"pair_claim_json"`
-			Msg3FrameHex             string `json:"msg3_frame_hex"`
-			FinalHandshakeHashHex    string `json:"final_handshake_hash_hex"`
-			PairResponseJSON         string `json:"pair_response_json"`
-			PairResponseFrameHex     string `json:"pair_response_frame_hex"`
+			PreambleHex                string `json:"preamble_hex"`
+			InitiatorStaticScalarHex   string `json:"initiator_static_scalar_hex"`
+			InitiatorStaticPubHex      string `json:"initiator_static_pub_hex"`
+			InitiatorEphemScalarHex    string `json:"initiator_ephem_scalar_hex"`
+			InitiatorMLKEM768KeygenHex string `json:"initiator_mlkem768_keygen_seed_hex"`
+			ResponderStaticScalarHex   string `json:"responder_static_scalar_hex"`
+			ResponderStaticPubHex      string `json:"responder_static_pub_hex"`
+			ResponderEphemScalarHex    string `json:"responder_ephem_scalar_hex"`
+			ResponderMLKEM768EncapsHex string `json:"responder_mlkem768_encaps_seed_hex"`
+			HostHelloJSON              string `json:"host_hello_json"`
+			Msg1FrameHex               string `json:"msg1_frame_hex"`
+			Msg2FrameHex               string `json:"msg2_frame_hex"`
+			PostMsg2HandshakeHashHex   string `json:"post_msg2_handshake_hash_hex"`
+			PairingCode                string `json:"pairing_code"`
+			PairingSAS                 string `json:"pairing_sas"`
+			CodeMACB64URL              string `json:"code_mac_b64url"`
+			PairClaimJSON              string `json:"pair_claim_json"`
+			Msg3FrameHex               string `json:"msg3_frame_hex"`
+			FinalHandshakeHashHex      string `json:"final_handshake_hash_hex"`
+			PairResponseJSON           string `json:"pair_response_json"`
+			PairResponseFrameHex       string `json:"pair_response_frame_hex"`
 		} `json:"pair_transcript"`
 		SessionTranscript struct {
-			PreambleHex              string `json:"preamble_hex"`
-			InitiatorStaticScalarHex string `json:"initiator_static_scalar_hex"`
-			InitiatorEphemScalarHex  string `json:"initiator_ephem_scalar_hex"`
-			ResponderStaticScalarHex string `json:"responder_static_scalar_hex"`
-			ResponderEphemScalarHex  string `json:"responder_ephem_scalar_hex"`
-			HostHelloJSON            string `json:"host_hello_json"`
-			Msg1FrameHex             string `json:"msg1_frame_hex"`
-			Msg2FrameHex             string `json:"msg2_frame_hex"`
-			PostMsg2HandshakeHashHex string `json:"post_msg2_handshake_hash_hex"`
-			SessionHelloJSON         string `json:"session_hello_json"`
-			Msg3FrameHex             string `json:"msg3_frame_hex"`
-			FinalHandshakeHashHex    string `json:"final_handshake_hash_hex"`
-			DataInnerHex             string `json:"data_inner_hex"`
-			DataFrameHex             string `json:"data_frame_hex"`
-			RekeyInnerHex            string `json:"rekey_inner_hex"`
-			RekeyFrameHex            string `json:"rekey_frame_hex"`
-			PostRekeyDataInnerHex    string `json:"post_rekey_data_inner_hex"`
-			PostRekeyDataFrameHex    string `json:"post_rekey_data_frame_hex"`
+			PreambleHex                string `json:"preamble_hex"`
+			InitiatorStaticScalarHex   string `json:"initiator_static_scalar_hex"`
+			InitiatorEphemScalarHex    string `json:"initiator_ephem_scalar_hex"`
+			InitiatorMLKEM768KeygenHex string `json:"initiator_mlkem768_keygen_seed_hex"`
+			ResponderStaticScalarHex   string `json:"responder_static_scalar_hex"`
+			ResponderEphemScalarHex    string `json:"responder_ephem_scalar_hex"`
+			ResponderMLKEM768EncapsHex string `json:"responder_mlkem768_encaps_seed_hex"`
+			HostHelloJSON              string `json:"host_hello_json"`
+			Msg1FrameHex               string `json:"msg1_frame_hex"`
+			Msg2FrameHex               string `json:"msg2_frame_hex"`
+			PostMsg2HandshakeHashHex   string `json:"post_msg2_handshake_hash_hex"`
+			SessionHelloJSON           string `json:"session_hello_json"`
+			Msg3FrameHex               string `json:"msg3_frame_hex"`
+			FinalHandshakeHashHex      string `json:"final_handshake_hash_hex"`
+			DataInnerHex               string `json:"data_inner_hex"`
+			DataFrameHex               string `json:"data_frame_hex"`
+			RekeyInnerHex              string `json:"rekey_inner_hex"`
+			RekeyFrameHex              string `json:"rekey_frame_hex"`
+			PostRekeyDataInnerHex      string `json:"post_rekey_data_inner_hex"`
+			PostRekeyDataFrameHex      string `json:"post_rekey_data_frame_hex"`
 		} `json:"session_transcript"`
 	}
 	loadVector(t, "handshake.json", &v)
 
-	if v.NoisePattern != "Noise_XX_25519_ChaChaPoly_SHA256" {
+	if v.NoisePattern != hfsPattern {
 		t.Fatalf("unexpected pattern %s", v.NoisePattern)
 	}
-	suite := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
 
 	// 1. Pair transcript
 	p := v.PairTranscript
 	preamble := mustHex(t, p.PreambleHex)
-	initS := noise.DHKey{
-		Private: mustHex(t, p.InitiatorStaticScalarHex),
-		Public:  mustHex(t, p.InitiatorStaticPubHex),
-	}
-	respS := noise.DHKey{
-		Private: mustHex(t, p.ResponderStaticScalarHex),
-		Public:  mustHex(t, p.ResponderStaticPubHex),
-	}
-
-	initHS, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   suite,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     true,
-		Prologue:      preamble,
-		StaticKeypair: initS,
-		Random:        bytes.NewReader(mustHex(t, p.InitiatorEphemScalarHex)),
-	})
+	initHS, err := newHfsHandshake(
+		true,
+		preamble,
+		mustHex(t, p.InitiatorStaticScalarHex),
+		mustHex(t, p.InitiatorEphemScalarHex),
+		mustHex(t, p.InitiatorMLKEM768KeygenHex),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	respHS, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   suite,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     false,
-		Prologue:      preamble,
-		StaticKeypair: respS,
-		Random:        bytes.NewReader(mustHex(t, p.ResponderEphemScalarHex)),
-	})
+	respHS, err := newHfsHandshake(
+		false,
+		preamble,
+		mustHex(t, p.ResponderStaticScalarHex),
+		mustHex(t, p.ResponderEphemScalarHex),
+		mustHex(t, p.ResponderMLKEM768EncapsHex),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if hex.EncodeToString(initHS.localPub) != p.InitiatorStaticPubHex || hex.EncodeToString(respHS.localPub) != p.ResponderStaticPubHex {
+		t.Fatalf("static pub mismatch")
+	}
 
-	msg1, _, _, err := initHS.WriteMessage(nil, nil)
+	msg1, err := initHS.writeMsg1(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(msg1)) != p.Msg1FrameHex {
 		t.Fatalf("pair msg1 mismatch:\ngot:  %x\nwant: %s", encodeFrame(msg1), p.Msg1FrameHex)
 	}
-	if _, _, _, err := respHS.ReadMessage(nil, decodeFrame(t, mustHex(t, p.Msg1FrameHex))); err != nil {
+	if _, err := respHS.readMsg1(decodeFrame(t, mustHex(t, p.Msg1FrameHex))); err != nil {
 		t.Fatal(err)
 	}
 
-	msg2, _, _, err := respHS.WriteMessage(nil, []byte(p.HostHelloJSON))
+	msg2, err := respHS.writeMsg2([]byte(p.HostHelloJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(msg2)) != p.Msg2FrameHex {
 		t.Fatalf("pair msg2 mismatch:\ngot:  %x\nwant: %s", encodeFrame(msg2), p.Msg2FrameHex)
 	}
-	pt2, _, _, err := initHS.ReadMessage(nil, decodeFrame(t, mustHex(t, p.Msg2FrameHex)))
+	pt2, err := initHS.readMsg2(decodeFrame(t, mustHex(t, p.Msg2FrameHex)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(pt2) != p.HostHelloJSON {
 		t.Fatalf("pair msg2 payload mismatch")
 	}
-	h := initHS.ChannelBinding()
+	var hostHello struct {
+		SigningPub string `json:"signing_pub"`
+	}
+	if err := json.Unmarshal(pt2, &hostHello); err != nil {
+		t.Fatal(err)
+	}
+	if len(mustB64URL(t, hostHello.SigningPub)) != 1984 {
+		t.Fatalf("expected 1984-byte hybrid signing_pub in HostHello")
+	}
+	h := initHS.h[:]
 	if hex.EncodeToString(h) != p.PostMsg2HandshakeHashHex {
 		t.Fatalf("pair post-msg2 h mismatch: %x != %s", h, p.PostMsg2HandshakeHashHex)
 	}
@@ -701,33 +1067,33 @@ func TestHandshake(t *testing.T) {
 		t.Fatalf("pair code_mac mismatch")
 	}
 
-	msg3, initCS0, initCS1, err := initHS.WriteMessage(nil, []byte(p.PairClaimJSON))
+	msg3, initCS0, initCS1, err := initHS.writeMsg3([]byte(p.PairClaimJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(msg3)) != p.Msg3FrameHex {
 		t.Fatalf("pair msg3 mismatch")
 	}
-	pt3, respCS0, respCS1, err := respHS.ReadMessage(nil, decodeFrame(t, mustHex(t, p.Msg3FrameHex)))
+	pt3, respCS0, respCS1, err := respHS.readMsg3(decodeFrame(t, mustHex(t, p.Msg3FrameHex)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(pt3) != p.PairClaimJSON {
 		t.Fatalf("pair msg3 payload mismatch")
 	}
-	if hex.EncodeToString(initHS.ChannelBinding()) != p.FinalHandshakeHashHex {
+	if hex.EncodeToString(initHS.h[:]) != p.FinalHandshakeHashHex {
 		t.Fatalf("pair final hash mismatch")
 	}
 
 	// Responder writes PairResponse on respCS1; initiator decrypts on initCS1
-	pairRespCT, err := respCS1.Encrypt(nil, nil, []byte(p.PairResponseJSON))
+	pairRespCT, err := respCS1.encryptWithAD(nil, []byte(p.PairResponseJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(pairRespCT)) != p.PairResponseFrameHex {
 		t.Fatalf("pair response frame mismatch")
 	}
-	pairRespPT, err := initCS1.Decrypt(nil, nil, decodeFrame(t, mustHex(t, p.PairResponseFrameHex)))
+	pairRespPT, err := initCS1.decryptWithAD(nil, decodeFrame(t, mustHex(t, p.PairResponseFrameHex)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -740,105 +1106,105 @@ func TestHandshake(t *testing.T) {
 	// 2. Session transcript + REKEY
 	s := v.SessionTranscript
 	sPre := mustHex(t, s.PreambleHex)
-	sInitPub, _ := curve25519.X25519(mustHex(t, s.InitiatorStaticScalarHex), curve25519.Basepoint)
-	sRespPub, _ := curve25519.X25519(mustHex(t, s.ResponderStaticScalarHex), curve25519.Basepoint)
-	sInitHS, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   suite,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     true,
-		Prologue:      sPre,
-		StaticKeypair: noise.DHKey{Private: mustHex(t, s.InitiatorStaticScalarHex), Public: sInitPub},
-		Random:        bytes.NewReader(mustHex(t, s.InitiatorEphemScalarHex)),
-	})
+	sInitHS, err := newHfsHandshake(
+		true,
+		sPre,
+		mustHex(t, s.InitiatorStaticScalarHex),
+		mustHex(t, s.InitiatorEphemScalarHex),
+		mustHex(t, s.InitiatorMLKEM768KeygenHex),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sRespHS, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   suite,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     false,
-		Prologue:      sPre,
-		StaticKeypair: noise.DHKey{Private: mustHex(t, s.ResponderStaticScalarHex), Public: sRespPub},
-		Random:        bytes.NewReader(mustHex(t, s.ResponderEphemScalarHex)),
-	})
+	sRespHS, err := newHfsHandshake(
+		false,
+		sPre,
+		mustHex(t, s.ResponderStaticScalarHex),
+		mustHex(t, s.ResponderEphemScalarHex),
+		mustHex(t, s.ResponderMLKEM768EncapsHex),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	sm1, _, _, err := sInitHS.WriteMessage(nil, nil)
+	sm1, err := sInitHS.writeMsg1(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(sm1)) != s.Msg1FrameHex {
 		t.Fatalf("session msg1 mismatch")
 	}
-	if _, _, _, err := sRespHS.ReadMessage(nil, decodeFrame(t, mustHex(t, s.Msg1FrameHex))); err != nil {
+	if _, err := sRespHS.readMsg1(decodeFrame(t, mustHex(t, s.Msg1FrameHex))); err != nil {
 		t.Fatal(err)
 	}
 
-	sm2, _, _, err := sRespHS.WriteMessage(nil, []byte(s.HostHelloJSON))
+	sm2, err := sRespHS.writeMsg2([]byte(s.HostHelloJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(sm2)) != s.Msg2FrameHex {
 		t.Fatalf("session msg2 mismatch")
 	}
-	if _, _, _, err := sInitHS.ReadMessage(nil, decodeFrame(t, mustHex(t, s.Msg2FrameHex))); err != nil {
+	if _, err := sInitHS.readMsg2(decodeFrame(t, mustHex(t, s.Msg2FrameHex))); err != nil {
 		t.Fatal(err)
 	}
-	if hex.EncodeToString(sInitHS.ChannelBinding()) != s.PostMsg2HandshakeHashHex {
+	if hex.EncodeToString(sInitHS.h[:]) != s.PostMsg2HandshakeHashHex {
 		t.Fatalf("session post-msg2 h mismatch")
 	}
 
-	sm3, sInitWrite, _, err := sInitHS.WriteMessage(nil, []byte(s.SessionHelloJSON))
+	sm3, sInitWrite, _, err := sInitHS.writeMsg3([]byte(s.SessionHelloJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(sm3)) != s.Msg3FrameHex {
 		t.Fatalf("session msg3 mismatch")
 	}
-	_, sRespRead, _, err := sRespHS.ReadMessage(nil, decodeFrame(t, mustHex(t, s.Msg3FrameHex)))
+	_, sRespRead, _, err := sRespHS.readMsg3(decodeFrame(t, mustHex(t, s.Msg3FrameHex)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hex.EncodeToString(sInitHS.ChannelBinding()) != s.FinalHandshakeHashHex {
+	if hex.EncodeToString(sInitHS.h[:]) != s.FinalHandshakeHashHex {
 		t.Fatalf("session final hash mismatch")
 	}
 
-	dataCT, err := sInitWrite.Encrypt(nil, nil, mustHex(t, s.DataInnerHex))
+	dataCT, err := sInitWrite.encryptWithAD(nil, mustHex(t, s.DataInnerHex))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(dataCT)) != s.DataFrameHex {
 		t.Fatalf("session data frame mismatch")
 	}
-	dataPT, err := sRespRead.Decrypt(nil, nil, decodeFrame(t, mustHex(t, s.DataFrameHex)))
+	dataPT, err := sRespRead.decryptWithAD(nil, decodeFrame(t, mustHex(t, s.DataFrameHex)))
 	if err != nil || hex.EncodeToString(dataPT) != s.DataInnerHex {
 		t.Fatalf("session data decrypt mismatch: %v", err)
 	}
 
-	rekeyCT, err := sInitWrite.Encrypt(nil, nil, mustHex(t, s.RekeyInnerHex))
+	rekeyCT, err := sInitWrite.encryptWithAD(nil, mustHex(t, s.RekeyInnerHex))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(rekeyCT)) != s.RekeyFrameHex {
 		t.Fatalf("session rekey frame mismatch")
 	}
-	sInitWrite.Rekey()
-	rekeyPT, err := sRespRead.Decrypt(nil, nil, decodeFrame(t, mustHex(t, s.RekeyFrameHex)))
+	if err := sInitWrite.rekey(); err != nil {
+		t.Fatal(err)
+	}
+	rekeyPT, err := sRespRead.decryptWithAD(nil, decodeFrame(t, mustHex(t, s.RekeyFrameHex)))
 	if err != nil || hex.EncodeToString(rekeyPT) != s.RekeyInnerHex {
 		t.Fatalf("session rekey decrypt mismatch: %v", err)
 	}
-	sRespRead.Rekey()
+	if err := sRespRead.rekey(); err != nil {
+		t.Fatal(err)
+	}
 
-	postCT, err := sInitWrite.Encrypt(nil, nil, mustHex(t, s.PostRekeyDataInnerHex))
+	postCT, err := sInitWrite.encryptWithAD(nil, mustHex(t, s.PostRekeyDataInnerHex))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(postCT)) != s.PostRekeyDataFrameHex {
 		t.Fatalf("post-rekey data frame mismatch:\ngot:  %x\nwant: %s", encodeFrame(postCT), s.PostRekeyDataFrameHex)
 	}
-	postPT, err := sRespRead.Decrypt(nil, nil, decodeFrame(t, mustHex(t, s.PostRekeyDataFrameHex)))
+	postPT, err := sRespRead.decryptWithAD(nil, decodeFrame(t, mustHex(t, s.PostRekeyDataFrameHex)))
 	if err != nil || hex.EncodeToString(postPT) != s.PostRekeyDataInnerHex {
 		t.Fatalf("post-rekey data decrypt mismatch: %v", err)
 	}
@@ -858,41 +1224,43 @@ func TestM2mEnrollment(t *testing.T) {
 		Sig       string   `json:"sig"`
 	}
 	var v struct {
-		NoisePattern                string         `json:"noise_pattern"`
-		PreambleHex                 string         `json:"preamble_hex"`
-		NowUnix                     uint64         `json:"now_unix"`
-		AnchorID                    string         `json:"anchor_id"`
-		AnchorSigningPubHex         string         `json:"anchor_signing_pub_hex"`
-		ResponderHostID             string         `json:"responder_host_id"`
-		ResponderStaticScalarHex    string         `json:"responder_static_scalar_hex"`
-		ResponderStaticPubHex       string         `json:"responder_static_pub_hex"`
-		ResponderEphemScalarHex     string         `json:"responder_ephem_scalar_hex"`
-		ResponderSigningPubHex      string         `json:"responder_signing_pub_hex"`
-		InitiatorStaticScalarHex    string         `json:"initiator_static_scalar_hex"`
-		InitiatorStaticPubHex       string         `json:"initiator_static_pub_hex"`
-		InitiatorDeviceID           string         `json:"initiator_device_id"`
-		InitiatorEphemScalarHex     string         `json:"initiator_ephem_scalar_hex"`
-		InitiatorSigningPubHex      string         `json:"initiator_signing_pub_hex"`
-		TokenJCSJSON                string         `json:"token_jcs_json"`
-		TokenSignedBytesHex         string         `json:"token_signed_bytes_hex"`
-		EnrollmentToken             enrollGrantObj `json:"enrollment_token"`
-		HostHelloJSON               string         `json:"host_hello_json"`
-		Msg1FrameHex                string         `json:"msg1_frame_hex"`
-		Msg2FrameHex                string         `json:"msg2_frame_hex"`
-		PostMsg2HandshakeHashHex    string         `json:"post_msg2_handshake_hash_hex"`
-		EnrollProofDomainHex        string         `json:"enroll_proof_domain_hex"`
-		EnrollProofBytesHex         string         `json:"enroll_proof_bytes_hex"`
-		EnrollProofB64URL           string         `json:"enroll_proof_b64url"`
-		PairClaimJSON               string         `json:"pair_claim_json"`
-		Msg3FrameHex                string         `json:"msg3_frame_hex"`
-		FinalHandshakeHashHex       string         `json:"final_handshake_hash_hex"`
-		PairResponseJSON            string         `json:"pair_response_json"`
-		PairResponseFrameHex        string         `json:"pair_response_frame_hex"`
-		ReplayedResponseJSON        string         `json:"replayed_response_json"`
+		NoisePattern               string         `json:"noise_pattern"`
+		PreambleHex                string         `json:"preamble_hex"`
+		NowUnix                    uint64         `json:"now_unix"`
+		AnchorID                   string         `json:"anchor_id"`
+		AnchorSigningPubHex        string         `json:"anchor_signing_pub_hex"`
+		ResponderHostID            string         `json:"responder_host_id"`
+		ResponderStaticScalarHex   string         `json:"responder_static_scalar_hex"`
+		ResponderStaticPubHex      string         `json:"responder_static_pub_hex"`
+		ResponderEphemScalarHex    string         `json:"responder_ephem_scalar_hex"`
+		ResponderMLKEM768EncapsHex string         `json:"responder_mlkem768_encaps_seed_hex"`
+		ResponderSigningPubHex     string         `json:"responder_signing_pub_hex"`
+		InitiatorStaticScalarHex   string         `json:"initiator_static_scalar_hex"`
+		InitiatorStaticPubHex      string         `json:"initiator_static_pub_hex"`
+		InitiatorDeviceID          string         `json:"initiator_device_id"`
+		InitiatorEphemScalarHex    string         `json:"initiator_ephem_scalar_hex"`
+		InitiatorMLKEM768KeygenHex string         `json:"initiator_mlkem768_keygen_seed_hex"`
+		InitiatorSigningPubHex     string         `json:"initiator_signing_pub_hex"`
+		TokenJCSJSON               string         `json:"token_jcs_json"`
+		TokenSignedBytesHex        string         `json:"token_signed_bytes_hex"`
+		EnrollmentToken            enrollGrantObj `json:"enrollment_token"`
+		HostHelloJSON              string         `json:"host_hello_json"`
+		Msg1FrameHex               string         `json:"msg1_frame_hex"`
+		Msg2FrameHex               string         `json:"msg2_frame_hex"`
+		PostMsg2HandshakeHashHex   string         `json:"post_msg2_handshake_hash_hex"`
+		EnrollProofDomainHex       string         `json:"enroll_proof_domain_hex"`
+		EnrollProofBytesHex        string         `json:"enroll_proof_bytes_hex"`
+		EnrollProofB64URL          string         `json:"enroll_proof_b64url"`
+		PairClaimJSON              string         `json:"pair_claim_json"`
+		Msg3FrameHex               string         `json:"msg3_frame_hex"`
+		FinalHandshakeHashHex      string         `json:"final_handshake_hash_hex"`
+		PairResponseJSON           string         `json:"pair_response_json"`
+		PairResponseFrameHex       string         `json:"pair_response_frame_hex"`
+		ReplayedResponseJSON       string         `json:"replayed_response_json"`
 	}
 	loadVector(t, "m2m_enrollment.json", &v)
 
-	if v.NoisePattern != "Noise_XX_25519_ChaChaPoly_SHA256" {
+	if v.NoisePattern != hfsPattern {
 		t.Fatalf("unexpected noise pattern %s", v.NoisePattern)
 	}
 	pre := mustHex(t, v.PreambleHex)
@@ -930,12 +1298,11 @@ func TestM2mEnrollment(t *testing.T) {
 	if hex.EncodeToString(signedTok) != v.TokenSignedBytesHex {
 		t.Fatalf("token signed bytes mismatch")
 	}
-	anchorPub := ed25519.PublicKey(mustHex(t, v.AnchorSigningPubHex))
-	if !ed25519.Verify(anchorPub, signedTok, mustB64URL(t, v.EnrollmentToken.Sig)) {
-		t.Fatalf("enrollment token signature invalid")
+	anchorPub := mustHex(t, v.AnchorSigningPubHex)
+	if err := verifyHybridSig(anchorPub, signedTok, mustB64URL(t, v.EnrollmentToken.Sig)); err != nil {
+		t.Fatalf("enrollment token signature invalid: %v", err)
 	}
 
-	cs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
 	initPub := mustHex(t, v.InitiatorStaticPubHex)
 	respPub := mustHex(t, v.ResponderStaticPubHex)
 	if goDeviceID(initPub) != v.InitiatorDeviceID {
@@ -945,53 +1312,51 @@ func TestM2mEnrollment(t *testing.T) {
 		t.Fatalf("responder host_id mismatch")
 	}
 
-	initHS, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   cs,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     true,
-		Prologue:      pre,
-		StaticKeypair: noise.DHKey{Private: mustHex(t, v.InitiatorStaticScalarHex), Public: initPub},
-		Random:        bytes.NewReader(mustHex(t, v.InitiatorEphemScalarHex)),
-	})
+	initHS, err := newHfsHandshake(
+		true,
+		pre,
+		mustHex(t, v.InitiatorStaticScalarHex),
+		mustHex(t, v.InitiatorEphemScalarHex),
+		mustHex(t, v.InitiatorMLKEM768KeygenHex),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	respHS, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   cs,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     false,
-		Prologue:      pre,
-		StaticKeypair: noise.DHKey{Private: mustHex(t, v.ResponderStaticScalarHex), Public: respPub},
-		Random:        bytes.NewReader(mustHex(t, v.ResponderEphemScalarHex)),
-	})
+	respHS, err := newHfsHandshake(
+		false,
+		pre,
+		mustHex(t, v.ResponderStaticScalarHex),
+		mustHex(t, v.ResponderEphemScalarHex),
+		mustHex(t, v.ResponderMLKEM768EncapsHex),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	m1, _, _, err := initHS.WriteMessage(nil, nil)
+	m1, err := initHS.writeMsg1(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(m1)) != v.Msg1FrameHex {
 		t.Fatalf("m2m msg1 frame mismatch")
 	}
-	if _, _, _, err := respHS.ReadMessage(nil, decodeFrame(t, mustHex(t, v.Msg1FrameHex))); err != nil {
+	if _, err := respHS.readMsg1(decodeFrame(t, mustHex(t, v.Msg1FrameHex))); err != nil {
 		t.Fatal(err)
 	}
 
-	m2, _, _, err := respHS.WriteMessage(nil, []byte(v.HostHelloJSON))
+	m2, err := respHS.writeMsg2([]byte(v.HostHelloJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(m2)) != v.Msg2FrameHex {
 		t.Fatalf("m2m msg2 frame mismatch")
 	}
-	pt2, _, _, err := initHS.ReadMessage(nil, decodeFrame(t, mustHex(t, v.Msg2FrameHex)))
+	pt2, err := initHS.readMsg2(decodeFrame(t, mustHex(t, v.Msg2FrameHex)))
 	if err != nil || string(pt2) != v.HostHelloJSON {
 		t.Fatalf("m2m msg2 decrypt mismatch: %v", err)
 	}
 
-	h := initHS.ChannelBinding()
+	h := initHS.h[:]
 	if hex.EncodeToString(h) != v.PostMsg2HandshakeHashHex {
 		t.Fatalf("m2m post-msg2 h mismatch")
 	}
@@ -1007,36 +1372,36 @@ func TestM2mEnrollment(t *testing.T) {
 	if hex.EncodeToString(proofInput) != v.EnrollProofBytesHex {
 		t.Fatalf("enroll proof bytes mismatch")
 	}
-	initSignPub := ed25519.PublicKey(mustHex(t, v.InitiatorSigningPubHex))
-	if !ed25519.Verify(initSignPub, proofInput, mustB64URL(t, v.EnrollProofB64URL)) {
-		t.Fatalf("enroll proof Ed25519 signature invalid")
+	initSignPub := mustHex(t, v.InitiatorSigningPubHex)
+	if err := verifyHybridSig(initSignPub, proofInput, mustB64URL(t, v.EnrollProofB64URL)); err != nil {
+		t.Fatalf("enroll proof hybrid signature invalid: %v", err)
 	}
 
-	m3, initCS0, initCS1, err := initHS.WriteMessage(nil, []byte(v.PairClaimJSON))
+	m3, initCS0, initCS1, err := initHS.writeMsg3([]byte(v.PairClaimJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(m3)) != v.Msg3FrameHex {
 		t.Fatalf("m2m msg3 frame mismatch")
 	}
-	pt3, respCS0, respCS1, err := respHS.ReadMessage(nil, decodeFrame(t, mustHex(t, v.Msg3FrameHex)))
+	pt3, respCS0, respCS1, err := respHS.readMsg3(decodeFrame(t, mustHex(t, v.Msg3FrameHex)))
 	if err != nil || string(pt3) != v.PairClaimJSON {
 		t.Fatalf("m2m msg3 decrypt mismatch: %v", err)
 	}
-	if hex.EncodeToString(initHS.ChannelBinding()) != v.FinalHandshakeHashHex {
+	if hex.EncodeToString(initHS.h[:]) != v.FinalHandshakeHashHex {
 		t.Fatalf("m2m final hash mismatch")
 	}
 	_ = initCS0
 	_ = respCS0
 
-	ct4, err := respCS1.Encrypt(nil, nil, []byte(v.PairResponseJSON))
+	ct4, err := respCS1.encryptWithAD(nil, []byte(v.PairResponseJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(encodeFrame(ct4)) != v.PairResponseFrameHex {
 		t.Fatalf("m2m pair_response frame mismatch")
 	}
-	pt4, err := initCS1.Decrypt(nil, nil, decodeFrame(t, mustHex(t, v.PairResponseFrameHex)))
+	pt4, err := initCS1.decryptWithAD(nil, decodeFrame(t, mustHex(t, v.PairResponseFrameHex)))
 	if err != nil || string(pt4) != v.PairResponseJSON {
 		t.Fatalf("m2m pair_response decrypt mismatch: %v", err)
 	}
@@ -1046,6 +1411,9 @@ func TestM2mEnrollment(t *testing.T) {
 	}
 	if respObj["status"] != "active" {
 		t.Fatalf("m2m pair response status = %q, want active", respObj["status"])
+	}
+	if respObj["host_signing_pub"] != base64.RawURLEncoding.EncodeToString(mustHex(t, v.ResponderSigningPubHex)) {
+		t.Fatalf("m2m pair response host_signing_pub mismatch")
 	}
 	var repObj map[string]string
 	if err := json.Unmarshal([]byte(v.ReplayedResponseJSON), &repObj); err != nil {
