@@ -371,7 +371,7 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
       () =>
         client.pair({
           relayUrl: relay.wsUrl,
-          targetPub: peerInit.signing_pub,
+          targetPub: peerInit.relay_pub,
           expectedHost: "127.0.0.1",
           code: code1,
         }),
@@ -385,7 +385,7 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
     const peerPair2 = peer.call({ op: "pair" });
     const paired = await client.pair({
       relayUrl: relay.wsUrl,
-      targetPub: peerInit.signing_pub,
+      targetPub: peerInit.relay_pub,
       expectedHost: "127.0.0.1",
       code: code2,
     });
@@ -419,7 +419,7 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
     const connectPeer = peer.call({ op: "connect" });
     const session1 = await client.connect({
       relayUrl: mitmWsUrl,
-      targetPub: peerInit.signing_pub,
+      targetPub: peerInit.relay_pub,
       expectedHost: "127.0.0.1",
       targetHostId: "sec-host",
       grantJson: JSON.stringify(grantObj),
@@ -502,7 +502,7 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
       const pp2 = peer2.call({ op: "pair" });
       const b2 = await client.pair({
         relayUrl: relay.wsUrl,
-        targetPub: init2.signing_pub,
+        targetPub: init2.relay_pub,
         expectedHost: "127.0.0.1",
         code: c2,
       });
@@ -515,7 +515,7 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
       const cp2 = peer2.call({ op: "connect" });
       const sess2 = await client.connect({
         relayUrl: relay.wsUrl,
-        targetPub: init2.signing_pub,
+        targetPub: init2.relay_pub,
         expectedHost: "127.0.0.1",
         targetHostId: "sec-host-2",
         grantJson: JSON.stringify(g2),
@@ -672,7 +672,7 @@ test("TendrilWebClient M2M enrollment over WSS relay, single-use replay, and anc
       const pairP = peer.call({ op: "pair" });
       const enrollRes = await client.enroll({
         relayUrl: relay.wsUrl,
-        targetPub: hostInit.signing_pub,
+        targetPub: hostInit.relay_pub,
         expectedHost: "127.0.0.1",
         allowInsecureWs: true,
         hostId: "web-m2m-host",
@@ -693,7 +693,7 @@ test("TendrilWebClient M2M enrollment over WSS relay, single-use replay, and anc
         () =>
           client.enroll({
             relayUrl: relay.wsUrl,
-            targetPub: hostInit.signing_pub,
+            targetPub: hostInit.relay_pub,
             expectedHost: "127.0.0.1",
             allowInsecureWs: true,
             hostId: "web-m2m-host",
@@ -711,7 +711,7 @@ test("TendrilWebClient M2M enrollment over WSS relay, single-use replay, and anc
       const connP = peer.call({ op: "connect" });
       const sess = await client.connect({
         relayUrl: relay.wsUrl,
-        targetPub: hostInit.signing_pub,
+        targetPub: hostInit.relay_pub,
         expectedHost: "127.0.0.1",
         allowInsecureWs: true,
         targetHostId: "web-m2m-host",
@@ -732,7 +732,7 @@ test("TendrilWebClient M2M enrollment over WSS relay, single-use replay, and anc
         () =>
           cli2.enroll({
             relayUrl: relay.wsUrl,
-            targetPub: hostInit.signing_pub,
+            targetPub: hostInit.relay_pub,
             expectedHost: "127.0.0.1",
             allowInsecureWs: true,
             hostId: "web-m2m-host",
@@ -756,12 +756,12 @@ test("TendrilWebClient M2M enrollment over WSS relay, single-use replay, and anc
         () =>
           cli2.enroll({
             relayUrl: relay.wsUrl,
-            targetPub: hostInit.signing_pub,
+            targetPub: hostInit.relay_pub,
             expectedHost: "127.0.0.1",
             allowInsecureWs: true,
             hostId: "web-m2m-host",
             hostStaticPubB64: hostInit.static_pub,
-            hostSigningPubB64: hostInit.signing_pub,
+            hostSigningPubB64: hostInit.signing_pub_hash,
             tokenJson: freshTok,
           }),
         /untrusted_anchor/
@@ -771,12 +771,12 @@ test("TendrilWebClient M2M enrollment over WSS relay, single-use replay, and anc
       const selfPairP = peer.call({ op: "pair" });
       const selfEnrollRes = await cli2.enroll({
         relayUrl: relay.wsUrl,
-        targetPub: hostInit.signing_pub,
+        targetPub: hostInit.relay_pub,
         expectedHost: "127.0.0.1",
         allowInsecureWs: true,
         hostId: "web-m2m-host",
         hostStaticPubB64: hostInit.static_pub,
-        hostSigningPubB64: hostInit.signing_pub,
+        hostSigningPubB64: hostInit.signing_pub_hash,
         tokenJson: selfTok,
         deviceName: "web-worker-2",
         deviceKind: "machine",

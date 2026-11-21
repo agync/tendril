@@ -22,15 +22,24 @@ import (
 	"unsafe"
 )
 
+const (
+	// SigningPubLen is the byte length of a hybrid Ed25519 + ML-DSA-65 public key.
+	SigningPubLen = int(C.TENDRIL_SIGNING_PUB_LEN)
+	// SigningHashLen is the byte length of a SHA-256 signing public key hash pin.
+	SigningHashLen = int(C.TENDRIL_SIGNING_HASH_LEN)
+)
+
 // ErrWouldBlock indicates a polled FFI call timed out with no new event ready.
 var ErrWouldBlock = errors.New("tendril: would block")
 
 // EndpointInfo holds an endpoint's public identifiers returned by Endpoint.Info.
 type EndpointInfo struct {
-	HostID     string `json:"host_id"`
-	DeviceID   string `json:"device_id"`
-	StaticPub  string `json:"static_pub"`
-	SigningPub string `json:"signing_pub"`
+	HostID         string `json:"host_id"`
+	DeviceID       string `json:"device_id"`
+	StaticPub      string `json:"static_pub"`
+	SigningPub     string `json:"signing_pub"`
+	SigningPubHash string `json:"signing_pub_hash"`
+	RelayPub       string `json:"relay_pub"`
 }
 
 // PairInitiateResult holds the client-side outcome of pairing initiation.
@@ -568,10 +577,10 @@ func (ep *Endpoint) RevokePeer(peerID string) error {
 	})
 }
 
-// AddTrustAnchor registers an active Ed25519 trust anchor for autonomous M2M enrollment.
+// AddTrustAnchor registers an active hybrid signing trust anchor for autonomous M2M enrollment.
 func (ep *Endpoint) AddTrustAnchor(anchorID string, signingPub []byte) error {
-	if len(signingPub) != 32 {
-		return fmt.Errorf("tendril: signingPub must be 32 bytes (got %d)", len(signingPub))
+	if len(signingPub) != SigningPubLen {
+		return fmt.Errorf("tendril: signingPub must be %d bytes (got %d)", SigningPubLen, len(signingPub))
 	}
 	defer runtime.KeepAlive(signingPub)
 	return ep.withHandle(func(h *C.TendrilEndpoint) error {
@@ -584,6 +593,7 @@ func (ep *Endpoint) AddTrustAnchor(anchorID string, signingPub []byte) error {
 			h,
 			ca,
 			(*C.uint8_t)(unsafe.Pointer(&signingPub[0])),
+			C.size_t(len(signingPub)),
 		)
 		if rc != C.TENDRIL_OK {
 			return ffiErr(rc)
@@ -645,8 +655,8 @@ func (ep *Endpoint) EnrollInitiate(
 	if len(hostStaticPub) != 32 {
 		return res, fmt.Errorf("tendril: hostStaticPub must be 32 bytes (got %d)", len(hostStaticPub))
 	}
-	if len(hostSigningPub) != 32 {
-		return res, fmt.Errorf("tendril: hostSigningPub must be 32 bytes (got %d)", len(hostSigningPub))
+	if len(hostSigningPub) != SigningPubLen && len(hostSigningPub) != SigningHashLen {
+		return res, fmt.Errorf("tendril: hostSigningPub must be %d or %d bytes (got %d)", SigningPubLen, SigningHashLen, len(hostSigningPub))
 	}
 	defer runtime.KeepAlive(hostStaticPub)
 	defer runtime.KeepAlive(hostSigningPub)
@@ -679,6 +689,7 @@ func (ep *Endpoint) EnrollInitiate(
 						chid,
 						(*C.uint8_t)(unsafe.Pointer(&hostStaticPub[0])),
 						(*C.uint8_t)(unsafe.Pointer(&hostSigningPub[0])),
+						C.size_t(len(hostSigningPub)),
 						C.uint64_t(hostRotationSeq),
 						ctok,
 						cn,

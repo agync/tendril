@@ -406,7 +406,7 @@ async function main() {
       window.__e2eClient = await sdk.TendrilWebClient.create({ hostId: 'chrome-client' });
       const res = await window.__e2eClient.pair({
         relayUrl: 'ws://127.0.0.1:${server.port}/v1/relay',
-        targetPub: ${JSON.stringify(peerInit.signing_pub)},
+        targetPub: ${JSON.stringify(peerInit.relay_pub)},
         expectedHost: '127.0.0.1',
         code: ${JSON.stringify(pairCode)},
         deviceName: 'chrome-browser',
@@ -430,7 +430,7 @@ async function main() {
       try {
         await window.__e2eClient.connect({
           relayUrl: 'ws://127.0.0.1:${server.port}/v1/relay',
-          targetPub: ${JSON.stringify(peerInit.signing_pub)},
+          targetPub: ${JSON.stringify(peerInit.relay_pub)},
           expectedHost: '127.0.0.1',
           targetHostId: 'web-e2e-host',
           grantJson: ${JSON.stringify(JSON.stringify(grantObj))},
@@ -450,7 +450,7 @@ async function main() {
     const chromeConnEval = cdp.evalAsync(`
       window.__e2eSession = await window.__e2eClient.connect({
         relayUrl: 'ws://127.0.0.1:${server.port}/v1/relay',
-        targetPub: ${JSON.stringify(peerInit.signing_pub)},
+        targetPub: ${JSON.stringify(peerInit.relay_pub)},
         expectedHost: '127.0.0.1',
         targetHostId: 'web-e2e-host',
         grantJson: ${JSON.stringify(JSON.stringify(grantObj))},

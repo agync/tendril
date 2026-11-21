@@ -721,7 +721,11 @@ public final class TendrilJniConformanceTest {
       Map<String, Object> anchorInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(anchorEp)));
       byte[] hostStatic = b64UrlDecode(asStr(hostInfo.get("static_pub")));
       byte[] hostSigning = b64UrlDecode(asStr(hostInfo.get("signing_pub")));
+      byte[] hostSigningHash = b64UrlDecode(asStr(hostInfo.get("signing_pub_hash")));
       byte[] anchorSigning = b64UrlDecode(asStr(anchorInfo.get("signing_pub")));
+      check(hostSigning.length == 1984, "expected 1984-byte hybrid signing key");
+      check(hostSigningHash.length == 32, "expected 32-byte signing pub hash");
+      check(anchorSigning.length == 1984, "expected 1984-byte anchor hybrid signing key");
 
       TendrilNative.endpointAddTrustAnchor(hostEp, "jni-m2m-anchor", anchorSigning);
       String ep = TendrilNative.endpointServeDirect(hostEp, "127.0.0.1:0");
@@ -868,7 +872,7 @@ public final class TendrilJniConformanceTest {
                       null,
                       "jni-m2m-host",
                       hostStatic,
-                      hostSigning,
+                      hostSigningHash,
                       0,
                       selfTok,
                       "jni-worker-2",

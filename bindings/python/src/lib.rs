@@ -10,12 +10,15 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use tendril_core::crypto::{
-    b64url_decode_array, b64url_encode, compute_code_mac as core_compute_code_mac,
-    device_id as core_device_id, fingerprint_device as core_fingerprint_device,
-    fingerprint_host as core_fingerprint_host, pairing_sas as core_pairing_sas, random_bytes,
+    HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, b64url_decode_array,
+    b64url_encode, compute_code_mac as core_compute_code_mac, device_id as core_device_id,
+    fingerprint_device as core_fingerprint_device, fingerprint_host as core_fingerprint_host,
+    pairing_sas as core_pairing_sas, random_bytes,
 };
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
-use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
+use tendril_core::identity::{
+    EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
+};
 use tendril_core::pairing::{
     EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PinnedHost,
     mint_enrollment_token as core_mint_enrollment_token,
@@ -31,14 +34,21 @@ use tendril_runtime::{
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
 
+fn persist_roster_guard(store: Option<&Arc<StateStore>>, roster: &Roster) -> PyResult<()> {
+    if let Some(s) = store {
+        s.save_roster(roster)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
+    Ok(())
+}
+
 fn persist_store_roster(
     store: Option<&Arc<StateStore>>,
     roster: &Arc<StdMutex<Roster>>,
 ) -> PyResult<()> {
-    if let Some(s) = store {
+    if store.is_some() {
         let guard = roster.lock().expect("roster mutex poisoned");
-        s.save_roster(&guard)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        persist_roster_guard(store, &guard)?;
     }
     Ok(())
 }
@@ -54,6 +64,30 @@ fn as_32(bytes: &[u8], name: &str) -> PyResult<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| PyValueError::new_err(format!("{name} must be exactly 32 bytes")))
+}
+
+fn parse_hybrid_signing_pub(bytes: &[u8], name: &str) -> PyResult<HybridSigningPublicKey> {
+    if bytes.len() != HYBRID_SIGNING_PUB_LEN {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be exactly {HYBRID_SIGNING_PUB_LEN} bytes"
+        )));
+    }
+    HybridSigningPublicKey::from_bytes(bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid {name}: {e}")))
+}
+
+fn parse_signing_pin(bytes: &[u8], name: &str) -> PyResult<SigningKeyPin> {
+    if bytes.len() == HYBRID_SIGNING_PUB_LEN {
+        parse_hybrid_signing_pub(bytes, name).map(SigningKeyPin::Full)
+    } else if bytes.len() == HYBRID_SIGNING_HASH_LEN {
+        let mut hash = [0u8; HYBRID_SIGNING_HASH_LEN];
+        hash.copy_from_slice(bytes);
+        Ok(SigningKeyPin::Hash(hash))
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{name} must be {HYBRID_SIGNING_PUB_LEN} or {HYBRID_SIGNING_HASH_LEN} bytes"
+        )))
+    }
 }
 
 async fn dial_endpoint(
@@ -104,13 +138,13 @@ fn verify_rotation_chain_json(
     cur_static_b64: &str,
     cur_signing_b64: &str,
 ) -> PyResult<u64> {
-    let psig = b64url_decode_array::<32>(pinned_signing_b64)
+    let psig = HybridSigningPublicKey::from_b64url(pinned_signing_b64)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let pstat = b64url_decode_array::<32>(pinned_static_b64)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let cstat = b64url_decode_array::<32>(cur_static_b64)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let csig = b64url_decode_array::<32>(cur_signing_b64)
+    let csig = HybridSigningPublicKey::from_b64url(cur_signing_b64)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let chain: Vec<RotationRecord> =
         serde_json::from_str(chain_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -135,7 +169,7 @@ fn verify_grant_json(
         serde_json::from_str(issuer_keys_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let mut key_map = HashMap::with_capacity(key_map_raw.len());
     for (id, b64) in key_map_raw {
-        let k = b64url_decode_array::<32>(&b64)
+        let k = HybridSigningPublicKey::from_b64url(&b64)
             .map_err(|e| PyValueError::new_err(format!("invalid key for {id}: {e}")))?;
         key_map.insert(id, k);
     }
@@ -152,7 +186,7 @@ fn verify_grant_json(
         requested_cap,
         now_unix_secs,
         crl.as_ref(),
-        |id| key_map.get(id).copied(),
+        |id| key_map.get(id).cloned(),
     );
     Ok(res.is_ok())
 }
@@ -235,7 +269,9 @@ impl Endpoint {
             "host_id": self.identity.host_id(),
             "device_id": self.identity.device_id(),
             "static_pub": b64url_encode(self.identity.static_key().public_bytes()),
-            "signing_pub": b64url_encode(self.identity.signing_key().public_bytes()),
+            "signing_pub": self.identity.signing_key().public_key().to_b64url(),
+            "signing_pub_hash": b64url_encode(&self.identity.signing_key().signing_pub_hash()),
+            "relay_pub": b64url_encode(self.identity.signing_key().ed25519_public_bytes()),
         })
         .to_string()
     }
@@ -268,7 +304,7 @@ impl Endpoint {
         let router = Arc::clone(&self.router);
         let url = relay_url.to_owned();
         let exp = expected_host.map(ToOwned::to_owned);
-        let key = self.identity.signing_key().signing_key();
+        let key = self.identity.signing_key().ed25519_signing_key();
         py.detach(move || {
             let listener = rt
                 .block_on(RelayListener::bind(url, exp, key, DEFAULT_WRITE_TIMEOUT))
@@ -539,14 +575,13 @@ impl Endpoint {
         let self_m2m = Arc::clone(&self.self_m2m_enabled);
         let m2m = Arc::clone(&self.m2m_enabled);
         py.detach(move || {
-            {
-                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-                roster
-                    .revoke_peer(&pid)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                refresh_m2m_flags(&self_m2m, &m2m, &roster);
-            }
-            persist_store_roster(store.as_ref(), &roster_arc)
+            let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+            roster
+                .revoke_peer(&pid)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            persist_roster_guard(store.as_ref(), &roster)?;
+            refresh_m2m_flags(&self_m2m, &m2m, &roster);
+            Ok(())
         })
     }
 
@@ -556,7 +591,7 @@ impl Endpoint {
         anchor_id: &str,
         signing_pub: &[u8],
     ) -> PyResult<()> {
-        let key = as_32(signing_pub, "signing_pub")?;
+        let key = parse_hybrid_signing_pub(signing_pub, "signing_pub")?;
         let aid = anchor_id.to_owned();
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
@@ -564,14 +599,12 @@ impl Endpoint {
         let m2m = Arc::clone(&self.m2m_enabled);
         let router = Arc::clone(&self.router);
         py.detach(move || {
-            {
-                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-                roster
-                    .add_trust_anchor(aid, key)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                refresh_m2m_flags(&self_m2m, &m2m, &roster);
-            }
-            persist_store_roster(store.as_ref(), &roster_arc)?;
+            let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+            roster
+                .add_trust_anchor(aid, key)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            persist_roster_guard(store.as_ref(), &roster)?;
+            refresh_m2m_flags(&self_m2m, &m2m, &roster);
             router.set_pair_enabled(true);
             Ok(())
         })
@@ -584,14 +617,13 @@ impl Endpoint {
         let self_m2m = Arc::clone(&self.self_m2m_enabled);
         let m2m = Arc::clone(&self.m2m_enabled);
         py.detach(move || {
-            {
-                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-                roster
-                    .revoke_trust_anchor(&aid)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                refresh_m2m_flags(&self_m2m, &m2m, &roster);
-            }
-            persist_store_roster(store.as_ref(), &roster_arc)
+            let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+            roster
+                .revoke_trust_anchor(&aid)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            persist_roster_guard(store.as_ref(), &roster)?;
+            refresh_m2m_flags(&self_m2m, &m2m, &roster);
+            Ok(())
         })
     }
 
@@ -606,6 +638,7 @@ impl Endpoint {
         let target_s = target_host_id.to_owned();
         let subject_s = subject.map(ToOwned::to_owned);
         let identity = Arc::clone(&self.identity);
+        let roster_arc = Arc::clone(&self.roster);
         let self_m2m = Arc::clone(&self.self_m2m_enabled);
         let m2m = Arc::clone(&self.m2m_enabled);
         let router = Arc::clone(&self.router);
@@ -621,8 +654,9 @@ impl Endpoint {
             )
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
             if target_s == identity.host_id() {
+                let roster = roster_arc.lock().expect("roster mutex poisoned");
                 self_m2m.store(true, Ordering::Release);
-                m2m.store(true, Ordering::Release);
+                refresh_m2m_flags(&self_m2m, &m2m, &roster);
                 router.set_pair_enabled(true);
             }
             serde_json::to_string(&token).map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -645,13 +679,13 @@ impl Endpoint {
         kind: &str,
     ) -> PyResult<String> {
         let static_pub = as_32(host_static_pub, "host_static_pub")?;
-        let signing_pub = as_32(host_signing_pub, "host_signing_pub")?;
+        let signing_pin = parse_signing_pin(host_signing_pub, "host_signing_pub")?;
         let token: Grant = serde_json::from_str(token_json)
             .map_err(|e| PyValueError::new_err(format!("invalid token_json: {e}")))?;
         let pinned_host = PinnedHost {
             host_id: Some(host_id.to_owned()),
             static_pub,
-            signing_pub,
+            signing_pin,
             rotation_seq: host_rotation_seq,
         };
         let rt = Arc::clone(&self.rt);

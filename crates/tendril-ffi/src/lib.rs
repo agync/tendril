@@ -12,12 +12,15 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tendril_core::crypto::{
-    b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
-    fingerprint_host, pairing_sas, random_bytes,
+    HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, b64url_decode_array,
+    b64url_encode, compute_code_mac, device_id, fingerprint_device, fingerprint_host, pairing_sas,
+    random_bytes,
 };
 use tendril_core::error::CoreError;
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
-use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
+use tendril_core::identity::{
+    EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
+};
 use tendril_core::pairing::{
     EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PinnedHost,
     mint_enrollment_token,
@@ -118,6 +121,53 @@ unsafe fn read_bytes32(ptr: *const u8, name: &str) -> Result<[u8; 32], i32> {
     let mut out = [0u8; 32];
     out.copy_from_slice(slice);
     Ok(out)
+}
+
+unsafe fn read_hybrid_signing_pub(
+    ptr: *const u8,
+    len: usize,
+    name: &str,
+) -> Result<HybridSigningPublicKey, i32> {
+    if ptr.is_null() {
+        set_last_error(format!("null pointer for {name}"));
+        return Err(TENDRIL_ERR_INVALID_ARG);
+    }
+    if len != HYBRID_SIGNING_PUB_LEN {
+        set_last_error(format!(
+            "invalid {name} length {len}, expected {HYBRID_SIGNING_PUB_LEN}"
+        ));
+        return Err(TENDRIL_ERR_INVALID_ARG);
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    HybridSigningPublicKey::from_bytes(slice).map_err(|e| {
+        set_last_error(format!("invalid {name}: {e}"));
+        TENDRIL_ERR_INVALID_ARG
+    })
+}
+
+unsafe fn read_signing_pin(ptr: *const u8, len: usize, name: &str) -> Result<SigningKeyPin, i32> {
+    if ptr.is_null() {
+        set_last_error(format!("null pointer for {name}"));
+        return Err(TENDRIL_ERR_INVALID_ARG);
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    if len == HYBRID_SIGNING_PUB_LEN {
+        HybridSigningPublicKey::from_bytes(slice)
+            .map(SigningKeyPin::Full)
+            .map_err(|e| {
+                set_last_error(format!("invalid {name}: {e}"));
+                TENDRIL_ERR_INVALID_ARG
+            })
+    } else if len == HYBRID_SIGNING_HASH_LEN {
+        let mut hash = [0u8; HYBRID_SIGNING_HASH_LEN];
+        hash.copy_from_slice(slice);
+        Ok(SigningKeyPin::Hash(hash))
+    } else {
+        set_last_error(format!(
+            "invalid {name} length {len}, expected {HYBRID_SIGNING_PUB_LEN} or {HYBRID_SIGNING_HASH_LEN}"
+        ));
+        Err(TENDRIL_ERR_INVALID_ARG)
+    }
 }
 
 unsafe fn write_out_cstring(out: *mut *mut c_char, val: &str) -> i32 {
@@ -424,7 +474,7 @@ pub unsafe extern "C" fn tendril_verify_rotation_chain_json(
             return TENDRIL_ERR_INVALID_ARG;
         };
 
-        let Ok(psig) = b64url_decode_array::<32>(psig_s) else {
+        let Ok(psig) = HybridSigningPublicKey::from_b64url(psig_s) else {
             set_last_error("invalid pinned_signing_b64");
             return TENDRIL_ERR_INVALID_ARG;
         };
@@ -436,7 +486,7 @@ pub unsafe extern "C" fn tendril_verify_rotation_chain_json(
             set_last_error("invalid cur_static_b64");
             return TENDRIL_ERR_INVALID_ARG;
         };
-        let Ok(csig) = b64url_decode_array::<32>(csig_s) else {
+        let Ok(csig) = HybridSigningPublicKey::from_b64url(csig_s) else {
             set_last_error("invalid cur_signing_b64");
             return TENDRIL_ERR_INVALID_ARG;
         };
@@ -519,9 +569,10 @@ pub unsafe extern "C" fn tendril_verify_grant_json(
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
-        let mut key_map: HashMap<String, [u8; 32]> = HashMap::with_capacity(key_map_raw.len());
+        let mut key_map: HashMap<String, HybridSigningPublicKey> =
+            HashMap::with_capacity(key_map_raw.len());
         for (id, b64) in key_map_raw {
-            let Ok(k) = b64url_decode_array::<32>(&b64) else {
+            let Ok(k) = HybridSigningPublicKey::from_b64url(&b64) else {
                 set_last_error(format!("invalid signing key for issuer '{id}'"));
                 return TENDRIL_ERR_INVALID_ARG;
             };
@@ -545,7 +596,7 @@ pub unsafe extern "C" fn tendril_verify_grant_json(
             cap_s,
             now_unix,
             crl.as_ref(),
-            |issuer| key_map.get(issuer).copied(),
+            |issuer| key_map.get(issuer).cloned(),
         );
         if let Err(ref err) = res {
             set_last_error(err.to_string());
@@ -777,7 +828,9 @@ pub unsafe extern "C" fn tendril_endpoint_info_json(
             "host_id": ep.identity.host_id(),
             "device_id": ep.identity.device_id(),
             "static_pub": b64url_encode(ep.identity.static_key().public_bytes()),
-            "signing_pub": b64url_encode(ep.identity.signing_key().public_bytes()),
+            "signing_pub": ep.identity.signing_key().public_key().to_b64url(),
+            "signing_pub_hash": b64url_encode(&ep.identity.signing_key().signing_pub_hash()),
+            "relay_pub": b64url_encode(ep.identity.signing_key().ed25519_public_bytes()),
         });
         unsafe { write_out_cstring(out_json, &info.to_string()) }
     })
@@ -849,7 +902,7 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay(
             Err(rc) => return rc,
         };
         let ep = unsafe { &*ep };
-        let signing_key = ep.identity.signing_key().signing_key();
+        let signing_key = ep.identity.signing_key().ed25519_signing_key();
         match ep.rt.block_on(RelayListener::bind(
             url,
             exp_host,
@@ -1315,15 +1368,16 @@ pub unsafe extern "C" fn tendril_endpoint_revoke_peer(
     })
 }
 
-/// Registers an active external Ed25519 trust anchor for M2M enrollment and enables M2M mode.
+/// Registers an active external hybrid signing trust anchor for M2M enrollment and enables M2M mode.
 ///
 /// # Safety
-/// `ep` and `anchor_id` must be valid non-null pointers and `signing_pub_32` must point to 32 bytes.
+/// `ep` and `anchor_id` must be valid non-null pointers and `signing_pub` must point to `signing_pub_len` bytes (`1984`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_endpoint_add_trust_anchor(
     ep: *mut TendrilEndpoint,
     anchor_id: *const c_char,
-    signing_pub_32: *const u8,
+    signing_pub: *const u8,
+    signing_pub_len: usize,
 ) -> i32 {
     ffi_i32(|| {
         if ep.is_null() {
@@ -1333,12 +1387,14 @@ pub unsafe extern "C" fn tendril_endpoint_add_trust_anchor(
         let Ok(anchor_s) = (unsafe { cstr_to_str(anchor_id, "anchor_id") }) else {
             return TENDRIL_ERR_INVALID_ARG;
         };
-        let Ok(signing_pub) = (unsafe { read_bytes32(signing_pub_32, "signing_pub_32") }) else {
+        let Ok(signing_pub_key) =
+            (unsafe { read_hybrid_signing_pub(signing_pub, signing_pub_len, "signing_pub") })
+        else {
             return TENDRIL_ERR_INVALID_ARG;
         };
         let ep = unsafe { &*ep };
         let mut roster = ep.roster.lock().expect("roster mutex poisoned");
-        if let Err(e) = roster.add_trust_anchor(anchor_s.to_owned(), signing_pub) {
+        if let Err(e) = roster.add_trust_anchor(anchor_s.to_owned(), signing_pub_key) {
             set_last_error(e.to_string());
             return match e {
                 CoreError::IncompletePin(_) => TENDRIL_ERR_INVALID_ARG,
@@ -1355,7 +1411,7 @@ pub unsafe extern "C" fn tendril_endpoint_add_trust_anchor(
     })
 }
 
-/// Revokes an external Ed25519 trust anchor and any sibling anchors sharing its signing key.
+/// Revokes an external hybrid signing trust anchor and any sibling anchors sharing its signing key.
 ///
 /// # Safety
 /// `ep` and `anchor_id` must be valid non-null pointers.
@@ -1378,11 +1434,11 @@ pub unsafe extern "C" fn tendril_endpoint_revoke_trust_anchor(
             set_last_error(e.to_string());
             return TENDRIL_ERR_NOT_FOUND;
         }
-        ep.refresh_m2m_enabled(&roster);
         if let Err(e) = ep.persist_roster(&roster) {
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
         }
+        ep.refresh_m2m_enabled(&roster);
         TENDRIL_OK
     })
 }
@@ -1448,8 +1504,9 @@ pub unsafe extern "C" fn tendril_endpoint_mint_enrollment_token(
 /// Initiates autonomous M2M enrollment toward a pinned host using `token_json`.
 ///
 /// # Safety
-/// `ep`, `endpoint`, `host_id`, `host_static_pub_32`, `host_signing_pub_32`, `token_json`, and
-/// `out_json` must be valid non-null pointers; optional strings may be null.
+/// `ep`, `endpoint`, `host_id`, `host_static_pub_32`, `host_signing_pin`, `token_json`, and
+/// `out_json` must be valid non-null pointers (`host_signing_pin_len` must be `1984` or `32`);
+/// optional strings may be null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
     ep: *mut TendrilEndpoint,
@@ -1457,7 +1514,8 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
     relay_host_opt: *const c_char,
     host_id: *const c_char,
     host_static_pub_32: *const u8,
-    host_signing_pub_32: *const u8,
+    host_signing_pin: *const u8,
+    host_signing_pin_len: usize,
     host_rotation_seq: u64,
     token_json: *const c_char,
     name: *const c_char,
@@ -1483,8 +1541,9 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
         else {
             return TENDRIL_ERR_INVALID_ARG;
         };
-        let Ok(signing_pub) = (unsafe { read_bytes32(host_signing_pub_32, "host_signing_pub_32") })
-        else {
+        let Ok(signing_pin) = (unsafe {
+            read_signing_pin(host_signing_pin, host_signing_pin_len, "host_signing_pin")
+        }) else {
             return TENDRIL_ERR_INVALID_ARG;
         };
         let Ok(token_s) = (unsafe { cstr_to_str(token_json, "token_json") }) else {
@@ -1506,7 +1565,7 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
         let pinned_host = PinnedHost {
             host_id: Some(host_id_s.to_owned()),
             static_pub,
-            signing_pub,
+            signing_pin,
             rotation_seq: host_rotation_seq,
         };
 

@@ -599,7 +599,7 @@ export class TendrilWebClient {
         const parsed = parsePairingUri(pairingUri);
         pairCode = parsed.code;
         hostStaticPin = parsed.host_static_pub_b64;
-        hostSigningPin = parsed.host_signing_pub_b64;
+        hostSigningPin = parsed.host_signing_pub_hash_b64;
         hostIdPin = parsed.host_id ?? null;
         hostRotationSeqPin = parsed.rotation_seq ?? null;
       }

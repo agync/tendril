@@ -756,6 +756,16 @@ func TestM2mEnrollmentAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode signing: %v", err)
 	}
+	if len(hostSigning) != tendril.SigningPubLen {
+		t.Fatalf("expected %d-byte hybrid signing pub, got %d", tendril.SigningPubLen, len(hostSigning))
+	}
+	hostSigningHash, err := base64.RawURLEncoding.DecodeString(hostInfo.SigningPubHash)
+	if err != nil {
+		t.Fatalf("decode signing hash: %v", err)
+	}
+	if len(hostSigningHash) != tendril.SigningHashLen {
+		t.Fatalf("expected %d-byte signing pub hash, got %d", tendril.SigningHashLen, len(hostSigningHash))
+	}
 	anchorInfo, err := anchorEp.Info()
 	if err != nil {
 		t.Fatalf("anchor Info: %v", err)
@@ -763,6 +773,9 @@ func TestM2mEnrollmentAndReplay(t *testing.T) {
 	anchorSigning, err := base64.RawURLEncoding.DecodeString(anchorInfo.SigningPub)
 	if err != nil {
 		t.Fatalf("decode anchor signing: %v", err)
+	}
+	if len(anchorSigning) != tendril.SigningPubLen {
+		t.Fatalf("expected %d-byte anchor signing pub, got %d", tendril.SigningPubLen, len(anchorSigning))
 	}
 
 	if err := hostEp.AddTrustAnchor("go-m2m-anchor", anchorSigning); err != nil {
@@ -863,7 +876,7 @@ func TestM2mEnrollmentAndReplay(t *testing.T) {
 		r, e := hostEp.PairAccept(5000)
 		accCh <- accOutcome{res: r, err: e}
 	}()
-	selfInitRes, err := cli2Ep.EnrollInitiate(addr, "", "go-m2m-host", hostStatic, hostSigning, 0, selfTok, "go-worker-2", "machine")
+	selfInitRes, err := cli2Ep.EnrollInitiate(addr, "", "go-m2m-host", hostStatic, hostSigningHash, 0, selfTok, "go-worker-2", "machine")
 	if err != nil {
 		t.Fatalf("EnrollInitiate self: %v", err)
 	}

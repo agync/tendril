@@ -251,6 +251,36 @@ static int read_bytes32(JNIEnv *env, jbyteArray arr, uint8_t out[32]) {
   return 1;
 }
 
+static int read_hybrid_signing_pub(JNIEnv *env, jbyteArray arr, uint8_t out[TENDRIL_SIGNING_PUB_LEN]) {
+  if (arr == NULL || (*env)->GetArrayLength(env, arr) != TENDRIL_SIGNING_PUB_LEN) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "expected 1984-byte hybrid signing key");
+    return 0;
+  }
+  (*env)->GetByteArrayRegion(env, arr, 0, TENDRIL_SIGNING_PUB_LEN, (jbyte *)out);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
+  return 1;
+}
+
+static int read_signing_pin(JNIEnv *env, jbyteArray arr, uint8_t out[TENDRIL_SIGNING_PUB_LEN], size_t *out_len) {
+  if (arr == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "expected 1984-byte or 32-byte signing pin");
+    return 0;
+  }
+  jsize len = (*env)->GetArrayLength(env, arr);
+  if (len != TENDRIL_SIGNING_PUB_LEN && len != TENDRIL_SIGNING_HASH_LEN) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "expected 1984-byte or 32-byte signing pin");
+    return 0;
+  }
+  (*env)->GetByteArrayRegion(env, arr, 0, len, (jbyte *)out);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
+  *out_len = (size_t)len;
+  return 1;
+}
+
 static int require_non_negative_jlong(JNIEnv *env, jlong val, const char *name) {
   if (val < 0) {
     char msg[128];
@@ -782,8 +812,8 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointAddTrustAnchor(
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid trust anchor arguments");
     return;
   }
-  uint8_t key[32];
-  if (!read_bytes32(env, signing_pub, key)) {
+  uint8_t key[TENDRIL_SIGNING_PUB_LEN];
+  if (!read_hybrid_signing_pub(env, signing_pub, key)) {
     return;
   }
   char *c_anchor = NULL;
@@ -791,7 +821,7 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointAddTrustAnchor(
     return;
   }
   int32_t rc = tendril_endpoint_add_trust_anchor(
-      (TendrilEndpoint *)(uintptr_t)ptr, c_anchor, key);
+      (TendrilEndpoint *)(uintptr_t)ptr, c_anchor, key, (size_t)TENDRIL_SIGNING_PUB_LEN);
   free(c_anchor);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_add_trust_anchor failed");
@@ -860,10 +890,11 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointEnrollInitiate(
   if (!require_non_negative_jlong(env, host_rotation_seq, "host_rotation_seq")) {
     return NULL;
   }
-  uint8_t static_pub[32];
-  uint8_t signing_pub[32];
+  uint8_t static_pub[TENDRIL_KEY_LEN];
+  uint8_t signing_pin[TENDRIL_SIGNING_PUB_LEN];
+  size_t signing_pin_len = 0;
   if (!read_bytes32(env, host_static_pub, static_pub) ||
-      !read_bytes32(env, host_signing_pub, signing_pub)) {
+      !read_signing_pin(env, host_signing_pub, signing_pin, &signing_pin_len)) {
     return NULL;
   }
   char *c_ep = NULL;
@@ -886,7 +917,8 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointEnrollInitiate(
         c_rh,
         c_host,
         static_pub,
-        signing_pub,
+        signing_pin,
+        signing_pin_len,
         (uint64_t)host_rotation_seq,
         c_token,
         c_name,

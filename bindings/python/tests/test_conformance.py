@@ -526,7 +526,11 @@ class TendrilPythonTests(unittest.TestCase):
 
             host_static = b64u_dec(host_info["static_pub"])
             host_signing = b64u_dec(host_info["signing_pub"])
+            host_signing_hash = b64u_dec(host_info["signing_pub_hash"])
             anchor_signing = b64u_dec(anchor_info["signing_pub"])
+            self.assertEqual(len(host_signing), 1984)
+            self.assertEqual(len(host_signing_hash), 32)
+            self.assertEqual(len(anchor_signing), 1984)
 
             host_ep.add_trust_anchor("py-m2m-anchor", anchor_signing)
             addr = host_ep.serve_direct("127.0.0.1:0")
@@ -624,7 +628,7 @@ class TendrilPythonTests(unittest.TestCase):
                     addr,
                     "py-m2m-host",
                     host_static,
-                    host_signing,
+                    host_signing_hash,
                     self_tok,
                     name="py-worker-2",
                     kind="machine",

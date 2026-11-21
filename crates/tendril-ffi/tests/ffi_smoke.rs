@@ -8,13 +8,14 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tendril_core::MAX_FRAME_LEN;
 use tendril_core::PREAMBLE_LEN;
-use tendril_core::crypto::{SigningKeypair, StaticKeypair, b64url_encode};
+use tendril_core::crypto::{
+    HYBRID_SIGNING_PUB_LEN, SigningKeypair, StaticKeypair, b64url_decode, b64url_encode,
+};
 use tendril_core::grants::{Grant, RevocationListUnsigned, sign_crl};
 use tendril_core::identity::sign_rotation;
+use tendril_core::noise::NoiseHfsHandshakeBuilder;
 use tendril_core::roster::PeerState;
-use tendril_core::wire::{
-    HostHello, Intent, NOISE_PATTERN, Preamble, ResumableFrameReader, encode_frame,
-};
+use tendril_core::wire::{HostHello, Intent, Preamble, ResumableFrameReader, encode_frame};
 use tendril_ffi::{
     TENDRIL_EOF, TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_ERR_PROTOCOL, TENDRIL_OK,
     TENDRIL_WOULD_BLOCK, tendril_compute_code_mac, tendril_device_id,
@@ -55,6 +56,13 @@ fn read_last_err() -> String {
         .to_str()
         .expect("utf8")
         .to_owned()
+}
+
+fn hex_bytes(hex_str: &str) -> Vec<u8> {
+    assert_eq!(hex_str.len() % 2, 0);
+    (0..hex_str.len() / 2)
+        .map(|i| u8::from_str_radix(&hex_str[2 * i..2 * i + 2], 16).expect("hex byte"))
+        .collect()
 }
 
 fn hex32(hex: &str) -> [u8; 32] {
@@ -134,7 +142,7 @@ fn ffi_verifies_all_spec_vectors_and_error_paths() {
     // 4. Rotation chain vector & fork rejection.
     let rot: Value = serde_json::from_str(include_str!("../../../spec/vectors/rotation.json"))
         .expect("rotation json");
-    let psig = b64url_encode(&hex32(rot["pinned_signing_pub_hex"].as_str().unwrap()));
+    let psig = b64url_encode(&hex_bytes(rot["pinned_signing_pub_hex"].as_str().unwrap()));
     let pstat = b64url_encode(&hex32(rot["pinned_static_pub_hex"].as_str().unwrap()));
     let records: Vec<Value> = rot["chain"]
         .as_array()
@@ -192,11 +200,11 @@ fn ffi_verifies_all_spec_vectors_and_error_paths() {
     let mut keys = HashMap::new();
     keys.insert(
         gv["root_issuer_id"].as_str().unwrap(),
-        b64url_encode(&hex32(gv["root_signing_pub_hex"].as_str().unwrap())),
+        b64url_encode(&hex_bytes(gv["root_signing_pub_hex"].as_str().unwrap())),
     );
     keys.insert(
         gv["delegate_id"].as_str().unwrap(),
-        b64url_encode(&hex32(gv["delegate_signing_pub_hex"].as_str().unwrap())),
+        b64url_encode(&hex_bytes(gv["delegate_signing_pub_hex"].as_str().unwrap())),
     );
     let keys_c = CString::new(serde_json::to_string(&keys).unwrap()).unwrap();
     let valid_grant_c =
@@ -700,19 +708,19 @@ fn ffi_persists_host_rotation_and_fork_revocation_across_restart() {
     let key_a_sig = SigningKeypair::generate().unwrap();
     let key_b_stat = StaticKeypair::generate().unwrap();
     let key_b_sig = SigningKeypair::generate().unwrap();
-    let seq1_signing = host_id.signing_key().signing_key();
+    let seq1_signing = host_id.signing_key();
     let rec_2a = sign_rotation(
         2,
-        &seq1_signing,
-        key_a_sig.public_bytes(),
+        seq1_signing,
+        key_a_sig.public_key(),
         key_a_stat.public_bytes(),
         now + 10,
     )
     .unwrap();
     let rec_2b = sign_rotation(
         2,
-        &seq1_signing,
-        key_b_sig.public_bytes(),
+        seq1_signing,
+        key_b_sig.public_key(),
         key_b_stat.public_bytes(),
         now + 11,
     )
@@ -733,11 +741,9 @@ fn ffi_persists_host_rotation_and_fork_revocation_across_restart() {
             let mut wrapped = PrefixedPathStream::new(stream, peeked[PREAMBLE_LEN..].to_vec());
             let mut reader = ResumableFrameReader::new();
             let msg1 = recv_tendril_frame(&mut wrapped, &mut reader).await.unwrap();
-            let mut hs = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            let mut hs = NoiseHfsHandshakeBuilder::new()
                 .local_private_key(key_a_stat.secret_bytes())
-                .unwrap()
                 .prologue(&Preamble::v1(Intent::Session).encode())
-                .unwrap()
                 .build_responder()
                 .unwrap();
             let mut pt = vec![0u8; MAX_FRAME_LEN];
@@ -745,6 +751,7 @@ fn ffi_persists_host_rotation_and_fork_revocation_across_restart() {
             let hello = serde_json::to_vec(&HostHello {
                 host_id: "rot-host".to_owned(),
                 proto_version: 1,
+                signing_pub: key_a_sig.public_key().to_b64url(),
                 rotation: vec![rec_2a, rec_2b],
             })
             .unwrap();
@@ -833,7 +840,7 @@ fn ffi_persists_session_terminating_crl_across_restart() {
                     revoked_nonces: vec![revoked_nonce],
                     ts: crl_ts,
                 },
-                &h_id.signing_key().signing_key(),
+                h_id.signing_key(),
             )
             .unwrap();
             drv.send_revocation(&crl).await.unwrap();
@@ -1487,8 +1494,10 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
     let host_id = host_info["host_id"].as_str().unwrap().to_owned();
     let host_static_pub: [u8; 32] =
         b64url_decode_array(host_info["static_pub"].as_str().unwrap()).unwrap();
-    let host_signing_pub: [u8; 32] =
-        b64url_decode_array(host_info["signing_pub"].as_str().unwrap()).unwrap();
+    let host_signing_pub = b64url_decode(host_info["signing_pub"].as_str().unwrap()).unwrap();
+    assert_eq!(host_signing_pub.len(), HYBRID_SIGNING_PUB_LEN);
+    let host_signing_hash: [u8; 32] =
+        b64url_decode_array(host_info["signing_pub_hash"].as_str().unwrap()).unwrap();
 
     let mut anchor_info_p: *mut c_char = ptr::null_mut();
     assert_eq!(
@@ -1497,8 +1506,8 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
     );
     let anchor_info: Value = serde_json::from_str(&unsafe { take_cstr(anchor_info_p) }).unwrap();
     let anchor_id = anchor_info["host_id"].as_str().unwrap().to_owned();
-    let anchor_signing_pub: [u8; 32] =
-        b64url_decode_array(anchor_info["signing_pub"].as_str().unwrap()).unwrap();
+    let anchor_signing_pub = b64url_decode(anchor_info["signing_pub"].as_str().unwrap()).unwrap();
+    assert_eq!(anchor_signing_pub.len(), HYBRID_SIGNING_PUB_LEN);
 
     let mut cli1_info_p: *mut c_char = ptr::null_mut();
     assert_eq!(
@@ -1575,6 +1584,7 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
             host_id_c.as_ptr(),
             host_static_pub.as_ptr(),
             host_signing_pub.as_ptr(),
+            host_signing_pub.len(),
             0,
             tok1_c.as_ptr(),
             name1_c.as_ptr(),
@@ -1614,7 +1624,8 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
             ptr::null(),
             host_id_c.as_ptr(),
             host_static_pub.as_ptr(),
-            host_signing_pub.as_ptr(),
+            host_signing_hash.as_ptr(),
+            host_signing_hash.len(),
             0,
             tok1_c.as_ptr(),
             name1_c.as_ptr(),
@@ -1634,6 +1645,7 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
                 host_ep,
                 anchor_id_c.as_ptr(),
                 anchor_signing_pub.as_ptr(),
+                anchor_signing_pub.len(),
             )
         },
         TENDRIL_OK
@@ -1676,7 +1688,8 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
                 ptr::null(),
                 host_id_c.as_ptr(),
                 host_static_pub.as_ptr(),
-                host_signing_pub.as_ptr(),
+                host_signing_hash.as_ptr(),
+                host_signing_hash.len(),
                 0,
                 tok2_c.as_ptr(),
                 name1_c.as_ptr(),
@@ -1731,6 +1744,7 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
                 host_id_c.as_ptr(),
                 host_static_pub.as_ptr(),
                 host_signing_pub.as_ptr(),
+                host_signing_pub.len(),
                 0,
                 tok3_c.as_ptr(),
                 name1_c.as_ptr(),

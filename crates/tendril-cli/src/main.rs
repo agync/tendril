@@ -10,9 +10,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::{
-    SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode, random_bytes,
+    HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, SigningKeypair,
+    StaticKeypair, b64url_decode, b64url_decode_array, b64url_encode, random_bytes,
 };
 use tendril_core::grants::Grant;
+use tendril_core::identity::SigningKeyPin;
 use tendril_core::pairing::{
     DEFAULT_ENROLLMENT_TTL_SECS, EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig,
     PairingManager, PairingUri, PinnedHost, mint_enrollment_token,
@@ -48,7 +50,7 @@ enum PairKindArg {
 
 #[derive(Debug, Subcommand)]
 enum AnchorCommand {
-    /// Register an active external Ed25519 trust anchor for M2M enrollment.
+    /// Register an active external hybrid signing trust anchor for M2M enrollment.
     Add {
         anchor_id: String,
         #[arg(long)]
@@ -127,7 +129,7 @@ enum Command {
         #[arg(long)]
         no_pkarr: bool,
     },
-    /// Manage external Ed25519 trust anchors for M2M enrollment.
+    /// Manage external hybrid signing trust anchors for M2M enrollment.
     Anchor {
         #[command(subcommand)]
         cmd: AnchorCommand,
@@ -221,6 +223,27 @@ struct InitOut {
     device_id: String,
     static_pub: String,
     signing_pub: String,
+    signing_pub_hash: String,
+    relay_pub: String,
+}
+
+fn parse_signing_pin_b64(encoded: &str) -> Result<SigningKeyPin, tendril_core::error::CoreError> {
+    let bytes = b64url_decode(encoded)?;
+    if bytes.len() == HYBRID_SIGNING_PUB_LEN {
+        Ok(SigningKeyPin::Full(HybridSigningPublicKey::from_bytes(
+            &bytes,
+        )?))
+    } else if bytes.len() == HYBRID_SIGNING_HASH_LEN {
+        let hash: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| tendril_core::error::CoreError::InvalidSignature)?;
+        Ok(SigningKeyPin::Hash(hash))
+    } else {
+        Err(tendril_core::error::CoreError::InvalidLength {
+            expected: HYBRID_SIGNING_PUB_LEN,
+            actual: bytes.len(),
+        })
+    }
 }
 
 fn now_unix() -> u64 {
@@ -668,12 +691,12 @@ fn persist_crl_for_issuer(
     };
     let ((), disk, stamp) = store.update_roster_with_state(|disk| {
         let issuer_pub = if issuer == identity.host_id() {
-            Some(*identity.signing_key().public_bytes())
+            Some(identity.signing_key().public_key().clone())
         } else {
             disk.lookup_active_signing_key(issuer).or_else(|| {
                 disk.get(issuer)
                     .filter(|e| e.state != tendril_core::roster::PeerState::Pending)
-                    .and_then(|e| e.signing_pub)
+                    .and_then(|e| e.signing_pub.clone())
             })
         };
         let Some(pk) = issuer_pub else {
@@ -763,7 +786,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 host_id: id.host_id().to_owned(),
                 device_id: id.device_id(),
                 static_pub: b64url_encode(id.static_key().public_bytes()),
-                signing_pub: b64url_encode(id.signing_key().public_bytes()),
+                signing_pub: id.signing_key().public_key().to_b64url(),
+                signing_pub_hash: b64url_encode(&id.signing_key().signing_pub_hash()),
+                relay_pub: b64url_encode(id.signing_key().ed25519_public_bytes()),
             });
         }
         Command::Serve {
@@ -828,7 +853,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let rl = RelayListener::bind(
                     relay_url,
                     effective_host,
-                    identity.signing_key().signing_key(),
+                    identity.signing_key().ed25519_signing_key(),
                     DEFAULT_WRITE_TIMEOUT,
                 )
                 .await?;
@@ -1047,7 +1072,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     host_id,
                                     display_name,
                                     host_static_pub,
-                                    Some(host_signing_pub),
+                                    Some(host_signing_pub.clone()),
                                     host_rotation_seq,
                                     hints,
                                 )
@@ -1059,7 +1084,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     host_id,
                                     display_name,
                                     host_static_pub,
-                                    host_signing_pub,
+                                    host_signing_pub.clone(),
                                     host_rotation_seq,
                                     pairing_sas,
                                     hints,
@@ -1075,7 +1100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "status": if host_pin_verified { "active" } else { "pending" },
                         "host_confirmed": host_pin_verified,
                         "static_pub": b64url_encode(&host_static_pub),
-                        "signing_pub": b64url_encode(&host_signing_pub),
+                        "signing_pub": host_signing_pub.to_b64url(),
+                        "signing_pub_hash": b64url_encode(&host_signing_pub.sha256_hash()),
                     }));
                 }
                 PairOutcome::Rejected { error } => {
@@ -1094,11 +1120,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 anchor_id,
                 signing_pub,
             } => {
-                let signing_pub_bytes: [u8; 32] = b64url_decode_array(&signing_pub)?;
+                let signing_pub_key = HybridSigningPublicKey::from_b64url(&signing_pub)?;
                 let id_clone = anchor_id.clone();
                 store.update_roster(|roster| {
                     roster
-                        .add_trust_anchor(id_clone, signing_pub_bytes)
+                        .add_trust_anchor(id_clone, signing_pub_key)
                         .map(|_| ())
                         .map_err(Into::into)
                 })?;
@@ -1120,7 +1146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|(id, anchor)| {
                         serde_json::json!({
                             "anchor_id": id,
-                            "signing_pub": b64url_encode(&anchor.signing_pub),
+                            "signing_pub": anchor.signing_pub.to_b64url(),
                             "state": match anchor.state {
                                 AnchorState::Active => "active",
                                 AnchorState::Revoked => "revoked",
@@ -1182,7 +1208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pinned_host = PinnedHost {
                 host_id: Some(host_id),
                 static_pub: b64url_decode_array(&host_static_pub)?,
-                signing_pub: b64url_decode_array(&host_signing_pub)?,
+                signing_pin: parse_signing_pin_b64(&host_signing_pub)?,
                 rotation_seq: host_rotation_seq,
             };
             let identity = store.load_or_generate_identity(None)?;
@@ -1221,7 +1247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 host_id,
                                 host_id_out.clone(),
                                 host_static_pub,
-                                Some(host_signing_pub),
+                                Some(host_signing_pub.clone()),
                                 host_rotation_seq,
                                 Vec::new(),
                             )
@@ -1235,7 +1261,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "host_rotation_seq": host_rotation_seq,
                         "token_nonce": token_nonce,
                         "static_pub": b64url_encode(&host_static_pub),
-                        "signing_pub": b64url_encode(&host_signing_pub),
+                        "signing_pub": host_signing_pub.to_b64url(),
+                        "signing_pub_hash": b64url_encode(&host_signing_pub.sha256_hash()),
                     }));
                 }
                 PairOutcome::Rejected { error } => {
@@ -1407,7 +1434,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "host_id": identity.host_id(),
                 "rotation_seq": identity.rotation_seq(),
                 "static_pub": b64url_encode(identity.static_key().public_bytes()),
-                "signing_pub": b64url_encode(identity.signing_key().public_bytes()),
+                "signing_pub": identity.signing_key().public_key().to_b64url(),
+                "signing_pub_hash": b64url_encode(&identity.signing_key().signing_pub_hash()),
+                "relay_pub": b64url_encode(identity.signing_key().ed25519_public_bytes()),
             }));
         }
     }

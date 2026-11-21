@@ -412,7 +412,8 @@ async fn sec13_global_connection_and_mailbox_caps() {
         };
         let nonce_bytes: [u8; 32] =
             tendril_core::crypto::b64url_decode_array(&nonce).expect("nonce");
-        let (pub_b64, sig_b64) = sign_relay_register(&kp.signing_key(), &host, &nonce_bytes);
+        let (pub_b64, sig_b64) =
+            sign_relay_register(&kp.ed25519_signing_key(), &host, &nonce_bytes);
         let reg = serde_json::to_string(&RelayClientMsg::Register {
             pub_key: pub_b64,
             sig: sig_b64,

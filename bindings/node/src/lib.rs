@@ -9,12 +9,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tendril_core::crypto::{
-    b64url_decode_array, b64url_encode, compute_code_mac as core_compute_code_mac,
-    device_id as core_device_id, fingerprint_device as core_fingerprint_device,
-    fingerprint_host as core_fingerprint_host, pairing_sas as core_pairing_sas, random_bytes,
+    HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, b64url_decode_array,
+    b64url_encode, compute_code_mac as core_compute_code_mac, device_id as core_device_id,
+    fingerprint_device as core_fingerprint_device, fingerprint_host as core_fingerprint_host,
+    pairing_sas as core_pairing_sas, random_bytes,
 };
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
-use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
+use tendril_core::identity::{
+    EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
+};
 use tendril_core::pairing::{
     EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PinnedHost,
     mint_enrollment_token as core_mint_enrollment_token,
@@ -103,6 +106,32 @@ fn as_32(bytes: &[u8], name: &str) -> Result<[u8; 32]> {
     })
 }
 
+fn parse_hybrid_signing_pub(bytes: &[u8], name: &str) -> Result<HybridSigningPublicKey> {
+    if bytes.len() != HYBRID_SIGNING_PUB_LEN {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{name} must be exactly {HYBRID_SIGNING_PUB_LEN} bytes"),
+        ));
+    }
+    HybridSigningPublicKey::from_bytes(bytes)
+        .map_err(|e| Error::new(Status::InvalidArg, format!("invalid {name}: {e}")))
+}
+
+fn parse_signing_pin(bytes: &[u8], name: &str) -> Result<SigningKeyPin> {
+    if bytes.len() == HYBRID_SIGNING_PUB_LEN {
+        parse_hybrid_signing_pub(bytes, name).map(SigningKeyPin::Full)
+    } else if bytes.len() == HYBRID_SIGNING_HASH_LEN {
+        let mut hash = [0u8; HYBRID_SIGNING_HASH_LEN];
+        hash.copy_from_slice(bytes);
+        Ok(SigningKeyPin::Hash(hash))
+    } else {
+        Err(Error::new(
+            Status::InvalidArg,
+            format!("{name} must be {HYBRID_SIGNING_PUB_LEN} or {HYBRID_SIGNING_HASH_LEN} bytes"),
+        ))
+    }
+}
+
 fn to_generic_err(err: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, err.to_string())
 }
@@ -165,10 +194,10 @@ pub fn verify_rotation_chain_json(
     cur_signing_b64: String,
 ) -> Result<f64> {
     let pinned_seq_u64 = f64_to_u64(pinned_seq, "pinned_seq")?;
-    let psig = b64url_decode_array::<32>(&pinned_signing_b64).map_err(to_generic_err)?;
+    let psig = HybridSigningPublicKey::from_b64url(&pinned_signing_b64).map_err(to_generic_err)?;
     let pstat = b64url_decode_array::<32>(&pinned_static_b64).map_err(to_generic_err)?;
     let cstat = b64url_decode_array::<32>(&cur_static_b64).map_err(to_generic_err)?;
-    let csig = b64url_decode_array::<32>(&cur_signing_b64).map_err(to_generic_err)?;
+    let csig = HybridSigningPublicKey::from_b64url(&cur_signing_b64).map_err(to_generic_err)?;
     let chain: Vec<RotationRecord> = serde_json::from_str(&chain_json).map_err(to_generic_err)?;
     let seq = verify_rotation_chain(&psig, &pstat, pinned_seq_u64, &chain, &cstat, &csig)
         .map_err(to_generic_err)?;
@@ -191,7 +220,7 @@ pub fn verify_grant_json(
         serde_json::from_str(&issuer_keys_json).map_err(to_generic_err)?;
     let mut key_map = HashMap::with_capacity(key_map_raw.len());
     for (id, b64) in key_map_raw {
-        let k = b64url_decode_array::<32>(&b64).map_err(to_generic_err)?;
+        let k = HybridSigningPublicKey::from_b64url(&b64).map_err(to_generic_err)?;
         key_map.insert(id, k);
     }
     let crl: Option<RevocationList> = match crl_json {
@@ -205,7 +234,7 @@ pub fn verify_grant_json(
         &requested_cap,
         now_u64,
         crl.as_ref(),
-        |id| key_map.get(id).copied(),
+        |id| key_map.get(id).cloned(),
     );
     Ok(res.is_ok())
 }
@@ -285,7 +314,9 @@ impl Endpoint {
             "host_id": self.identity.host_id(),
             "device_id": self.identity.device_id(),
             "static_pub": b64url_encode(self.identity.static_key().public_bytes()),
-            "signing_pub": b64url_encode(self.identity.signing_key().public_bytes()),
+            "signing_pub": self.identity.signing_key().public_key().to_b64url(),
+            "signing_pub_hash": b64url_encode(&self.identity.signing_key().signing_pub_hash()),
+            "relay_pub": b64url_encode(self.identity.signing_key().ed25519_public_bytes()),
         })
         .to_string()
     }
@@ -311,7 +342,7 @@ impl Endpoint {
         relay_url: String,
         expected_host: Option<String>,
     ) -> Result<String> {
-        let key = self.identity.signing_key().signing_key();
+        let key = self.identity.signing_key().ed25519_signing_key();
         let listener = RelayListener::bind(relay_url, expected_host, key, DEFAULT_WRITE_TIMEOUT)
             .await
             .map_err(to_generic_err)?;
@@ -539,7 +570,7 @@ impl Endpoint {
 
     #[napi]
     pub fn add_trust_anchor(&self, anchor_id: String, signing_pub: Buffer) -> Result<()> {
-        let key = as_32(signing_pub.as_ref(), "signing_pub")?;
+        let key = parse_hybrid_signing_pub(signing_pub.as_ref(), "signing_pub")?;
         let mut roster = self.roster.lock().expect("roster mutex poisoned");
         roster
             .add_trust_anchor(anchor_id, key)
@@ -606,7 +637,7 @@ impl Endpoint {
         kind: Option<String>,
     ) -> Result<String> {
         let static_pub = as_32(host_static_pub.as_ref(), "host_static_pub")?;
-        let signing_pub = as_32(host_signing_pub.as_ref(), "host_signing_pub")?;
+        let signing_pin = parse_signing_pin(host_signing_pub.as_ref(), "host_signing_pub")?;
         let rot_seq = match host_rotation_seq {
             Some(v) => f64_to_u64(v, "host_rotation_seq")?,
             None => 0,
@@ -616,7 +647,7 @@ impl Endpoint {
         let pinned_host = PinnedHost {
             host_id: Some(host_id),
             static_pub,
-            signing_pub,
+            signing_pin,
             rotation_seq: rot_seq,
         };
 

@@ -10,7 +10,7 @@ export interface ParsedPairingUri {
   host_name: string;
   code: string;
   host_static_pub_b64: string;
-  host_signing_pub_b64: string;
+  host_signing_pub_hash_b64: string;
   endpoints: string[];
   host_id?: string | null;
   rotation_seq?: number | null;
@@ -39,6 +39,8 @@ export interface EndpointInfo {
   device_id: string;
   static_pub: string;
   signing_pub: string;
+  signing_pub_hash: string;
+  relay_pub: string;
 }
 
 export interface PairResult {

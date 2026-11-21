@@ -33,6 +33,7 @@ struct PersistedIdentity {
     host_id: String,
     static_secret_b64: String,
     signing_seed_b64: String,
+    pq_signing_seed_b64: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rotation_chain: Vec<RotationRecord>,
     #[serde(default)]
@@ -43,6 +44,7 @@ impl Drop for PersistedIdentity {
     fn drop(&mut self) {
         self.static_secret_b64.zeroize();
         self.signing_seed_b64.zeroize();
+        self.pq_signing_seed_b64.zeroize();
     }
 }
 
@@ -52,11 +54,13 @@ pub fn serialize_identity_json(
 ) -> Result<Zeroizing<String>, RuntimeError> {
     let static_b64 = Zeroizing::new(b64url_encode(identity.static_key().secret_bytes()));
     let signing_b64 = Zeroizing::new(b64url_encode(identity.signing_key().seed_bytes()));
+    let pq_signing_b64 = Zeroizing::new(b64url_encode(identity.signing_key().mldsa_seed_bytes()));
     let payload = PersistedIdentity {
         version: 1,
         host_id: identity.host_id().to_owned(),
         static_secret_b64: static_b64.to_string(),
         signing_seed_b64: signing_b64.to_string(),
+        pq_signing_seed_b64: pq_signing_b64.to_string(),
         rotation_chain: identity.rotation_chain().to_vec(),
         rotation_seq: identity.rotation_seq(),
     };
@@ -80,8 +84,9 @@ pub fn deserialize_identity_json(raw: &str) -> Result<EndpointIdentity, RuntimeE
     }
     let static_scalar = Zeroizing::new(b64url_decode_array::<32>(&disk.static_secret_b64)?);
     let signing_seed = Zeroizing::new(b64url_decode_array::<32>(&disk.signing_seed_b64)?);
+    let pq_signing_seed = Zeroizing::new(b64url_decode_array::<32>(&disk.pq_signing_seed_b64)?);
     let static_key = StaticKeypair::from_scalar(*static_scalar);
-    let signing_key = SigningKeypair::from_seed(*signing_seed);
+    let signing_key = SigningKeypair::from_seeds(*signing_seed, *pq_signing_seed);
     let identity = EndpointIdentity::from_persisted(
         disk.host_id.clone(),
         static_key,

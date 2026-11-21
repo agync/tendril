@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tendril_core::PREAMBLE_LEN;
-use tendril_core::crypto::{b64url_decode, b64url_encode, random_bytes};
+use tendril_core::crypto::{HybridSigningPublicKey, b64url_decode, b64url_encode, random_bytes};
 use tendril_core::grants::Grant;
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::pairing::{
@@ -225,7 +225,9 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                         "host_id": id.host_id(),
                         "device_id": id.device_id(),
                         "static_pub": b64url_encode(id.static_key().public_bytes()),
-                        "signing_pub": b64url_encode(id.signing_key().public_bytes()),
+                        "signing_pub": id.signing_key().public_key().to_b64url(),
+                        "signing_pub_hash": b64url_encode(&id.signing_key().signing_pub_hash()),
+                        "relay_pub": b64url_encode(id.signing_key().ed25519_public_bytes()),
                     });
                     state.identity = Some(id);
                     (resp, false)
@@ -255,7 +257,7 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
             match RelayListener::bind(
                 relay_url,
                 expected_host,
-                id.signing_key().signing_key(),
+                id.signing_key().ed25519_signing_key(),
                 DEFAULT_WRITE_TIMEOUT,
             )
             .await
@@ -283,18 +285,11 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
             anchor_id,
             signing_pub,
         } => {
-            let key_bytes = match b64url_decode(&signing_pub).and_then(|v| {
-                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
-                    tendril_core::error::CoreError::InvalidLength {
-                        expected: 32,
-                        actual: v.len(),
-                    }
-                })
-            }) {
+            let signing_key = match HybridSigningPublicKey::from_b64url(&signing_pub) {
                 Ok(k) => k,
                 Err(e) => return (err_json(e.to_string()), false),
             };
-            if let Err(e) = state.roster.add_trust_anchor(anchor_id, key_bytes) {
+            if let Err(e) = state.roster.add_trust_anchor(anchor_id, signing_key) {
                 return (err_json(e.to_string()), false);
             }
             if let Err(e) = state.persist_roster() {

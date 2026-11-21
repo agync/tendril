@@ -505,7 +505,11 @@ test("Node M2M enrollment, single-use replay, and anchor revocation", async () =
     const anchorInfo = JSON.parse(anchorEp.infoJson());
     const hostStatic = Buffer.from(hostInfo.static_pub, "base64url");
     const hostSigning = Buffer.from(hostInfo.signing_pub, "base64url");
+    const hostSigningHash = Buffer.from(hostInfo.signing_pub_hash, "base64url");
     const anchorSigning = Buffer.from(anchorInfo.signing_pub, "base64url");
+    assert.equal(hostSigning.length, 1984);
+    assert.equal(hostSigningHash.length, 32);
+    assert.equal(anchorSigning.length, 1984);
 
     hostEp.addTrustAnchor("node-m2m-anchor", anchorSigning);
     const addr = await hostEp.serveDirect("127.0.0.1:0");
@@ -574,7 +578,7 @@ test("Node M2M enrollment, single-use replay, and anchor revocation", async () =
     assert.match(String(revAnchorRes.reason), /untrusted_anchor/);
 
     const [selfInitRaw, selfAccRaw] = await Promise.all([
-      cli2Ep.enrollInitiate(addr, "node-m2m-host", hostStatic, hostSigning, selfTok),
+      cli2Ep.enrollInitiate(addr, "node-m2m-host", hostStatic, hostSigningHash, selfTok),
       hostEp.pairAccept(5000),
     ]);
     assert.equal(JSON.parse(selfInitRaw).status, "active");

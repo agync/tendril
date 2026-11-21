@@ -631,14 +631,16 @@ public final class TendrilEndpoint {
   }
 
   public func addTrustAnchor(anchorId: String, signingPub: Data) throws {
-    guard signingPub.count == 32 else {
-      throw TendrilError.invalidArgument("signingPub must be 32 bytes")
+    guard signingPub.count == Int(TENDRIL_SIGNING_PUB_LEN) else {
+      throw TendrilError.invalidArgument(
+        "signingPub must be \(TENDRIL_SIGNING_PUB_LEN) bytes"
+      )
     }
     try withHandle { h in
       let rc = try withValidatedCString(anchorId, name: "anchorId") { cAnchor in
         signingPub.withUnsafeBytes { keyRaw in
           tendril_endpoint_add_trust_anchor(
-            h, cAnchor, keyRaw.bindMemory(to: UInt8.self).baseAddress
+            h, cAnchor, keyRaw.bindMemory(to: UInt8.self).baseAddress, signingPub.count
           )
         }
       }
@@ -691,11 +693,15 @@ public final class TendrilEndpoint {
     name: String = "ios-machine",
     kind: String = "machine"
   ) throws -> String {
-    guard hostStaticPub.count == 32 else {
-      throw TendrilError.invalidArgument("hostStaticPub must be 32 bytes")
+    guard hostStaticPub.count == Int(TENDRIL_KEY_LEN) else {
+      throw TendrilError.invalidArgument("hostStaticPub must be \(TENDRIL_KEY_LEN) bytes")
     }
-    guard hostSigningPub.count == 32 else {
-      throw TendrilError.invalidArgument("hostSigningPub must be 32 bytes")
+    guard hostSigningPub.count == Int(TENDRIL_SIGNING_PUB_LEN)
+      || hostSigningPub.count == Int(TENDRIL_SIGNING_HASH_LEN)
+    else {
+      throw TendrilError.invalidArgument(
+        "hostSigningPub must be \(TENDRIL_SIGNING_PUB_LEN) or \(TENDRIL_SIGNING_HASH_LEN) bytes"
+      )
     }
     return try withHandle { h in
       var out: UnsafeMutablePointer<CChar>?
@@ -714,6 +720,7 @@ public final class TendrilEndpoint {
                         cHost,
                         stRaw.bindMemory(to: UInt8.self).baseAddress,
                         sgRaw.bindMemory(to: UInt8.self).baseAddress,
+                        hostSigningPub.count,
                         hostRotationSeq,
                         cToken,
                         cName,

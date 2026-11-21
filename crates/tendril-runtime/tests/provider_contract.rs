@@ -110,7 +110,7 @@ async fn setup_provider(provider: ProviderId) -> ProviderPair {
             let listener = RelayListener::bind(
                 handle.ws_url(),
                 Some("localhost".to_owned()),
-                key.signing_key(),
+                key.ed25519_signing_key(),
                 DEFAULT_WRITE_TIMEOUT,
             )
             .await
@@ -323,7 +323,7 @@ async fn run_six_point_contract(provider: ProviderId) {
         let host_for_cli = EndpointIdentity::from_persisted(
             host_id_ent.host_id().to_owned(),
             StaticKeypair::from_scalar(*host_id_ent.static_key().secret_bytes()),
-            SigningKeypair::from_seed(*host_id_ent.signing_key().seed_bytes()),
+            host_id_ent.signing_key().clone(),
             Vec::new(),
             0,
         )
@@ -333,7 +333,7 @@ async fn run_six_point_contract(provider: ProviderId) {
                 cli_id_ent.device_id(),
                 "client".to_owned(),
                 *cli_id_ent.static_key().public_bytes(),
-                Some(*cli_id_ent.signing_key().public_bytes()),
+                Some(cli_id_ent.signing_key().public_key().clone()),
                 0,
                 Vec::new(),
             )
@@ -345,7 +345,7 @@ async fn run_six_point_contract(provider: ProviderId) {
                 host_for_cli.host_id().to_owned(),
                 "host".to_owned(),
                 *host_for_cli.static_key().public_bytes(),
-                Some(*host_for_cli.signing_key().public_bytes()),
+                Some(host_for_cli.signing_key().public_key().clone()),
                 0,
                 Vec::new(),
             )
@@ -477,7 +477,9 @@ fn state_store_sets_permissions_and_preserves_rotated_identity() {
     store.save_identity(&identity).expect("save rotated");
 
     let peer_static = *tendril_core::crypto::StaticKeypair::from_scalar([0x51; 32]).public_bytes();
-    let peer_signing = *tendril_core::crypto::SigningKeypair::from_seed([0x52; 32]).public_bytes();
+    let peer_signing = tendril_core::crypto::SigningKeypair::from_seed([0x52; 32])
+        .public_key()
+        .clone();
     let mut roster = Roster::new();
     roster
         .insert_pinned_host(
@@ -535,7 +537,7 @@ async fn dial_with_policy_fails_over_from_unreachable_direct_to_live_relay() {
     let mut relay_listener = RelayListener::bind(
         relay_handle.ws_url(),
         Some("localhost".to_owned()),
-        key.signing_key(),
+        key.ed25519_signing_key(),
         DEFAULT_WRITE_TIMEOUT,
     )
     .await
@@ -852,7 +854,7 @@ async fn relay_listener_verifies_url_host_even_when_expected_host_is_none() {
     let res = RelayListener::bind(
         h_mismatch.ws_url(),
         None,
-        key.signing_key(),
+        key.ed25519_signing_key(),
         DEFAULT_WRITE_TIMEOUT,
     )
     .await;
@@ -873,7 +875,7 @@ async fn relay_listener_verifies_url_host_even_when_expected_host_is_none() {
     let listener = RelayListener::bind(
         h_match.ws_url(),
         None,
-        key.signing_key(),
+        key.ed25519_signing_key(),
         DEFAULT_WRITE_TIMEOUT,
     )
     .await
@@ -1216,7 +1218,7 @@ async fn relay_hint_migration_public_to_self_hosted_to_embedded_without_repairin
     let mut host_relay_a = RelayListener::bind(
         relay_a.ws_url(),
         Some("localhost".to_owned()),
-        host_id.signing_key().signing_key(),
+        host_id.signing_key().ed25519_signing_key(),
         DEFAULT_WRITE_TIMEOUT,
     )
     .await
@@ -1309,7 +1311,7 @@ async fn relay_hint_migration_public_to_self_hosted_to_embedded_without_repairin
     let mut host_relay_b = RelayListener::bind(
         relay_b.ws_url(),
         Some("localhost".to_owned()),
-        host_id.signing_key().signing_key(),
+        host_id.signing_key().ed25519_signing_key(),
         DEFAULT_WRITE_TIMEOUT,
     )
     .await
@@ -1355,7 +1357,7 @@ async fn relay_hint_migration_public_to_self_hosted_to_embedded_without_repairin
     let mut host_relay_c = RelayListener::bind(
         relay_c.ws_url(),
         Some(relay_c.host().to_owned()),
-        host_id.signing_key().signing_key(),
+        host_id.signing_key().ed25519_signing_key(),
         DEFAULT_WRITE_TIMEOUT,
     )
     .await
@@ -1812,7 +1814,7 @@ fn batch1_sec04_state_store_flock_serializes_concurrent_updates() {
     let target = tendril_core::identity::EndpointIdentity::generate().expect("target");
     let target_id = "peer-target".to_owned();
     let target_pub = *target.static_key().public_bytes();
-    let target_sig = *target.signing_key().public_bytes();
+    let target_sig = target.signing_key().public_key().clone();
 
     store
         .update_roster(|r| {
@@ -1847,7 +1849,7 @@ fn batch1_sec04_state_store_flock_serializes_concurrent_updates() {
                         format!("peer-{i}"),
                         format!("Peer {i}"),
                         *peer.static_key().public_bytes(),
-                        Some(*peer.signing_key().public_bytes()),
+                        Some(peer.signing_key().public_key().clone()),
                         0,
                         vec![],
                     )?;
@@ -2108,7 +2110,7 @@ async fn batch2a_sec14_url_ssrf_and_filtered_p2p_addrs() {
         RelayListener::bind(
             "ws://relay.example/v1/relay",
             None,
-            kp.signing_key(),
+            kp.ed25519_signing_key(),
             DEFAULT_WRITE_TIMEOUT
         )
         .await,
@@ -2320,7 +2322,7 @@ async fn batch2a_sec20_connect_with_policy_fails_over_past_malicious_direct() {
             cli_id.device_id(),
             "cli".to_owned(),
             *cli_id.static_key().public_bytes(),
-            Some(*cli_id.signing_key().public_bytes()),
+            Some(cli_id.signing_key().public_key().clone()),
             cli_id.rotation_seq(),
             Vec::new(),
         )
@@ -2332,7 +2334,7 @@ async fn batch2a_sec20_connect_with_policy_fails_over_past_malicious_direct() {
             host_id.host_id().to_owned(),
             "host".to_owned(),
             *host_id.static_key().public_bytes(),
-            Some(*host_id.signing_key().public_bytes()),
+            Some(host_id.signing_key().public_key().clone()),
             host_id.rotation_seq(),
             Vec::new(),
         )
@@ -2341,7 +2343,7 @@ async fn batch2a_sec20_connect_with_policy_fails_over_past_malicious_direct() {
     let mut relay_listener = RelayListener::bind(
         relay_handle.ws_url(),
         Some("localhost".to_owned()),
-        host_id.signing_key().signing_key(),
+        host_id.signing_key().ed25519_signing_key(),
         DEFAULT_WRITE_TIMEOUT,
     )
     .await
@@ -2577,7 +2579,7 @@ async fn batch2b_sec17_sec31_concurrent_session_and_fresh_now_unix() {
                 cli_id.device_id(),
                 "cli".to_owned(),
                 *cli_id.static_key().public_bytes(),
-                Some(*cli_id.signing_key().public_bytes()),
+                Some(cli_id.signing_key().public_key().clone()),
                 0,
                 Vec::new(),
             )
@@ -2588,7 +2590,7 @@ async fn batch2b_sec17_sec31_concurrent_session_and_fresh_now_unix() {
                 "conc-host".to_owned(),
                 "conc-host".to_owned(),
                 *host_id.static_key().public_bytes(),
-                Some(*host_id.signing_key().public_bytes()),
+                Some(host_id.signing_key().public_key().clone()),
                 0,
                 Vec::new(),
             )
@@ -2721,7 +2723,7 @@ async fn batch2b_sec17_sec31_concurrent_session_and_fresh_now_unix() {
             cli_id.device_id(),
             "cli".to_owned(),
             *cli_id.static_key().public_bytes(),
-            Some(*cli_id.signing_key().public_bytes()),
+            Some(cli_id.signing_key().public_key().clone()),
             0,
             Vec::new(),
         )
@@ -2732,7 +2734,7 @@ async fn batch2b_sec17_sec31_concurrent_session_and_fresh_now_unix() {
             "exp-host".to_owned(),
             "exp-host".to_owned(),
             *host_id.static_key().public_bytes(),
-            Some(*host_id.signing_key().public_bytes()),
+            Some(host_id.signing_key().public_key().clone()),
             0,
             Vec::new(),
         )

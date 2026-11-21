@@ -776,7 +776,7 @@ async fn batch1_sec04_cli_serve_enforces_live_revoke_and_flock_pair_safety() {
                 "revoked-keep".into(),
                 "Revoked".into(),
                 *dummy.static_key().public_bytes(),
-                Some(*dummy.signing_key().public_bytes()),
+                Some(dummy.signing_key().public_key().clone()),
                 0,
                 vec![],
             )?;

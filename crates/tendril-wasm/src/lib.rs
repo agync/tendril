@@ -10,13 +10,16 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tendril_core::crypto::{
-    SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode,
+    HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, SigningKeypair,
+    StaticKeypair, b64url_decode, b64url_decode_array, b64url_encode,
     compute_code_mac as core_compute_code_mac, device_id as core_device_id,
     fingerprint_device as core_fingerprint_device, fingerprint_host as core_fingerprint_host,
     pairing_sas as core_pairing_sas, random_bytes,
 };
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
-use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
+use tendril_core::identity::{
+    EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
+};
 use tendril_core::pairing::{
     PairAction, PairOutcome, PairingInitiator, PairingUri, PinnedHost,
     mint_enrollment_token as core_mint_enrollment_token,
@@ -34,6 +37,24 @@ fn as_32(bytes: &[u8], name: &str) -> Result<[u8; 32], String> {
     bytes
         .try_into()
         .map_err(|_| format!("{name} must be exactly 32 bytes"))
+}
+
+fn parse_signing_pin_b64(encoded: &str, name: &str) -> Result<SigningKeyPin, String> {
+    let bytes = b64url_decode(encoded).map_err(|e| format!("invalid {name}: {e}"))?;
+    if bytes.len() == HYBRID_SIGNING_PUB_LEN {
+        HybridSigningPublicKey::from_bytes(&bytes)
+            .map(SigningKeyPin::Full)
+            .map_err(|e| format!("invalid {name}: {e}"))
+    } else if bytes.len() == HYBRID_SIGNING_HASH_LEN {
+        let hash: [u8; HYBRID_SIGNING_HASH_LEN] = bytes
+            .try_into()
+            .map_err(|_| format!("invalid {name} hash length"))?;
+        Ok(SigningKeyPin::Hash(hash))
+    } else {
+        Err(format!(
+            "{name} must be {HYBRID_SIGNING_PUB_LEN} or {HYBRID_SIGNING_HASH_LEN} bytes"
+        ))
+    }
 }
 
 fn f64_to_u64(v: f64, name: &str) -> Result<u64, String> {
@@ -124,10 +145,10 @@ pub fn verify_rotation_chain_json(
     cur_signing_b64: &str,
 ) -> Result<f64, JsValue> {
     let p_seq = f64_to_u64(pinned_seq, "pinned_seq").map_err(to_js_err)?;
-    let psig = b64url_decode_array::<32>(pinned_signing_b64).map_err(to_js_err)?;
+    let psig = HybridSigningPublicKey::from_b64url(pinned_signing_b64).map_err(to_js_err)?;
     let pstat = b64url_decode_array::<32>(pinned_static_b64).map_err(to_js_err)?;
     let cstat = b64url_decode_array::<32>(cur_static_b64).map_err(to_js_err)?;
-    let csig = b64url_decode_array::<32>(cur_signing_b64).map_err(to_js_err)?;
+    let csig = HybridSigningPublicKey::from_b64url(cur_signing_b64).map_err(to_js_err)?;
     let chain: Vec<RotationRecord> = serde_json::from_str(chain_json).map_err(to_js_err)?;
     let final_seq =
         verify_rotation_chain(&psig, &pstat, p_seq, &chain, &cstat, &csig).map_err(to_js_err)?;
@@ -150,7 +171,7 @@ pub fn verify_grant_json(
         serde_json::from_str(issuer_keys_json).map_err(to_js_err)?;
     let mut key_map = HashMap::with_capacity(key_map_raw.len());
     for (id, b64) in key_map_raw {
-        let k = b64url_decode_array::<32>(&b64)
+        let k = HybridSigningPublicKey::from_b64url(&b64)
             .map_err(|e| to_js_err(format!("invalid key for {id}: {e}")))?;
         key_map.insert(id, k);
     }
@@ -165,7 +186,7 @@ pub fn verify_grant_json(
         requested_cap,
         now_u64,
         crl.as_ref(),
-        |id| key_map.get(id).copied(),
+        |id| key_map.get(id).cloned(),
     );
     Ok(res.is_ok())
 }
@@ -182,7 +203,7 @@ pub fn parse_pairing_uri_json(uri: &str) -> Result<String, JsValue> {
         "host_name": parsed.host_name,
         "code": parsed.code,
         "host_static_pub_b64": b64url_encode(&parsed.host_static_pub),
-        "host_signing_pub_b64": b64url_encode(&parsed.host_signing_pub),
+        "host_signing_pub_hash_b64": b64url_encode(&parsed.host_signing_pub_hash),
         "endpoints": parsed.endpoints,
         "host_id": parsed.host_id,
         "rotation_seq": rotation_seq,
@@ -195,10 +216,19 @@ struct PersistedWasmIdentity {
     host_id: String,
     static_secret_b64: String,
     signing_seed_b64: String,
+    pq_signing_seed_b64: String,
     #[serde(default)]
     rotation_chain: Vec<RotationRecord>,
     #[serde(default)]
     rotation_seq: u64,
+}
+
+impl Drop for PersistedWasmIdentity {
+    fn drop(&mut self) {
+        self.static_secret_b64.zeroize();
+        self.signing_seed_b64.zeroize();
+        self.pq_signing_seed_b64.zeroize();
+    }
 }
 
 /// Persistent client/endpoint identity held in browser storage by host JS.
@@ -223,6 +253,7 @@ impl WasmIdentity {
             host_id: self.inner.host_id().to_owned(),
             static_secret_b64: b64url_encode(self.inner.static_key().secret_bytes()),
             signing_seed_b64: b64url_encode(self.inner.signing_key().seed_bytes()),
+            pq_signing_seed_b64: b64url_encode(self.inner.signing_key().mldsa_seed_bytes()),
             rotation_chain: self.inner.rotation_chain().to_vec(),
             rotation_seq: self.inner.rotation_seq(),
         };
@@ -236,11 +267,13 @@ impl WasmIdentity {
             b64url_decode_array(&doc.static_secret_b64).map_err(|e| e.to_string())?;
         let signing_seed: [u8; 32] =
             b64url_decode_array(&doc.signing_seed_b64).map_err(|e| e.to_string())?;
+        let pq_signing_seed: [u8; 32] =
+            b64url_decode_array(&doc.pq_signing_seed_b64).map_err(|e| e.to_string())?;
         let inner = EndpointIdentity::from_persisted(
-            doc.host_id,
+            doc.host_id.clone(),
             StaticKeypair::from_scalar(static_scalar),
-            SigningKeypair::from_seed(signing_seed),
-            doc.rotation_chain,
+            SigningKeypair::from_seeds(signing_seed, pq_signing_seed),
+            doc.rotation_chain.clone(),
             doc.rotation_seq,
         )
         .map_err(|e| e.to_string())?;
@@ -252,7 +285,9 @@ impl WasmIdentity {
             "host_id": self.inner.host_id(),
             "device_id": self.inner.device_id(),
             "static_pub": b64url_encode(self.inner.static_key().public_bytes()),
-            "signing_pub": b64url_encode(self.inner.signing_key().public_bytes()),
+            "signing_pub": self.inner.signing_key().public_key().to_b64url(),
+            "signing_pub_hash": b64url_encode(&self.inner.signing_key().signing_pub_hash()),
+            "relay_pub": b64url_encode(self.inner.signing_key().ed25519_public_bytes()),
         })
         .to_string()
     }
@@ -350,7 +385,9 @@ impl WasmRoster {
         let seq = f64_to_u64(rotation_seq, "rotation_seq").map_err(to_js_err)?;
         let static_pub = b64url_decode_array::<32>(static_pub_b64).map_err(to_js_err)?;
         let signing_pub = match signing_pub_b64 {
-            Some(ref s) if !s.is_empty() => Some(b64url_decode_array::<32>(s).map_err(to_js_err)?),
+            Some(ref s) if !s.is_empty() => {
+                Some(HybridSigningPublicKey::from_b64url(s).map_err(to_js_err)?)
+            }
             _ => None,
         };
         let hints: Vec<String> = match relay_hints_json {
@@ -393,7 +430,7 @@ impl WasmRoster {
         anchor_id: &str,
         signing_pub_b64: &str,
     ) -> Result<(), JsValue> {
-        let key = b64url_decode_array::<32>(signing_pub_b64).map_err(to_js_err)?;
+        let key = HybridSigningPublicKey::from_b64url(signing_pub_b64).map_err(to_js_err)?;
         self.inner
             .add_trust_anchor(anchor_id.to_owned(), key)
             .map(|_| ())
@@ -455,7 +492,7 @@ impl WasmPairInitiator {
                 Some(PinnedHost {
                     host_id: host_id.filter(|h| !h.is_empty()).map(ToOwned::to_owned),
                     static_pub: b64url_decode_array::<32>(st).map_err(|e| e.to_string())?,
-                    signing_pub: b64url_decode_array::<32>(sg).map_err(|e| e.to_string())?,
+                    signing_pin: parse_signing_pin_b64(sg, "host_signing_pub_b64")?,
                     rotation_seq: seq,
                 })
             }
@@ -596,14 +633,13 @@ impl WasmPairInitiator {
         };
         let static_pub =
             b64url_decode_array::<32>(host_static_pub_b64).map_err(|e| e.to_string())?;
-        let signing_pub =
-            b64url_decode_array::<32>(host_signing_pub_b64).map_err(|e| e.to_string())?;
+        let signing_pin = parse_signing_pin_b64(host_signing_pub_b64, "host_signing_pub_b64")?;
         let token: Grant =
             serde_json::from_str(token_json).map_err(|e| format!("invalid token_json: {e}"))?;
         let pinned = PinnedHost {
             host_id: Some(host_id.to_owned()),
             static_pub,
-            signing_pub,
+            signing_pin,
             rotation_seq: seq,
         };
         let inner = PairingInitiator::new_m2m(
@@ -1038,7 +1074,7 @@ mod tests {
         host_roster
             .add_trust_anchor(
                 "wasm-m2m-anchor".to_owned(),
-                *anchor_id.signing_key().public_bytes(),
+                anchor_id.signing_key().public_key().clone(),
             )
             .unwrap();
         let mut mgr = PairingManager::new(PairingConfig::default());
@@ -1057,7 +1093,7 @@ mod tests {
             "machine",
             "wasm-m2m-host",
             &b64url_encode(host_id.static_key().public_bytes()),
-            &b64url_encode(host_id.signing_key().public_bytes()),
+            &host_id.signing_key().public_key().to_b64url(),
             None,
             &tok_json,
         )
@@ -1116,7 +1152,7 @@ mod tests {
             "machine",
             "wasm-m2m-host",
             &b64url_encode(host_id.static_key().public_bytes()),
-            &b64url_encode(host_id.signing_key().public_bytes()),
+            &b64url_encode(&host_id.signing_key().signing_pub_hash()),
             None,
             &tok_json,
         )

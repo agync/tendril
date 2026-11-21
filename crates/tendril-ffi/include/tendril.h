@@ -9,6 +9,10 @@
 extern "C" {
 #endif
 
+#define TENDRIL_KEY_LEN 32
+#define TENDRIL_SIGNING_PUB_LEN 1984
+#define TENDRIL_SIGNING_HASH_LEN 32
+
 typedef struct TendrilEndpoint TendrilEndpoint;
 typedef struct TendrilSession TendrilSession;
 
@@ -114,7 +118,8 @@ int32_t tendril_endpoint_revoke_peer(TendrilEndpoint *ep, const char *peer_id);
 int32_t tendril_endpoint_add_trust_anchor(
     TendrilEndpoint *ep,
     const char *anchor_id,
-    const uint8_t *signing_pub_32
+    const uint8_t *signing_pub,
+    size_t signing_pub_len
 );
 int32_t tendril_endpoint_revoke_trust_anchor(TendrilEndpoint *ep, const char *anchor_id);
 int32_t tendril_endpoint_mint_enrollment_token(
@@ -130,7 +135,8 @@ int32_t tendril_endpoint_enroll_initiate(
     const char *relay_host_opt,
     const char *host_id,
     const uint8_t *host_static_pub_32,
-    const uint8_t *host_signing_pub_32,
+    const uint8_t *host_signing_pin,
+    size_t host_signing_pin_len,
     uint64_t host_rotation_seq,
     const char *token_json,
     const char *name,

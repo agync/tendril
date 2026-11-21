@@ -209,7 +209,11 @@ final class TendrilConformanceTests: XCTestCase {
     let anchorInfo = try JSONSerialization.jsonObject(with: Data(anchor.infoJson().utf8)) as! [String: Any]
     let hostStatic = decodeB64Url(hostInfo["static_pub"] as! String)
     let hostSigning = decodeB64Url(hostInfo["signing_pub"] as! String)
+    let hostSigningHash = decodeB64Url(hostInfo["signing_pub_hash"] as! String)
     let anchorSigning = decodeB64Url(anchorInfo["signing_pub"] as! String)
+    XCTAssertEqual(hostSigning.count, 1984)
+    XCTAssertEqual(hostSigningHash.count, 32)
+    XCTAssertEqual(anchorSigning.count, 1984)
 
     try host.addTrustAnchor(anchorId: "swift-m2m-anchor", signingPub: anchorSigning)
     let addr = try host.serveDirect(listenAddr: "127.0.0.1:0")
@@ -245,7 +249,7 @@ final class TendrilConformanceTests: XCTestCase {
         endpoint: addr,
         hostId: "swift-m2m-host",
         hostStaticPub: hostStatic,
-        hostSigningPub: hostSigning,
+        hostSigningPub: hostSigningHash,
         tokenJson: tokJson
       )
     )

@@ -181,7 +181,7 @@ async function initClient() {
   });
   await writeVaultString(IDENTITY_VAULT_ID, client.exportIdentityJson());
   const info = client.info();
-  $("status").textContent = "WASM core ready (Noise_XX_25519_ChaChaPoly_SHA256)";
+  $("status").textContent = "WASM core ready (Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256)";
   $("device-id").textContent = `device_id: ${info.device_id}`;
 }
 
