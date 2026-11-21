@@ -2,7 +2,7 @@
 
 Canonical byte-for-byte test vectors for identity fingerprints, pairing MACs,
 signed key rotations, RFC 8785 JCS capability grants, revocation lists, and
-Noise XX handshake transcripts.
+Noise_XXhfs (hybrid X25519 + ML-KEM-768) handshake transcripts.
 
 ## Files
 

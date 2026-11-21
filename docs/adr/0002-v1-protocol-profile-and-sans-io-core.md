@@ -8,6 +8,8 @@ tags: [adr, wire, pairing, architecture, relay]
 
 # 0002 V1 protocol profile and Sans-I/O core
 
+> **Amended by [ADR 0004](0004-hybrid-post-quantum-v1.md):** `ADR 0004` replaced classical `Noise_XX_25519_ChaChaPoly_SHA256` and pure Ed25519 signatures in wire v1 with mandatory `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` (hybrid X25519 + ML-KEM-768) and hybrid `Ed25519 + ML-DSA-65` signatures, with no classical fallback.
+
 ## Context
 
 [ADR 0001](0001-one-core-hostile-paths.md) established the top-level split between one Rust trust core, thin language bindings, and untrusted path providers. Before writing normative wire specifications, conformance vectors, and core state machines, five protocol and crate-boundary choices needed resolution:

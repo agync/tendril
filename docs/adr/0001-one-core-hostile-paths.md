@@ -8,6 +8,8 @@ tags: [adr, architecture, security]
 
 # 0001 One core, hostile paths
 
+> **Amended by [ADR 0004](0004-hybrid-post-quantum-v1.md):** `ADR 0004` replaced classical `Noise_XX_25519_ChaChaPoly_SHA256` and pure Ed25519 signatures in wire v1 with mandatory `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` (hybrid X25519 + ML-KEM-768) and hybrid `Ed25519 + ML-DSA-65` signatures, with no classical fallback.
+
 ## Context
 
 Personal devices need private, direct communication across changing networks (home LANs, overlays, cellular CGNAT, and browsers) without delegating trust to a central service or reimplementing cryptographic protocols in every host language.

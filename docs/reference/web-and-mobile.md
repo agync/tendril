@@ -50,17 +50,20 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 ## Apple Swift (`bindings/swift`)
 
 - `bindings/swift/Package.swift` declares `CTendril` (`module.modulemap` + `shim.h` referencing `crates/tendril-ffi/include/tendril.h`), the `Tendril` wrapper module (`TendrilCrypto`, `TendrilEndpoint` including `addTrustAnchor`, `revokeTrustAnchor`, `mintEnrollmentToken`, and `enrollInitiate`, plus `TendrilSession`, validating strings against embedded NUL bytes and using `NSCondition` active-call refcounting with `tendril_endpoint_close`/`tendril_session_shutdown`), `TendrilKeychainStore` (`SealedSwiftStateStore` handling `errSecDuplicateItem`, key buffer zeroization, version `0x01` + domain AAD `CryptoKit` AES-GCM sealing wired into `TendrilEndpoint`/`TendrilSession`), and `TendrilTests` (offline vectors, fork rejection, local endpoint lifecycle, and M2M enrollment/replay checks).
-- Verification note: SwiftPM compilation and `XCTest` execution (`TendrilConformanceTests.swift`) require Apple macOS/iOS toolchains and were not executed on Linux.
+- Verification note: `swift test` (`TendrilConformanceTests`, 4/4 tests) and `aarch64-apple-darwin` (macOS arm64) release builds pass on macOS arm64; cross-compiling `aarch64-apple-ios` requires full `Xcode.app` (`iphoneos` SDK) for `ring` rather than Command Line Tools alone.
 
 ## Gate #7 baselines
 
 | Artifact | Target | Raw Size | Stripped / Compressed | Measurement Method |
 |---|---|---|---|---|
-| `bindings/web/pkg/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, default sans-I/O, hybrid PQ) | 1,027,782 bytes (1003.7 KiB) | 363,833 bytes (355.3 KiB) gzipped | Wave 2 `wasm-bindgen --target web` + `gzip -c -9` |
-| `bindings/web/pkg-p2p/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, `--features p2p-iroh`, hybrid PQ) | 4,279,199 bytes (4.08 MiB) | 1,565,104 bytes (1.49 MiB) gzipped | Wave 2 `wasm-bindgen --target web` (`p2p-iroh`) + `gzip -c -9` |
-| `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26, `--no-default-features`) | 3,434,576 bytes | 3,434,248 bytes (3.28 MiB, pre-PQ baseline) | `stat -c%s` before and after `llvm-strip` |
-| `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26, default `p2p-iroh`) | 12,291,992 bytes | 12,291,664 bytes (11.72 MiB, pre-PQ baseline) | `stat -c%s` before and after `llvm-strip` |
-| `aarch64-apple-ios` static archive | `aarch64-apple-ios` | Not measured on Linux | Not measured on Linux | Requires Apple Xcode toolchain |
+| `bindings/web/pkg/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, default sans-I/O, hybrid PQ) | 1,027,782 bytes (1003.7 KiB) | 363,831 bytes (355.3 KiB) gzipped | `wasm-bindgen --target web` + `gzip -c -9` |
+| `bindings/web/pkg-p2p/tendril_wasm_bg.wasm` | `wasm32-unknown-unknown` (`release`, `--features p2p-iroh`, hybrid PQ) | 4,279,199 bytes (4.08 MiB) | 1,565,110 bytes (1.49 MiB) gzipped | `wasm-bindgen --target web` (`p2p-iroh`) + `gzip -c -9` |
+| `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26, `--no-default-features`, hybrid PQ) | 4,095,168 bytes (3.91 MiB) | 4,095,160 bytes (3.91 MiB) | `stat -c%s` before and after `llvm-strip` |
+| `target/aarch64-linux-android/release/libtendril_ffi.so` | `aarch64-linux-android` (`release`, API 26, default `p2p-iroh`, hybrid PQ) | 12,761,016 bytes (12.17 MiB) | 12,761,008 bytes (12.17 MiB) | `stat -c%s` before and after `llvm-strip` |
+| Android Gradle release AAR (`bindings/kotlin`) | `aarch64-linux-android` (`release`, hybrid PQ) | 5,800,485 bytes (5.53 MiB) | Packaged AAR | Gradle `assembleRelease` |
+| `target/release/libtendril_ffi.{dylib,a}` | `aarch64-apple-darwin` (`release`, `--no-default-features`, hybrid PQ) | 3,984,240 B `.dylib` / 56,631,288 B `.a` | 3,984,304 B (`strip -x`) / 12,489,976 B (`strip -S`) | macOS arm64 release build + `strip` |
+| `target/release/libtendril_ffi.{dylib,a}` | `aarch64-apple-darwin` (`release`, default `p2p-iroh`, hybrid PQ) | 11,255,888 B `.dylib` / 124,318,248 B `.a` | 11,255,976 B (`strip -x`) / 29,375,784 B (`strip -S`) | macOS arm64 release build + `strip` |
+| `aarch64-apple-ios` static archive | `aarch64-apple-ios` | Not measured | Not measured | Requires full `Xcode.app` (`iphoneos` SDK) for `ring` |
 
 ## Gate #8 WASM Argon2id timings
 
@@ -68,28 +71,43 @@ Measured via `benchmarkArgon2` (`t=3, m=64 MiB, p=1`) in headless desktop Google
 
 | Execution Context | Runs | Min (ms) | Median (ms) | Max (ms) | Notes |
 |---|---|---|---|---|---|
-| Desktop headless Chrome (main thread) | 3 | 158.6 | 159.4 | 163.9 | Single-call `compute_code_mac` (`useWorker: false`) |
-| Desktop headless Chrome (Web Worker) | 2 | 168.7 | 193.8 | 193.8 | Includes worker spawn and WASM init (`useWorker: true`) |
+| Desktop headless Chrome (main thread) | 3 | 135.2 | 148.5 | 158.7 | Single-call `compute_code_mac` (`useWorker: false`, post-`ADR 0004`) |
+| Desktop headless Chrome (Web Worker) | 2 | 183.7 | 218.7 | 218.7 | Includes worker spawn and WASM init (`useWorker: true`, post-`ADR 0004`) |
 | Mobile phone browser (main thread) | 3 | 153.8 | 155.8 | 171.7 | Physical phone run against hosted demo (`useWorker: false`) |
 | Mobile phone browser (Web Worker) | 3 | 402.6 | 665.7 | 1030.9 | Includes worker spawn and WASM init per call (`useWorker: true`) |
 
-## Gate #9 real-device pairing and reconnect baselines
+## Gate #9 pairing and reconnect baselines
 
-### WebSocket relay baseline (physical phone)
+### Desktop headless Chrome WebSocket relay (post-`ADR 0004` `Noise_XXhfs`)
+
+Measured in headless desktop Google Chrome against `tendril-conformance-peer` over a loopback `tendril-relay` (`Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256`, `1216 B` `msg1`, and `3373 B` hybrid `Ed25519 + ML-DSA-65` signatures):
+
+- **Remote pairing (`TendrilWebClient.pair`):** `269.4 ms` end-to-end (includes `Noise_XXhfs` `pair` handshake and Argon2id `code_mac`).
+- **Authenticated session connect (`TendrilWebClient.connect`):** `18.0 ms` initial `Noise_XXhfs` handshake over loopback relay (`14.6 ms` repeat connect).
+- **Encrypted control and data round-trip:** `25.5 ms` encrypted `0x05 PING` -> `0x06 PONG` RTT, `0.2 ms` client `0x04 REKEY` dispatch, and verified `21`-byte plaintext delivery on the Rust conformance peer.
+
+These desktop headless figures are local loopback baselines and are not directly comparable to WAN physical-phone latencies.
+
+### Historical pre-`ADR 0004` physical-phone baselines
+
+> [!NOTE]
+> The two physical-phone subsections below are **historical pre-`ADR 0004` baselines** measured under classical `Noise_XX` before `1216 B` `Noise_XXhfs` `msg1` and `3373 B` hybrid `Ed25519 + ML-DSA-65` signatures landed in wire v1. Physical-phone re-measurement under `Noise_XXhfs` is pending.
+
+#### WebSocket relay baseline (physical phone, pre-`ADR 0004` classical `Noise_XX`)
 
 Observed between a physical mobile browser and the desktop Rust `tendril` CLI host over the WebSocket relay demo (`< 30 s` pairing target):
 
 - **Remote pairing:** `0.59 s` end-to-end with verified 16-character SAS match and host `tendril confirm`.
-- **Authenticated session connect:** `332.1 ms` initial Noise XX handshake over relay (`164.5 ms` repeat connect).
+- **Authenticated session connect:** `332.1 ms` initial pre-`ADR 0004` classical `Noise_XX` handshake over relay (`164.5 ms` repeat connect).
 - **Encrypted control and data round-trip:** `27 ms` encrypted `0x05 PING` -> `0x06 PONG`, followed by `0x04 REKEY` and verified plaintext delivery (`21` bytes) decoded on the Rust host.
 - **Disconnect and reconnect recovery:** Re-established authenticated relay sessions in `526.5 ms`, `520.4 ms`, and `418.0 ms` across manual reconnect and connectivity restoration tests.
 
-### Zero-setup `iroh://` baseline (physical phone, Tailscale OFF)
+#### Zero-setup `iroh://` baseline (physical phone, Tailscale OFF, pre-`ADR 0004` classical `Noise_XX`)
 
 Observed between a physical mobile browser (Tailscale OFF, zero self-hosted Tendril relay) and `tendril serve --p2p --issue-code remote` over bare `iroh://` routed via public `n0` relay (`euc1-1.relay.n0.iroh.link.`):
 
 - **Warm remote pairing:** `0.87 s` with verified 16-character SAS match and host `tendril confirm` (a cold first tap timed out while downloading the uncompressed `3.93 MiB` `pkg-p2p` bundle inside the shared `15 s` timeout, motivating `initTendrilP2p()` pre-warming and gzip compression in `demo/server.mjs`).
-- **Authenticated session connect (`provider: P2p`):** `634.9 ms` initial Noise XX QUIC establish.
+- **Authenticated session connect (`provider: P2p`):** `634.9 ms` initial pre-`ADR 0004` classical `Noise_XX` QUIC establish.
 - **Encrypted control and data round-trip:** `63 ms`, `67 ms`, and post-rekey `69 ms` `0x05 PING` -> `0x06 PONG` RTTs, followed by `0x04 REKEY` and `21`-byte plaintext verified on the Rust host.
 - **Disconnect and reconnect recovery:** Clean session close (`code=1000`, `reason="reconnect"`) and re-establishment in `392.9 ms` over `provider: P2p`.
 
