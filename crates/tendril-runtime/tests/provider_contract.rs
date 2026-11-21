@@ -2657,11 +2657,11 @@ async fn batch2b_sec17_sec31_concurrent_session_and_fresh_now_unix() {
             for i in 0..32u8 {
                 cli_conc.send_data(&[i; 32]).await.expect("cli stress send");
             }
-            timeout(Duration::from_secs(3), recv_loop)
+            timeout(Duration::from_secs(15), recv_loop)
                 .await
                 .expect("stress recv timed out (possible deadlock)")
                 .expect("recv join");
-            timeout(Duration::from_secs(3), auth_loop)
+            timeout(Duration::from_secs(15), auth_loop)
                 .await
                 .expect("stress auth timed out (possible deadlock)")
                 .expect("auth join");

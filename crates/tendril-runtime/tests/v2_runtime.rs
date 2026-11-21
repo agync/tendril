@@ -1073,46 +1073,64 @@ async fn wake_provider_memory_http_and_noop_integrate_with_v2_relay() {
     let wake_notify_c = Arc::clone(&wake_notify);
     let wake_secret_http = wake_secret.clone();
     let sink_task = tokio::spawn(async move {
-        let (mut sock, _) = http_sink.accept().await.unwrap();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 1024];
-        let header_end;
         loop {
-            let n = sock.read(&mut tmp).await.unwrap();
-            assert!(n > 0);
-            buf.extend_from_slice(&tmp[..n]);
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                header_end = pos + 4;
-                break;
+            let (mut sock, _) = http_sink.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let mut header_end = None;
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = Some(pos + 4);
+                    break;
+                }
             }
-        }
-        let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
-        let clen = headers
-            .lines()
-            .find_map(|l| {
-                let (k, v) = l.split_once(':')?;
-                k.eq_ignore_ascii_case("content-length")
-                    .then(|| v.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap();
-        while buf.len() < header_end + clen {
-            let n = sock.read(&mut tmp).await.unwrap();
-            assert!(n > 0);
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        let json: serde_json::Value =
-            serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
-        let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
-        assert!(verify_epoch_wake_tag_window(
-            wake_secret_http.as_bytes(),
-            &tag,
-            now_unix
-        ));
-        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
+            if !headers.starts_with("POST ") {
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                continue;
+            }
+            let clen = headers
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap();
+            while buf.len() < header_end + clen {
+                let n = sock.read(&mut tmp).await.unwrap();
+                assert!(n > 0);
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let json: serde_json::Value =
+                serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
+            let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
+            assert!(verify_epoch_wake_tag_window(
+                wake_secret_http.as_bytes(),
+                &tag,
+                now_unix
+            ));
+            sock.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
             .await
             .unwrap();
-        wake_notify_c.notify_one();
+            wake_notify_c.notify_one();
+            break;
+        }
     });
 
     let url_c2 = relay_v2_url.clone();

@@ -1988,14 +1988,74 @@ async fn cli_e2e_relay_auth_ticket_and_hmac_gate() {
     .expect("spawn_blocking");
 }
 
+async fn accept_wake_post(listener: &tokio::net::TcpListener, wake_secret: &[u8; 32]) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tendril_runtime::{WakeTag, verify_epoch_wake_tag_window};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    loop {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let mut header_end = None;
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+                break;
+            }
+        }
+        let Some(header_end) = header_end else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
+        if !headers.starts_with("POST ") {
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            continue;
+        }
+        let clen = headers
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        while buf.len() < header_end + clen {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
+        let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(verify_epoch_wake_tag_window(wake_secret, &tag, now_s));
+        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = sock.flush().await;
+        return headers;
+    }
+}
+
 #[tokio::test]
 async fn cli_e2e_wire_v2_pair_relay_v2_downgrade_guard_and_http_wake() {
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use tendril_core::crypto::b64url_decode_array;
     use tendril_core::relay_auth::RelayAuthScope;
-    use tendril_runtime::{WakeTag, verify_epoch_wake_tag_window};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
     use zeroize::Zeroizing;
@@ -2068,51 +2128,13 @@ async fn cli_e2e_wire_v2_pair_relay_v2_downgrade_guard_and_http_wake() {
     let sink1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let sink1_addr = sink1.local_addr().unwrap();
     let sink1_task = tokio::spawn(async move {
-        let (mut sock, _) = sink1.accept().await.unwrap();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 1024];
-        let header_end;
-        loop {
-            let n = sock.read(&mut tmp).await.unwrap();
-            assert!(n > 0);
-            buf.extend_from_slice(&tmp[..n]);
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                header_end = pos + 4;
-                break;
-            }
-        }
-        let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
+        let headers = accept_wake_post(&sink1, &wake_secret).await;
         assert!(
             headers
                 .to_ascii_lowercase()
                 .contains("authorization: bearer wake-bearer-tok"),
             "missing wake auth header: {headers}"
         );
-        let clen = headers
-            .lines()
-            .find_map(|l| {
-                let (k, v) = l.split_once(':')?;
-                k.eq_ignore_ascii_case("content-length")
-                    .then(|| v.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap();
-        while buf.len() < header_end + clen {
-            let n = sock.read(&mut tmp).await.unwrap();
-            assert!(n > 0);
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        let json: serde_json::Value =
-            serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
-        let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
-        let now_s = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert!(verify_epoch_wake_tag_window(&wake_secret, &tag, now_s));
-        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
     });
 
     // Loopback HTTP wake sink #2 (wake-on-demand when host serve is sleeping).
@@ -2121,46 +2143,8 @@ async fn cli_e2e_wire_v2_pair_relay_v2_downgrade_guard_and_http_wake() {
     let woken_notify = Arc::new(Notify::new());
     let woken_notify_c = Arc::clone(&woken_notify);
     let sink2_task = tokio::spawn(async move {
-        let (mut sock, _) = sink2.accept().await.unwrap();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 1024];
-        let header_end;
-        loop {
-            let n = sock.read(&mut tmp).await.unwrap();
-            assert!(n > 0);
-            buf.extend_from_slice(&tmp[..n]);
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                header_end = pos + 4;
-                break;
-            }
-        }
-        let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
-        let clen = headers
-            .lines()
-            .find_map(|l| {
-                let (k, v) = l.split_once(':')?;
-                k.eq_ignore_ascii_case("content-length")
-                    .then(|| v.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap();
-        while buf.len() < header_end + clen {
-            let n = sock.read(&mut tmp).await.unwrap();
-            assert!(n > 0);
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        let json: serde_json::Value =
-            serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
-        let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
-        let now_s = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert!(verify_epoch_wake_tag_window(&wake_secret, &tag, now_s));
+        let _ = accept_wake_post(&sink2, &wake_secret).await;
         woken_notify_c.notify_one();
-        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
     });
 
     let host_dir_path = host_dir.path().to_path_buf();
@@ -2417,11 +2401,8 @@ async fn cli_e2e_wire_v2_pair_relay_v2_downgrade_guard_and_http_wake() {
 
 #[tokio::test]
 async fn cli_e2e_conformance_peer_v2_relay_auth_and_wake() {
-    use std::time::{SystemTime, UNIX_EPOCH};
     use tendril_core::crypto::{b64url_decode_array, b64url_encode};
     use tendril_core::relay_auth::RelayAuthScope;
-    use tendril_runtime::{WakeTag, verify_epoch_wake_tag_window};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use zeroize::Zeroizing;
 
@@ -2473,45 +2454,7 @@ async fn cli_e2e_conformance_peer_v2_relay_auth_and_wake() {
     let wake_sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let wake_addr = wake_sink.local_addr().unwrap();
     let wake_task = tokio::spawn(async move {
-        let (mut sock, _) = wake_sink.accept().await.unwrap();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 1024];
-        let header_end;
-        loop {
-            let n = sock.read(&mut tmp).await.unwrap();
-            assert!(n > 0);
-            buf.extend_from_slice(&tmp[..n]);
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                header_end = pos + 4;
-                break;
-            }
-        }
-        let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
-        let clen = headers
-            .lines()
-            .find_map(|l| {
-                let (k, v) = l.split_once(':')?;
-                k.eq_ignore_ascii_case("content-length")
-                    .then(|| v.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap();
-        while buf.len() < header_end + clen {
-            let n = sock.read(&mut tmp).await.unwrap();
-            assert!(n > 0);
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        let json: serde_json::Value =
-            serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
-        let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
-        let now_s = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert!(verify_epoch_wake_tag_window(&wake_secret, &tag, now_s));
-        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        let _ = accept_wake_post(&wake_sink, &wake_secret).await;
     });
 
     client.call(serde_json::json!({

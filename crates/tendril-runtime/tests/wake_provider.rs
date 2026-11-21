@@ -11,47 +11,62 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 async fn read_one_http_request(listener: &TcpListener) -> (String, Value) {
-    let (mut stream, _) = listener.accept().await.expect("accept");
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 1024];
-    let header_end;
     loop {
-        let n = stream.read(&mut tmp).await.expect("read");
-        assert!(n > 0, "unexpected EOF before headers");
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            header_end = pos + 4;
-            break;
-        }
-    }
-    let headers_str = std::str::from_utf8(&buf[..header_end])
-        .expect("utf8 headers")
-        .to_owned();
-    let content_len = headers_str
-        .lines()
-        .find_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            if k.eq_ignore_ascii_case("content-length") {
-                v.trim().parse::<usize>().ok()
-            } else {
-                None
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let mut header_end = None;
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read");
+            if n == 0 {
+                break;
             }
-        })
-        .expect("content-length header");
-    while buf.len() < header_end + content_len {
-        let n = stream.read(&mut tmp).await.expect("read body");
-        assert!(n > 0, "unexpected EOF before body");
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    let body_json: Value =
-        serde_json::from_slice(&buf[header_end..header_end + content_len]).expect("valid json");
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+                break;
+            }
+        }
+        let Some(header_end) = header_end else {
+            continue;
+        };
+        let headers_str = std::str::from_utf8(&buf[..header_end])
+            .expect("utf8 headers")
+            .to_owned();
+        if !headers_str.starts_with("POST ") {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            continue;
+        }
+        let content_len = headers_str
+            .lines()
+            .find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                if k.eq_ignore_ascii_case("content-length") {
+                    v.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .expect("content-length header");
+        while buf.len() < header_end + content_len {
+            let n = stream.read(&mut tmp).await.expect("read body");
+            assert!(n > 0, "unexpected EOF before body");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let body_json: Value =
+            serde_json::from_slice(&buf[header_end..header_end + content_len]).expect("valid json");
 
-    stream
-        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .await
-        .expect("write response");
-    stream.flush().await.expect("flush");
-    (headers_str, body_json)
+        stream
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write response");
+        stream.flush().await.expect("flush");
+        return (headers_str, body_json);
+    }
 }
 
 #[tokio::test]
