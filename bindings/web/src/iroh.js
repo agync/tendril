@@ -230,21 +230,57 @@ class IrohStream {
   }
 }
 
+const textDecoder = new TextDecoder("utf-8", { fatal: true });
+
 export async function dialIrohStream({
   endpoint,
   relayUrlOverride = null,
+  p2pRelayUrls = null,
+  p2pRelayAuthToken = null,
+  p2pApiSecret = null,
   timeoutMs = 15000,
 }) {
+  if (p2pApiSecret) {
+    throw new Error(
+      "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+    );
+  }
   if (!endpoint || !endpoint.startsWith("iroh://")) {
     throw new Error(`iroh endpoint must start with iroh://: ${endpoint}`);
+  }
+  let authTokenStr = null;
+  if (p2pRelayAuthToken !== null && p2pRelayAuthToken !== undefined) {
+    if (p2pRelayAuthToken instanceof Uint8Array) {
+      try {
+        authTokenStr = textDecoder.decode(p2pRelayAuthToken);
+      } finally {
+        p2pRelayAuthToken.fill(0);
+      }
+    } else if (typeof p2pRelayAuthToken === "string") {
+      authTokenStr = p2pRelayAuthToken;
+    } else {
+      throw new TypeError("p2pRelayAuthToken must be a string or Uint8Array");
+    }
+    if (!authTokenStr) {
+      throw new Error("p2pRelayAuthToken must not be empty");
+    }
+  }
+  let relayUrlsJson = null;
+  if (p2pRelayUrls !== null && p2pRelayUrls !== undefined) {
+    if (!Array.isArray(p2pRelayUrls)) {
+      throw new TypeError("p2pRelayUrls must be an array of relay URLs");
+    }
+    relayUrlsJson = JSON.stringify(p2pRelayUrls);
+  } else if (relayUrlOverride && authTokenStr !== null) {
+    relayUrlsJson = JSON.stringify([relayUrlOverride]);
   }
   const mod = await ensureP2pReady();
   let timer = null;
   let timedOut = false;
-  const dialPromise = mod.WasmIrohStream.dial(
-    endpoint,
-    relayUrlOverride || null,
-    timeoutMs
+  const useOptions = relayUrlsJson !== null || authTokenStr !== null;
+  const dialPromise = (useOptions
+    ? mod.WasmIrohStream.dial_with_options(endpoint, relayUrlsJson, authTokenStr, timeoutMs)
+    : mod.WasmIrohStream.dial(endpoint, relayUrlOverride || null, timeoutMs)
   )
     .then(async (stream) => {
       if (timedOut) {

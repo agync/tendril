@@ -1,8 +1,12 @@
-// Browser WebSocket relay client implementing spec/relay-v1.md dialer framing.
+// Browser WebSocket relay client implementing spec/relay-v1.md and /v2/relay dialer framing.
+
+import { compute_relay_auth_hmac_b64, v2_epoch_within_skew } from "../pkg/tendril_wasm.js";
 
 export const MAX_RELAY_FRAME_LEN = 65521;
 export const MAX_QUEUED_BYTES = 16 * MAX_RELAY_FRAME_LEN;
 export const MAX_QUEUED_FRAMES = 256;
+
+const relayTextEncoder = new TextEncoder();
 
 function stripHostBrackets(host) {
   return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
@@ -369,18 +373,102 @@ export class RelayStream {
   }
 }
 
-export async function dialRelayStream({
+function encodeB64url(buf) {
+  let bin = "";
+  for (let i = 0; i < buf.length; i += 1) {
+    bin += String.fromCharCode(buf[i]);
+  }
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function decodeB64url(str) {
+  if (typeof str !== "string" || !str) {
+    return new Uint8Array(0);
+  }
+  const pad = "=".repeat((4 - (str.length % 4)) % 4);
+  const b64 = (str + pad).replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+function randomConnIdBytes() {
+  const buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  return buf;
+}
+
+function validateRelayAuthSecretInput(relayAuthSecret) {
+  if (relayAuthSecret === null || relayAuthSecret === undefined) {
+    return;
+  }
+  if (relayAuthSecret instanceof Uint8Array) {
+    if (relayAuthSecret.length === 0 || relayAuthSecret.every((b) => b === 0)) {
+      throw new Error("relayAuthSecret must not be empty or all-zero");
+    }
+    return;
+  }
+  if (typeof relayAuthSecret === "string") {
+    if (relayAuthSecret.length === 0) {
+      throw new Error("relayAuthSecret must not be empty");
+    }
+    return;
+  }
+  throw new TypeError("relayAuthSecret must be a Uint8Array or string");
+}
+
+function buildRelayDialAuth({ relayAuthTicket, relayAuthSecret, challenge, targetBytes }) {
+  const authRequired =
+    Array.isArray(challenge.auth_required) && challenge.auth_required.includes("dial");
+  if (!authRequired) {
+    return null;
+  }
+  if (relayAuthTicket !== null && relayAuthTicket !== undefined) {
+    const ticket =
+      typeof relayAuthTicket === "string" ? JSON.parse(relayAuthTicket) : relayAuthTicket;
+    if (!ticket || typeof ticket !== "object") {
+      throw new Error("relayAuthTicket must be a JSON string or ticket object");
+    }
+    return { kind: "ticket", ticket };
+  }
+  if (relayAuthSecret !== null && relayAuthSecret !== undefined) {
+    let secretBytes;
+    if (relayAuthSecret instanceof Uint8Array) {
+      secretBytes = relayAuthSecret;
+    } else if (typeof relayAuthSecret === "string") {
+      secretBytes = relayTextEncoder.encode(relayAuthSecret);
+    } else {
+      throw new TypeError("relayAuthSecret must be a Uint8Array or string");
+    }
+    try {
+      const nonceBytes = decodeB64url(challenge.nonce);
+      const mac = compute_relay_auth_hmac_b64(
+        secretBytes,
+        "dial",
+        challenge.host,
+        nonceBytes,
+        targetBytes
+      );
+      return { kind: "hmac", mac };
+    } finally {
+      secretBytes.fill(0);
+    }
+  }
+  throw new Error("relay requires dial authentication (relayAuthTicket or relayAuthSecret)");
+}
+
+async function openRelayHandshake({
   relayUrl,
-  targetPub,
   expectedHost = null,
   allowInsecureWs = false,
   timeoutMs = 15000,
+  buildDialMsg,
 }) {
   const { url: canonicalUrl, bareHost } = validateRelayWsUrl(relayUrl, allowInsecureWs);
   const expHost = expectedHost || bareHost;
-  if (!targetPub) {
-    throw new Error("targetPub is required for relay dial");
-  }
 
   const ws = new WebSocket(canonicalUrl);
   ws.binaryType = "arraybuffer";
@@ -537,8 +625,8 @@ export async function dialRelayStream({
       stream._setMaxFrame(challenge.max_frame);
     }
 
-    const connId = randomConnIdB64();
-    ws.send(JSON.stringify({ op: "dial", target_pub: targetPub, conn_id: connId }));
+    const { connId, payload } = await buildDialMsg(challenge);
+    ws.send(JSON.stringify(payload));
 
     const reply = await nextControl();
     if (!reply) {
@@ -555,5 +643,116 @@ export async function dialRelayStream({
   } catch (err) {
     stream.close();
     throw err;
+  }
+}
+
+export async function dialRelayStream({
+  relayUrl,
+  targetPub,
+  expectedHost = null,
+  allowInsecureWs = false,
+  relayAuthTicket = null,
+  relayAuthSecret = null,
+  timeoutMs = 15000,
+}) {
+  try {
+    validateRelayAuthSecretInput(relayAuthSecret);
+    if (!targetPub) {
+      throw new Error("targetPub is required for relay dial");
+    }
+    const targetBytes = decodeB64url(targetPub);
+    return await openRelayHandshake({
+      relayUrl,
+      expectedHost,
+      allowInsecureWs,
+      timeoutMs,
+      buildDialMsg: (challenge) => {
+        const connId = encodeB64url(randomConnIdBytes());
+        const auth = buildRelayDialAuth({
+          relayAuthTicket,
+          relayAuthSecret,
+          challenge,
+          targetBytes,
+        });
+        const payload = { op: "dial", target_pub: targetPub, conn_id: connId };
+        if (auth) {
+          payload.auth = auth;
+        }
+        return { connId, payload };
+      },
+    });
+  } finally {
+    if (relayAuthSecret instanceof Uint8Array) {
+      relayAuthSecret.fill(0);
+    }
+  }
+}
+
+export async function dialRelayV2Stream({
+  relayUrl,
+  deriveV2Dial = null,
+  expectedHost = null,
+  allowInsecureWs = false,
+  relayAuthTicket = null,
+  relayAuthSecret = null,
+  timeoutMs = 15000,
+}) {
+  try {
+    validateRelayAuthSecretInput(relayAuthSecret);
+    if (typeof deriveV2Dial !== "function") {
+      throw new Error(
+        "dialRelayV2Stream requires a deriveV2Dial callback (dial_token binds server nonce and per-dial conn_id)"
+      );
+    }
+    return await openRelayHandshake({
+      relayUrl,
+      expectedHost,
+      allowInsecureWs,
+      timeoutMs,
+      buildDialMsg: async (challenge) => {
+        if (!Number.isInteger(challenge.epoch) || challenge.epoch < 0) {
+          throw new Error(`invalid /v2/relay challenge epoch: ${challenge.epoch}`);
+        }
+        const connIdBytes = randomConnIdBytes();
+        const connId = encodeB64url(connIdBytes);
+        const derived = await deriveV2Dial({
+          relayHost: challenge.host,
+          nonceBytes: decodeB64url(challenge.nonce),
+          connIdBytes,
+          connId,
+          serverEpoch: challenge.epoch,
+        });
+        const mailboxId = derived.mailbox_id;
+        const dialEpoch = derived.epoch;
+        const token = derived.dial_token;
+        if (!v2_epoch_within_skew(challenge.epoch, dialEpoch)) {
+          throw new Error(
+            `relay v2 epoch out of skew: server=${challenge.epoch}, client=${dialEpoch}`
+          );
+        }
+        const targetBytes = decodeB64url(mailboxId);
+        const auth = buildRelayDialAuth({
+          relayAuthTicket,
+          relayAuthSecret,
+          challenge,
+          targetBytes,
+        });
+        const payload = {
+          op: "dial",
+          target_mailbox_id: mailboxId,
+          epoch: dialEpoch,
+          conn_id: connId,
+          dial_token: token,
+        };
+        if (auth) {
+          payload.auth = auth;
+        }
+        return { connId, payload };
+      },
+    });
+  } finally {
+    if (relayAuthSecret instanceof Uint8Array) {
+      relayAuthSecret.fill(0);
+    }
   }
 }

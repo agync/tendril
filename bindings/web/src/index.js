@@ -3,13 +3,18 @@ import initWasm, {
   WasmPairInitiator,
   WasmRoster,
   WasmSessionClient,
+  WasmV2PakePairInitiator,
+  WasmV2SessionInitiator,
   compute_code_mac,
   compute_code_mac_bytes,
+  compute_relay_auth_hmac_b64,
+  derive_v2_relay_dial_json,
   device_id,
   fingerprint_device,
   fingerprint_host,
   pairing_sas,
   parse_pairing_uri_json,
+  v2_epoch_within_skew,
   verify_grant_json,
   verify_rotation_chain_json,
 } from "../pkg/tendril_wasm.js";
@@ -19,6 +24,7 @@ import {
   MAX_RELAY_FRAME_LEN,
   RelayStream,
   dialRelayStream,
+  dialRelayV2Stream,
   validateRelayWsUrl,
 } from "./relay.js";
 
@@ -28,6 +34,7 @@ export {
   MAX_RELAY_FRAME_LEN,
   RelayStream,
   dialRelayStream,
+  dialRelayV2Stream,
   validateRelayWsUrl,
 };
 
@@ -86,18 +93,50 @@ async function dialWebStream({
   targetPub = null,
   expectedHost = null,
   relayUrlOverride = null,
+  p2pRelayUrls = null,
+  p2pRelayAuthToken = null,
+  p2pApiSecret = null,
+  relayAuthTicket = null,
+  relayAuthSecret = null,
+  useRelayV2 = false,
+  deriveV2Dial = null,
   allowInsecureWs = false,
   timeoutMs,
 }) {
+  if (p2pApiSecret) {
+    throw new Error(
+      "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+    );
+  }
   const target = endpoint || relayUrl;
   if (target && target.startsWith("iroh://")) {
-    return dialIrohStream({ endpoint: target, relayUrlOverride, timeoutMs });
+    return dialIrohStream({
+      endpoint: target,
+      relayUrlOverride,
+      p2pRelayUrls,
+      p2pRelayAuthToken,
+      p2pApiSecret,
+      timeoutMs,
+    });
+  }
+  if (useRelayV2) {
+    return dialRelayV2Stream({
+      relayUrl: target,
+      deriveV2Dial,
+      expectedHost,
+      allowInsecureWs,
+      relayAuthTicket,
+      relayAuthSecret,
+      timeoutMs,
+    });
   }
   return dialRelayStream({
     relayUrl: target,
     targetPub,
     expectedHost,
     allowInsecureWs,
+    relayAuthTicket,
+    relayAuthSecret,
     timeoutMs,
   });
 }
@@ -289,6 +328,27 @@ export function parsePairingUri(uri) {
   return JSON.parse(parse_pairing_uri_json(uri));
 }
 
+export function computeRelayAuthHmacB64(secretBytes, op, relayHost, nonce, pubOrTarget) {
+  if (!(secretBytes instanceof Uint8Array)) {
+    throw new TypeError("secretBytes must be a Uint8Array");
+  }
+  try {
+    return compute_relay_auth_hmac_b64(secretBytes, op, relayHost, nonce, pubOrTarget);
+  } finally {
+    secretBytes.fill(0);
+  }
+}
+
+export function deriveV2RelayDial(mailboxSecret, relayHost, unixSecs, dialNonce, connId) {
+  return JSON.parse(derive_v2_relay_dial_json(mailboxSecret, relayHost, unixSecs, dialNonce, connId));
+}
+
+export function v2EpochWithinSkew(serverEpoch, claimedEpoch) {
+  return v2_epoch_within_skew(serverEpoch, claimedEpoch);
+}
+
+export { WasmV2PakePairInitiator, WasmV2SessionInitiator };
+
 export class TendrilWebClient {
   #identity;
   #roster;
@@ -461,12 +521,39 @@ export class TendrilWebClient {
     return this.#identity.mint_enrollment_token(targetHostId, subject, nowUnixSecs(), ttlSecs);
   }
 
+  mintRelayTicket(relayHost, role = "dial", targetPubOrWildcard = "*", ttlSecs = 900) {
+    this.#ensureOpen();
+    return this.#identity.mint_relay_ticket_json(
+      relayHost,
+      role,
+      targetPubOrWildcard,
+      nowUnixSecs(),
+      ttlSecs
+    );
+  }
+
+  pairingFloor(staticPub) {
+    this.#ensureOpen();
+    const bytes = typeof staticPub === "string" ? b64urlDecode(staticPub) : staticPub;
+    return this.#roster.pairing_floor(bytes);
+  }
+
+  peerV2Summary(peerId) {
+    this.#ensureOpen();
+    return JSON.parse(this.#roster.peer_v2_summary(peerId));
+  }
+
   async enroll({
     endpoint = null,
     relayUrl = null,
     targetPub = null,
     expectedHost = null,
     relayUrlOverride = null,
+    p2pRelayUrls = null,
+    p2pRelayAuthToken = null,
+    p2pApiSecret = null,
+    relayAuthTicket = null,
+    relayAuthSecret = null,
     allowInsecureWs = false,
     hostId,
     hostStaticPubB64,
@@ -477,11 +564,16 @@ export class TendrilWebClient {
     deviceKind = "machine",
     timeoutMs = 15000,
   }) {
+    if (p2pApiSecret) {
+      throw new Error(
+        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+      );
+    }
     return this.#withHold(async () => {
       await warmTargetTransport(endpoint, relayUrl);
       this.#ensureOpen();
       const deadlineMs = performance.now() + timeoutMs;
-      const initiator = WasmPairInitiator.new_m2m(
+      const initiator = WasmPairInitiator.new_m2m_with_roster(
         this.#identity,
         deviceName,
         deviceKind,
@@ -489,7 +581,8 @@ export class TendrilWebClient {
         hostStaticPubB64,
         hostSigningPubB64,
         hostRotationSeq,
-        tokenJson
+        tokenJson,
+        this.#roster
       );
       let stream = null;
       try {
@@ -499,6 +592,11 @@ export class TendrilWebClient {
           targetPub,
           expectedHost,
           relayUrlOverride,
+          p2pRelayUrls,
+          p2pRelayAuthToken,
+          p2pApiSecret,
+          relayAuthTicket,
+          relayAuthSecret,
           allowInsecureWs,
           timeoutMs: remainingBudgetMs(
             deadlineMs,
@@ -582,6 +680,11 @@ export class TendrilWebClient {
     targetPub = null,
     expectedHost = null,
     relayUrlOverride = null,
+    p2pRelayUrls = null,
+    p2pRelayAuthToken = null,
+    p2pApiSecret = null,
+    relayAuthTicket = null,
+    relayAuthSecret = null,
     allowInsecureWs = false,
     code = "",
     pairingUri = null,
@@ -589,6 +692,11 @@ export class TendrilWebClient {
     deviceKind = "web",
     timeoutMs = 15000,
   }) {
+    if (p2pApiSecret) {
+      throw new Error(
+        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+      );
+    }
     return this.#withHold(async () => {
       let pairCode = code;
       let hostStaticPin = null;
@@ -610,7 +718,7 @@ export class TendrilWebClient {
       await warmTargetTransport(endpoint, relayUrl);
       this.#ensureOpen();
       const deadlineMs = performance.now() + timeoutMs;
-      const initiator = new WasmPairInitiator(
+      const initiator = WasmPairInitiator.new_with_roster(
         this.#identity,
         deviceName,
         deviceKind,
@@ -618,7 +726,8 @@ export class TendrilWebClient {
         hostStaticPin,
         hostSigningPin,
         hostIdPin,
-        hostRotationSeqPin
+        hostRotationSeqPin,
+        this.#roster
       );
       let stream = null;
       try {
@@ -628,6 +737,11 @@ export class TendrilWebClient {
           targetPub,
           expectedHost,
           relayUrlOverride,
+          p2pRelayUrls,
+          p2pRelayAuthToken,
+          p2pApiSecret,
+          relayAuthTicket,
+          relayAuthSecret,
           allowInsecureWs,
           timeoutMs: remainingBudgetMs(deadlineMs, "pairing timed out connecting to transport"),
         });
@@ -686,18 +800,153 @@ export class TendrilWebClient {
     });
   }
 
+  async pairV2({
+    endpoint = null,
+    relayUrl = null,
+    targetPub = null,
+    expectedHost = null,
+    relayUrlOverride = null,
+    p2pRelayUrls = null,
+    p2pRelayAuthToken = null,
+    p2pApiSecret = null,
+    relayAuthTicket = null,
+    relayAuthSecret = null,
+    allowInsecureWs = false,
+    code = "",
+    pairingUri = null,
+    pinnedHost = null,
+    deviceName = "web-device",
+    deviceKind = "web",
+    timeoutMs = 15000,
+  }) {
+    if (p2pApiSecret) {
+      throw new Error(
+        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+      );
+    }
+    return this.#withHold(async () => {
+      let pairCode = code;
+      let pinnedJson = null;
+      if (pairingUri) {
+        const parsed = parsePairingUri(pairingUri);
+        pairCode = parsed.code;
+        pinnedJson = JSON.stringify({
+          host_id: parsed.host_id ?? null,
+          static_pub_b64: parsed.host_static_pub_b64,
+          signing_pub_b64: parsed.host_signing_pub_hash_b64,
+          rotation_seq: parsed.rotation_seq ?? 0,
+          min_wire_version: 2,
+        });
+      } else if (pinnedHost) {
+        pinnedJson = typeof pinnedHost === "string" ? pinnedHost : JSON.stringify(pinnedHost);
+      }
+      if (!pairCode) {
+        throw new Error("pairing code or pairingUri is required");
+      }
+
+      await warmTargetTransport(endpoint, relayUrl);
+      this.#ensureOpen();
+      const deadlineMs = performance.now() + timeoutMs;
+      const initiator = new WasmV2PakePairInitiator(
+        this.#identity,
+        deviceName,
+        deviceKind,
+        pairCode,
+        pinnedJson
+      );
+      let stream = null;
+      try {
+        stream = await dialWebStream({
+          endpoint,
+          relayUrl,
+          targetPub,
+          expectedHost,
+          relayUrlOverride,
+          p2pRelayUrls,
+          p2pRelayAuthToken,
+          p2pApiSecret,
+          relayAuthTicket,
+          relayAuthSecret,
+          allowInsecureWs,
+          timeoutMs: remainingBudgetMs(deadlineMs, "v2 pairing timed out connecting to transport"),
+        });
+        this.#ensureOpen();
+        const startBytes = initiator.start();
+        await sendProtocolBytes(stream, startBytes);
+        while (true) {
+          const waitMs = remainingBudgetMs(
+            deadlineMs,
+            "v2 pairing timed out waiting for host response"
+          );
+          const frame = await stream.recv(waitMs);
+          this.#ensureOpen();
+          if (frame.status === "would_block") {
+            throw new Error("v2 pairing timed out waiting for host response");
+          }
+          if (frame.status === "eof") {
+            throw new Error("v2 pairing stream closed before completion");
+          }
+          const prevRoster = this.#roster.to_json();
+          const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
+          if (res.write_b64) {
+            await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+          }
+          if (res.outcome) {
+            if (res.outcome.status === "pending") {
+              try {
+                await this.#persistRoster();
+              } catch (err) {
+                if (!this.#wasmFreed) {
+                  try {
+                    this.#roster.replace_from_json(prevRoster);
+                  } catch {}
+                }
+                throw err;
+              }
+              return {
+                device_id: res.outcome.device_id,
+                host_id: res.outcome.host_id,
+                sas: res.outcome.sas,
+                host_confirmed: Boolean(res.outcome.host_confirmed),
+              };
+            }
+            if (res.outcome.status === "rejected") {
+              throw new Error(`v2 pairing rejected: ${res.outcome.error}`);
+            }
+            throw new Error(`unexpected v2 pairing outcome: ${JSON.stringify(res.outcome)}`);
+          }
+        }
+      } finally {
+        initiator.free();
+        if (stream) {
+          await stream.close();
+        }
+      }
+    });
+  }
+
   async connect({
     endpoint = null,
     relayUrl = null,
     targetPub = null,
     expectedHost = null,
     relayUrlOverride = null,
+    p2pRelayUrls = null,
+    p2pRelayAuthToken = null,
+    p2pApiSecret = null,
+    relayAuthTicket = null,
+    relayAuthSecret = null,
     allowInsecureWs = false,
     targetHostId,
     grantJson = null,
     crlSeq = null,
     timeoutMs = 15000,
   }) {
+    if (p2pApiSecret) {
+      throw new Error(
+        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+      );
+    }
     return this.#withHold(async () => {
       await warmTargetTransport(endpoint, relayUrl);
       this.#ensureOpen();
@@ -718,6 +967,11 @@ export class TendrilWebClient {
           targetPub,
           expectedHost,
           relayUrlOverride,
+          p2pRelayUrls,
+          p2pRelayAuthToken,
+          p2pApiSecret,
+          relayAuthTicket,
+          relayAuthSecret,
           allowInsecureWs,
           timeoutMs: remainingBudgetMs(
             deadlineMs,
@@ -797,6 +1051,151 @@ export class TendrilWebClient {
     });
   }
 
+  async connectV2({
+    endpoint = null,
+    relayUrl = null,
+    targetPub = null,
+    expectedHost = null,
+    relayUrlOverride = null,
+    p2pRelayUrls = null,
+    p2pRelayAuthToken = null,
+    p2pApiSecret = null,
+    relayAuthTicket = null,
+    relayAuthSecret = null,
+    useRelayV2 = false,
+    allowInsecureWs = false,
+    targetHostId,
+    grantJson = null,
+    crlSeq = null,
+    timeoutMs = 15000,
+  }) {
+    if (p2pApiSecret) {
+      throw new Error(
+        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+      );
+    }
+    return this.#withHold(async () => {
+      await warmTargetTransport(endpoint, relayUrl);
+      this.#ensureOpen();
+      const deadlineMs = performance.now() + timeoutMs;
+      const seq = crlSeq ?? this.#roster.crl_seq(targetHostId);
+      const session = new WasmV2SessionInitiator(
+        this.#identity,
+        targetHostId,
+        this.#roster,
+        grantJson,
+        seq ?? null
+      );
+      let stream = null;
+      let handedOff = false;
+      try {
+        const deriveV2Dial = useRelayV2
+          ? ({ relayHost, nonceBytes, connIdBytes }) =>
+              JSON.parse(
+                this.#roster.derive_v2_relay_dial_for_peer_json(
+                  targetHostId,
+                  relayHost,
+                  nowUnixSecs(),
+                  nonceBytes,
+                  connIdBytes
+                )
+              )
+          : null;
+        stream = await dialWebStream({
+          endpoint,
+          relayUrl,
+          targetPub,
+          expectedHost,
+          relayUrlOverride,
+          p2pRelayUrls,
+          p2pRelayAuthToken,
+          p2pApiSecret,
+          relayAuthTicket,
+          relayAuthSecret,
+          useRelayV2,
+          deriveV2Dial,
+          allowInsecureWs,
+          timeoutMs: remainingBudgetMs(
+            deadlineMs,
+            "v2 session handshake timed out connecting to transport"
+          ),
+        });
+        this.#ensureOpen();
+        const startedMs = performance.now();
+        const m1 = session.start(nowUnixSecs());
+        await sendProtocolBytes(stream, m1);
+        let initialEvents = [];
+        while (!session.is_established()) {
+          const waitMs = remainingBudgetMs(deadlineMs, "v2 session handshake timed out");
+          const frame = await stream.recv(waitMs);
+          this.#ensureOpen();
+          if (frame.status === "would_block") {
+            throw new Error("v2 session handshake timed out");
+          }
+          if (frame.status === "eof") {
+            throw new Error("v2 session stream closed during handshake");
+          }
+          const elapsedMs = Math.max(0, Math.floor(performance.now() - startedMs));
+          let step;
+          try {
+            step = JSON.parse(
+              session.feed_bytes(frame.bytes, nowUnixSecs(), elapsedMs, this.#roster)
+            );
+          } catch (err) {
+            try {
+              await this.#persistRoster();
+            } catch (persistErr) {
+              throw new Error(
+                `v2 session handshake failed (${err.message || err}); failed to persist roster update: ${persistErr.message || persistErr}`,
+                { cause: persistErr }
+              );
+            }
+            throw err;
+          }
+          const outBytes = session.poll_write();
+          if (outBytes && outBytes.length > 0) {
+            await sendProtocolBytes(stream, outBytes);
+          }
+          const events = JSON.parse(session.drain_events_json());
+          if (step.established) {
+            initialEvents = events;
+            break;
+          }
+        }
+        await this.#persistRoster();
+        this.#ensureOpen();
+        let releaseSession = null;
+        const webSession = new TendrilWebSession(
+          SESSION_TOKEN,
+          session,
+          stream,
+          this.#roster,
+          startedMs,
+          () => this.#persistRoster(),
+          initialEvents,
+          () => {
+            if (releaseSession) {
+              releaseSession();
+              releaseSession = null;
+            }
+          },
+          true
+        );
+        releaseSession = this.#attachSession(webSession);
+        handedOff = true;
+        return webSession;
+      } catch (err) {
+        if (!handedOff) {
+          session.free();
+          if (stream) {
+            await stream.close();
+          }
+        }
+        throw err;
+      }
+    });
+  }
+
   free() {
     if (this.#freed) {
       return;
@@ -817,6 +1216,7 @@ export class TendrilWebSession {
   #persist;
   #onRelease;
   #queue;
+  #isV2;
   #sendChain = Promise.resolve();
   #recvChain = Promise.resolve();
   #closing = false;
@@ -832,7 +1232,8 @@ export class TendrilWebSession {
     startedMs,
     persistFn,
     initialEvents = [],
-    onRelease = null
+    onRelease = null,
+    isV2 = false
   ) {
     if (token !== SESSION_TOKEN) {
       throw new Error("Use TendrilWebClient.connect()");
@@ -844,6 +1245,7 @@ export class TendrilWebSession {
     this.#persist = persistFn;
     this.#onRelease = onRelease;
     this.#queue = [...initialEvents];
+    this.#isV2 = Boolean(isV2);
   }
 
   #elapsedMs() {
@@ -899,17 +1301,42 @@ export class TendrilWebSession {
     });
   }
 
+  sendDummyCover(bucketSize = 256) {
+    this.#ensureOpen();
+    if (!this.#isV2) {
+      throw new Error("sendDummyCover requires a v2 session");
+    }
+    return this.#enqueueSend(async () => {
+      this.#ensureOpen();
+      const out = this.#session.send_dummy_cover(bucketSize, this.#elapsedMs());
+      await sendProtocolBytes(this.#stream, out);
+    });
+  }
+
+  nextPingDelayMs() {
+    this.#ensureOpen();
+    if (!this.#isV2) {
+      throw new Error("nextPingDelayMs requires a v2 session");
+    }
+    return this.#session.next_ping_delay_ms();
+  }
+
   rekey() {
     this.#ensureOpen();
     return this.#enqueueSend(async () => {
       this.#ensureOpen();
-      const out = this.#session.send_rekey(this.#elapsedMs());
+      const out = this.#isV2
+        ? this.#session.rekey(this.#elapsedMs())
+        : this.#session.send_rekey(this.#elapsedMs());
       await sendProtocolBytes(this.#stream, out);
     });
   }
 
   ping(cookie = 1) {
     this.#ensureOpen();
+    if (this.#isV2) {
+      throw new Error("ping is not exposed directly on v2 session");
+    }
     return this.#enqueueSend(async () => {
       this.#ensureOpen();
       const out = this.#session.send_ping(cookie, this.#elapsedMs());
@@ -919,6 +1346,9 @@ export class TendrilWebSession {
 
   tick() {
     this.#ensureOpen();
+    if (this.#isV2) {
+      return Promise.resolve();
+    }
     return this.#enqueueSend(async () => {
       this.#ensureOpen();
       let out;
@@ -947,6 +1377,10 @@ export class TendrilWebSession {
   authorize(requestedCap) {
     this.#ensureOpen();
     return this.#session.authorize(requestedCap, nowUnixSecs(), this.#roster);
+  }
+
+  poll(timeoutMs = 5000) {
+    return this.pollEvent(timeoutMs);
   }
 
   pollEvent(timeoutMs = 5000) {
@@ -1021,6 +1455,28 @@ export class TendrilWebSession {
           }
           throw feedErr;
         }
+        if (this.#isV2) {
+          const outBytes = this.#session.poll_write();
+          if (outBytes && outBytes.length > 0) {
+            await sendProtocolBytes(this.#stream, outBytes);
+          }
+          const events = JSON.parse(this.#session.drain_events_json());
+          if (events && events.length > 0) {
+            if (events.some((ev) => ev.event === "revocation_updated")) {
+              try {
+                await this.#persist();
+              } catch (persistErr) {
+                this.#failPersistAndClose(persistErr);
+                throw new Error(
+                  `failed to persist revocation update: ${persistErr.message || persistErr}`,
+                  { cause: persistErr }
+                );
+              }
+            }
+            this.#queue.push(...events);
+          }
+          return { eof: Boolean(step.closed && this.#queue.length === 0) };
+        }
         if (step.write_b64) {
           await sendProtocolBytes(this.#stream, b64urlDecode(step.write_b64));
         }
@@ -1055,7 +1511,9 @@ export class TendrilWebSession {
       try {
         await this.#enqueueSend(async () => {
           if (!this.#freed && !this.#session.is_closed()) {
-            const out = this.#session.send_close(code, reason);
+            const out = this.#isV2
+              ? this.#session.close(code, reason, this.#elapsedMs())
+              : this.#session.send_close(code, reason);
             await sendProtocolBytes(this.#stream, out);
           }
         }).catch(() => {});

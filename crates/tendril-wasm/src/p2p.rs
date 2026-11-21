@@ -6,11 +6,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use futures_util::lock::Mutex as AsyncMutex;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAddr};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, TransportAddr,
+};
 use n0_future::time::{Duration, timeout};
 use tendril_core::MAX_FRAME_LEN;
 use url::Url;
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
 
 const TENDRIL_P2P_ALPN: &[u8] = b"tendril/p2p/v1";
 const P2P_STREAM_MAGIC: u8 = 0x54;
@@ -218,6 +221,94 @@ pub struct WasmIrohStream {
     recv: Arc<AsyncMutex<Option<RecvStream>>>,
 }
 
+const MAX_P2P_RELAY_URLS: usize = 8;
+const MAX_P2P_AUTH_TOKEN_BYTES: usize = 4_096;
+
+fn validate_p2p_auth_token_wasm(raw: String) -> Result<Zeroizing<String>, String> {
+    let token = Zeroizing::new(raw);
+    if token.is_empty() || token.len() > MAX_P2P_AUTH_TOKEN_BYTES {
+        return Err("iroh relay auth token length must be within 1..=4096 bytes".to_owned());
+    }
+    if token.bytes().any(|b| b <= 0x1f || b == 0x7f) {
+        return Err("iroh relay auth token contains control characters".to_owned());
+    }
+    Ok(token)
+}
+
+fn build_relay_map_wasm(urls: &[String], auth_token: Option<&str>) -> Result<RelayMap, String> {
+    if urls.is_empty() || urls.len() > MAX_P2P_RELAY_URLS {
+        return Err(format!(
+            "p2pRelayUrls must contain 1..={MAX_P2P_RELAY_URLS} URLs"
+        ));
+    }
+    let mut configs = Vec::with_capacity(urls.len());
+    for raw in urls {
+        let validated = validate_iroh_relay_url_wasm(raw.trim())?;
+        let url = RelayUrl::from_str(validated.as_str())
+            .map_err(|e| format!("invalid relay URL '{raw}': {e}"))?;
+        configs.push(RelayConfig::from(url));
+    }
+    let map = RelayMap::from_iter(configs);
+    Ok(match auth_token {
+        Some(tok) => map.with_auth_token(tok),
+        None => map,
+    })
+}
+
+async fn dial_with_relay_mode(
+    addr: EndpointAddr,
+    relay_mode: RelayMode,
+    allow_n0_dns: bool,
+    timeout_ms: Option<u32>,
+) -> Result<WasmIrohStream, JsValue> {
+    let budget = Duration::from_millis(u64::from(timeout_ms.unwrap_or(15_000).clamp(100, 120_000)));
+    let mut builder = Endpoint::builder(presets::Minimal).relay_mode(relay_mode);
+    if allow_n0_dns && addr.relay_urls().next().is_none() {
+        builder = builder.address_lookup(iroh::address_lookup::PkarrResolver::n0_dns());
+    }
+    let ep = timeout(budget, builder.bind())
+        .await
+        .map_err(|_| to_js_err("iroh endpoint bind timed out"))?
+        .map_err(|e| to_js_err(format!("iroh endpoint bind failed: {e}")))?;
+
+    let dial_res = timeout(budget, async {
+        let conn = ep
+            .connect(addr, TENDRIL_P2P_ALPN)
+            .await
+            .map_err(|e| format!("iroh connect failed: {e}"))?;
+
+        let (mut send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| format!("iroh open_bi failed: {e}"))?;
+
+        // Write a 1-byte stream marker immediately so the peer's accept_bi() resolves.
+        send.write_all(&[P2P_STREAM_MAGIC])
+            .await
+            .map_err(|e| format!("iroh opener write failed: {e}"))?;
+
+        Ok::<_, String>((conn, send, recv))
+    })
+    .await;
+
+    match dial_res {
+        Ok(Ok((conn, send, recv))) => Ok(WasmIrohStream {
+            endpoint: ep,
+            conn: StdMutex::new(Some(conn)),
+            send: Arc::new(AsyncMutex::new(Some(send))),
+            recv: Arc::new(AsyncMutex::new(Some(recv))),
+        }),
+        Ok(Err(msg)) => {
+            ep.close().await;
+            Err(to_js_err(msg))
+        }
+        Err(_) => {
+            ep.close().await;
+            Err(to_js_err("timed out connecting to iroh endpoint"))
+        }
+    }
+}
+
 #[wasm_bindgen]
 impl WasmIrohStream {
     /// Connects a fresh ephemeral `iroh` endpoint to `endpoint` and opens a Tendril tunnel stream.
@@ -227,8 +318,6 @@ impl WasmIrohStream {
         relay_url_override: Option<String>,
         timeout_ms: Option<u32>,
     ) -> Result<WasmIrohStream, JsValue> {
-        let budget =
-            Duration::from_millis(u64::from(timeout_ms.unwrap_or(15_000).clamp(100, 120_000)));
         let addr = parse_p2p_endpoint_filtered(&endpoint, false).map_err(to_js_err)?;
         if relay_url_override
             .as_deref()
@@ -236,7 +325,7 @@ impl WasmIrohStream {
         {
             return Err(to_js_err("iroh relay URL contains control characters"));
         }
-        let builder = match relay_url_override
+        let (relay_mode, allow_n0_dns) = match relay_url_override
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -245,58 +334,45 @@ impl WasmIrohStream {
                 let validated = validate_iroh_relay_url_wasm(url_str).map_err(to_js_err)?;
                 let url = RelayUrl::from_str(validated.as_str())
                     .map_err(|e| to_js_err(format!("invalid relay URL '{url_str}': {e}")))?;
-                Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(url.into()))
+                (RelayMode::Custom(url.into()), false)
             }
-            None => {
-                let mut builder =
-                    Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Default);
-                if addr.relay_urls().next().is_none() {
-                    builder = builder.address_lookup(iroh::address_lookup::PkarrResolver::n0_dns());
-                }
-                builder
-            }
+            None => (RelayMode::Default, true),
         };
-        let ep = timeout(budget, builder.bind())
-            .await
-            .map_err(|_| to_js_err("iroh endpoint bind timed out"))?
-            .map_err(|e| to_js_err(format!("iroh endpoint bind failed: {e}")))?;
+        dial_with_relay_mode(addr, relay_mode, allow_n0_dns, timeout_ms).await
+    }
 
-        let dial_res = timeout(budget, async {
-            let conn = ep
-                .connect(addr, TENDRIL_P2P_ALPN)
-                .await
-                .map_err(|e| format!("iroh connect failed: {e}"))?;
-
-            let (mut send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| format!("iroh open_bi failed: {e}"))?;
-
-            // Write a 1-byte stream marker immediately so the peer's accept_bi() resolves.
-            send.write_all(&[P2P_STREAM_MAGIC])
-                .await
-                .map_err(|e| format!("iroh opener write failed: {e}"))?;
-
-            Ok::<_, String>((conn, send, recv))
-        })
-        .await;
-
-        match dial_res {
-            Ok(Ok((conn, send, recv))) => Ok(Self {
-                endpoint: ep,
-                conn: StdMutex::new(Some(conn)),
-                send: Arc::new(AsyncMutex::new(Some(send))),
-                recv: Arc::new(AsyncMutex::new(Some(recv))),
-            }),
-            Ok(Err(msg)) => {
-                ep.close().await;
-                Err(to_js_err(msg))
+    /// Connects an ephemeral `iroh` endpoint with multi-relay `RelayMap` and optional bearer auth token.
+    #[wasm_bindgen]
+    pub async fn dial_with_options(
+        endpoint: String,
+        relay_urls_json_opt: Option<String>,
+        auth_token_opt: Option<String>,
+        timeout_ms: Option<u32>,
+    ) -> Result<WasmIrohStream, JsValue> {
+        let addr = parse_p2p_endpoint_filtered(&endpoint, false).map_err(to_js_err)?;
+        let token = auth_token_opt
+            .map(validate_p2p_auth_token_wasm)
+            .transpose()
+            .map_err(to_js_err)?;
+        let (relay_mode, allow_n0_dns) = match relay_urls_json_opt {
+            Some(json_str) => {
+                let urls: Vec<String> = serde_json::from_str(&json_str)
+                    .map_err(|e| to_js_err(format!("invalid relay_urls_json: {e}")))?;
+                let map = build_relay_map_wasm(&urls, token.as_deref().map(String::as_str))
+                    .map_err(to_js_err)?;
+                (RelayMode::Custom(map), false)
             }
-            Err(_) => {
-                ep.close().await;
-                Err(to_js_err("timed out connecting to iroh endpoint"))
-            }
-        }
+            None => match token {
+                Some(tok) => {
+                    let map = iroh::endpoint::default_relay_mode()
+                        .relay_map()
+                        .with_auth_token(tok.as_str());
+                    (RelayMode::Custom(map), false)
+                }
+                None => (RelayMode::Default, true),
+            },
+        };
+        dial_with_relay_mode(addr, relay_mode, allow_n0_dns, timeout_ms).await
     }
 
     /// Sends one bounded chunk over the open QUIC stream.

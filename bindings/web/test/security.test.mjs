@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -14,10 +16,18 @@ import {
   MAX_RELAY_FRAME_LEN,
   RelayStream,
   TendrilWebClient,
+  WasmV2PakePairInitiator,
+  WasmV2SessionInitiator,
   computeCodeMac,
   computeCodeMacBytes,
   computeCodeMacWorker,
+  computeRelayAuthHmacB64,
+  deriveV2RelayDial,
+  dialIrohStream,
+  dialRelayStream,
+  dialRelayV2Stream,
   initTendril,
+  v2EpochWithinSkew,
   validateRelayWsUrl,
 } from "../src/index.js";
 
@@ -792,5 +802,452 @@ test("TendrilWebClient M2M enrollment over WSS relay, single-use replay, and anc
   } finally {
     peer.close();
     relay.child.kill();
+  }
+});
+
+function encodeWsTextFrame(text) {
+  const payload = Buffer.from(text, "utf8");
+  if (payload.length < 126) {
+    return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+  }
+  const hdr = Buffer.alloc(4);
+  hdr[0] = 0x81;
+  hdr[1] = 126;
+  hdr.writeUInt16BE(payload.length, 2);
+  return Buffer.concat([hdr, payload]);
+}
+
+function decodeWsClientFrame(buf) {
+  if (buf.length < 2) return null;
+  const opcode = buf[0] & 0x0f;
+  const lenByte = buf[1] & 0x7f;
+  const masked = (buf[1] & 0x80) !== 0;
+  let offset = 2;
+  let payloadLen = lenByte;
+  if (lenByte === 126) {
+    if (buf.length < 4) return null;
+    payloadLen = buf.readUInt16BE(2);
+    offset = 4;
+  }
+  const maskLen = masked ? 4 : 0;
+  if (buf.length < offset + maskLen + payloadLen) return null;
+  if (opcode === 0x08) {
+    return { close: true };
+  }
+  const out = Buffer.alloc(payloadLen);
+  if (masked) {
+    const mask = buf.subarray(offset, offset + 4);
+    offset += 4;
+    for (let i = 0; i < payloadLen; i += 1) {
+      out[i] = buf[offset + i] ^ mask[i % 4];
+    }
+  } else {
+    buf.copy(out, 0, offset, offset + payloadLen);
+  }
+  return { close: false, text: out.toString("utf8") };
+}
+
+function startMockRelayWsServer(onDial) {
+  return new Promise((resolve) => {
+    const seenUrls = [];
+    const sockets = new Set();
+    const server = http.createServer();
+    server.on("upgrade", (req, socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      socket.on("error", () => {});
+      seenUrls.push(req.url || "");
+      const key = req.headers["sec-websocket-key"];
+      const accept = crypto
+        .createHash("sha1")
+        .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+        .digest("base64");
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\n" +
+          "Upgrade: websocket\r\n" +
+          "Connection: Upgrade\r\n" +
+          `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+      );
+      const { challenge, handleDial } = onDial(req.url || "");
+      socket.write(encodeWsTextFrame(JSON.stringify(challenge)));
+      let acc = Buffer.alloc(0);
+      socket.on("data", (chunk) => {
+        acc = Buffer.concat([acc, chunk]);
+        const frame = decodeWsClientFrame(acc);
+        if (frame !== null) {
+          acc = Buffer.alloc(0);
+          if (frame.close) {
+            socket.end();
+            return;
+          }
+          const reply = handleDial(JSON.parse(frame.text));
+          if (reply) {
+            socket.write(encodeWsTextFrame(JSON.stringify(reply)));
+          }
+        }
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve({
+        port: addr.port,
+        seenUrls,
+        close: () =>
+          new Promise((r) => {
+            for (const s of sockets) {
+              s.destroy();
+            }
+            server.closeAllConnections?.();
+            server.close(r);
+          }),
+      });
+    });
+  });
+}
+
+test("mintRelayTicket, computeRelayAuthHmacB64 KAT + zeroization, and deriveV2RelayDial KAT", async () => {
+  await ensureWasm();
+  const vectors = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, "spec", "vectors", "wire_v2.json"), "utf8")
+  );
+  const client = await TendrilWebClient.create({ hostId: "web-ticket-test" });
+  try {
+    const info = client.info();
+    const ticketJson = client.mintRelayTicket("Relay.Example.", "dial", "*", 900);
+    const ticket = JSON.parse(ticketJson);
+    assert.equal(ticket.v, 1);
+    assert.equal(ticket.issuer_pub, info.relay_pub);
+    assert.equal(ticket.relay_host, "relay.example");
+    assert.equal(ticket.role, "dial");
+    assert.equal(ticket.target_pub, "*");
+    assert.ok(ticket.not_after - ticket.not_before === 900);
+    assert.ok(typeof ticket.sig === "string" && ticket.sig.length > 0);
+
+    // Known-answer check against spec/vectors/wire_v2.json relay_admission
+    const ra = vectors.relay_admission;
+    const katSecret = new Uint8Array(Buffer.from(ra.shared_secret_hex, "hex"));
+    const katNonce = new Uint8Array(Buffer.from(ra.challenge_nonce_hex, "hex"));
+    const katTarget = new Uint8Array(Buffer.from(ra.pub_or_target_hex, "hex"));
+    const katMac = computeRelayAuthHmacB64(
+      katSecret,
+      ra.op,
+      ra.relay_host_raw,
+      katNonce,
+      katTarget
+    );
+    assert.equal(katMac, ra.hmac_mac_b64url);
+    assert.equal(katSecret.every((b) => b === 0), true, "KAT secret buffer must be zeroized");
+
+    const badSecret = new Uint8Array(32).fill(0x55);
+    assert.throws(() =>
+      computeRelayAuthHmacB64(badSecret, "bad_op", "relay.example", katNonce, katTarget)
+    );
+    assert.equal(
+      badSecret.every((b) => b === 0),
+      true,
+      "secret buffer must be zeroized on error too"
+    );
+
+    // Known-answer check against spec/vectors/wire_v2.json blinded_relay
+    const br = vectors.blinded_relay;
+    const mbSecret = new Uint8Array(Buffer.from(br.mailbox_secret_hex, "hex"));
+    const brNonce = new Uint8Array(Buffer.from(br.challenge_nonce_hex, "hex"));
+    const connId = new Uint8Array(Buffer.from(br.conn_id_hex, "hex"));
+    const dial = deriveV2RelayDial(mbSecret, br.relay_host_raw, br.unix_secs, brNonce, connId);
+    assert.equal(dial.mailbox_id, br.mailbox_id_b64url);
+    assert.equal(dial.epoch, br.epoch);
+    assert.equal(dial.dial_token, br.dial_token_b64url);
+    assert.equal(v2EpochWithinSkew(dial.epoch, dial.epoch + 1), true);
+    assert.equal(v2EpochWithinSkew(dial.epoch, dial.epoch + 2), false);
+  } finally {
+    client.free();
+  }
+});
+
+test("p2pApiSecret is rejected across dialIrohStream and TendrilWebClient", async () => {
+  await ensureWasm();
+  const client = await TendrilWebClient.create({ hostId: "web-p2p-reject" });
+  try {
+    await assert.rejects(
+      () =>
+        dialIrohStream({
+          endpoint: "iroh://invalid",
+          p2pApiSecret: "raw-secret",
+        }),
+      /p2pApiSecret is not permitted/
+    );
+    await assert.rejects(
+      () =>
+        client.pair({
+          endpoint: "iroh://invalid",
+          code: "1234-5678",
+          p2pApiSecret: "raw-secret",
+        }),
+      /p2pApiSecret is not permitted/
+    );
+    await assert.rejects(
+      () =>
+        client.pairV2({
+          endpoint: "iroh://invalid",
+          code: "1234-5678",
+          p2pApiSecret: "raw-secret",
+        }),
+      /p2pApiSecret is not permitted/
+    );
+    await assert.rejects(
+      () =>
+        client.connect({
+          endpoint: "iroh://invalid",
+          targetHostId: "host-1",
+          p2pApiSecret: "raw-secret",
+        }),
+      /p2pApiSecret is not permitted/
+    );
+    await assert.rejects(
+      () =>
+        client.connectV2({
+          endpoint: "iroh://invalid",
+          targetHostId: "host-1",
+          p2pApiSecret: "raw-secret",
+        }),
+      /p2pApiSecret is not permitted/
+    );
+
+    const tokenBuf = new TextEncoder().encode("scoped-p2p-token");
+    await assert.rejects(() =>
+      dialIrohStream({
+        endpoint: "iroh://not-a-valid-endpoint-id",
+        p2pRelayAuthToken: tokenBuf,
+      })
+    );
+    assert.equal(tokenBuf.every((b) => b === 0), true, "p2pRelayAuthToken buffer must be zeroized");
+  } finally {
+    client.free();
+  }
+});
+
+test("dialRelayStream and dialRelayV2Stream enforce dial auth, zeroize secrets, and reject skew/static dialToken", async () => {
+  await ensureWasm();
+  const nonceBytes = new Uint8Array(32).fill(0x99);
+  const nonceB64 = Buffer.from(nonceBytes).toString("base64url");
+  const targetPub = Buffer.from(new Uint8Array(32).fill(0xaa)).toString("base64url");
+  const serverEpoch = Math.floor(Date.now() / 1000 / 3600);
+  const dialMessages = [];
+  let mode = "auth_all";
+
+  const mock = await startMockRelayWsServer((reqUrl) => {
+    const isV2 = reqUrl.startsWith("/v2/relay");
+    const authRequired = mode === "register_only" ? ["register"] : ["register", "dial"];
+    return {
+      challenge: isV2
+        ? {
+            op: "challenge",
+            host: "127.0.0.1",
+            nonce: nonceB64,
+            epoch: serverEpoch,
+            max_frame: MAX_RELAY_FRAME_LEN,
+            auth_required: authRequired,
+          }
+        : {
+            op: "challenge",
+            host: "127.0.0.1",
+            nonce: nonceB64,
+            max_frame: MAX_RELAY_FRAME_LEN,
+            auth_required: authRequired,
+          },
+      handleDial: (msg) => {
+        dialMessages.push(msg);
+        return { op: "ready", conn_id: msg.conn_id };
+      },
+    };
+  });
+
+  const client = await TendrilWebClient.create({ hostId: "web-ticket-dial" });
+  try {
+    // 1. Missing dial auth fails closed
+    await assert.rejects(
+      () =>
+        dialRelayStream({
+          relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+          targetPub,
+          expectedHost: "127.0.0.1",
+          allowInsecureWs: true,
+        }),
+      /relay requires dial authentication/
+    );
+
+    // 2. Empty or all-zero relayAuthSecret rejected
+    await assert.rejects(
+      () =>
+        dialRelayStream({
+          relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+          targetPub,
+          expectedHost: "127.0.0.1",
+          allowInsecureWs: true,
+          relayAuthSecret: new Uint8Array(32),
+        }),
+      /empty or all-zero/
+    );
+
+    // 3. Zeroized on host mismatch failure
+    const mismatchSecret = new TextEncoder().encode("mismatch-secret");
+    await assert.rejects(
+      () =>
+        dialRelayStream({
+          relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+          targetPub,
+          expectedHost: "wrong.example",
+          allowInsecureWs: true,
+          relayAuthSecret: mismatchSecret,
+        }),
+      /host mismatch/
+    );
+    assert.equal(mismatchSecret.every((b) => b === 0), true, "secret must zeroize on host mismatch");
+
+    // 4. HMAC dial path
+    const secretBuf = new TextEncoder().encode("shared-hmac-secret");
+    const s1 = await dialRelayStream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+      targetPub,
+      expectedHost: "127.0.0.1",
+      allowInsecureWs: true,
+      relayAuthSecret: secretBuf,
+    });
+    assert.equal(secretBuf.every((b) => b === 0), true, "relayAuthSecret buffer must be zeroized");
+    s1.close();
+    assert.equal(dialMessages.at(-1).auth.kind, "hmac");
+    assert.ok(typeof dialMessages.at(-1).auth.mac === "string");
+
+    // 5. Ticket dial path
+    const ticketJson = client.mintRelayTicket("127.0.0.1", "dial", targetPub, 900);
+    const sTicket = await dialRelayStream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+      targetPub,
+      expectedHost: "127.0.0.1",
+      allowInsecureWs: true,
+      relayAuthTicket: ticketJson,
+    });
+    sTicket.close();
+    assert.equal(dialMessages.at(-1).auth.kind, "ticket");
+    assert.equal(dialMessages.at(-1).auth.ticket.target_pub, targetPub);
+
+    // 6. auth_required: ["register"] sends NO dial auth, and still zeroes relayAuthSecret
+    mode = "register_only";
+    const unusedSecret = new TextEncoder().encode("unused-when-register-only");
+    const sRegOnly = await dialRelayStream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+      targetPub,
+      expectedHost: "127.0.0.1",
+      allowInsecureWs: true,
+      relayAuthSecret: unusedSecret,
+    });
+    sRegOnly.close();
+    assert.equal(dialMessages.at(-1).auth, undefined, "must not send auth when dial not required");
+    assert.equal(unusedSecret.every((b) => b === 0), true);
+    mode = "auth_all";
+
+    // 7. dialRelayV2Stream rejects static dialToken without deriveV2Dial
+    await assert.rejects(
+      () =>
+        dialRelayV2Stream({
+          relayUrl: `ws://127.0.0.1:${mock.port}/v2/relay`,
+          targetMailboxId: targetPub,
+          epoch: serverEpoch,
+          dialToken: "static-token",
+          expectedHost: "127.0.0.1",
+          allowInsecureWs: true,
+        }),
+      /requires a deriveV2Dial callback/
+    );
+
+    // 8. dialRelayV2Stream rejects out-of-skew epoch
+    const mbSecret = new Uint8Array(32).fill(0x31);
+    await assert.rejects(
+      () =>
+        dialRelayV2Stream({
+          relayUrl: `ws://127.0.0.1:${mock.port}/v2/relay`,
+          expectedHost: "127.0.0.1",
+          allowInsecureWs: true,
+          relayAuthTicket: ticketJson,
+          deriveV2Dial: ({ relayHost, nonceBytes: n, connIdBytes }) =>
+            deriveV2RelayDial(mbSecret, relayHost, (serverEpoch + 3) * 3600, n, connIdBytes),
+        }),
+      /epoch out of skew/
+    );
+
+    // 9. dialRelayV2Stream valid path
+    const v2Secret = new TextEncoder().encode("v2-hmac-secret");
+    const s2 = await dialRelayV2Stream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v2/relay`,
+      expectedHost: "127.0.0.1",
+      allowInsecureWs: true,
+      relayAuthSecret: v2Secret,
+      deriveV2Dial: ({ relayHost, nonceBytes: n, connIdBytes }) =>
+        deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, n, connIdBytes),
+    });
+    assert.equal(v2Secret.every((b) => b === 0), true);
+    s2.close();
+
+    const v2Dial = dialMessages.at(-1);
+    assert.equal(v2Dial.op, "dial");
+    assert.equal(v2Dial.epoch, serverEpoch);
+    assert.ok(typeof v2Dial.target_mailbox_id === "string");
+    assert.ok(typeof v2Dial.dial_token === "string");
+    assert.equal(v2Dial.auth.kind, "hmac");
+
+    for (const url of mock.seenUrls) {
+      assert.equal(url.includes("token="), false, "URL must never contain query tokens");
+    }
+  } finally {
+    client.free();
+    await mock.close();
+  }
+});
+
+test("WasmV2PakePairInitiator emits v2 PAKE preamble and connectV2 fails closed without v2 peer", async () => {
+  await ensureWasm();
+  const vectors = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, "spec", "vectors", "wire_v2.json"), "utf8")
+  );
+  const client = await TendrilWebClient.create({ hostId: "web-v2-init" });
+  try {
+    assert.equal(client.pairingFloor(new Uint8Array(32).fill(0x01)), 1);
+    assert.throws(() => client.peerV2Summary("missing-host"));
+
+    await assert.rejects(
+      () =>
+        client.connectV2({
+          relayUrl: "ws://127.0.0.1:1/v1/relay",
+          targetHostId: "missing-host",
+          allowInsecureWs: true,
+        }),
+      /peer not found/
+    );
+
+    // Verify WasmV2PakePairInitiator emits the exact v2 PAKE preamble from spec/vectors/wire_v2.json
+    // followed by a valid length-prefixed Noise msg1 frame, and fails closed on empty/bad input.
+    const { WasmIdentity, WasmRoster } = await import("../pkg/tendril_wasm.js");
+    const id = WasmIdentity.generate("web-v2-pake");
+    const roster = new WasmRoster();
+    const pairInit = new WasmV2PakePairInitiator(id, "web", "browser", "4829-1704", null);
+    try {
+      const msg1 = pairInit.start();
+      const expectedPre = Buffer.from(vectors.v2_pake_pair_preamble_hex, "hex");
+      assert.equal(
+        Buffer.from(msg1.subarray(0, expectedPre.length)).equals(expectedPre),
+        true,
+        "v2 PAKE start() must emit exact v2_pake_pair_preamble_hex"
+      );
+      assert.ok(msg1.length > expectedPre.length + 2);
+      assert.throws(() => pairInit.start(), /already started/);
+      assert.throws(() => pairInit.feed_bytes(new Uint8Array([0, 2, 0xff, 0xff]), roster));
+    } finally {
+      pairInit.free();
+      roster.free();
+      id.free();
+    }
+    assert.equal(typeof WasmV2SessionInitiator, "function");
+  } finally {
+    client.free();
   }
 });

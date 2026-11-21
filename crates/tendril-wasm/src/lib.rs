@@ -24,10 +24,20 @@ use tendril_core::pairing::{
     PairAction, PairOutcome, PairingInitiator, PairingUri, PinnedHost,
     mint_enrollment_token as core_mint_enrollment_token,
 };
+use tendril_core::relay_auth::{
+    RelayAuthRole, compute_relay_auth_hmac_b64 as core_compute_relay_auth_hmac_b64,
+    mint_relay_ticket as core_mint_relay_ticket,
+};
 use tendril_core::roster::Roster;
 use tendril_core::session::{SessionAction, SessionMachine};
+use tendril_core::v2::{
+    PaddingPolicy, PakeArgon2Params, V2PairAction, V2PairOutcome, V2PakePairInitiator,
+    V2PinnedHost, V2SessionAction, V2SessionInitiator, VerifiedRelayHost, derive_epoch_mailbox,
+    epoch_for_unix, epoch_within_skew, sign_v2_relay_dial,
+};
+use tendril_core::wire::WIRE_VERSION_V2;
 use wasm_bindgen::prelude::*;
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 fn to_js_err(err: impl fmt::Display) -> JsValue {
     JsValue::from_str(&err.to_string())
@@ -133,6 +143,72 @@ pub fn compute_code_mac_bytes(
     };
     code_utf8.zeroize();
     mac_res
+}
+
+#[wasm_bindgen]
+pub fn compute_relay_auth_hmac_b64(
+    secret: &mut [u8],
+    op: &str,
+    relay_host: &str,
+    nonce: &[u8],
+    pub_or_target: &[u8],
+) -> Result<String, JsValue> {
+    let res = as_32(nonce, "nonce")
+        .and_then(|nonce_arr| {
+            as_32(pub_or_target, "pub_or_target").and_then(|target_arr| {
+                core_compute_relay_auth_hmac_b64(secret, op, relay_host, &nonce_arr, &target_arr)
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .map_err(to_js_err);
+    secret.zeroize();
+    res
+}
+
+fn derive_v2_relay_dial_inner(
+    mailbox_secret: &[u8; 32],
+    relay_host: &str,
+    unix_secs: f64,
+    dial_nonce: &[u8],
+    conn_id: &[u8],
+) -> Result<String, String> {
+    let host = VerifiedRelayHost::new(relay_host).map_err(|e| e.to_string())?;
+    let unix = f64_to_u64(unix_secs, "unix_secs")?;
+    let nonce = as_32(dial_nonce, "dial_nonce")?;
+    let cid: [u8; 16] = conn_id
+        .try_into()
+        .map_err(|_| "conn_id must be exactly 16 bytes".to_owned())?;
+    let epoch = epoch_for_unix(unix);
+    let mailbox = derive_epoch_mailbox(mailbox_secret, epoch);
+    let dial_token =
+        sign_v2_relay_dial(&mailbox, host.as_str(), &nonce, &cid).map_err(|e| e.to_string())?;
+    let epoch_f64 = u64_to_f64(epoch)?;
+    Ok(json!({
+        "mailbox_id": b64url_encode(&mailbox.mailbox_id),
+        "epoch": epoch_f64,
+        "dial_token": b64url_encode(&dial_token),
+    })
+    .to_string())
+}
+
+#[wasm_bindgen]
+pub fn derive_v2_relay_dial_json(
+    mailbox_secret: &[u8],
+    relay_host: &str,
+    unix_secs: f64,
+    dial_nonce: &[u8],
+    conn_id: &[u8],
+) -> Result<String, JsValue> {
+    let secret = Zeroizing::new(as_32(mailbox_secret, "mailbox_secret").map_err(to_js_err)?);
+    derive_v2_relay_dial_inner(&secret, relay_host, unix_secs, dial_nonce, conn_id)
+        .map_err(to_js_err)
+}
+
+#[wasm_bindgen]
+pub fn v2_epoch_within_skew(server_epoch: f64, claimed_epoch: f64) -> Result<bool, JsValue> {
+    let srv = f64_to_u64(server_epoch, "server_epoch").map_err(to_js_err)?;
+    let claimed = f64_to_u64(claimed_epoch, "claimed_epoch").map_err(to_js_err)?;
+    Ok(epoch_within_skew(srv, claimed))
 }
 
 #[wasm_bindgen]
@@ -337,6 +413,40 @@ impl WasmIdentity {
         .map_err(to_js_err)?;
         serde_json::to_string(&token).map_err(to_js_err)
     }
+
+    #[wasm_bindgen]
+    pub fn mint_relay_ticket_json(
+        &self,
+        relay_host: &str,
+        role: &str,
+        target_pub_or_wildcard: &str,
+        now_unix: f64,
+        ttl_secs: f64,
+    ) -> Result<String, JsValue> {
+        let parsed_role = match role {
+            "register" => RelayAuthRole::Register,
+            "dial" => RelayAuthRole::Dial,
+            "any" => RelayAuthRole::Any,
+            _ => {
+                return Err(to_js_err(
+                    "invalid relay auth role; expected register, dial, or any",
+                ));
+            }
+        };
+        let now_u64 = f64_to_u64(now_unix, "now_unix").map_err(to_js_err)?;
+        let ttl_u64 = f64_to_u64(ttl_secs, "ttl_secs").map_err(to_js_err)?;
+        let signing_key = self.inner.signing_key().ed25519_signing_key();
+        let ticket = core_mint_relay_ticket(
+            &signing_key,
+            relay_host,
+            parsed_role,
+            target_pub_or_wildcard,
+            now_u64,
+            ttl_u64,
+        )
+        .map_err(to_js_err)?;
+        serde_json::to_string(&ticket).map_err(to_js_err)
+    }
 }
 
 /// Sans-I/O peer roster and verified CRL store managed by host JS storage.
@@ -457,6 +567,52 @@ impl WasmRoster {
             .crl(issuer)
             .and_then(|crl| u64_to_f64(crl.seq).ok())
     }
+
+    #[wasm_bindgen]
+    pub fn pairing_floor(&self, static_pub: &[u8]) -> Result<u8, JsValue> {
+        let key = as_32(static_pub, "static_pub").map_err(to_js_err)?;
+        Ok(self.inner.pairing_floor(&key))
+    }
+
+    #[wasm_bindgen]
+    pub fn peer_v2_summary(&self, peer_id: &str) -> Result<String, JsValue> {
+        let entry = self
+            .inner
+            .get(peer_id)
+            .ok_or_else(|| to_js_err("peer not found"))?;
+        Ok(json!({
+            "min_wire_version": entry.min_wire_version,
+            "has_v2_secrets": entry.v2_secrets.is_some(),
+        })
+        .to_string())
+    }
+
+    #[wasm_bindgen]
+    pub fn derive_v2_relay_dial_for_peer_json(
+        &self,
+        peer_id: &str,
+        relay_host: &str,
+        unix_secs: f64,
+        dial_nonce: &[u8],
+        conn_id: &[u8],
+    ) -> Result<String, JsValue> {
+        let entry = self
+            .inner
+            .get(peer_id)
+            .ok_or_else(|| to_js_err("peer not found"))?;
+        let secrets = entry
+            .v2_secrets
+            .as_ref()
+            .ok_or_else(|| to_js_err("peer has no v2 secrets"))?;
+        derive_v2_relay_dial_inner(
+            secrets.mailbox_secret(),
+            relay_host,
+            unix_secs,
+            dial_nonce,
+            conn_id,
+        )
+        .map_err(to_js_err)
+    }
 }
 
 impl Default for WasmRoster {
@@ -482,6 +638,7 @@ impl WasmPairInitiator {
         host_signing_pub_b64: Option<&str>,
         host_id: Option<&str>,
         host_rotation_seq: Option<f64>,
+        roster_opt: Option<&WasmRoster>,
     ) -> Result<Self, String> {
         let pinned = match (host_static_pub_b64, host_signing_pub_b64) {
             (Some(st), Some(sg)) if !st.is_empty() && !sg.is_empty() => {
@@ -504,15 +661,24 @@ impl WasmPairInitiator {
                 );
             }
         };
-        let inner = PairingInitiator::new(
+        let mut inner = PairingInitiator::new(
             &identity.inner,
             device_name.to_owned(),
             device_kind.to_owned(),
             code.to_owned(),
-            pinned,
+            pinned.clone(),
             None,
         )
         .map_err(|e| e.to_string())?;
+        if let Some(roster_ref) = roster_opt {
+            if let Some(ref p) = pinned {
+                let floor = roster_ref.inner.pairing_floor(&p.static_pub);
+                inner = inner
+                    .with_min_wire_version(floor)
+                    .map_err(|e| e.to_string())?;
+            }
+            inner = inner.with_roster_floors(&roster_ref.inner);
+        }
         Ok(Self { inner })
     }
 
@@ -626,6 +792,7 @@ impl WasmPairInitiator {
         host_signing_pub_b64: &str,
         host_rotation_seq: Option<f64>,
         token_json: &str,
+        roster_opt: Option<&WasmRoster>,
     ) -> Result<Self, String> {
         let seq = match host_rotation_seq {
             Some(v) => f64_to_u64(v, "host_rotation_seq")?,
@@ -642,7 +809,7 @@ impl WasmPairInitiator {
             signing_pin,
             rotation_seq: seq,
         };
-        let inner = PairingInitiator::new_m2m(
+        let mut inner = PairingInitiator::new_m2m(
             &identity.inner,
             device_name.to_owned(),
             device_kind.to_owned(),
@@ -651,6 +818,13 @@ impl WasmPairInitiator {
             None,
         )
         .map_err(|e| e.to_string())?;
+        if let Some(roster_ref) = roster_opt {
+            let floor = roster_ref.inner.pairing_floor(&static_pub);
+            inner = inner
+                .with_min_wire_version(floor)
+                .map_err(|e| e.to_string())?;
+            inner = inner.with_roster_floors(&roster_ref.inner);
+        }
         Ok(Self { inner })
     }
 }
@@ -678,6 +852,34 @@ impl WasmPairInitiator {
             host_signing_pub_b64.as_deref(),
             host_id.as_deref(),
             host_rotation_seq,
+            None,
+        )
+        .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_roster(
+        identity: &WasmIdentity,
+        device_name: &str,
+        device_kind: &str,
+        code: &str,
+        host_static_pub_b64: Option<String>,
+        host_signing_pub_b64: Option<String>,
+        host_id: Option<String>,
+        host_rotation_seq: Option<f64>,
+        roster: &WasmRoster,
+    ) -> Result<WasmPairInitiator, JsValue> {
+        Self::new_inner(
+            identity,
+            device_name,
+            device_kind,
+            code,
+            host_static_pub_b64.as_deref(),
+            host_signing_pub_b64.as_deref(),
+            host_id.as_deref(),
+            host_rotation_seq,
+            Some(roster),
         )
         .map_err(to_js_err)
     }
@@ -703,6 +905,34 @@ impl WasmPairInitiator {
             host_signing_pub_b64,
             host_rotation_seq,
             token_json,
+            None,
+        )
+        .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_m2m_with_roster(
+        identity: &WasmIdentity,
+        device_name: &str,
+        device_kind: &str,
+        host_id: &str,
+        host_static_pub_b64: &str,
+        host_signing_pub_b64: &str,
+        host_rotation_seq: Option<f64>,
+        token_json: &str,
+        roster: &WasmRoster,
+    ) -> Result<WasmPairInitiator, JsValue> {
+        Self::new_m2m_inner(
+            identity,
+            device_name,
+            device_kind,
+            host_id,
+            host_static_pub_b64,
+            host_signing_pub_b64,
+            host_rotation_seq,
+            token_json,
+            Some(roster),
         )
         .map_err(to_js_err)
     }
@@ -923,6 +1153,540 @@ impl WasmSessionClient {
     }
 }
 
+#[derive(Deserialize)]
+struct WasmV2PinnedHostInput {
+    #[serde(default)]
+    host_id: Option<String>,
+    static_pub_b64: String,
+    signing_pub_b64: String,
+    #[serde(default)]
+    rotation_seq: Option<u64>,
+    #[serde(default)]
+    min_wire_version: Option<u8>,
+}
+
+/// Sans-I/O Wire v2 (`0x02`) PAKE pairing initiator for JS transport layers.
+#[wasm_bindgen]
+pub struct WasmV2PakePairInitiator {
+    inner: V2PakePairInitiator,
+    pending_events: Vec<serde_json::Value>,
+}
+
+impl WasmV2PakePairInitiator {
+    fn new_inner(
+        identity: &WasmIdentity,
+        device_name: &str,
+        device_kind: &str,
+        code: &str,
+        pinned_host_json: Option<&str>,
+    ) -> Result<Self, String> {
+        let pinned = match pinned_host_json {
+            Some(raw) if !raw.trim().is_empty() => {
+                let parsed: WasmV2PinnedHostInput = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid pinned_host_json: {e}"))?;
+                let static_pub =
+                    b64url_decode_array::<32>(&parsed.static_pub_b64).map_err(|e| e.to_string())?;
+                let signing_pin =
+                    parse_signing_pin_b64(&parsed.signing_pub_b64, "signing_pub_b64")?;
+                let base = PinnedHost {
+                    host_id: parsed.host_id.filter(|h| !h.is_empty()),
+                    static_pub,
+                    signing_pin,
+                    rotation_seq: parsed.rotation_seq.unwrap_or(0),
+                };
+                Some(
+                    V2PinnedHost::new(base, parsed.min_wire_version.unwrap_or(WIRE_VERSION_V2))
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+            _ => None,
+        };
+        let inner = V2PakePairInitiator::new(
+            &identity.inner,
+            device_name,
+            device_kind,
+            code,
+            pinned,
+            PakeArgon2Params::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Self {
+            inner,
+            pending_events: Vec::new(),
+        })
+    }
+
+    fn step_bytes(&mut self, bytes: &[u8], roster: &mut WasmRoster) -> Result<String, String> {
+        let actions = self.inner.feed_bytes(bytes).map_err(|e| e.to_string())?;
+        let mut writes = Vec::new();
+        let mut sas: Option<String> = None;
+        let mut outcome_json: Option<serde_json::Value> = None;
+
+        for action in actions {
+            match action {
+                V2PairAction::WriteBytes(chunk) => writes.extend_from_slice(&chunk),
+                V2PairAction::SasReady {
+                    pairing_sas,
+                    host_id,
+                    ..
+                } => {
+                    sas = Some(pairing_sas.clone());
+                    self.pending_events.push(json!({
+                        "event": "sas_ready",
+                        "sas": pairing_sas,
+                        "host_id": host_id,
+                    }));
+                }
+                V2PairAction::Completed(
+                    ref outcome @ V2PairOutcome::InitiatorPending {
+                        ref device_id,
+                        ref host_id,
+                        ref pairing_sas,
+                        host_pin_verified,
+                        ..
+                    },
+                ) => {
+                    roster
+                        .inner
+                        .apply_v2_pair_initiator_outcome(outcome, host_id.clone(), Vec::new())
+                        .map_err(|e| e.to_string())?;
+                    sas = Some(pairing_sas.clone());
+                    let obj = json!({
+                        "status": "pending",
+                        "device_id": device_id,
+                        "host_id": host_id,
+                        "sas": pairing_sas,
+                        "host_confirmed": host_pin_verified,
+                    });
+                    self.pending_events.push(json!({
+                        "event": "completed",
+                        "outcome": obj,
+                    }));
+                    outcome_json = Some(obj);
+                }
+                V2PairAction::Completed(V2PairOutcome::Rejected { error }) => {
+                    let obj = json!({
+                        "status": "rejected",
+                        "error": error,
+                    });
+                    self.pending_events.push(json!({
+                        "event": "completed",
+                        "outcome": obj,
+                    }));
+                    outcome_json = Some(obj);
+                }
+                V2PairAction::Completed(V2PairOutcome::ResponderPending { .. }) => {
+                    return Err("unexpected responder outcome".to_owned());
+                }
+                V2PairAction::CloseTransport(reason) => {
+                    self.pending_events.push(json!({
+                        "event": "close_transport",
+                        "reason": reason,
+                    }));
+                }
+            }
+        }
+
+        Ok(json!({
+            "write_b64": b64url_encode(&writes),
+            "sas": sas,
+            "outcome": outcome_json,
+        })
+        .to_string())
+    }
+}
+
+#[wasm_bindgen]
+impl WasmV2PakePairInitiator {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        identity: &WasmIdentity,
+        device_name: &str,
+        device_kind: &str,
+        code: &str,
+        pinned_host_json: Option<String>,
+    ) -> Result<WasmV2PakePairInitiator, JsValue> {
+        Self::new_inner(
+            identity,
+            device_name,
+            device_kind,
+            code,
+            pinned_host_json.as_deref(),
+        )
+        .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn start(&mut self) -> Result<Vec<u8>, JsValue> {
+        let actions = self.inner.start().map_err(to_js_err)?;
+        let mut out = Vec::new();
+        for action in actions {
+            if let V2PairAction::WriteBytes(chunk) = action {
+                out.extend_from_slice(&chunk);
+            }
+        }
+        Ok(out)
+    }
+
+    #[wasm_bindgen]
+    pub fn feed_bytes(&mut self, bytes: &[u8], roster: &mut WasmRoster) -> Result<String, JsValue> {
+        self.step_bytes(bytes, roster).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn drain_events_json(&mut self) -> String {
+        serde_json::Value::Array(std::mem::take(&mut self.pending_events)).to_string()
+    }
+}
+
+enum V2WasmSessionPhase {
+    Active(Box<V2SessionInitiator>),
+    Closed,
+}
+
+fn collect_v2_writes(actions: Vec<V2SessionAction>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for action in actions {
+        if let V2SessionAction::WriteBytes(chunk) = action {
+            out.extend_from_slice(&chunk);
+        }
+    }
+    out
+}
+
+/// Sans-I/O Wire v2 (`0x02`) pseudonymous session initiator for JS transport layers.
+#[wasm_bindgen]
+pub struct WasmV2SessionInitiator {
+    phase: V2WasmSessionPhase,
+    target_host_id: String,
+    pending_writes: Vec<u8>,
+    pending_events: Vec<serde_json::Value>,
+}
+
+impl WasmV2SessionInitiator {
+    fn new_inner(
+        identity: &WasmIdentity,
+        target_host_id: &str,
+        roster: &WasmRoster,
+        grant_json: Option<&str>,
+        crl_seq: Option<f64>,
+    ) -> Result<Self, String> {
+        let entry = roster
+            .inner
+            .get(target_host_id)
+            .ok_or_else(|| format!("peer not found: {target_host_id}"))?;
+        let secrets = entry
+            .v2_secrets
+            .as_ref()
+            .ok_or_else(|| format!("peer {target_host_id} has no v2 secrets"))?;
+        let grant: Option<Grant> = match grant_json {
+            Some(s) if !s.trim().is_empty() => {
+                Some(serde_json::from_str(s).map_err(|e| e.to_string())?)
+            }
+            _ => None,
+        };
+        let cseq = match crl_seq {
+            Some(v) => Some(f64_to_u64(v, "crl_seq")?),
+            None => roster.inner.crl(target_host_id).map(|c| c.seq),
+        };
+        let machine = V2SessionInitiator::new(
+            &identity.inner,
+            target_host_id,
+            *secrets.reconnect_secret(),
+            grant,
+            cseq,
+        )
+        .map_err(|e| e.to_string())?
+        .with_padding_policy(PaddingPolicy::v2_default());
+        Ok(Self {
+            phase: V2WasmSessionPhase::Active(Box::new(machine)),
+            target_host_id: target_host_id.to_owned(),
+            pending_writes: Vec::new(),
+            pending_events: Vec::new(),
+        })
+    }
+
+    fn push_v2_action(
+        &mut self,
+        action: V2SessionAction,
+        roster: &mut Roster,
+    ) -> Result<(), String> {
+        match action {
+            V2SessionAction::WriteBytes(chunk) => {
+                self.pending_writes.extend_from_slice(&chunk);
+            }
+            V2SessionAction::Established { peer_device_id, .. } => {
+                roster
+                    .set_peer_min_wire_version(&self.target_host_id, WIRE_VERSION_V2)
+                    .map_err(|e| e.to_string())?;
+                self.pending_events.push(json!({
+                    "event": "established",
+                    "peer_device_id": peer_device_id,
+                }));
+            }
+            V2SessionAction::AppData(data) => {
+                self.pending_events.push(json!({
+                    "event": "data",
+                    "data_b64": b64url_encode(&data),
+                }));
+            }
+            V2SessionAction::GrantUpdated(g) => {
+                self.pending_events.push(json!({
+                    "event": "grant_updated",
+                    "grant": g,
+                }));
+            }
+            V2SessionAction::RevocationUpdated { issuer, seq } => {
+                let seq_f64 = u64_to_f64(seq)?;
+                self.pending_events.push(json!({
+                    "event": "revocation_updated",
+                    "issuer": issuer,
+                    "seq": seq_f64,
+                }));
+            }
+            V2SessionAction::Rekeyed { direction } => {
+                self.pending_events.push(json!({
+                    "event": "rekeyed",
+                    "direction": format!("{direction:?}"),
+                }));
+            }
+            V2SessionAction::PongReceived(cookie) => {
+                let cookie_f64 = u64_to_f64(cookie).unwrap_or(0.0);
+                self.pending_events.push(json!({
+                    "event": "pong",
+                    "cookie": cookie_f64,
+                }));
+            }
+            V2SessionAction::Audit(audit) => {
+                self.pending_events.push(json!({
+                    "event": "audit",
+                    "audit": audit,
+                }));
+            }
+            V2SessionAction::CloseTransport { code, reason } => {
+                self.pending_events.push(json!({
+                    "event": "closed",
+                    "code": code,
+                    "reason": reason,
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn step_bytes(
+        &mut self,
+        chunk: &[u8],
+        now_unix: f64,
+        now_ms: f64,
+        roster: &mut WasmRoster,
+    ) -> Result<String, String> {
+        let now_u = f64_to_u64(now_unix, "now_unix")?;
+        let now_m = f64_to_u64(now_ms, "now_ms")?;
+        let prev = std::mem::replace(&mut self.phase, V2WasmSessionPhase::Closed);
+        let mut machine = match prev {
+            V2WasmSessionPhase::Active(m) => m,
+            V2WasmSessionPhase::Closed => return Err("v2 session closed".to_owned()),
+        };
+        let actions = match machine.feed_bytes(chunk, now_u, now_m, &mut roster.inner) {
+            Ok(a) => a,
+            Err(err) => {
+                if !machine.is_closed() {
+                    self.phase = V2WasmSessionPhase::Active(machine);
+                }
+                return Err(err.to_string());
+            }
+        };
+        for action in actions {
+            if let Err(err) = self.push_v2_action(action, &mut roster.inner) {
+                if !machine.is_closed() {
+                    self.phase = V2WasmSessionPhase::Active(machine);
+                }
+                return Err(err);
+            }
+        }
+        if !machine.is_closed() {
+            self.phase = V2WasmSessionPhase::Active(machine);
+        }
+
+        Ok(json!({
+            "established": self.is_established(),
+            "closed": self.is_closed(),
+            "has_writes": !self.pending_writes.is_empty(),
+            "event_count": self.pending_events.len(),
+        })
+        .to_string())
+    }
+}
+
+#[wasm_bindgen]
+impl WasmV2SessionInitiator {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        identity: &WasmIdentity,
+        target_host_id: &str,
+        roster: &WasmRoster,
+        grant_json: Option<String>,
+        crl_seq: Option<f64>,
+    ) -> Result<WasmV2SessionInitiator, JsValue> {
+        Self::new_inner(
+            identity,
+            target_host_id,
+            roster,
+            grant_json.as_deref(),
+            crl_seq,
+        )
+        .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn start(&mut self, now_unix: f64) -> Result<Vec<u8>, JsValue> {
+        let now_u = f64_to_u64(now_unix, "now_unix").map_err(to_js_err)?;
+        let V2WasmSessionPhase::Active(ref mut machine) = self.phase else {
+            return Err(to_js_err("v2 session closed"));
+        };
+        let actions = machine.start(now_u).map_err(to_js_err)?;
+        Ok(collect_v2_writes(actions))
+    }
+
+    #[wasm_bindgen]
+    pub fn feed_bytes(
+        &mut self,
+        chunk: &[u8],
+        now_unix: f64,
+        now_ms: f64,
+        roster: &mut WasmRoster,
+    ) -> Result<String, JsValue> {
+        self.step_bytes(chunk, now_unix, now_ms, roster)
+            .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn poll_write(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_writes)
+    }
+
+    #[wasm_bindgen]
+    pub fn drain_events_json(&mut self) -> String {
+        serde_json::Value::Array(std::mem::take(&mut self.pending_events)).to_string()
+    }
+
+    #[wasm_bindgen]
+    pub fn send_data(&mut self, payload: &[u8], now_ms: f64) -> Result<Vec<u8>, JsValue> {
+        let now_m = f64_to_u64(now_ms, "now_ms").map_err(to_js_err)?;
+        let V2WasmSessionPhase::Active(ref mut machine) = self.phase else {
+            return Err(to_js_err("v2 session closed"));
+        };
+        let actions = machine.seal_data(payload, now_m).map_err(to_js_err)?;
+        Ok(collect_v2_writes(actions))
+    }
+
+    #[wasm_bindgen]
+    pub fn send_dummy_cover(
+        &mut self,
+        bucket_size: usize,
+        now_ms: f64,
+    ) -> Result<Vec<u8>, JsValue> {
+        let now_m = f64_to_u64(now_ms, "now_ms").map_err(to_js_err)?;
+        let V2WasmSessionPhase::Active(ref mut machine) = self.phase else {
+            return Err(to_js_err("v2 session closed"));
+        };
+        let actions = machine
+            .seal_dummy_cover(bucket_size, now_m)
+            .map_err(to_js_err)?;
+        Ok(collect_v2_writes(actions))
+    }
+
+    #[wasm_bindgen]
+    pub fn next_ping_delay_ms(&self) -> Result<f64, JsValue> {
+        let V2WasmSessionPhase::Active(ref machine) = self.phase else {
+            return Err(to_js_err("v2 session closed"));
+        };
+        let delay = machine.next_ping_delay_ms().map_err(to_js_err)?;
+        u64_to_f64(delay).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn authorize(&self, requested_cap: &str, now_unix: f64, roster: &WasmRoster) -> bool {
+        let V2WasmSessionPhase::Active(ref machine) = self.phase else {
+            return false;
+        };
+        let Ok(now_u) = f64_to_u64(now_unix, "now_unix") else {
+            return false;
+        };
+        machine
+            .authorize(requested_cap, now_u, &roster.inner)
+            .0
+            .is_ok()
+    }
+
+    #[wasm_bindgen]
+    pub fn rekey(&mut self, now_ms: f64) -> Result<Vec<u8>, JsValue> {
+        let now_m = f64_to_u64(now_ms, "now_ms").map_err(to_js_err)?;
+        let V2WasmSessionPhase::Active(ref mut machine) = self.phase else {
+            return Err(to_js_err("v2 session closed"));
+        };
+        let actions = machine.seal_rekey(now_m).map_err(to_js_err)?;
+        Ok(collect_v2_writes(actions))
+    }
+
+    #[wasm_bindgen]
+    pub fn close(&mut self, code: f64, reason: &str, now_ms: f64) -> Result<Vec<u8>, JsValue> {
+        let close_code = f64_to_u16(code, "code").map_err(to_js_err)?;
+        let now_m = f64_to_u64(now_ms, "now_ms").map_err(to_js_err)?;
+        let V2WasmSessionPhase::Active(ref mut machine) = self.phase else {
+            return Ok(Vec::new());
+        };
+        if !machine.is_established() {
+            self.phase = V2WasmSessionPhase::Closed;
+            return Ok(Vec::new());
+        }
+        let actions = machine
+            .seal_close(close_code, reason, now_m)
+            .map_err(to_js_err)?;
+        self.phase = V2WasmSessionPhase::Closed;
+        Ok(collect_v2_writes(actions))
+    }
+
+    #[wasm_bindgen]
+    pub fn tick(
+        &mut self,
+        now_unix: f64,
+        now_ms: f64,
+        roster: &WasmRoster,
+    ) -> Result<Vec<u8>, JsValue> {
+        let now_u = f64_to_u64(now_unix, "now_unix").map_err(to_js_err)?;
+        let now_m = f64_to_u64(now_ms, "now_ms").map_err(to_js_err)?;
+        let V2WasmSessionPhase::Active(ref mut machine) = self.phase else {
+            return Err(to_js_err("v2 session closed"));
+        };
+        let actions = match machine.tick(now_u, now_m, &roster.inner) {
+            Ok(a) => a,
+            Err(err) => {
+                if machine.is_closed() {
+                    self.phase = V2WasmSessionPhase::Closed;
+                }
+                return Err(to_js_err(err));
+            }
+        };
+        Ok(collect_v2_writes(actions))
+    }
+
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn is_established(&self) -> bool {
+        matches!(self.phase, V2WasmSessionPhase::Active(ref m) if m.is_established())
+    }
+
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        matches!(self.phase, V2WasmSessionPhase::Closed)
+            || matches!(self.phase, V2WasmSessionPhase::Active(ref m) if m.is_closed())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tendril_core::crypto::b64url_decode;
@@ -953,6 +1717,7 @@ mod tests {
             "web",
             "browser",
             &code,
+            None,
             None,
             None,
             None,
@@ -1096,6 +1861,7 @@ mod tests {
             &host_id.signing_key().public_key().to_b64url(),
             None,
             &tok_json,
+            None,
         )
         .unwrap();
         let mut pair_resp = PairingResponder::with_enrollment_policy(
@@ -1155,6 +1921,7 @@ mod tests {
             &b64url_encode(&host_id.signing_key().signing_pub_hash()),
             None,
             &tok_json,
+            None,
         )
         .unwrap();
         let mut rep_resp = PairingResponder::with_enrollment_policy(
@@ -1188,5 +1955,351 @@ mod tests {
             a,
             PairAction::Completed(PairOutcome::Rejected { error }) if error == "token_replayed"
         )));
+    }
+
+    #[test]
+    fn wasm_v2_pake_pair_and_session_roundtrip_and_downgrade_rejection() {
+        use tendril_core::v2::{V2PakePairResponder, V2SessionResponder};
+
+        let host_id = EndpointIdentity::generate()
+            .unwrap()
+            .with_host_id("wasm-v2-host");
+        let mut host_roster = Roster::new();
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let now = 1_795_564_800u64;
+        let code = mgr.issue_code(PairingCodeKind::Remote3Group, now).unwrap();
+
+        let cli_id = WasmIdentity::generate_inner(Some("wasm-v2-cli")).unwrap();
+        let mut cli_roster = WasmRoster::new();
+        let mut pair_init =
+            WasmV2PakePairInitiator::new_inner(&cli_id, "web", "browser", &code, None).unwrap();
+        let mut pair_resp = V2PakePairResponder::new(
+            &host_id,
+            PairingPathKind::Remote,
+            PakeArgon2Params::default(),
+        )
+        .unwrap();
+
+        let init_m1 = pair_init.start().unwrap();
+        let resp_acts1 = pair_resp
+            .feed_bytes(&init_m1, now, &mut mgr, &mut host_roster)
+            .unwrap();
+        let m2: Vec<u8> = resp_acts1
+            .into_iter()
+            .filter_map(|a| match a {
+                V2PairAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        let step1_val: serde_json::Value =
+            serde_json::from_str(&pair_init.step_bytes(&m2, &mut cli_roster).unwrap()).unwrap();
+        let m3 = b64url_decode(step1_val["write_b64"].as_str().unwrap()).unwrap();
+        let resp_acts2 = pair_resp
+            .feed_bytes(&m3, now, &mut mgr, &mut host_roster)
+            .unwrap();
+        let mut resp_bytes = Vec::new();
+        let mut cli_dev_id = String::new();
+        let mut host_sas = String::new();
+        let mut resp_v2_secrets = None;
+        for a in resp_acts2 {
+            match a {
+                V2PairAction::WriteBytes(b) => resp_bytes.extend_from_slice(&b),
+                V2PairAction::Completed(V2PairOutcome::ResponderPending {
+                    device_id,
+                    pairing_sas,
+                    v2_secrets,
+                    ..
+                }) => {
+                    cli_dev_id = device_id;
+                    host_sas = pairing_sas;
+                    resp_v2_secrets = Some(v2_secrets);
+                }
+                _ => {}
+            }
+        }
+        let step2_val: serde_json::Value =
+            serde_json::from_str(&pair_init.step_bytes(&resp_bytes, &mut cli_roster).unwrap())
+                .unwrap();
+        assert_eq!(step2_val["sas"].as_str().unwrap(), host_sas);
+        assert_eq!(step2_val["outcome"]["status"], "pending");
+
+        host_roster
+            .confirm_peer(&cli_dev_id, Some(&host_sas))
+            .unwrap();
+        host_roster
+            .upgrade_peer_to_v2(&cli_dev_id, resp_v2_secrets.unwrap())
+            .unwrap();
+        cli_roster
+            .inner
+            .confirm_peer("wasm-v2-host", Some(&host_sas))
+            .unwrap();
+
+        assert_eq!(
+            cli_roster
+                .inner
+                .pairing_floor(host_id.static_key().public_bytes()),
+            2
+        );
+        // V1 pairing fallback against a known v2 peer must fail closed.
+        let v1_downgrade = WasmPairInitiator::new_inner(
+            &cli_id,
+            "web",
+            "browser",
+            &code,
+            Some(&b64url_encode(host_id.static_key().public_bytes())),
+            Some(&host_id.signing_key().public_key().to_b64url()),
+            Some("wasm-v2-host"),
+            None,
+            Some(&cli_roster),
+        );
+        assert!(v1_downgrade.is_err());
+
+        let grant = host_roster
+            .mint_grant(
+                &host_id,
+                &cli_dev_id,
+                vec!["fs.read".to_owned()],
+                now,
+                now + 3600,
+                [0x88; 16],
+            )
+            .unwrap();
+        let grant_json = serde_json::to_string(&grant).unwrap();
+
+        let mut cli_sess = WasmV2SessionInitiator::new_inner(
+            &cli_id,
+            "wasm-v2-host",
+            &cli_roster,
+            Some(&grant_json),
+            None,
+        )
+        .unwrap();
+        let mut host_sess = V2SessionResponder::new(&host_id).unwrap();
+
+        #[allow(clippy::cast_precision_loss)]
+        let sm1 = cli_sess.start(now as f64).unwrap();
+        let sa1 = host_sess
+            .feed_bytes(&sm1, now, 10, &mut host_roster)
+            .unwrap();
+        let sm2: Vec<u8> = sa1
+            .into_iter()
+            .filter_map(|a| match a {
+                V2SessionAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        #[allow(clippy::cast_precision_loss)]
+        let s_res: serde_json::Value = serde_json::from_str(
+            &cli_sess
+                .step_bytes(&sm2, now as f64, 20.0, &mut cli_roster)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(s_res["established"], true);
+        let sm3 = cli_sess.poll_write();
+        host_sess
+            .feed_bytes(&sm3, now, 25, &mut host_roster)
+            .unwrap();
+        assert!(host_sess.is_established());
+
+        let summary: serde_json::Value =
+            serde_json::from_str(&cli_roster.peer_v2_summary("wasm-v2-host").unwrap()).unwrap();
+        assert_eq!(summary["min_wire_version"], 2);
+        assert_eq!(summary["has_v2_secrets"], true);
+
+        #[allow(clippy::cast_precision_loss)]
+        {
+            assert!(cli_sess.authorize("fs.read", now as f64, &cli_roster));
+            assert!(!cli_sess.authorize("shell.exec", now as f64, &cli_roster));
+        }
+        assert!(cli_sess.next_ping_delay_ms().unwrap() > 0.0);
+
+        let cover = cli_sess.send_dummy_cover(256, 30.0).unwrap();
+        let cover_acts = host_sess
+            .feed_bytes(&cover, now, 35, &mut host_roster)
+            .unwrap();
+        assert!(cover_acts.is_empty());
+
+        let data_wire = cli_sess.send_data(b"hello-v2", 40.0).unwrap();
+        let data_acts = host_sess
+            .feed_bytes(&data_wire, now, 45, &mut host_roster)
+            .unwrap();
+        assert!(
+            data_acts
+                .iter()
+                .any(|a| matches!(a, V2SessionAction::AppData(d) if d == b"hello-v2"))
+        );
+
+        let rk_wire = cli_sess.rekey(50.0).unwrap();
+        let rk_acts = host_sess
+            .feed_bytes(&rk_wire, now, 55, &mut host_roster)
+            .unwrap();
+        assert!(
+            rk_acts
+                .iter()
+                .any(|a| matches!(a, V2SessionAction::Rekeyed { .. }))
+        );
+
+        let close_wire = cli_sess.close(1000.0, "bye", 60.0).unwrap();
+        assert!(cli_sess.is_closed());
+        let close_acts = host_sess
+            .feed_bytes(&close_wire, now, 65, &mut host_roster)
+            .unwrap();
+        assert!(close_acts.iter().any(
+            |a| matches!(a, V2SessionAction::CloseTransport { code: 1000, reason } if reason == "bye")
+        ));
+    }
+
+    #[test]
+    fn wasm_v2_session_revocation_crl_closes_session() {
+        use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+        use tendril_core::v2::{V2PakePairResponder, V2SessionResponder};
+
+        let host_id = EndpointIdentity::generate()
+            .unwrap()
+            .with_host_id("wasm-v2-rev-host");
+        let mut host_roster = Roster::new();
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let now = 1_795_564_800u64;
+        let code = mgr.issue_code(PairingCodeKind::Remote3Group, now).unwrap();
+
+        let cli_id = WasmIdentity::generate_inner(Some("wasm-v2-rev-cli")).unwrap();
+        let mut cli_roster = WasmRoster::new();
+        let mut pair_init =
+            WasmV2PakePairInitiator::new_inner(&cli_id, "web", "browser", &code, None).unwrap();
+        let mut pair_resp = V2PakePairResponder::new(
+            &host_id,
+            PairingPathKind::Remote,
+            PakeArgon2Params::default(),
+        )
+        .unwrap();
+
+        let init_m1 = pair_init.start().unwrap();
+        let m2: Vec<u8> = pair_resp
+            .feed_bytes(&init_m1, now, &mut mgr, &mut host_roster)
+            .unwrap()
+            .into_iter()
+            .filter_map(|a| match a {
+                V2PairAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let step1_val: serde_json::Value =
+            serde_json::from_str(&pair_init.step_bytes(&m2, &mut cli_roster).unwrap()).unwrap();
+        let m3 = b64url_decode(step1_val["write_b64"].as_str().unwrap()).unwrap();
+        let mut resp_bytes = Vec::new();
+        let mut cli_dev_id = String::new();
+        let mut host_sas = String::new();
+        let mut resp_v2_secrets = None;
+        for a in pair_resp
+            .feed_bytes(&m3, now, &mut mgr, &mut host_roster)
+            .unwrap()
+        {
+            match a {
+                V2PairAction::WriteBytes(b) => resp_bytes.extend_from_slice(&b),
+                V2PairAction::Completed(V2PairOutcome::ResponderPending {
+                    device_id,
+                    pairing_sas,
+                    v2_secrets,
+                    ..
+                }) => {
+                    cli_dev_id = device_id;
+                    host_sas = pairing_sas;
+                    resp_v2_secrets = Some(v2_secrets);
+                }
+                _ => {}
+            }
+        }
+        pair_init.step_bytes(&resp_bytes, &mut cli_roster).unwrap();
+        host_roster
+            .confirm_peer(&cli_dev_id, Some(&host_sas))
+            .unwrap();
+        host_roster
+            .upgrade_peer_to_v2(&cli_dev_id, resp_v2_secrets.unwrap())
+            .unwrap();
+        cli_roster
+            .inner
+            .confirm_peer("wasm-v2-rev-host", Some(&host_sas))
+            .unwrap();
+
+        let grant = host_roster
+            .mint_grant(
+                &host_id,
+                &cli_dev_id,
+                vec!["fs.read".to_owned()],
+                now,
+                now + 3600,
+                [0x99; 16],
+            )
+            .unwrap();
+        let grant_json = serde_json::to_string(&grant).unwrap();
+
+        let mut cli_sess = WasmV2SessionInitiator::new_inner(
+            &cli_id,
+            "wasm-v2-rev-host",
+            &cli_roster,
+            Some(&grant_json),
+            None,
+        )
+        .unwrap();
+        let mut host_sess = V2SessionResponder::new(&host_id).unwrap();
+
+        #[allow(clippy::cast_precision_loss)]
+        let sm1 = cli_sess.start(now as f64).unwrap();
+        let sm2: Vec<u8> = host_sess
+            .feed_bytes(&sm1, now, 10, &mut host_roster)
+            .unwrap()
+            .into_iter()
+            .filter_map(|a| match a {
+                V2SessionAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        #[allow(clippy::cast_precision_loss)]
+        cli_sess
+            .step_bytes(&sm2, now as f64, 20.0, &mut cli_roster)
+            .unwrap();
+        let sm3 = cli_sess.poll_write();
+        host_sess
+            .feed_bytes(&sm3, now, 25, &mut host_roster)
+            .unwrap();
+        assert!(cli_sess.is_established());
+        assert!(!cli_sess.is_closed());
+
+        // Host issues a CRL revoking the local device and seals it over the established session.
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: "wasm-v2-rev-host".to_owned(),
+                seq: 1,
+                ts: "2026-11-21T12:00:00Z".to_owned(),
+                revoked_devices: vec![cli_dev_id],
+                revoked_nonces: Vec::new(),
+            },
+            host_id.signing_key(),
+        )
+        .unwrap();
+        let crl_wire: Vec<u8> = host_sess
+            .seal_revocation(&crl, 30)
+            .unwrap()
+            .into_iter()
+            .filter_map(|a| match a {
+                V2SessionAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        #[allow(clippy::cast_precision_loss)]
+        let rev_res = cli_sess.step_bytes(&crl_wire, now as f64, 35.0, &mut cli_roster);
+        assert!(rev_res.is_err());
+        assert!(cli_sess.is_closed());
+        assert!(!cli_sess.is_established());
     }
 }
