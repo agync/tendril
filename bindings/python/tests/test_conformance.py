@@ -1,8 +1,10 @@
 import base64
 import json
+import os
 import pathlib
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -12,6 +14,7 @@ import tendril
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 VECTORS = ROOT / "spec" / "vectors"
 PEER_BIN = ROOT / "target" / "debug" / "tendril-conformance-peer"
+RELAY_BIN = ROOT / "target" / "debug" / "tendril-relay"
 
 
 def load_vec(name: str) -> dict:
@@ -642,6 +645,341 @@ class TendrilPythonTests(unittest.TestCase):
             cli_ep.close()
             anchor_ep.close()
             host_ep.close()
+
+    def test_configure_transports_json_validation_and_redaction(self) -> None:
+        ep = tendril.Endpoint(None, "py-cfg-test")
+        try:
+            # Unknown field rejected (deny_unknown_fields).
+            with self.assertRaises(ValueError):
+                ep.configure_transports_json('{"unknown_field": true}')
+
+            # Scalar secret redaction: error message must not leak the scalar value.
+            with self.assertRaises(ValueError) as ctx:
+                ep.configure_transports_json('{"relay_auth_secret":123456}')
+            self.assertNotIn("123456", str(ctx.exception))
+
+            # Redacted pinned_host_json parse error in pair_v2_initiate.
+            with self.assertRaises(ValueError) as ctx_pin:
+                ep.pair_v2_initiate("127.0.0.1:1", "1234-5678", pinned_host_json='{"static_pub_b64":998877}')
+            self.assertNotIn("998877", str(ctx_pin.exception))
+
+            # Mutual-exclusion checks.
+            ticket_json = ep.mint_relay_ticket("localhost", "any", "*", 300)
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                ep.configure_transports_json(
+                    json.dumps(
+                        {
+                            "relay_auth_secret": "a" * 32,
+                            "relay_ticket": json.loads(ticket_json),
+                        }
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                ep.configure_transports_json(
+                    json.dumps(
+                        {
+                            "p2p_relay_auth_token": "tok-123",
+                            "p2p_api_secret": "sec-456",
+                        }
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                ep.configure_transports_json(
+                    json.dumps(
+                        {
+                            "p2p_relay_mode": "disabled",
+                            "p2p_relay_urls": ["https://relay.example"],
+                        }
+                    )
+                )
+
+            # p2p_api_secret either requires p2p-iroh-services feature or succeeds when built with it.
+            if os.environ.get("TENDRIL_PY_IROH_SERVICES") == "1":
+                ep.configure_transports_json(json.dumps({"p2p_api_secret": "iroh-sec-1234"}))
+            else:
+                with self.assertRaisesRegex(RuntimeError, "p2p-iroh-services"):
+                    ep.configure_transports_json(json.dumps({"p2p_api_secret": "iroh-sec-1234"}))
+        finally:
+            ep.close()
+
+    def test_mint_relay_ticket_and_gated_relay_v1_and_v2(self) -> None:
+        if not RELAY_BIN.exists():
+            subprocess.run(
+                ["cargo", "build", "-p", "tendril-relay", "--bin", "tendril-relay"],
+                cwd=str(ROOT),
+                check=True,
+            )
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        secret_val = "tendril-test-relay-hmac-secret-32b"
+        issuer_ep = tendril.Endpoint(None, "py-ticket-issuer")
+        issuer_info = json.loads(issuer_ep.info_json())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secret_file = pathlib.Path(tmpdir) / "relay.secret"
+            secret_file.write_text(secret_val, encoding="utf-8")
+
+            relay_proc = subprocess.Popen(
+                [
+                    str(RELAY_BIN),
+                    "--listen",
+                    f"127.0.0.1:{port}",
+                    "--host",
+                    "localhost",
+                    "--auth-secret-file",
+                    str(secret_file),
+                    "--issuer-pub",
+                    issuer_info["relay_pub"],
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    try:
+                        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                            break
+                    except OSError:
+                        time.sleep(0.05)
+                else:
+                    raise RuntimeError("tendril-relay did not listen in time")
+
+                relay_v1_url = f"ws://127.0.0.1:{port}/v1/relay"
+                relay_v2_url = f"ws://127.0.0.1:{port}/v2/relay"
+
+                host_ep = tendril.Endpoint(str(pathlib.Path(tmpdir) / "host"), "py-gated-host")
+                cli_ep = tendril.Endpoint(str(pathlib.Path(tmpdir) / "cli"), "py-gated-cli")
+                unauth_ep = tendril.Endpoint(None, "py-gated-unauth")
+                try:
+                    # 1. /v1/relay: unauthenticated, wrong secret, and wrong-role ticket fail closed.
+                    with self.assertRaises(RuntimeError):
+                        unauth_ep.serve_relay(relay_v1_url, "localhost")
+
+                    wrong_sec_ep = tendril.Endpoint(None, "py-wrong-sec")
+                    wrong_sec_ep.configure_transports_json(
+                        json.dumps({"relay_auth_secret": "wrong-secret-000000000000000000"})
+                    )
+                    with self.assertRaises(RuntimeError):
+                        wrong_sec_ep.serve_relay(relay_v1_url, "localhost")
+                    wrong_sec_ep.close()
+
+                    dial_only_ticket = json.loads(
+                        issuer_ep.mint_relay_ticket("localhost", "dial", "*", 300)
+                    )
+                    host_ep.configure_transports_json(
+                        json.dumps({"relay_ticket": dial_only_ticket})
+                    )
+                    with self.assertRaises(RuntimeError):
+                        host_ep.serve_relay(relay_v1_url, "localhost")
+
+                    reg_ticket = json.loads(
+                        issuer_ep.mint_relay_ticket("localhost", "register", "*", 300)
+                    )
+                    host_ep.configure_transports_json(json.dumps({"relay_ticket": reg_ticket}))
+                    v1_ep = host_ep.serve_relay(relay_v1_url, "localhost")
+
+                    code = host_ep.issue_code("remote")
+                    with self.assertRaises(RuntimeError):
+                        unauth_ep.pair_initiate(v1_ep, code, relay_host="localhost")
+
+                    cli_ep.configure_transports_json(
+                        json.dumps({"relay_auth_secret": secret_val})
+                    )
+                    t_acc = threading.Thread(target=lambda: host_ep.pair_accept(5000))
+                    t_acc.start()
+                    p1 = json.loads(cli_ep.pair_initiate(v1_ep, code, relay_host="localhost"))
+                    t_acc.join(timeout=5)
+                    host_ep.confirm_peer(p1["device_id"], p1["sas"])
+                    cli_ep.confirm_peer("py-gated-host", p1["sas"])
+                    g1 = host_ep.mint_grant(p1["device_id"], ["fs.read"], 3600)
+
+                    with self.assertRaises(RuntimeError):
+                        unauth_ep.connect(v1_ep, "py-gated-host", g1, relay_host="localhost")
+
+                    s_holder: dict = {}
+                    t_s = threading.Thread(
+                        target=lambda: s_holder.__setitem__("s", host_ep.accept_session(5000))
+                    )
+                    t_s.start()
+                    c1 = cli_ep.connect(v1_ep, "py-gated-host", g1, relay_host="localhost")
+                    t_s.join(timeout=5)
+                    c1.send_data(b"v1-gated-ok")
+                    ev1 = json.loads(s_holder["s"].poll_event(2000))
+                    self.assertEqual(ev1["event"], "data")
+                    c1.close()
+
+                    # 2. /v2/relay: pair via direct first so both endpoints hold v2 mailbox_secret.
+                    direct_addr = host_ep.serve_direct("127.0.0.1:0")
+                    v2_code = host_ep.issue_code("lan")
+                    v2_acc: dict = {}
+                    t_v2p = threading.Thread(
+                        target=lambda: v2_acc.__setitem__("res", json.loads(host_ep.pair_v2_accept(5000)))
+                    )
+                    t_v2p.start()
+                    v2_init = json.loads(cli_ep.pair_v2_initiate(direct_addr, v2_code))
+                    t_v2p.join(timeout=5)
+                    self.assertEqual(v2_acc["res"]["sas"], v2_init["sas"])
+                    host_ep.confirm_peer(v2_acc["res"]["device_id"], v2_init["sas"])
+                    cli_ep.confirm_peer("py-gated-host", v2_init["sas"])
+                    g2 = host_ep.mint_grant(v2_acc["res"]["device_id"], ["fs.read"], 3600)
+
+                    host_ep.configure_transports_json(json.dumps({"relay_ticket": dial_only_ticket}))
+                    with self.assertRaises(RuntimeError):
+                        host_ep.serve_relay_v2(relay_v2_url, "localhost", v2_acc["res"]["device_id"])
+
+                    host_ep.configure_transports_json(json.dumps({"relay_auth_secret": secret_val}))
+                    v2_ep = host_ep.serve_relay_v2(
+                        relay_v2_url, "localhost", v2_acc["res"]["device_id"]
+                    )
+                    self.assertIn("/v2/relay#", v2_ep)
+
+                    with self.assertRaises(RuntimeError):
+                        unauth_ep.connect_v2(v2_ep, "py-gated-host", g2, relay_host="localhost")
+
+                    cli_ep.configure_transports_json(json.dumps({"relay_ticket": dial_only_ticket}))
+                    v2_sh: dict = {}
+                    t_v2s = threading.Thread(
+                        target=lambda: v2_sh.__setitem__("s", host_ep.accept_v2(5000))
+                    )
+                    t_v2s.start()
+                    c2 = cli_ep.connect_v2(v2_ep, "py-gated-host", g2, relay_host="localhost")
+                    t_v2s.join(timeout=5)
+                    c2.send_data(b"v2-gated-ok")
+                    ev2 = json.loads(v2_sh["s"].poll_event(2000))
+                    self.assertEqual(ev2["event"], "data")
+                    c2.close()
+                finally:
+                    unauth_ep.close()
+                    cli_ep.close()
+                    host_ep.close()
+            finally:
+                issuer_ep.close()
+                if relay_proc.poll() is None:
+                    relay_proc.kill()
+                relay_proc.wait()
+
+    def test_wire_v2_interop_with_conformance_peer(self) -> None:
+        if not RELAY_BIN.exists():
+            subprocess.run(
+                ["cargo", "build", "-p", "tendril-relay", "--bin", "tendril-relay"],
+                cwd=str(ROOT),
+                check=True,
+            )
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        relay_proc = subprocess.Popen(
+            [str(RELAY_BIN), "--listen", f"127.0.0.1:{port}", "--host", "localhost"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        peer = PeerProc()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            py_cli = tendril.Endpoint(str(pathlib.Path(tmpdir) / "py_cli"), "py-v2-cli")
+            try:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    try:
+                        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                            break
+                    except OSError:
+                        time.sleep(0.05)
+                else:
+                    raise RuntimeError("tendril-relay did not listen in time")
+
+                relay_v2_url = f"ws://127.0.0.1:{port}/v2/relay"
+
+                peer.call({"op": "init", "host_id": "rust-v2-host"})
+                direct_ep = peer.call({"op": "serve_direct"})["endpoint"]
+
+                # Wrong-code rejection on pair_v2_initiate.
+                code_bad = peer.call({"op": "issue_code", "kind": "lan"})["code"]
+                peer.send({"op": "pair_v2_accept", "timeout_ms": 5000})
+                with self.assertRaises(RuntimeError):
+                    py_cli.pair_v2_initiate(direct_ep, "0000-0000")
+                self.assertFalse(peer.recv()["ok"])
+
+                # Valid Wire v2 pairing.
+                code_ok = peer.call({"op": "issue_code", "kind": "lan"})["code"]
+                peer.send({"op": "pair_v2_accept", "timeout_ms": 5000})
+                p_res = json.loads(
+                    py_cli.pair_v2_initiate(direct_ep, code_ok, name="py-v2-dev", kind="python")
+                )
+                peer_pair = peer.recv()
+                self.assertTrue(peer_pair["ok"])
+                self.assertEqual(p_res["wire_version"], 2)
+                self.assertEqual(peer_pair["sas"], p_res["sas"])
+                dev_id = peer_pair["device_id"]
+
+                peer.call({"op": "confirm", "peer_id": dev_id, "sas": p_res["sas"]})
+                py_cli.confirm_peer("rust-v2-host", p_res["sas"])
+                grant_obj = peer.call({"op": "mint", "peer_id": dev_id, "caps": ["fs.read"]})[
+                    "grant"
+                ]
+
+                # Serve /v2/relay on Rust peer and connect_v2 from Python.
+                v2_ep = peer.call(
+                    {
+                        "op": "serve_relay_v2",
+                        "relay_url": relay_v2_url,
+                        "expected_host": "localhost",
+                        "peer_id": dev_id,
+                    }
+                )["endpoint"]
+
+                peer.send({"op": "accept_v2", "timeout_ms": 5000})
+                sess = py_cli.connect_v2(
+                    v2_ep, "rust-v2-host", json.dumps(grant_obj), relay_host="localhost"
+                )
+                self.assertTrue(peer.recv()["ok"])
+                self.assertTrue(peer.call({"op": "authorize", "cap": "fs.read"})["allowed"])
+                self.assertFalse(peer.call({"op": "authorize", "cap": "shell.exec"})["allowed"])
+
+                sess.send_data(b"v2-from-python")
+                ev = peer.call({"op": "recv", "timeout_ms": 2000})
+                self.assertEqual(ev["data_utf8"], "v2-from-python")
+
+                sess.rekey()
+                ev_rk = json.loads(sess.poll_event(2000))
+                self.assertEqual(ev_rk["event"], "rekeyed")
+                ev_peer_rk = peer.call({"op": "recv", "timeout_ms": 2000})
+                self.assertEqual(ev_peer_rk["event"], "rekeyed")
+
+                peer.call({"op": "send", "data_utf8": "v2-back-to-python"})
+                ev_py = json.loads(sess.poll_event(2000))
+                self.assertEqual(ev_py["event"], "data")
+                b64 = ev_py["data_b64"]
+                self.assertEqual(
+                    base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4)),
+                    b"v2-back-to-python",
+                )
+
+                sess.close()
+                ev_peer_close = peer.call({"op": "recv", "timeout_ms": 2000})
+                self.assertEqual(ev_peer_close["event"], "closed")
+
+                # Revoking peer fails authorization and subsequent connect_v2.
+                peer.call({"op": "revoke", "peer_id": dev_id})
+                peer.send({"op": "accept_v2", "timeout_ms": 2000})
+                with self.assertRaises(RuntimeError):
+                    py_cli.connect_v2(
+                        v2_ep, "rust-v2-host", json.dumps(grant_obj), relay_host="localhost"
+                    )
+                self.assertFalse(peer.recv()["ok"])
+
+                peer.call({"op": "shutdown"})
+            finally:
+                py_cli.close()
+                peer.close()
+                if relay_proc.poll() is None:
+                    relay_proc.kill()
+                relay_proc.wait()
 
 
 if __name__ == "__main__":
