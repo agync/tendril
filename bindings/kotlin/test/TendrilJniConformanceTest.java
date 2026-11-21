@@ -715,6 +715,7 @@ public final class TendrilJniConformanceTest {
     long anchorEp = TendrilNative.endpointNewFromState(null, null, "jni-m2m-anchor");
     long cliEp = TendrilNative.endpointNewFromState(null, null, "jni-m2m-cli");
     long cli2Ep = TendrilNative.endpointNewFromState(null, null, "jni-m2m-cli2");
+    final Thread[] activeBg = new Thread[1];
     try {
       Map<String, Object> hostInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(hostEp)));
       Map<String, Object> anchorInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(anchorEp)));
@@ -733,6 +734,7 @@ public final class TendrilJniConformanceTest {
               () -> {
                 acc[0] = TendrilNative.endpointPairAccept(hostEp, 5000);
               });
+      activeBg[0] = pt;
       pt.start();
       Map<String, Object> initRes =
           asObj(
@@ -749,6 +751,7 @@ public final class TendrilJniConformanceTest {
                       "jni-worker",
                       "machine")));
       pt.join(5000);
+      activeBg[0] = null;
       Map<String, Object> accRes = asObj(Json.parse(acc[0]));
       check("active".equals(initRes.get("status")), "expected active init status: " + initRes);
       check("active".equals(accRes.get("status")), "expected active acc status: " + accRes);
@@ -764,6 +767,7 @@ public final class TendrilJniConformanceTest {
                 } catch (IllegalStateException ignored) {
                 }
               });
+      activeBg[0] = repPt;
       repPt.start();
       boolean replayRejected = false;
       try {
@@ -773,6 +777,7 @@ public final class TendrilJniConformanceTest {
         replayRejected = e.getMessage() != null && e.getMessage().contains("token_replayed");
       }
       repPt.join(5000);
+      activeBg[0] = null;
       check(replayRejected, "replayed M2M token must fail closed with token_replayed");
 
       String grant =
@@ -784,9 +789,11 @@ public final class TendrilJniConformanceTest {
               () -> {
                 hostSessHolder[0] = TendrilNative.sessionAccept(hostEp, 5000);
               });
+      activeBg[0] = st;
       st.start();
       long cliSess = TendrilNative.sessionConnect(cliEp, ep, null, "jni-m2m-host", grant);
       st.join(5000);
+      activeBg[0] = null;
       long hostSess = hostSessHolder[0];
       check(hostSess != 0, "post-M2M session accept failed");
       try {
@@ -808,6 +815,7 @@ public final class TendrilJniConformanceTest {
                 } catch (IllegalStateException ignored) {
                 }
               });
+      activeBg[0] = revPt;
       revPt.start();
       boolean soleAnchorDisabled = false;
       try {
@@ -817,6 +825,7 @@ public final class TendrilJniConformanceTest {
         soleAnchorDisabled = e.getMessage() != null && e.getMessage().contains("unauthorized");
       }
       revPt.join(5000);
+      activeBg[0] = null;
       check(soleAnchorDisabled, "revoking sole anchor must disable M2M (unauthorized)");
 
       String selfTok =
@@ -829,6 +838,7 @@ public final class TendrilJniConformanceTest {
                 } catch (IllegalStateException ignored) {
                 }
               });
+      activeBg[0] = revPt2;
       revPt2.start();
       boolean revokedRejected = false;
       try {
@@ -838,6 +848,7 @@ public final class TendrilJniConformanceTest {
         revokedRejected = e.getMessage() != null && e.getMessage().contains("untrusted_anchor");
       }
       revPt2.join(5000);
+      activeBg[0] = null;
       check(revokedRejected, "revoked trust anchor token must fail with untrusted_anchor");
 
       final String[] selfAcc = new String[1];
@@ -846,6 +857,7 @@ public final class TendrilJniConformanceTest {
               () -> {
                 selfAcc[0] = TendrilNative.endpointPairAccept(hostEp, 5000);
               });
+      activeBg[0] = selfPt;
       selfPt.start();
       Map<String, Object> selfInit =
           asObj(
@@ -862,11 +874,20 @@ public final class TendrilJniConformanceTest {
                       "jni-worker-2",
                       "machine")));
       selfPt.join(5000);
+      activeBg[0] = null;
       check("active".equals(selfInit.get("status")), "self-issued M2M init must succeed");
       check(
           "active".equals(asObj(Json.parse(selfAcc[0])).get("status")),
           "self-issued M2M accept must succeed");
     } finally {
+      TendrilNative.endpointClose(hostEp);
+      if (activeBg[0] != null) {
+        try {
+          activeBg[0].join(5000);
+        } catch (InterruptedException ignored) {
+          Thread.currentThread().interrupt();
+        }
+      }
       TendrilNative.endpointFree(cli2Ep);
       TendrilNative.endpointFree(cliEp);
       TendrilNative.endpointFree(anchorEp);

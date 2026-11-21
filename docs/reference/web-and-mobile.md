@@ -22,7 +22,7 @@ Browser and mobile targets run the same Rust protocol core as desktop targets. B
 
 ### `crates/tendril-wasm`
 
-`crates/tendril-wasm` compiles cleanly for `wasm32-unknown-unknown` using `.cargo/config.toml` (`getrandom_backend="wasm_js"`). Its default build (`bindings/web/pkg`) remains strictly sans-I/O and exports four stateful types plus eight helper functions; enabling the opt-in `p2p-iroh` feature (`bindings/web/pkg-p2p`) adds `WasmIrohStream` and `parse_p2p_endpoint_json` over `iroh` 1.5 (`ws_stream_wasm` + `ring`):
+`crates/tendril-wasm` compiles cleanly for `wasm32-unknown-unknown` using `.cargo/config.toml` (`getrandom_backend="wasm_js"`). Its default build (`bindings/web/pkg`) remains strictly sans-I/O and exports four stateful types plus nine helper functions; enabling the opt-in `p2p-iroh` feature (`bindings/web/pkg-p2p`) adds `WasmIrohStream` and `parse_p2p_endpoint_json` over `iroh` 1.5 (`ws_stream_wasm` + `ring`):
 
 - `WasmIdentity`: generates, exports, and restores client Ed25519 signing and X25519 static keys without touching host storage directly, and mints single-use M2M enrollment tokens via `mint_enrollment_token`.
 - `WasmRoster`: serializes and atomically replaces (`replace_from_json`) pinned hosts, pairing state, verified CRL sequence tracking, and M2M trust anchors (`add_trust_anchor`, `revoke_trust_anchor`).

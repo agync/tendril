@@ -1378,11 +1378,11 @@ pub unsafe extern "C" fn tendril_endpoint_revoke_trust_anchor(
             set_last_error(e.to_string());
             return TENDRIL_ERR_NOT_FOUND;
         }
+        ep.refresh_m2m_enabled(&roster);
         if let Err(e) = ep.persist_roster(&roster) {
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
         }
-        ep.refresh_m2m_enabled(&roster);
         TENDRIL_OK
     })
 }

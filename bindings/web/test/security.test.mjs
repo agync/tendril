@@ -225,12 +225,18 @@ test("SEC-21 RelayStream enforces byte/frame caps, drops post-close frames, and 
   closeCalls.length = 0;
   const frameCapped = new RelayStream(fakeWs);
   for (let i = 0; i < MAX_QUEUED_FRAMES; i += 1) {
-    frameCapped._pushFrame(new Uint8Array(0));
+    frameCapped._pushFrame(new Uint8Array(1));
   }
   assert.equal(closeCalls.length, 0);
-  frameCapped._pushFrame(new Uint8Array(0));
+  frameCapped._pushFrame(new Uint8Array(1));
   assert.deepEqual(closeCalls, [{ code: 1008, reason: "receive queue overflow" }]);
   await assert.rejects(() => frameCapped.recv(10), /receive queue exceeded/);
+
+  closeCalls.length = 0;
+  const zeroFrame = new RelayStream(fakeWs);
+  zeroFrame._pushFrame(new Uint8Array(0));
+  assert.deepEqual(closeCalls, [{ code: 1002, reason: "empty binary frame" }]);
+  await assert.rejects(() => zeroFrame.recv(10), /empty relay binary frame/);
 
   closeCalls.length = 0;
   const closable = new RelayStream(fakeWs);
@@ -585,6 +591,12 @@ test("computeCodeMacWorker handles timeout and messageerror with termination", a
     }
   }
 
+  class ThrowingWorker extends HangingWorker {
+    postMessage() {
+      throw new Error("sync postMessage failed");
+    }
+  }
+
   try {
     globalThis.Worker = HangingWorker;
     const rawTimeout = new TextEncoder().encode("TND-AAAA-BBBB");
@@ -599,7 +611,15 @@ test("computeCodeMacWorker handles timeout and messageerror with termination", a
       () => computeCodeMacWorker("TND-AAAA-BBBB", hh, { timeoutMs: 5000 }),
       /worker message deserialization failed/
     );
-    assert.equal(terminatedCount, 2);
+
+    globalThis.Worker = ThrowingWorker;
+    const rawThrow = new TextEncoder().encode("TND-CCCC-DDDD");
+    await assert.rejects(
+      () => computeCodeMacWorker(rawThrow, hh, { timeoutMs: 15000 }),
+      /sync postMessage failed/
+    );
+    assert.deepEqual(rawThrow, new Uint8Array(rawThrow.length));
+    assert.equal(terminatedCount, 3);
   } finally {
     globalThis.Worker = savedWorker;
   }

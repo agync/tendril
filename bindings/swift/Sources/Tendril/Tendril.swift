@@ -557,8 +557,9 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK else {
         throw ffiError(rc, fallback: "tendril_endpoint_pair_initiate failed")
       }
+      let result = takeOutCString(out)
       try persistRoster(h)
-      return takeOutCString(out)
+      return result
     }
   }
 
@@ -567,10 +568,22 @@ public final class TendrilEndpoint {
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_endpoint_pair_accept(h, timeoutMs, &out)
       guard rc == TENDRIL_OK else {
-        throw ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
+        let acceptErr = ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
+        if rc != TENDRIL_WOULD_BLOCK && rc != TENDRIL_ERR_CLOSED {
+          do {
+            try persistRoster(h)
+          } catch {
+            throw TendrilError.ffi(
+              code: rc,
+              message: "\(acceptErr) (roster persist error: \(error))"
+            )
+          }
+        }
+        throw acceptErr
       }
+      let result = takeOutCString(out)
       try persistRoster(h)
-      return takeOutCString(out)
+      return result
     }
   }
 
@@ -599,8 +612,9 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK else {
         throw ffiError(rc, fallback: "tendril_endpoint_mint_grant failed")
       }
+      let result = takeOutCString(out)
       try persistRoster(h)
-      return takeOutCString(out)
+      return result
     }
   }
 
@@ -618,7 +632,7 @@ public final class TendrilEndpoint {
 
   public func addTrustAnchor(anchorId: String, signingPub: Data) throws {
     guard signingPub.count == 32 else {
-      throw TendrilError.invalidInput("signingPub must be 32 bytes")
+      throw TendrilError.invalidArgument("signingPub must be 32 bytes")
     }
     try withHandle { h in
       let rc = try withValidatedCString(anchorId, name: "anchorId") { cAnchor in
@@ -678,10 +692,10 @@ public final class TendrilEndpoint {
     kind: String = "machine"
   ) throws -> String {
     guard hostStaticPub.count == 32 else {
-      throw TendrilError.invalidInput("hostStaticPub must be 32 bytes")
+      throw TendrilError.invalidArgument("hostStaticPub must be 32 bytes")
     }
     guard hostSigningPub.count == 32 else {
-      throw TendrilError.invalidInput("hostSigningPub must be 32 bytes")
+      throw TendrilError.invalidArgument("hostSigningPub must be 32 bytes")
     }
     return try withHandle { h in
       var out: UnsafeMutablePointer<CChar>?
@@ -717,8 +731,9 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK else {
         throw ffiError(rc, fallback: "tendril_endpoint_enroll_initiate failed")
       }
+      let result = takeOutCString(out)
       try persistRoster(h)
-      return takeOutCString(out)
+      return result
     }
   }
 

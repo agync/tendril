@@ -203,17 +203,24 @@ export async function computeCodeMacWorker(code, handshakeHash, { timeoutMs = 15
     worker.addEventListener("messageerror", () => {
       finish(new Error("worker message deserialization failed"));
     });
-    let payloadBytes;
-    if (code instanceof Uint8Array) {
-      payloadBytes = new Uint8Array(code);
-      code.fill(0);
-    } else {
-      payloadBytes = encoder.encode(String(code));
+    let payloadBytes = null;
+    try {
+      if (code instanceof Uint8Array) {
+        payloadBytes = new Uint8Array(code);
+        code.fill(0);
+      } else {
+        payloadBytes = encoder.encode(String(code));
+      }
+      worker.postMessage(
+        { id, op: "compute_code_mac", codeBytes: payloadBytes, handshakeHash },
+        [payloadBytes.buffer]
+      );
+    } catch (err) {
+      if (payloadBytes) {
+        payloadBytes.fill(0);
+      }
+      finish(err);
     }
-    worker.postMessage(
-      { id, op: "compute_code_mac", codeBytes: payloadBytes, handshakeHash },
-      [payloadBytes.buffer]
-    );
   });
 }
 

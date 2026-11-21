@@ -232,6 +232,15 @@ export class RelayStream {
     if (this.#closed || this.#eof || this.#error) {
       return;
     }
+    if (bytes.byteLength === 0) {
+      this.#queue = [];
+      this.#queuedBytes = 0;
+      this._fail(new Error("empty relay binary frame"));
+      try {
+        this.#ws.close(1002, "empty binary frame");
+      } catch {}
+      return;
+    }
     if (bytes.byteLength > this.#maxFrame) {
       this.#queue = [];
       this.#queuedBytes = 0;

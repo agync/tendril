@@ -226,9 +226,18 @@ class TendrilEndpoint private constructor(
 
   fun pairAccept(timeoutMs: Long): String =
     withHandle {
-      val out = TendrilNative.endpointPairAccept(it, timeoutMs)
-      persistRoster(it)
-      out
+      try {
+        val out = TendrilNative.endpointPairAccept(it, timeoutMs)
+        persistRoster(it)
+        out
+      } catch (t: Throwable) {
+        try {
+          persistRoster(it)
+        } catch (pe: Throwable) {
+          t.addSuppressed(pe)
+        }
+        throw t
+      }
     }
 
   fun confirmPeer(peerId: String, sas: String? = null) =
