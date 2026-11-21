@@ -1588,8 +1588,9 @@ pub unsafe extern "C" fn tendril_session_authorize(
             return TENDRIL_ERR_INVALID_ARG;
         };
         let sess = unsafe { &*sess };
-        let roster = sess.roster.lock().expect("roster mutex poisoned");
-        let (res, _audit) = sess.session.authorize(cap_s, now_unix(), &roster);
+        let (res, _audit) = sess
+            .session
+            .authorize_locked(cap_s, now_unix(), &sess.roster);
         unsafe {
             *out_allowed = u8::from(res.is_ok());
         }

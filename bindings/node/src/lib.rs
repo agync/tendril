@@ -652,9 +652,8 @@ impl Session {
 
     #[napi]
     pub async fn authorize(&self, requested_cap: String) -> bool {
-        let r = self.roster.lock().expect("roster mutex poisoned");
         self.session
-            .authorize(&requested_cap, now_unix(), &r)
+            .authorize_locked(&requested_cap, now_unix(), &self.roster)
             .0
             .is_ok()
     }

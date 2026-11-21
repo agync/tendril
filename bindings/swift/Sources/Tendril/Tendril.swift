@@ -167,11 +167,21 @@ internal final class SealedSwiftStateStore {
     return try readSealed(fileName: Self.rosterFile, aad: Self.rosterAad)
   }
 
-  func saveRosterJson(_ json: String) throws {
+  func saveRoster(_ exportJson: () throws -> String) throws {
     lock.lock()
     defer { lock.unlock() }
+    let json = try exportJson()
     try writeSealed(fileName: Self.rosterFile, json: json, aad: Self.rosterAad)
   }
+}
+
+private func exportEndpointRosterJson(_ h: OpaquePointer) throws -> String {
+  var out: UnsafeMutablePointer<CChar>?
+  let rc = tendril_endpoint_export_roster_json(h, &out)
+  guard rc == TENDRIL_OK else {
+    throw ffiError(rc, fallback: "tendril_endpoint_export_roster_json failed")
+  }
+  return takeOutCString(out)
 }
 #endif
 
@@ -356,12 +366,9 @@ public final class TendrilEndpoint {
           try store.saveIdentityJson(takeOutCString(out))
         }
         if rosterJson == nil {
-          var out: UnsafeMutablePointer<CChar>?
-          let rc = tendril_endpoint_export_roster_json(raw, &out)
-          guard rc == TENDRIL_OK else {
-            throw ffiError(rc, fallback: "tendril_endpoint_export_roster_json failed")
+          try store.saveRoster {
+            try exportEndpointRosterJson(raw)
           }
-          try store.saveRosterJson(takeOutCString(out))
         }
       } catch {
         tendril_endpoint_free(raw)
@@ -406,13 +413,20 @@ public final class TendrilEndpoint {
     }
     let firstCloser = !closing
     closing = true
+    if firstCloser {
+      activeCalls += 1
+    }
     cond.unlock()
 
     if firstCloser {
       _ = tendril_endpoint_close(h)
+      cond.lock()
+      activeCalls -= 1
+      cond.broadcast()
+    } else {
+      cond.lock()
     }
 
-    cond.lock()
     while activeCalls > 0 {
       cond.wait()
     }
@@ -447,12 +461,9 @@ public final class TendrilEndpoint {
   private func persistRoster(_ h: OpaquePointer) throws {
     #if canImport(CryptoKit) && canImport(Security)
     guard let store = stateStore else { return }
-    var out: UnsafeMutablePointer<CChar>?
-    let rc = tendril_endpoint_export_roster_json(h, &out)
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_endpoint_export_roster_json failed")
+    try store.saveRoster {
+      try exportEndpointRosterJson(h)
     }
-    try store.saveRosterJson(takeOutCString(out))
     #else
     _ = h
     #endif
@@ -625,7 +636,12 @@ public final class TendrilEndpoint {
         try? persistRoster(h)
         throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_session_connect failed")
       }
-      try persistRoster(h)
+      do {
+        try persistRoster(h)
+      } catch {
+        tendril_session_free(raw)
+        throw error
+      }
       #if canImport(CryptoKit) && canImport(Security)
       return TendrilSession(handle: raw, stateStore: stateStore)
       #else
@@ -653,6 +669,7 @@ public final class TendrilSession {
   private var handle: OpaquePointer?
   private var activeCalls: Int = 0
   private var closing: Bool = false
+  private var lockedPersistError: Error?
   #if canImport(CryptoKit) && canImport(Security)
   private let stateStore: SealedSwiftStateStore?
 
@@ -678,13 +695,20 @@ public final class TendrilSession {
     }
     let firstCloser = !closing
     closing = true
+    if firstCloser {
+      activeCalls += 1
+    }
     cond.unlock()
 
     if firstCloser {
       _ = tendril_session_shutdown(h)
+      cond.lock()
+      activeCalls -= 1
+      cond.broadcast()
+    } else {
+      cond.lock()
     }
 
-    cond.lock()
     while activeCalls > 0 {
       cond.wait()
     }
@@ -699,6 +723,10 @@ public final class TendrilSession {
 
   private func withHandle<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
     cond.lock()
+    if let err = lockedPersistError {
+      cond.unlock()
+      throw err
+    }
     guard !closing, let h = handle else {
       cond.unlock()
       throw TendrilError.closed
@@ -719,12 +747,14 @@ public final class TendrilSession {
   private func persistRoster(_ h: OpaquePointer) throws {
     #if canImport(CryptoKit) && canImport(Security)
     guard let store = stateStore else { return }
-    var out: UnsafeMutablePointer<CChar>?
-    let rc = tendril_session_export_roster_json(h, &out)
-    guard rc == TENDRIL_OK else {
-      throw ffiError(rc, fallback: "tendril_session_export_roster_json failed")
+    try store.saveRoster {
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_session_export_roster_json(h, &out)
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_session_export_roster_json failed")
+      }
+      return takeOutCString(out)
     }
-    try store.saveRosterJson(takeOutCString(out))
     #else
     _ = h
     #endif
@@ -742,18 +772,40 @@ public final class TendrilSession {
   }
 
   public func pollEvent(timeoutMs: UInt64) throws -> String {
-    try withHandle { h in
+    var shouldFreeOnPersistFailure = false
+    defer {
+      if shouldFreeOnPersistFailure {
+        free()
+      }
+    }
+    return try withHandle { h in
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_session_poll_event(h, timeoutMs, &out)
       guard rc == TENDRIL_OK else {
         if rc != TENDRIL_WOULD_BLOCK && rc != TENDRIL_EOF {
-          try? persistRoster(h)
+          do {
+            try persistRoster(h)
+          } catch {
+            cond.lock()
+            lockedPersistError = error
+            cond.unlock()
+            shouldFreeOnPersistFailure = true
+            throw error
+          }
         }
         throw ffiError(rc, fallback: "tendril_session_poll_event failed")
       }
       let ev = takeOutCString(out)
       if ev.contains("\"revocation_updated\"") {
-        try persistRoster(h)
+        do {
+          try persistRoster(h)
+        } catch {
+          cond.lock()
+          lockedPersistError = error
+          cond.unlock()
+          shouldFreeOnPersistFailure = true
+          throw error
+        }
       }
       return ev
     }

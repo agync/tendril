@@ -99,7 +99,7 @@ impl StateStore {
     /// Opens or creates `dir` with `0o700` permissions on Unix.
     pub fn open_or_create(dir: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let dir = dir.as_ref().to_path_buf();
-        create_private_dir_0700(&dir)?;
+        crate::providers::create_private_dir_0700(&dir)?;
         Ok(Self { dir })
     }
 
@@ -282,32 +282,6 @@ impl StateStore {
         }
         write_res
     }
-}
-
-#[cfg(unix)]
-fn create_private_dir_0700(dir: &Path) -> Result<(), RuntimeError> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    let meta = fs::symlink_metadata(dir)?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Err(RuntimeError::Storage(format!(
-            "state dir '{}' must be a real directory, not a symlink",
-            dir.display()
-        )));
-    }
-    if (meta.permissions().mode() & 0o077) != 0 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_private_dir_0700(dir: &Path) -> Result<(), RuntimeError> {
-    fs::create_dir_all(dir)?;
-    Ok(())
 }
 
 #[cfg(unix)]

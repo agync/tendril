@@ -712,10 +712,7 @@ impl Session {
         let sess = Arc::clone(&self.session);
         let roster = Arc::clone(&self.roster);
         let cap = requested_cap.to_owned();
-        py.detach(move || {
-            let r = roster.lock().expect("roster mutex poisoned");
-            sess.authorize(&cap, now_unix(), &r).0.is_ok()
-        })
+        py.detach(move || sess.authorize_locked(&cap, now_unix(), &roster).0.is_ok())
     }
 
     fn rekey(&self, py: Python<'_>) -> PyResult<()> {

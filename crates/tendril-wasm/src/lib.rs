@@ -40,6 +40,11 @@ fn f64_to_u64(v: f64, name: &str) -> Result<u64, String> {
     Ok(v as u64)
 }
 
+fn f64_to_u16(v: f64, name: &str) -> Result<u16, String> {
+    let n = f64_to_u64(v, name)?;
+    u16::try_from(n).map_err(|_| format!("{name} must be within 0..=65535"))
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn u64_to_f64(v: u64) -> Result<f64, String> {
     if v > 9_007_199_254_740_991 {
@@ -679,8 +684,12 @@ impl WasmSessionClient {
     }
 
     #[wasm_bindgen]
-    pub fn send_close(&mut self, code: u16, reason: &str) -> Result<Vec<u8>, JsValue> {
-        let actions = self.inner.send_close(code, reason).map_err(to_js_err)?;
+    pub fn send_close(&mut self, code: f64, reason: &str) -> Result<Vec<u8>, JsValue> {
+        let close_code = f64_to_u16(code, "code").map_err(to_js_err)?;
+        let actions = self
+            .inner
+            .send_close(close_code, reason)
+            .map_err(to_js_err)?;
         Ok(collect_session_writes(actions))
     }
 

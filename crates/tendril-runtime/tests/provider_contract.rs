@@ -2624,6 +2624,42 @@ async fn batch2b_sec17_sec31_concurrent_session_and_fresh_now_unix() {
             Arc::new(cli_drv.expect("cli connect").into_concurrent());
         let host_roster_mux = Arc::new(Mutex::new(host_roster));
 
+        // Concurrent AB-BA stress check: stream inbound frames into next_event_locked_now while
+        // hammer-calling authorize_locked on the same host session + shared Mutex<Roster>.
+        if provider == ProviderId::Direct {
+            let drain_hr = Arc::clone(&host_roster_mux);
+            let drain_hc = Arc::clone(&host_conc);
+            let recv_loop = tokio::spawn(async move {
+                let mut seen = 0usize;
+                while seen < 32 {
+                    match drain_hc.next_event_locked_now(&drain_hr).await {
+                        Ok(Some(SessionEvent::AppData(_))) => seen += 1,
+                        Ok(Some(_)) => {}
+                        other => panic!("unexpected stress event: {other:?}"),
+                    }
+                }
+            });
+            let auth_hr = Arc::clone(&host_roster_mux);
+            let auth_hc = Arc::clone(&host_conc);
+            let auth_loop = tokio::spawn(async move {
+                for _ in 0..200 {
+                    assert!(auth_hc.authorize_locked("fs.read", now, &auth_hr).0.is_ok());
+                    tokio::task::yield_now().await;
+                }
+            });
+            for i in 0..32u8 {
+                cli_conc.send_data(&[i; 32]).await.expect("cli stress send");
+            }
+            timeout(Duration::from_secs(3), recv_loop)
+                .await
+                .expect("stress recv timed out (possible deadlock)")
+                .expect("recv join");
+            timeout(Duration::from_secs(3), auth_loop)
+                .await
+                .expect("stress auth timed out (possible deadlock)")
+                .expect("auth join");
+        }
+
         let hc = Arc::clone(&host_conc);
         let hr = Arc::clone(&host_roster_mux);
         let poll_task = tokio::spawn(async move {
@@ -2632,10 +2668,12 @@ async fn batch2b_sec17_sec31_concurrent_session_and_fresh_now_unix() {
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         let t0 = Instant::now();
-        {
-            let rg = host_roster_mux.lock().unwrap();
-            assert!(host_conc.authorize("fs.read", now, &rg).0.is_ok());
-        }
+        assert!(
+            host_conc
+                .authorize_locked("fs.read", now, &host_roster_mux)
+                .0
+                .is_ok()
+        );
         host_conc
             .send_data(b"full-duplex-host")
             .await

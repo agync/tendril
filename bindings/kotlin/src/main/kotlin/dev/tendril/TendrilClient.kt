@@ -90,8 +90,8 @@ internal class SealedStateStore(dirPath: String, private val cipher: KeystoreSta
 
   fun loadRosterJson(): String? = synchronized(ioLock) { readSealed(ROSTER_FILE, ROSTER_AAD) }
 
-  fun saveRosterJson(json: String) =
-    synchronized(ioLock) { writeSealed(ROSTER_FILE, json, ROSTER_AAD) }
+  fun saveRoster(exportJson: () -> String) =
+    synchronized(ioLock) { writeSealed(ROSTER_FILE, exportJson(), ROSTER_AAD) }
 }
 
 class TendrilEndpoint private constructor(
@@ -122,7 +122,7 @@ class TendrilEndpoint private constructor(
           store.saveIdentityJson(TendrilNative.endpointExportIdentityJson(ptr))
         }
         if (existingRoster == null) {
-          store.saveRosterJson(TendrilNative.endpointExportRosterJson(ptr))
+          store.saveRoster { TendrilNative.endpointExportRosterJson(ptr) }
         }
       } catch (t: Throwable) {
         TendrilNative.endpointFree(ptr)
@@ -194,7 +194,7 @@ class TendrilEndpoint private constructor(
 
   private fun persistRoster(ptr: Long) {
     val store = stateStore ?: return
-    store.saveRosterJson(TendrilNative.endpointExportRosterJson(ptr))
+    store.saveRoster { TendrilNative.endpointExportRosterJson(ptr) }
   }
 
   fun infoJson(): String = withHandle { TendrilNative.endpointInfoJson(it) }
@@ -257,14 +257,27 @@ class TendrilEndpoint private constructor(
     grantJson: String? = null,
   ): TendrilSession =
     withHandle {
+      var sessionPtr = 0L
       try {
-        val ptr = TendrilNative.sessionConnect(it, endpoint, relayHost, targetHostId, grantJson)
+        sessionPtr = TendrilNative.sessionConnect(it, endpoint, relayHost, targetHostId, grantJson)
         persistRoster(it)
-        TendrilSession(ptr, stateStore)
+        val ownedPtr = sessionPtr
+        sessionPtr = 0L
+        TendrilSession(ownedPtr, stateStore)
       } catch (t: Throwable) {
-        try {
-          persistRoster(it)
-        } catch (_: Throwable) {}
+        if (sessionPtr != 0L) {
+          try {
+            TendrilNative.sessionFree(sessionPtr)
+          } catch (freeErr: Throwable) {
+            t.addSuppressed(freeErr)
+          }
+        } else {
+          try {
+            persistRoster(it)
+          } catch (pe: Throwable) {
+            t.addSuppressed(pe)
+          }
+        }
         throw t
       }
     }
@@ -295,9 +308,13 @@ class TendrilSession internal constructor(
 ) : Closeable {
   private val lock = ReentrantReadWriteLock()
   private var handleValue: Long = handle
+  @Volatile private var persistError: Throwable? = null
 
   private inline fun <T> withHandle(fn: (Long) -> T): T =
     lock.read {
+      persistError?.let {
+        throw IllegalStateException("TendrilSession locked after roster persistence failure", it)
+      }
       val ptr = handleValue
       check(ptr != 0L) { "TendrilSession is closed" }
       fn(ptr)
@@ -305,27 +322,49 @@ class TendrilSession internal constructor(
 
   private fun persistRoster(ptr: Long) {
     val store = stateStore ?: return
-    store.saveRosterJson(TendrilNative.sessionExportRosterJson(ptr))
+    store.saveRoster { TendrilNative.sessionExportRosterJson(ptr) }
   }
 
   fun sendData(payload: ByteArray) =
     withHandle { TendrilNative.sessionSendData(it, payload) }
 
-  fun pollEvent(timeoutMs: Long): String =
-    withHandle {
-      try {
-        val ev = TendrilNative.sessionPollEvent(it, timeoutMs)
-        if (ev.contains("\"revocation_updated\"")) {
-          persistRoster(it)
-        }
-        ev
-      } catch (t: Throwable) {
+  fun pollEvent(timeoutMs: Long): String {
+    var shouldCloseOnPersistFailure = false
+    try {
+      return withHandle {
         try {
-          persistRoster(it)
+          val ev = TendrilNative.sessionPollEvent(it, timeoutMs)
+          if (ev.contains("\"revocation_updated\"")) {
+            try {
+              persistRoster(it)
+            } catch (pe: Throwable) {
+              persistError = pe
+              shouldCloseOnPersistFailure = true
+              throw pe
+            }
+          }
+          ev
+        } catch (t: Throwable) {
+          if (!shouldCloseOnPersistFailure) {
+            try {
+              persistRoster(it)
+            } catch (pe: Throwable) {
+              persistError = pe
+              shouldCloseOnPersistFailure = true
+              t.addSuppressed(pe)
+            }
+          }
+          throw t
+        }
+      }
+    } finally {
+      if (shouldCloseOnPersistFailure) {
+        try {
+          close()
         } catch (_: Throwable) {}
-        throw t
       }
     }
+  }
 
   fun authorize(requestedCap: String): Boolean =
     withHandle { TendrilNative.sessionAuthorize(it, requestedCap) }

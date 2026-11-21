@@ -342,7 +342,7 @@ JNIEXPORT jbyteArray JNICALL Java_dev_tendril_TendrilNative_computeCodeMac(
   }
   uint8_t mac[32];
   int32_t rc = tendril_compute_code_mac(c_code, hh, mac);
-  free(c_code);
+  zeroize_cstr_free(c_code);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_compute_code_mac failed");
     return NULL;

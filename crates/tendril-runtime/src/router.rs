@@ -9,7 +9,7 @@ use tendril_core::PREAMBLE_LEN;
 use tendril_core::wire::{Intent, Preamble};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout, timeout_at};
 
 use crate::driver::DEFAULT_PRE_AUTH_TIMEOUT;
@@ -186,6 +186,19 @@ impl InboundRouter {
         self.pair_enabled.load(Ordering::Acquire)
     }
 
+    fn register_background_task(&self, join: JoinHandle<()>) {
+        let mut tasks = self
+            .listener_tasks
+            .lock()
+            .expect("listener_tasks mutex poisoned");
+        if *self.shutdown_tx.borrow() {
+            drop(tasks);
+            join.abort();
+            return;
+        }
+        tasks.push(join.abort_handle());
+    }
+
     fn ensure_sweeper(&self, handle: &Handle) {
         if self.sweeper_started.swap(true, Ordering::AcqRel) {
             return;
@@ -193,12 +206,18 @@ impl InboundRouter {
         let pair_q = self.pair_queue.clone();
         let sess_q = self.session_queue.clone();
         let mut shut = self.shutdown_tx.subscribe();
+        if *shut.borrow() {
+            return;
+        }
         let tick_every =
             (self.queue_ttl / 2).clamp(Duration::from_millis(20), Duration::from_secs(1));
         let join = handle.spawn(async move {
             let mut interval = tokio::time::interval(tick_every);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
+                if *shut.borrow() {
+                    break;
+                }
                 tokio::select! {
                     biased;
                     _ = shut.changed() => break,
@@ -210,14 +229,7 @@ impl InboundRouter {
                 }
             }
         });
-        if *self.shutdown_tx.borrow() {
-            join.abort();
-            return;
-        }
-        self.listener_tasks
-            .lock()
-            .expect("listener_tasks mutex poisoned")
-            .push(join.abort_handle());
+        self.register_background_task(join);
     }
 
     /// Spawns an accept loop on `handle` routing inbound connections from `listener`.
@@ -235,10 +247,16 @@ impl InboundRouter {
         let sess_q = self.session_queue.clone();
         let queue_ttl = self.queue_ttl;
         let shutdown_tx = self.shutdown_tx.clone();
+        let mut shut = shutdown_tx.subscribe();
+        if *shut.borrow() {
+            return;
+        }
         let handle_clone = handle.clone();
         let join = handle.spawn(async move {
-            let mut shut = shutdown_tx.subscribe();
             loop {
+                if *shut.borrow() {
+                    break;
+                }
                 let mut stream = tokio::select! {
                     biased;
                     _ = shut.changed() => break,
@@ -303,14 +321,7 @@ impl InboundRouter {
             }
         });
 
-        if *self.shutdown_tx.borrow() {
-            join.abort();
-            return;
-        }
-        self.listener_tasks
-            .lock()
-            .expect("listener_tasks mutex poisoned")
-            .push(join.abort_handle());
+        self.register_background_task(join);
     }
 
     /// Waits up to `wait` for the next inbound `Intent::Pair` stream.

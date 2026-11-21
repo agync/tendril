@@ -936,6 +936,19 @@ impl ConcurrentSession {
         machine.authorize(requested_cap, now_unix, roster)
     }
 
+    /// Evaluates default-deny capability authorization against a shared roster lock while
+    /// maintaining `machine -> roster` lock order with `next_event_*`.
+    pub fn authorize_locked(
+        &self,
+        requested_cap: &str,
+        now_unix: u64,
+        roster: &Mutex<Roster>,
+    ) -> (Result<(), CoreError>, AuditEvent) {
+        let machine = self.machine.lock().expect("session machine mutex poisoned");
+        let roster_guard = roster.lock().expect("roster mutex poisoned");
+        machine.authorize(requested_cap, now_unix, &roster_guard)
+    }
+
     /// Returns the authenticated peer device ID if established.
     #[must_use]
     pub fn peer_device_id(&self) -> Option<String> {
@@ -991,6 +1004,7 @@ impl ConcurrentSession {
         };
         let res = self.dispatch_actions_locked(&mut writer, actions).await;
         let _ = writer.close().await;
+        self.event_notify.notify_waiters();
         res
     }
 
@@ -1001,6 +1015,30 @@ impl ConcurrentSession {
             let now_ms = self.elapsed_ms();
             let mut machine = self.machine.lock().expect("session machine mutex poisoned");
             machine.tick(now_unix, now_ms, roster)
+        };
+        match tick_res {
+            Ok(actions) => self.dispatch_actions_locked(&mut writer, actions).await,
+            Err(err) => {
+                let _ = writer.close().await;
+                self.event_notify.notify_waiters();
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Advances timer and grant checks against a shared roster lock while preserving
+    /// `writer -> machine -> roster` lock order.
+    pub async fn tick_locked(
+        &self,
+        now_unix: u64,
+        roster: &Mutex<Roster>,
+    ) -> Result<(), RuntimeError> {
+        let mut writer = self.writer.lock().await;
+        let tick_res = {
+            let now_ms = self.elapsed_ms();
+            let mut machine = self.machine.lock().expect("session machine mutex poisoned");
+            let roster_guard = roster.lock().expect("roster mutex poisoned");
+            machine.tick(now_unix, now_ms, &roster_guard)
         };
         match tick_res {
             Ok(actions) => self.dispatch_actions_locked(&mut writer, actions).await,
