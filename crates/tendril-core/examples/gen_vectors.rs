@@ -12,14 +12,22 @@ use snow::params::NoiseParams;
 use tendril_core::MAX_FRAME_LEN;
 use tendril_core::crypto::{
     ARGON2_KEY_LEN, ARGON2_MEMORY_KIB, ARGON2_PARALLELISM, ARGON2_TIME, PAIR_MAC_LABEL, SAS_LABEL,
-    argon2id_pairing_key, b64url_encode, compute_code_mac, device_id, fingerprint_device,
-    fingerprint_host, normalize_code, pairing_sas, x25519_public_from_scalar,
+    SigningKeypair, StaticKeypair, argon2id_pairing_key, b64url_encode, compute_code_mac,
+    device_id, fingerprint_device, fingerprint_host, normalize_code, pairing_sas,
+    x25519_public_from_scalar,
 };
 use tendril_core::grants::{
     CRL_DOMAIN, GRANT_DOMAIN, Grant, GrantUnsigned, RevocationList, RevocationListUnsigned,
     canonical_json, crl_signed_bytes, grant_signed_bytes, sign_crl, sign_grant,
 };
-use tendril_core::identity::{RotationRecord, rotation_signed_bytes, sign_rotation};
+use tendril_core::identity::{
+    EndpointIdentity, RotationRecord, rotation_signed_bytes, sign_rotation,
+};
+use tendril_core::pairing::{
+    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, enroll_proof_bytes, mint_enrollment_token,
+    sign_enroll_proof, verify_enrollment_token,
+};
+use tendril_core::roster::Roster;
 use tendril_core::wire::{
     HostHello, InnerFrameType, Intent, NOISE_PATTERN, PairClaim, PairResponse, Preamble,
     SessionHello, decode_frame, encode_frame, encode_inner_frame,
@@ -167,6 +175,43 @@ struct HandshakeVector {
     noise_pattern: String,
     pair_transcript: PairTranscriptVector,
     session_transcript: SessionTranscriptVector,
+}
+
+#[derive(Serialize)]
+struct M2mEnrollmentVector {
+    noise_pattern: String,
+    preamble_hex: String,
+    now_unix: u64,
+    anchor_id: String,
+    anchor_signing_seed_hex: String,
+    anchor_signing_pub_hex: String,
+    responder_host_id: String,
+    responder_static_scalar_hex: String,
+    responder_static_pub_hex: String,
+    responder_ephem_scalar_hex: String,
+    responder_signing_pub_hex: String,
+    initiator_static_scalar_hex: String,
+    initiator_static_pub_hex: String,
+    initiator_device_id: String,
+    initiator_ephem_scalar_hex: String,
+    initiator_signing_seed_hex: String,
+    initiator_signing_pub_hex: String,
+    token_jcs_json: String,
+    token_signed_bytes_hex: String,
+    enrollment_token: Grant,
+    host_hello_json: String,
+    msg1_frame_hex: String,
+    msg2_frame_hex: String,
+    post_msg2_handshake_hash_hex: String,
+    enroll_proof_domain_hex: String,
+    enroll_proof_bytes_hex: String,
+    enroll_proof_b64url: String,
+    pair_claim_json: String,
+    msg3_frame_hex: String,
+    final_handshake_hash_hex: String,
+    pair_response_json: String,
+    pair_response_frame_hex: String,
+    replayed_response_json: String,
 }
 
 fn seq_bytes(start: u8) -> [u8; 32] {
@@ -456,8 +501,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     write_json(&vectors_dir, "handshake.json", &handshake)?;
 
+    // 6. m2m_enrollment.json
+    let m2m_vec = build_m2m_enrollment_vector()?;
+    write_json(&vectors_dir, "m2m_enrollment.json", &m2m_vec)?;
+
     println!(
-        "Generated 5 canonical vector files under {}",
+        "Generated 6 canonical vector files under {}",
         vectors_dir.display()
     );
     Ok(())
@@ -517,7 +566,10 @@ fn build_pair_transcript(
     let claim = PairClaim {
         name: "Phone".to_string(),
         kind: "ios".to_string(),
-        code_mac: mac_b64.clone(),
+        code_mac: Some(mac_b64.clone()),
+        enrollment_token: None,
+        signing_pub: None,
+        enroll_proof: None,
     };
     let pair_claim_json = serde_json::to_string(&claim)?;
     let n3 = initiator.write_message(pair_claim_json.as_bytes(), &mut buf)?;
@@ -675,5 +727,186 @@ fn build_session_transcript(
         rekey_frame_hex: hex::encode(rekey_frame),
         post_rekey_data_inner_hex: hex::encode(post_rekey_inner),
         post_rekey_data_frame_hex: hex::encode(post_rekey_frame),
+    })
+}
+
+fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::error::Error>> {
+    let now_unix = 1_795_132_800u64;
+    let resp_static_scalar = seq_bytes(0x71);
+    let resp_signing_seed = seq_bytes(0x72);
+    let resp_ephem_scalar = seq_bytes(0x73);
+    let resp_id = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar(resp_static_scalar),
+        SigningKeypair::from_seed(resp_signing_seed),
+    );
+    let resp_static_pub = *resp_id.static_key().public_bytes();
+    let resp_signing_pub = *resp_id.signing_key().public_bytes();
+    let responder_host_id = resp_id.host_id().to_string();
+
+    let init_static_scalar = seq_bytes(0x81);
+    let init_signing_seed = seq_bytes(0x82);
+    let init_ephem_scalar = seq_bytes(0x83);
+    let init_id = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar(init_static_scalar),
+        SigningKeypair::from_seed(init_signing_seed),
+    );
+    let init_static_pub = *init_id.static_key().public_bytes();
+    let init_signing_pub = *init_id.signing_key().public_bytes();
+    let initiator_device_id = init_id.device_id();
+
+    let anchor_id = "anchor-ci".to_string();
+    let anchor_signing_seed = seq_bytes(0x91);
+    let anchor_identity = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar(seq_bytes(0x92)),
+        SigningKeypair::from_seed(anchor_signing_seed),
+    )
+    .with_host_id(&anchor_id);
+    let anchor_signing_pub = *anchor_identity.signing_key().public_bytes();
+
+    let nonce = [0x5Au8; 16];
+    let enrollment_token = mint_enrollment_token(
+        &anchor_identity,
+        &responder_host_id,
+        Some(&initiator_device_id),
+        now_unix,
+        900,
+        nonce,
+    )?;
+    let token_unsigned = enrollment_token.unsigned();
+    let token_jcs_json = canonical_json(&token_unsigned)?;
+    let token_signed_bytes = grant_signed_bytes(&token_unsigned)?;
+
+    let params: NoiseParams = NOISE_PATTERN.parse()?;
+    let preamble = Preamble::v1(Intent::Pair).encode();
+    let mut initiator = Builder::new(params.clone())
+        .local_private_key(&init_static_scalar)?
+        .prologue(&preamble)?
+        .fixed_ephemeral_key_for_testing_only(&init_ephem_scalar)
+        .build_initiator()?;
+    let mut responder = Builder::new(params)
+        .local_private_key(&resp_static_scalar)?
+        .prologue(&preamble)?
+        .fixed_ephemeral_key_for_testing_only(&resp_ephem_scalar)
+        .build_responder()?;
+
+    let mut buf = vec![0u8; MAX_FRAME_LEN];
+    let mut pt = vec![0u8; MAX_FRAME_LEN];
+
+    let n1 = initiator.write_message(&[], &mut buf)?;
+    let msg1_frame = encode_frame(&buf[..n1])?;
+    let (body1, _) = decode_frame(&msg1_frame)?;
+    let _ = responder.read_message(body1, &mut pt)?;
+
+    let host_hello = HostHello {
+        host_id: responder_host_id.clone(),
+        proto_version: 1,
+        rotation: vec![],
+    };
+    let host_hello_json = serde_json::to_string(&host_hello)?;
+    let n2 = responder.write_message(host_hello_json.as_bytes(), &mut buf)?;
+    let msg2_frame = encode_frame(&buf[..n2])?;
+    let (body2, _) = decode_frame(&msg2_frame)?;
+    let n_pt2 = initiator.read_message(body2, &mut pt)?;
+    assert_eq!(&pt[..n_pt2], host_hello_json.as_bytes());
+
+    let post_msg2_hash: [u8; 32] = initiator.get_handshake_hash().try_into()?;
+    assert_eq!(post_msg2_hash, responder.get_handshake_hash());
+
+    let proof_bytes =
+        enroll_proof_bytes(&post_msg2_hash, &init_static_pub, &enrollment_token.nonce);
+    let proof_sig = sign_enroll_proof(
+        &init_id.signing_key().signing_key(),
+        &post_msg2_hash,
+        &init_static_pub,
+        &enrollment_token.nonce,
+    );
+    let enroll_proof_b64url = b64url_encode(&proof_sig);
+
+    let claim = PairClaim {
+        name: "build-runner-01".to_string(),
+        kind: "machine".to_string(),
+        code_mac: None,
+        enrollment_token: Some(enrollment_token.clone()),
+        signing_pub: Some(b64url_encode(&init_signing_pub)),
+        enroll_proof: Some(enroll_proof_b64url.clone()),
+    };
+    let pair_claim_json = serde_json::to_string(&claim)?;
+    let n3 = initiator.write_message(pair_claim_json.as_bytes(), &mut buf)?;
+    let msg3_frame = encode_frame(&buf[..n3])?;
+    let (body3, _) = decode_frame(&msg3_frame)?;
+    let n_pt3 = responder.read_message(body3, &mut pt)?;
+    assert_eq!(&pt[..n_pt3], pair_claim_json.as_bytes());
+
+    let final_hash: [u8; 32] = initiator.get_handshake_hash().try_into()?;
+    assert_eq!(final_hash, responder.get_handshake_hash());
+
+    let mut roster = Roster::new();
+    roster.add_trust_anchor(anchor_id.clone(), anchor_signing_pub)?;
+    let policy = EnrollmentPolicy::enabled_default();
+    let (_, na) = verify_enrollment_token(
+        &enrollment_token,
+        &responder_host_id,
+        &resp_signing_pub,
+        &initiator_device_id,
+        now_unix,
+        &policy,
+        &roster,
+    )?;
+    roster.burn_enrollment_nonce(&enrollment_token.nonce, na, now_unix)?;
+    roster.record_enrolled_machine(init_static_pub, init_signing_pub, claim.name, claim.kind)?;
+
+    let mut init_tx = initiator.into_transport_mode()?;
+    let mut resp_tx = responder.into_transport_mode()?;
+    let pair_resp = PairResponse::Success {
+        device_id: initiator_device_id.clone(),
+        status: "active".to_string(),
+        host_signing_pub: b64url_encode(&resp_signing_pub),
+    };
+    let pair_response_json = serde_json::to_string(&pair_resp)?;
+    let n4 = resp_tx.write_message(pair_response_json.as_bytes(), &mut buf)?;
+    let pair_response_frame = encode_frame(&buf[..n4])?;
+    let (body4, _) = decode_frame(&pair_response_frame)?;
+    let n_pt4 = init_tx.read_message(body4, &mut pt)?;
+    assert_eq!(&pt[..n_pt4], pair_response_json.as_bytes());
+
+    let replayed_resp = PairResponse::Error {
+        error: "token_replayed".to_string(),
+    };
+    let replayed_response_json = serde_json::to_string(&replayed_resp)?;
+
+    Ok(M2mEnrollmentVector {
+        noise_pattern: NOISE_PATTERN.to_string(),
+        preamble_hex: hex::encode(preamble),
+        now_unix,
+        anchor_id,
+        anchor_signing_seed_hex: hex::encode(anchor_signing_seed),
+        anchor_signing_pub_hex: hex::encode(anchor_signing_pub),
+        responder_host_id,
+        responder_static_scalar_hex: hex::encode(resp_static_scalar),
+        responder_static_pub_hex: hex::encode(resp_static_pub),
+        responder_ephem_scalar_hex: hex::encode(resp_ephem_scalar),
+        responder_signing_pub_hex: hex::encode(resp_signing_pub),
+        initiator_static_scalar_hex: hex::encode(init_static_scalar),
+        initiator_static_pub_hex: hex::encode(init_static_pub),
+        initiator_device_id,
+        initiator_ephem_scalar_hex: hex::encode(init_ephem_scalar),
+        initiator_signing_seed_hex: hex::encode(init_signing_seed),
+        initiator_signing_pub_hex: hex::encode(init_signing_pub),
+        token_jcs_json,
+        token_signed_bytes_hex: hex::encode(token_signed_bytes),
+        enrollment_token,
+        host_hello_json,
+        msg1_frame_hex: hex::encode(msg1_frame),
+        msg2_frame_hex: hex::encode(msg2_frame),
+        post_msg2_handshake_hash_hex: hex::encode(post_msg2_hash),
+        enroll_proof_domain_hex: hex::encode(ENROLL_PROOF_DOMAIN),
+        enroll_proof_bytes_hex: hex::encode(proof_bytes),
+        enroll_proof_b64url,
+        pair_claim_json,
+        msg3_frame_hex: hex::encode(msg3_frame),
+        final_handshake_hash_hex: hex::encode(final_hash),
+        pair_response_json,
+        pair_response_frame_hex: hex::encode(pair_response_frame),
+        replayed_response_json,
     })
 }

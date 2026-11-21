@@ -475,8 +475,17 @@ pub fn verify_delegation_subset(child: &Grant, parent: &Grant) -> Result<(), Cor
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum GrantCheckMode {
+    Session,
+    Enrollment { allow_wildcard_subject: bool },
+}
+
 /// Validates a full delegation chain recursively (structural bounds, subject, time, CRL,
 /// root authority, signatures, subset rules).
+///
+/// Rejects `uses == Some(0)` and rejects any grant (leaf or ancestor) specifying `uses` or
+/// `machine: Some(true)` so single-use enrollment tokens cannot be used as session grants.
 ///
 /// When `crl` is `Some(list)`, this verifies `list.v == 1`, `list.issuer == expected_root_issuer`,
 /// valid whole-second UTC `list.ts`, and `verify_crl_signature(list, root_pub)` using the key
@@ -488,6 +497,58 @@ pub fn verify_grant_with_chain<F>(
     expected_root_issuer: &str,
     now_unix: u64,
     crl: Option<&RevocationList>,
+    lookup_issuer_key: F,
+) -> Result<(), CoreError>
+where
+    F: FnMut(&str) -> Option<[u8; 32]>,
+{
+    verify_chain_with_mode(
+        grant,
+        expected_subject,
+        expected_root_issuer,
+        now_unix,
+        crl,
+        GrantCheckMode::Session,
+        lookup_issuer_key,
+    )
+}
+
+/// Validates a delegated or root M2M enrollment grant chain (`machine == true`, `uses == 1` on leaf).
+///
+/// Leaves with `subject == "*"` are accepted only when `allow_wildcard_subject` is `true`.
+/// Any ancestor delegation links MUST omit `uses` and `machine: true`.
+pub fn verify_enrollment_grant_chain<F>(
+    grant: &Grant,
+    expected_subject: &str,
+    allow_wildcard_subject: bool,
+    expected_root_issuer: &str,
+    now_unix: u64,
+    crl: Option<&RevocationList>,
+    lookup_issuer_key: F,
+) -> Result<(), CoreError>
+where
+    F: FnMut(&str) -> Option<[u8; 32]>,
+{
+    verify_chain_with_mode(
+        grant,
+        expected_subject,
+        expected_root_issuer,
+        now_unix,
+        crl,
+        GrantCheckMode::Enrollment {
+            allow_wildcard_subject,
+        },
+        lookup_issuer_key,
+    )
+}
+
+fn verify_chain_with_mode<F>(
+    grant: &Grant,
+    expected_subject: &str,
+    expected_root_issuer: &str,
+    now_unix: u64,
+    crl: Option<&RevocationList>,
+    mode: GrantCheckMode,
     mut lookup_issuer_key: F,
 ) -> Result<(), CoreError>
 where
@@ -518,6 +579,7 @@ where
         now_unix,
         crl,
         0,
+        mode,
         &mut seen_nonces,
         &mut seen_subjects,
         &mut lookup_issuer_key,
@@ -532,6 +594,7 @@ fn verify_grant_node<F>(
     now_unix: u64,
     crl: Option<&RevocationList>,
     depth: usize,
+    mode: GrantCheckMode,
     seen_nonces: &mut HashSet<String>,
     seen_subjects: &mut HashSet<String>,
     lookup_issuer_key: &mut F,
@@ -549,6 +612,35 @@ where
             "invalid grant version or nonce".to_string(),
         ));
     }
+    if grant.uses == Some(0) {
+        return Err(CoreError::GrantDenied(
+            "grant uses must be >= 1".to_string(),
+        ));
+    }
+    match (mode, depth) {
+        (GrantCheckMode::Session, _) | (GrantCheckMode::Enrollment { .. }, 1..) => {
+            if grant.uses.is_some() || grant.machine.is_some() {
+                return Err(CoreError::GrantDenied(
+                    "enrollment-only fields forbidden on session or ancestor grants".to_string(),
+                ));
+            }
+        }
+        (GrantCheckMode::Enrollment { .. }, 0) => {
+            if grant.machine != Some(true) {
+                return Err(CoreError::GrantDenied(
+                    "enrollment grant requires machine=true".to_string(),
+                ));
+            }
+            if grant.uses != Some(1) {
+                return Err(CoreError::GrantDenied(
+                    "enrollment grant requires uses=1".to_string(),
+                ));
+            }
+            b64url_decode_array::<16>(&grant.nonce).map_err(|_| {
+                CoreError::GrantDenied("enrollment grant nonce must be 16-byte b64url".to_string())
+            })?;
+        }
+    }
     if !seen_nonces.insert(grant.nonce.clone()) {
         return Err(CoreError::DelegationDenied(
             "delegation nonce cycle".to_string(),
@@ -561,7 +653,21 @@ where
     }
     parse_caps(&grant.caps)?;
 
-    if let Some(subj) = expected_subject
+    if grant.subject == "*" {
+        match (mode, depth) {
+            (
+                GrantCheckMode::Enrollment {
+                    allow_wildcard_subject: true,
+                },
+                0,
+            ) => {}
+            _ => {
+                return Err(CoreError::GrantDenied(
+                    "wildcard grant subject disallowed".to_string(),
+                ));
+            }
+        }
+    } else if let Some(subj) = expected_subject
         && grant.subject != subj
     {
         return Err(CoreError::GrantDenied("grant subject mismatch".to_string()));
@@ -613,6 +719,7 @@ where
             now_unix,
             crl,
             depth + 1,
+            mode,
             seen_nonces,
             seen_subjects,
             lookup_issuer_key,
@@ -829,7 +936,7 @@ fn grant_allows_path_depth(
     Ok(true)
 }
 
-fn parse_caps(raw: &[String]) -> Result<Vec<Capability>, CoreError> {
+pub(crate) fn parse_caps(raw: &[String]) -> Result<Vec<Capability>, CoreError> {
     raw.iter().map(|s| Capability::parse(s)).collect()
 }
 

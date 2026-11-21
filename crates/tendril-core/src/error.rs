@@ -136,6 +136,21 @@ pub enum CoreError {
     #[error("session closed (code {code}): {reason}")]
     SessionClosed { code: u16, reason: String },
 
+    #[error("enrollment token invalid: {0}")]
+    EnrollmentTokenInvalid(String),
+
+    #[error("enrollment token expired")]
+    EnrollmentTokenExpired,
+
+    #[error("enrollment token already used")]
+    EnrollmentTokenReplayed,
+
+    #[error("enrollment anchor untrusted: {0}")]
+    EnrollmentAnchorUntrusted(String),
+
+    #[error("enrollment burn log capacity exceeded")]
+    EnrollmentBurnLogFull,
+
     #[error("state machine not ready: {0}")]
     NotReady(&'static str),
 
@@ -150,6 +165,10 @@ impl CoreError {
         match self {
             Self::PairingCodeExpired => "code_expired",
             Self::PairingCodeBurned => "code_burned",
+            Self::EnrollmentTokenExpired => "token_expired",
+            Self::EnrollmentTokenReplayed => "token_replayed",
+            Self::EnrollmentAnchorUntrusted(_) => "untrusted_anchor",
+            Self::EnrollmentBurnLogFull => "rate_limited",
             Self::PeerRevoked(_) => "revoked",
             Self::PairingPathDisallowed(_) => "path_disallowed",
             Self::ProtocolViolation(_)

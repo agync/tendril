@@ -282,7 +282,14 @@ pub struct SessionHello {
 pub struct PairClaim {
     pub name: String,
     pub kind: String,
-    pub code_mac: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mac: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_token: Option<Grant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_pub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_proof: Option<String>,
 }
 
 /// Encrypted post-handshake response frame for `intent = pair` (`responder -> initiator`).

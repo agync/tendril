@@ -630,7 +630,7 @@ fn adversarial_wire_and_framing_faults() {
         )
         .unwrap();
     host_roster
-        .confirm_peer(&client_id.device_id(), None)
+        .confirm_peer(&client_id.device_id(), Some("abcd efgh ijkl mnop"))
         .unwrap();
 
     let mut cli_roster = Roster::new();
@@ -1095,7 +1095,9 @@ fn adversarial_grants_crl_and_rotation_forks() {
                 "abcd".into(),
             )
             .unwrap();
-        host_roster.confirm_peer(&peer.device_id(), None).unwrap();
+        host_roster
+            .confirm_peer(&peer.device_id(), Some("abcd"))
+            .unwrap();
     }
     client_roster
         .insert_pinned_host(
@@ -1613,7 +1615,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             "sas".into(),
         )
         .unwrap();
-    roster.confirm_peer(&del_dev, None).unwrap();
+    roster.confirm_peer(&del_dev, Some("sas")).unwrap();
 
     let lookup = |id: &str| roster.lookup_active_signing_key(id);
 
@@ -1855,7 +1857,9 @@ fn batch1_sec10_rekey_does_not_desync_on_oversized_payload() {
             "sas".into(),
         )
         .unwrap();
-    host_roster.confirm_peer(&cli.device_id(), None).unwrap();
+    host_roster
+        .confirm_peer(&cli.device_id(), Some("sas"))
+        .unwrap();
     cli_roster
         .insert_pinned_host(
             host.host_id().to_string(),
@@ -2154,7 +2158,9 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
             "sas".into(),
         )
         .unwrap();
-    host_roster.confirm_peer(&cli.device_id(), None).unwrap();
+    host_roster
+        .confirm_peer(&cli.device_id(), Some("sas"))
+        .unwrap();
     cli_roster
         .insert_pinned_host(
             host.host_id().to_string(),
@@ -2458,7 +2464,10 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
     let bad_claim = PairClaim {
         name: "Evil\x1b[31mDevice".into(),
         kind: "cli\n".into(),
-        code_mac: b64url_encode(&mac),
+        code_mac: Some(b64url_encode(&mac)),
+        enrollment_token: None,
+        signing_pub: None,
+        enroll_proof: None,
     };
     let mut m3 = vec![0u8; MAX_FRAME_LEN];
     let n3 = hs_i
@@ -2485,5 +2494,949 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
         String::from_utf8_lossy(&ept[..ne]).contains("protocol_error"),
         "expected protocol_error response, got {}",
         String::from_utf8_lossy(&ept[..ne])
+    );
+}
+
+fn completed_pair_outcome(actions: &[PairAction]) -> PairOutcome {
+    actions
+        .iter()
+        .find_map(|a| match a {
+            PairAction::Completed(o) => Some(o.clone()),
+            _ => None,
+        })
+        .expect("expected PairAction::Completed")
+}
+
+fn host_pinned(host: &EndpointIdentity) -> PinnedHost {
+    PinnedHost {
+        host_id: Some(host.host_id().to_string()),
+        static_pub: *host.static_key().public_bytes(),
+        signing_pub: *host.signing_key().public_bytes(),
+        rotation_seq: host.rotation_seq(),
+    }
+}
+
+#[test]
+fn phase6_m2m_self_and_anchor_delegated_enrollment_and_default_deny() {
+    use tendril_core::grants::authorize_grant;
+    use tendril_core::pairing::{EnrollmentPolicy, mint_enrollment_token};
+
+    let host = mk_identity(120);
+    let peer_self = mk_identity(121);
+    let peer_delegated = mk_identity(122);
+    let anchor = mk_identity(123).with_host_id("anchor-prod");
+    let delegate = mk_identity(124).with_host_id("anchor-delegate");
+
+    let mut host_roster = Roster::new();
+    host_roster
+        .add_trust_anchor("anchor-prod".into(), *anchor.signing_key().public_bytes())
+        .unwrap();
+    host_roster
+        .insert_pinned_host(
+            "anchor-delegate".into(),
+            "Delegate".into(),
+            *delegate.static_key().public_bytes(),
+            Some(*delegate.signing_key().public_bytes()),
+            0,
+            vec![],
+        )
+        .unwrap();
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let policy = EnrollmentPolicy::enabled_default();
+
+    // 1. Self-issued M2M token enrolls peer_self as Active with zero app grants.
+    let self_tok = mint_enrollment_token(
+        &host,
+        host.host_id(),
+        Some(&peer_self.device_id()),
+        NOW_UNIX,
+        900,
+        [0xA1; 16],
+    )
+    .unwrap();
+    let mut init1 = PairingInitiator::new_m2m(
+        &peer_self,
+        "runner-self",
+        "machine",
+        self_tok.clone(),
+        host_pinned(&host),
+        None,
+    )
+    .unwrap();
+    let mut resp1 =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let (i1, r1) = run_pair_exchange(
+        &mut init1,
+        &mut resp1,
+        &mut mgr,
+        &mut host_roster,
+        NOW_UNIX,
+        19,
+    );
+    assert!(matches!(
+        completed_pair_outcome(&i1),
+        PairOutcome::InitiatorEnrolled { ref device_id, ref token_nonce, .. }
+            if device_id == &peer_self.device_id() && token_nonce == &self_tok.nonce
+    ));
+    assert!(matches!(
+        completed_pair_outcome(&r1),
+        PairOutcome::ResponderEnrolled { ref device_id, ref token_nonce, .. }
+            if device_id == &peer_self.device_id() && token_nonce == &self_tok.nonce
+    ));
+    let entry = host_roster.get(&peer_self.device_id()).unwrap();
+    assert_eq!(entry.state, PeerState::Active);
+    assert_eq!(
+        entry.signing_pub,
+        Some(*peer_self.signing_key().public_bytes())
+    );
+    assert!(entry.grants.is_empty());
+
+    // Default deny: session rejects missing grant, then accepts explicitly minted grant.
+    let mut peer_roster = Roster::new();
+    peer_roster
+        .insert_pinned_host(
+            host.host_id().to_string(),
+            "Host".into(),
+            *host.static_key().public_bytes(),
+            Some(*host.signing_key().public_bytes()),
+            0,
+            vec![],
+        )
+        .unwrap();
+    let mut s_init =
+        SessionMachine::new_initiator(&peer_self, host.host_id(), None, None, None).unwrap();
+    let mut s_resp = SessionMachine::new_responder(&host, None).unwrap();
+    let (_, resp_s) = connect_session(
+        &mut s_init,
+        &mut s_resp,
+        &mut peer_roster,
+        &mut host_roster,
+        NOW_UNIX,
+        10_000,
+        64,
+    )
+    .unwrap();
+    let _ = resp_s;
+    let (deny_res, audit_deny) = authorize_grant(
+        None,
+        &peer_self.device_id(),
+        host.host_id(),
+        "fs.read:/secret",
+        NOW_UNIX,
+        None,
+        |id| (id == host.host_id()).then_some(*host.signing_key().public_bytes()),
+    );
+    assert!(deny_res.is_err());
+    assert!(!audit_deny.allow);
+
+    let app_grant = host_roster
+        .mint_grant(
+            &host,
+            &peer_self.device_id(),
+            vec!["fs.read:/secret/*".to_string()],
+            GRANT_NB,
+            GRANT_NA,
+            [0xB1; 16],
+        )
+        .unwrap();
+    let (ok_res, audit_ok) = authorize_grant(
+        Some(&app_grant),
+        &peer_self.device_id(),
+        host.host_id(),
+        "fs.read:/secret/doc.txt",
+        NOW_UNIX,
+        None,
+        |id| (id == host.host_id()).then_some(*host.signing_key().public_bytes()),
+    );
+    assert!(ok_res.is_ok());
+    assert!(audit_ok.allow);
+
+    // 2. Trust-anchor delegated M2M enrollment (ancestor holds pair.mint + pair.enroll; no uses/machine).
+    let root_delegator = sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: "anchor-prod".to_string(),
+            subject: "anchor-delegate".to_string(),
+            caps: vec![
+                "pair.mint".to_string(),
+                format!("pair.enroll:{}", host.host_id()),
+            ],
+            not_before: "2026-11-20T00:00:00Z".to_string(),
+            not_after: "2026-12-20T00:00:00Z".to_string(),
+            nonce: "anchor_parent_nonce_01".to_string(),
+            delegated_from: vec![],
+            uses: None,
+            machine: None,
+        },
+        &anchor.signing_key().signing_key(),
+    )
+    .unwrap();
+    let child_enroll = sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: "anchor-delegate".to_string(),
+            subject: "*".to_string(),
+            caps: vec![format!("pair.enroll:{}", host.host_id())],
+            not_before: "2026-11-25T00:00:00Z".to_string(),
+            not_after: "2026-11-25T00:10:00Z".to_string(),
+            nonce: b64url_encode(&[0xA2; 16]),
+            delegated_from: vec![root_delegator],
+            uses: Some(1),
+            machine: Some(true),
+        },
+        &delegate.signing_key().signing_key(),
+    )
+    .unwrap();
+
+    let mut init2 = PairingInitiator::new_m2m(
+        &peer_delegated,
+        "runner-del",
+        "machine",
+        child_enroll,
+        host_pinned(&host),
+        None,
+    )
+    .unwrap();
+    let mut resp2 =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let (i2, r2) = run_pair_exchange(
+        &mut init2,
+        &mut resp2,
+        &mut mgr,
+        &mut host_roster,
+        NOW_UNIX,
+        31,
+    );
+    assert!(matches!(
+        completed_pair_outcome(&i2),
+        PairOutcome::InitiatorEnrolled { .. }
+    ));
+    assert!(matches!(
+        completed_pair_outcome(&r2),
+        PairOutcome::ResponderEnrolled { .. }
+    ));
+
+    // 3. Replay rejection survives JSON serialization reload!
+    let json = serde_json::to_string(&host_roster).unwrap();
+    let mut reloaded: Roster = serde_json::from_str(&json).unwrap();
+    let other_peer = mk_identity(125);
+    let init3 = PairingInitiator::new_m2m(
+        &other_peer,
+        "replayer",
+        "machine",
+        self_tok,
+        host_pinned(&host),
+        None,
+    )
+    .unwrap_err();
+    let _ = init3; // self_tok was subject-bound to peer_self; test replay as peer_self!
+    let mut init_replay = PairingInitiator::new_m2m(
+        &peer_self,
+        "replayer",
+        "machine",
+        mint_enrollment_token(
+            &host,
+            host.host_id(),
+            Some(&peer_self.device_id()),
+            NOW_UNIX,
+            900,
+            [0xA1; 16],
+        )
+        .unwrap(),
+        host_pinned(&host),
+        None,
+    )
+    .unwrap();
+    let mut resp_replay =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let (i_rep, r_rep) = run_pair_exchange(
+        &mut init_replay,
+        &mut resp_replay,
+        &mut mgr,
+        &mut reloaded,
+        NOW_UNIX,
+        64,
+    );
+    assert_eq!(
+        completed_pair_outcome(&i_rep),
+        PairOutcome::Rejected {
+            error: "token_replayed".to_string()
+        }
+    );
+    assert_eq!(
+        completed_pair_outcome(&r_rep),
+        PairOutcome::Rejected {
+            error: "token_replayed".to_string()
+        }
+    );
+}
+
+#[test]
+fn phase6_m2m_negative_expiry_anchor_crl_revoked_burn_rotation_and_sas() {
+    use tendril_core::MAX_BURNED_ENROLLMENT_NONCES;
+    use tendril_core::grants::{
+        authorize_grant, verify_enrollment_grant_chain, verify_grant_with_chain,
+    };
+    use tendril_core::pairing::{EnrollmentPolicy, mint_enrollment_token, verify_enrollment_token};
+
+    let host = mk_identity(130);
+    let peer = mk_identity(131);
+    let innocent = mk_identity(132);
+    let anchor = mk_identity(133).with_host_id("anchor-a");
+    let sibling_anchor_sk = anchor.signing_key().clone();
+    let rogue_anchor = mk_identity(134).with_host_id("rogue-anchor");
+    let policy = EnrollmentPolicy::enabled_default();
+    let mut mgr = PairingManager::new(PairingConfig::default());
+
+    let mut roster = Roster::new();
+    roster
+        .add_trust_anchor("anchor-a".into(), *anchor.signing_key().public_bytes())
+        .unwrap();
+    roster
+        .add_trust_anchor("anchor-b-sibling".into(), *sibling_anchor_sk.public_bytes())
+        .unwrap();
+
+    // 1. Expired token -> token_expired
+    let expired_tok = mint_enrollment_token(
+        &host,
+        host.host_id(),
+        None,
+        NOW_UNIX - 1000,
+        900,
+        [0xC1; 16],
+    )
+    .unwrap();
+    let mut init_exp =
+        PairingInitiator::new_m2m(&peer, "p", "machine", expired_tok, host_pinned(&host), None)
+            .unwrap();
+    let mut resp_exp =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let (ie, _) = run_pair_exchange(
+        &mut init_exp,
+        &mut resp_exp,
+        &mut mgr,
+        &mut roster,
+        NOW_UNIX,
+        64,
+    );
+    assert_eq!(
+        completed_pair_outcome(&ie),
+        PairOutcome::Rejected {
+            error: "token_expired".to_string()
+        }
+    );
+
+    // 2. Untrusted anchor -> untrusted_anchor
+    let rogue_tok = mint_enrollment_token(
+        &rogue_anchor,
+        host.host_id(),
+        None,
+        NOW_UNIX,
+        900,
+        [0xC2; 16],
+    )
+    .unwrap();
+    let mut init_rogue =
+        PairingInitiator::new_m2m(&peer, "p", "machine", rogue_tok, host_pinned(&host), None)
+            .unwrap();
+    let mut resp_rogue =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let (ir, _) = run_pair_exchange(
+        &mut init_rogue,
+        &mut resp_rogue,
+        &mut mgr,
+        &mut roster,
+        NOW_UNIX,
+        64,
+    );
+    assert_eq!(
+        completed_pair_outcome(&ir),
+        PairOutcome::Rejected {
+            error: "untrusted_anchor".to_string()
+        }
+    );
+
+    // 3. Sibling anchor revocation blocks anchor sharing the same signing key
+    let sibling_tok = mint_enrollment_token(
+        &anchor.clone().with_host_id("anchor-b-sibling"),
+        host.host_id(),
+        None,
+        NOW_UNIX,
+        900,
+        [0xC3; 16],
+    )
+    .unwrap();
+    roster.revoke_trust_anchor("anchor-a").unwrap();
+    let mut init_sib =
+        PairingInitiator::new_m2m(&peer, "p", "machine", sibling_tok, host_pinned(&host), None)
+            .unwrap();
+    let mut resp_sib =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let (isib, _) = run_pair_exchange(
+        &mut init_sib,
+        &mut resp_sib,
+        &mut mgr,
+        &mut roster,
+        NOW_UNIX,
+        64,
+    );
+    assert_eq!(
+        completed_pair_outcome(&isib),
+        PairOutcome::Rejected {
+            error: "untrusted_anchor".to_string()
+        }
+    );
+
+    // 4. CRL revoke_nonce blocks unused token
+    let crl_tok =
+        mint_enrollment_token(&host, host.host_id(), None, NOW_UNIX, 900, [0xC4; 16]).unwrap();
+    roster
+        .revoke_nonce(&host, &crl_tok.nonce, NOW_UNIX)
+        .unwrap();
+    let mut init_crl =
+        PairingInitiator::new_m2m(&peer, "p", "machine", crl_tok, host_pinned(&host), None)
+            .unwrap();
+    let mut resp_crl =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let (icrl, _) = run_pair_exchange(
+        &mut init_crl,
+        &mut resp_crl,
+        &mut mgr,
+        &mut roster,
+        NOW_UNIX,
+        64,
+    );
+    assert_eq!(
+        completed_pair_outcome(&icrl),
+        PairOutcome::Rejected {
+            error: "unauthorized".to_string()
+        }
+    );
+
+    // 5. Revoked peer presenting stolen valid wildcard token BURNS the token nonce & gets "revoked"
+    let wildcard_tok =
+        mint_enrollment_token(&host, host.host_id(), None, NOW_UNIX, 900, [0xC5; 16]).unwrap();
+    roster
+        .record_enrolled_machine(
+            *peer.static_key().public_bytes(),
+            *peer.signing_key().public_bytes(),
+            "revoked-peer".into(),
+            "machine".into(),
+        )
+        .unwrap();
+    roster.revoke_peer(&peer.device_id()).unwrap();
+
+    let mut init_rev = PairingInitiator::new_m2m(
+        &peer,
+        "revoked-peer",
+        "machine",
+        wildcard_tok.clone(),
+        host_pinned(&host),
+        None,
+    )
+    .unwrap();
+    let mut resp_rev =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let (irev, _) = run_pair_exchange(
+        &mut init_rev,
+        &mut resp_rev,
+        &mut mgr,
+        &mut roster,
+        NOW_UNIX,
+        64,
+    );
+    assert_eq!(
+        completed_pair_outcome(&irev),
+        PairOutcome::Rejected {
+            error: "revoked".to_string()
+        }
+    );
+    assert!(roster.is_enrollment_nonce_burned(&wildcard_tok.nonce));
+
+    // Innocent peer re-using the burned stolen token gets token_replayed!
+    let mut init_inn = PairingInitiator::new_m2m(
+        &innocent,
+        "innocent",
+        "machine",
+        wildcard_tok,
+        host_pinned(&host),
+        None,
+    )
+    .unwrap();
+    let mut resp_inn =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let (iinn, _) = run_pair_exchange(
+        &mut init_inn,
+        &mut resp_inn,
+        &mut mgr,
+        &mut roster,
+        NOW_UNIX,
+        64,
+    );
+    assert_eq!(
+        completed_pair_outcome(&iinn),
+        PairOutcome::Rejected {
+            error: "token_replayed".to_string()
+        }
+    );
+
+    // 6. Host rotation + M2M enrollment succeeds when initiator pins pre-rotation identity,
+    // and wrong pin aborts msg2 with HostKeyUnverified before msg3!
+    let mut rotated_host = host.clone();
+    let pre_rot_pin = host_pinned(&host);
+    let new_stat = StaticKeypair::from_scalar([0xE1; 32]);
+    let new_sig = SigningKeypair::from_seed([0xE2; 32]);
+    rotated_host.rotate(new_stat, new_sig, NOW_UNIX).unwrap();
+    roster.resign_crl(&rotated_host, NOW_UNIX).unwrap();
+    let rot_tok = mint_enrollment_token(
+        &rotated_host,
+        rotated_host.host_id(),
+        Some(&innocent.device_id()),
+        NOW_UNIX,
+        900,
+        [0xC6; 16],
+    )
+    .unwrap();
+    let mut init_rot = PairingInitiator::new_m2m(
+        &innocent,
+        "innocent-rot",
+        "machine",
+        rot_tok.clone(),
+        pre_rot_pin,
+        None,
+    )
+    .unwrap();
+    let mut resp_rot = PairingResponder::with_enrollment_policy(
+        &rotated_host,
+        PairingPathKind::Remote,
+        None,
+        policy,
+    )
+    .unwrap();
+    let (irot, _) = run_pair_exchange(
+        &mut init_rot,
+        &mut resp_rot,
+        &mut mgr,
+        &mut roster,
+        NOW_UNIX,
+        64,
+    );
+    assert!(matches!(
+        completed_pair_outcome(&irot),
+        PairOutcome::InitiatorEnrolled {
+            host_rotation_seq: 1,
+            ..
+        }
+    ));
+
+    let mut bad_pin = host_pinned(&mk_identity(199));
+    bad_pin.host_id = Some(rotated_host.host_id().to_string());
+    let mut bad_pin_init =
+        PairingInitiator::new_m2m(&innocent, "bad-pin", "machine", rot_tok, bad_pin, None).unwrap();
+    let mut resp_bad = PairingResponder::with_enrollment_policy(
+        &rotated_host,
+        PairingPathKind::Remote,
+        None,
+        policy,
+    )
+    .unwrap();
+    let msg1 = collect_pair_writes(&bad_pin_init.start().unwrap());
+    let msg2 = collect_pair_writes(
+        &resp_bad
+            .feed_bytes(&msg1, NOW_UNIX, &mut mgr, &mut roster)
+            .unwrap(),
+    );
+    assert_eq!(
+        bad_pin_init.feed_bytes(&msg2),
+        Err(CoreError::HostKeyUnverified)
+    );
+
+    // 7. Purpose separation, SAS confirmation, and structural validation checks
+    let lookup_host =
+        |id: &str| (id == host.host_id()).then_some(*host.signing_key().public_bytes());
+    let bad_uses0 = sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: host.host_id().to_string(),
+            subject: innocent.device_id(),
+            caps: vec!["pair.enroll".to_string()],
+            not_before: "2026-11-25T00:00:00Z".to_string(),
+            not_after: "2026-11-25T00:05:00Z".to_string(),
+            nonce: b64url_encode(&[0xD1; 16]),
+            delegated_from: vec![],
+            uses: Some(0),
+            machine: Some(true),
+        },
+        &host.signing_key().signing_key(),
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_grant_with_chain(
+            &bad_uses0,
+            &innocent.device_id(),
+            host.host_id(),
+            NOW_UNIX,
+            None,
+            lookup_host
+        ),
+        Err(CoreError::GrantDenied(_))
+    ));
+    assert!(matches!(
+        verify_enrollment_grant_chain(
+            &bad_uses0,
+            &innocent.device_id(),
+            true,
+            host.host_id(),
+            NOW_UNIX,
+            None,
+            lookup_host
+        ),
+        Err(CoreError::GrantDenied(_))
+    ));
+
+    let bad_app_cap = sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: host.host_id().to_string(),
+            subject: innocent.device_id(),
+            caps: vec!["pair.enroll".to_string(), "fs.read:/".to_string()],
+            not_before: "2026-11-25T00:00:00Z".to_string(),
+            not_after: "2026-11-25T00:05:00Z".to_string(),
+            nonce: b64url_encode(&[0xD2; 16]),
+            delegated_from: vec![],
+            uses: Some(1),
+            machine: Some(true),
+        },
+        &host.signing_key().signing_key(),
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_enrollment_token(
+            &bad_app_cap,
+            host.host_id(),
+            host.signing_key().public_bytes(),
+            &innocent.device_id(),
+            NOW_UNIX,
+            &policy,
+            &roster,
+        ),
+        Err(CoreError::EnrollmentTokenInvalid(_))
+    ));
+
+    let valid_enroll_for_session_check = mint_enrollment_token(
+        &host,
+        host.host_id(),
+        Some(&innocent.device_id()),
+        NOW_UNIX,
+        900,
+        [0xD3; 16],
+    )
+    .unwrap();
+    let (session_check_res, _) = authorize_grant(
+        Some(&valid_enroll_for_session_check),
+        &innocent.device_id(),
+        host.host_id(),
+        "pair.enroll",
+        NOW_UNIX,
+        None,
+        lookup_host,
+    );
+    assert!(matches!(session_check_res, Err(CoreError::GrantDenied(_))));
+
+    let bad_machine_false = sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: host.host_id().to_string(),
+            subject: innocent.device_id(),
+            caps: vec!["session.ping".to_string()],
+            not_before: "2026-11-25T00:00:00Z".to_string(),
+            not_after: "2026-11-25T00:05:00Z".to_string(),
+            nonce: b64url_encode(&[0xD4; 16]),
+            delegated_from: vec![],
+            uses: None,
+            machine: Some(false),
+        },
+        &host.signing_key().signing_key(),
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_grant_with_chain(
+            &bad_machine_false,
+            &innocent.device_id(),
+            host.host_id(),
+            NOW_UNIX,
+            None,
+            lookup_host,
+        ),
+        Err(CoreError::GrantDenied(_))
+    ));
+
+    // confirm_peer(..., None) fails closed when live SAS exists, and confirm_peer_without_sas succeeds.
+    let sas_peer = mk_identity(135);
+    roster
+        .record_pending_pair(
+            *sas_peer.static_key().public_bytes(),
+            None,
+            "HumanCli".into(),
+            "cli".into(),
+            "abcd 1234 efgh 5678".into(),
+        )
+        .unwrap();
+    assert_eq!(
+        roster.confirm_peer(&sas_peer.device_id(), None),
+        Err(CoreError::ProtocolViolation(
+            "pairing SAS confirmation required"
+        ))
+    );
+    roster
+        .confirm_peer_without_sas(&sas_peer.device_id())
+        .unwrap();
+    assert_eq!(
+        roster.get(&sas_peer.device_id()).unwrap().state,
+        PeerState::Active
+    );
+
+    // Burn-log capacity cap & expired pruning
+    let mut cap_roster = Roster::new();
+    for i in 0..MAX_BURNED_ENROLLMENT_NONCES {
+        let mut nonce = [0u8; 16];
+        nonce[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        cap_roster
+            .burn_enrollment_nonce(&b64url_encode(&nonce), NOW_UNIX + 100, NOW_UNIX)
+            .unwrap();
+    }
+    assert_eq!(
+        cap_roster.burn_enrollment_nonce("overflow-nonce-000000", NOW_UNIX + 100, NOW_UNIX),
+        Err(CoreError::EnrollmentBurnLogFull)
+    );
+    // Once expired, pruning reclaims slots cleanly!
+    cap_roster
+        .burn_enrollment_nonce("post-expiry-nonce-000", NOW_UNIX + 200, NOW_UNIX + 101)
+        .unwrap();
+}
+
+#[test]
+fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
+    use tendril_core::crypto::device_id;
+    use tendril_core::pairing::mint_enrollment_token;
+    use tendril_core::wire::{PairResponse, encode_frame};
+
+    let host = mk_identity(140);
+    let peer = mk_identity(141);
+    let params: NoiseParams = NOISE_PATTERN.parse().unwrap();
+    let preamble = Preamble::v1(Intent::Pair).encode();
+
+    // 1. M2M initiator rejects responder returning status == "pending" instead of "active".
+    let tok = mint_enrollment_token(
+        &host,
+        host.host_id(),
+        Some(&peer.device_id()),
+        NOW_UNIX,
+        900,
+        [0xE1; 16],
+    )
+    .unwrap();
+    let mut init_m2m =
+        PairingInitiator::new_m2m(&peer, "m", "machine", tok, host_pinned(&host), None).unwrap();
+    let mut raw_resp = Builder::new(params.clone())
+        .local_private_key(host.static_key().secret_bytes())
+        .unwrap()
+        .prologue(&preamble)
+        .unwrap()
+        .build_responder()
+        .unwrap();
+    let mut buf = vec![0u8; MAX_FRAME_LEN];
+    let mut pt = vec![0u8; MAX_FRAME_LEN];
+    let m1 = collect_pair_writes(&init_m2m.start().unwrap());
+    raw_resp
+        .read_message(decode_frame(&m1[6..]).unwrap().0, &mut pt)
+        .unwrap();
+    let hh = serde_json::to_vec(&HostHello {
+        host_id: host.host_id().to_string(),
+        proto_version: 1,
+        rotation: vec![],
+    })
+    .unwrap();
+    let n2 = raw_resp.write_message(&hh, &mut buf).unwrap();
+    let m3 = collect_pair_writes(
+        &init_m2m
+            .feed_bytes(&encode_frame(&buf[..n2]).unwrap())
+            .unwrap(),
+    );
+    raw_resp
+        .read_message(decode_frame(&m3).unwrap().0, &mut pt)
+        .unwrap();
+    let mut tx_r = raw_resp.into_transport_mode().unwrap();
+    let wrong_status = serde_json::to_vec(&PairResponse::Success {
+        device_id: peer.device_id(),
+        status: "pending".to_string(),
+        host_signing_pub: b64url_encode(host.signing_key().public_bytes()),
+    })
+    .unwrap();
+    let n4 = tx_r.write_message(&wrong_status, &mut buf).unwrap();
+    assert_eq!(
+        init_m2m.feed_bytes(&encode_frame(&buf[..n4]).unwrap()),
+        Err(CoreError::ProtocolViolation(
+            "unexpected pair response fields"
+        ))
+    );
+
+    // 2. Human initiator rejects responder returning status == "active" instead of "pending".
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Remote3Group, NOW_UNIX)
+        .unwrap();
+    let mut init_hum =
+        PairingInitiator::new(&peer, "h", "cli", code, Some(host_pinned(&host)), None).unwrap();
+    let mut raw_resp2 = Builder::new(params.clone())
+        .local_private_key(host.static_key().secret_bytes())
+        .unwrap()
+        .prologue(&preamble)
+        .unwrap()
+        .build_responder()
+        .unwrap();
+    let hm1 = collect_pair_writes(&init_hum.start().unwrap());
+    raw_resp2
+        .read_message(decode_frame(&hm1[6..]).unwrap().0, &mut pt)
+        .unwrap();
+    let hn2 = raw_resp2.write_message(&hh, &mut buf).unwrap();
+    let hm3 = collect_pair_writes(
+        &init_hum
+            .feed_bytes(&encode_frame(&buf[..hn2]).unwrap())
+            .unwrap(),
+    );
+    raw_resp2
+        .read_message(decode_frame(&hm3).unwrap().0, &mut pt)
+        .unwrap();
+    let mut tx_r2 = raw_resp2.into_transport_mode().unwrap();
+    let wrong_active = serde_json::to_vec(&PairResponse::Success {
+        device_id: device_id(peer.static_key().public_bytes()),
+        status: "active".to_string(),
+        host_signing_pub: b64url_encode(host.signing_key().public_bytes()),
+    })
+    .unwrap();
+    let hn4 = tx_r2.write_message(&wrong_active, &mut buf).unwrap();
+    assert_eq!(
+        init_hum.feed_bytes(&encode_frame(&buf[..hn4]).unwrap()),
+        Err(CoreError::ProtocolViolation(
+            "unexpected pair response fields"
+        ))
+    );
+
+    // 3. Forged enroll_proof and XOR PairClaim conflict fail closed on PairingResponder.
+    let policy = tendril_core::pairing::EnrollmentPolicy::enabled_default();
+    let tok2 = mint_enrollment_token(
+        &host,
+        host.host_id(),
+        Some(&peer.device_id()),
+        NOW_UNIX,
+        900,
+        [0xE2; 16],
+    )
+    .unwrap();
+    let mut forged_resp =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let mut raw_init = Builder::new(params.clone())
+        .local_private_key(peer.static_key().secret_bytes())
+        .unwrap()
+        .prologue(&preamble)
+        .unwrap()
+        .build_initiator()
+        .unwrap();
+    let n1 = raw_init.write_message(&[], &mut buf).unwrap();
+    let mut f1 = preamble.to_vec();
+    f1.extend_from_slice(&encode_frame(&buf[..n1]).unwrap());
+    let out2 = collect_pair_writes(
+        &forged_resp
+            .feed_bytes(&f1, NOW_UNIX, &mut mgr, &mut Roster::new())
+            .unwrap(),
+    );
+    raw_init
+        .read_message(decode_frame(&out2).unwrap().0, &mut pt)
+        .unwrap();
+    let forged_claim = PairClaim {
+        name: "m".into(),
+        kind: "machine".into(),
+        code_mac: None,
+        enrollment_token: Some(tok2.clone()),
+        signing_pub: Some(b64url_encode(peer.signing_key().public_bytes())),
+        enroll_proof: Some(b64url_encode(&[0x42u8; 64])),
+    };
+    let n3 = raw_init
+        .write_message(&serde_json::to_vec(&forged_claim).unwrap(), &mut buf)
+        .unwrap();
+    let mut r_forged = Roster::new();
+    let r_acts = forged_resp
+        .feed_bytes(
+            &encode_frame(&buf[..n3]).unwrap(),
+            NOW_UNIX,
+            &mut mgr,
+            &mut r_forged,
+        )
+        .unwrap();
+    assert_eq!(
+        completed_pair_outcome(&r_acts),
+        PairOutcome::Rejected {
+            error: "unauthorized".to_string()
+        }
+    );
+    assert!(!r_forged.is_enrollment_nonce_burned(&tok2.nonce));
+
+    // 4. Setting both code_mac and M2M fields in PairClaim returns protocol_error.
+    let mut conflict_resp =
+        PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
+            .unwrap();
+    let mut raw_init2 = Builder::new(params)
+        .local_private_key(peer.static_key().secret_bytes())
+        .unwrap()
+        .prologue(&preamble)
+        .unwrap()
+        .build_initiator()
+        .unwrap();
+    let cn1 = raw_init2.write_message(&[], &mut buf).unwrap();
+    let mut cf1 = preamble.to_vec();
+    cf1.extend_from_slice(&encode_frame(&buf[..cn1]).unwrap());
+    let cout2 = collect_pair_writes(
+        &conflict_resp
+            .feed_bytes(&cf1, NOW_UNIX, &mut mgr, &mut Roster::new())
+            .unwrap(),
+    );
+    raw_init2
+        .read_message(decode_frame(&cout2).unwrap().0, &mut pt)
+        .unwrap();
+    let conflict_claim = PairClaim {
+        name: "m".into(),
+        kind: "machine".into(),
+        code_mac: Some(b64url_encode(&[0x11u8; 32])),
+        enrollment_token: Some(tok2),
+        signing_pub: Some(b64url_encode(peer.signing_key().public_bytes())),
+        enroll_proof: Some(b64url_encode(&[0x42u8; 64])),
+    };
+    let cn3 = raw_init2
+        .write_message(&serde_json::to_vec(&conflict_claim).unwrap(), &mut buf)
+        .unwrap();
+    let c_acts = conflict_resp
+        .feed_bytes(
+            &encode_frame(&buf[..cn3]).unwrap(),
+            NOW_UNIX,
+            &mut mgr,
+            &mut Roster::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        completed_pair_outcome(&c_acts),
+        PairOutcome::Rejected {
+            error: "protocol_error".to_string()
+        }
     );
 }

@@ -23,9 +23,14 @@ use tendril_core::identity::{
     RotationRecord, detect_rotation_fork, rotation_signed_bytes, sign_rotation,
     verify_rotation_chain, verify_rotation_record,
 };
+use tendril_core::pairing::{
+    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, enroll_proof_bytes, sign_enroll_proof,
+    verify_enroll_proof, verify_enrollment_token,
+};
+use tendril_core::roster::Roster;
 use tendril_core::wire::{
-    HostHello, InnerFrameType, Intent, NOISE_PATTERN, Preamble, decode_frame, decode_inner_frame,
-    encode_frame,
+    HostHello, InnerFrameType, Intent, NOISE_PATTERN, PairResponse, Preamble, decode_frame,
+    decode_inner_frame, encode_frame,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -633,5 +638,225 @@ fn handshake_transcript_vectors_match() {
     assert_eq!(
         decode_inner_frame(&pt[..np_pt]).unwrap(),
         (InnerFrameType::Data, b"after rekey".as_slice())
+    );
+}
+
+#[derive(Deserialize)]
+struct M2mEnrollmentVector {
+    noise_pattern: String,
+    preamble_hex: String,
+    now_unix: u64,
+    anchor_id: String,
+    anchor_signing_pub_hex: String,
+    responder_host_id: String,
+    responder_static_scalar_hex: String,
+    responder_static_pub_hex: String,
+    responder_ephem_scalar_hex: String,
+    responder_signing_pub_hex: String,
+    initiator_static_scalar_hex: String,
+    initiator_static_pub_hex: String,
+    initiator_device_id: String,
+    initiator_ephem_scalar_hex: String,
+    initiator_signing_seed_hex: String,
+    initiator_signing_pub_hex: String,
+    token_jcs_json: String,
+    token_signed_bytes_hex: String,
+    enrollment_token: Grant,
+    host_hello_json: String,
+    msg1_frame_hex: String,
+    msg2_frame_hex: String,
+    post_msg2_handshake_hash_hex: String,
+    enroll_proof_domain_hex: String,
+    enroll_proof_bytes_hex: String,
+    enroll_proof_b64url: String,
+    pair_claim_json: String,
+    msg3_frame_hex: String,
+    final_handshake_hash_hex: String,
+    pair_response_json: String,
+    pair_response_frame_hex: String,
+    replayed_response_json: String,
+}
+
+#[test]
+fn m2m_enrollment_vectors_match() {
+    use tendril_core::crypto::SigningKeypair;
+
+    let raw = fs::read_to_string(vectors_dir().join("m2m_enrollment.json")).unwrap();
+    let v: M2mEnrollmentVector = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v.noise_pattern, NOISE_PATTERN);
+
+    let pre = hex::decode(&v.preamble_hex).unwrap();
+    assert_eq!(Preamble::decode(&pre).unwrap(), Preamble::v1(Intent::Pair));
+
+    let anchor_pub = decode_hex_array::<32>(&v.anchor_signing_pub_hex);
+    let resp_static_pub = decode_hex_array::<32>(&v.responder_static_pub_hex);
+    let resp_signing_pub = decode_hex_array::<32>(&v.responder_signing_pub_hex);
+    let init_static_pub = decode_hex_array::<32>(&v.initiator_static_pub_hex);
+    let init_signing_pub = decode_hex_array::<32>(&v.initiator_signing_pub_hex);
+    assert_eq!(device_id(&init_static_pub), v.initiator_device_id);
+    assert_eq!(device_id(&resp_static_pub), v.responder_host_id);
+
+    let unsigned = v.enrollment_token.unsigned();
+    assert_eq!(canonical_json(&unsigned).unwrap(), v.token_jcs_json);
+    assert_eq!(
+        hex::encode(grant_signed_bytes(&unsigned).unwrap()),
+        v.token_signed_bytes_hex
+    );
+    verify_grant_signature(&v.enrollment_token, &anchor_pub).unwrap();
+
+    // Purpose separation: enrollment tokens must NEVER verify as regular session grants.
+    let err = verify_grant_with_chain(
+        &v.enrollment_token,
+        &v.initiator_device_id,
+        &v.anchor_id,
+        v.now_unix,
+        None,
+        |id| (id == v.anchor_id).then_some(anchor_pub),
+    );
+    assert!(matches!(err, Err(CoreError::GrantDenied(_))));
+
+    let params: NoiseParams = v.noise_pattern.parse().unwrap();
+    let mut buf = vec![0u8; MAX_FRAME_LEN];
+    let mut pt = vec![0u8; MAX_FRAME_LEN];
+    let mut init = Builder::new(params.clone())
+        .local_private_key(&decode_hex_array::<32>(&v.initiator_static_scalar_hex))
+        .unwrap()
+        .prologue(&pre)
+        .unwrap()
+        .fixed_ephemeral_key_for_testing_only(&decode_hex_array::<32>(
+            &v.initiator_ephem_scalar_hex,
+        ))
+        .build_initiator()
+        .unwrap();
+    let mut resp = Builder::new(params)
+        .local_private_key(&decode_hex_array::<32>(&v.responder_static_scalar_hex))
+        .unwrap()
+        .prologue(&pre)
+        .unwrap()
+        .fixed_ephemeral_key_for_testing_only(&decode_hex_array::<32>(
+            &v.responder_ephem_scalar_hex,
+        ))
+        .build_responder()
+        .unwrap();
+
+    let n1 = init.write_message(&[], &mut buf).unwrap();
+    let f1 = encode_frame(&buf[..n1]).unwrap();
+    assert_eq!(hex::encode(&f1), v.msg1_frame_hex);
+    resp.read_message(decode_frame(&f1).unwrap().0, &mut pt)
+        .unwrap();
+
+    let n2 = resp
+        .write_message(v.host_hello_json.as_bytes(), &mut buf)
+        .unwrap();
+    let f2 = encode_frame(&buf[..n2]).unwrap();
+    assert_eq!(hex::encode(&f2), v.msg2_frame_hex);
+    let npt2 = init
+        .read_message(decode_frame(&f2).unwrap().0, &mut pt)
+        .unwrap();
+    assert_eq!(&pt[..npt2], v.host_hello_json.as_bytes());
+
+    let h: [u8; 32] = init.get_handshake_hash().try_into().unwrap();
+    assert_eq!(hex::encode(h), v.post_msg2_handshake_hash_hex);
+    assert_eq!(hex::encode(ENROLL_PROOF_DOMAIN), v.enroll_proof_domain_hex);
+    let expected_proof_bytes = enroll_proof_bytes(&h, &init_static_pub, &v.enrollment_token.nonce);
+    assert_eq!(hex::encode(&expected_proof_bytes), v.enroll_proof_bytes_hex);
+    let proof_sig = b64url_decode_array::<64>(&v.enroll_proof_b64url).unwrap();
+    verify_enroll_proof(
+        &init_signing_pub,
+        &h,
+        &init_static_pub,
+        &v.enrollment_token.nonce,
+        &proof_sig,
+    )
+    .unwrap();
+
+    let n3 = init
+        .write_message(v.pair_claim_json.as_bytes(), &mut buf)
+        .unwrap();
+    let f3 = encode_frame(&buf[..n3]).unwrap();
+    assert_eq!(hex::encode(&f3), v.msg3_frame_hex);
+    let npt3 = resp
+        .read_message(decode_frame(&f3).unwrap().0, &mut pt)
+        .unwrap();
+    assert_eq!(&pt[..npt3], v.pair_claim_json.as_bytes());
+    assert_eq!(
+        hex::encode(init.get_handshake_hash()),
+        v.final_handshake_hash_hex
+    );
+
+    let mut init_tx = init.into_transport_mode().unwrap();
+    let mut resp_tx = resp.into_transport_mode().unwrap();
+    let n4 = resp_tx
+        .write_message(v.pair_response_json.as_bytes(), &mut buf)
+        .unwrap();
+    let f4 = encode_frame(&buf[..n4]).unwrap();
+    assert_eq!(hex::encode(&f4), v.pair_response_frame_hex);
+    let npt4 = init_tx
+        .read_message(decode_frame(&f4).unwrap().0, &mut pt)
+        .unwrap();
+    assert_eq!(&pt[..npt4], v.pair_response_json.as_bytes());
+    let parsed_resp: PairResponse = serde_json::from_slice(&pt[..npt4]).unwrap();
+    assert!(matches!(
+        parsed_resp,
+        PairResponse::Success { ref status, .. } if status == "active"
+    ));
+
+    // Also run the state machines end-to-end with the vector keys to verify replay rejection.
+    let mut roster = Roster::new();
+    roster
+        .add_trust_anchor(v.anchor_id.clone(), anchor_pub)
+        .unwrap();
+    verify_enrollment_token(
+        &v.enrollment_token,
+        &v.responder_host_id,
+        &resp_signing_pub,
+        &v.initiator_device_id,
+        v.now_unix,
+        &EnrollmentPolicy::enabled_default(),
+        &roster,
+    )
+    .unwrap();
+
+    let init_signing =
+        SigningKeypair::from_seed(decode_hex_array::<32>(&v.initiator_signing_seed_hex));
+    assert_eq!(*init_signing.public_bytes(), init_signing_pub);
+    let expected_sig = sign_enroll_proof(
+        &init_signing.signing_key(),
+        &h,
+        &init_static_pub,
+        &v.enrollment_token.nonce,
+    );
+    assert_eq!(b64url_encode(&expected_sig), v.enroll_proof_b64url);
+
+    let (_, na) = verify_enrollment_token(
+        &v.enrollment_token,
+        &v.responder_host_id,
+        &resp_signing_pub,
+        &v.initiator_device_id,
+        v.now_unix,
+        &EnrollmentPolicy::enabled_default(),
+        &roster,
+    )
+    .unwrap();
+    roster
+        .burn_enrollment_nonce(&v.enrollment_token.nonce, na, v.now_unix)
+        .unwrap();
+    assert_eq!(
+        verify_enrollment_token(
+            &v.enrollment_token,
+            &v.responder_host_id,
+            &resp_signing_pub,
+            &v.initiator_device_id,
+            v.now_unix,
+            &EnrollmentPolicy::enabled_default(),
+            &roster,
+        ),
+        Err(CoreError::EnrollmentTokenReplayed)
+    );
+    assert_eq!(
+        serde_json::from_str::<PairResponse>(&v.replayed_response_json).unwrap(),
+        PairResponse::Error {
+            error: "token_replayed".to_string(),
+        }
     );
 }

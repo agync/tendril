@@ -843,3 +843,215 @@ func TestHandshake(t *testing.T) {
 		t.Fatalf("post-rekey data decrypt mismatch: %v", err)
 	}
 }
+
+func TestM2mEnrollment(t *testing.T) {
+	type enrollGrantObj struct {
+		V         uint8    `json:"v"`
+		Issuer    string   `json:"issuer"`
+		Subject   string   `json:"subject"`
+		Caps      []string `json:"caps"`
+		NotBefore string   `json:"not_before"`
+		NotAfter  string   `json:"not_after"`
+		Nonce     string   `json:"nonce"`
+		Uses      *uint64  `json:"uses,omitempty"`
+		Machine   *bool    `json:"machine,omitempty"`
+		Sig       string   `json:"sig"`
+	}
+	var v struct {
+		NoisePattern                string         `json:"noise_pattern"`
+		PreambleHex                 string         `json:"preamble_hex"`
+		NowUnix                     uint64         `json:"now_unix"`
+		AnchorID                    string         `json:"anchor_id"`
+		AnchorSigningPubHex         string         `json:"anchor_signing_pub_hex"`
+		ResponderHostID             string         `json:"responder_host_id"`
+		ResponderStaticScalarHex    string         `json:"responder_static_scalar_hex"`
+		ResponderStaticPubHex       string         `json:"responder_static_pub_hex"`
+		ResponderEphemScalarHex     string         `json:"responder_ephem_scalar_hex"`
+		ResponderSigningPubHex      string         `json:"responder_signing_pub_hex"`
+		InitiatorStaticScalarHex    string         `json:"initiator_static_scalar_hex"`
+		InitiatorStaticPubHex       string         `json:"initiator_static_pub_hex"`
+		InitiatorDeviceID           string         `json:"initiator_device_id"`
+		InitiatorEphemScalarHex     string         `json:"initiator_ephem_scalar_hex"`
+		InitiatorSigningPubHex      string         `json:"initiator_signing_pub_hex"`
+		TokenJCSJSON                string         `json:"token_jcs_json"`
+		TokenSignedBytesHex         string         `json:"token_signed_bytes_hex"`
+		EnrollmentToken             enrollGrantObj `json:"enrollment_token"`
+		HostHelloJSON               string         `json:"host_hello_json"`
+		Msg1FrameHex                string         `json:"msg1_frame_hex"`
+		Msg2FrameHex                string         `json:"msg2_frame_hex"`
+		PostMsg2HandshakeHashHex    string         `json:"post_msg2_handshake_hash_hex"`
+		EnrollProofDomainHex        string         `json:"enroll_proof_domain_hex"`
+		EnrollProofBytesHex         string         `json:"enroll_proof_bytes_hex"`
+		EnrollProofB64URL           string         `json:"enroll_proof_b64url"`
+		PairClaimJSON               string         `json:"pair_claim_json"`
+		Msg3FrameHex                string         `json:"msg3_frame_hex"`
+		FinalHandshakeHashHex       string         `json:"final_handshake_hash_hex"`
+		PairResponseJSON            string         `json:"pair_response_json"`
+		PairResponseFrameHex        string         `json:"pair_response_frame_hex"`
+		ReplayedResponseJSON        string         `json:"replayed_response_json"`
+	}
+	loadVector(t, "m2m_enrollment.json", &v)
+
+	if v.NoisePattern != "Noise_XX_25519_ChaChaPoly_SHA256" {
+		t.Fatalf("unexpected noise pattern %s", v.NoisePattern)
+	}
+	pre := mustHex(t, v.PreambleHex)
+	if !bytes.Equal(pre, []byte{'T', 'N', 'D', 0x01, 0x02, 0x00}) {
+		t.Fatalf("unexpected preamble %x", pre)
+	}
+	if v.EnrollmentToken.Uses == nil || *v.EnrollmentToken.Uses != 1 {
+		t.Fatalf("enrollment token uses must be 1")
+	}
+	if v.EnrollmentToken.Machine == nil || !*v.EnrollmentToken.Machine {
+		t.Fatalf("enrollment token machine must be true")
+	}
+
+	rawTok, err := json.Marshal(v.EnrollmentToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tokMap map[string]any
+	if err := json.Unmarshal(rawTok, &tokMap); err != nil {
+		t.Fatal(err)
+	}
+	delete(tokMap, "sig")
+	unsignedBytes, err := json.Marshal(tokMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jcsTok, err := jsoncanonicalizer.Transform(unsignedBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(jcsTok) != v.TokenJCSJSON {
+		t.Fatalf("token JCS mismatch:\ngot:  %s\nwant: %s", string(jcsTok), v.TokenJCSJSON)
+	}
+	signedTok := append([]byte("tendril-grant-v1\x00"), jcsTok...)
+	if hex.EncodeToString(signedTok) != v.TokenSignedBytesHex {
+		t.Fatalf("token signed bytes mismatch")
+	}
+	anchorPub := ed25519.PublicKey(mustHex(t, v.AnchorSigningPubHex))
+	if !ed25519.Verify(anchorPub, signedTok, mustB64URL(t, v.EnrollmentToken.Sig)) {
+		t.Fatalf("enrollment token signature invalid")
+	}
+
+	cs := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+	initPub := mustHex(t, v.InitiatorStaticPubHex)
+	respPub := mustHex(t, v.ResponderStaticPubHex)
+	if goDeviceID(initPub) != v.InitiatorDeviceID {
+		t.Fatalf("initiator device_id mismatch")
+	}
+	if goDeviceID(respPub) != v.ResponderHostID {
+		t.Fatalf("responder host_id mismatch")
+	}
+
+	initHS, err := noise.NewHandshakeState(noise.Config{
+		CipherSuite:   cs,
+		Pattern:       noise.HandshakeXX,
+		Initiator:     true,
+		Prologue:      pre,
+		StaticKeypair: noise.DHKey{Private: mustHex(t, v.InitiatorStaticScalarHex), Public: initPub},
+		Random:        bytes.NewReader(mustHex(t, v.InitiatorEphemScalarHex)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	respHS, err := noise.NewHandshakeState(noise.Config{
+		CipherSuite:   cs,
+		Pattern:       noise.HandshakeXX,
+		Initiator:     false,
+		Prologue:      pre,
+		StaticKeypair: noise.DHKey{Private: mustHex(t, v.ResponderStaticScalarHex), Public: respPub},
+		Random:        bytes.NewReader(mustHex(t, v.ResponderEphemScalarHex)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m1, _, _, err := initHS.WriteMessage(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(m1)) != v.Msg1FrameHex {
+		t.Fatalf("m2m msg1 frame mismatch")
+	}
+	if _, _, _, err := respHS.ReadMessage(nil, decodeFrame(t, mustHex(t, v.Msg1FrameHex))); err != nil {
+		t.Fatal(err)
+	}
+
+	m2, _, _, err := respHS.WriteMessage(nil, []byte(v.HostHelloJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(m2)) != v.Msg2FrameHex {
+		t.Fatalf("m2m msg2 frame mismatch")
+	}
+	pt2, _, _, err := initHS.ReadMessage(nil, decodeFrame(t, mustHex(t, v.Msg2FrameHex)))
+	if err != nil || string(pt2) != v.HostHelloJSON {
+		t.Fatalf("m2m msg2 decrypt mismatch: %v", err)
+	}
+
+	h := initHS.ChannelBinding()
+	if hex.EncodeToString(h) != v.PostMsg2HandshakeHashHex {
+		t.Fatalf("m2m post-msg2 h mismatch")
+	}
+	domain := []byte("tendril-enroll-v1\x00")
+	if hex.EncodeToString(domain) != v.EnrollProofDomainHex {
+		t.Fatalf("enroll proof domain mismatch")
+	}
+	var proofInput []byte
+	proofInput = append(proofInput, domain...)
+	proofInput = append(proofInput, h...)
+	proofInput = append(proofInput, initPub...)
+	proofInput = append(proofInput, []byte(v.EnrollmentToken.Nonce)...)
+	if hex.EncodeToString(proofInput) != v.EnrollProofBytesHex {
+		t.Fatalf("enroll proof bytes mismatch")
+	}
+	initSignPub := ed25519.PublicKey(mustHex(t, v.InitiatorSigningPubHex))
+	if !ed25519.Verify(initSignPub, proofInput, mustB64URL(t, v.EnrollProofB64URL)) {
+		t.Fatalf("enroll proof Ed25519 signature invalid")
+	}
+
+	m3, initCS0, initCS1, err := initHS.WriteMessage(nil, []byte(v.PairClaimJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(m3)) != v.Msg3FrameHex {
+		t.Fatalf("m2m msg3 frame mismatch")
+	}
+	pt3, respCS0, respCS1, err := respHS.ReadMessage(nil, decodeFrame(t, mustHex(t, v.Msg3FrameHex)))
+	if err != nil || string(pt3) != v.PairClaimJSON {
+		t.Fatalf("m2m msg3 decrypt mismatch: %v", err)
+	}
+	if hex.EncodeToString(initHS.ChannelBinding()) != v.FinalHandshakeHashHex {
+		t.Fatalf("m2m final hash mismatch")
+	}
+	_ = initCS0
+	_ = respCS0
+
+	ct4, err := respCS1.Encrypt(nil, nil, []byte(v.PairResponseJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(encodeFrame(ct4)) != v.PairResponseFrameHex {
+		t.Fatalf("m2m pair_response frame mismatch")
+	}
+	pt4, err := initCS1.Decrypt(nil, nil, decodeFrame(t, mustHex(t, v.PairResponseFrameHex)))
+	if err != nil || string(pt4) != v.PairResponseJSON {
+		t.Fatalf("m2m pair_response decrypt mismatch: %v", err)
+	}
+	var respObj map[string]string
+	if err := json.Unmarshal(pt4, &respObj); err != nil {
+		t.Fatal(err)
+	}
+	if respObj["status"] != "active" {
+		t.Fatalf("m2m pair response status = %q, want active", respObj["status"])
+	}
+	var repObj map[string]string
+	if err := json.Unmarshal([]byte(v.ReplayedResponseJSON), &repObj); err != nil {
+		t.Fatal(err)
+	}
+	if repObj["error"] != "token_replayed" {
+		t.Fatalf("replayed error = %q, want token_replayed", repObj["error"])
+	}
+}

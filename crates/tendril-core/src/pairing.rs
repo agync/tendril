@@ -4,18 +4,25 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use snow::params::NoiseParams;
 use snow::{HandshakeState, TransportState};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    CODE_ALPHABET, b64url_decode_array, b64url_encode, compute_code_mac, device_id,
+    CODE_ALPHABET, SigningKeypair, b64url_decode_array, b64url_encode, compute_code_mac, device_id,
     fingerprint_device, has_control_chars, is_valid_ed25519_public_key, is_valid_x25519_public_key,
     new_noise_builder, pairing_sas, random_bytes, verify_code_mac,
 };
 use crate::error::CoreError;
-use crate::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
-use crate::roster::Roster;
+use crate::grants::{
+    Capability, Grant, GrantUnsigned, MAX_CLOCK_SKEW_SECS, MAX_DELEGATION_DEPTH, parse_caps,
+    sign_grant, verify_enrollment_grant_chain,
+};
+use crate::identity::{
+    EndpointIdentity, RotationRecord, format_rfc3339_utc, parse_rfc3339_utc, verify_rotation_chain,
+};
+use crate::roster::{AnchorState, Roster};
 use crate::wire::{
     HostHello, Intent, MAX_FRAME_LEN, NOISE_PATTERN, PairClaim, PairResponse, Preamble,
     ResumableFrameReader, encode_frame,
@@ -26,6 +33,48 @@ pub const DEFAULT_PAIRING_TTL_SECS: u64 = 900;
 
 /// Default maximum failed claim attempts across live pairing codes before burn.
 pub const DEFAULT_MAX_PAIRING_ATTEMPTS: u32 = 5;
+
+/// Default lifetime of an M2M enrollment token (`15` minutes).
+pub const DEFAULT_ENROLLMENT_TTL_SECS: u64 = 900;
+
+/// Hard upper bound on M2M enrollment token lifetime (`24` hours).
+pub const MAX_ENROLLMENT_TTL_SECS: u64 = 86_400;
+
+/// 18-byte domain prefix prepended to Ed25519 channel-binding M2M enrollment proofs.
+pub const ENROLL_PROOF_DOMAIN: &[u8] = b"tendril-enroll-v1\0";
+
+/// Policy controlling autonomous Machine-to-Machine enrollment on a responder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrollmentPolicy {
+    pub enabled: bool,
+    pub allow_self_issued: bool,
+    pub allow_wildcard_subject: bool,
+    pub max_ttl_secs: u64,
+}
+
+impl Default for EnrollmentPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_self_issued: false,
+            allow_wildcard_subject: false,
+            max_ttl_secs: DEFAULT_ENROLLMENT_TTL_SECS,
+        }
+    }
+}
+
+impl EnrollmentPolicy {
+    /// Returns the opt-in default M2M policy enabling self-issued and anchored tokens (`900 s` TTL).
+    #[must_use]
+    pub const fn enabled_default() -> Self {
+        Self {
+            enabled: true,
+            allow_self_issued: true,
+            allow_wildcard_subject: true,
+            max_ttl_secs: DEFAULT_ENROLLMENT_TTL_SECS,
+        }
+    }
+}
 
 /// Pairing code entropy form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,9 +811,278 @@ pub enum PairOutcome {
         name: String,
         kind: String,
     },
+    InitiatorEnrolled {
+        device_id: String,
+        host_id: String,
+        host_static_pub: [u8; 32],
+        host_signing_pub: [u8; 32],
+        host_rotation_seq: u64,
+        token_nonce: String,
+    },
+    ResponderEnrolled {
+        device_id: String,
+        device_static_pub: [u8; 32],
+        device_signing_pub: [u8; 32],
+        token_nonce: String,
+        name: String,
+        kind: String,
+    },
     Rejected {
         error: String,
     },
+}
+
+/// Mints a short-lived, single-use M2M enrollment token (`Grant` with `machine = true`, `uses = 1`).
+pub fn mint_enrollment_token(
+    issuer: &EndpointIdentity,
+    target_host_id: &str,
+    subject_device_id: Option<&str>,
+    not_before_unix: u64,
+    ttl_secs: u64,
+    nonce: [u8; 16],
+) -> Result<Grant, CoreError> {
+    if target_host_id.is_empty()
+        || target_host_id.contains('*')
+        || has_control_chars(target_host_id)
+    {
+        return Err(CoreError::EnrollmentTokenInvalid(
+            "invalid target_host_id".to_string(),
+        ));
+    }
+    if ttl_secs == 0 || ttl_secs > MAX_ENROLLMENT_TTL_SECS {
+        return Err(CoreError::EnrollmentTokenInvalid(
+            "enrollment ttl out of bounds".to_string(),
+        ));
+    }
+    let cap = format!("pair.enroll:{target_host_id}");
+    Capability::parse(&cap)?;
+
+    let subject = match subject_device_id {
+        Some(subj) => {
+            if subj.is_empty() || has_control_chars(subj) {
+                return Err(CoreError::EnrollmentTokenInvalid(
+                    "invalid enrollment subject".to_string(),
+                ));
+            }
+            subj.to_string()
+        }
+        None => "*".to_string(),
+    };
+
+    let not_after_unix = not_before_unix
+        .checked_add(ttl_secs)
+        .ok_or_else(|| CoreError::InvalidTimestamp("enrollment timestamp overflow".to_string()))?;
+
+    sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: issuer.host_id().to_string(),
+            subject,
+            caps: vec![cap],
+            not_before: format_rfc3339_utc(not_before_unix)?,
+            not_after: format_rfc3339_utc(not_after_unix)?,
+            nonce: b64url_encode(&nonce),
+            delegated_from: Vec::new(),
+            uses: Some(1),
+            machine: Some(true),
+        },
+        &issuer.signing_key().signing_key(),
+    )
+}
+
+/// Builds the canonical Ed25519 signature input for `PairClaim.enroll_proof`:
+/// `"tendril-enroll-v1\0" (18 B) || h (32 B) || peer_static_pub (32 B) || UTF-8(token_nonce)`.
+#[must_use]
+pub fn enroll_proof_bytes(
+    handshake_hash: &[u8; 32],
+    peer_static_pub: &[u8; 32],
+    token_nonce: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ENROLL_PROOF_DOMAIN.len() + 32 + 32 + token_nonce.len());
+    out.extend_from_slice(ENROLL_PROOF_DOMAIN);
+    out.extend_from_slice(handshake_hash);
+    out.extend_from_slice(peer_static_pub);
+    out.extend_from_slice(token_nonce.as_bytes());
+    out
+}
+
+/// Signs the M2M channel-binding proof binding `handshake_hash`, `peer_static_pub`, and `token_nonce`.
+#[must_use]
+pub fn sign_enroll_proof(
+    signing_key: &SigningKey,
+    handshake_hash: &[u8; 32],
+    peer_static_pub: &[u8; 32],
+    token_nonce: &str,
+) -> [u8; 64] {
+    let msg = enroll_proof_bytes(handshake_hash, peer_static_pub, token_nonce);
+    signing_key.sign(&msg).to_bytes()
+}
+
+/// Strictly verifies a channel-bound M2M `enroll_proof` Ed25519 signature.
+pub fn verify_enroll_proof(
+    signing_pub: &[u8; 32],
+    handshake_hash: &[u8; 32],
+    peer_static_pub: &[u8; 32],
+    token_nonce: &str,
+    sig_bytes: &[u8; 64],
+) -> Result<(), CoreError> {
+    if !is_valid_ed25519_public_key(signing_pub) {
+        return Err(CoreError::IncompletePin("invalid signing_pub".to_string()));
+    }
+    let vk = VerifyingKey::from_bytes(signing_pub).map_err(|_| CoreError::InvalidSignature)?;
+    let sig = Signature::from_bytes(sig_bytes);
+    let msg = enroll_proof_bytes(handshake_hash, peer_static_pub, token_nonce);
+    vk.verify_strict(&msg, &sig)
+        .map_err(|_| CoreError::InvalidSignature)
+}
+
+fn validate_enrollment_token_structure(
+    token: &Grant,
+    expected_host_id: Option<&str>,
+    max_ttl_secs: u64,
+) -> Result<(u64, u64), CoreError> {
+    if token.v != 1 {
+        return Err(CoreError::EnrollmentTokenInvalid(
+            "unsupported enrollment token version".to_string(),
+        ));
+    }
+    if token.machine != Some(true) || token.uses != Some(1) {
+        return Err(CoreError::EnrollmentTokenInvalid(
+            "enrollment token requires machine=true and uses=1".to_string(),
+        ));
+    }
+    b64url_decode_array::<16>(&token.nonce).map_err(|_| {
+        CoreError::EnrollmentTokenInvalid("enrollment nonce must be 16-byte b64url".to_string())
+    })?;
+
+    let nb = parse_rfc3339_utc(&token.not_before)?;
+    let na = parse_rfc3339_utc(&token.not_after)?;
+    if nb >= na || na - nb > max_ttl_secs {
+        return Err(CoreError::EnrollmentTokenInvalid(
+            "enrollment token validity window exceeds policy limit".to_string(),
+        ));
+    }
+
+    if token.caps.is_empty() {
+        return Err(CoreError::EnrollmentTokenInvalid(
+            "enrollment token caps cannot be empty".to_string(),
+        ));
+    }
+    let parsed_caps = parse_caps(&token.caps)?;
+    for cap in &parsed_caps {
+        if cap.namespace != "pair" || cap.verb != "enroll" {
+            return Err(CoreError::EnrollmentTokenInvalid(format!(
+                "disallowed capability {cap} in enrollment token"
+            )));
+        }
+        if let Some(res) = cap.resource.as_deref()
+            && (res.contains('*') || expected_host_id.is_some_and(|hid| res != hid))
+        {
+            return Err(CoreError::EnrollmentTokenInvalid(format!(
+                "enrollment capability scope mismatch: {cap}"
+            )));
+        }
+    }
+
+    Ok((nb, na))
+}
+
+fn find_enrollment_root_issuer(token: &Grant) -> Result<String, CoreError> {
+    let mut cur = token;
+    for depth in 0..=MAX_DELEGATION_DEPTH {
+        if cur.delegated_from.is_empty() {
+            return Ok(cur.issuer.clone());
+        }
+        if cur.delegated_from.len() != 1 || depth == MAX_DELEGATION_DEPTH {
+            return Err(CoreError::DelegationDenied(
+                "invalid enrollment token delegation chain".to_string(),
+            ));
+        }
+        cur = &cur.delegated_from[0];
+    }
+    Err(CoreError::DelegationDenied(
+        "enrollment delegation depth exceeded".to_string(),
+    ))
+}
+
+/// Verifies an M2M enrollment token against `policy`, trust anchors, persisted CRLs, and the
+/// burned-nonce replay log, returning the token's `(not_before_unix, not_after_unix)` window.
+pub fn verify_enrollment_token(
+    token: &Grant,
+    responder_host_id: &str,
+    responder_signing_pub: &[u8; 32],
+    peer_device_id: &str,
+    now_unix: u64,
+    policy: &EnrollmentPolicy,
+    roster: &Roster,
+) -> Result<(u64, u64), CoreError> {
+    if !policy.enabled {
+        return Err(CoreError::EnrollmentAnchorUntrusted(
+            "m2m enrollment disabled by policy".to_string(),
+        ));
+    }
+    let max_ttl = policy.max_ttl_secs.min(MAX_ENROLLMENT_TTL_SECS);
+    if max_ttl == 0 {
+        return Err(CoreError::EnrollmentTokenInvalid(
+            "invalid max_ttl policy".to_string(),
+        ));
+    }
+
+    let (nb, na) = validate_enrollment_token_structure(token, Some(responder_host_id), max_ttl)?;
+    if now_unix >= na {
+        return Err(CoreError::EnrollmentTokenExpired);
+    }
+    if now_unix < nb.saturating_sub(MAX_CLOCK_SKEW_SECS) {
+        return Err(CoreError::EnrollmentTokenInvalid(
+            "enrollment token not yet valid".to_string(),
+        ));
+    }
+
+    let root_issuer = find_enrollment_root_issuer(token)?;
+    let self_issued = root_issuer == responder_host_id;
+    let self_anchor_ok = if let Some(anchor) = roster.trust_anchor(&root_issuer) {
+        anchor.state == AnchorState::Active && anchor.signing_pub == *responder_signing_pub
+    } else {
+        true
+    };
+    if self_issued {
+        if !policy.allow_self_issued || !self_anchor_ok {
+            return Err(CoreError::EnrollmentAnchorUntrusted(root_issuer));
+        }
+    } else if roster.lookup_active_anchor_key(&root_issuer).is_none() {
+        return Err(CoreError::EnrollmentAnchorUntrusted(root_issuer));
+    }
+
+    let crl = roster.crl(&root_issuer);
+    verify_enrollment_grant_chain(
+        token,
+        peer_device_id,
+        policy.allow_wildcard_subject,
+        &root_issuer,
+        now_unix,
+        crl,
+        |issuer_id| {
+            if issuer_id == responder_host_id && policy.allow_self_issued && self_anchor_ok {
+                Some(*responder_signing_pub)
+            } else {
+                roster
+                    .lookup_active_anchor_key(issuer_id)
+                    .or_else(|| roster.lookup_active_signing_key(issuer_id))
+            }
+        },
+    )?;
+
+    if let Some(list) = crl
+        && list.revoked_devices.iter().any(|d| d == peer_device_id)
+    {
+        return Err(CoreError::PeerRevoked(peer_device_id.to_string()));
+    }
+
+    if roster.is_enrollment_nonce_burned(&token.nonce) {
+        return Err(CoreError::EnrollmentTokenReplayed);
+    }
+
+    Ok((nb, na))
 }
 
 enum InitiatorPhase {
@@ -783,11 +1101,21 @@ enum InitiatorPhase {
     Closed,
 }
 
+enum InitiatorAuth {
+    Human {
+        code: Zeroizing<String>,
+    },
+    M2m {
+        token: Box<Grant>,
+        signing_key: SigningKeypair,
+    },
+}
+
 /// Sans-I/O pairing initiator state machine (`intent = 0x02`).
 pub struct PairingInitiator {
     phase: InitiatorPhase,
     reader: ResumableFrameReader,
-    code: Zeroizing<String>,
+    auth: InitiatorAuth,
     device_name: String,
     device_kind: String,
     local_static_pub: [u8; 32],
@@ -796,24 +1124,25 @@ pub struct PairingInitiator {
 
 impl fmt::Debug for PairingInitiator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mode = match &self.auth {
+            InitiatorAuth::Human { .. } => "human",
+            InitiatorAuth::M2m { .. } => "m2m",
+        };
         f.debug_struct("PairingInitiator")
             .field("device_id", &device_id(&self.local_static_pub))
-            .field("code", &"<redacted>")
+            .field("mode", &mode)
+            .field("credentials", &"<redacted>")
             .finish()
     }
 }
 
 impl PairingInitiator {
-    /// Creates a new initiator ready to emit the pairing preamble and `msg1`.
-    pub fn new(
+    fn build_handshake(
         identity: &EndpointIdentity,
-        device_name: impl Into<String>,
-        device_kind: impl Into<String>,
-        code: impl Into<String>,
-        pinned_host: Option<PinnedHost>,
+        pinned_host: Option<&PinnedHost>,
         fixed_ephemeral: Option<[u8; 32]>,
-    ) -> Result<Self, CoreError> {
-        if let Some(ref pin) = pinned_host
+    ) -> Result<HandshakeState, CoreError> {
+        if let Some(pin) = pinned_host
             && (!is_valid_x25519_public_key(&pin.static_pub)
                 || !is_valid_ed25519_public_key(&pin.signing_pub))
         {
@@ -835,18 +1164,77 @@ impl PairingInitiator {
         if let Some(ref eph) = fixed_ephemeral {
             builder = builder.fixed_ephemeral_key_for_testing_only(eph);
         }
-        let hs = builder
+        builder
             .build_initiator()
-            .map_err(|err| CoreError::Noise(format!("{err}")))?;
+            .map_err(|err| CoreError::Noise(format!("{err}")))
+    }
 
+    /// Creates a new human pairing initiator ready to emit the pairing preamble and `msg1`.
+    pub fn new(
+        identity: &EndpointIdentity,
+        device_name: impl Into<String>,
+        device_kind: impl Into<String>,
+        code: impl Into<String>,
+        pinned_host: Option<PinnedHost>,
+        fixed_ephemeral: Option<[u8; 32]>,
+    ) -> Result<Self, CoreError> {
+        let hs = Self::build_handshake(identity, pinned_host.as_ref(), fixed_ephemeral)?;
         Ok(Self {
             phase: InitiatorPhase::Init(Box::new(hs)),
             reader: ResumableFrameReader::new(),
-            code: Zeroizing::new(code.into()),
+            auth: InitiatorAuth::Human {
+                code: Zeroizing::new(code.into()),
+            },
             device_name: device_name.into(),
             device_kind: device_kind.into(),
             local_static_pub: *identity.static_key().public_bytes(),
             pinned_host,
+        })
+    }
+
+    /// Creates an autonomous M2M enrollment initiator requiring an out-of-band pinned host key.
+    pub fn new_m2m(
+        identity: &EndpointIdentity,
+        device_name: impl Into<String>,
+        device_kind: impl Into<String>,
+        enrollment_token: Grant,
+        pinned_host: PinnedHost,
+        fixed_ephemeral: Option<[u8; 32]>,
+    ) -> Result<Self, CoreError> {
+        let device_name = device_name.into();
+        let device_kind = device_kind.into();
+        if device_name.is_empty()
+            || device_kind.is_empty()
+            || has_control_chars(&device_name)
+            || has_control_chars(&device_kind)
+        {
+            return Err(CoreError::ProtocolViolation(
+                "invalid device metadata in m2m initiator",
+            ));
+        }
+        validate_enrollment_token_structure(
+            &enrollment_token,
+            pinned_host.host_id.as_deref(),
+            MAX_ENROLLMENT_TTL_SECS,
+        )?;
+        if enrollment_token.subject != "*" && enrollment_token.subject != identity.device_id() {
+            return Err(CoreError::EnrollmentTokenInvalid(
+                "enrollment token subject does not match local device_id".to_string(),
+            ));
+        }
+
+        let hs = Self::build_handshake(identity, Some(&pinned_host), fixed_ephemeral)?;
+        Ok(Self {
+            phase: InitiatorPhase::Init(Box::new(hs)),
+            reader: ResumableFrameReader::new(),
+            auth: InitiatorAuth::M2m {
+                token: Box::new(enrollment_token),
+                signing_key: identity.signing_key().clone(),
+            },
+            device_name,
+            device_kind,
+            local_static_pub: *identity.static_key().public_bytes(),
+            pinned_host: Some(pinned_host),
         })
     }
 
@@ -994,17 +1382,39 @@ impl PairingInitiator {
                     .try_into()
                     .map_err(|_| CoreError::Noise("unexpected handshake hash length".into()))?;
                 let sas = pairing_sas(&h);
-                actions.push(PairAction::SasReady {
-                    pairing_sas: sas.clone(),
-                    host_id: host_hello.host_id.clone(),
-                    host_static_pub: remote_static,
-                });
-
-                let mac = compute_code_mac(&self.code, &h)?;
-                let claim = PairClaim {
-                    name: self.device_name.clone(),
-                    kind: self.device_kind.clone(),
-                    code_mac: b64url_encode(&mac),
+                let claim = match &self.auth {
+                    InitiatorAuth::Human { code } => {
+                        actions.push(PairAction::SasReady {
+                            pairing_sas: sas.clone(),
+                            host_id: host_hello.host_id.clone(),
+                            host_static_pub: remote_static,
+                        });
+                        let mac = compute_code_mac(code, &h)?;
+                        PairClaim {
+                            name: self.device_name.clone(),
+                            kind: self.device_kind.clone(),
+                            code_mac: Some(b64url_encode(&mac)),
+                            enrollment_token: None,
+                            signing_pub: None,
+                            enroll_proof: None,
+                        }
+                    }
+                    InitiatorAuth::M2m { token, signing_key } => {
+                        let proof = sign_enroll_proof(
+                            &signing_key.signing_key(),
+                            &h,
+                            &self.local_static_pub,
+                            &token.nonce,
+                        );
+                        PairClaim {
+                            name: self.device_name.clone(),
+                            kind: self.device_kind.clone(),
+                            code_mac: None,
+                            enrollment_token: Some(token.as_ref().clone()),
+                            signing_pub: Some(b64url_encode(signing_key.public_bytes())),
+                            enroll_proof: Some(b64url_encode(&proof)),
+                        }
+                    }
                 };
                 let claim_json = Zeroizing::new(
                     serde_json::to_vec(&claim).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -1053,7 +1463,13 @@ impl PairingInitiator {
                         status,
                         host_signing_pub,
                     } => {
-                        if resp_dev_id != device_id(&self.local_static_pub) || status != "pending" {
+                        let expected_status = match &self.auth {
+                            InitiatorAuth::Human { .. } => "pending",
+                            InitiatorAuth::M2m { .. } => "active",
+                        };
+                        if resp_dev_id != device_id(&self.local_static_pub)
+                            || status != expected_status
+                        {
                             return Err(CoreError::ProtocolViolation(
                                 "unexpected pair response fields",
                             ));
@@ -1084,15 +1500,26 @@ impl PairingInitiator {
                         } else {
                             0
                         };
-                        actions.push(PairAction::Completed(PairOutcome::InitiatorPending {
-                            device_id: resp_dev_id,
-                            host_id,
-                            host_static_pub,
-                            host_signing_pub: host_signing,
-                            host_rotation_seq,
-                            pairing_sas,
-                            host_pin_verified,
-                        }));
+                        let outcome = match &self.auth {
+                            InitiatorAuth::Human { .. } => PairOutcome::InitiatorPending {
+                                device_id: resp_dev_id,
+                                host_id,
+                                host_static_pub,
+                                host_signing_pub: host_signing,
+                                host_rotation_seq,
+                                pairing_sas,
+                                host_pin_verified,
+                            },
+                            InitiatorAuth::M2m { token, .. } => PairOutcome::InitiatorEnrolled {
+                                device_id: resp_dev_id,
+                                host_id,
+                                host_static_pub,
+                                host_signing_pub: host_signing,
+                                host_rotation_seq,
+                                token_nonce: token.nonce.clone(),
+                            },
+                        };
+                        actions.push(PairAction::Completed(outcome));
                         actions.push(PairAction::CloseTransport("pairing complete".to_string()));
                         self.phase = InitiatorPhase::Closed;
                         Ok(())
@@ -1133,6 +1560,7 @@ pub struct PairingResponder {
     host_hello: HostHello,
     host_signing_pub: [u8; 32],
     path: PairingPathKind,
+    enrollment_policy: EnrollmentPolicy,
 }
 
 impl fmt::Debug for PairingResponder {
@@ -1140,16 +1568,28 @@ impl fmt::Debug for PairingResponder {
         f.debug_struct("PairingResponder")
             .field("host_id", &self.host_hello.host_id)
             .field("path", &self.path)
+            .field("m2m_enabled", &self.enrollment_policy.enabled)
             .finish()
     }
 }
 
 impl PairingResponder {
-    /// Creates a new pairing responder bound to `identity` and transport classification `path`.
+    /// Creates a new pairing responder bound to `identity` and transport classification `path`
+    /// with M2M enrollment disabled by default.
     pub fn new(
         identity: &EndpointIdentity,
         path: PairingPathKind,
         fixed_ephemeral: Option<[u8; 32]>,
+    ) -> Result<Self, CoreError> {
+        Self::with_enrollment_policy(identity, path, fixed_ephemeral, EnrollmentPolicy::default())
+    }
+
+    /// Creates a pairing responder configured with an explicit [`EnrollmentPolicy`].
+    pub fn with_enrollment_policy(
+        identity: &EndpointIdentity,
+        path: PairingPathKind,
+        fixed_ephemeral: Option<[u8; 32]>,
+        enrollment_policy: EnrollmentPolicy,
     ) -> Result<Self, CoreError> {
         let params: NoiseParams = NOISE_PATTERN
             .parse()
@@ -1177,7 +1617,14 @@ impl PairingResponder {
             },
             host_signing_pub: *identity.signing_key().public_bytes(),
             path,
+            enrollment_policy,
         })
+    }
+
+    /// Returns `true` once `msg2` has been sent and the responder is waiting for `msg3` (`PairClaim`).
+    #[must_use]
+    pub fn is_awaiting_claim(&self) -> bool {
+        matches!(self.phase, ResponderPhase::AwaitMsg3 { .. })
     }
 
     /// Consumes inbound transport bytes, verifies `code_mac` against `manager`, and updates `roster`.
@@ -1321,58 +1768,162 @@ impl PairingResponder {
                     return write_pair_error(&mut transport, "protocol_error", actions);
                 }
 
-                let mac_bytes: [u8; 32] = match b64url_decode_array(&claim.code_mac) {
-                    Ok(m) => m,
-                    Err(_) => {
+                match (
+                    claim.code_mac,
+                    claim.enrollment_token,
+                    claim.signing_pub,
+                    claim.enroll_proof,
+                ) {
+                    (Some(code_mac), None, None, None) => {
+                        let mac_bytes: [u8; 32] = match b64url_decode_array(&code_mac) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                return write_pair_error(&mut transport, "protocol_error", actions);
+                            }
+                        };
+
+                        // Verify and burn the pairing code BEFORE inspecting roster state so
+                        // revoked devices cannot probe live codes without consuming them.
+                        if let Err(err) =
+                            manager.verify_claim(&post_msg2_hash, &mac_bytes, self.path, now_unix)
+                        {
+                            return write_pair_error(
+                                &mut transport,
+                                err.pair_error_code(),
+                                actions,
+                            );
+                        }
+
+                        let sas = pairing_sas(&post_msg2_hash);
+                        let peer_id = match roster.record_pending_pair(
+                            peer_static,
+                            None,
+                            claim.name.clone(),
+                            claim.kind.clone(),
+                            sas.clone(),
+                        ) {
+                            Ok(entry) => entry.device_id.clone(),
+                            Err(err) => {
+                                return write_pair_error(
+                                    &mut transport,
+                                    err.pair_error_code(),
+                                    actions,
+                                );
+                            }
+                        };
+
+                        write_pair_success(
+                            &mut transport,
+                            &peer_id,
+                            "pending",
+                            &self.host_signing_pub,
+                            PairOutcome::ResponderPending {
+                                device_id: peer_id.clone(),
+                                device_static_pub: peer_static,
+                                device_fingerprint: fingerprint_device(&peer_static),
+                                pairing_sas: sas,
+                                name: claim.name,
+                                kind: claim.kind,
+                            },
+                            actions,
+                        )?;
+                    }
+                    (None, Some(token), Some(sig_pub_b64), Some(proof_b64)) => {
+                        if !self.enrollment_policy.enabled {
+                            return write_pair_error(&mut transport, "unauthorized", actions);
+                        }
+                        let peer_signing_pub: [u8; 32] = match b64url_decode_array(&sig_pub_b64) {
+                            Ok(k) => k,
+                            Err(_) => {
+                                return write_pair_error(&mut transport, "protocol_error", actions);
+                            }
+                        };
+                        let proof_bytes: [u8; 64] = match b64url_decode_array(&proof_b64) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                return write_pair_error(&mut transport, "protocol_error", actions);
+                            }
+                        };
+                        if let Err(err) = verify_enroll_proof(
+                            &peer_signing_pub,
+                            &post_msg2_hash,
+                            &peer_static,
+                            &token.nonce,
+                            &proof_bytes,
+                        ) {
+                            return write_pair_error(
+                                &mut transport,
+                                err.pair_error_code(),
+                                actions,
+                            );
+                        }
+
+                        let peer_id = device_id(&peer_static);
+                        let (_, na) = match verify_enrollment_token(
+                            &token,
+                            &self.host_hello.host_id,
+                            &self.host_signing_pub,
+                            &peer_id,
+                            now_unix,
+                            &self.enrollment_policy,
+                            roster,
+                        ) {
+                            Ok(win) => win,
+                            Err(err) => {
+                                return write_pair_error(
+                                    &mut transport,
+                                    err.pair_error_code(),
+                                    actions,
+                                );
+                            }
+                        };
+
+                        // Burn single-use nonce BEFORE inspecting/recording peer roster state so a
+                        // revoked peer presenting a stolen wildcard token consumes the token.
+                        if let Err(err) = roster.burn_enrollment_nonce(&token.nonce, na, now_unix) {
+                            return write_pair_error(
+                                &mut transport,
+                                err.pair_error_code(),
+                                actions,
+                            );
+                        }
+
+                        let registered_id = match roster.record_enrolled_machine(
+                            peer_static,
+                            peer_signing_pub,
+                            claim.name.clone(),
+                            claim.kind.clone(),
+                        ) {
+                            Ok(entry) => entry.device_id.clone(),
+                            Err(err) => {
+                                return write_pair_error(
+                                    &mut transport,
+                                    err.pair_error_code(),
+                                    actions,
+                                );
+                            }
+                        };
+
+                        write_pair_success(
+                            &mut transport,
+                            &registered_id,
+                            "active",
+                            &self.host_signing_pub,
+                            PairOutcome::ResponderEnrolled {
+                                device_id: registered_id.clone(),
+                                device_static_pub: peer_static,
+                                device_signing_pub: peer_signing_pub,
+                                token_nonce: token.nonce,
+                                name: claim.name,
+                                kind: claim.kind,
+                            },
+                            actions,
+                        )?;
+                    }
+                    _ => {
                         return write_pair_error(&mut transport, "protocol_error", actions);
                     }
-                };
-
-                // Verify and burn the pairing code BEFORE inspecting roster state so revoked
-                // devices cannot probe live codes without consuming them.
-                if let Err(err) =
-                    manager.verify_claim(&post_msg2_hash, &mac_bytes, self.path, now_unix)
-                {
-                    return write_pair_error(&mut transport, err.pair_error_code(), actions);
                 }
-
-                let sas = pairing_sas(&post_msg2_hash);
-                let peer_id = match roster.record_pending_pair(
-                    peer_static,
-                    None,
-                    claim.name.clone(),
-                    claim.kind.clone(),
-                    sas.clone(),
-                ) {
-                    Ok(entry) => entry.device_id.clone(),
-                    Err(err) => {
-                        return write_pair_error(&mut transport, err.pair_error_code(), actions);
-                    }
-                };
-
-                let resp = PairResponse::Success {
-                    device_id: peer_id.clone(),
-                    status: "pending".to_string(),
-                    host_signing_pub: b64url_encode(&self.host_signing_pub),
-                };
-                let resp_json = Zeroizing::new(
-                    serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?,
-                );
-                let mut out_ct = vec![0u8; MAX_FRAME_LEN];
-                let n_ct = transport
-                    .write_message(&resp_json, &mut out_ct)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let resp_frame = encode_frame(&out_ct[..n_ct])?;
-                actions.push(PairAction::WriteBytes(resp_frame));
-                actions.push(PairAction::Completed(PairOutcome::ResponderPending {
-                    device_id: peer_id,
-                    device_static_pub: peer_static,
-                    device_fingerprint: fingerprint_device(&peer_static),
-                    pairing_sas: sas,
-                    name: claim.name,
-                    kind: claim.kind,
-                }));
-                actions.push(PairAction::CloseTransport("pairing complete".to_string()));
                 self.phase = ResponderPhase::Closed;
                 Ok(())
             }
@@ -1385,6 +1936,31 @@ impl PairingResponder {
             }),
         }
     }
+}
+
+fn write_pair_success(
+    transport: &mut TransportState,
+    device_id: &str,
+    status: &str,
+    host_signing_pub: &[u8; 32],
+    outcome: PairOutcome,
+    actions: &mut Vec<PairAction>,
+) -> Result<(), CoreError> {
+    let resp = PairResponse::Success {
+        device_id: device_id.to_string(),
+        status: status.to_string(),
+        host_signing_pub: b64url_encode(host_signing_pub),
+    };
+    let resp_json =
+        Zeroizing::new(serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?);
+    let mut out_ct = vec![0u8; MAX_FRAME_LEN];
+    let n_ct = transport
+        .write_message(&resp_json, &mut out_ct)
+        .map_err(|err| CoreError::Noise(format!("{err}")))?;
+    actions.push(PairAction::WriteBytes(encode_frame(&out_ct[..n_ct])?));
+    actions.push(PairAction::Completed(outcome));
+    actions.push(PairAction::CloseTransport("pairing complete".to_string()));
+    Ok(())
 }
 
 fn write_pair_error(

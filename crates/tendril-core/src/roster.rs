@@ -5,11 +5,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
-    b64url_encode, device_id, is_valid_ed25519_public_key, is_valid_x25519_public_key,
+    b64url_encode, device_id, has_control_chars, is_valid_ed25519_public_key,
+    is_valid_x25519_public_key,
 };
 use crate::error::CoreError;
 use crate::grants::{
-    Capability, Grant, GrantUnsigned, RevocationList, sign_grant, verify_crl_signature,
+    Capability, Grant, GrantUnsigned, RevocationList, RevocationListUnsigned, sign_crl, sign_grant,
+    verify_crl_signature,
 };
 use crate::identity::{
     EndpointIdentity, RotationRecord, format_rfc3339_utc, verify_rotation_chain,
@@ -62,11 +64,34 @@ impl RosterEntry {
     }
 }
 
-/// Authoritative in-memory peer roster and verified CRL store.
+/// Hard cap on tracked active burned M2M enrollment nonces in [`Roster`].
+pub const MAX_BURNED_ENROLLMENT_NONCES: usize = 16_384;
+
+/// Lifecycle state of an external M2M trust anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnchorState {
+    Active,
+    Revoked,
+}
+
+/// Trusted Ed25519 root signer authorized to issue M2M enrollment tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustAnchor {
+    pub anchor_id: String,
+    pub signing_pub: [u8; 32],
+    pub state: AnchorState,
+}
+
+/// Authoritative in-memory peer roster, trust anchors, burn log, and verified CRL store.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Roster {
     entries: BTreeMap<String, RosterEntry>,
     crls: BTreeMap<String, RevocationList>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    trust_anchors: BTreeMap<String, TrustAnchor>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    burned_enrollment_nonces: BTreeMap<String, u64>,
 }
 
 impl Roster {
@@ -292,12 +317,11 @@ impl Roster {
         Ok(&self.entries[&id])
     }
 
-    /// Confirms a `Pending` peer (`pair.confirm`), optionally enforcing SAS match, and moves it
-    /// to `Active` with zero non-session capabilities (default deny).
-    pub fn confirm_peer(
+    fn confirm_peer_inner(
         &mut self,
         peer_id: &str,
         expected_sas: Option<&str>,
+        allow_skip_sas: bool,
     ) -> Result<&RosterEntry, CoreError> {
         let entry = self
             .entries
@@ -307,6 +331,11 @@ impl Roster {
             return Err(CoreError::PeerRevoked(peer_id.to_string()));
         }
         entry.require_static_pin()?;
+        if !allow_skip_sas && entry.last_pairing_sas.is_some() && expected_sas.is_none() {
+            return Err(CoreError::ProtocolViolation(
+                "pairing SAS confirmation required",
+            ));
+        }
         if let Some(sas) = expected_sas
             && entry.last_pairing_sas.as_deref() != Some(sas)
         {
@@ -314,6 +343,26 @@ impl Roster {
         }
         entry.state = PeerState::Active;
         Ok(&self.entries[peer_id])
+    }
+
+    /// Confirms a `Pending` peer (`pair.confirm`) and moves it to `Active` with zero
+    /// non-session capabilities (default deny).
+    ///
+    /// Whenever a live pairing SAS is recorded on the peer entry, `expected_sas` MUST be
+    /// `Some(...)` and match; omitting `expected_sas` fails closed. Use
+    /// [`Self::confirm_peer_without_sas`] only for explicit out-of-band fingerprint approval.
+    pub fn confirm_peer(
+        &mut self,
+        peer_id: &str,
+        expected_sas: Option<&str>,
+    ) -> Result<&RosterEntry, CoreError> {
+        self.confirm_peer_inner(peer_id, expected_sas, false)
+    }
+
+    /// Confirms a `Pending` peer explicitly bypassing live SAS verification (for example after
+    /// out-of-band fingerprint verification).
+    pub fn confirm_peer_without_sas(&mut self, peer_id: &str) -> Result<&RosterEntry, CoreError> {
+        self.confirm_peer_inner(peer_id, None, true)
     }
 
     /// Mints a signed [`Grant`] (`pair.mint`) for an already `Active` peer on this roster.
@@ -400,6 +449,15 @@ impl Roster {
             if shares_static || shares_signing {
                 other.state = PeerState::Revoked;
                 other.grants.clear();
+            }
+        }
+        if let Some(sig) = revoked_signing
+            && has_signing
+        {
+            for anchor in self.trust_anchors.values_mut() {
+                if anchor.signing_pub == sig {
+                    anchor.state = AnchorState::Revoked;
+                }
             }
         }
     }
@@ -525,6 +583,10 @@ impl Roster {
                     revoked_keys.push((entry.static_pub, entry.signing_pub));
                 }
             }
+            if let Some(anchor) = self.trust_anchors.get_mut(revoked_id) {
+                anchor.state = AnchorState::Revoked;
+                revoked_keys.push(([0u8; 32], Some(anchor.signing_pub)));
+            }
         }
         for (revoked_static, revoked_signing) in revoked_keys {
             self.revoke_siblings_by_keys(revoked_static, revoked_signing);
@@ -610,6 +672,304 @@ impl Roster {
         }
 
         Some(sig_pub)
+    }
+
+    /// Registers an active external Ed25519 trust anchor for autonomous M2M enrollment.
+    ///
+    /// Fails closed if `anchor_id` is empty/malformed, `signing_pub` is invalid, any sibling
+    /// sharing `signing_pub` (or `anchor_id`) is revoked, or an existing entry pins a differing key.
+    pub fn add_trust_anchor(
+        &mut self,
+        anchor_id: String,
+        signing_pub: [u8; 32],
+    ) -> Result<&TrustAnchor, CoreError> {
+        if anchor_id.is_empty()
+            || anchor_id == "*"
+            || has_control_chars(&anchor_id)
+            || !is_valid_ed25519_public_key(&signing_pub)
+        {
+            return Err(CoreError::IncompletePin(anchor_id));
+        }
+
+        let sibling_revoked = self.trust_anchors.values().any(|a| {
+            a.state == AnchorState::Revoked
+                && (a.anchor_id == anchor_id || a.signing_pub == signing_pub)
+        }) || self.entries.values().any(|e| {
+            e.state == PeerState::Revoked
+                && (e.device_id == anchor_id || e.signing_pub == Some(signing_pub))
+        }) || self
+            .crls
+            .values()
+            .any(|c| c.revoked_devices.iter().any(|d| d == &anchor_id));
+        if sibling_revoked {
+            return Err(CoreError::PeerRevoked(anchor_id));
+        }
+
+        if let Some(existing) = self.trust_anchors.get(&anchor_id) {
+            if existing.signing_pub != signing_pub {
+                return Err(CoreError::ProtocolViolation("trust anchor key conflict"));
+            }
+            return Ok(&self.trust_anchors[&anchor_id]);
+        }
+
+        self.trust_anchors.insert(
+            anchor_id.clone(),
+            TrustAnchor {
+                anchor_id: anchor_id.clone(),
+                signing_pub,
+                state: AnchorState::Active,
+            },
+        );
+        Ok(&self.trust_anchors[&anchor_id])
+    }
+
+    /// Marks `anchor_id` (and any sibling anchors or peers sharing its `signing_pub`) as `Revoked`.
+    pub fn revoke_trust_anchor(&mut self, anchor_id: &str) -> Result<(), CoreError> {
+        let revoked_pub = {
+            let anchor = self
+                .trust_anchors
+                .get_mut(anchor_id)
+                .ok_or_else(|| CoreError::PeerNotFound(anchor_id.to_string()))?;
+            anchor.state = AnchorState::Revoked;
+            anchor.signing_pub
+        };
+        self.revoke_siblings_by_keys([0u8; 32], Some(revoked_pub));
+        Ok(())
+    }
+
+    /// Returns a trust anchor record by identifier.
+    #[must_use]
+    pub fn trust_anchor(&self, anchor_id: &str) -> Option<&TrustAnchor> {
+        self.trust_anchors.get(anchor_id)
+    }
+
+    /// Iterates over all trust anchors ordered by `anchor_id`.
+    pub fn trust_anchors(&self) -> impl Iterator<Item = (&String, &TrustAnchor)> {
+        self.trust_anchors.iter()
+    }
+
+    /// Returns the Ed25519 signing public key of an active trust anchor, enforcing sibling and
+    /// CRL revocation checks.
+    #[must_use]
+    pub fn lookup_active_anchor_key(&self, anchor_id: &str) -> Option<[u8; 32]> {
+        let anchor = self.trust_anchors.get(anchor_id)?;
+        if anchor.state != AnchorState::Active || !is_valid_ed25519_public_key(&anchor.signing_pub)
+        {
+            return None;
+        }
+        let sibling_anchor_revoked = self.trust_anchors.values().any(|other| {
+            other.state == AnchorState::Revoked && other.signing_pub == anchor.signing_pub
+        });
+        if sibling_anchor_revoked {
+            return None;
+        }
+        let peer_revoked = self.entries.values().any(|other| {
+            other.state == PeerState::Revoked
+                && (other.device_id == anchor_id || other.signing_pub == Some(anchor.signing_pub))
+        });
+        if peer_revoked {
+            return None;
+        }
+        let crl_revoked = self
+            .crls
+            .values()
+            .any(|crl| crl.revoked_devices.iter().any(|d| d == anchor_id));
+        if crl_revoked {
+            return None;
+        }
+        Some(anchor.signing_pub)
+    }
+
+    /// Returns `true` if `nonce` has already been burned in an M2M enrollment claim.
+    #[must_use]
+    pub fn is_enrollment_nonce_burned(&self, nonce: &str) -> bool {
+        self.burned_enrollment_nonces.contains_key(nonce)
+    }
+
+    /// Returns the count of tracked burned enrollment nonces.
+    #[must_use]
+    pub fn burned_enrollment_nonce_count(&self) -> usize {
+        self.burned_enrollment_nonces.len()
+    }
+
+    /// Prunes expired burned enrollment nonces (`not_after <= now_unix`) and returns how many
+    /// entries were removed.
+    pub fn prune_expired_enrollment_nonces(&mut self, now_unix: u64) -> usize {
+        let before = self.burned_enrollment_nonces.len();
+        self.burned_enrollment_nonces
+            .retain(|_, &mut not_after| not_after > now_unix);
+        before.saturating_sub(self.burned_enrollment_nonces.len())
+    }
+
+    /// Atomically checks and burns a single-use M2M enrollment token `nonce`, pruning expired
+    /// entries first and enforcing [`MAX_BURNED_ENROLLMENT_NONCES`].
+    pub fn burn_enrollment_nonce(
+        &mut self,
+        nonce: &str,
+        not_after_unix: u64,
+        now_unix: u64,
+    ) -> Result<(), CoreError> {
+        if nonce.is_empty() {
+            return Err(CoreError::EnrollmentTokenInvalid(
+                "empty enrollment nonce".to_string(),
+            ));
+        }
+        if self.burned_enrollment_nonces.contains_key(nonce) {
+            return Err(CoreError::EnrollmentTokenReplayed);
+        }
+        self.prune_expired_enrollment_nonces(now_unix);
+        if self.burned_enrollment_nonces.len() >= MAX_BURNED_ENROLLMENT_NONCES {
+            return Err(CoreError::EnrollmentBurnLogFull);
+        }
+        self.burned_enrollment_nonces
+            .insert(nonce.to_string(), not_after_unix);
+        Ok(())
+    }
+
+    /// Records a newly verified M2M peer directly in `Active` state with zero application grants
+    /// (`pair.mint` remains a separate step).
+    ///
+    /// Fails closed if `static_pub`, `signing_pub`, or any revoked sibling/CRL indicates
+    /// revocation, or if an existing entry has conflicting keys.
+    pub fn record_enrolled_machine(
+        &mut self,
+        static_pub: [u8; 32],
+        signing_pub: [u8; 32],
+        name: String,
+        kind: String,
+    ) -> Result<&RosterEntry, CoreError> {
+        if !is_valid_x25519_public_key(&static_pub) {
+            return Err(CoreError::IncompletePin(
+                "invalid or low-order static_pub".to_string(),
+            ));
+        }
+        if !is_valid_ed25519_public_key(&signing_pub) {
+            return Err(CoreError::IncompletePin("invalid signing_pub".to_string()));
+        }
+        if name.is_empty()
+            || kind.is_empty()
+            || has_control_chars(&name)
+            || has_control_chars(&kind)
+        {
+            return Err(CoreError::ProtocolViolation(
+                "invalid device metadata in enrollment",
+            ));
+        }
+
+        let id = device_id(&static_pub);
+        let sibling_or_crl_revoked = self.entries.values().any(|other| {
+            other.state == PeerState::Revoked
+                && (other.device_id == id
+                    || other.static_pub == static_pub
+                    || other.signing_pub == Some(signing_pub))
+        }) || self
+            .trust_anchors
+            .values()
+            .any(|a| a.state == AnchorState::Revoked && a.signing_pub == signing_pub)
+            || self
+                .crls
+                .values()
+                .any(|c| c.revoked_devices.iter().any(|d| d == &id));
+        if sibling_or_crl_revoked {
+            return Err(CoreError::PeerRevoked(id));
+        }
+
+        if let Some(existing) = self.entries.get_mut(&id) {
+            if existing.static_pub != static_pub {
+                return Err(CoreError::ProtocolViolation(
+                    "device_id collision with distinct static key",
+                ));
+            }
+            if existing.state == PeerState::Revoked {
+                return Err(CoreError::PeerRevoked(id));
+            }
+            if let Some(prev_sig) = existing.signing_pub
+                && prev_sig != signing_pub
+            {
+                return Err(CoreError::ProtocolViolation(
+                    "signing_pub mismatch on existing peer",
+                ));
+            }
+            existing.name = name;
+            existing.kind = kind;
+            existing.signing_pub = Some(signing_pub);
+            existing.state = PeerState::Active;
+            existing.last_pairing_sas = None;
+            return Ok(&self.entries[&id]);
+        }
+
+        let entry = RosterEntry {
+            device_id: id.clone(),
+            name,
+            kind,
+            static_pub,
+            signing_pub: Some(signing_pub),
+            rotation_seq: 0,
+            state: PeerState::Active,
+            last_pairing_sas: None,
+            grants: Vec::new(),
+            relay_hints: Vec::new(),
+        };
+        self.entries.insert(id.clone(), entry);
+        Ok(&self.entries[&id])
+    }
+
+    fn mint_crl_update(
+        &mut self,
+        issuer: &EndpointIdentity,
+        extra_nonce: Option<&str>,
+        now_unix: u64,
+    ) -> Result<RevocationList, CoreError> {
+        let issuer_id = issuer.host_id().to_string();
+        let existing = self.crls.get(&issuer_id);
+        let seq = existing.map_or(1, |c| c.seq.saturating_add(1));
+        let revoked_devices = existing.map_or_else(Vec::new, |c| c.revoked_devices.clone());
+        let mut revoked_nonces = existing.map_or_else(Vec::new, |c| c.revoked_nonces.clone());
+        if let Some(nonce) = extra_nonce
+            && !revoked_nonces.iter().any(|n| n == nonce)
+        {
+            revoked_nonces.push(nonce.to_string());
+        }
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: issuer_id.clone(),
+                seq,
+                revoked_devices,
+                revoked_nonces,
+                ts: format_rfc3339_utc(now_unix)?,
+            },
+            &issuer.signing_key().signing_key(),
+        )?;
+        self.ingest_crl(crl.clone(), &issuer_id, issuer.signing_key().public_bytes())?;
+        Ok(crl)
+    }
+
+    /// Mints and ingests a monotonic signed [`RevocationList`] adding `nonce` to `revoked_nonces`.
+    pub fn revoke_nonce(
+        &mut self,
+        issuer: &EndpointIdentity,
+        nonce: &str,
+        now_unix: u64,
+    ) -> Result<RevocationList, CoreError> {
+        if nonce.is_empty() {
+            return Err(CoreError::EnrollmentTokenInvalid(
+                "empty nonce to revoke".to_string(),
+            ));
+        }
+        self.mint_crl_update(issuer, Some(nonce), now_unix)
+    }
+
+    /// Re-signs any existing self-issued CRL under `issuer`'s current signing key after key rotation.
+    pub fn resign_crl(
+        &mut self,
+        issuer: &EndpointIdentity,
+        now_unix: u64,
+    ) -> Result<Option<RevocationList>, CoreError> {
+        if !self.crls.contains_key(issuer.host_id()) {
+            return Ok(None);
+        }
+        self.mint_crl_update(issuer, None, now_unix).map(Some)
     }
 }
 

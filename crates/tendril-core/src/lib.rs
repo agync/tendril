@@ -13,7 +13,13 @@ pub mod roster;
 pub mod session;
 pub mod wire;
 
-pub use grants::{authorize_path_capability, canonicalize_capability_path};
+pub use grants::{
+    authorize_path_capability, canonicalize_capability_path, verify_enrollment_grant_chain,
+};
+pub use pairing::{
+    DEFAULT_ENROLLMENT_TTL_SECS, ENROLL_PROOF_DOMAIN, EnrollmentPolicy, MAX_ENROLLMENT_TTL_SECS,
+};
+pub use roster::{AnchorState, MAX_BURNED_ENROLLMENT_NONCES, TrustAnchor};
 pub use wire::{
     AEAD_TAG_LEN, MAX_APP_DATA_LEN, MAX_FRAME_LEN, MAX_TRANSPORT_PLAINTEXT, NOISE_PATTERN,
     PREAMBLE_LEN, PREAMBLE_MAGIC, WIRE_VERSION,

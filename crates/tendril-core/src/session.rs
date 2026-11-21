@@ -994,7 +994,9 @@ mod tests {
                 "abcd".to_string(),
             )
             .unwrap();
-        host_roster.confirm_peer(&cli.device_id(), None).unwrap();
+        host_roster
+            .confirm_peer(&cli.device_id(), Some("abcd"))
+            .unwrap();
 
         let mut cli_roster = Roster::new();
         cli_roster
