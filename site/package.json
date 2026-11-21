@@ -4,6 +4,6 @@
   "description": "Test-only dependencies for make check. The versions match the pinned Playwright container image.",
   "devDependencies": {
     "@axe-core/playwright": "4.14.0",
-    "playwright": "1.65.0"
+    "playwright": "1.65.1"
   }
 }
