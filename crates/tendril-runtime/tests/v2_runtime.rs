@@ -1841,13 +1841,13 @@ async fn concurrent_v2_session_persists_ingested_crl_to_state_store_and_errors_c
             host_id.signing_key().public_key(),
         )
         .unwrap();
-    conc_srv.send_revocation(&crl).await.unwrap();
-
     let cli_roster_lock = Arc::new(Mutex::new(cli_store.load_roster().unwrap()));
-    let err = conc_cli
-        .next_event_locked_now(&cli_roster_lock)
-        .await
-        .unwrap_err();
+    let (send_res, recv_res) = tokio::join!(
+        conc_srv.send_revocation(&crl),
+        conc_cli.next_event_locked_now(&cli_roster_lock),
+    );
+    send_res.unwrap();
+    let err = recv_res.unwrap_err();
     assert!(
         matches!(
             err,
