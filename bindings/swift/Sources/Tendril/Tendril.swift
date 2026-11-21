@@ -616,6 +616,112 @@ public final class TendrilEndpoint {
     }
   }
 
+  public func addTrustAnchor(anchorId: String, signingPub: Data) throws {
+    guard signingPub.count == 32 else {
+      throw TendrilError.invalidInput("signingPub must be 32 bytes")
+    }
+    try withHandle { h in
+      let rc = try withValidatedCString(anchorId, name: "anchorId") { cAnchor in
+        signingPub.withUnsafeBytes { keyRaw in
+          tendril_endpoint_add_trust_anchor(
+            h, cAnchor, keyRaw.bindMemory(to: UInt8.self).baseAddress
+          )
+        }
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_add_trust_anchor failed")
+      }
+      try persistRoster(h)
+    }
+  }
+
+  public func revokeTrustAnchor(anchorId: String) throws {
+    try withHandle { h in
+      let rc = try withValidatedCString(anchorId, name: "anchorId") { cAnchor in
+        tendril_endpoint_revoke_trust_anchor(h, cAnchor)
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_revoke_trust_anchor failed")
+      }
+      try persistRoster(h)
+    }
+  }
+
+  public func mintEnrollmentToken(
+    targetHostId: String,
+    subject: String? = nil,
+    ttlSecs: UInt64 = 900
+  ) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
+        try withOptionalValidatedCString(subject, name: "subject") { cSubj in
+          tendril_endpoint_mint_enrollment_token(h, cTarget, cSubj, ttlSecs, &out)
+        }
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_mint_enrollment_token failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  public func enrollInitiate(
+    endpoint: String,
+    relayHost: String? = nil,
+    hostId: String,
+    hostStaticPub: Data,
+    hostSigningPub: Data,
+    hostRotationSeq: UInt64 = 0,
+    tokenJson: String,
+    name: String = "ios-machine",
+    kind: String = "machine"
+  ) throws -> String {
+    guard hostStaticPub.count == 32 else {
+      throw TendrilError.invalidInput("hostStaticPub must be 32 bytes")
+    }
+    guard hostSigningPub.count == 32 else {
+      throw TendrilError.invalidInput("hostSigningPub must be 32 bytes")
+    }
+    return try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withValidatedCString(endpoint, name: "endpoint") { cEp in
+        try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
+          try withValidatedCString(hostId, name: "hostId") { cHost in
+            try withValidatedCString(tokenJson, name: "tokenJson") { cToken in
+              try withValidatedCString(name, name: "name") { cName in
+                try withValidatedCString(kind, name: "kind") { cKind in
+                  hostStaticPub.withUnsafeBytes { stRaw in
+                    hostSigningPub.withUnsafeBytes { sgRaw in
+                      tendril_endpoint_enroll_initiate(
+                        h,
+                        cEp,
+                        cRh,
+                        cHost,
+                        stRaw.bindMemory(to: UInt8.self).baseAddress,
+                        sgRaw.bindMemory(to: UInt8.self).baseAddress,
+                        hostRotationSeq,
+                        cToken,
+                        cName,
+                        cKind,
+                        &out
+                      )
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      guard rc == TENDRIL_OK else {
+        throw ffiError(rc, fallback: "tendril_endpoint_enroll_initiate failed")
+      }
+      try persistRoster(h)
+      return takeOutCString(out)
+    }
+  }
+
   public func connect(
     endpoint: String,
     relayHost: String? = nil,

@@ -188,4 +188,67 @@ final class TendrilConformanceTests: XCTestCase {
     XCTAssertFalse(try srvSess.authorize("fs.read"))
     try cliSess.close(code: 1000, reason: "done")
   }
+
+  func testM2mEnrollmentAndReplay() throws {
+    let host = try TendrilEndpoint(hostId: "swift-m2m-host")
+    let anchor = try TendrilEndpoint(hostId: "swift-m2m-anchor")
+    let client = try TendrilEndpoint(hostId: "swift-m2m-cli")
+    defer {
+      client.close()
+      anchor.close()
+      host.close()
+    }
+
+    func decodeB64Url(_ s: String) -> Data {
+      var b64 = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+      while b64.count % 4 != 0 { b64.append("=") }
+      return Data(base64Encoded: b64)!
+    }
+
+    let hostInfo = try JSONSerialization.jsonObject(with: Data(host.infoJson().utf8)) as! [String: Any]
+    let anchorInfo = try JSONSerialization.jsonObject(with: Data(anchor.infoJson().utf8)) as! [String: Any]
+    let hostStatic = decodeB64Url(hostInfo["static_pub"] as! String)
+    let hostSigning = decodeB64Url(hostInfo["signing_pub"] as! String)
+    let anchorSigning = decodeB64Url(anchorInfo["signing_pub"] as! String)
+
+    try host.addTrustAnchor(anchorId: "swift-m2m-anchor", signingPub: anchorSigning)
+    let addr = try host.serveDirect(listenAddr: "127.0.0.1:0")
+    let tokJson = try anchor.mintEnrollmentToken(targetHostId: "swift-m2m-host", subject: nil, ttlSecs: 900)
+
+    let queue = DispatchQueue(label: "tendril.swift.m2m")
+    let pairExp = expectation(description: "m2m accept")
+    var accJson = ""
+    queue.async {
+      accJson = (try? host.pairAccept(timeoutMs: 5000)) ?? ""
+      pairExp.fulfill()
+    }
+    let initJson = try client.enrollInitiate(
+      endpoint: addr,
+      hostId: "swift-m2m-host",
+      hostStaticPub: hostStatic,
+      hostSigningPub: hostSigning,
+      tokenJson: tokJson
+    )
+    wait(for: [pairExp], timeout: 5.0)
+    let initObj = try JSONSerialization.jsonObject(with: Data(initJson.utf8)) as! [String: Any]
+    let accObj = try JSONSerialization.jsonObject(with: Data(accJson.utf8)) as! [String: Any]
+    XCTAssertEqual(initObj["status"] as? String, "active")
+    XCTAssertEqual(accObj["status"] as? String, "active")
+
+    let repExp = expectation(description: "m2m replay accept")
+    queue.async {
+      _ = try? host.pairAccept(timeoutMs: 5000)
+      repExp.fulfill()
+    }
+    XCTAssertThrowsError(
+      try client.enrollInitiate(
+        endpoint: addr,
+        hostId: "swift-m2m-host",
+        hostStaticPub: hostStatic,
+        hostSigningPub: hostSigning,
+        tokenJson: tokJson
+      )
+    )
+    wait(for: [repExp], timeout: 5.0)
+  }
 }

@@ -710,6 +710,170 @@ public final class TendrilJniConformanceTest {
     }
   }
 
+  private static void verifyM2mEnrollment() throws Exception {
+    long hostEp = TendrilNative.endpointNewFromState(null, null, "jni-m2m-host");
+    long anchorEp = TendrilNative.endpointNewFromState(null, null, "jni-m2m-anchor");
+    long cliEp = TendrilNative.endpointNewFromState(null, null, "jni-m2m-cli");
+    long cli2Ep = TendrilNative.endpointNewFromState(null, null, "jni-m2m-cli2");
+    try {
+      Map<String, Object> hostInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(hostEp)));
+      Map<String, Object> anchorInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(anchorEp)));
+      byte[] hostStatic = b64UrlDecode(asStr(hostInfo.get("static_pub")));
+      byte[] hostSigning = b64UrlDecode(asStr(hostInfo.get("signing_pub")));
+      byte[] anchorSigning = b64UrlDecode(asStr(anchorInfo.get("signing_pub")));
+
+      TendrilNative.endpointAddTrustAnchor(hostEp, "jni-m2m-anchor", anchorSigning);
+      String ep = TendrilNative.endpointServeDirect(hostEp, "127.0.0.1:0");
+      String tokJson =
+          TendrilNative.endpointMintEnrollmentToken(anchorEp, "jni-m2m-host", null, 900);
+
+      final String[] acc = new String[1];
+      Thread pt =
+          new Thread(
+              () -> {
+                acc[0] = TendrilNative.endpointPairAccept(hostEp, 5000);
+              });
+      pt.start();
+      Map<String, Object> initRes =
+          asObj(
+              Json.parse(
+                  TendrilNative.endpointEnrollInitiate(
+                      cliEp,
+                      ep,
+                      null,
+                      "jni-m2m-host",
+                      hostStatic,
+                      hostSigning,
+                      0,
+                      tokJson,
+                      "jni-worker",
+                      "machine")));
+      pt.join(5000);
+      Map<String, Object> accRes = asObj(Json.parse(acc[0]));
+      check("active".equals(initRes.get("status")), "expected active init status: " + initRes);
+      check("active".equals(accRes.get("status")), "expected active acc status: " + accRes);
+      check(
+          asStr(initRes.get("device_id")).equals(asStr(accRes.get("device_id"))),
+          "device_id mismatch");
+
+      Thread repPt =
+          new Thread(
+              () -> {
+                try {
+                  TendrilNative.endpointPairAccept(hostEp, 5000);
+                } catch (IllegalStateException ignored) {
+                }
+              });
+      repPt.start();
+      boolean replayRejected = false;
+      try {
+        TendrilNative.endpointEnrollInitiate(
+            cliEp, ep, null, "jni-m2m-host", hostStatic, hostSigning, 0, tokJson, "r", "machine");
+      } catch (IllegalStateException e) {
+        replayRejected = e.getMessage() != null && e.getMessage().contains("token_replayed");
+      }
+      repPt.join(5000);
+      check(replayRejected, "replayed M2M token must fail closed with token_replayed");
+
+      String grant =
+          TendrilNative.endpointMintGrant(
+              hostEp, asStr(initRes.get("device_id")), Json.stringify(List.of("fs.read")), 3600);
+      final long[] hostSessHolder = new long[1];
+      Thread st =
+          new Thread(
+              () -> {
+                hostSessHolder[0] = TendrilNative.sessionAccept(hostEp, 5000);
+              });
+      st.start();
+      long cliSess = TendrilNative.sessionConnect(cliEp, ep, null, "jni-m2m-host", grant);
+      st.join(5000);
+      long hostSess = hostSessHolder[0];
+      check(hostSess != 0, "post-M2M session accept failed");
+      try {
+        check(TendrilNative.sessionAuthorize(hostSess, "fs.read"), "post-M2M authorize fs.read");
+        check(!TendrilNative.sessionAuthorize(hostSess, "shell.exec"), "post-M2M deny shell.exec");
+      } finally {
+        TendrilNative.sessionFree(cliSess);
+        TendrilNative.sessionFree(hostSess);
+      }
+
+      TendrilNative.endpointRevokeTrustAnchor(hostEp, "jni-m2m-anchor");
+      String freshTok =
+          TendrilNative.endpointMintEnrollmentToken(anchorEp, "jni-m2m-host", null, 900);
+      Thread revPt =
+          new Thread(
+              () -> {
+                try {
+                  TendrilNative.endpointPairAccept(hostEp, 5000);
+                } catch (IllegalStateException ignored) {
+                }
+              });
+      revPt.start();
+      boolean soleAnchorDisabled = false;
+      try {
+        TendrilNative.endpointEnrollInitiate(
+            cli2Ep, ep, null, "jni-m2m-host", hostStatic, hostSigning, 0, freshTok, "r2", "machine");
+      } catch (IllegalStateException e) {
+        soleAnchorDisabled = e.getMessage() != null && e.getMessage().contains("unauthorized");
+      }
+      revPt.join(5000);
+      check(soleAnchorDisabled, "revoking sole anchor must disable M2M (unauthorized)");
+
+      String selfTok =
+          TendrilNative.endpointMintEnrollmentToken(hostEp, "jni-m2m-host", null, 900);
+      Thread revPt2 =
+          new Thread(
+              () -> {
+                try {
+                  TendrilNative.endpointPairAccept(hostEp, 5000);
+                } catch (IllegalStateException ignored) {
+                }
+              });
+      revPt2.start();
+      boolean revokedRejected = false;
+      try {
+        TendrilNative.endpointEnrollInitiate(
+            cli2Ep, ep, null, "jni-m2m-host", hostStatic, hostSigning, 0, freshTok, "r2", "machine");
+      } catch (IllegalStateException e) {
+        revokedRejected = e.getMessage() != null && e.getMessage().contains("untrusted_anchor");
+      }
+      revPt2.join(5000);
+      check(revokedRejected, "revoked trust anchor token must fail with untrusted_anchor");
+
+      final String[] selfAcc = new String[1];
+      Thread selfPt =
+          new Thread(
+              () -> {
+                selfAcc[0] = TendrilNative.endpointPairAccept(hostEp, 5000);
+              });
+      selfPt.start();
+      Map<String, Object> selfInit =
+          asObj(
+              Json.parse(
+                  TendrilNative.endpointEnrollInitiate(
+                      cli2Ep,
+                      ep,
+                      null,
+                      "jni-m2m-host",
+                      hostStatic,
+                      hostSigning,
+                      0,
+                      selfTok,
+                      "jni-worker-2",
+                      "machine")));
+      selfPt.join(5000);
+      check("active".equals(selfInit.get("status")), "self-issued M2M init must succeed");
+      check(
+          "active".equals(asObj(Json.parse(selfAcc[0])).get("status")),
+          "self-issued M2M accept must succeed");
+    } finally {
+      TendrilNative.endpointFree(cli2Ep);
+      TendrilNative.endpointFree(cliEp);
+      TendrilNative.endpointFree(anchorEp);
+      TendrilNative.endpointFree(hostEp);
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     Path root = Paths.get("").toAbsolutePath().normalize();
     Path peerBin = root.resolve("target").resolve("debug").resolve("tendril-conformance-peer");
@@ -719,5 +883,7 @@ public final class TendrilJniConformanceTest {
     verifyServeP2pLoopback();
     verifyJniSecurityHardening();
     System.out.println("JNI_LIVE_INTEROP_OK=true");
+    verifyM2mEnrollment();
+    System.out.println("JNI_M2M_OK=true");
   }
 }

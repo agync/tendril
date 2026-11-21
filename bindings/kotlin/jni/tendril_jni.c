@@ -775,6 +775,140 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointRevokePeer(
   }
 }
 
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointAddTrustAnchor(
+    JNIEnv *env, jclass cls, jlong ptr, jstring anchor_id, jbyteArray signing_pub) {
+  (void)cls;
+  if (ptr == 0 || anchor_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid trust anchor arguments");
+    return;
+  }
+  uint8_t key[32];
+  if (!read_bytes32(env, signing_pub, key)) {
+    return;
+  }
+  char *c_anchor = NULL;
+  if (!dup_opt_utf8(env, anchor_id, &c_anchor)) {
+    return;
+  }
+  int32_t rc = tendril_endpoint_add_trust_anchor(
+      (TendrilEndpoint *)(uintptr_t)ptr, c_anchor, key);
+  free(c_anchor);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_add_trust_anchor failed");
+  }
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointRevokeTrustAnchor(
+    JNIEnv *env, jclass cls, jlong ptr, jstring anchor_id) {
+  (void)cls;
+  if (ptr == 0 || anchor_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid revoke trust anchor arguments");
+    return;
+  }
+  char *c_anchor = NULL;
+  if (!dup_opt_utf8(env, anchor_id, &c_anchor)) {
+    return;
+  }
+  int32_t rc = tendril_endpoint_revoke_trust_anchor(
+      (TendrilEndpoint *)(uintptr_t)ptr, c_anchor);
+  free(c_anchor);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_revoke_trust_anchor failed");
+  }
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointMintEnrollmentToken(
+    JNIEnv *env, jclass cls, jlong ptr, jstring target_host_id, jstring subject, jlong ttl_secs) {
+  (void)cls;
+  if (ptr == 0 || target_host_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid mint enrollment token arguments");
+    return NULL;
+  }
+  if (!require_non_negative_jlong(env, ttl_secs, "ttl_secs")) {
+    return NULL;
+  }
+  char *c_target = NULL;
+  char *c_subject = NULL;
+  char *out = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, target_host_id, &c_target) &&
+      dup_opt_utf8(env, subject, &c_subject)) {
+    rc = tendril_endpoint_mint_enrollment_token(
+        (TendrilEndpoint *)(uintptr_t)ptr, c_target, c_subject, (uint64_t)ttl_secs, &out);
+  }
+  free(c_target);
+  free(c_subject);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_mint_enrollment_token failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointEnrollInitiate(
+    JNIEnv *env, jclass cls, jlong ptr, jstring endpoint, jstring relay_host,
+    jstring host_id, jbyteArray host_static_pub, jbyteArray host_signing_pub,
+    jlong host_rotation_seq, jstring token_json, jstring name, jstring kind) {
+  (void)cls;
+  if (ptr == 0 || endpoint == NULL || host_id == NULL || token_json == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid enroll initiate arguments");
+    return NULL;
+  }
+  if (!require_non_negative_jlong(env, host_rotation_seq, "host_rotation_seq")) {
+    return NULL;
+  }
+  uint8_t static_pub[32];
+  uint8_t signing_pub[32];
+  if (!read_bytes32(env, host_static_pub, static_pub) ||
+      !read_bytes32(env, host_signing_pub, signing_pub)) {
+    return NULL;
+  }
+  char *c_ep = NULL;
+  char *c_rh = NULL;
+  char *c_host = NULL;
+  char *c_token = NULL;
+  char *c_name = NULL;
+  char *c_kind = NULL;
+  char *out = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, endpoint, &c_ep) &&
+      dup_opt_utf8(env, relay_host, &c_rh) &&
+      dup_opt_utf8(env, host_id, &c_host) &&
+      dup_opt_utf8(env, token_json, &c_token) &&
+      dup_opt_utf8(env, name, &c_name) &&
+      dup_opt_utf8(env, kind, &c_kind)) {
+    rc = tendril_endpoint_enroll_initiate(
+        (TendrilEndpoint *)(uintptr_t)ptr,
+        c_ep,
+        c_rh,
+        c_host,
+        static_pub,
+        signing_pub,
+        (uint64_t)host_rotation_seq,
+        c_token,
+        c_name,
+        c_kind,
+        &out);
+  }
+  free(c_ep);
+  free(c_rh);
+  free(c_host);
+  zeroize_cstr_free(c_token);
+  free(c_name);
+  free(c_kind);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_enroll_initiate failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
 JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionConnect(
     JNIEnv *env, jclass cls, jlong ep_ptr, jstring endpoint, jstring relay_host,
     jstring target_host_id, jstring grant_json) {

@@ -12,19 +12,21 @@ use tendril_core::crypto::{b64url_decode, b64url_encode, random_bytes};
 use tendril_core::grants::Grant;
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::pairing::{
-    PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PairingPathKind,
+    EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PairingPathKind,
+    mint_enrollment_token as core_mint_enrollment_token,
 };
 use tendril_core::policy::ProviderId;
-use tendril_core::roster::Roster;
+use tendril_core::roster::{AnchorState, Roster};
 use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
     DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer, PathDialer, PathListener,
     PathStream, PrefixedPathStream, RelayDialer, RelayListener, SessionDriver, SessionEvent,
-    StateStore, drive_pair_initiator, drive_pair_responder, peek_exact,
+    StateStore, drive_pair_initiator, drive_pair_responder_with_policy, peek_exact,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use zeroize::Zeroizing;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -42,6 +44,18 @@ enum PeerCmd {
     },
     IssueCode {
         kind: Option<String>,
+    },
+    AddTrustAnchor {
+        anchor_id: String,
+        signing_pub: String,
+    },
+    RevokeTrustAnchor {
+        anchor_id: String,
+    },
+    MintEnrollmentToken {
+        target_host_id: String,
+        subject: Option<String>,
+        ttl_secs: Option<u64>,
     },
     Pair {
         endpoint: Option<String>,
@@ -98,6 +112,7 @@ struct PeerState {
     identity: Option<EndpointIdentity>,
     roster: Roster,
     pair_mgr: PairingManager,
+    self_m2m_enabled: bool,
     accepted_tx: mpsc::Sender<Box<dyn PathStream>>,
     accepted_rx: mpsc::Receiver<Box<dyn PathStream>>,
     listener_tasks: Vec<JoinHandle<()>>,
@@ -112,6 +127,7 @@ impl PeerState {
             identity: None,
             roster: Roster::new(),
             pair_mgr: PairingManager::new(PairingConfig::default()),
+            self_m2m_enabled: false,
             accepted_tx,
             accepted_rx,
             listener_tasks: Vec::new(),
@@ -263,6 +279,73 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 Err(e) => (err_json(e.to_string()), false),
             }
         }
+        PeerCmd::AddTrustAnchor {
+            anchor_id,
+            signing_pub,
+        } => {
+            let key_bytes = match b64url_decode(&signing_pub).and_then(|v| {
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    tendril_core::error::CoreError::InvalidLength {
+                        expected: 32,
+                        actual: v.len(),
+                    }
+                })
+            }) {
+                Ok(k) => k,
+                Err(e) => return (err_json(e.to_string()), false),
+            };
+            if let Err(e) = state.roster.add_trust_anchor(anchor_id, key_bytes) {
+                return (err_json(e.to_string()), false);
+            }
+            if let Err(e) = state.persist_roster() {
+                return (err_json(e), false);
+            }
+            (serde_json::json!({ "ok": true }), false)
+        }
+        PeerCmd::RevokeTrustAnchor { anchor_id } => {
+            if let Err(e) = state.roster.revoke_trust_anchor(&anchor_id) {
+                return (err_json(e.to_string()), false);
+            }
+            if let Err(e) = state.persist_roster() {
+                return (err_json(e), false);
+            }
+            (serde_json::json!({ "ok": true }), false)
+        }
+        PeerCmd::MintEnrollmentToken {
+            target_host_id,
+            subject,
+            ttl_secs,
+        } => {
+            let Some(id) = state.identity.as_ref() else {
+                return (
+                    err_json("init required before mint_enrollment_token"),
+                    false,
+                );
+            };
+            let nonce = match random_bytes::<16>() {
+                Ok(n) => n,
+                Err(e) => return (err_json(e.to_string()), false),
+            };
+            let token = match core_mint_enrollment_token(
+                id,
+                &target_host_id,
+                subject.as_deref(),
+                now_unix(),
+                ttl_secs.unwrap_or(900),
+                nonce,
+            ) {
+                Ok(t) => t,
+                Err(e) => return (err_json(e.to_string()), false),
+            };
+            if target_host_id == id.host_id() {
+                state.self_m2m_enabled = true;
+            }
+            let json = Zeroizing::new(serde_json::to_string(&token).expect("serialize token"));
+            (
+                serde_json::json!({ "ok": true, "token_json": *json }),
+                false,
+            )
+        }
         PeerCmd::Pair {
             endpoint,
             relay_host,
@@ -380,19 +463,32 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 } else {
                     PairingPathKind::Lan
                 };
+                let policy = if state.self_m2m_enabled
+                    || state
+                        .roster
+                        .trust_anchors()
+                        .any(|(_, a)| a.state == AnchorState::Active)
+                {
+                    EnrollmentPolicy::enabled_default()
+                } else {
+                    EnrollmentPolicy::default()
+                };
                 let mgr_lock = StdMutex::new(std::mem::replace(
                     &mut state.pair_mgr,
                     PairingManager::new(PairingConfig::default()),
                 ));
                 let roster_lock = StdMutex::new(std::mem::take(&mut state.roster));
-                let pair_res = drive_pair_responder(
+                let pair_res = drive_pair_responder_with_policy(
                     &mut wrapped,
                     &id,
                     &mgr_lock,
                     &roster_lock,
                     path_kind,
                     now_unix(),
+                    policy,
                     None,
+                    None,
+                    tendril_runtime::DEFAULT_PRE_AUTH_TIMEOUT,
                 )
                 .await;
                 state.pair_mgr = mgr_lock.into_inner().expect("lock");
@@ -421,13 +517,33 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                                 false,
                             )
                         }
+                        PairOutcome::ResponderEnrolled {
+                            device_id,
+                            token_nonce,
+                            name,
+                            kind,
+                            ..
+                        } => {
+                            if let Err(e) = state.persist_roster() {
+                                return (err_json(e), false);
+                            }
+                            (
+                                serde_json::json!({
+                                    "ok": true,
+                                    "role": "responder",
+                                    "status": "active",
+                                    "device_id": device_id,
+                                    "token_nonce": token_nonce,
+                                    "name": name,
+                                    "kind": kind,
+                                }),
+                                false,
+                            )
+                        }
                         PairOutcome::Rejected { error } => (err_json(error), false),
                         PairOutcome::InitiatorPending { .. }
                         | PairOutcome::InitiatorEnrolled { .. } => {
                             (err_json("unexpected initiator outcome"), false)
-                        }
-                        PairOutcome::ResponderEnrolled { .. } => {
-                            (err_json("unexpected m2m enrollment outcome"), false)
                         }
                     },
                     Err(e) => (err_json(e.to_string()), false),

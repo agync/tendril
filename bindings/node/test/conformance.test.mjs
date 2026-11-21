@@ -494,3 +494,95 @@ test("Node binding validates safe integers and runs full-duplex session ops conc
     cliEp.close();
   }
 });
+
+test("Node M2M enrollment, single-use replay, and anchor revocation", async () => {
+  const hostEp = new tendril.Endpoint(null, "node-m2m-host");
+  const anchorEp = new tendril.Endpoint(null, "node-m2m-anchor");
+  const cliEp = new tendril.Endpoint(null, "node-m2m-cli");
+  const cli2Ep = new tendril.Endpoint(null, "node-m2m-cli2");
+  try {
+    const hostInfo = JSON.parse(hostEp.infoJson());
+    const anchorInfo = JSON.parse(anchorEp.infoJson());
+    const hostStatic = Buffer.from(hostInfo.static_pub, "base64url");
+    const hostSigning = Buffer.from(hostInfo.signing_pub, "base64url");
+    const anchorSigning = Buffer.from(anchorInfo.signing_pub, "base64url");
+
+    hostEp.addTrustAnchor("node-m2m-anchor", anchorSigning);
+    const addr = await hostEp.serveDirect("127.0.0.1:0");
+    const tokJson = anchorEp.mintEnrollmentToken("node-m2m-host", null, 900);
+
+    for (const badTtl of [-1, NaN, Infinity, 1.5, 2 ** 53]) {
+      assert.throws(() => anchorEp.mintEnrollmentToken("node-m2m-host", null, badTtl));
+    }
+    for (const badSeq of [-1, NaN, Infinity, 1.5, 2 ** 53]) {
+      await assert.rejects(
+        cliEp.enrollInitiate(addr, "node-m2m-host", hostStatic, hostSigning, tokJson, null, badSeq)
+      );
+    }
+
+    const [initRaw, accRaw] = await Promise.all([
+      cliEp.enrollInitiate(
+        addr,
+        "node-m2m-host",
+        hostStatic,
+        hostSigning,
+        tokJson,
+        null,
+        0,
+        "node-worker",
+        "machine"
+      ),
+      hostEp.pairAccept(5000),
+    ]);
+    const initRes = JSON.parse(initRaw);
+    const accRes = JSON.parse(accRaw);
+    assert.equal(initRes.status, "active");
+    assert.equal(accRes.status, "active");
+    assert.equal(initRes.device_id, accRes.device_id);
+
+    const [repInitRes] = await Promise.allSettled([
+      cliEp.enrollInitiate(addr, "node-m2m-host", hostStatic, hostSigning, tokJson),
+      hostEp.pairAccept(5000).catch(() => null),
+    ]);
+    assert.equal(repInitRes.status, "rejected");
+    assert.match(String(repInitRes.reason), /token_replayed/);
+
+    const grantJson = hostEp.mintGrant(initRes.device_id, ["fs.read"], 3600);
+    const [cliSess, hostSess] = await Promise.all([
+      cliEp.connect(addr, "node-m2m-host", grantJson),
+      hostEp.acceptSession(5000),
+    ]);
+    assert.equal(await hostSess.authorize("fs.read"), true);
+    assert.equal(await hostSess.authorize("shell.exec"), false);
+    await cliSess.close(1000, "done");
+
+    hostEp.revokeTrustAnchor("node-m2m-anchor");
+    const freshTok = anchorEp.mintEnrollmentToken("node-m2m-host", null, 900);
+    const [revRes] = await Promise.allSettled([
+      cli2Ep.enrollInitiate(addr, "node-m2m-host", hostStatic, hostSigning, freshTok),
+      hostEp.pairAccept(5000).catch(() => null),
+    ]);
+    assert.equal(revRes.status, "rejected");
+    assert.match(String(revRes.reason), /unauthorized/);
+
+    const selfTok = hostEp.mintEnrollmentToken("node-m2m-host", null, 900);
+    const [revAnchorRes] = await Promise.allSettled([
+      cli2Ep.enrollInitiate(addr, "node-m2m-host", hostStatic, hostSigning, freshTok),
+      hostEp.pairAccept(5000).catch(() => null),
+    ]);
+    assert.equal(revAnchorRes.status, "rejected");
+    assert.match(String(revAnchorRes.reason), /untrusted_anchor/);
+
+    const [selfInitRaw, selfAccRaw] = await Promise.all([
+      cli2Ep.enrollInitiate(addr, "node-m2m-host", hostStatic, hostSigning, selfTok),
+      hostEp.pairAccept(5000),
+    ]);
+    assert.equal(JSON.parse(selfInitRaw).status, "active");
+    assert.equal(JSON.parse(selfAccRaw).status, "active");
+  } finally {
+    cli2Ep.close();
+    cliEp.close();
+    anchorEp.close();
+    hostEp.close();
+  }
+});

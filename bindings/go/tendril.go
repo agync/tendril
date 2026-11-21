@@ -44,10 +44,21 @@ type PairInitiateResult struct {
 
 // PairAcceptResult holds the server-side outcome of accepting a pairing connection.
 type PairAcceptResult struct {
-	DeviceID string `json:"device_id"`
-	SAS      string `json:"sas"`
-	Name     string `json:"name"`
-	Kind     string `json:"kind"`
+	DeviceID   string `json:"device_id"`
+	SAS        string `json:"sas,omitempty"`
+	Status     string `json:"status,omitempty"`
+	TokenNonce string `json:"token_nonce,omitempty"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+}
+
+// EnrollInitiateResult holds the client-side outcome of M2M enrollment initiation.
+type EnrollInitiateResult struct {
+	DeviceID        string `json:"device_id"`
+	HostID          string `json:"host_id"`
+	Status          string `json:"status"`
+	HostRotationSeq uint64 `json:"host_rotation_seq"`
+	TokenNonce      string `json:"token_nonce"`
 }
 
 // SessionEvent represents one polled decrypted session event from Session.PollEvent.
@@ -555,6 +566,137 @@ func (ep *Endpoint) RevokePeer(peerID string) error {
 		}
 		return nil
 	})
+}
+
+// AddTrustAnchor registers an active Ed25519 trust anchor for autonomous M2M enrollment.
+func (ep *Endpoint) AddTrustAnchor(anchorID string, signingPub []byte) error {
+	if len(signingPub) != 32 {
+		return fmt.Errorf("tendril: signingPub must be 32 bytes (got %d)", len(signingPub))
+	}
+	defer runtime.KeepAlive(signingPub)
+	return ep.withHandle(func(h *C.TendrilEndpoint) error {
+		ca, err := toCStr(anchorID, "anchorID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(ca))
+		rc := C.tendril_endpoint_add_trust_anchor(
+			h,
+			ca,
+			(*C.uint8_t)(unsafe.Pointer(&signingPub[0])),
+		)
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return nil
+	})
+}
+
+// RevokeTrustAnchor revokes an external trust anchor and sibling anchors sharing its key.
+func (ep *Endpoint) RevokeTrustAnchor(anchorID string) error {
+	return ep.withHandle(func(h *C.TendrilEndpoint) error {
+		ca, err := toCStr(anchorID, "anchorID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(ca))
+		if rc := C.tendril_endpoint_revoke_trust_anchor(h, ca); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return nil
+	})
+}
+
+// MintEnrollmentToken mints a single-use M2M enrollment token JSON document.
+func (ep *Endpoint) MintEnrollmentToken(targetHostID, subject string, ttlSecs uint64) (string, error) {
+	var tokenJSON string
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		ct, err := toCStr(targetHostID, "targetHostID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(ct))
+
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptCStr(subject, "subject", func(cs *C.char) error {
+			rc = C.tendril_endpoint_mint_enrollment_token(h, ct, cs, C.uint64_t(ttlSecs), &out)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		tokenJSON = takeOutCStr(out)
+		return nil
+	})
+	return tokenJSON, err
+}
+
+// EnrollInitiate dials endpoint with a pinned host key and single-use M2M enrollment token.
+func (ep *Endpoint) EnrollInitiate(
+	endpoint, relayHost, hostID string,
+	hostStaticPub, hostSigningPub []byte,
+	hostRotationSeq uint64,
+	tokenJSON, name, kind string,
+) (EnrollInitiateResult, error) {
+	var res EnrollInitiateResult
+	if len(hostStaticPub) != 32 {
+		return res, fmt.Errorf("tendril: hostStaticPub must be 32 bytes (got %d)", len(hostStaticPub))
+	}
+	if len(hostSigningPub) != 32 {
+		return res, fmt.Errorf("tendril: hostSigningPub must be 32 bytes (got %d)", len(hostSigningPub))
+	}
+	defer runtime.KeepAlive(hostStaticPub)
+	defer runtime.KeepAlive(hostSigningPub)
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cep, err := toCStr(endpoint, "endpoint")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cep))
+		chid, err := toCStr(hostID, "hostID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(chid))
+		ctok, err := toCStr(tokenJSON, "tokenJSON")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(ctok))
+
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptCStr(relayHost, "relayHost", func(cr *C.char) error {
+			return withOptCStr(name, "name", func(cn *C.char) error {
+				return withOptCStr(kind, "kind", func(ck *C.char) error {
+					rc = C.tendril_endpoint_enroll_initiate(
+						h,
+						cep,
+						cr,
+						chid,
+						(*C.uint8_t)(unsafe.Pointer(&hostStaticPub[0])),
+						(*C.uint8_t)(unsafe.Pointer(&hostSigningPub[0])),
+						C.uint64_t(hostRotationSeq),
+						ctok,
+						cn,
+						ck,
+						&out,
+					)
+					return nil
+				})
+			})
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return json.Unmarshal([]byte(takeOutCStr(out)), &res)
+	})
+	return res, err
 }
 
 // Connect opens an authenticated Noise XX session toward targetHostID.

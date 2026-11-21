@@ -604,3 +604,173 @@ test("computeCodeMacWorker handles timeout and messageerror with termination", a
     globalThis.Worker = savedWorker;
   }
 });
+
+test("TendrilWebClient M2M enrollment over WSS relay, single-use replay, and anchor revocation", async () => {
+  await ensureWasm();
+  const relay = await spawnRelay();
+  const peer = spawnPeer();
+  try {
+    const hostInit = await peer.call({ op: "init", host_id: "web-m2m-host" });
+    await peer.call({
+      op: "serve_relay",
+      relay_url: relay.wsUrl,
+      expected_host: "127.0.0.1",
+    });
+
+    let persistedCount = 0;
+    const anchorClient = await TendrilWebClient.create({ hostId: "web-m2m-anchor" });
+    const client = await TendrilWebClient.create({
+      hostId: "web-m2m-cli",
+      onPersistRoster: () => {
+        persistedCount += 1;
+      },
+    });
+    const cli2 = await TendrilWebClient.create({ hostId: "web-m2m-cli2" });
+
+    try {
+      const anchorInfo = anchorClient.info();
+      await peer.call({
+        op: "add_trust_anchor",
+        anchor_id: "web-m2m-anchor",
+        signing_pub: anchorInfo.signing_pub,
+      });
+      const beforePersist = persistedCount;
+      await client.addTrustAnchor("web-m2m-anchor", anchorInfo.signing_pub);
+      assert.equal(persistedCount, beforePersist + 1);
+      const addedRoster = JSON.parse(client.exportRosterJson());
+      assert.equal(addedRoster.trust_anchors["web-m2m-anchor"].state, "active");
+      await client.revokeTrustAnchor("web-m2m-anchor");
+      assert.equal(persistedCount, beforePersist + 2);
+      const revokedRoster = JSON.parse(client.exportRosterJson());
+      assert.equal(revokedRoster.trust_anchors["web-m2m-anchor"].state, "revoked");
+
+      const tokenJson = anchorClient.mintEnrollmentToken({
+        targetHostId: "web-m2m-host",
+        ttlSecs: 900,
+      });
+
+      const pairP = peer.call({ op: "pair" });
+      const enrollRes = await client.enroll({
+        relayUrl: relay.wsUrl,
+        targetPub: hostInit.signing_pub,
+        expectedHost: "127.0.0.1",
+        allowInsecureWs: true,
+        hostId: "web-m2m-host",
+        hostStaticPubB64: hostInit.static_pub,
+        hostSigningPubB64: hostInit.signing_pub,
+        tokenJson,
+        deviceName: "web-worker",
+        deviceKind: "machine",
+      });
+      const hostRes = await pairP;
+      assert.equal(enrollRes.status, "active");
+      assert.equal(hostRes.status, "active");
+      assert.equal(enrollRes.device_id, hostRes.device_id);
+      assert.equal(persistedCount, beforePersist + 3);
+
+      const repPairP = peer.call({ op: "pair" }).catch(() => null);
+      await assert.rejects(
+        () =>
+          client.enroll({
+            relayUrl: relay.wsUrl,
+            targetPub: hostInit.signing_pub,
+            expectedHost: "127.0.0.1",
+            allowInsecureWs: true,
+            hostId: "web-m2m-host",
+            hostStaticPubB64: hostInit.static_pub,
+            hostSigningPubB64: hostInit.signing_pub,
+            tokenJson,
+          }),
+        /token_replayed/
+      );
+      await repPairP;
+
+      const grant = (
+        await peer.call({ op: "mint", peer_id: hostRes.device_id, caps: ["fs.read"] })
+      ).grant;
+      const connP = peer.call({ op: "connect" });
+      const sess = await client.connect({
+        relayUrl: relay.wsUrl,
+        targetPub: hostInit.signing_pub,
+        expectedHost: "127.0.0.1",
+        allowInsecureWs: true,
+        targetHostId: "web-m2m-host",
+        grantJson: JSON.stringify(grant),
+      });
+      await connP;
+      assert.equal((await peer.call({ op: "authorize", cap: "fs.read" })).allowed, true);
+      assert.equal((await peer.call({ op: "authorize", cap: "shell.exec" })).allowed, false);
+      await sess.close(1000, "done");
+
+      await peer.call({ op: "revoke_trust_anchor", anchor_id: "web-m2m-anchor" });
+      const freshTok = anchorClient.mintEnrollmentToken({
+        targetHostId: "web-m2m-host",
+        ttlSecs: 900,
+      });
+      const revPairP = peer.call({ op: "pair" }).catch(() => null);
+      await assert.rejects(
+        () =>
+          cli2.enroll({
+            relayUrl: relay.wsUrl,
+            targetPub: hostInit.signing_pub,
+            expectedHost: "127.0.0.1",
+            allowInsecureWs: true,
+            hostId: "web-m2m-host",
+            hostStaticPubB64: hostInit.static_pub,
+            hostSigningPubB64: hostInit.signing_pub,
+            tokenJson: freshTok,
+          }),
+        /unauthorized/
+      );
+      await revPairP;
+
+      const selfTok = (
+        await peer.call({
+          op: "mint_enrollment_token",
+          target_host_id: "web-m2m-host",
+          ttl_secs: 900,
+        })
+      ).token_json;
+      const revPairP2 = peer.call({ op: "pair" }).catch(() => null);
+      await assert.rejects(
+        () =>
+          cli2.enroll({
+            relayUrl: relay.wsUrl,
+            targetPub: hostInit.signing_pub,
+            expectedHost: "127.0.0.1",
+            allowInsecureWs: true,
+            hostId: "web-m2m-host",
+            hostStaticPubB64: hostInit.static_pub,
+            hostSigningPubB64: hostInit.signing_pub,
+            tokenJson: freshTok,
+          }),
+        /untrusted_anchor/
+      );
+      await revPairP2;
+
+      const selfPairP = peer.call({ op: "pair" });
+      const selfEnrollRes = await cli2.enroll({
+        relayUrl: relay.wsUrl,
+        targetPub: hostInit.signing_pub,
+        expectedHost: "127.0.0.1",
+        allowInsecureWs: true,
+        hostId: "web-m2m-host",
+        hostStaticPubB64: hostInit.static_pub,
+        hostSigningPubB64: hostInit.signing_pub,
+        tokenJson: selfTok,
+        deviceName: "web-worker-2",
+        deviceKind: "machine",
+      });
+      const selfHostRes = await selfPairP;
+      assert.equal(selfEnrollRes.status, "active");
+      assert.equal(selfHostRes.status, "active");
+    } finally {
+      cli2.free();
+      client.free();
+      anchorClient.free();
+    }
+  } finally {
+    peer.close();
+    relay.child.kill();
+  }
+});

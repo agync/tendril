@@ -512,6 +512,133 @@ class TendrilPythonTests(unittest.TestCase):
             host_ep.close()
             cli_ep.close()
 
+    def test_m2m_enrollment_and_replay(self) -> None:
+        host_ep = tendril.Endpoint(None, "py-m2m-host")
+        anchor_ep = tendril.Endpoint(None, "py-m2m-anchor")
+        cli_ep = tendril.Endpoint(None, "py-m2m-cli")
+        cli2_ep = tendril.Endpoint(None, "py-m2m-cli2")
+        try:
+            host_info = json.loads(host_ep.info_json())
+            anchor_info = json.loads(anchor_ep.info_json())
+
+            def b64u_dec(s: str) -> bytes:
+                return base64.urlsafe_b64decode(s + "=" * ((4 - len(s) % 4) % 4))
+
+            host_static = b64u_dec(host_info["static_pub"])
+            host_signing = b64u_dec(host_info["signing_pub"])
+            anchor_signing = b64u_dec(anchor_info["signing_pub"])
+
+            host_ep.add_trust_anchor("py-m2m-anchor", anchor_signing)
+            addr = host_ep.serve_direct("127.0.0.1:0")
+            tok_json = anchor_ep.mint_enrollment_token("py-m2m-host", None, 900)
+
+            acc_holder: dict = {}
+
+            def accept_pair() -> None:
+                acc_holder["res"] = json.loads(host_ep.pair_accept(5000))
+
+            t = threading.Thread(target=accept_pair)
+            t.start()
+            init_res = json.loads(
+                cli_ep.enroll_initiate(
+                    addr,
+                    "py-m2m-host",
+                    host_static,
+                    host_signing,
+                    tok_json,
+                    name="py-worker",
+                    kind="machine",
+                )
+            )
+            t.join(timeout=5)
+            acc = acc_holder["res"]
+            self.assertEqual(init_res["status"], "active")
+            self.assertEqual(acc["status"], "active")
+            self.assertEqual(init_res["device_id"], acc["device_id"])
+
+            def accept_ignore_err() -> None:
+                try:
+                    host_ep.pair_accept(5000)
+                except RuntimeError:
+                    pass
+
+            t_rep = threading.Thread(target=accept_ignore_err)
+            t_rep.start()
+            with self.assertRaisesRegex(RuntimeError, "token_replayed"):
+                cli_ep.enroll_initiate(
+                    addr,
+                    "py-m2m-host",
+                    host_static,
+                    host_signing,
+                    tok_json,
+                )
+            t_rep.join(timeout=5)
+
+            grant_json = host_ep.mint_grant(init_res["device_id"], ["fs.read"], 3600)
+            sess_holder: dict = {}
+            t_sess = threading.Thread(
+                target=lambda: sess_holder.__setitem__("sess", host_ep.accept_session(5000))
+            )
+            t_sess.start()
+            cli_sess = cli_ep.connect(addr, "py-m2m-host", grant_json)
+            t_sess.join(timeout=5)
+            host_sess = sess_holder["sess"]
+            self.assertTrue(host_sess.authorize("fs.read"))
+            self.assertFalse(host_sess.authorize("shell.exec"))
+            cli_sess.close()
+
+            # Revoking the sole trust anchor disables M2M policy -> unauthorized.
+            host_ep.revoke_trust_anchor("py-m2m-anchor")
+            fresh_tok = anchor_ep.mint_enrollment_token("py-m2m-host", None, 900)
+            t_rev = threading.Thread(target=accept_ignore_err)
+            t_rev.start()
+            with self.assertRaisesRegex(RuntimeError, "unauthorized"):
+                cli2_ep.enroll_initiate(
+                    addr,
+                    "py-m2m-host",
+                    host_static,
+                    host_signing,
+                    fresh_tok,
+                )
+            t_rev.join(timeout=5)
+
+            # Re-enabling M2M via self-issued minting still blocks revoked anchor with untrusted_anchor
+            # while allowing the self-issued token to enroll.
+            self_tok = host_ep.mint_enrollment_token("py-m2m-host", None, 900)
+            t_rev2 = threading.Thread(target=accept_ignore_err)
+            t_rev2.start()
+            with self.assertRaisesRegex(RuntimeError, "untrusted_anchor"):
+                cli2_ep.enroll_initiate(
+                    addr,
+                    "py-m2m-host",
+                    host_static,
+                    host_signing,
+                    fresh_tok,
+                )
+            t_rev2.join(timeout=5)
+
+            t_self = threading.Thread(target=lambda: acc_holder.__setitem__("self", json.loads(host_ep.pair_accept(5000))))
+            t_self.start()
+            self_res = json.loads(
+                cli2_ep.enroll_initiate(
+                    addr,
+                    "py-m2m-host",
+                    host_static,
+                    host_signing,
+                    self_tok,
+                    name="py-worker-2",
+                    kind="machine",
+                )
+            )
+            t_self.join(timeout=5)
+            self.assertEqual(self_res["status"], "active")
+            self.assertEqual(acc_holder["self"]["status"], "active")
+        finally:
+            cli2_ep.close()
+            cli_ep.close()
+            anchor_ep.close()
+            host_ep.close()
+
 
 if __name__ == "__main__":
     unittest.main()

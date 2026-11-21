@@ -48,6 +48,14 @@ export interface PairResult {
   host_confirmed: boolean;
 }
 
+export interface EnrollResult {
+  device_id: string;
+  host_id: string;
+  status: "active";
+  host_rotation_seq: number;
+  token_nonce: string;
+}
+
 export interface PollEvent {
   status: "event" | "would_block" | "eof";
   event?: string;
@@ -148,6 +156,29 @@ export class TendrilWebClient {
   getPeer(peerId: string): unknown | null;
   confirmPeer(peerId: string, sas?: string | null): Promise<void>;
   removePendingPeer(peerId: string): Promise<void>;
+  addTrustAnchor(anchorId: string, signingPubB64: string): Promise<void>;
+  revokeTrustAnchor(anchorId: string): Promise<void>;
+  mintEnrollmentToken(options: {
+    targetHostId: string;
+    subject?: string | null;
+    ttlSecs?: number;
+  }): string;
+  enroll(options: {
+    endpoint?: string | null;
+    relayUrl?: string | null;
+    targetPub?: string | null;
+    expectedHost?: string | null;
+    relayUrlOverride?: string | null;
+    allowInsecureWs?: boolean;
+    hostId: string;
+    hostStaticPubB64: string;
+    hostSigningPubB64: string;
+    hostRotationSeq?: number;
+    tokenJson: string;
+    deviceName?: string;
+    deviceKind?: string;
+    timeoutMs?: number;
+  }): Promise<EnrollResult>;
   pair(options: {
     endpoint?: string | null;
     relayUrl?: string | null;

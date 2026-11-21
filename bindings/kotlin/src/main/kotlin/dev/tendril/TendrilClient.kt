@@ -250,6 +250,54 @@ class TendrilEndpoint private constructor(
       persistRoster(it)
     }
 
+  fun addTrustAnchor(anchorId: String, signingPub: ByteArray) =
+    withHandle {
+      TendrilNative.endpointAddTrustAnchor(it, anchorId, signingPub)
+      persistRoster(it)
+    }
+
+  fun revokeTrustAnchor(anchorId: String) =
+    withHandle {
+      TendrilNative.endpointRevokeTrustAnchor(it, anchorId)
+      persistRoster(it)
+    }
+
+  fun mintEnrollmentToken(
+    targetHostId: String,
+    subject: String? = null,
+    ttlSecs: Long = 900,
+  ): String =
+    withHandle { TendrilNative.endpointMintEnrollmentToken(it, targetHostId, subject, ttlSecs) }
+
+  fun enrollInitiate(
+    endpoint: String,
+    relayHost: String? = null,
+    hostId: String,
+    hostStaticPub: ByteArray,
+    hostSigningPub: ByteArray,
+    hostRotationSeq: Long = 0,
+    tokenJson: String,
+    deviceName: String = "android-machine",
+    deviceKind: String = "machine",
+  ): String =
+    withHandle {
+      val out =
+        TendrilNative.endpointEnrollInitiate(
+          it,
+          endpoint,
+          relayHost,
+          hostId,
+          hostStaticPub,
+          hostSigningPub,
+          hostRotationSeq,
+          tokenJson,
+          deviceName,
+          deviceKind,
+        )
+      persistRoster(it)
+      out
+    }
+
   fun connect(
     endpoint: String,
     relayHost: String? = null,

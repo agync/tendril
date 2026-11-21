@@ -415,6 +415,145 @@ export class TendrilWebClient {
     });
   }
 
+  async addTrustAnchor(anchorId, signingPubB64) {
+    return this.#withHold(async () => {
+      const prevRoster = this.#roster.to_json();
+      this.#roster.add_trust_anchor(anchorId, signingPubB64);
+      try {
+        await this.#persistRoster();
+      } catch (err) {
+        if (!this.#wasmFreed) {
+          try {
+            this.#roster.replace_from_json(prevRoster);
+          } catch {}
+        }
+        throw err;
+      }
+    });
+  }
+
+  async revokeTrustAnchor(anchorId) {
+    return this.#withHold(async () => {
+      const prevRoster = this.#roster.to_json();
+      this.#roster.revoke_trust_anchor(anchorId);
+      try {
+        await this.#persistRoster();
+      } catch (err) {
+        if (!this.#wasmFreed) {
+          try {
+            this.#roster.replace_from_json(prevRoster);
+          } catch {}
+        }
+        throw err;
+      }
+    });
+  }
+
+  mintEnrollmentToken({ targetHostId, subject = null, ttlSecs = 900 }) {
+    this.#ensureOpen();
+    return this.#identity.mint_enrollment_token(targetHostId, subject, nowUnixSecs(), ttlSecs);
+  }
+
+  async enroll({
+    endpoint = null,
+    relayUrl = null,
+    targetPub = null,
+    expectedHost = null,
+    relayUrlOverride = null,
+    allowInsecureWs = false,
+    hostId,
+    hostStaticPubB64,
+    hostSigningPubB64,
+    hostRotationSeq = 0,
+    tokenJson,
+    deviceName = "web-machine",
+    deviceKind = "machine",
+    timeoutMs = 15000,
+  }) {
+    return this.#withHold(async () => {
+      await warmTargetTransport(endpoint, relayUrl);
+      this.#ensureOpen();
+      const deadlineMs = performance.now() + timeoutMs;
+      const initiator = WasmPairInitiator.new_m2m(
+        this.#identity,
+        deviceName,
+        deviceKind,
+        hostId,
+        hostStaticPubB64,
+        hostSigningPubB64,
+        hostRotationSeq,
+        tokenJson
+      );
+      let stream = null;
+      try {
+        stream = await dialWebStream({
+          endpoint,
+          relayUrl,
+          targetPub,
+          expectedHost,
+          relayUrlOverride,
+          allowInsecureWs,
+          timeoutMs: remainingBudgetMs(
+            deadlineMs,
+            "m2m enrollment timed out connecting to transport"
+          ),
+        });
+        this.#ensureOpen();
+        const startBytes = initiator.start();
+        await sendProtocolBytes(stream, startBytes);
+        while (true) {
+          const waitMs = remainingBudgetMs(
+            deadlineMs,
+            "m2m enrollment timed out waiting for host response"
+          );
+          const frame = await stream.recv(waitMs);
+          this.#ensureOpen();
+          if (frame.status === "would_block") {
+            throw new Error("m2m enrollment timed out waiting for host response");
+          }
+          if (frame.status === "eof") {
+            throw new Error("m2m enrollment stream closed before completion");
+          }
+          const prevRoster = this.#roster.to_json();
+          const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
+          if (res.write_b64) {
+            await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+          }
+          if (res.outcome) {
+            if (res.outcome.status === "active") {
+              try {
+                await this.#persistRoster();
+              } catch (err) {
+                if (!this.#wasmFreed) {
+                  try {
+                    this.#roster.replace_from_json(prevRoster);
+                  } catch {}
+                }
+                throw err;
+              }
+              return {
+                device_id: res.outcome.device_id,
+                host_id: res.outcome.host_id,
+                status: "active",
+                host_rotation_seq: res.outcome.host_rotation_seq,
+                token_nonce: res.outcome.token_nonce,
+              };
+            }
+            if (res.outcome.status === "rejected") {
+              throw new Error(`m2m enrollment rejected: ${res.outcome.error}`);
+            }
+            throw new Error(`unexpected enrollment outcome: ${JSON.stringify(res.outcome)}`);
+          }
+        }
+      } finally {
+        initiator.free();
+        if (stream) {
+          await stream.close();
+        }
+      }
+    });
+  }
+
   #persistRoster() {
     const fn = this.#onPersistRoster;
     if (typeof fn !== "function") {

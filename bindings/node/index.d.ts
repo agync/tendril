@@ -39,6 +39,24 @@ export class Endpoint {
   confirmPeer(peerId: string, sas?: string | null): void;
   mintGrant(peerId: string, caps: string[], ttlSecs?: number | null): string;
   revokePeer(peerId: string): void;
+  addTrustAnchor(anchorId: string, signingPub: Buffer): void;
+  revokeTrustAnchor(anchorId: string): void;
+  mintEnrollmentToken(
+    targetHostId: string,
+    subject?: string | null,
+    ttlSecs?: number | null
+  ): string;
+  enrollInitiate(
+    endpoint: string,
+    hostId: string,
+    hostStaticPub: Buffer,
+    hostSigningPub: Buffer,
+    tokenJson: string,
+    relayHost?: string | null,
+    hostRotationSeq?: number | null,
+    name?: string | null,
+    kind?: string | null
+  ): Promise<string>;
   connect(
     endpoint: string,
     targetHostId: string,

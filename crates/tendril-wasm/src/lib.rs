@@ -13,11 +13,14 @@ use tendril_core::crypto::{
     SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode,
     compute_code_mac as core_compute_code_mac, device_id as core_device_id,
     fingerprint_device as core_fingerprint_device, fingerprint_host as core_fingerprint_host,
-    pairing_sas as core_pairing_sas,
+    pairing_sas as core_pairing_sas, random_bytes,
 };
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
 use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
-use tendril_core::pairing::{PairAction, PairOutcome, PairingInitiator, PairingUri, PinnedHost};
+use tendril_core::pairing::{
+    PairAction, PairOutcome, PairingInitiator, PairingUri, PinnedHost,
+    mint_enrollment_token as core_mint_enrollment_token,
+};
 use tendril_core::roster::Roster;
 use tendril_core::session::{SessionAction, SessionMachine};
 use wasm_bindgen::prelude::*;
@@ -276,6 +279,29 @@ impl WasmIdentity {
     pub fn info_json(&self) -> String {
         self.info_string()
     }
+
+    #[wasm_bindgen]
+    pub fn mint_enrollment_token(
+        &self,
+        target_host_id: &str,
+        subject_opt: Option<String>,
+        now_unix: f64,
+        ttl_secs: f64,
+    ) -> Result<String, JsValue> {
+        let now_u64 = f64_to_u64(now_unix, "now_unix").map_err(to_js_err)?;
+        let ttl_u64 = f64_to_u64(ttl_secs, "ttl_secs").map_err(to_js_err)?;
+        let nonce = random_bytes::<16>().map_err(to_js_err)?;
+        let token = core_mint_enrollment_token(
+            &self.inner,
+            target_host_id,
+            subject_opt.as_deref(),
+            now_u64,
+            ttl_u64,
+            nonce,
+        )
+        .map_err(to_js_err)?;
+        serde_json::to_string(&token).map_err(to_js_err)
+    }
 }
 
 /// Sans-I/O peer roster and verified CRL store managed by host JS storage.
@@ -359,6 +385,24 @@ impl WasmRoster {
     #[wasm_bindgen]
     pub fn remove_pending_peer(&mut self, peer_id: &str) -> Result<(), JsValue> {
         self.inner.remove_pending_peer(peer_id).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn add_trust_anchor(
+        &mut self,
+        anchor_id: &str,
+        signing_pub_b64: &str,
+    ) -> Result<(), JsValue> {
+        let key = b64url_decode_array::<32>(signing_pub_b64).map_err(to_js_err)?;
+        self.inner
+            .add_trust_anchor(anchor_id.to_owned(), key)
+            .map(|_| ())
+            .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn revoke_trust_anchor(&mut self, anchor_id: &str) -> Result<(), JsValue> {
+        self.inner.revoke_trust_anchor(anchor_id).map_err(to_js_err)
     }
 
     #[wasm_bindgen]
@@ -486,6 +530,33 @@ impl WasmPairInitiator {
                         "host_confirmed": host_pin_verified,
                     }));
                 }
+                PairAction::Completed(PairOutcome::InitiatorEnrolled {
+                    device_id,
+                    host_id,
+                    host_static_pub,
+                    host_signing_pub,
+                    host_rotation_seq,
+                    token_nonce,
+                }) => {
+                    roster
+                        .inner
+                        .insert_pinned_host(
+                            host_id.clone(),
+                            host_id.clone(),
+                            host_static_pub,
+                            Some(host_signing_pub),
+                            host_rotation_seq,
+                            Vec::new(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    outcome_json = Some(json!({
+                        "status": "active",
+                        "device_id": device_id,
+                        "host_id": host_id,
+                        "host_rotation_seq": host_rotation_seq,
+                        "token_nonce": token_nonce,
+                    }));
+                }
                 PairAction::Completed(PairOutcome::Rejected { error }) => {
                     outcome_json = Some(json!({
                         "status": "rejected",
@@ -495,9 +566,6 @@ impl WasmPairInitiator {
                 PairAction::Completed(PairOutcome::ResponderPending { .. })
                 | PairAction::Completed(PairOutcome::ResponderEnrolled { .. }) => {
                     return Err("unexpected responder outcome".to_owned());
-                }
-                PairAction::Completed(PairOutcome::InitiatorEnrolled { .. }) => {
-                    return Err("unexpected m2m enrollment outcome".to_owned());
                 }
                 PairAction::CloseTransport(_) => {}
             }
@@ -509,6 +577,45 @@ impl WasmPairInitiator {
             "outcome": outcome_json,
         })
         .to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_m2m_inner(
+        identity: &WasmIdentity,
+        device_name: &str,
+        device_kind: &str,
+        host_id: &str,
+        host_static_pub_b64: &str,
+        host_signing_pub_b64: &str,
+        host_rotation_seq: Option<f64>,
+        token_json: &str,
+    ) -> Result<Self, String> {
+        let seq = match host_rotation_seq {
+            Some(v) => f64_to_u64(v, "host_rotation_seq")?,
+            None => 0,
+        };
+        let static_pub =
+            b64url_decode_array::<32>(host_static_pub_b64).map_err(|e| e.to_string())?;
+        let signing_pub =
+            b64url_decode_array::<32>(host_signing_pub_b64).map_err(|e| e.to_string())?;
+        let token: Grant =
+            serde_json::from_str(token_json).map_err(|e| format!("invalid token_json: {e}"))?;
+        let pinned = PinnedHost {
+            host_id: Some(host_id.to_owned()),
+            static_pub,
+            signing_pub,
+            rotation_seq: seq,
+        };
+        let inner = PairingInitiator::new_m2m(
+            &identity.inner,
+            device_name.to_owned(),
+            device_kind.to_owned(),
+            token,
+            pinned,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Self { inner })
     }
 }
 
@@ -535,6 +642,31 @@ impl WasmPairInitiator {
             host_signing_pub_b64.as_deref(),
             host_id.as_deref(),
             host_rotation_seq,
+        )
+        .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_m2m(
+        identity: &WasmIdentity,
+        device_name: &str,
+        device_kind: &str,
+        host_id: &str,
+        host_static_pub_b64: &str,
+        host_signing_pub_b64: &str,
+        host_rotation_seq: Option<f64>,
+        token_json: &str,
+    ) -> Result<WasmPairInitiator, JsValue> {
+        Self::new_m2m_inner(
+            identity,
+            device_name,
+            device_kind,
+            host_id,
+            host_static_pub_b64,
+            host_signing_pub_b64,
+            host_rotation_seq,
+            token_json,
         )
         .map_err(to_js_err)
     }
@@ -890,5 +1022,135 @@ mod tests {
             .feed_bytes(&sm3, now, 25, &mut host_roster)
             .unwrap();
         assert!(host_sess.is_established());
+    }
+
+    #[test]
+    fn wasm_m2m_enrollment_and_replay_rejection() {
+        use tendril_core::pairing::EnrollmentPolicy;
+
+        let host_id = EndpointIdentity::generate()
+            .unwrap()
+            .with_host_id("wasm-m2m-host");
+        let anchor_id = EndpointIdentity::generate()
+            .unwrap()
+            .with_host_id("wasm-m2m-anchor");
+        let mut host_roster = Roster::new();
+        host_roster
+            .add_trust_anchor(
+                "wasm-m2m-anchor".to_owned(),
+                *anchor_id.signing_key().public_bytes(),
+            )
+            .unwrap();
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let now = 1_795_564_800u64;
+
+        let tok =
+            core_mint_enrollment_token(&anchor_id, "wasm-m2m-host", None, now, 900, [0xA1; 16])
+                .unwrap();
+        let tok_json = serde_json::to_string(&tok).unwrap();
+
+        let cli_id = WasmIdentity::generate_inner(Some("wasm-m2m-cli")).unwrap();
+        let mut cli_roster = WasmRoster::new();
+        let mut pair_init = WasmPairInitiator::new_m2m_inner(
+            &cli_id,
+            "web-machine",
+            "machine",
+            "wasm-m2m-host",
+            &b64url_encode(host_id.static_key().public_bytes()),
+            &b64url_encode(host_id.signing_key().public_bytes()),
+            None,
+            &tok_json,
+        )
+        .unwrap();
+        let mut pair_resp = PairingResponder::with_enrollment_policy(
+            &host_id,
+            PairingPathKind::Remote,
+            None,
+            EnrollmentPolicy::enabled_default(),
+        )
+        .unwrap();
+
+        let init_m1: Vec<u8> = match pair_init.inner.start().unwrap().pop().unwrap() {
+            PairAction::WriteBytes(b) => b,
+            other => panic!("unexpected start action: {other:?}"),
+        };
+        let resp_acts1 = pair_resp
+            .feed_bytes(&init_m1, now, &mut mgr, &mut host_roster)
+            .unwrap();
+        let m2: Vec<u8> = resp_acts1
+            .into_iter()
+            .filter_map(|a| match a {
+                PairAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        let step1: serde_json::Value =
+            serde_json::from_str(&pair_init.step_bytes(&m2, &mut cli_roster).unwrap()).unwrap();
+        let m3 = b64url_decode(step1["write_b64"].as_str().unwrap()).unwrap();
+        let resp_acts2 = pair_resp
+            .feed_bytes(&m3, now, &mut mgr, &mut host_roster)
+            .unwrap();
+        let mut resp_bytes = Vec::new();
+        let mut enrolled_id = String::new();
+        for a in resp_acts2 {
+            match a {
+                PairAction::WriteBytes(b) => resp_bytes.extend_from_slice(&b),
+                PairAction::Completed(PairOutcome::ResponderEnrolled { device_id, .. }) => {
+                    enrolled_id = device_id;
+                }
+                _ => {}
+            }
+        }
+        let step2: serde_json::Value =
+            serde_json::from_str(&pair_init.step_bytes(&resp_bytes, &mut cli_roster).unwrap())
+                .unwrap();
+        assert_eq!(step2["outcome"]["status"], "active");
+        assert_eq!(step2["outcome"]["device_id"], enrolled_id);
+
+        // Single-use replay fails closed.
+        let mut rep_init = WasmPairInitiator::new_m2m_inner(
+            &cli_id,
+            "web-machine",
+            "machine",
+            "wasm-m2m-host",
+            &b64url_encode(host_id.static_key().public_bytes()),
+            &b64url_encode(host_id.signing_key().public_bytes()),
+            None,
+            &tok_json,
+        )
+        .unwrap();
+        let mut rep_resp = PairingResponder::with_enrollment_policy(
+            &host_id,
+            PairingPathKind::Remote,
+            None,
+            EnrollmentPolicy::enabled_default(),
+        )
+        .unwrap();
+        let rep_m1: Vec<u8> = match rep_init.inner.start().unwrap().pop().unwrap() {
+            PairAction::WriteBytes(b) => b,
+            _ => unreachable!(),
+        };
+        let rep_m2: Vec<u8> = rep_resp
+            .feed_bytes(&rep_m1, now, &mut mgr, &mut host_roster)
+            .unwrap()
+            .into_iter()
+            .filter_map(|a| match a {
+                PairAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let rep_step1: serde_json::Value =
+            serde_json::from_str(&rep_init.step_bytes(&rep_m2, &mut cli_roster).unwrap()).unwrap();
+        let rep_m3 = b64url_decode(rep_step1["write_b64"].as_str().unwrap()).unwrap();
+        let rep_acts2 = rep_resp
+            .feed_bytes(&rep_m3, now, &mut mgr, &mut host_roster)
+            .unwrap();
+        assert!(rep_acts2.iter().any(|a| matches!(
+            a,
+            PairAction::Completed(PairOutcome::Rejected { error }) if error == "token_replayed"
+        )));
     }
 }

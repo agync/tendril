@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -718,5 +719,156 @@ func BenchmarkFFIOverhead(b *testing.B) {
 		if _, err := tendril.DeviceID(key); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestM2mEnrollmentAndReplay(t *testing.T) {
+	hostEp, err := tendril.NewEndpoint("", "go-m2m-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint host: %v", err)
+	}
+	defer hostEp.Close()
+	anchorEp, err := tendril.NewEndpoint("", "go-m2m-anchor")
+	if err != nil {
+		t.Fatalf("NewEndpoint anchor: %v", err)
+	}
+	defer anchorEp.Close()
+	cliEp, err := tendril.NewEndpoint("", "go-m2m-cli")
+	if err != nil {
+		t.Fatalf("NewEndpoint cli: %v", err)
+	}
+	defer cliEp.Close()
+	cli2Ep, err := tendril.NewEndpoint("", "go-m2m-cli2")
+	if err != nil {
+		t.Fatalf("NewEndpoint cli2: %v", err)
+	}
+	defer cli2Ep.Close()
+
+	hostInfo, err := hostEp.Info()
+	if err != nil {
+		t.Fatalf("host Info: %v", err)
+	}
+	hostStatic, err := base64.RawURLEncoding.DecodeString(hostInfo.StaticPub)
+	if err != nil {
+		t.Fatalf("decode static: %v", err)
+	}
+	hostSigning, err := base64.RawURLEncoding.DecodeString(hostInfo.SigningPub)
+	if err != nil {
+		t.Fatalf("decode signing: %v", err)
+	}
+	anchorInfo, err := anchorEp.Info()
+	if err != nil {
+		t.Fatalf("anchor Info: %v", err)
+	}
+	anchorSigning, err := base64.RawURLEncoding.DecodeString(anchorInfo.SigningPub)
+	if err != nil {
+		t.Fatalf("decode anchor signing: %v", err)
+	}
+
+	if err := hostEp.AddTrustAnchor("go-m2m-anchor", anchorSigning); err != nil {
+		t.Fatalf("AddTrustAnchor: %v", err)
+	}
+	addr, err := hostEp.ServeDirect("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+
+	tokJSON, err := anchorEp.MintEnrollmentToken("go-m2m-host", "", 900)
+	if err != nil {
+		t.Fatalf("MintEnrollmentToken: %v", err)
+	}
+
+	type accOutcome struct {
+		res tendril.PairAcceptResult
+		err error
+	}
+	accCh := make(chan accOutcome, 1)
+	go func() {
+		r, e := hostEp.PairAccept(5000)
+		accCh <- accOutcome{res: r, err: e}
+	}()
+	initRes, err := cliEp.EnrollInitiate(addr, "", "go-m2m-host", hostStatic, hostSigning, 0, tokJSON, "go-worker", "machine")
+	if err != nil {
+		t.Fatalf("EnrollInitiate: %v", err)
+	}
+	acc := <-accCh
+	if acc.err != nil {
+		t.Fatalf("PairAccept M2M: %v", acc.err)
+	}
+	if initRes.Status != "active" || acc.res.Status != "active" || initRes.DeviceID != acc.res.DeviceID {
+		t.Fatalf("unexpected M2M outcome: init=%+v acc=%+v", initRes, acc.res)
+	}
+
+	// Single-use token replay must fail closed with token_replayed.
+	go func() {
+		_, _ = hostEp.PairAccept(5000)
+	}()
+	if _, err := cliEp.EnrollInitiate(addr, "", "go-m2m-host", hostStatic, hostSigning, 0, tokJSON, "go-worker", "machine"); err == nil {
+		t.Fatal("replayed M2M token must fail")
+	}
+
+	// Enrolled machine enters Active state with default-deny grants; minting enables session auth.
+	grantJSON, err := hostEp.MintGrant(initRes.DeviceID, []string{"fs.read"}, 3600)
+	if err != nil {
+		t.Fatalf("MintGrant post-M2M: %v", err)
+	}
+	sessCh := make(chan *tendril.Session, 1)
+	go func() {
+		s, e := hostEp.AcceptSession(5000)
+		if e == nil {
+			sessCh <- s
+		}
+	}()
+	cliSess, err := cliEp.Connect(addr, "", "go-m2m-host", grantJSON)
+	if err != nil {
+		t.Fatalf("Connect post-M2M: %v", err)
+	}
+	defer cliSess.Close()
+	srvSess := <-sessCh
+	defer srvSess.Close()
+	if allowed, err := srvSess.Authorize("fs.read"); err != nil || !allowed {
+		t.Fatalf("Authorize fs.read failed: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, err := srvSess.Authorize("shell.exec"); err != nil || allowed {
+		t.Fatalf("Authorize shell.exec must deny: allowed=%v err=%v", allowed, err)
+	}
+
+	// Revoking the sole trust anchor disables M2M policy -> unauthorized.
+	if err := hostEp.RevokeTrustAnchor("go-m2m-anchor"); err != nil {
+		t.Fatalf("RevokeTrustAnchor: %v", err)
+	}
+	freshTok, err := anchorEp.MintEnrollmentToken("go-m2m-host", "", 900)
+	if err != nil {
+		t.Fatalf("MintEnrollmentToken 2: %v", err)
+	}
+	go func() {
+		_, _ = hostEp.PairAccept(5000)
+	}()
+	if _, err := cli2Ep.EnrollInitiate(addr, "", "go-m2m-host", hostStatic, hostSigning, 0, freshTok, "go-worker-2", "machine"); err == nil || !strings.Contains(err.Error(), "unauthorized") {
+		t.Fatalf("revoked sole trust anchor token must fail with unauthorized, got: %v", err)
+	}
+
+	// Self-issued token re-enables M2M on host while still rejecting revoked anchor with untrusted_anchor.
+	selfTok, err := hostEp.MintEnrollmentToken("go-m2m-host", "", 900)
+	if err != nil {
+		t.Fatalf("MintEnrollmentToken self: %v", err)
+	}
+	go func() {
+		_, _ = hostEp.PairAccept(5000)
+	}()
+	if _, err := cli2Ep.EnrollInitiate(addr, "", "go-m2m-host", hostStatic, hostSigning, 0, freshTok, "go-worker-2", "machine"); err == nil || !strings.Contains(err.Error(), "untrusted_anchor") {
+		t.Fatalf("revoked trust anchor under active M2M must fail with untrusted_anchor, got: %v", err)
+	}
+	go func() {
+		r, e := hostEp.PairAccept(5000)
+		accCh <- accOutcome{res: r, err: e}
+	}()
+	selfInitRes, err := cli2Ep.EnrollInitiate(addr, "", "go-m2m-host", hostStatic, hostSigning, 0, selfTok, "go-worker-2", "machine")
+	if err != nil {
+		t.Fatalf("EnrollInitiate self: %v", err)
+	}
+	selfAcc := <-accCh
+	if selfAcc.err != nil || selfInitRes.Status != "active" || selfAcc.res.Status != "active" {
+		t.Fatalf("self-issued M2M failed: init=%+v acc=%+v err=%v", selfInitRes, selfAcc.res, selfAcc.err)
 	}
 }

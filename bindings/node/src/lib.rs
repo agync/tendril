@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,13 +15,17 @@ use tendril_core::crypto::{
 };
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
 use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
-use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
-use tendril_core::roster::Roster;
+use tendril_core::pairing::{
+    EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PinnedHost,
+    mint_enrollment_token as core_mint_enrollment_token,
+};
+use tendril_core::roster::{AnchorState, Roster};
 use tendril_runtime::{
     ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
     InboundRouter, P2pListener, PathListener, PathStream, RelayListener, SessionDriver,
-    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
-    drive_pair_responder_with_options, pairing_path_kind_for_provider, parse_p2p_relay_mode,
+    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint, drive_m2m_enroll_initiator,
+    drive_pair_initiator, drive_pair_responder_with_policy_and_store,
+    pairing_path_kind_for_provider, parse_p2p_relay_mode,
 };
 use tokio::time::timeout;
 
@@ -212,6 +217,8 @@ pub struct Endpoint {
     roster: Arc<StdMutex<Roster>>,
     pair_mgr: Arc<StdMutex<PairingManager>>,
     router: InboundRouter,
+    self_m2m_enabled: AtomicBool,
+    m2m_enabled: AtomicBool,
 }
 
 impl Endpoint {
@@ -220,6 +227,14 @@ impl Endpoint {
             store.save_roster(roster).map_err(to_generic_err)?;
         }
         Ok(())
+    }
+
+    fn refresh_m2m_enabled(&self, roster: &Roster) {
+        let enabled = self.self_m2m_enabled.load(Ordering::Acquire)
+            || roster
+                .trust_anchors()
+                .any(|(_, a)| a.state == AnchorState::Active);
+        self.m2m_enabled.store(enabled, Ordering::Release);
     }
 
     fn spawn_listener(&self, listener: Box<dyn PathListener>) {
@@ -250,12 +265,17 @@ impl Endpoint {
             (None, identity, Roster::new())
         };
 
+        let has_active_anchor = roster
+            .trust_anchors()
+            .any(|(_, a)| a.state == AnchorState::Active);
         Ok(Self {
             store,
             identity: Arc::new(identity),
             roster: Arc::new(StdMutex::new(roster)),
             pair_mgr: Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default()))),
             router: InboundRouter::new(),
+            self_m2m_enabled: AtomicBool::new(false),
+            m2m_enabled: AtomicBool::new(has_active_anchor),
         })
     }
 
@@ -408,6 +428,11 @@ impl Endpoint {
     #[napi]
     pub async fn pair_accept(&self, timeout_ms: Option<f64>) -> Result<String> {
         let wait = Duration::from_millis(f64_to_timeout_ms(timeout_ms, 5000)?);
+        let policy = if self.m2m_enabled.load(Ordering::Acquire) {
+            EnrollmentPolicy::enabled_default()
+        } else {
+            EnrollmentPolicy::default()
+        };
         let (mut stream, guard) = match self.router.recv_pair(wait).await {
             Ok(Some(pair)) => pair,
             Ok(None) => return Err(to_generic_err("listener closed")),
@@ -415,13 +440,15 @@ impl Endpoint {
         };
 
         let path_kind = pairing_path_kind_for_provider(stream.provider_id());
-        let res = drive_pair_responder_with_options(
+        let res = drive_pair_responder_with_policy_and_store(
             stream.as_mut(),
             &self.identity,
             &self.pair_mgr,
             &self.roster,
+            self.store.as_deref(),
             path_kind,
             now_unix(),
+            policy,
             Some(self.router.rate_limiter()),
             Some(guard),
             DEFAULT_PRE_AUTH_TIMEOUT,
@@ -436,22 +463,30 @@ impl Endpoint {
                 name,
                 kind,
                 ..
-            } => {
-                persist_store_roster(self.store.as_ref(), &self.roster)?;
-                Ok(serde_json::json!({
-                    "device_id": device_id,
-                    "sas": pairing_sas,
-                    "name": name,
-                    "kind": kind,
-                })
-                .to_string())
-            }
+            } => Ok(serde_json::json!({
+                "device_id": device_id,
+                "sas": pairing_sas,
+                "name": name,
+                "kind": kind,
+            })
+            .to_string()),
+            PairOutcome::ResponderEnrolled {
+                device_id,
+                token_nonce,
+                name,
+                kind,
+                ..
+            } => Ok(serde_json::json!({
+                "device_id": device_id,
+                "status": "active",
+                "token_nonce": token_nonce,
+                "name": name,
+                "kind": kind,
+            })
+            .to_string()),
             PairOutcome::Rejected { error } => Err(to_generic_err(error)),
             PairOutcome::InitiatorPending { .. } | PairOutcome::InitiatorEnrolled { .. } => {
                 Err(to_generic_err("unexpected initiator outcome"))
-            }
-            PairOutcome::ResponderEnrolled { .. } => {
-                Err(to_generic_err("unexpected m2m enrollment outcome"))
             }
         }
     }
@@ -497,7 +532,147 @@ impl Endpoint {
     pub fn revoke_peer(&self, peer_id: String) -> Result<()> {
         let mut roster = self.roster.lock().expect("roster mutex poisoned");
         roster.revoke_peer(&peer_id).map_err(to_generic_err)?;
-        self.persist_roster(&roster)
+        self.persist_roster(&roster)?;
+        self.refresh_m2m_enabled(&roster);
+        Ok(())
+    }
+
+    #[napi]
+    pub fn add_trust_anchor(&self, anchor_id: String, signing_pub: Buffer) -> Result<()> {
+        let key = as_32(signing_pub.as_ref(), "signing_pub")?;
+        let mut roster = self.roster.lock().expect("roster mutex poisoned");
+        roster
+            .add_trust_anchor(anchor_id, key)
+            .map_err(to_generic_err)?;
+        self.persist_roster(&roster)?;
+        self.refresh_m2m_enabled(&roster);
+        self.router.set_pair_enabled(true);
+        Ok(())
+    }
+
+    #[napi]
+    pub fn revoke_trust_anchor(&self, anchor_id: String) -> Result<()> {
+        let mut roster = self.roster.lock().expect("roster mutex poisoned");
+        roster
+            .revoke_trust_anchor(&anchor_id)
+            .map_err(to_generic_err)?;
+        self.persist_roster(&roster)?;
+        self.refresh_m2m_enabled(&roster);
+        Ok(())
+    }
+
+    #[napi]
+    pub fn mint_enrollment_token(
+        &self,
+        target_host_id: String,
+        subject: Option<String>,
+        ttl_secs: Option<f64>,
+    ) -> Result<String> {
+        let ttl = match ttl_secs {
+            Some(v) => f64_to_u64(v, "ttl_secs")?,
+            None => 900,
+        };
+        let nonce = random_bytes::<16>().map_err(to_generic_err)?;
+        let token = core_mint_enrollment_token(
+            &self.identity,
+            &target_host_id,
+            subject.as_deref(),
+            now_unix(),
+            ttl,
+            nonce,
+        )
+        .map_err(|e| Error::new(Status::InvalidArg, e.to_string()))?;
+        if target_host_id == self.identity.host_id() {
+            self.self_m2m_enabled.store(true, Ordering::Release);
+            let roster = self.roster.lock().expect("roster mutex poisoned");
+            self.refresh_m2m_enabled(&roster);
+            self.router.set_pair_enabled(true);
+        }
+        serde_json::to_string(&token).map_err(to_generic_err)
+    }
+
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enroll_initiate(
+        &self,
+        endpoint: String,
+        host_id: String,
+        host_static_pub: Buffer,
+        host_signing_pub: Buffer,
+        token_json: String,
+        relay_host: Option<String>,
+        host_rotation_seq: Option<f64>,
+        name: Option<String>,
+        kind: Option<String>,
+    ) -> Result<String> {
+        let static_pub = as_32(host_static_pub.as_ref(), "host_static_pub")?;
+        let signing_pub = as_32(host_signing_pub.as_ref(), "host_signing_pub")?;
+        let rot_seq = match host_rotation_seq {
+            Some(v) => f64_to_u64(v, "host_rotation_seq")?,
+            None => 0,
+        };
+        let token: Grant = serde_json::from_str(&token_json)
+            .map_err(|e| Error::new(Status::InvalidArg, format!("invalid token_json: {e}")))?;
+        let pinned_host = PinnedHost {
+            host_id: Some(host_id),
+            static_pub,
+            signing_pub,
+            rotation_seq: rot_seq,
+        };
+
+        let mut stream = dial_endpoint(&endpoint, relay_host.as_deref())
+            .await
+            .map_err(to_generic_err)?;
+        let res = drive_m2m_enroll_initiator(
+            stream.as_mut(),
+            &self.identity,
+            name.unwrap_or_else(|| "node-machine".to_owned()),
+            kind.unwrap_or_else(|| "machine".to_owned()),
+            token,
+            pinned_host,
+        )
+        .await;
+        let _ = stream.close().await;
+        let res = res.map_err(to_generic_err)?;
+
+        match res.outcome {
+            PairOutcome::InitiatorEnrolled {
+                device_id,
+                host_id,
+                host_static_pub,
+                host_signing_pub,
+                host_rotation_seq,
+                token_nonce,
+            } => {
+                let mut roster = self.roster.lock().expect("roster mutex poisoned");
+                roster
+                    .insert_pinned_host(
+                        host_id.clone(),
+                        host_id.clone(),
+                        host_static_pub,
+                        Some(host_signing_pub),
+                        host_rotation_seq,
+                        Vec::new(),
+                    )
+                    .map_err(to_generic_err)?;
+                self.persist_roster(&roster)?;
+                Ok(serde_json::json!({
+                    "device_id": device_id,
+                    "host_id": host_id,
+                    "status": "active",
+                    "host_rotation_seq": host_rotation_seq,
+                    "token_nonce": token_nonce,
+                })
+                .to_string())
+            }
+            PairOutcome::Rejected { error } => Err(to_generic_err(error)),
+            PairOutcome::InitiatorPending { .. } => {
+                Err(to_generic_err("unexpected human pending outcome"))
+            }
+            PairOutcome::ResponderPending { .. } | PairOutcome::ResponderEnrolled { .. } => {
+                Err(to_generic_err("unexpected responder outcome"))
+            }
+        }
     }
 
     #[napi]

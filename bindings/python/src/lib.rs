@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,13 +16,17 @@ use tendril_core::crypto::{
 };
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
 use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
-use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
-use tendril_core::roster::Roster;
+use tendril_core::pairing::{
+    EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PinnedHost,
+    mint_enrollment_token as core_mint_enrollment_token,
+};
+use tendril_core::roster::{AnchorState, Roster};
 use tendril_runtime::{
     ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
     InboundRouter, P2pListener, PathListener, PathStream, RelayListener, SessionDriver,
-    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
-    drive_pair_responder_with_options, pairing_path_kind_for_provider, parse_p2p_relay_mode,
+    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint, drive_m2m_enroll_initiator,
+    drive_pair_initiator, drive_pair_responder_with_policy_and_store,
+    pairing_path_kind_for_provider, parse_p2p_relay_mode,
 };
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
@@ -152,6 +157,14 @@ fn verify_grant_json(
     Ok(res.is_ok())
 }
 
+fn refresh_m2m_flags(self_m2m: &AtomicBool, m2m: &AtomicBool, roster: &Roster) {
+    let enabled = self_m2m.load(Ordering::Acquire)
+        || roster
+            .trust_anchors()
+            .any(|(_, a)| a.state == AnchorState::Active);
+    m2m.store(enabled, Ordering::Release);
+}
+
 #[pyclass(frozen)]
 struct Endpoint {
     rt: Arc<Runtime>,
@@ -160,6 +173,8 @@ struct Endpoint {
     roster: Arc<StdMutex<Roster>>,
     pair_mgr: Arc<StdMutex<PairingManager>>,
     router: Arc<InboundRouter>,
+    self_m2m_enabled: Arc<AtomicBool>,
+    m2m_enabled: Arc<AtomicBool>,
 }
 
 #[pymethods]
@@ -199,6 +214,9 @@ impl Endpoint {
                 (None, identity, Roster::new())
             };
 
+            let has_active_anchor = roster
+                .trust_anchors()
+                .any(|(_, a)| a.state == AnchorState::Active);
             Ok(Self {
                 rt,
                 store,
@@ -206,6 +224,8 @@ impl Endpoint {
                 roster: Arc::new(StdMutex::new(roster)),
                 pair_mgr: Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default()))),
                 router: Arc::new(InboundRouter::new()),
+                self_m2m_enabled: Arc::new(AtomicBool::new(false)),
+                m2m_enabled: Arc::new(AtomicBool::new(has_active_anchor)),
             })
         })
     }
@@ -393,6 +413,11 @@ impl Endpoint {
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
         let wait = Duration::from_millis(timeout_ms);
+        let policy = if self.m2m_enabled.load(Ordering::Acquire) {
+            EnrollmentPolicy::enabled_default()
+        } else {
+            EnrollmentPolicy::default()
+        };
 
         py.detach(move || {
             let roster_in = Arc::clone(&roster_arc);
@@ -404,13 +429,15 @@ impl Endpoint {
                 };
 
                 let path_kind = pairing_path_kind_for_provider(stream.provider_id());
-                drive_pair_responder_with_options(
+                drive_pair_responder_with_policy_and_store(
                     stream.as_mut(),
                     &identity,
                     &pair_mgr,
                     &roster_in,
+                    store.as_deref(),
                     path_kind,
                     now_unix(),
+                    policy,
                     Some(router.rate_limiter()),
                     Some(guard),
                     DEFAULT_PRE_AUTH_TIMEOUT,
@@ -426,22 +453,30 @@ impl Endpoint {
                     name,
                     kind,
                     ..
-                } => {
-                    persist_store_roster(store.as_ref(), &roster_arc)?;
-                    Ok(serde_json::json!({
-                        "device_id": device_id,
-                        "sas": pairing_sas,
-                        "name": name,
-                        "kind": kind,
-                    })
-                    .to_string())
-                }
+                } => Ok(serde_json::json!({
+                    "device_id": device_id,
+                    "sas": pairing_sas,
+                    "name": name,
+                    "kind": kind,
+                })
+                .to_string()),
+                PairOutcome::ResponderEnrolled {
+                    device_id,
+                    token_nonce,
+                    name,
+                    kind,
+                    ..
+                } => Ok(serde_json::json!({
+                    "device_id": device_id,
+                    "status": "active",
+                    "token_nonce": token_nonce,
+                    "name": name,
+                    "kind": kind,
+                })
+                .to_string()),
                 PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
                 PairOutcome::InitiatorPending { .. } | PairOutcome::InitiatorEnrolled { .. } => {
                     Err(PyRuntimeError::new_err("unexpected initiator outcome"))
-                }
-                PairOutcome::ResponderEnrolled { .. } => {
-                    Err(PyRuntimeError::new_err("unexpected m2m enrollment outcome"))
                 }
             }
         })
@@ -501,14 +536,192 @@ impl Endpoint {
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
         let pid = peer_id.to_owned();
+        let self_m2m = Arc::clone(&self.self_m2m_enabled);
+        let m2m = Arc::clone(&self.m2m_enabled);
         py.detach(move || {
             {
                 let mut roster = roster_arc.lock().expect("roster mutex poisoned");
                 roster
                     .revoke_peer(&pid)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                refresh_m2m_flags(&self_m2m, &m2m, &roster);
             }
             persist_store_roster(store.as_ref(), &roster_arc)
+        })
+    }
+
+    fn add_trust_anchor(
+        &self,
+        py: Python<'_>,
+        anchor_id: &str,
+        signing_pub: &[u8],
+    ) -> PyResult<()> {
+        let key = as_32(signing_pub, "signing_pub")?;
+        let aid = anchor_id.to_owned();
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let self_m2m = Arc::clone(&self.self_m2m_enabled);
+        let m2m = Arc::clone(&self.m2m_enabled);
+        let router = Arc::clone(&self.router);
+        py.detach(move || {
+            {
+                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+                roster
+                    .add_trust_anchor(aid, key)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                refresh_m2m_flags(&self_m2m, &m2m, &roster);
+            }
+            persist_store_roster(store.as_ref(), &roster_arc)?;
+            router.set_pair_enabled(true);
+            Ok(())
+        })
+    }
+
+    fn revoke_trust_anchor(&self, py: Python<'_>, anchor_id: &str) -> PyResult<()> {
+        let aid = anchor_id.to_owned();
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let self_m2m = Arc::clone(&self.self_m2m_enabled);
+        let m2m = Arc::clone(&self.m2m_enabled);
+        py.detach(move || {
+            {
+                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+                roster
+                    .revoke_trust_anchor(&aid)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                refresh_m2m_flags(&self_m2m, &m2m, &roster);
+            }
+            persist_store_roster(store.as_ref(), &roster_arc)
+        })
+    }
+
+    #[pyo3(signature = (target_host_id, subject=None, ttl_secs=900))]
+    fn mint_enrollment_token(
+        &self,
+        py: Python<'_>,
+        target_host_id: &str,
+        subject: Option<&str>,
+        ttl_secs: u64,
+    ) -> PyResult<String> {
+        let target_s = target_host_id.to_owned();
+        let subject_s = subject.map(ToOwned::to_owned);
+        let identity = Arc::clone(&self.identity);
+        let self_m2m = Arc::clone(&self.self_m2m_enabled);
+        let m2m = Arc::clone(&self.m2m_enabled);
+        let router = Arc::clone(&self.router);
+        py.detach(move || {
+            let nonce = random_bytes::<16>().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let token = core_mint_enrollment_token(
+                &identity,
+                &target_s,
+                subject_s.as_deref(),
+                now_unix(),
+                ttl_secs,
+                nonce,
+            )
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            if target_s == identity.host_id() {
+                self_m2m.store(true, Ordering::Release);
+                m2m.store(true, Ordering::Release);
+                router.set_pair_enabled(true);
+            }
+            serde_json::to_string(&token).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    #[pyo3(signature = (endpoint, host_id, host_static_pub, host_signing_pub, token_json, relay_host=None, host_rotation_seq=0, name="py-machine", kind="machine"))]
+    #[allow(clippy::too_many_arguments)]
+    fn enroll_initiate(
+        &self,
+        py: Python<'_>,
+        endpoint: &str,
+        host_id: &str,
+        host_static_pub: &[u8],
+        host_signing_pub: &[u8],
+        token_json: &str,
+        relay_host: Option<&str>,
+        host_rotation_seq: u64,
+        name: &str,
+        kind: &str,
+    ) -> PyResult<String> {
+        let static_pub = as_32(host_static_pub, "host_static_pub")?;
+        let signing_pub = as_32(host_signing_pub, "host_signing_pub")?;
+        let token: Grant = serde_json::from_str(token_json)
+            .map_err(|e| PyValueError::new_err(format!("invalid token_json: {e}")))?;
+        let pinned_host = PinnedHost {
+            host_id: Some(host_id.to_owned()),
+            static_pub,
+            signing_pub,
+            rotation_seq: host_rotation_seq,
+        };
+        let rt = Arc::clone(&self.rt);
+        let identity = Arc::clone(&self.identity);
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let ep_s = endpoint.to_owned();
+        let rh_s = relay_host.map(ToOwned::to_owned);
+        let name_s = name.to_owned();
+        let kind_s = kind.to_owned();
+
+        py.detach(move || {
+            let res = rt.block_on(async move {
+                let mut stream = dial_endpoint(&ep_s, rh_s.as_deref())
+                    .await
+                    .map_err(PyRuntimeError::new_err)?;
+                let pair_res = drive_m2m_enroll_initiator(
+                    stream.as_mut(),
+                    &identity,
+                    name_s,
+                    kind_s,
+                    token,
+                    pinned_host,
+                )
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                let _ = stream.close().await;
+                pair_res
+            })?;
+
+            match res.outcome {
+                PairOutcome::InitiatorEnrolled {
+                    device_id,
+                    host_id,
+                    host_static_pub,
+                    host_signing_pub,
+                    host_rotation_seq,
+                    token_nonce,
+                } => {
+                    {
+                        let mut roster = roster_arc.lock().expect("roster mutex poisoned");
+                        roster
+                            .insert_pinned_host(
+                                host_id.clone(),
+                                host_id.clone(),
+                                host_static_pub,
+                                Some(host_signing_pub),
+                                host_rotation_seq,
+                                Vec::new(),
+                            )
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    }
+                    persist_store_roster(store.as_ref(), &roster_arc)?;
+                    Ok(serde_json::json!({
+                        "device_id": device_id,
+                        "host_id": host_id,
+                        "status": "active",
+                        "host_rotation_seq": host_rotation_seq,
+                        "token_nonce": token_nonce,
+                    })
+                    .to_string())
+                }
+                PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
+                PairOutcome::InitiatorPending { .. } => {
+                    Err(PyRuntimeError::new_err("unexpected human pending outcome"))
+                }
+                PairOutcome::ResponderPending { .. } | PairOutcome::ResponderEnrolled { .. } => {
+                    Err(PyRuntimeError::new_err("unexpected responder outcome"))
+                }
+            }
         })
     }
 

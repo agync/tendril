@@ -70,6 +70,26 @@ final class TendrilNative {
 
   public static native void endpointRevokePeer(long ptr, String peerId);
 
+  public static native void endpointAddTrustAnchor(
+      long ptr, String anchorId, byte[] signingPub);
+
+  public static native void endpointRevokeTrustAnchor(long ptr, String anchorId);
+
+  public static native String endpointMintEnrollmentToken(
+      long ptr, String targetHostId, String subject, long ttlSecs);
+
+  public static native String endpointEnrollInitiate(
+      long ptr,
+      String endpoint,
+      String relayHost,
+      String hostId,
+      byte[] hostStaticPub,
+      byte[] hostSigningPub,
+      long hostRotationSeq,
+      String tokenJson,
+      String name,
+      String kind);
+
   public static native long sessionConnect(
       long epPtr, String endpoint, String relayHost, String targetHostId, String grantJson);
 
