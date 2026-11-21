@@ -101,7 +101,9 @@ fn persist_store_roster(
     roster: &Arc<StdMutex<Roster>>,
 ) -> Result<()> {
     if let Some(s) = store {
-        let guard = roster.lock().expect("roster mutex poisoned");
+        let guard = roster
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.save_roster(&guard).map_err(to_generic_err)?;
     }
     Ok(())
@@ -820,7 +822,10 @@ impl Endpoint {
     fn sync_roster_from_store(&self) -> Result<()> {
         if let Some(store) = &self.store {
             let disk = store.load_roster().map_err(to_generic_err)?;
-            let mut guard = self.roster.lock().expect("roster mutex poisoned");
+            let mut guard = self
+                .roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = disk;
         }
         Ok(())
@@ -829,7 +834,7 @@ impl Endpoint {
     fn snapshot_transport_cfg(&self) -> EndpointTransportConfig {
         self.transport_cfg
             .lock()
-            .expect("transport_cfg mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -977,7 +982,12 @@ impl Endpoint {
         kind: Option<String>,
     ) -> Result<String> {
         let cfg = self.snapshot_transport_cfg();
-        let roster_snapshot = { self.roster.lock().expect("roster mutex poisoned").clone() };
+        let roster_snapshot = {
+            self.roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
         let v2_secret = if is_v2_relay_endpoint(&endpoint) {
             Some(lookup_v2_mailbox_secret_for_pair(
                 &roster_snapshot,
@@ -1031,7 +1041,10 @@ impl Endpoint {
                 pairing_sas,
                 host_pin_verified,
             } => {
-                let mut roster = self.roster.lock().expect("roster mutex poisoned");
+                let mut roster = self
+                    .roster
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let pin_res = if host_pin_verified {
                     roster.insert_pinned_host(
                         host_id.clone(),
@@ -1141,7 +1154,10 @@ impl Endpoint {
 
     #[napi]
     pub fn confirm_peer(&self, peer_id: String, sas: Option<String>) -> Result<()> {
-        let mut roster = self.roster.lock().expect("roster mutex poisoned");
+        let mut roster = self
+            .roster
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         roster
             .confirm_peer(&peer_id, sas.as_deref())
             .map_err(to_generic_err)?;
@@ -1160,7 +1176,10 @@ impl Endpoint {
             None => 3600,
         };
         let nonce = random_bytes::<16>().map_err(to_generic_err)?;
-        let mut roster = self.roster.lock().expect("roster mutex poisoned");
+        let mut roster = self
+            .roster
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = now_unix();
         let grant = roster
             .mint_grant(
@@ -1178,7 +1197,10 @@ impl Endpoint {
 
     #[napi]
     pub fn revoke_peer(&self, peer_id: String) -> Result<()> {
-        let mut roster = self.roster.lock().expect("roster mutex poisoned");
+        let mut roster = self
+            .roster
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         roster.revoke_peer(&peer_id).map_err(to_generic_err)?;
         self.persist_roster(&roster)?;
         self.refresh_m2m_enabled(&roster);
@@ -1188,7 +1210,10 @@ impl Endpoint {
     #[napi]
     pub fn add_trust_anchor(&self, anchor_id: String, signing_pub: Buffer) -> Result<()> {
         let key = parse_hybrid_signing_pub(signing_pub.as_ref(), "signing_pub")?;
-        let mut roster = self.roster.lock().expect("roster mutex poisoned");
+        let mut roster = self
+            .roster
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         roster
             .add_trust_anchor(anchor_id, key)
             .map_err(to_generic_err)?;
@@ -1200,7 +1225,10 @@ impl Endpoint {
 
     #[napi]
     pub fn revoke_trust_anchor(&self, anchor_id: String) -> Result<()> {
-        let mut roster = self.roster.lock().expect("roster mutex poisoned");
+        let mut roster = self
+            .roster
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         roster
             .revoke_trust_anchor(&anchor_id)
             .map_err(to_generic_err)?;
@@ -1232,7 +1260,10 @@ impl Endpoint {
         .map_err(|e| Error::new(Status::InvalidArg, e.to_string()))?;
         if target_host_id == self.identity.host_id() {
             self.self_m2m_enabled.store(true, Ordering::Release);
-            let roster = self.roster.lock().expect("roster mutex poisoned");
+            let roster = self
+                .roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.refresh_m2m_enabled(&roster);
             self.router.set_pair_enabled(true);
         }
@@ -1330,7 +1361,10 @@ impl Endpoint {
                 host_rotation_seq,
                 token_nonce,
             } => {
-                let mut roster = self.roster.lock().expect("roster mutex poisoned");
+                let mut roster = self
+                    .roster
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 roster
                     .insert_pinned_host(
                         host_id.clone(),
@@ -2166,15 +2200,12 @@ mod tests {
             .connect_v2(v2_ep, "crl-host".to_owned(), Some(grant_json), None)
             .await
             .unwrap();
-        let mut got_revocation = false;
         let mut closed_or_err = false;
         for _ in 0..4 {
             match cli_sess.poll_event(Some(2000.0)).await {
                 Ok(ev_raw) => {
                     let ev: serde_json::Value = serde_json::from_str(&ev_raw).unwrap();
-                    if ev["event"] == "revocation_updated" {
-                        got_revocation = true;
-                    } else if ev["event"] == "closed" || ev["status"] == "eof" {
+                    if ev["event"] == "closed" || ev["status"] == "eof" {
                         closed_or_err = true;
                         break;
                     }
@@ -2185,10 +2216,24 @@ mod tests {
                 }
             }
         }
-        assert!(got_revocation || closed_or_err);
+        assert!(
+            closed_or_err,
+            "expected mid-session CRL revocation to close or error session"
+        );
         assert!(!cli_sess.authorize("fs.read".to_owned()).await);
         let _ = accept_handle.await;
         cli_ep.close();
+
+        let reloaded_roster = StateStore::open_or_create(&cli_dir)
+            .unwrap()
+            .load_roster()
+            .unwrap();
+        let persisted_crl = reloaded_roster
+            .crl("crl-host")
+            .expect("persisted CRL across reload");
+        assert_eq!(persisted_crl.seq, 1);
+        assert_eq!(persisted_crl.revoked_nonces, vec![grant.nonce]);
+
         let _ = std::fs::remove_dir_all(&base_dir);
     }
 }

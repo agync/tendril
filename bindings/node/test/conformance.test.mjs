@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -922,5 +923,83 @@ test("Node binding runs Wire v2 PAKE pairing, session ops, and wrong-code reject
     cliEp.close();
     hostEp.close();
     peer.close();
+  }
+});
+
+test("Node binding delivers wake_and_dial_v2 HTTP wake on connectV2", async () => {
+  const wakeRequests = [];
+  const wakeServer = http.createServer((req, res) => {
+    if (req.method !== "POST") {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      wakeRequests.push({
+        method: req.method,
+        url: req.url,
+        auth: req.headers.authorization,
+        body,
+      });
+      res.writeHead(202);
+      res.end();
+    });
+  });
+  await new Promise((resolve) => wakeServer.listen(0, "127.0.0.1", resolve));
+  const wakePort = wakeServer.address().port;
+
+  const hostEp = new tendril.Endpoint(null, "node-wake-host");
+  const cliEp = new tendril.Endpoint(null, "node-wake-cli");
+  try {
+    const directAddr = await hostEp.serveDirect("127.0.0.1:0");
+    const code = hostEp.issueCode("lan");
+    const [pairRaw, accRaw] = await Promise.all([
+      cliEp.pairV2Initiate(directAddr, code, null, "node-wake-cli", "node", null),
+      hostEp.pairV2Accept(5000),
+    ]);
+    const pairRes = JSON.parse(pairRaw);
+    const accRes = JSON.parse(accRaw);
+    assert.equal(pairRes.sas, accRes.sas);
+
+    hostEp.confirmPeer(accRes.device_id, pairRes.sas);
+    cliEp.confirmPeer("node-wake-host", pairRes.sas);
+    const grantJson = hostEp.mintGrant(accRes.device_id, ["fs.read"], 3600);
+
+    const wakeSecretB64 = crypto.randomBytes(32).toString("base64url");
+    cliEp.configureTransportsJson(
+      JSON.stringify({
+        wake_url: `http://127.0.0.1:${wakePort}/wake`,
+        wake_adapter: "webhook",
+        wake_secret_b64: wakeSecretB64,
+        wake_auth_token: "node-wake-token",
+        wake_pre_wake: true,
+        wake_retry_delay_ms: 25,
+        wake_max_attempts: 10,
+        wake_timeout_ms: 2000,
+      }),
+    );
+
+    const [cliSess, hostSess] = await Promise.all([
+      cliEp.connectV2(directAddr, "node-wake-host", grantJson, null),
+      hostEp.acceptV2(5000),
+    ]);
+    assert.ok(wakeRequests.length >= 1, "expected at least one POST wake request");
+    assert.equal(wakeRequests[0].url, "/wake");
+    assert.equal(wakeRequests[0].auth, "Bearer node-wake-token");
+    assert.equal(typeof wakeRequests[0].body.wake_tag, "string");
+    assert.ok(wakeRequests[0].body.wake_tag.length > 0);
+
+    await cliSess.sendData(Buffer.from("wake-v2-ok", "utf8"));
+    const ev = JSON.parse(await hostSess.pollEvent(2000));
+    assert.equal(ev.event, "data");
+    assert.equal(Buffer.from(ev.data_b64, "base64url").toString("utf8"), "wake-v2-ok");
+    await cliSess.close(1000, "done");
+  } finally {
+    cliEp.close();
+    hostEp.close();
+    await new Promise((resolve) => wakeServer.close(resolve));
   }
 });

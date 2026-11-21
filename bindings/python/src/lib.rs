@@ -1996,7 +1996,7 @@ impl Endpoint {
         let driver = py.detach(move || {
             let roster_in = Arc::clone(&roster);
             let store_in = store.clone();
-            let drv = rt.block_on(async move {
+            let res = rt.block_on(async move {
                 let (stream, guard) = match router.recv_v2_session(wait).await {
                     Ok(Some(pair)) => pair,
                     Ok(None) => return Err(PyRuntimeError::new_err("listener closed")),
@@ -2031,9 +2031,19 @@ impl Endpoint {
                     .await
                 }
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            })?;
-            sync_roster_from_store_opt(store.as_ref(), &roster)?;
-            Ok::<_, PyErr>(drv)
+            });
+            match res {
+                Ok(drv) => {
+                    sync_roster_from_store_opt(store.as_ref(), &roster)?;
+                    Ok(drv)
+                }
+                Err(err) => {
+                    if store.is_some() {
+                        let _ = sync_roster_from_store_opt(store.as_ref(), &roster);
+                    }
+                    Err(err)
+                }
+            }
         })?;
 
         Ok(Session {

@@ -1,4 +1,5 @@
 import base64
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import pathlib
@@ -840,6 +841,16 @@ class TendrilPythonTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         unauth_ep.connect_v2(v2_ep, "py-gated-host", g2, relay_host="localhost")
 
+                    cli_ep.configure_transports_json(
+                        json.dumps({"relay_auth_secret": "wrong-secret-000000000000000000"})
+                    )
+                    with self.assertRaises(RuntimeError):
+                        cli_ep.connect_v2(v2_ep, "py-gated-host", g2, relay_host="localhost")
+
+                    cli_ep.configure_transports_json(json.dumps({"relay_ticket": reg_ticket}))
+                    with self.assertRaises(RuntimeError):
+                        cli_ep.connect_v2(v2_ep, "py-gated-host", g2, relay_host="localhost")
+
                     cli_ep.configure_transports_json(json.dumps({"relay_ticket": dial_only_ticket}))
                     v2_sh: dict = {}
                     t_v2s = threading.Thread(
@@ -980,6 +991,105 @@ class TendrilPythonTests(unittest.TestCase):
                 if relay_proc.poll() is None:
                     relay_proc.kill()
                 relay_proc.wait()
+
+    def test_wake_and_dial_v2_http_delivery(self) -> None:
+        wake_requests: list[dict] = []
+
+        class WakeHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(405)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                wake_requests.append(
+                    {
+                        "path": self.path,
+                        "auth": self.headers.get("Authorization"),
+                        "body": json.loads(raw.decode("utf-8")),
+                    }
+                )
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), WakeHandler)
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
+        wake_port = server.server_address[1]
+
+        host_ep = tendril.Endpoint(None, "py-wake-host")
+        cli_ep = tendril.Endpoint(None, "py-wake-cli")
+        try:
+            direct_addr = host_ep.serve_direct("127.0.0.1:0")
+            code = host_ep.issue_code("lan")
+            acc_holder: dict = {}
+            t_acc = threading.Thread(
+                target=lambda: acc_holder.__setitem__("res", json.loads(host_ep.pair_v2_accept(5000)))
+            )
+            t_acc.start()
+            pair_res = json.loads(
+                cli_ep.pair_v2_initiate(direct_addr, code, name="py-wake-cli", kind="python")
+            )
+            t_acc.join(timeout=5)
+            self.assertEqual(acc_holder["res"]["sas"], pair_res["sas"])
+
+            host_ep.confirm_peer(acc_holder["res"]["device_id"], pair_res["sas"])
+            cli_ep.confirm_peer("py-wake-host", pair_res["sas"])
+            grant_json = host_ep.mint_grant(acc_holder["res"]["device_id"], ["fs.read"], 3600)
+
+            wake_secret_b64 = (
+                base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
+            )
+            cli_ep.configure_transports_json(
+                json.dumps(
+                    {
+                        "wake_url": f"http://127.0.0.1:{wake_port}/wake",
+                        "wake_adapter": "webhook",
+                        "wake_secret_b64": wake_secret_b64,
+                        "wake_auth_token": "py-wake-token",
+                        "wake_pre_wake": True,
+                        "wake_retry_delay_ms": 25,
+                        "wake_max_attempts": 10,
+                        "wake_timeout_ms": 2000,
+                    }
+                )
+            )
+
+            sess_holder: dict = {}
+            t_sess = threading.Thread(
+                target=lambda: sess_holder.__setitem__("s", host_ep.accept_v2(5000))
+            )
+            t_sess.start()
+            cli_sess = cli_ep.connect_v2(direct_addr, "py-wake-host", grant_json)
+            t_sess.join(timeout=5)
+
+            self.assertGreaterEqual(len(wake_requests), 1)
+            self.assertEqual(wake_requests[0]["path"], "/wake")
+            self.assertEqual(wake_requests[0]["auth"], "Bearer py-wake-token")
+            self.assertIsInstance(wake_requests[0]["body"].get("wake_tag"), str)
+            self.assertTrue(len(wake_requests[0]["body"]["wake_tag"]) > 0)
+
+            cli_sess.send_data(b"py-wake-v2-ok")
+            ev = json.loads(sess_holder["s"].poll_event(2000))
+            self.assertEqual(ev["event"], "data")
+            b64 = ev["data_b64"]
+            self.assertEqual(
+                base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4)),
+                b"py-wake-v2-ok",
+            )
+            cli_sess.close()
+        finally:
+            cli_ep.close()
+            host_ep.close()
+            server.shutdown()
+            server.server_close()
+            srv_thread.join(timeout=2)
 
 
 if __name__ == "__main__":
