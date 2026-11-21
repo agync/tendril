@@ -998,9 +998,19 @@ impl ConcurrentSession {
     /// Sends encrypted `0x07 CLOSE` and shuts down the transport writer.
     pub async fn send_close(&self, code: u16, reason: &str) -> Result<(), RuntimeError> {
         let mut writer = self.writer.lock().await;
-        let actions = {
+        let close_res = {
             let mut machine = self.machine.lock().expect("session machine mutex poisoned");
-            machine.send_close(code, reason)?
+            (machine.send_close(code, reason), machine.is_closed())
+        };
+        let actions = match close_res {
+            (Ok(actions), _) => actions,
+            (Err(err), closed) => {
+                if closed {
+                    let _ = writer.close().await;
+                    self.event_notify.notify_waiters();
+                }
+                return Err(err.into());
+            }
         };
         let res = self.dispatch_actions_locked(&mut writer, actions).await;
         let _ = writer.close().await;

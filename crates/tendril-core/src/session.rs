@@ -369,14 +369,18 @@ impl SessionMachine {
 
     /// Sends an encrypted `0x07 CLOSE` frame and transitions to terminal closed state.
     pub fn send_close(&mut self, code: u16, reason: &str) -> Result<Vec<SessionAction>, CoreError> {
-        let prev = std::mem::replace(&mut self.phase, SessionPhase::Closed);
-        let SessionPhase::Transport(mut tx) = prev else {
+        if !matches!(self.phase, SessionPhase::Transport(_)) {
             return Err(CoreError::NotReady("session not in transport mode"));
-        };
+        }
         let mut payload = Vec::with_capacity(2 + reason.len());
         payload.extend_from_slice(&code.to_be_bytes());
         payload.extend_from_slice(reason.as_bytes());
-        let frame = encrypt_inner(&mut tx, InnerFrameType::Close, &payload)?;
+        let inner = Zeroizing::new(encode_inner_frame(InnerFrameType::Close, &payload)?);
+        let prev = std::mem::replace(&mut self.phase, SessionPhase::Closed);
+        let SessionPhase::Transport(mut tx) = prev else {
+            unreachable!("validated transport phase above");
+        };
+        let frame = encrypt_encoded_inner(&mut tx, &inner)?;
         Ok(vec![
             SessionAction::WriteBytes(frame),
             SessionAction::CloseTransport {
@@ -971,8 +975,7 @@ mod tests {
     use super::*;
     use crate::crypto::{SigningKeypair, StaticKeypair};
 
-    #[test]
-    fn responder_records_peer_crl_seq_from_session_hello() {
+    fn established_pair() -> (SessionMachine, SessionMachine) {
         let host = EndpointIdentity::from_keys(
             StaticKeypair::from_scalar([0x51; 32]),
             SigningKeypair::from_seed([0x52; 32]),
@@ -1035,6 +1038,31 @@ mod tests {
         }
         resp.feed_bytes(&m3, 1_795_564_800, 3, &mut host_roster)
             .unwrap();
+        (init, resp)
+    }
+
+    #[test]
+    fn responder_records_peer_crl_seq_from_session_hello() {
+        let (_init, resp) = established_pair();
         assert_eq!(resp.peer_crl_seq(), Some(7));
+    }
+
+    #[test]
+    fn send_close_rejects_oversized_reason_without_closing_session() {
+        let (mut init, _resp) = established_pair();
+        let oversized = "x".repeat(crate::wire::MAX_APP_DATA_LEN);
+        assert!(matches!(
+            init.send_close(1000, &oversized),
+            Err(CoreError::FrameTooLarge { .. })
+        ));
+        assert!(init.is_established());
+        assert!(!init.is_closed());
+        let actions = init.send_close(1000, "ok").expect("subsequent valid close");
+        assert!(init.is_closed());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::WriteBytes(_)))
+        );
     }
 }

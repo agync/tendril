@@ -668,7 +668,7 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointPairInitiate(
   }
   free(c_ep);
   free(c_rh);
-  free(c_code);
+  zeroize_cstr_free(c_code);
   free(c_name);
   free(c_kind);
   if ((*env)->ExceptionCheck(env)) {

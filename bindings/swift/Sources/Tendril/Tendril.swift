@@ -633,8 +633,16 @@ public final class TendrilEndpoint {
         }
       }
       guard let raw else {
-        try? persistRoster(h)
-        throw ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_session_connect failed")
+        let connectErr = ffiError(TENDRIL_ERR_INTERNAL, fallback: "tendril_session_connect failed")
+        do {
+          try persistRoster(h)
+        } catch {
+          throw TendrilError.ffi(
+            code: TENDRIL_ERR_INTERNAL,
+            message: "\(connectErr) (roster persist error: \(error))"
+          )
+        }
+        throw connectErr
       }
       do {
         try persistRoster(h)
