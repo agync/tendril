@@ -299,7 +299,7 @@
       <button type="button" role="tab" id="tab-cli" aria-controls="panel-cli" aria-selected="false" tabindex="-1" data-lang="cli">CLI</button>
     </div>
     <div class="code-panel" role="tabpanel" id="panel-python" aria-labelledby="tab-python" data-lang="python">
-<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>uv add tendril</code><button type="button" class="copy" data-copy="uv add tendril">Copy</button></div>
+<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>uv add tendril-sdk</code><button type="button" class="copy" data-copy="uv add tendril-sdk">Copy</button></div>
 <pre tabindex="0" aria-label="Python example"><code>import json, tendril
 
 host = tendril.Endpoint(&quot;./laptop-state&quot;, &quot;laptop&quot;)
@@ -314,8 +314,8 @@ session = host.accept_session(5000)
 session.authorize(&quot;notes.sync&quot;)                   # True</code></pre>
 </div>
 <div class="code-panel" role="tabpanel" id="panel-typescript" aria-labelledby="tab-typescript" data-lang="typescript">
-<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>npm install @tendril/node</code><button type="button" class="copy" data-copy="npm install @tendril/node">Copy</button></div>
-<pre tabindex="0" aria-label="TypeScript example"><code>import tendril from &quot;@tendril/node&quot;;
+<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>npm install @tendril-sdk/node</code><button type="button" class="copy" data-copy="npm install @tendril-sdk/node">Copy</button></div>
+<pre tabindex="0" aria-label="TypeScript example"><code>import tendril from &quot;@tendril-sdk/node&quot;;
 
 const host = new tendril.Endpoint(&quot;./laptop-state&quot;, &quot;laptop&quot;);
 const addr = await host.serveDirect(&quot;127.0.0.1:0&quot;);
@@ -329,8 +329,8 @@ const session = await host.acceptSession(5000);
 await session.authorize(&quot;notes.sync&quot;); // true</code></pre>
 </div>
 <div class="code-panel" role="tabpanel" id="panel-go" aria-labelledby="tab-go" data-lang="go">
-<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>go get tendril.dev/bindings/go</code><button type="button" class="copy" data-copy="go get tendril.dev/bindings/go">Copy</button></div>
-<pre tabindex="0" aria-label="Go example"><code>import tendril &quot;tendril.dev/bindings/go&quot;
+<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>go get github.com/agync/tendril/bindings/go</code><button type="button" class="copy" data-copy="go get github.com/agync/tendril/bindings/go">Copy</button></div>
+<pre tabindex="0" aria-label="Go example"><code>import tendril &quot;github.com/agync/tendril/bindings/go&quot;
 
 host, err := tendril.NewEndpoint(&quot;./laptop-state&quot;, &quot;laptop&quot;)
 if err != nil { return err }
@@ -369,7 +369,7 @@ let session = try host.acceptSession(timeoutMs: 5000)
 let ok = try session.authorize(&quot;notes.sync&quot;) // true</code></pre>
 </div>
 <div class="code-panel" role="tabpanel" id="panel-kotlin" aria-labelledby="tab-kotlin" data-lang="kotlin">
-<div class="install"><code><span class="c-p" aria-hidden="true"></span>implementation(&quot;dev.tendril:tendril-kotlin:0.1.0&quot;)</code><button type="button" class="copy" data-copy="implementation(&quot;dev.tendril:tendril-kotlin:0.1.0&quot;)">Copy</button></div>
+<div class="install"><code><span class="c-p" aria-hidden="true"></span>implementation(&quot;dev.agync:tendril-android:0.1.0&quot;)</code><button type="button" class="copy" data-copy="implementation(&quot;dev.agync:tendril-android:0.1.0&quot;)">Copy</button></div>
 <pre tabindex="0" aria-label="Kotlin example"><code>import dev.tendril.TendrilEndpoint
 import org.json.JSONObject
 
