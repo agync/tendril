@@ -150,8 +150,8 @@ unsafe fn read_signing_pin(ptr: *const u8, len: usize, name: &str) -> Result<Sig
         set_last_error(format!("null pointer for {name}"));
         return Err(TENDRIL_ERR_INVALID_ARG);
     }
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
     if len == HYBRID_SIGNING_PUB_LEN {
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
         HybridSigningPublicKey::from_bytes(slice)
             .map(SigningKeyPin::Full)
             .map_err(|e| {
@@ -159,6 +159,7 @@ unsafe fn read_signing_pin(ptr: *const u8, len: usize, name: &str) -> Result<Sig
                 TENDRIL_ERR_INVALID_ARG
             })
     } else if len == HYBRID_SIGNING_HASH_LEN {
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
         let mut hash = [0u8; HYBRID_SIGNING_HASH_LEN];
         hash.copy_from_slice(slice);
         Ok(SigningKeyPin::Hash(hash))

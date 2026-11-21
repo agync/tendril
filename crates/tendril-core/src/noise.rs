@@ -41,6 +41,11 @@ pub const KEM_CT_LEN: usize = ml_kem_768::CT_LEN;
 /// Fixed byte length of `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` message 1 (`e || e1`).
 pub const MSG1_LEN: usize = DH_LEN + KEM_PK_LEN;
 
+const ENC_CT_LEN: usize = KEM_CT_LEN + AEAD_TAG_LEN;
+const ENC_STATIC_LEN: usize = DH_LEN + AEAD_TAG_LEN;
+const MIN_MSG2_LEN: usize = DH_LEN + ENC_CT_LEN + ENC_STATIC_LEN + AEAD_TAG_LEN;
+const MIN_MSG3_LEN: usize = ENC_STATIC_LEN + AEAD_TAG_LEN;
+
 /// Deterministic test-only randomness for X25519 ephemeral + ML-KEM-768 operations.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct NoiseHfsSeeds {
@@ -544,12 +549,30 @@ impl NoiseHfsHandshake {
         Ok(out)
     }
 
+    fn expected_write_len(&self, payload_len: usize) -> Result<usize, CoreError> {
+        match self.step {
+            HandshakeStep::InitiatorWriteMsg1 => Ok(MSG1_LEN.saturating_add(payload_len)),
+            HandshakeStep::ResponderWriteMsg2 => Ok(MIN_MSG2_LEN.saturating_add(payload_len)),
+            HandshakeStep::InitiatorWriteMsg3 => Ok(MIN_MSG3_LEN.saturating_add(payload_len)),
+            _ => Err(CoreError::Noise(
+                "write_message called out of handshake turn".into(),
+            )),
+        }
+    }
+
     /// Generates the next handshake message into `out`, returning bytes written.
     pub fn write_message(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize, CoreError> {
-        let msg = self.write_message_vec(payload)?;
-        if out.len() < msg.len() {
+        let projected_len = self.expected_write_len(payload.len())?;
+        if projected_len > MAX_FRAME_LEN {
+            return Err(CoreError::FrameTooLarge {
+                len: projected_len,
+                max: MAX_FRAME_LEN,
+            });
+        }
+        if out.len() < projected_len {
             return Err(CoreError::Noise("output buffer too small".into()));
         }
+        let msg = self.write_message_vec(payload)?;
         out[..msg.len()].copy_from_slice(&msg);
         Ok(msg.len())
     }
@@ -600,9 +623,6 @@ impl NoiseHfsHandshake {
             }
             HandshakeStep::InitiatorReadMsg2 => {
                 // `<- e, ee, ekem1, s, es`
-                const ENC_CT_LEN: usize = KEM_CT_LEN + AEAD_TAG_LEN;
-                const ENC_STATIC_LEN: usize = DH_LEN + AEAD_TAG_LEN;
-                const MIN_MSG2_LEN: usize = DH_LEN + ENC_CT_LEN + ENC_STATIC_LEN + AEAD_TAG_LEN;
                 if message.len() < MIN_MSG2_LEN {
                     return Err(CoreError::Noise("truncated XXhfs msg2".into()));
                 }
@@ -661,8 +681,7 @@ impl NoiseHfsHandshake {
             }
             HandshakeStep::ResponderReadMsg3 => {
                 // `-> s, se`
-                const ENC_STATIC_LEN: usize = DH_LEN + AEAD_TAG_LEN;
-                if message.len() < ENC_STATIC_LEN + AEAD_TAG_LEN {
+                if message.len() < MIN_MSG3_LEN {
                     return Err(CoreError::Noise("truncated XXhfs msg3".into()));
                 }
                 let e_priv = self
@@ -692,10 +711,26 @@ impl NoiseHfsHandshake {
 
     /// Consumes the next incoming handshake message, copying decrypted payload into `out`.
     pub fn read_message(&mut self, message: &[u8], out: &mut [u8]) -> Result<usize, CoreError> {
-        let pt = self.read_message_vec(message)?;
-        if out.len() < pt.len() {
+        if message.len() > MAX_FRAME_LEN {
+            return Err(CoreError::FrameTooLarge {
+                len: message.len(),
+                max: MAX_FRAME_LEN,
+            });
+        }
+        let min_len = match self.step {
+            HandshakeStep::ResponderReadMsg1 => MSG1_LEN,
+            HandshakeStep::InitiatorReadMsg2 => MIN_MSG2_LEN,
+            HandshakeStep::ResponderReadMsg3 => MIN_MSG3_LEN,
+            _ => {
+                return Err(CoreError::Noise(
+                    "read_message called out of handshake turn".into(),
+                ));
+            }
+        };
+        if message.len() >= min_len && out.len() < message.len() - min_len {
             return Err(CoreError::Noise("plaintext buffer too small".into()));
         }
+        let pt = self.read_message_vec(message)?;
         out[..pt.len()].copy_from_slice(&pt);
         Ok(pt.len())
     }
@@ -768,10 +803,17 @@ impl NoiseTransport {
 
     /// Encrypts a transport payload into `out`, returning bytes written.
     pub fn write_message(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize, CoreError> {
-        let ct = self.write_message_vec(payload)?;
-        if out.len() < ct.len() {
+        let projected_len = payload.len().saturating_add(AEAD_TAG_LEN);
+        if projected_len > MAX_FRAME_LEN {
+            return Err(CoreError::FrameTooLarge {
+                len: projected_len,
+                max: MAX_FRAME_LEN,
+            });
+        }
+        if out.len() < projected_len {
             return Err(CoreError::Noise("output buffer too small".into()));
         }
+        let ct = self.write_message_vec(payload)?;
         out[..ct.len()].copy_from_slice(&ct);
         Ok(ct.len())
     }
@@ -789,10 +831,16 @@ impl NoiseTransport {
 
     /// Decrypts a transport ciphertext frame into `out`, returning plaintext bytes written.
     pub fn read_message(&mut self, message: &[u8], out: &mut [u8]) -> Result<usize, CoreError> {
-        let pt = self.read_message_vec(message)?;
-        if out.len() < pt.len() {
+        if message.len() > MAX_FRAME_LEN {
+            return Err(CoreError::FrameTooLarge {
+                len: message.len(),
+                max: MAX_FRAME_LEN,
+            });
+        }
+        if message.len() >= AEAD_TAG_LEN && out.len() < message.len() - AEAD_TAG_LEN {
             return Err(CoreError::Noise("plaintext buffer too small".into()));
         }
+        let pt = self.read_message_vec(message)?;
         out[..pt.len()].copy_from_slice(&pt);
         Ok(pt.len())
     }
@@ -937,5 +985,72 @@ mod tests {
             hs_i2.write_message_vec(b"retry"),
             Err(CoreError::Noise(_))
         ));
+    }
+
+    #[test]
+    fn undersized_slice_buffers_do_not_advance_handshake_or_nonces() {
+        let init_k = StaticKeypair::from_scalar([0x11; 32]);
+        let resp_k = StaticKeypair::from_scalar([0x22; 32]);
+        let mut hs_i = NoiseHfsHandshakeBuilder::new()
+            .local_private_key(init_k.secret_bytes())
+            .prologue(b"TND\x01\x01\x00")
+            .build_initiator()
+            .unwrap();
+        let mut hs_r = NoiseHfsHandshakeBuilder::new()
+            .local_private_key(resp_k.secret_bytes())
+            .prologue(b"TND\x01\x01\x00")
+            .build_responder()
+            .unwrap();
+
+        let mut tiny = [0u8; 4];
+        assert!(matches!(
+            hs_i.write_message(b"", &mut tiny),
+            Err(CoreError::Noise(_))
+        ));
+        let mut msg1_buf = vec![0u8; MSG1_LEN];
+        let n1 = hs_i.write_message(b"", &mut msg1_buf).unwrap();
+        assert_eq!(n1, MSG1_LEN);
+
+        let pt1 = hs_r.read_message_vec(&msg1_buf).unwrap();
+        assert!(pt1.is_empty());
+        assert!(matches!(
+            hs_r.write_message(b"host-hello", &mut tiny),
+            Err(CoreError::Noise(_))
+        ));
+        let mut msg2_buf = vec![0u8; MIN_MSG2_LEN + 10];
+        let n2 = hs_r.write_message(b"host-hello", &mut msg2_buf).unwrap();
+        assert_eq!(n2, msg2_buf.len());
+
+        assert!(matches!(
+            hs_i.read_message(&msg2_buf, &mut tiny),
+            Err(CoreError::Noise(_))
+        ));
+        let mut pt2_buf = [0u8; 10];
+        let p2_len = hs_i.read_message(&msg2_buf, &mut pt2_buf).unwrap();
+        assert_eq!(&pt2_buf[..p2_len], b"host-hello");
+
+        let msg3 = hs_i.write_message_vec(b"cli").unwrap();
+        hs_r.read_message_vec(&msg3).unwrap();
+
+        let mut tx_i = hs_i.into_transport_mode().unwrap();
+        let mut tx_r = hs_r.into_transport_mode().unwrap();
+
+        assert!(matches!(
+            tx_i.write_message(b"hello-world", &mut tiny),
+            Err(CoreError::Noise(_))
+        ));
+        assert_eq!(tx_i.tx.n, 0);
+
+        let mut ct_buf = [0u8; 64];
+        let ct_len = tx_i.write_message(b"hello-world", &mut ct_buf).unwrap();
+        assert!(matches!(
+            tx_r.read_message(&ct_buf[..ct_len], &mut tiny),
+            Err(CoreError::Noise(_))
+        ));
+        assert_eq!(tx_r.rx.n, 0);
+
+        let mut pt_buf = [0u8; 32];
+        let pt_len = tx_r.read_message(&ct_buf[..ct_len], &mut pt_buf).unwrap();
+        assert_eq!(&pt_buf[..pt_len], b"hello-world");
     }
 }

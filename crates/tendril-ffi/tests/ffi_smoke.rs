@@ -1819,6 +1819,35 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
     );
     assert_eq!(allowed, 1);
 
+    // Invalid pin/key lengths must fail closed before reading beyond caller buffer.
+    let short_buf = [0x11u8; 32];
+    for bad_len in [0usize, 1, 31, 33, 1983, 1985, usize::MAX] {
+        let rc_anchor = unsafe {
+            tendril_endpoint_add_trust_anchor(host_ep, ep_c.as_ptr(), short_buf.as_ptr(), bad_len)
+        };
+        assert_eq!(rc_anchor, TENDRIL_ERR_INVALID_ARG);
+
+        let mut bad_enroll_p: *mut c_char = ptr::null_mut();
+        let rc_enroll = unsafe {
+            tendril_endpoint_enroll_initiate(
+                cli1_ep,
+                ep_c.as_ptr(),
+                ptr::null(),
+                host_id_c.as_ptr(),
+                host_static_pub.as_ptr(),
+                short_buf.as_ptr(),
+                bad_len,
+                0,
+                tok3_c.as_ptr(),
+                name1_c.as_ptr(),
+                kind_c.as_ptr(),
+                &raw mut bad_enroll_p,
+            )
+        };
+        assert_eq!(rc_enroll, TENDRIL_ERR_INVALID_ARG);
+        assert!(bad_enroll_p.is_null());
+    }
+
     unsafe {
         tendril_session_close(sess1, 1000, ptr::null());
         tendril_session_free(sess1);
