@@ -123,7 +123,7 @@ bindings/jni: ## Build tendril_jni shared library and run host JVM conformance t
 bindings/android: ## Cross-compile tendril-ffi for aarch64-linux-android using local Android NDK
 	@NDK_ROOT="$${ANDROID_NDK_HOME:-$$(ls -d "$(HOME)"/Android/Sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)}"; \
 	NDK_BIN="$$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"; \
-	CLANG="$$(ls "$$NDK_BIN"/aarch64-linux-android*-clang 2>/dev/null | sort -V | awk -F'android|-clang' '$$2 >= 26 {print $$0; exit}')"; \
+	CLANG="$$(ls "$$NDK_BIN"/aarch64-linux-android*-clang 2>/dev/null | sort -V | awk -F'aarch64-linux-android|-clang' '$$2 >= 26 {print $$0; exit}')"; \
 	test -x "$$CLANG" || { printf 'bindings/android: no Android NDK aarch64 clang >= API 26 found under %s\n' "$$NDK_ROOT" >&2; exit 1; }; \
 	CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$$CLANG" \
 	CC_aarch64_linux_android="$$CLANG" \

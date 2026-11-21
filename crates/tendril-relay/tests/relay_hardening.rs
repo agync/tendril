@@ -21,12 +21,18 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{Connector, connect_async_tls_with_config, connect_async_with_config};
 
 fn generate_ephemeral_cert(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let ca_cnf = dir.join("ca.cnf");
     let ca_key = dir.join("ca.key");
     let ca_cert = dir.join("ca.crt");
     let leaf_key = dir.join("relay.key");
     let leaf_csr = dir.join("relay.csr");
     let leaf_cert = dir.join("relay.crt");
     let ext_file = dir.join("leaf.ext");
+    std::fs::write(
+        &ca_cnf,
+        "[req]\ndistinguished_name = dn\nx509_extensions = v3_ca\nprompt = no\n\n[dn]\nCN = Tendril Test CA\n\n[v3_ca]\nbasicConstraints = critical,CA:TRUE\nkeyUsage = critical,keyCertSign\n",
+    )
+    .expect("write ca.cnf");
     std::fs::write(
         &ext_file,
         "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n",
@@ -46,12 +52,8 @@ fn generate_ephemeral_cert(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
             "-days",
             "1",
             "-nodes",
-            "-subj",
-            "/CN=Tendril Test CA",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-            "-addext",
-            "keyUsage=critical,keyCertSign",
+            "-config",
+            ca_cnf.to_str().expect("utf8"),
         ])
         .status()
         .expect("run openssl ca");
