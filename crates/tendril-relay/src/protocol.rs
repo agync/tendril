@@ -9,6 +9,9 @@ use tendril_core::error::CoreError;
 /// Canonical WebSocket path for Tendril v1 relays.
 pub const RELAY_PATH: &str = "/v1/relay";
 
+/// Canonical WebSocket path for Tendril v2 blinded-epoch relays (`spec/relay-v2.md`).
+pub const RELAY_V2_PATH: &str = "/v2/relay";
+
 /// 21-byte domain prefix for mailbox registration signatures.
 pub const RELAY_REG_DOMAIN: &[u8] = b"tendril-relay-reg-v1\0";
 
@@ -58,6 +61,58 @@ pub enum RelayClientMsg {
     Accept {
         #[serde(rename = "pub")]
         pub_key: String,
+        conn_id: String,
+        sig: String,
+    },
+}
+
+/// Messages sent from the `/v2/relay` server to a WebSocket client during the control phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RelayV2ServerMsg {
+    Challenge {
+        nonce: String,
+        host: String,
+        epoch: u64,
+        max_frame: usize,
+    },
+    Registered {
+        mailbox_id: String,
+        epoch: u64,
+    },
+    Incoming {
+        mailbox_id: String,
+        epoch: u64,
+        conn_id: String,
+        dial_nonce: String,
+        dial_token: String,
+    },
+    Ready {
+        conn_id: String,
+    },
+    Error {
+        code: String,
+    },
+}
+
+/// Messages sent from a WebSocket client to the `/v2/relay` server during the control phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RelayV2ClientMsg {
+    Register {
+        mailbox_id: String,
+        epoch: u64,
+        sig: String,
+    },
+    Dial {
+        target_mailbox_id: String,
+        epoch: u64,
+        conn_id: String,
+        dial_token: String,
+    },
+    Accept {
+        mailbox_id: String,
+        epoch: u64,
         conn_id: String,
         sig: String,
     },

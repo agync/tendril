@@ -7,15 +7,21 @@ pub mod providers;
 pub mod rate_limit;
 pub mod router;
 pub mod store;
+pub mod v2_driver;
 pub mod wake;
 
 pub use driver::{
-    ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, SessionDriver, SessionEvent, dial_with_policy,
-    dial_with_policy_verified, drive_m2m_enroll_initiator, drive_m2m_enroll_initiator_with_timeout,
-    drive_pair_initiator, drive_pair_initiator_with_timeout, drive_pair_responder,
-    drive_pair_responder_with_options, drive_pair_responder_with_policy,
-    drive_pair_responder_with_policy_and_store, drive_pair_responder_with_store,
-    pairing_path_kind_for_provider,
+    ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, PairDriveResult, SessionDriver, SessionEvent,
+    dial_with_policy, dial_with_policy_verified, drive_m2m_enroll_initiator_with_floor,
+    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_floor,
+    drive_pair_initiator_with_store, drive_pair_responder, drive_pair_responder_with_options,
+    drive_pair_responder_with_policy, drive_pair_responder_with_policy_and_store,
+    drive_pair_responder_with_store, pairing_path_kind_for_provider, pinned_pairing_floor,
+};
+#[allow(deprecated)]
+pub use driver::{
+    drive_m2m_enroll_initiator, drive_m2m_enroll_initiator_with_timeout, drive_pair_initiator,
+    drive_pair_initiator_with_timeout,
 };
 pub use error::RuntimeError;
 pub use provider::{
@@ -27,8 +33,8 @@ pub use providers::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DirectDialer, DirectListener, EmbeddedRelay,
     LocalDialer, LocalListener, OverlayConfig, OverlayDialer, OverlayHelperDialer,
     OverlayHelperListener, OverlayListener, OverlayMode, OverlayResolvedMode, RelayDialer,
-    RelayListener, dial_endpoint, is_loopback_host, is_metadata_or_link_local_ip, is_tailnet_ip,
-    select_overlay_mode,
+    RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, dial_endpoint,
+    is_loopback_host, is_metadata_or_link_local_ip, is_tailnet_ip, select_overlay_mode,
 };
 #[cfg(feature = "p2p-iroh")]
 pub use providers::{
@@ -39,6 +45,15 @@ pub use providers::{
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
 pub use store::{RosterStamp, StateStore, deserialize_identity_json, serialize_identity_json};
+pub use v2_driver::{
+    ConcurrentV2Session, DEFAULT_ARGON2_ACQUIRE_TIMEOUT, DEFAULT_ARGON2_CONCURRENCY,
+    V2PairDriveResult, V2ResponderConfig, V2ResponderState, V2SessionDriver, WakeDialOptions,
+    drive_v2_pake_pair_initiator, drive_v2_pake_pair_initiator_with_store,
+    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder,
+    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
+    drive_v2_session_initiator, drive_v2_session_responder, wake_and_connect_v2_session,
+    wake_and_dial_v2,
+};
 pub use wake::{
     ApnsAps, ApnsPayload, DEFAULT_WAKE_COALESCE_INTERVAL_SECS, DEFAULT_WAKE_TIMEOUT,
     FcmAndroidConfig, FcmDataFields, FcmMessage, FcmPayload, HttpWakeProvider,

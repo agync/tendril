@@ -27,9 +27,11 @@ use tendril_core::roster::{AnchorState, Roster};
 use tendril_runtime::{
     ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
     InboundRouter, P2pListener, PathListener, PathStream, RelayListener, SessionDriver,
-    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint, drive_m2m_enroll_initiator,
-    drive_pair_initiator, drive_pair_responder_with_policy_and_store,
-    pairing_path_kind_for_provider, parse_p2p_relay_mode,
+    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint,
+    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_store,
+    drive_pair_initiator_with_floor, drive_pair_initiator_with_store,
+    drive_pair_responder_with_policy_and_store, pairing_path_kind_for_provider,
+    parse_p2p_relay_mode, pinned_pairing_floor,
 };
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
@@ -373,14 +375,37 @@ impl Endpoint {
         let kind_s = kind.to_owned();
 
         py.detach(move || {
+            let store_for_pair = store.clone();
             let res = rt.block_on(async move {
                 let mut stream = dial_endpoint(&ep_s, rh_s.as_deref())
                     .await
                     .map_err(PyRuntimeError::new_err)?;
-                let pair_res =
-                    drive_pair_initiator(stream.as_mut(), &identity, name_s, kind_s, code_s, None)
-                        .await
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                let pair_res = if let Some(ref s) = store_for_pair {
+                    drive_pair_initiator_with_store(
+                        stream.as_mut(),
+                        &identity,
+                        name_s,
+                        kind_s,
+                        code_s,
+                        None,
+                        s,
+                        DEFAULT_PRE_AUTH_TIMEOUT,
+                    )
+                    .await
+                } else {
+                    drive_pair_initiator_with_floor(
+                        stream.as_mut(),
+                        &identity,
+                        name_s,
+                        kind_s,
+                        code_s,
+                        None,
+                        tendril_core::WIRE_VERSION,
+                        DEFAULT_PRE_AUTH_TIMEOUT,
+                    )
+                    .await
+                }
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
                 let _ = stream.close().await;
                 pair_res
             })?;
@@ -697,20 +722,43 @@ impl Endpoint {
         let name_s = name.to_owned();
         let kind_s = kind.to_owned();
 
+        let fallback_floor = {
+            let roster = roster_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pinned_pairing_floor(&roster, &pinned_host)
+        };
         py.detach(move || {
+            let store_for_enroll = store.clone();
             let res = rt.block_on(async move {
                 let mut stream = dial_endpoint(&ep_s, rh_s.as_deref())
                     .await
                     .map_err(PyRuntimeError::new_err)?;
-                let pair_res = drive_m2m_enroll_initiator(
-                    stream.as_mut(),
-                    &identity,
-                    name_s,
-                    kind_s,
-                    token,
-                    pinned_host,
-                )
-                .await
+                let pair_res = if let Some(ref s) = store_for_enroll {
+                    drive_m2m_enroll_initiator_with_store(
+                        stream.as_mut(),
+                        &identity,
+                        name_s,
+                        kind_s,
+                        token,
+                        pinned_host,
+                        s,
+                        DEFAULT_PRE_AUTH_TIMEOUT,
+                    )
+                    .await
+                } else {
+                    drive_m2m_enroll_initiator_with_floor(
+                        stream.as_mut(),
+                        &identity,
+                        name_s,
+                        kind_s,
+                        token,
+                        pinned_host,
+                        fallback_floor,
+                        DEFAULT_PRE_AUTH_TIMEOUT,
+                    )
+                    .await
+                }
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()));
                 let _ = stream.close().await;
                 pair_res

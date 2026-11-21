@@ -144,7 +144,7 @@ pub struct RelayStream {
 }
 
 impl RelayStream {
-    fn new(ws: ClientWsStream, write_timeout: Duration) -> Self {
+    pub(crate) fn new(ws: ClientWsStream, write_timeout: Duration) -> Self {
         Self {
             inner: WsBinaryPathStream::new(
                 ProviderId::Relay,
@@ -500,6 +500,12 @@ impl EmbeddedRelay {
     #[must_use]
     pub fn ws_url(&self) -> String {
         self.handle.ws_url()
+    }
+
+    /// Returns the `ws://.../v2/relay` URL served by this embedded relay.
+    #[must_use]
+    pub fn ws_v2_url(&self) -> String {
+        self.handle.ws_v2_url()
     }
 
     /// Returns the configured expected host identifier advertised by challenges.

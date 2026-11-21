@@ -23,10 +23,9 @@ use tendril_runtime::{
     MAX_OUTER_FRAME_LEN, OverlayConfig, OverlayDialer, OverlayHelperDialer, OverlayHelperListener,
     OverlayListener, OverlayMode, OverlayResolvedMode, PathDialer, PathListener, PathReader,
     PathStream, PathWriter, PreAuthConfig, PreAuthRateLimiter, RelayDialer, RelayListener,
-    RuntimeError, SessionDriver, SessionEvent, StateStore, dial_with_policy, drive_pair_initiator,
-    drive_pair_responder, drive_pair_responder_with_options, is_tailnet_ip,
-    pairing_path_kind_for_provider, recv_tendril_frame, select_overlay_mode, send_tendril_frame,
-    split_path_stream_fallback,
+    RuntimeError, SessionDriver, SessionEvent, StateStore, dial_with_policy, drive_pair_responder,
+    drive_pair_responder_with_options, is_tailnet_ip, pairing_path_kind_for_provider,
+    recv_tendril_frame, select_overlay_mode, send_tendril_frame, split_path_stream_fallback,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{P2pDialer, P2pListener, P2pRelayMode};
@@ -579,8 +578,10 @@ async fn dial_with_policy_fails_over_from_unreachable_direct_to_live_relay() {
     relay_handle.stop().await.expect("stop relay");
 }
 
+#[allow(deprecated)]
 #[tokio::test]
 async fn full_lifecycle_pair_confirm_mint_connect_authorize_data_rekey_revoke_across_providers() {
+    use tendril_runtime::drive_pair_initiator;
     #[cfg(feature = "p2p-iroh")]
     let providers = [
         ProviderId::Local,
@@ -1185,8 +1186,10 @@ async fn broker_rejects_wrong_path_and_invalid_auth_header() {
     drop(listener);
 }
 
+#[allow(deprecated)]
 #[tokio::test]
 async fn relay_hint_migration_public_to_self_hosted_to_embedded_without_repairing() {
+    use tendril_runtime::drive_pair_initiator;
     let relay_a = RelayServer::bind(RelayConfig::default())
         .await
         .expect("bind relay a")
@@ -2522,6 +2525,7 @@ async fn batch2a_sec26_unix_socket_and_store_hardening() {
     assert!(ids.iter().all(|d| d == &ids[0]));
 }
 
+#[allow(deprecated)]
 #[tokio::test]
 async fn batch2a_sec30_drive_pair_initiator_times_out_on_stalled_peer() {
     use tendril_runtime::drive_pair_initiator_with_timeout;

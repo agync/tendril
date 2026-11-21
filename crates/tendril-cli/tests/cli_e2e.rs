@@ -1502,3 +1502,82 @@ fn cli_e2e_m2m_enrollment_replay_anchor_and_rotation() {
         "confirm --allow-no-sas must explicitly opt in"
     );
 }
+
+#[test]
+fn cli_v1_pairing_rejects_v2_floored_host_with_zero_wire_bytes_sent() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    use tendril_core::identity::EndpointIdentity;
+    use tendril_core::pairing::PairingUri;
+    use tendril_core::roster::V2PeerSecrets;
+    use tendril_runtime::StateStore;
+
+    let cli_dir = TempDir::new().unwrap();
+    assert!(run_tendril(cli_dir.path(), &["init"]).status.success());
+
+    let host_identity = EndpointIdentity::generate().unwrap();
+    let store = StateStore::open_or_create(cli_dir.path()).unwrap();
+    store
+        .update_roster(|rst| {
+            rst.insert_pinned_host(
+                host_identity.host_id().to_owned(),
+                "v2-floored-host".to_owned(),
+                *host_identity.static_key().public_bytes(),
+                Some(host_identity.signing_key().public_key().clone()),
+                host_identity.rotation_seq(),
+                vec![],
+            )?;
+            rst.upgrade_peer_to_v2(
+                host_identity.host_id(),
+                V2PeerSecrets::new([0x11; 32], [0x22; 32]),
+            )?;
+            assert_eq!(
+                rst.pairing_floor(host_identity.static_key().public_bytes()),
+                2
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let accept_thread = std::thread::spawn(move || {
+        let (mut sock, _) = tcp.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut received = Vec::new();
+        let _ = sock.read_to_end(&mut received);
+        received
+    });
+
+    let uri = PairingUri {
+        host_name: "v2-floored-host".to_owned(),
+        code: "TND-1234-5678".to_owned(),
+        host_static_pub: *host_identity.static_key().public_bytes(),
+        host_signing_pub_hash: host_identity.signing_key().public_key().sha256_hash(),
+        endpoints: vec![format!("direct:{addr}")],
+        host_id: Some(host_identity.host_id().to_owned()),
+        rotation_seq: Some(host_identity.rotation_seq()),
+    }
+    .encode();
+
+    let pair_out = run_tendril(cli_dir.path(), &["pair", "--pairing-uri", &uri]);
+    assert!(
+        !pair_out.status.success(),
+        "v1 pair against min_wire_version=2 host must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&pair_out.stderr);
+    assert!(
+        stderr.contains("VersionDowngrade"),
+        "unexpected stderr: {stderr}"
+    );
+
+    let wire_bytes = accept_thread.join().unwrap();
+    assert!(
+        wire_bytes.is_empty(),
+        "CLI v1 downgrade guard must reject before writing wire bytes, got {} bytes",
+        wire_bytes.len()
+    );
+}

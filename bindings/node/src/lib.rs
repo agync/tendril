@@ -26,9 +26,11 @@ use tendril_core::roster::{AnchorState, Roster};
 use tendril_runtime::{
     ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
     InboundRouter, P2pListener, PathListener, PathStream, RelayListener, SessionDriver,
-    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint, drive_m2m_enroll_initiator,
-    drive_pair_initiator, drive_pair_responder_with_policy_and_store,
-    pairing_path_kind_for_provider, parse_p2p_relay_mode,
+    SessionEvent, StateStore, dial_endpoint as runtime_dial_endpoint,
+    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_store,
+    drive_pair_initiator_with_floor, drive_pair_initiator_with_store,
+    drive_pair_responder_with_policy_and_store, pairing_path_kind_for_provider,
+    parse_p2p_relay_mode, pinned_pairing_floor,
 };
 use tokio::time::timeout;
 
@@ -392,15 +394,33 @@ impl Endpoint {
         let mut stream = dial_endpoint(&endpoint, relay_host.as_deref())
             .await
             .map_err(to_generic_err)?;
-        let res = drive_pair_initiator(
-            stream.as_mut(),
-            &self.identity,
-            name.unwrap_or_else(|| "node-device".to_owned()),
-            kind.unwrap_or_else(|| "node".to_owned()),
-            code,
-            None,
-        )
-        .await;
+        let device_name = name.unwrap_or_else(|| "node-device".to_owned());
+        let device_kind = kind.unwrap_or_else(|| "node".to_owned());
+        let res = if let Some(ref store) = self.store {
+            drive_pair_initiator_with_store(
+                stream.as_mut(),
+                &self.identity,
+                device_name,
+                device_kind,
+                code,
+                None,
+                store,
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
+        } else {
+            drive_pair_initiator_with_floor(
+                stream.as_mut(),
+                &self.identity,
+                device_name,
+                device_kind,
+                code,
+                None,
+                tendril_core::WIRE_VERSION,
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
+        };
         let _ = stream.close().await;
         let res = res.map_err(to_generic_err)?;
 
@@ -651,18 +671,43 @@ impl Endpoint {
             rotation_seq: rot_seq,
         };
 
+        let fallback_floor = {
+            let roster = self
+                .roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pinned_pairing_floor(&roster, &pinned_host)
+        };
         let mut stream = dial_endpoint(&endpoint, relay_host.as_deref())
             .await
             .map_err(to_generic_err)?;
-        let res = drive_m2m_enroll_initiator(
-            stream.as_mut(),
-            &self.identity,
-            name.unwrap_or_else(|| "node-machine".to_owned()),
-            kind.unwrap_or_else(|| "machine".to_owned()),
-            token,
-            pinned_host,
-        )
-        .await;
+        let device_name = name.unwrap_or_else(|| "node-machine".to_owned());
+        let device_kind = kind.unwrap_or_else(|| "machine".to_owned());
+        let res = if let Some(ref store) = self.store {
+            drive_m2m_enroll_initiator_with_store(
+                stream.as_mut(),
+                &self.identity,
+                device_name,
+                device_kind,
+                token,
+                pinned_host,
+                store,
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
+        } else {
+            drive_m2m_enroll_initiator_with_floor(
+                stream.as_mut(),
+                &self.identity,
+                device_name,
+                device_kind,
+                token,
+                pinned_host,
+                fallback_floor,
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
+        };
         let _ = stream.close().await;
         let res = res.map_err(to_generic_err)?;
 

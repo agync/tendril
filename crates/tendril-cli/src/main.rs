@@ -26,9 +26,9 @@ use tendril_runtime::{
     DirectListener, EmbeddedRelay, HalfOpenGuard, OverlayListener, P2pDialer, P2pListener,
     P2pOptions, P2pRelayMode, PathDialer, PathListener, PathStream, PreAuthConfig,
     PreAuthRateLimiter, PrefixedPathStream, RelayListener, SessionDriver, SessionEvent, StateStore,
-    dial_endpoint as runtime_dial_endpoint, drive_m2m_enroll_initiator, drive_pair_initiator,
-    drive_pair_responder_with_store, pairing_path_kind_for_provider, parse_p2p_relay_mode,
-    peek_exact,
+    dial_endpoint as runtime_dial_endpoint, drive_m2m_enroll_initiator_with_store,
+    drive_pair_initiator_with_store, drive_pair_responder_with_store,
+    pairing_path_kind_for_provider, parse_p2p_relay_mode, peek_exact,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use zeroize::{Zeroize, Zeroizing};
@@ -1034,13 +1034,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_pkarr,
             )
             .await?;
-            let res = drive_pair_initiator(
+            let res = drive_pair_initiator_with_store(
                 stream.as_mut(),
                 &identity,
                 name,
                 kind,
                 effective_code.as_str().to_owned(),
                 pinned_host,
+                &store,
+                DEFAULT_PRE_AUTH_TIMEOUT,
             )
             .await;
             let _ = stream.close().await;
@@ -1220,13 +1222,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_pkarr,
             )
             .await?;
-            let res = drive_m2m_enroll_initiator(
+            let res = drive_m2m_enroll_initiator_with_store(
                 stream.as_mut(),
                 &identity,
                 name,
                 kind,
                 token,
                 pinned_host,
+                &store,
+                DEFAULT_PRE_AUTH_TIMEOUT,
             )
             .await;
             let _ = stream.close().await;

@@ -7,6 +7,7 @@ pub mod overlay;
 #[cfg(feature = "p2p-iroh")]
 pub mod p2p;
 pub mod relay;
+pub mod relay_v2;
 
 use std::collections::VecDeque;
 use std::fs;
@@ -42,6 +43,7 @@ pub use p2p::{
     parse_p2p_relay_mode,
 };
 pub use relay::{EmbeddedRelay, RelayDialer, RelayListener};
+pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};
 
 /// Dials any supported Tendril endpoint (`iroh://`, `overlay://`, `broker+ws(s)://`,
 /// `ws(s)://`, `unix://`/`/...`, or `host:port`) via its matching [`PathDialer`].

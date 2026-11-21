@@ -29,9 +29,10 @@ use tendril_core::roster::{AnchorState, Roster};
 use tendril_runtime::{
     ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
     InboundRouter, PathListener, RelayListener, SessionDriver, SessionEvent, StateStore,
-    deserialize_identity_json, dial_endpoint, drive_m2m_enroll_initiator, drive_pair_initiator,
-    drive_pair_responder_with_policy_and_store, pairing_path_kind_for_provider,
-    serialize_identity_json,
+    deserialize_identity_json, dial_endpoint, drive_m2m_enroll_initiator_with_floor,
+    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_floor,
+    drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
+    pairing_path_kind_for_provider, pinned_pairing_floor, serialize_identity_json,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{P2pListener, parse_p2p_relay_mode};
@@ -1055,15 +1056,33 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
             let mut stream = dial_endpoint(endpoint_s, relay_host_s)
                 .await
                 .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
-            let pair_res = drive_pair_initiator(
-                stream.as_mut(),
-                &ep.identity,
-                name_s.unwrap_or("ffi-device").to_owned(),
-                kind_s.unwrap_or("ffi").to_owned(),
-                code_s.to_owned(),
-                None,
-            )
-            .await
+            let device_name = name_s.unwrap_or("ffi-device").to_owned();
+            let device_kind = kind_s.unwrap_or("ffi").to_owned();
+            let pair_res = if let Some(ref store) = ep.store {
+                drive_pair_initiator_with_store(
+                    stream.as_mut(),
+                    &ep.identity,
+                    device_name,
+                    device_kind,
+                    code_s.to_owned(),
+                    None,
+                    store,
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            } else {
+                drive_pair_initiator_with_floor(
+                    stream.as_mut(),
+                    &ep.identity,
+                    device_name,
+                    device_kind,
+                    code_s.to_owned(),
+                    None,
+                    tendril_core::WIRE_VERSION,
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            }
             .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()));
             let _ = stream.close().await;
             pair_res
@@ -1571,19 +1590,44 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
         };
 
         let ep = unsafe { &*ep };
+        let fallback_floor = {
+            let roster = ep
+                .roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pinned_pairing_floor(&roster, &pinned_host)
+        };
         let res = ep.rt.block_on(async {
             let mut stream = dial_endpoint(endpoint_s, relay_host_s)
                 .await
                 .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
-            let pair_res = drive_m2m_enroll_initiator(
-                stream.as_mut(),
-                &ep.identity,
-                name_s.unwrap_or("ffi-machine").to_owned(),
-                kind_s.unwrap_or("machine").to_owned(),
-                token,
-                pinned_host,
-            )
-            .await
+            let device_name = name_s.unwrap_or("ffi-machine").to_owned();
+            let device_kind = kind_s.unwrap_or("machine").to_owned();
+            let pair_res = if let Some(ref store) = ep.store {
+                drive_m2m_enroll_initiator_with_store(
+                    stream.as_mut(),
+                    &ep.identity,
+                    device_name,
+                    device_kind,
+                    token,
+                    pinned_host,
+                    store,
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            } else {
+                drive_m2m_enroll_initiator_with_floor(
+                    stream.as_mut(),
+                    &ep.identity,
+                    device_name,
+                    device_kind,
+                    token,
+                    pinned_host,
+                    fallback_floor,
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            }
             .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()));
             let _ = stream.close().await;
             pair_res

@@ -19,9 +19,10 @@ use tendril_core::policy::ProviderId;
 use tendril_core::roster::{AnchorState, Roster};
 use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
-    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer, PathDialer, PathListener,
-    PathStream, PrefixedPathStream, RelayDialer, RelayListener, SessionDriver, SessionEvent,
-    StateStore, drive_pair_initiator, drive_pair_responder_with_policy, peek_exact,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer,
+    PathDialer, PathListener, PathStream, PrefixedPathStream, RelayDialer, RelayListener,
+    SessionDriver, SessionEvent, StateStore, drive_pair_initiator_with_floor,
+    drive_pair_responder_with_policy, peek_exact,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -359,13 +360,15 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                     Ok(s) => s,
                     Err(e) => return (err_json(e), false),
                 };
-                match drive_pair_initiator(
+                match drive_pair_initiator_with_floor(
                     stream.as_mut(),
                     &id,
                     name.unwrap_or_else(|| "peer-client".to_owned()),
                     kind.unwrap_or_else(|| "cli".to_owned()),
                     code_str,
                     None,
+                    tendril_core::WIRE_VERSION,
+                    DEFAULT_PRE_AUTH_TIMEOUT,
                 )
                 .await
                 {

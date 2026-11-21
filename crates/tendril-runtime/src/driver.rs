@@ -29,14 +29,14 @@ use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, P
 use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
 use crate::store::StateStore;
 
-fn current_unix_secs() -> u64 {
+pub(crate) fn current_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
-async fn write_protocol_chunks(
+pub(crate) async fn write_protocol_chunks(
     writer: &mut dyn PathWriter,
     bytes: &[u8],
 ) -> Result<(), RuntimeError> {
@@ -116,7 +116,7 @@ pub struct PairDriveResult {
     pub sas: Option<String>,
 }
 
-async fn write_protocol_bytes(
+pub(crate) async fn write_protocol_bytes(
     stream: &mut dyn PathStream,
     bytes: &[u8],
 ) -> Result<(), RuntimeError> {
@@ -126,7 +126,21 @@ async fn write_protocol_bytes(
     Ok(())
 }
 
+/// Resolves the highest persisted `min_wire_version` floor matching `pin` in `roster`.
+#[must_use]
+pub fn pinned_pairing_floor(roster: &Roster, pin: &PinnedHost) -> u8 {
+    let static_floor = roster.pairing_floor(&pin.static_pub);
+    let host_floor = pin
+        .host_id
+        .as_deref()
+        .and_then(|id| roster.get(id))
+        .map_or(tendril_core::WIRE_VERSION, |e| e.min_wire_version);
+    static_floor.max(host_floor)
+}
+
 /// Drives a pairing initiator handshake to completion over `stream` within `DEFAULT_PRE_AUTH_TIMEOUT`.
+#[deprecated(note = "use _with_store or _with_floor to enforce Wire v2 anti-downgrade")]
+#[allow(deprecated)]
 pub async fn drive_pair_initiator(
     stream: &mut dyn PathStream,
     identity: &EndpointIdentity,
@@ -148,6 +162,7 @@ pub async fn drive_pair_initiator(
 }
 
 /// Drives a pairing initiator handshake to completion over `stream` within `handshake_timeout`.
+#[deprecated(note = "use _with_store or _with_floor to enforce Wire v2 anti-downgrade")]
 pub async fn drive_pair_initiator_with_timeout(
     stream: &mut dyn PathStream,
     identity: &EndpointIdentity,
@@ -162,8 +177,100 @@ pub async fn drive_pair_initiator_with_timeout(
     drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
 }
 
+/// Drives a v1 pairing initiator enforcing an explicit `min_wire_version` anti-downgrade floor.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_pair_initiator_with_floor(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    device_name: String,
+    device_kind: String,
+    code: String,
+    pinned_host: Option<PinnedHost>,
+    min_wire_version: u8,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    let machine = PairingInitiator::new_with_min_wire_version(
+        identity,
+        device_name,
+        device_kind,
+        code,
+        pinned_host,
+        min_wire_version,
+        None,
+    )?;
+    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+}
+
+/// Drives a v1 pairing initiator while enforcing any persisted `min_wire_version` floor from `store`.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_pair_initiator_with_store(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    device_name: String,
+    device_kind: String,
+    code: String,
+    pinned_host: Option<PinnedHost>,
+    store: &StateStore,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    let was_unpinned = pinned_host.is_none();
+    let floor = match pinned_host.as_ref() {
+        Some(pin) => {
+            let roster = store.load_roster()?;
+            pinned_pairing_floor(&roster, pin)
+        }
+        None => tendril_core::WIRE_VERSION,
+    };
+    let res = drive_pair_initiator_with_floor(
+        stream,
+        identity,
+        device_name,
+        device_kind,
+        code,
+        pinned_host,
+        floor,
+        handshake_timeout,
+    )
+    .await?;
+    if was_unpinned {
+        match &res.outcome {
+            PairOutcome::InitiatorPending {
+                host_id,
+                host_static_pub,
+                ..
+            }
+            | PairOutcome::InitiatorEnrolled {
+                host_id,
+                host_static_pub,
+                ..
+            } => {
+                let roster = store.load_roster()?;
+                let learned_floor = roster.pairing_floor(host_static_pub).max(
+                    roster
+                        .get(host_id)
+                        .map_or(tendril_core::WIRE_VERSION, |e| e.min_wire_version),
+                );
+                if learned_floor >= tendril_core::wire::WIRE_VERSION_V2 {
+                    let _ = stream.close().await;
+                    return Err(CoreError::VersionDowngrade {
+                        peer_min: learned_floor,
+                        negotiated: tendril_core::WIRE_VERSION,
+                    }
+                    .into());
+                }
+            }
+            PairOutcome::ResponderPending { .. }
+            | PairOutcome::ResponderEnrolled { .. }
+            | PairOutcome::Rejected { .. } => {}
+        }
+    }
+    Ok(res)
+}
+
 /// Drives an autonomous M2M enrollment initiator handshake to completion over `stream`
 /// within `DEFAULT_PRE_AUTH_TIMEOUT`, requiring a pinned host identity.
+#[deprecated(note = "use _with_store or _with_floor to enforce Wire v2 anti-downgrade")]
+#[allow(deprecated)]
 pub async fn drive_m2m_enroll_initiator(
     stream: &mut dyn PathStream,
     identity: &EndpointIdentity,
@@ -186,6 +293,7 @@ pub async fn drive_m2m_enroll_initiator(
 
 /// Drives an autonomous M2M enrollment initiator handshake to completion over `stream`
 /// within `handshake_timeout`, requiring a pinned host identity.
+#[deprecated(note = "use _with_store or _with_floor to enforce Wire v2 anti-downgrade")]
 pub async fn drive_m2m_enroll_initiator_with_timeout(
     stream: &mut dyn PathStream,
     identity: &EndpointIdentity,
@@ -204,6 +312,57 @@ pub async fn drive_m2m_enroll_initiator_with_timeout(
         None,
     )?;
     drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+}
+
+/// Drives a v1 M2M enrollment initiator enforcing an explicit `min_wire_version` floor.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_m2m_enroll_initiator_with_floor(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    device_name: String,
+    device_kind: String,
+    enrollment_token: Grant,
+    pinned_host: PinnedHost,
+    min_wire_version: u8,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    let machine = PairingInitiator::new_m2m_with_min_wire_version(
+        identity,
+        device_name,
+        device_kind,
+        enrollment_token,
+        pinned_host,
+        min_wire_version,
+        None,
+    )?;
+    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+}
+
+/// Drives a v1 M2M enrollment initiator while enforcing any persisted `min_wire_version` floor from `store`.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_m2m_enroll_initiator_with_store(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    device_name: String,
+    device_kind: String,
+    enrollment_token: Grant,
+    pinned_host: PinnedHost,
+    store: &StateStore,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    let roster = store.load_roster()?;
+    let floor = pinned_pairing_floor(&roster, &pinned_host);
+    drive_m2m_enroll_initiator_with_floor(
+        stream,
+        identity,
+        device_name,
+        device_kind,
+        enrollment_token,
+        pinned_host,
+        floor,
+        handshake_timeout,
+    )
+    .await
 }
 
 async fn drive_pairing_initiator_machine(
@@ -435,7 +594,7 @@ enum ResponderRosterBackend<'a> {
     },
 }
 
-fn has_complete_outer_frame(buf: &[u8]) -> Result<bool, RuntimeError> {
+pub(crate) fn has_complete_outer_frame(buf: &[u8]) -> Result<bool, RuntimeError> {
     if buf.len() < 2 {
         return Ok(false);
     }

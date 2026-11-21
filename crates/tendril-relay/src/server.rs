@@ -1,4 +1,4 @@
-//! Stateless async WebSocket relay server implementing `spec/relay-v1.md`.
+//! Stateless async WebSocket relay server implementing `spec/relay-v1.md` and `spec/relay-v2.md`.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -8,18 +8,23 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use serde::Serialize;
 use tendril_core::crypto::{b64url_decode_array, b64url_encode, random_bytes};
+use tendril_core::v2::{
+    RELAY_V2_EPOCH_SECS, canonical_relay_host, epoch_for_unix, epoch_within_skew,
+    verify_v2_relay_accept, verify_v2_relay_register,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant as TokioInstant, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
@@ -29,10 +34,17 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::protocol::{
-    MAX_RELAY_FRAME_LEN, RELAY_PATH, RelayClientMsg, RelayServerMsg, verify_relay_accept,
-    verify_relay_register,
+    MAX_RELAY_FRAME_LEN, RELAY_PATH, RELAY_V2_PATH, RelayClientMsg, RelayServerMsg,
+    RelayV2ClientMsg, RelayV2ServerMsg, verify_relay_accept, verify_relay_register,
 };
 use crate::rate_limit::{IpTokenLimiter, normalize_rate_limit_ip};
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 static RELAY_RING_INIT: Once = Once::new();
 
@@ -242,6 +254,13 @@ impl RelayHandle {
         format!("{scheme}://{}{RELAY_PATH}", self.addr)
     }
 
+    /// Returns a `ws://` or `wss://` URL pointing at the `/v2/relay` path.
+    #[must_use]
+    pub fn ws_v2_url(&self) -> String {
+        let scheme = if self.uses_tls { "wss" } else { "ws" };
+        format!("{scheme}://{}{RELAY_V2_PATH}", self.addr)
+    }
+
     /// Signals graceful shutdown and awaits server task exit.
     pub async fn stop(mut self) -> Result<(), RelayError> {
         if let Some(tx) = self.shutdown_tx.take() {
@@ -317,10 +336,33 @@ struct MailboxEntry {
     incoming_tx: mpsc::Sender<String>,
 }
 
+#[derive(Clone)]
+struct IncomingV2Notification {
+    mailbox_id: String,
+    epoch: u64,
+    conn_id: String,
+    dial_nonce: String,
+    dial_token: String,
+}
+
+#[derive(Clone)]
+struct MailboxV2Entry {
+    reg_id: u64,
+    epoch: u64,
+    incoming_tx: mpsc::Sender<IncomingV2Notification>,
+}
+
 struct PendingDial {
     dial_id: u64,
     target_pub: [u8; 32],
     match_tx: oneshot::Sender<AcceptorTransfer>,
+}
+
+struct PendingV2Dial {
+    dial_id: u64,
+    target_mailbox: [u8; 32],
+    epoch: u64,
+    match_tx: oneshot::Sender<AcceptorV2Transfer>,
 }
 
 struct AcceptorTransfer {
@@ -330,12 +372,23 @@ struct AcceptorTransfer {
     _stream_guard: MailboxStreamGuard,
 }
 
+struct AcceptorV2Transfer {
+    ws: WebSocketStream<RelayTcpStream>,
+    _global_guard: GlobalConnGuard,
+    _ip_guard: IpConnGuard,
+    _stream_guard: MailboxV2StreamGuard,
+}
+
 struct RelayTables {
     next_id: u64,
     mailboxes: HashMap<[u8; 32], MailboxEntry>,
     pending: HashMap<[u8; 16], PendingDial>,
     pending_counts: HashMap<[u8; 32], usize>,
     active_per_mailbox: HashMap<[u8; 32], usize>,
+    v2_mailboxes: HashMap<[u8; 32], MailboxV2Entry>,
+    v2_pending: HashMap<[u8; 16], PendingV2Dial>,
+    v2_pending_counts: HashMap<[u8; 32], usize>,
+    v2_active_per_mailbox: HashMap<[u8; 32], usize>,
 }
 
 impl RelayTables {
@@ -346,7 +399,15 @@ impl RelayTables {
             pending: HashMap::new(),
             pending_counts: HashMap::new(),
             active_per_mailbox: HashMap::new(),
+            v2_mailboxes: HashMap::new(),
+            v2_pending: HashMap::new(),
+            v2_pending_counts: HashMap::new(),
+            v2_active_per_mailbox: HashMap::new(),
         }
+    }
+
+    fn total_mailbox_count(&self) -> usize {
+        self.mailboxes.len().saturating_add(self.v2_mailboxes.len())
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -507,6 +568,70 @@ impl Drop for MailboxStreamGuard {
     }
 }
 
+struct MailboxV2RegGuard {
+    state: Arc<RelayState>,
+    mailbox_id: [u8; 32],
+    reg_id: u64,
+}
+
+impl Drop for MailboxV2RegGuard {
+    fn drop(&mut self) {
+        let mut tables = self
+            .state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tables
+            .v2_mailboxes
+            .get(&self.mailbox_id)
+            .is_some_and(|entry| entry.reg_id == self.reg_id)
+        {
+            tables.v2_mailboxes.remove(&self.mailbox_id);
+        }
+    }
+}
+
+struct PendingV2DialGuard {
+    state: Arc<RelayState>,
+    target_mailbox: [u8; 32],
+    conn_id: [u8; 16],
+    dial_id: u64,
+}
+
+impl Drop for PendingV2DialGuard {
+    fn drop(&mut self) {
+        let mut tables = self
+            .state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let matches = tables
+            .v2_pending
+            .get(&self.conn_id)
+            .is_some_and(|p| p.dial_id == self.dial_id);
+        if matches {
+            tables.v2_pending.remove(&self.conn_id);
+            decrement_count(&mut tables.v2_pending_counts, &self.target_mailbox);
+        }
+    }
+}
+
+struct MailboxV2StreamGuard {
+    state: Arc<RelayState>,
+    mailbox_id: [u8; 32],
+}
+
+impl Drop for MailboxV2StreamGuard {
+    fn drop(&mut self) {
+        let mut tables = self
+            .state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        decrement_count(&mut tables.v2_active_per_mailbox, &self.mailbox_id);
+    }
+}
+
 fn decrement_count(map: &mut HashMap<[u8; 32], usize>, key: &[u8; 32]) {
     if let Some(count) = map.get_mut(key) {
         if *count <= 1 {
@@ -589,6 +714,17 @@ impl RelayServer {
         format!("{scheme}://{}{RELAY_PATH}", self.addr)
     }
 
+    /// Returns a `ws://` or `wss://` URL pointing at `/v2/relay`.
+    #[must_use]
+    pub fn ws_v2_url(&self) -> String {
+        let scheme = if self.tls_acceptor.is_some() {
+            "wss"
+        } else {
+            "ws"
+        };
+        format!("{scheme}://{}{RELAY_V2_PATH}", self.addr)
+    }
+
     /// Runs the accept loop until `shutdown` fires.
     pub async fn serve_until(self, mut shutdown: oneshot::Receiver<()>) -> Result<(), RelayError> {
         loop {
@@ -655,9 +791,9 @@ impl RelayServer {
     }
 }
 
-async fn send_json(
+async fn send_json<T: Serialize>(
     ws: &mut WebSocketStream<RelayTcpStream>,
-    msg: &RelayServerMsg,
+    msg: &T,
     write_timeout: Duration,
 ) -> bool {
     let Ok(text) = serde_json::to_string(msg) else {
@@ -682,6 +818,28 @@ async fn send_error_and_close(
     )
     .await;
     let _ = timeout(write_timeout, ws.close(None)).await;
+}
+
+async fn send_v2_error_and_close(
+    ws: &mut WebSocketStream<RelayTcpStream>,
+    code: &str,
+    write_timeout: Duration,
+) {
+    let _ = send_json(
+        ws,
+        &RelayV2ServerMsg::Error {
+            code: code.to_owned(),
+        },
+        write_timeout,
+    )
+    .await;
+    let _ = timeout(write_timeout, ws.close(None)).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayProtocolVersion {
+    V1,
+    V2,
 }
 
 fn parse_forwarded_ip_token(raw: &str) -> Option<IpAddr> {
@@ -774,17 +932,26 @@ async fn handle_connection(
         .max_frame_size(Some(MAX_RELAY_FRAME_LEN));
 
     let extracted_ip = Arc::new(Mutex::new(None::<IpAddr>));
+    let matched_version = Arc::new(Mutex::new(None::<RelayProtocolVersion>));
     let extract_trusted = pre_acquired_ip.is_none();
     let trusted_proxies = state.config.trusted_proxies.clone();
     let extracted_slot = Arc::clone(&extracted_ip);
+    let version_slot = Arc::clone(&matched_version);
 
     #[allow(clippy::result_large_err)]
     let validate_req = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-        if req.uri().path() != RELAY_PATH {
-            let mut err = ErrorResponse::new(Some("not found".to_owned()));
-            *err.status_mut() = StatusCode::NOT_FOUND;
-            return Err(err);
-        }
+        let version = match req.uri().path() {
+            RELAY_PATH => RelayProtocolVersion::V1,
+            RELAY_V2_PATH => RelayProtocolVersion::V2,
+            _ => {
+                let mut err = ErrorResponse::new(Some("not found".to_owned()));
+                *err.status_mut() = StatusCode::NOT_FOUND;
+                return Err(err);
+            }
+        };
+        *version_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(version);
         if extract_trusted {
             let resolved = extract_trusted_client_ip(req.headers(), &trusted_proxies, peer_ip);
             *extracted_slot.lock().expect("extracted_ip mutex poisoned") = Some(resolved);
@@ -801,6 +968,11 @@ async fn handle_connection(
         return;
     };
 
+    let version = matched_version
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or(RelayProtocolVersion::V1);
+
     let ip_guard = match pre_acquired_ip {
         Some(g) => g,
         None => {
@@ -809,12 +981,30 @@ async fn handle_connection(
                 .expect("extracted_ip mutex poisoned")
                 .unwrap_or(peer_ip);
             let Some(g) = state.try_acquire_ip(resolved) else {
-                send_error_and_close(&mut ws, "rate_limited", state.config.write_timeout).await;
+                match version {
+                    RelayProtocolVersion::V1 => {
+                        send_error_and_close(&mut ws, "rate_limited", state.config.write_timeout)
+                            .await;
+                    }
+                    RelayProtocolVersion::V2 => {
+                        send_v2_error_and_close(
+                            &mut ws,
+                            "rate_limited",
+                            state.config.write_timeout,
+                        )
+                        .await;
+                    }
+                }
                 return;
             };
             g
         }
     };
+
+    if version == RelayProtocolVersion::V2 {
+        handle_v2_connection(ws, global_guard, ip_guard, state).await;
+        return;
+    }
 
     let Ok(nonce) = random_bytes::<32>() else {
         return;
@@ -900,7 +1090,7 @@ async fn handle_register(
     let reg_id_opt = {
         let mut tables = state.tables.lock().expect("tables mutex poisoned");
         if !tables.mailboxes.contains_key(&mailbox_pub)
-            && tables.mailboxes.len() >= state.config.max_mailboxes.max(1)
+            && tables.total_mailbox_count() >= state.config.max_mailboxes.max(1)
         {
             None
         } else {
@@ -1103,7 +1293,10 @@ async fn handle_accept(
     }
 
     let claim = {
-        let mut tables = state.tables.lock().expect("tables mutex poisoned");
+        let mut tables = state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match tables.pending.get(&conn_id) {
             None => ClaimResult::NotFound,
             Some(entry) if entry.target_pub != acceptor_pub => ClaimResult::WrongOwner,
@@ -1168,6 +1361,542 @@ async fn handle_accept(
     }
 
     let _ = match_tx.send(AcceptorTransfer {
+        ws,
+        _global_guard: global_guard,
+        _ip_guard: ip_guard,
+        _stream_guard: stream_guard,
+    });
+}
+
+async fn handle_v2_connection(
+    mut ws: WebSocketStream<RelayTcpStream>,
+    global_guard: GlobalConnGuard,
+    ip_guard: IpConnGuard,
+    state: Arc<RelayState>,
+) {
+    let Ok(canonical_host) = canonical_relay_host(&state.config.host) else {
+        send_v2_error_and_close(&mut ws, "invalid_request", state.config.write_timeout).await;
+        return;
+    };
+    let Ok(nonce) = random_bytes::<32>() else {
+        return;
+    };
+    let server_epoch = epoch_for_unix(current_unix_secs());
+    let challenge = RelayV2ServerMsg::Challenge {
+        nonce: b64url_encode(&nonce),
+        host: canonical_host.clone(),
+        epoch: server_epoch,
+        max_frame: MAX_RELAY_FRAME_LEN,
+    };
+    if !send_json(&mut ws, &challenge, state.config.write_timeout).await {
+        return;
+    }
+
+    let first_msg = match timeout(state.config.accept_timeout, ws.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => text,
+        Ok(Some(Ok(_))) => {
+            send_v2_error_and_close(&mut ws, "invalid_request", state.config.write_timeout).await;
+            return;
+        }
+        Ok(None | Some(Err(_))) => return,
+        Err(_) => {
+            send_v2_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
+            return;
+        }
+    };
+
+    let Ok(cmd) = serde_json::from_str::<RelayV2ClientMsg>(&first_msg) else {
+        send_v2_error_and_close(&mut ws, "invalid_request", state.config.write_timeout).await;
+        return;
+    };
+
+    match cmd {
+        RelayV2ClientMsg::Register {
+            mailbox_id,
+            epoch,
+            sig,
+        } => {
+            handle_v2_register(
+                ws,
+                global_guard,
+                ip_guard,
+                state,
+                &canonical_host,
+                server_epoch,
+                &nonce,
+                mailbox_id,
+                epoch,
+                sig,
+            )
+            .await;
+        }
+        RelayV2ClientMsg::Dial {
+            target_mailbox_id,
+            epoch,
+            conn_id,
+            dial_token,
+        } => {
+            handle_v2_dial(
+                ws,
+                global_guard,
+                ip_guard,
+                state,
+                server_epoch,
+                &nonce,
+                target_mailbox_id,
+                epoch,
+                conn_id,
+                dial_token,
+            )
+            .await;
+        }
+        RelayV2ClientMsg::Accept {
+            mailbox_id,
+            epoch,
+            conn_id,
+            sig,
+        } => {
+            handle_v2_accept(
+                ws,
+                global_guard,
+                ip_guard,
+                state,
+                &canonical_host,
+                server_epoch,
+                &nonce,
+                mailbox_id,
+                epoch,
+                conn_id,
+                sig,
+            )
+            .await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_v2_register(
+    mut ws: WebSocketStream<RelayTcpStream>,
+    _global_guard: GlobalConnGuard,
+    _ip_guard: IpConnGuard,
+    state: Arc<RelayState>,
+    canonical_host: &str,
+    server_epoch: u64,
+    nonce: &[u8; 32],
+    mailbox_id_b64: String,
+    epoch: u64,
+    sig_b64: String,
+) {
+    let (Ok(mailbox_id), Ok(sig)) = (
+        b64url_decode_array::<32>(&mailbox_id_b64),
+        b64url_decode_array::<64>(&sig_b64),
+    ) else {
+        send_v2_error_and_close(&mut ws, "invalid_request", state.config.write_timeout).await;
+        return;
+    };
+    if !epoch_within_skew(server_epoch, epoch)
+        || verify_v2_relay_register(&mailbox_id, epoch, canonical_host, nonce, &sig).is_err()
+    {
+        send_v2_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
+        return;
+    }
+
+    let chan_cap = state
+        .config
+        .max_pending_per_mailbox
+        .saturating_mul(2)
+        .max(8);
+    let (incoming_tx, mut incoming_rx) = mpsc::channel::<IncomingV2Notification>(chan_cap);
+    let reg_id_opt = {
+        let mut tables = state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !tables.v2_mailboxes.contains_key(&mailbox_id)
+            && tables.total_mailbox_count() >= state.config.max_mailboxes.max(1)
+        {
+            None
+        } else {
+            let reg_id = tables.alloc_id();
+            tables.v2_mailboxes.insert(
+                mailbox_id,
+                MailboxV2Entry {
+                    reg_id,
+                    epoch,
+                    incoming_tx,
+                },
+            );
+            Some(reg_id)
+        }
+    };
+    let Some(reg_id) = reg_id_opt else {
+        send_v2_error_and_close(&mut ws, "capacity_exceeded", state.config.write_timeout).await;
+        return;
+    };
+    let reg_guard = MailboxV2RegGuard {
+        state: Arc::clone(&state),
+        mailbox_id,
+        reg_id,
+    };
+
+    if !send_json(
+        &mut ws,
+        &RelayV2ServerMsg::Registered {
+            mailbox_id: mailbox_id_b64,
+            epoch,
+        },
+        state.config.write_timeout,
+    )
+    .await
+    {
+        return;
+    }
+
+    let expire_secs = epoch
+        .saturating_add(2)
+        .saturating_mul(RELAY_V2_EPOCH_SECS)
+        .saturating_sub(current_unix_secs());
+    let epoch_expiry = tokio::time::sleep(Duration::from_secs(expire_secs));
+    tokio::pin!(epoch_expiry);
+    let idle_sleep = tokio::time::sleep(state.config.idle_timeout.max(Duration::from_millis(1)));
+    tokio::pin!(idle_sleep);
+    let mut awaiting_pong = false;
+
+    loop {
+        tokio::select! {
+            () = &mut epoch_expiry => {
+                break;
+            }
+            () = &mut idle_sleep => {
+                if awaiting_pong {
+                    break;
+                }
+                if !timeout(
+                    state.config.write_timeout,
+                    ws.send(Message::Ping(Vec::new().into())),
+                )
+                .await
+                .is_ok_and(|res| res.is_ok())
+                {
+                    break;
+                }
+                awaiting_pong = true;
+                idle_sleep
+                    .as_mut()
+                    .reset(TokioInstant::now() + state.config.accept_timeout.max(Duration::from_millis(1)));
+            }
+            maybe_note = incoming_rx.recv() => {
+                let Some(note) = maybe_note else {
+                    break;
+                };
+                if !send_json(
+                    &mut ws,
+                    &RelayV2ServerMsg::Incoming {
+                        mailbox_id: note.mailbox_id,
+                        epoch: note.epoch,
+                        conn_id: note.conn_id,
+                        dial_nonce: note.dial_nonce,
+                        dial_token: note.dial_token,
+                    },
+                    state.config.write_timeout,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+            maybe_ws = ws.next() => {
+                match maybe_ws {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                        awaiting_pong = false;
+                        idle_sleep
+                            .as_mut()
+                            .reset(TokioInstant::now() + state.config.idle_timeout.max(Duration::from_millis(1)));
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    drop(reg_guard);
+    let _ = timeout(state.config.write_timeout, ws.close(None)).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_v2_dial(
+    mut ws: WebSocketStream<RelayTcpStream>,
+    _global_guard: GlobalConnGuard,
+    _ip_guard: IpConnGuard,
+    state: Arc<RelayState>,
+    server_epoch: u64,
+    dial_nonce: &[u8; 32],
+    target_mailbox_b64: String,
+    epoch: u64,
+    conn_id_b64: String,
+    dial_token_b64: String,
+) {
+    let (Ok(target_mailbox), Ok(conn_id), Ok(_dial_token)) = (
+        b64url_decode_array::<32>(&target_mailbox_b64),
+        b64url_decode_array::<16>(&conn_id_b64),
+        b64url_decode_array::<32>(&dial_token_b64),
+    ) else {
+        send_v2_error_and_close(&mut ws, "invalid_request", state.config.write_timeout).await;
+        return;
+    };
+    if !epoch_within_skew(server_epoch, epoch) {
+        send_v2_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
+        return;
+    }
+
+    let (match_tx, mut match_rx) = oneshot::channel::<AcceptorV2Transfer>();
+    let enqueue_res: Result<(mpsc::Sender<IncomingV2Notification>, u64), &'static str> = {
+        let mut tables = state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mailbox) = tables.v2_mailboxes.get(&target_mailbox).cloned() {
+            if mailbox.epoch != epoch {
+                Err("offline")
+            } else {
+                let active_count = tables
+                    .v2_active_per_mailbox
+                    .get(&target_mailbox)
+                    .copied()
+                    .unwrap_or(0);
+                let pending_count = tables
+                    .v2_pending_counts
+                    .get(&target_mailbox)
+                    .copied()
+                    .unwrap_or(0);
+                if active_count >= state.config.max_active_per_mailbox
+                    || pending_count >= state.config.max_pending_per_mailbox
+                {
+                    Err("rate_limited")
+                } else if tables.v2_pending.contains_key(&conn_id) {
+                    Err("invalid_request")
+                } else {
+                    let dial_id = tables.alloc_id();
+                    *tables.v2_pending_counts.entry(target_mailbox).or_insert(0) += 1;
+                    tables.v2_pending.insert(
+                        conn_id,
+                        PendingV2Dial {
+                            dial_id,
+                            target_mailbox,
+                            epoch,
+                            match_tx,
+                        },
+                    );
+                    Ok((mailbox.incoming_tx, dial_id))
+                }
+            }
+        } else {
+            Err("offline")
+        }
+    };
+    let (incoming_tx, dial_id) = match enqueue_res {
+        Ok(pair) => pair,
+        Err(code) => {
+            send_v2_error_and_close(&mut ws, code, state.config.write_timeout).await;
+            return;
+        }
+    };
+
+    let _pending_guard = PendingV2DialGuard {
+        state: Arc::clone(&state),
+        target_mailbox,
+        conn_id,
+        dial_id,
+    };
+
+    let note = IncomingV2Notification {
+        mailbox_id: target_mailbox_b64,
+        epoch,
+        conn_id: conn_id_b64.clone(),
+        dial_nonce: b64url_encode(dial_nonce),
+        dial_token: dial_token_b64,
+    };
+    match incoming_tx.try_send(note) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            send_v2_error_and_close(&mut ws, "rate_limited", state.config.write_timeout).await;
+            return;
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            send_v2_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
+            return;
+        }
+    }
+
+    let accept_deadline = tokio::time::sleep(state.config.accept_timeout);
+    tokio::pin!(accept_deadline);
+    let acceptor = loop {
+        tokio::select! {
+            res = &mut match_rx => match res {
+                Ok(transfer) => break transfer,
+                Err(_) => {
+                    send_v2_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
+                    return;
+                }
+            },
+            () = &mut accept_deadline => {
+                send_v2_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
+                return;
+            }
+            maybe_ws = ws.next() => {
+                match maybe_ws {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    _ => return,
+                }
+            }
+        }
+    };
+
+    if !send_json(
+        &mut ws,
+        &RelayV2ServerMsg::Ready {
+            conn_id: conn_id_b64,
+        },
+        state.config.write_timeout,
+    )
+    .await
+    {
+        return;
+    }
+
+    bridge_streams(
+        ws,
+        acceptor.ws,
+        state.config.write_timeout,
+        state.config.idle_timeout,
+    )
+    .await;
+    drop(acceptor._global_guard);
+    drop(acceptor._ip_guard);
+    drop(acceptor._stream_guard);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_v2_accept(
+    mut ws: WebSocketStream<RelayTcpStream>,
+    global_guard: GlobalConnGuard,
+    ip_guard: IpConnGuard,
+    state: Arc<RelayState>,
+    canonical_host: &str,
+    server_epoch: u64,
+    nonce: &[u8; 32],
+    mailbox_id_b64: String,
+    epoch: u64,
+    conn_id_b64: String,
+    sig_b64: String,
+) {
+    let (Ok(acceptor_mailbox), Ok(conn_id), Ok(sig)) = (
+        b64url_decode_array::<32>(&mailbox_id_b64),
+        b64url_decode_array::<16>(&conn_id_b64),
+        b64url_decode_array::<64>(&sig_b64),
+    ) else {
+        send_v2_error_and_close(&mut ws, "invalid_request", state.config.write_timeout).await;
+        return;
+    };
+
+    if !epoch_within_skew(server_epoch, epoch)
+        || verify_v2_relay_accept(
+            &acceptor_mailbox,
+            epoch,
+            canonical_host,
+            nonce,
+            &conn_id,
+            &sig,
+        )
+        .is_err()
+    {
+        send_v2_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
+        return;
+    }
+
+    enum ClaimResult {
+        Claimed {
+            target_mailbox: [u8; 32],
+            match_tx: oneshot::Sender<AcceptorV2Transfer>,
+        },
+        NotFound,
+        WrongOwner,
+        RateLimited,
+    }
+
+    let claim = {
+        let mut tables = state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match tables.v2_pending.get(&conn_id) {
+            None => ClaimResult::NotFound,
+            Some(entry) if entry.target_mailbox != acceptor_mailbox || entry.epoch != epoch => {
+                ClaimResult::WrongOwner
+            }
+            Some(entry) => {
+                let active_count = tables
+                    .v2_active_per_mailbox
+                    .get(&entry.target_mailbox)
+                    .copied()
+                    .unwrap_or(0);
+                if active_count >= state.config.max_active_per_mailbox {
+                    ClaimResult::RateLimited
+                } else {
+                    let pending = tables
+                        .v2_pending
+                        .remove(&conn_id)
+                        .expect("checked Some above");
+                    decrement_count(&mut tables.v2_pending_counts, &pending.target_mailbox);
+                    *tables
+                        .v2_active_per_mailbox
+                        .entry(pending.target_mailbox)
+                        .or_insert(0) += 1;
+                    ClaimResult::Claimed {
+                        target_mailbox: pending.target_mailbox,
+                        match_tx: pending.match_tx,
+                    }
+                }
+            }
+        }
+    };
+
+    let (target_mailbox, match_tx) = match claim {
+        ClaimResult::Claimed {
+            target_mailbox,
+            match_tx,
+        } => (target_mailbox, match_tx),
+        ClaimResult::NotFound => {
+            send_v2_error_and_close(&mut ws, "invalid_request", state.config.write_timeout).await;
+            return;
+        }
+        ClaimResult::WrongOwner => {
+            send_v2_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
+            return;
+        }
+        ClaimResult::RateLimited => {
+            send_v2_error_and_close(&mut ws, "rate_limited", state.config.write_timeout).await;
+            return;
+        }
+    };
+
+    let stream_guard = MailboxV2StreamGuard {
+        state: Arc::clone(&state),
+        mailbox_id: target_mailbox,
+    };
+
+    if !send_json(
+        &mut ws,
+        &RelayV2ServerMsg::Ready {
+            conn_id: conn_id_b64,
+        },
+        state.config.write_timeout,
+    )
+    .await
+    {
+        return;
+    }
+
+    let _ = match_tx.send(AcceptorV2Transfer {
         ws,
         _global_guard: global_guard,
         _ip_guard: ip_guard,
