@@ -67,10 +67,28 @@ export function initTendrilP2p(
   wasmUrl?: string | URL | RequestInfo | BufferSource
 ): Promise<void>;
 export function parseP2pEndpoint(endpoint: string): Promise<ParsedP2pEndpoint>;
+export const MAX_RELAY_FRAME_LEN: number;
+export const MAX_QUEUED_BYTES: number;
+export const MAX_QUEUED_FRAMES: number;
+
+export class RelayStream implements TendrilStream {
+  constructor(ws: WebSocket, maxQueuedBytes?: number, maxQueuedFrames?: number);
+  maxFrame(): number;
+  send(bytes: Uint8Array): void;
+  recv(timeoutMs?: number): Promise<WebStreamRecvResult>;
+  close(): void;
+}
+
+export function validateRelayWsUrl(
+  relayUrl: string,
+  allowInsecureWs?: boolean
+): { url: string; bareHost: string };
+
 export function dialRelayStream(options: {
   relayUrl: string;
   targetPub: string;
   expectedHost?: string | null;
+  allowInsecureWs?: boolean;
   timeoutMs?: number;
 }): Promise<TendrilStream>;
 export function dialIrohStream(options: {
@@ -131,6 +149,7 @@ export class TendrilWebClient {
     targetPub?: string | null;
     expectedHost?: string | null;
     relayUrlOverride?: string | null;
+    allowInsecureWs?: boolean;
     code?: string;
     pairingUri?: string | null;
     deviceName?: string;
@@ -143,6 +162,7 @@ export class TendrilWebClient {
     targetPub?: string | null;
     expectedHost?: string | null;
     relayUrlOverride?: string | null;
+    allowInsecureWs?: boolean;
     targetHostId: string;
     grantJson?: string | null;
     crlSeq?: number | null;

@@ -264,9 +264,44 @@ async function main() {
     cdp = await CdpClient.connect(pageTarget.webSocketDebuggerUrl);
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
+
+    const rootResp = await fetch(`${server.baseUrl}/`);
+    assert.equal(rootResp.status, 200);
+    assert.equal(rootResp.headers.get("x-frame-options"), "DENY");
+    assert.equal(rootResp.headers.get("referrer-policy"), "no-referrer");
+    assert.equal(rootResp.headers.get("x-content-type-options"), "nosniff");
+    const rootCsp = rootResp.headers.get("content-security-policy") || "";
+    assert.ok(rootCsp.includes("frame-ancestors 'none'"));
+    assert.ok(rootCsp.includes("'wasm-unsafe-eval'"));
+    const leakedServer = await fetch(`${server.baseUrl}/demo/server.mjs`);
+    assert.equal(leakedServer.status, 404);
+
     const loaded = cdp.waitForEvent("Page.loadEventFired");
-    await cdp.send("Page.navigate", { url: `${server.baseUrl}/` });
+    await cdp.send("Page.navigate", { url: `${server.baseUrl}/?code=1111-2222-3333#pub=testpub` });
     await loaded;
+
+    const demoSecurityState = await cdp.evalAsync(`
+      for (let i = 0; i < 100; i += 1) {
+        if ((document.getElementById('status')?.textContent || '').includes('WASM core ready')) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return {
+        status: document.getElementById('status')?.textContent || '',
+        search: window.location.search,
+        hash: window.location.hash,
+        codeValue: document.getElementById('pair-code')?.value || '',
+        pubValue: document.getElementById('target-pub')?.value || '',
+        localStorageKeys: Object.keys(localStorage),
+      };
+    `);
+    assert.ok(demoSecurityState.status.includes("WASM core ready"));
+    assert.equal(demoSecurityState.search, "");
+    assert.equal(demoSecurityState.hash, "");
+    assert.equal(demoSecurityState.codeValue, "1111-2222-3333");
+    assert.equal(demoSecurityState.pubValue, "testpub");
+    assert.deepEqual(demoSecurityState.localStorageKeys, []);
 
     // 1. Offline conformance vectors & Gate #8 Chrome WASM Argon2 benchmark.
     const offline = await cdp.evalAsync(`

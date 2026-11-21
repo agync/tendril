@@ -1,10 +1,16 @@
 import { TendrilWebClient, b64urlDecode, benchmarkArgon2 } from "/src/index.js";
 
-const IDENTITY_KEY = "tendril.demo.identity.v1";
-const ROSTER_KEY = "tendril.demo.roster.v1";
+const LEGACY_IDENTITY_KEY = "tendril.demo.identity.v1";
+const LEGACY_ROSTER_KEY = "tendril.demo.roster.v1";
+const VAULT_DB_NAME = "tendril-demo-vault-v1";
+const VAULT_STORE = "vault";
+const WRAPPING_KEY_ID = "wrapping-key";
+const IDENTITY_VAULT_ID = "identity";
+const ROSTER_VAULT_ID = "roster";
 
 const $ = (id) => document.getElementById(id);
 const logEl = $("log");
+const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 function appendLog(msg) {
@@ -18,6 +24,132 @@ function defaultRelayUrl() {
   return `${proto}//${window.location.host}/v1/relay`;
 }
 
+function requireSecureVaultSupport() {
+  if (!window.isSecureContext || !globalThis.crypto?.subtle || !globalThis.indexedDB) {
+    throw new Error(
+      "Secure WebCrypto AES-GCM and IndexedDB context required for demo keystore"
+    );
+  }
+}
+
+function idbRequest(req) {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("IndexedDB request failed"));
+  });
+}
+
+function idbTransactionDone(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("IndexedDB transaction failed"));
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
+  });
+}
+
+let vaultDbPromise = null;
+
+function openVaultDb() {
+  requireSecureVaultSupport();
+  if (!vaultDbPromise) {
+    vaultDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(VAULT_DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(VAULT_STORE)) {
+          db.createObjectStore(VAULT_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => {
+        vaultDbPromise = null;
+        reject(req.error || new Error("failed opening IndexedDB vault"));
+      };
+    });
+  }
+  return vaultDbPromise;
+}
+
+async function getOrCreateWrappingKey(db) {
+  const readTx = db.transaction(VAULT_STORE, "readonly");
+  const existing = await idbRequest(readTx.objectStore(VAULT_STORE).get(WRAPPING_KEY_ID));
+  await idbTransactionDone(readTx);
+  if (existing) {
+    return existing;
+  }
+  const generated = await crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+  const writeTx = db.transaction(VAULT_STORE, "readwrite");
+  const store = writeTx.objectStore(VAULT_STORE);
+  const current = await idbRequest(store.get(WRAPPING_KEY_ID));
+  if (current) {
+    await idbTransactionDone(writeTx);
+    return current;
+  }
+  store.put(generated, WRAPPING_KEY_ID);
+  await idbTransactionDone(writeTx);
+  return generated;
+}
+
+async function writeVaultString(entryId, value) {
+  const db = await openVaultDb();
+  const key = await getOrCreateWrappingKey(db);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aad = encoder.encode(`tendril.demo.vault.v1:${entryId}`);
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: aad },
+    key,
+    encoder.encode(value)
+  );
+  const tx = db.transaction(VAULT_STORE, "readwrite");
+  tx.objectStore(VAULT_STORE).put({ iv, ct: new Uint8Array(ct) }, entryId);
+  await idbTransactionDone(tx);
+}
+
+async function readVaultString(entryId) {
+  const db = await openVaultDb();
+  const key = await getOrCreateWrappingKey(db);
+  const tx = db.transaction(VAULT_STORE, "readonly");
+  const record = await idbRequest(tx.objectStore(VAULT_STORE).get(entryId));
+  await idbTransactionDone(tx);
+  if (!record || !record.iv || !record.ct) {
+    return null;
+  }
+  const aad = encoder.encode(`tendril.demo.vault.v1:${entryId}`);
+  const ptBuf = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: record.iv, additionalData: aad },
+    key,
+    record.ct
+  );
+  return decoder.decode(ptBuf);
+}
+
+async function clearVault() {
+  const db = await openVaultDb();
+  const tx = db.transaction(VAULT_STORE, "readwrite");
+  tx.objectStore(VAULT_STORE).clear();
+  await idbTransactionDone(tx);
+}
+
+function scrubLegacyLocalStorage() {
+  localStorage.removeItem(LEGACY_IDENTITY_KEY);
+  localStorage.removeItem(LEGACY_ROSTER_KEY);
+}
+
+function isThirdPartyTarget(targetUrl) {
+  if (!targetUrl) return false;
+  if (targetUrl.startsWith("iroh://")) return true;
+  try {
+    const parsed = new URL(targetUrl, window.location.href);
+    return parsed.host !== window.location.host;
+  } catch {
+    return true;
+  }
+}
+
 let client = null;
 let session = null;
 let polling = false;
@@ -25,16 +157,29 @@ let pendingHostId = null;
 let pendingHostSas = null;
 
 async function initClient() {
-  const identityJson = localStorage.getItem(IDENTITY_KEY);
-  const rosterJson = localStorage.getItem(ROSTER_KEY);
+  let identityJson = await readVaultString(IDENTITY_VAULT_ID);
+  let rosterJson = await readVaultString(ROSTER_VAULT_ID);
+
+  const legacyIdentity = localStorage.getItem(LEGACY_IDENTITY_KEY);
+  const legacyRoster = localStorage.getItem(LEGACY_ROSTER_KEY);
+  if (!identityJson && legacyIdentity) {
+    identityJson = legacyIdentity;
+    await writeVaultString(IDENTITY_VAULT_ID, identityJson);
+  }
+  if (!rosterJson && legacyRoster) {
+    rosterJson = legacyRoster;
+    await writeVaultString(ROSTER_VAULT_ID, rosterJson);
+  }
+  scrubLegacyLocalStorage();
+
   client = await TendrilWebClient.create({
     identityJson,
     rosterJson,
-    onPersistRoster: (rj) => {
-      localStorage.setItem(ROSTER_KEY, rj);
+    onPersistRoster: async (rj) => {
+      await writeVaultString(ROSTER_VAULT_ID, rj);
     },
   });
-  localStorage.setItem(IDENTITY_KEY, client.exportIdentityJson());
+  await writeVaultString(IDENTITY_VAULT_ID, client.exportIdentityJson());
   const info = client.info();
   $("status").textContent = "WASM core ready (Noise_XX_25519_ChaChaPoly_SHA256)";
   $("device-id").textContent = `device_id: ${info.device_id}`;
@@ -42,23 +187,64 @@ async function initClient() {
 
 async function applyPreconfig() {
   $("relay-url").value = defaultRelayUrl();
-  const params = new URLSearchParams(window.location.search);
-  if (params.get("endpoint")) $("relay-url").value = params.get("endpoint");
-  if (params.get("relay")) $("relay-url").value = params.get("relay");
-  if (params.get("pub")) $("target-pub").value = params.get("pub");
-  if (params.get("host")) $("target-host-id").value = params.get("host");
-  if (params.get("code")) $("pair-code").value = params.get("code");
+  const searchParams = new URLSearchParams(window.location.search);
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  const urlParam = (name) => hashParams.get(name) ?? searchParams.get(name);
+
+  const urlEndpoint = urlParam("endpoint") || urlParam("relay");
+  if (urlEndpoint) $("relay-url").value = urlEndpoint;
+  if (urlParam("pub")) $("target-pub").value = urlParam("pub");
+  if (urlParam("host")) $("target-host-id").value = urlParam("host");
+  if (urlParam("code")) $("pair-code").value = urlParam("code");
+  if (urlParam("uri")) $("pair-uri").value = urlParam("uri");
+
+  let serverConfigSetTarget = false;
   try {
     const resp = await fetch("/demo-config.json", { cache: "no-store" });
     if (resp.ok) {
       const cfg = await resp.json();
-      if (cfg.endpoint) $("relay-url").value = cfg.endpoint;
-      else if (cfg.relayUrl) $("relay-url").value = cfg.relayUrl;
-      if (cfg.targetPub && !$("target-pub").value) $("target-pub").value = cfg.targetPub;
+      if (cfg.endpoint) {
+        $("relay-url").value = cfg.endpoint;
+        serverConfigSetTarget = true;
+      } else if (cfg.relayUrl) {
+        $("relay-url").value = cfg.relayUrl;
+        serverConfigSetTarget = true;
+      }
+      if (cfg.targetPub) $("target-pub").value = cfg.targetPub;
       if (cfg.hostId) $("target-host-id").value = cfg.hostId;
-      if (cfg.code && !$("pair-code").value) $("pair-code").value = cfg.code;
+      if (cfg.code) $("pair-code").value = cfg.code;
     }
   } catch {}
+
+  let urlChanged = false;
+  for (const key of ["code", "uri", "pub"]) {
+    if (searchParams.has(key)) {
+      searchParams.delete(key);
+      urlChanged = true;
+    }
+    if (hashParams.has(key)) {
+      hashParams.delete(key);
+      urlChanged = true;
+    }
+  }
+  if (urlChanged) {
+    const qs = searchParams.toString();
+    const hs = hashParams.toString();
+    const cleanUrl =
+      window.location.pathname + (qs ? `?${qs}` : "") + (hs ? `#${hs}` : "");
+    window.history.replaceState(null, "", cleanUrl);
+  }
+
+  const warningEl = $("url-warning");
+  if (urlEndpoint && !serverConfigSetTarget && isThirdPartyTarget(urlEndpoint)) {
+    const msg = `Warning: endpoint/relay overridden by URL parameters (${urlEndpoint}); verify destination before pairing or connecting.`;
+    warningEl.textContent = msg;
+    warningEl.hidden = false;
+    appendLog(msg);
+  } else {
+    warningEl.hidden = true;
+    warningEl.textContent = "";
+  }
 }
 
 function transportArgsFromUi() {
@@ -121,8 +307,8 @@ $("reset-btn").addEventListener("click", async () => {
     await session.close(1000, "reset");
     session = null;
   }
-  localStorage.removeItem(IDENTITY_KEY);
-  localStorage.removeItem(ROSTER_KEY);
+  await clearVault();
+  scrubLegacyLocalStorage();
   client.free();
   await initClient();
   appendLog("Identity and roster reset.");

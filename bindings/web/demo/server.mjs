@@ -49,6 +49,110 @@ const MIME = {
   ".css": "text/css; charset=utf-8",
 };
 const COMPRESSIBLE_EXTS = new Set([".wasm", ".js", ".mjs", ".html", ".css", ".json"]);
+const DEMO_PUBLIC_FILES = new Set(["index.html", "app.js"]);
+const ALLOWED_UPGRADE_HEADERS = new Set([
+  "host",
+  "upgrade",
+  "connection",
+  "sec-websocket-key",
+  "sec-websocket-version",
+  "sec-websocket-protocol",
+  "sec-websocket-extensions",
+]);
+const SINGLETON_UPGRADE_HEADERS = new Set([
+  "host",
+  "upgrade",
+  "connection",
+  "sec-websocket-key",
+  "sec-websocket-version",
+]);
+const UPGRADE_CONNECT_TIMEOUT_MS = 5000;
+const DEMO_CSP = [
+  "default-src 'none'",
+  "script-src 'self' 'wasm-unsafe-eval'",
+  "worker-src 'self'",
+  "style-src 'unsafe-inline'",
+  "connect-src 'self' wss: https: ws://127.0.0.1:* ws://localhost:* http://127.0.0.1:* http://localhost:*",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+function applySecurityHeaders(res) {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Content-Security-Policy", DEMO_CSP);
+}
+
+function rejectUpgrade(socket, statusLine = "400 Bad Request") {
+  try {
+    socket.end(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`);
+  } catch {
+    socket.destroy();
+  }
+}
+
+function validateUpgradeRequest(req, head) {
+  if (head && head.length > 0) {
+    return null;
+  }
+  const seen = new Map();
+  const forwardedLines = [];
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    const rawName = req.rawHeaders[i];
+    const rawValue = req.rawHeaders[i + 1];
+    if (/[\r\n\0]/.test(rawName) || /[\r\n\0]/.test(rawValue)) {
+      return null;
+    }
+    const lower = rawName.toLowerCase();
+    if (lower === "content-length" || lower === "transfer-encoding") {
+      return null;
+    }
+    if (SINGLETON_UPGRADE_HEADERS.has(lower) && seen.has(lower)) {
+      return null;
+    }
+    if (!seen.has(lower)) {
+      seen.set(lower, rawValue);
+    }
+    if (ALLOWED_UPGRADE_HEADERS.has(lower)) {
+      forwardedLines.push(`${rawName}: ${rawValue}`);
+    }
+  }
+
+  const hostHdr = seen.get("host");
+  const upgradeHdr = seen.get("upgrade");
+  const connectionHdr = seen.get("connection");
+  const wsKeyHdr = seen.get("sec-websocket-key");
+  const wsVersionHdr = seen.get("sec-websocket-version");
+
+  if (!hostHdr || !hostHdr.trim()) {
+    return null;
+  }
+  if (!upgradeHdr || upgradeHdr.trim().toLowerCase() !== "websocket") {
+    return null;
+  }
+  if (
+    !connectionHdr ||
+    !connectionHdr
+      .split(",")
+      .some((tok) => tok.trim().toLowerCase() === "upgrade")
+  ) {
+    return null;
+  }
+  if (!wsVersionHdr || wsVersionHdr.trim() !== "13") {
+    return null;
+  }
+  if (!wsKeyHdr || !/^[A-Za-z0-9+/]{22}==$/.test(wsKeyHdr.trim())) {
+    return null;
+  }
+  if (Buffer.from(wsKeyHdr.trim(), "base64").length !== 16) {
+    return null;
+  }
+  return forwardedLines;
+}
 
 function resolveSafe(baseDir, relPath) {
   const clean = path.normalize(relPath).replace(/^(\.\.(\/|\\|$))+/, "");
@@ -62,6 +166,12 @@ function resolveSafe(baseDir, relPath) {
 const cfg = parseArgs(process.argv.slice(2));
 
 const server = http.createServer((req, res) => {
+  applySecurityHeaders(res);
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.writeHead(405, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("method not allowed");
+    return;
+  }
   let url;
   try {
     url = new URL(req.url || "/", "http://127.0.0.1");
@@ -71,8 +181,6 @@ const server = http.createServer((req, res) => {
     return;
   }
   const pathname = url.pathname;
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("X-Content-Type-Options", "nosniff");
 
   if (pathname === "/demo-config.json") {
     if (cfg.demoConfigFile && fs.existsSync(cfg.demoConfigFile)) {
@@ -89,7 +197,10 @@ const server = http.createServer((req, res) => {
   if (pathname === "/" || pathname === "/index.html") {
     filePath = path.join(WEB_ROOT, "demo", "index.html");
   } else if (pathname.startsWith("/demo/")) {
-    filePath = resolveSafe(path.join(WEB_ROOT, "demo"), pathname.slice("/demo/".length));
+    const rel = pathname.slice("/demo/".length);
+    if (DEMO_PUBLIC_FILES.has(rel)) {
+      filePath = path.join(WEB_ROOT, "demo", rel);
+    }
   } else if (pathname.startsWith("/src/")) {
     filePath = resolveSafe(path.join(WEB_ROOT, "src"), pathname.slice("/src/".length));
   } else if (pathname.startsWith("/pkg/")) {
@@ -138,37 +249,56 @@ server.on("upgrade", (req, socket, head) => {
   try {
     url = new URL(req.url || "/", "http://127.0.0.1");
   } catch {
-    socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    rejectUpgrade(socket, "400 Bad Request");
     return;
   }
   if (req.method !== "GET" || url.pathname !== "/v1/relay" || !cfg.relayHost || !cfg.relayPort) {
-    socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    rejectUpgrade(socket, "404 Not Found");
     return;
   }
+  if (url.search !== "") {
+    rejectUpgrade(socket, "400 Bad Request");
+    return;
+  }
+  const headerLines = validateUpgradeRequest(req, head);
+  if (!headerLines) {
+    rejectUpgrade(socket, "400 Bad Request");
+    return;
+  }
+
   const upstream = net.connect(cfg.relayPort, cfg.relayHost);
+  let connected = false;
+  const connectTimer = setTimeout(() => {
+    if (!connected) {
+      rejectUpgrade(socket, "504 Gateway Timeout");
+      upstream.destroy();
+    }
+  }, UPGRADE_CONNECT_TIMEOUT_MS);
+
   upstream.on("error", () => {
+    clearTimeout(connectTimer);
+    if (!connected) {
+      rejectUpgrade(socket, "502 Bad Gateway");
+    }
     socket.destroy();
   });
   socket.on("error", () => {
+    clearTimeout(connectTimer);
     upstream.destroy();
   });
   upstream.on("close", () => {
+    clearTimeout(connectTimer);
     socket.destroy();
   });
   socket.on("close", () => {
+    clearTimeout(connectTimer);
     upstream.destroy();
   });
   upstream.on("connect", () => {
-    const headerLines = [];
-    for (let i = 0; i < req.rawHeaders.length; i += 2) {
-      headerLines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
-    }
-    const targetPath = `${url.pathname}${url.search}`;
-    const reqHead = `${req.method} ${targetPath} HTTP/${req.httpVersion}\r\n${headerLines.join("\r\n")}\r\n\r\n`;
+    connected = true;
+    clearTimeout(connectTimer);
+    const reqHead = `GET /v1/relay HTTP/1.1\r\n${headerLines.join("\r\n")}\r\n\r\n`;
     upstream.write(reqHead);
-    if (head && head.length > 0) {
-      upstream.write(head);
-    }
     socket.pipe(upstream);
     upstream.pipe(socket);
   });

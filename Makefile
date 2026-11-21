@@ -96,9 +96,10 @@ bindings/wasm-p2p: ## Build opt-in p2p-iroh browser WASM module into bindings/we
 	cargo build --release --target wasm32-unknown-unknown -p tendril-wasm --features p2p-iroh
 	wasm-bindgen --target web --out-dir bindings/web/pkg-p2p target/wasm32-unknown-unknown/release/tendril_wasm.wasm
 
-bindings/web: bindings/wasm bindings/wasm-p2p ## Run headless Chrome Web SDK conformance and live relay E2E tests
+bindings/web: bindings/wasm bindings/wasm-p2p ## Run Web SDK security tests, conformance, and live relay E2E tests
 	cargo build -p tendril-relay --bin tendril-relay
 	cargo build -p tendril-cli --bin tendril-conformance-peer
+	node --test bindings/web/test/security.test.mjs
 	node bindings/web/test/browser_e2e.mjs
 
 bindings/jni: ## Build tendril_jni shared library and run host JVM conformance tests

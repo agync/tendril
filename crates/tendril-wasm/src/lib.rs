@@ -284,6 +284,12 @@ impl WasmRoster {
     }
 
     #[wasm_bindgen]
+    pub fn replace_from_json(&mut self, json: &str) -> Result<(), JsValue> {
+        self.inner = serde_json::from_str(json).map_err(to_js_err)?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
     pub fn insert_pinned_host(
         &mut self,
         host_id: &str,
