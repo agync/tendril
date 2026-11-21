@@ -57,6 +57,9 @@ build/
 DerivedData/
 *.xcframework/
 bindings/kotlin/build-jni/
+bindings/kotlin/local.properties
+bindings/kotlin/.cxx/
+bindings/kotlin/.kotlin/
 
 # Rendered docs
 /_site/
