@@ -1581,3 +1581,98 @@ fn cli_v1_pairing_rejects_v2_floored_host_with_zero_wire_bytes_sent() {
         wire_bytes.len()
     );
 }
+
+#[test]
+fn cli_accepts_leading_hyphen_b64url_args() {
+    use tendril_core::crypto::b64url_encode;
+
+    let cli_dir = TempDir::new().unwrap();
+    assert!(run_tendril(cli_dir.path(), &["init"]).status.success());
+
+    // 0xf9, 0xc0 encodes to "-c..." in unpadded base64url.
+    let leading_hyphen_nonce =
+        b64url_encode(&[0xf9, 0xc0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    assert!(
+        leading_hyphen_nonce.starts_with("-c"),
+        "expected -c prefix, got {leading_hyphen_nonce}"
+    );
+
+    let revoke_out = run_tendril(cli_dir.path(), &["revoke-token", &leading_hyphen_nonce]);
+    assert!(
+        revoke_out.status.success(),
+        "revoke-token should accept leading-hyphen b64url nonce, stderr: {}",
+        String::from_utf8_lossy(&revoke_out.stderr)
+    );
+
+    let anchor_out = run_tendril(
+        cli_dir.path(),
+        &[
+            "anchor",
+            "add",
+            "hyphen-anchor",
+            "--signing-pub",
+            &leading_hyphen_nonce,
+        ],
+    );
+    let anchor_stderr = String::from_utf8_lossy(&anchor_out.stderr);
+    assert!(
+        !anchor_out.status.success() && !anchor_stderr.contains("unexpected argument"),
+        "anchor add must parse leading-hyphen --signing-pub instead of failing in clap: {anchor_stderr}"
+    );
+
+    let enroll_out = run_tendril(
+        cli_dir.path(),
+        &[
+            "enroll",
+            "--endpoint",
+            "127.0.0.1:1",
+            "--host-id",
+            "host-1",
+            "--host-static-pub",
+            &leading_hyphen_nonce,
+            "--host-signing-pub",
+            &leading_hyphen_nonce,
+        ],
+    );
+    let enroll_stderr = String::from_utf8_lossy(&enroll_out.stderr);
+    assert!(
+        !enroll_out.status.success() && !enroll_stderr.contains("unexpected argument"),
+        "enroll must parse leading-hyphen host keys instead of failing in clap: {enroll_stderr}"
+    );
+
+    let dial_out = run_tendril(
+        cli_dir.path(),
+        &[
+            "dial",
+            "--target",
+            "host-1",
+            "--endpoint",
+            "127.0.0.1:1",
+            "--grant",
+            &leading_hyphen_nonce,
+            "--message",
+            "-c-message",
+        ],
+    );
+    let dial_stderr = String::from_utf8_lossy(&dial_out.stderr);
+    assert!(
+        !dial_out.status.success() && !dial_stderr.contains("unexpected argument"),
+        "dial must parse leading-hyphen --grant and --message instead of failing in clap: {dial_stderr}"
+    );
+
+    let pair_out = run_tendril(
+        cli_dir.path(),
+        &[
+            "pair",
+            "--endpoint",
+            "127.0.0.1:1",
+            "--code",
+            "-c-pair-code",
+        ],
+    );
+    let pair_stderr = String::from_utf8_lossy(&pair_out.stderr);
+    assert!(
+        !pair_out.status.success() && !pair_stderr.contains("unexpected argument"),
+        "pair must parse leading-hyphen --code instead of failing in clap: {pair_stderr}"
+    );
+}

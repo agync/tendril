@@ -53,7 +53,7 @@ enum AnchorCommand {
     /// Register an active external hybrid signing trust anchor for M2M enrollment.
     Add {
         anchor_id: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         signing_pub: String,
     },
     /// Revoke an external trust anchor (and sibling anchors sharing its signing key).
@@ -108,7 +108,7 @@ enum Command {
     Pair {
         #[arg(long, required_unless_present = "pairing_uri")]
         endpoint: Option<String>,
-        #[arg(long, conflicts_with_all = ["code_stdin", "code_file"])]
+        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["code_stdin", "code_file"])]
         code: Option<String>,
         #[arg(long, conflicts_with_all = ["code", "code_file"])]
         code_stdin: bool,
@@ -151,9 +151,9 @@ enum Command {
         endpoint: String,
         #[arg(long)]
         host_id: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         host_static_pub: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         host_signing_pub: String,
         #[arg(long, default_value_t = 0)]
         host_rotation_seq: u64,
@@ -204,15 +204,18 @@ enum Command {
         p2p_relay: Option<String>,
         #[arg(long)]
         no_pkarr: bool,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         grant: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         message: Option<String>,
     },
     /// Revoke an existing peer (`pair.revoke`), failing closed on all future sessions.
     Revoke { peer_id: String },
     /// Revoke an unused grant or enrollment token nonce on the signed local CRL.
-    RevokeToken { nonce: String },
+    RevokeToken {
+        #[arg(allow_hyphen_values = true)]
+        nonce: String,
+    },
     /// Rotate local static and signing identity keys and re-sign any persisted self-CRL.
     Rotate,
 }
