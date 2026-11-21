@@ -16,7 +16,7 @@ use crate::identity::{EndpointIdentity, RotationRecord};
 use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::roster::{PeerState, Roster};
 use crate::wire::{
-    HostHello, InnerFrameType, Intent, Preamble, ResumableFrameReader, SessionHello,
+    HostHello, InnerFrameType, Intent, Preamble, ResumableFrameReader, SessionHello, WIRE_VERSION,
     decode_inner_frame, encode_frame, encode_inner_frame,
 };
 
@@ -268,6 +268,10 @@ impl SessionMachine {
         if matches!(self.phase, SessionPhase::AwaitPreamble(_)) {
             match self.reader.take_preamble() {
                 Ok(Some(preamble)) => {
+                    if preamble.version != WIRE_VERSION {
+                        self.phase = SessionPhase::Closed;
+                        return Err(CoreError::UnsupportedVersion(preamble.version));
+                    }
                     if preamble.intent != Intent::Session {
                         self.phase = SessionPhase::Closed;
                         return Err(CoreError::ProtocolViolation(
@@ -581,15 +585,23 @@ impl SessionMachine {
                 }
 
                 let (pinned_static, pinned_signing) = match roster.get(target_id) {
-                    Some(entry) => match entry.state {
-                        PeerState::Pending => {
-                            return Err(CoreError::PeerPending(target_id.to_string()));
+                    Some(entry) => {
+                        if entry.min_wire_version > WIRE_VERSION {
+                            return Err(CoreError::VersionDowngrade {
+                                peer_min: entry.min_wire_version,
+                                negotiated: WIRE_VERSION,
+                            });
                         }
-                        PeerState::Revoked => {
-                            return Err(CoreError::PeerRevoked(target_id.to_string()));
+                        match entry.state {
+                            PeerState::Pending => {
+                                return Err(CoreError::PeerPending(target_id.to_string()));
+                            }
+                            PeerState::Revoked => {
+                                return Err(CoreError::PeerRevoked(target_id.to_string()));
+                            }
+                            PeerState::Active => entry.require_complete_pin()?,
                         }
-                        PeerState::Active => entry.require_complete_pin()?,
-                    },
+                    }
                     None => return Err(CoreError::HostKeyUnverified),
                 };
 
@@ -684,10 +696,14 @@ impl SessionMachine {
                     ));
                 }
 
-                let canonical_peer_id = roster
-                    .lookup_active_by_static(&peer_static)?
-                    .device_id
-                    .clone();
+                let peer_entry = roster.lookup_active_by_static(&peer_static)?;
+                if peer_entry.min_wire_version > WIRE_VERSION {
+                    return Err(CoreError::VersionDowngrade {
+                        peer_min: peer_entry.min_wire_version,
+                        negotiated: WIRE_VERSION,
+                    });
+                }
+                let canonical_peer_id = peer_entry.device_id.clone();
                 let crl = roster.crl(&self.local_host_id);
                 if let Some(list) = crl
                     && list.revoked_devices.iter().any(|d| d == &canonical_peer_id)
@@ -790,6 +806,9 @@ impl SessionMachine {
                         })?;
                         self.phase = SessionPhase::Closed;
                         actions.push(SessionAction::CloseTransport { code, reason });
+                    }
+                    InnerFrameType::Padding | InnerFrameType::Padded => {
+                        return Err(CoreError::UnknownInnerFrameType(kind as u8));
                     }
                 }
                 Ok(())

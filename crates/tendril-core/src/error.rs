@@ -20,6 +20,17 @@ pub enum CoreError {
     #[error("non-zero reserved preamble byte: 0x{0:02x}")]
     NonZeroReserved(u8),
 
+    #[error("invalid preamble flags 0x{flags:02x} for intent 0x{intent:02x}")]
+    InvalidPreambleFlags { intent: u8, flags: u8 },
+
+    #[error(
+        "wire version downgrade rejected: peer requires >= v{peer_min}, negotiated v{negotiated}"
+    )]
+    VersionDowngrade { peer_min: u8, negotiated: u8 },
+
+    #[error("PAKE pairing authentication failed")]
+    PairingAuthFailed,
+
     #[error("frame length {len} exceeds maximum {max}")]
     FrameTooLarge { len: usize, max: usize },
 
@@ -176,6 +187,8 @@ impl CoreError {
             | Self::UnsupportedVersion(_)
             | Self::UnknownIntent(_)
             | Self::NonZeroReserved(_)
+            | Self::InvalidPreambleFlags { .. }
+            | Self::VersionDowngrade { .. }
             | Self::InvalidPreambleLength { .. }
             | Self::FrameTooLarge { .. }
             | Self::TruncatedFrame { .. }

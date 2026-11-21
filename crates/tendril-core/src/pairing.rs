@@ -1,6 +1,6 @@
 //! Pairing code management, URI codec, and Sans-I/O pairing state machines.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
@@ -23,7 +23,8 @@ use crate::identity::{
 use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::roster::{AnchorState, Roster};
 use crate::wire::{
-    HostHello, Intent, PairClaim, PairResponse, Preamble, ResumableFrameReader, encode_frame,
+    HostHello, Intent, PairClaim, PairResponse, Preamble, ResumableFrameReader, WIRE_VERSION,
+    encode_frame,
 };
 
 /// Default lifetime of a newly issued pairing code (`15` minutes).
@@ -130,11 +131,16 @@ impl fmt::Debug for IssuedCode {
     }
 }
 
+/// Maximum bounded replay cache entries for v2 PAKE `msg1` `(salt, init_mac)` pairs.
+pub const MAX_PAKE_MSG1_REPLAY_ENTRIES: usize = 1024;
+
 /// Tracks issued pairing codes, TTL expiration, single-use burn, and constant-time retry budgets.
 #[derive(Debug, Default)]
 pub struct PairingManager {
     config: PairingConfig,
     codes: Vec<IssuedCode>,
+    seen_pake_msg1: BTreeSet<([u8; 16], [u8; 32])>,
+    seen_pake_msg1_order: VecDeque<(u64, [u8; 16], [u8; 32])>,
 }
 
 impl PairingManager {
@@ -144,6 +150,8 @@ impl PairingManager {
         Self {
             config,
             codes: Vec::new(),
+            seen_pake_msg1: BTreeSet::new(),
+            seen_pake_msg1_order: VecDeque::new(),
         }
     }
 
@@ -308,6 +316,94 @@ impl PairingManager {
         }
 
         Err(CoreError::PairingCodeInvalid)
+    }
+
+    pub(crate) fn live_codes(
+        &mut self,
+        now_unix: u64,
+    ) -> Vec<(Zeroizing<String>, PairingCodeKind)> {
+        for c in &mut self.codes {
+            if !c.burned && now_unix >= c.expires_at {
+                c.expired = true;
+            }
+        }
+        self.codes
+            .iter()
+            .filter(|c| !c.burned && !c.expired)
+            .map(|c| (c.code.clone(), c.kind))
+            .collect()
+    }
+
+    fn prune_expired_pake_msg1(&mut self, now_unix: u64) {
+        while let Some(&(expires_at, salt, init_mac)) = self.seen_pake_msg1_order.front() {
+            if expires_at <= now_unix {
+                self.seen_pake_msg1_order.pop_front();
+                self.seen_pake_msg1.remove(&(salt, init_mac));
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn can_accept_pake_msg1(
+        &mut self,
+        salt: &[u8; 16],
+        init_mac: &[u8; 32],
+        now_unix: u64,
+    ) -> bool {
+        self.prune_expired_pake_msg1(now_unix);
+        !self.seen_pake_msg1.contains(&(*salt, *init_mac))
+            && self.seen_pake_msg1.len() < MAX_PAKE_MSG1_REPLAY_ENTRIES
+    }
+
+    pub(crate) fn record_pake_msg1(
+        &mut self,
+        salt: [u8; 16],
+        init_mac: [u8; 32],
+        now_unix: u64,
+    ) -> bool {
+        self.prune_expired_pake_msg1(now_unix);
+        if self.seen_pake_msg1.contains(&(salt, init_mac))
+            || self.seen_pake_msg1.len() >= MAX_PAKE_MSG1_REPLAY_ENTRIES
+        {
+            return false;
+        }
+        let expires_at = now_unix.saturating_add(self.config.ttl_secs.max(1));
+        self.seen_pake_msg1.insert((salt, init_mac));
+        self.seen_pake_msg1_order
+            .push_back((expires_at, salt, init_mac));
+        true
+    }
+
+    pub(crate) fn burn_pake_code(
+        &mut self,
+        code: &str,
+        path: PairingPathKind,
+        now_unix: u64,
+    ) -> Result<(), CoreError> {
+        for c in &mut self.codes {
+            if !c.burned && now_unix >= c.expires_at {
+                c.expired = true;
+            }
+        }
+        let Some(entry) = self
+            .codes
+            .iter_mut()
+            .rev()
+            .find(|c| !c.burned && !c.expired && c.code.as_str() == code)
+        else {
+            return Err(CoreError::PairingCodeInvalid);
+        };
+        entry.burned = true;
+        if entry.kind == PairingCodeKind::Lan2Group
+            && path == PairingPathKind::Remote
+            && !self.config.allow_lan_code_over_remote
+        {
+            return Err(CoreError::PairingPathDisallowed(
+                "2-group code disallowed on remote path",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1248,6 +1344,34 @@ impl PairingInitiator {
         })
     }
 
+    /// Creates a v1 human pairing initiator enforcing `min_wire_version` anti-downgrade.
+    ///
+    /// Fails closed with [`CoreError::VersionDowngrade`] if `min_wire_version >= 2`.
+    pub fn new_with_min_wire_version(
+        identity: &EndpointIdentity,
+        device_name: impl Into<String>,
+        device_kind: impl Into<String>,
+        code: impl Into<String>,
+        pinned_host: Option<PinnedHost>,
+        min_wire_version: u8,
+        fixed_ephemeral: Option<[u8; 32]>,
+    ) -> Result<Self, CoreError> {
+        if min_wire_version > WIRE_VERSION {
+            return Err(CoreError::VersionDowngrade {
+                peer_min: min_wire_version,
+                negotiated: WIRE_VERSION,
+            });
+        }
+        Self::new(
+            identity,
+            device_name,
+            device_kind,
+            code,
+            pinned_host,
+            fixed_ephemeral,
+        )
+    }
+
     /// Creates an autonomous M2M enrollment initiator requiring an out-of-band pinned host key.
     pub fn new_m2m(
         identity: &EndpointIdentity,
@@ -1292,6 +1416,45 @@ impl PairingInitiator {
             local_static_pub: *identity.static_key().public_bytes(),
             pinned_host: Some(pinned_host),
         })
+    }
+
+    /// Creates a v1 M2M pairing initiator enforcing `min_wire_version` anti-downgrade.
+    ///
+    /// Fails closed with [`CoreError::VersionDowngrade`] if `min_wire_version >= 2`.
+    pub fn new_m2m_with_min_wire_version(
+        identity: &EndpointIdentity,
+        device_name: impl Into<String>,
+        device_kind: impl Into<String>,
+        enrollment_token: Grant,
+        pinned_host: PinnedHost,
+        min_wire_version: u8,
+        fixed_ephemeral: Option<[u8; 32]>,
+    ) -> Result<Self, CoreError> {
+        if min_wire_version > WIRE_VERSION {
+            return Err(CoreError::VersionDowngrade {
+                peer_min: min_wire_version,
+                negotiated: WIRE_VERSION,
+            });
+        }
+        Self::new_m2m(
+            identity,
+            device_name,
+            device_kind,
+            enrollment_token,
+            pinned_host,
+            fixed_ephemeral,
+        )
+    }
+
+    /// Enforces a persisted `min_wire_version` floor before emitting `PairClaim`.
+    pub fn with_min_wire_version(self, min_wire_version: u8) -> Result<Self, CoreError> {
+        if min_wire_version > WIRE_VERSION {
+            return Err(CoreError::VersionDowngrade {
+                peer_min: min_wire_version,
+                negotiated: WIRE_VERSION,
+            });
+        }
+        Ok(self)
     }
 
     /// Emits the 6-byte `Intent::Pair` preamble concatenated with Noise `msg1`.
@@ -1669,6 +1832,10 @@ impl PairingResponder {
         if matches!(self.phase, ResponderPhase::AwaitPreamble(_)) {
             match self.reader.take_preamble() {
                 Ok(Some(preamble)) => {
+                    if preamble.version != WIRE_VERSION {
+                        self.phase = ResponderPhase::Closed;
+                        return Err(CoreError::UnsupportedVersion(preamble.version));
+                    }
                     if preamble.intent != Intent::Pair {
                         self.phase = ResponderPhase::Closed;
                         return Err(CoreError::ProtocolViolation(
@@ -1749,6 +1916,19 @@ impl PairingResponder {
                     return Err(CoreError::ProtocolViolation(
                         "invalid or low-order initiator static key",
                     ));
+                }
+                if let Some(peer_min) = roster
+                    .entries()
+                    .filter(|(_, e)| {
+                        e.static_pub == peer_static && e.min_wire_version > WIRE_VERSION
+                    })
+                    .map(|(_, e)| e.min_wire_version)
+                    .max()
+                {
+                    return Err(CoreError::VersionDowngrade {
+                        peer_min,
+                        negotiated: WIRE_VERSION,
+                    });
                 }
 
                 let mut transport = hs.into_transport_mode()?;

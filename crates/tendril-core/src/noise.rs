@@ -22,7 +22,7 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::crypto::{random_bytes, x25519_public_from_scalar};
+use crate::crypto::{hkdf_sha256_32, random_bytes, x25519_public_from_scalar};
 use crate::error::CoreError;
 use crate::wire::{AEAD_TAG_LEN, MAX_FRAME_LEN, NOISE_PATTERN};
 
@@ -378,6 +378,7 @@ impl NoiseHfsHandshakeBuilder {
             remote_static: None,
             local_kem_dk: None,
             remote_kem_ek: None,
+            remote_kem_ek_hash: None,
             fixed_seeds: self.fixed_seeds,
         })
     }
@@ -395,6 +396,7 @@ pub struct NoiseHfsHandshake {
     remote_static: Option<[u8; 32]>,
     local_kem_dk: Option<Box<ml_kem_768::DecapsKey>>,
     remote_kem_ek: Option<Box<ml_kem_768::EncapsKey>>,
+    remote_kem_ek_hash: Option<[u8; 32]>,
     fixed_seeds: Option<NoiseHfsSeeds>,
 }
 
@@ -411,6 +413,12 @@ impl NoiseHfsHandshake {
         self.remote_static.as_ref()
     }
 
+    /// Returns `(remote_ephemeral_pub, SHA-256(remote_mlkem_ek))` once `msg1` has been read.
+    #[must_use]
+    pub fn remote_ephemeral_and_kem_hash(&self) -> Option<([u8; 32], [u8; 32])> {
+        Some((self.remote_ephemeral?, self.remote_kem_ek_hash?))
+    }
+
     /// Returns `true` when all 3 handshake messages have completed.
     #[must_use]
     pub fn is_handshake_finished(&self) -> bool {
@@ -423,16 +431,157 @@ impl NoiseHfsHandshake {
         self.remote_ephemeral = None;
         self.local_kem_dk = None;
         self.remote_kem_ek = None;
+        self.remote_kem_ek_hash = None;
+    }
+
+    /// Generates `msg1` (`-> e, e1`), calling `build_payload(&e_pub, &ek_bytes)` to construct the payload.
+    pub fn write_msg1_with_payload<F>(&mut self, build_payload: F) -> Result<Vec<u8>, CoreError>
+    where
+        F: FnOnce(&[u8; 32], &[u8]) -> Result<Vec<u8>, CoreError>,
+    {
+        let step = std::mem::replace(&mut self.step, HandshakeStep::Failed);
+        if step != HandshakeStep::InitiatorWriteMsg1 {
+            self.fail_and_wipe_secrets();
+            return Err(CoreError::Noise(
+                "write_msg1_with_payload called out of handshake turn".into(),
+            ));
+        }
+        let res = self.write_msg1_step(build_payload);
+        if res.is_err() {
+            self.fail_and_wipe_secrets();
+        }
+        res
+    }
+
+    /// Generates `msg2` (`<- e, ee, ekem1, s, es`), calling `build_payload(&h_pre)` right before encrypting payload.
+    pub fn write_msg2_with_hash<F>(&mut self, build_payload: F) -> Result<Vec<u8>, CoreError>
+    where
+        F: FnOnce(&[u8; 32]) -> Result<Vec<u8>, CoreError>,
+    {
+        let step = std::mem::replace(&mut self.step, HandshakeStep::Failed);
+        if step != HandshakeStep::ResponderWriteMsg2 {
+            self.fail_and_wipe_secrets();
+            return Err(CoreError::Noise(
+                "write_msg2_with_hash called out of handshake turn".into(),
+            ));
+        }
+        let res = self.write_msg2_step(build_payload);
+        if res.is_err() {
+            self.fail_and_wipe_secrets();
+        }
+        res
     }
 
     /// Generates the next handshake message into a freshly sized `Vec<u8>`.
     pub fn write_message_vec(&mut self, payload: &[u8]) -> Result<Vec<u8>, CoreError> {
         let step = std::mem::replace(&mut self.step, HandshakeStep::Failed);
-        let res = self.write_message_step(step, payload);
+        let res = match step {
+            HandshakeStep::InitiatorWriteMsg1 => self.write_msg1_step(|_, _| Ok(payload.to_vec())),
+            HandshakeStep::ResponderWriteMsg2 => self.write_msg2_step(|_| Ok(payload.to_vec())),
+            _ => self.write_message_step(step, payload),
+        };
         if res.is_err() {
             self.fail_and_wipe_secrets();
         }
         res
+    }
+
+    fn write_msg1_step<F>(&mut self, build_payload: F) -> Result<Vec<u8>, CoreError>
+    where
+        F: FnOnce(&[u8; 32], &[u8]) -> Result<Vec<u8>, CoreError>,
+    {
+        let mut out = Vec::new();
+        let e_priv = match self.fixed_seeds {
+            Some(ref seeds) => Zeroizing::new(seeds.x25519),
+            None => Zeroizing::new(random_bytes::<32>()?),
+        };
+        let e_pub = x25519_public_from_scalar(&e_priv);
+        out.extend_from_slice(&e_pub);
+        self.sym.mix_hash(&e_pub);
+        self.local_ephemeral_priv = Some(e_priv);
+
+        let d = match self.fixed_seeds {
+            Some(ref seeds) => Zeroizing::new(seeds.mlkem_d),
+            None => Zeroizing::new(random_bytes::<32>()?),
+        };
+        let z = match self.fixed_seeds {
+            Some(ref seeds) => Zeroizing::new(seeds.mlkem_z),
+            None => Zeroizing::new(random_bytes::<32>()?),
+        };
+        let (ek, dk) = ml_kem_768::KG::keygen_from_seed(*d, *z);
+        let ek_bytes = ek.into_bytes();
+        out.extend_from_slice(&ek_bytes);
+        self.sym.mix_hash(&ek_bytes);
+        self.local_kem_dk = Some(Box::new(dk));
+
+        let payload = Zeroizing::new(build_payload(&e_pub, &ek_bytes)?);
+        let enc_payload = self.sym.encrypt_and_hash(&payload)?;
+        out.extend_from_slice(&enc_payload);
+        if out.len() > MAX_FRAME_LEN {
+            return Err(CoreError::FrameTooLarge {
+                len: out.len(),
+                max: MAX_FRAME_LEN,
+            });
+        }
+        self.step = HandshakeStep::InitiatorReadMsg2;
+        Ok(out)
+    }
+
+    fn write_msg2_step<F>(&mut self, build_payload: F) -> Result<Vec<u8>, CoreError>
+    where
+        F: FnOnce(&[u8; 32]) -> Result<Vec<u8>, CoreError>,
+    {
+        let mut out = Vec::new();
+        let re = self
+            .remote_ephemeral
+            .ok_or_else(|| CoreError::Noise("missing remote ephemeral key".into()))?;
+        let ek = self
+            .remote_kem_ek
+            .take()
+            .ok_or_else(|| CoreError::Noise("missing remote encapsulation key".into()))?;
+
+        let e_priv = match self.fixed_seeds {
+            Some(ref seeds) => Zeroizing::new(seeds.x25519),
+            None => Zeroizing::new(random_bytes::<32>()?),
+        };
+        let e_pub = x25519_public_from_scalar(&e_priv);
+        out.extend_from_slice(&e_pub);
+        self.sym.mix_hash(&e_pub);
+
+        let dh_ee = x25519_dh(&e_priv, &re)?;
+        self.sym.mix_key(&*dh_ee)?;
+
+        let m = match self.fixed_seeds {
+            Some(ref seeds) => Zeroizing::new(seeds.mlkem_m),
+            None => Zeroizing::new(random_bytes::<32>()?),
+        };
+        let (ss, ct) = ek.encaps_from_seed(&m);
+        let ct_bytes = ct.into_bytes();
+        let ct_enc = self.sym.encrypt_and_hash(&ct_bytes)?;
+        out.extend_from_slice(&ct_enc);
+        let ss_bytes = Zeroizing::new(ss.into_bytes());
+        self.sym.mix_key(&*ss_bytes)?;
+
+        let s_enc = self.sym.encrypt_and_hash(&self.local_static_pub)?;
+        out.extend_from_slice(&s_enc);
+
+        let dh_es = x25519_dh(&self.local_static_priv, &re)?;
+        self.sym.mix_key(&*dh_es)?;
+
+        let h_pre = self.sym.h;
+        let payload = Zeroizing::new(build_payload(&h_pre)?);
+        let payload_enc = self.sym.encrypt_and_hash(&payload)?;
+        out.extend_from_slice(&payload_enc);
+
+        if out.len() > MAX_FRAME_LEN {
+            return Err(CoreError::FrameTooLarge {
+                len: out.len(),
+                max: MAX_FRAME_LEN,
+            });
+        }
+        self.local_ephemeral_priv = Some(e_priv);
+        self.step = HandshakeStep::ResponderReadMsg3;
+        Ok(out)
     }
 
     fn write_message_step(
@@ -442,79 +591,6 @@ impl NoiseHfsHandshake {
     ) -> Result<Vec<u8>, CoreError> {
         let mut out = Vec::new();
         let next_step = match step {
-            HandshakeStep::InitiatorWriteMsg1 => {
-                // `-> e, e1`
-                let e_priv = match self.fixed_seeds {
-                    Some(ref seeds) => Zeroizing::new(seeds.x25519),
-                    None => Zeroizing::new(random_bytes::<32>()?),
-                };
-                let e_pub = x25519_public_from_scalar(&e_priv);
-                out.extend_from_slice(&e_pub);
-                self.sym.mix_hash(&e_pub);
-                self.local_ephemeral_priv = Some(e_priv);
-
-                let d = match self.fixed_seeds {
-                    Some(ref seeds) => Zeroizing::new(seeds.mlkem_d),
-                    None => Zeroizing::new(random_bytes::<32>()?),
-                };
-                let z = match self.fixed_seeds {
-                    Some(ref seeds) => Zeroizing::new(seeds.mlkem_z),
-                    None => Zeroizing::new(random_bytes::<32>()?),
-                };
-                let (ek, dk) = ml_kem_768::KG::keygen_from_seed(*d, *z);
-                let ek_bytes = ek.into_bytes();
-                out.extend_from_slice(&ek_bytes);
-                self.sym.mix_hash(&ek_bytes);
-                self.local_kem_dk = Some(Box::new(dk));
-
-                let enc_payload = self.sym.encrypt_and_hash(payload)?;
-                out.extend_from_slice(&enc_payload);
-                HandshakeStep::InitiatorReadMsg2
-            }
-            HandshakeStep::ResponderWriteMsg2 => {
-                // `<- e, ee, ekem1, s, es`
-                let re = self
-                    .remote_ephemeral
-                    .ok_or_else(|| CoreError::Noise("missing remote ephemeral key".into()))?;
-                let ek = self
-                    .remote_kem_ek
-                    .take()
-                    .ok_or_else(|| CoreError::Noise("missing remote encapsulation key".into()))?;
-
-                let e_priv = match self.fixed_seeds {
-                    Some(ref seeds) => Zeroizing::new(seeds.x25519),
-                    None => Zeroizing::new(random_bytes::<32>()?),
-                };
-                let e_pub = x25519_public_from_scalar(&e_priv);
-                out.extend_from_slice(&e_pub);
-                self.sym.mix_hash(&e_pub);
-
-                let dh_ee = x25519_dh(&e_priv, &re)?;
-                self.sym.mix_key(&*dh_ee)?;
-
-                let m = match self.fixed_seeds {
-                    Some(ref seeds) => Zeroizing::new(seeds.mlkem_m),
-                    None => Zeroizing::new(random_bytes::<32>()?),
-                };
-                let (ss, ct) = ek.encaps_from_seed(&m);
-                let ct_bytes = ct.into_bytes();
-                let ct_enc = self.sym.encrypt_and_hash(&ct_bytes)?;
-                out.extend_from_slice(&ct_enc);
-                let ss_bytes = Zeroizing::new(ss.into_bytes());
-                self.sym.mix_key(&*ss_bytes)?;
-
-                let s_enc = self.sym.encrypt_and_hash(&self.local_static_pub)?;
-                out.extend_from_slice(&s_enc);
-
-                let dh_es = x25519_dh(&self.local_static_priv, &re)?;
-                self.sym.mix_key(&*dh_es)?;
-
-                let payload_enc = self.sym.encrypt_and_hash(payload)?;
-                out.extend_from_slice(&payload_enc);
-
-                self.local_ephemeral_priv = Some(e_priv);
-                HandshakeStep::ResponderReadMsg3
-            }
             HandshakeStep::InitiatorWriteMsg3 => {
                 // `-> s, se`
                 let re = self
@@ -577,6 +653,32 @@ impl NoiseHfsHandshake {
         Ok(msg.len())
     }
 
+    /// Consumes `msg2` and returns `(decrypted_payload, pre_payload_handshake_hash)`.
+    pub fn read_msg2_with_pre_payload_hash(
+        &mut self,
+        message: &[u8],
+    ) -> Result<(Zeroizing<Vec<u8>>, [u8; 32]), CoreError> {
+        let step = std::mem::replace(&mut self.step, HandshakeStep::Failed);
+        if step != HandshakeStep::InitiatorReadMsg2 {
+            self.fail_and_wipe_secrets();
+            return Err(CoreError::Noise(
+                "read_msg2_with_pre_payload_hash called out of handshake turn".into(),
+            ));
+        }
+        if message.len() > MAX_FRAME_LEN {
+            self.fail_and_wipe_secrets();
+            return Err(CoreError::FrameTooLarge {
+                len: message.len(),
+                max: MAX_FRAME_LEN,
+            });
+        }
+        let res = self.read_msg2_step(message);
+        if res.is_err() {
+            self.fail_and_wipe_secrets();
+        }
+        res
+    }
+
     /// Consumes the next incoming handshake message, returning the zeroized decrypted payload.
     pub fn read_message_vec(&mut self, message: &[u8]) -> Result<Zeroizing<Vec<u8>>, CoreError> {
         let step = std::mem::replace(&mut self.step, HandshakeStep::Failed);
@@ -585,6 +687,69 @@ impl NoiseHfsHandshake {
             self.fail_and_wipe_secrets();
         }
         res
+    }
+
+    fn read_msg2_step(
+        &mut self,
+        message: &[u8],
+    ) -> Result<(Zeroizing<Vec<u8>>, [u8; 32]), CoreError> {
+        // `<- e, ee, ekem1, s, es`
+        if message.len() < MIN_MSG2_LEN {
+            return Err(CoreError::Noise("truncated XXhfs msg2".into()));
+        }
+
+        let e_priv = self
+            .local_ephemeral_priv
+            .as_ref()
+            .ok_or_else(|| CoreError::Noise("missing local ephemeral key".into()))?
+            .clone();
+        let dk = self
+            .local_kem_dk
+            .take()
+            .ok_or_else(|| CoreError::Noise("missing local ML-KEM decaps key".into()))?;
+
+        let mut pos = 0;
+        let mut re = [0u8; DH_LEN];
+        re.copy_from_slice(&message[pos..pos + DH_LEN]);
+        pos += DH_LEN;
+        self.sym.mix_hash(&re);
+
+        let dh_ee = x25519_dh(&e_priv, &re)?;
+        self.sym.mix_key(&*dh_ee)?;
+
+        let ct_pt = self.sym.decrypt_and_hash(&message[pos..pos + ENC_CT_LEN])?;
+        pos += ENC_CT_LEN;
+        let ct_arr: Box<[u8; KEM_CT_LEN]> = ct_pt
+            .to_vec()
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| CoreError::Noise("invalid ML-KEM ciphertext length".into()))?;
+        let ct = ml_kem_768::CipherText::try_from_bytes(*ct_arr)
+            .map_err(|err| CoreError::Noise(format!("invalid ML-KEM ciphertext: {err}")))?;
+        let ss = dk
+            .try_decaps(&ct)
+            .map_err(|err| CoreError::Noise(format!("ML-KEM decapsulation failed: {err}")))?;
+        let ss_bytes = Zeroizing::new(ss.into_bytes());
+        self.sym.mix_key(&*ss_bytes)?;
+
+        let rs_pt = self
+            .sym
+            .decrypt_and_hash(&message[pos..pos + ENC_STATIC_LEN])?;
+        pos += ENC_STATIC_LEN;
+        let rs: [u8; DH_LEN] = rs_pt
+            .as_slice()
+            .try_into()
+            .map_err(|_| CoreError::Noise("invalid remote static key length".into()))?;
+
+        let dh_es = x25519_dh(&e_priv, &rs)?;
+        self.sym.mix_key(&*dh_es)?;
+
+        let h_pre = self.sym.h;
+        let payload = self.sym.decrypt_and_hash(&message[pos..])?;
+        self.remote_ephemeral = Some(re);
+        self.remote_static = Some(rs);
+        self.step = HandshakeStep::InitiatorWriteMsg3;
+        Ok((payload, h_pre))
     }
 
     fn read_message_step(
@@ -613,70 +778,18 @@ impl NoiseHfsHandshake {
                 let ek = ml_kem_768::EncapsKey::try_from_bytes(*ek_bytes).map_err(|err| {
                     CoreError::Noise(format!("invalid ML-KEM-768 encapsulation key: {err}"))
                 })?;
+                let ek_hash: [u8; 32] = Sha256::digest(*ek_bytes).into();
                 self.sym.mix_hash(&*ek_bytes);
 
                 let payload = self.sym.decrypt_and_hash(&message[MSG1_LEN..])?;
                 self.remote_ephemeral = Some(re);
                 self.remote_kem_ek = Some(Box::new(ek));
+                self.remote_kem_ek_hash = Some(ek_hash);
                 self.step = HandshakeStep::ResponderWriteMsg2;
                 Ok(payload)
             }
             HandshakeStep::InitiatorReadMsg2 => {
-                // `<- e, ee, ekem1, s, es`
-                if message.len() < MIN_MSG2_LEN {
-                    return Err(CoreError::Noise("truncated XXhfs msg2".into()));
-                }
-
-                let e_priv = self
-                    .local_ephemeral_priv
-                    .as_ref()
-                    .ok_or_else(|| CoreError::Noise("missing local ephemeral key".into()))?
-                    .clone();
-                let dk = self
-                    .local_kem_dk
-                    .take()
-                    .ok_or_else(|| CoreError::Noise("missing local ML-KEM decaps key".into()))?;
-
-                let mut pos = 0;
-                let mut re = [0u8; DH_LEN];
-                re.copy_from_slice(&message[pos..pos + DH_LEN]);
-                pos += DH_LEN;
-                self.sym.mix_hash(&re);
-
-                let dh_ee = x25519_dh(&e_priv, &re)?;
-                self.sym.mix_key(&*dh_ee)?;
-
-                let ct_pt = self.sym.decrypt_and_hash(&message[pos..pos + ENC_CT_LEN])?;
-                pos += ENC_CT_LEN;
-                let ct_arr: Box<[u8; KEM_CT_LEN]> = ct_pt
-                    .to_vec()
-                    .into_boxed_slice()
-                    .try_into()
-                    .map_err(|_| CoreError::Noise("invalid ML-KEM ciphertext length".into()))?;
-                let ct = ml_kem_768::CipherText::try_from_bytes(*ct_arr)
-                    .map_err(|err| CoreError::Noise(format!("invalid ML-KEM ciphertext: {err}")))?;
-                let ss = dk.try_decaps(&ct).map_err(|err| {
-                    CoreError::Noise(format!("ML-KEM decapsulation failed: {err}"))
-                })?;
-                let ss_bytes = Zeroizing::new(ss.into_bytes());
-                self.sym.mix_key(&*ss_bytes)?;
-
-                let rs_pt = self
-                    .sym
-                    .decrypt_and_hash(&message[pos..pos + ENC_STATIC_LEN])?;
-                pos += ENC_STATIC_LEN;
-                let rs: [u8; DH_LEN] = rs_pt
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| CoreError::Noise("invalid remote static key length".into()))?;
-
-                let dh_es = x25519_dh(&e_priv, &rs)?;
-                self.sym.mix_key(&*dh_es)?;
-
-                let payload = self.sym.decrypt_and_hash(&message[pos..])?;
-                self.remote_ephemeral = Some(re);
-                self.remote_static = Some(rs);
-                self.step = HandshakeStep::InitiatorWriteMsg3;
+                let (payload, _) = self.read_msg2_step(message)?;
                 Ok(payload)
             }
             HandshakeStep::ResponderReadMsg3 => {
@@ -744,6 +857,8 @@ impl NoiseHfsHandshake {
         }
         let handshake_hash = self.sym.h;
         let remote_static = self.remote_static;
+        let exporter_secret =
+            hkdf_sha256_32(&*self.sym.ck, &self.sym.h, b"tendril-v2-session-export");
         let (c1, c2) = self.sym.split()?;
         let (tx, rx) = match self.role {
             Role::Initiator => (c1, c2),
@@ -754,6 +869,7 @@ impl NoiseHfsHandshake {
             rx,
             handshake_hash,
             remote_static,
+            exporter_secret,
         })
     }
 }
@@ -774,6 +890,7 @@ pub struct NoiseTransport {
     rx: CipherState,
     handshake_hash: [u8; 32],
     remote_static: Option<[u8; 32]>,
+    exporter_secret: Zeroizing<[u8; 32]>,
 }
 
 impl NoiseTransport {
@@ -787,6 +904,37 @@ impl NoiseTransport {
     #[must_use]
     pub fn get_remote_static(&self) -> Option<&[u8; 32]> {
         self.remote_static.as_ref()
+    }
+
+    /// Returns the current outgoing AEAD nonce counter.
+    #[must_use]
+    pub const fn tx_nonce(&self) -> u64 {
+        self.tx.n
+    }
+
+    /// Returns the current incoming AEAD nonce counter.
+    #[must_use]
+    pub const fn rx_nonce(&self) -> u64 {
+        self.rx.n
+    }
+
+    /// Derives `(reconnect_secret, mailbox_secret)` bound to `host_static_pub` from post-handshake secret key material.
+    #[must_use]
+    pub fn export_v2_secrets(
+        &self,
+        host_static_pub: &[u8; 32],
+    ) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+        let reconnect_secret = hkdf_sha256_32(
+            &*self.exporter_secret,
+            b"tendril-reconnect-v2",
+            host_static_pub,
+        );
+        let mailbox_secret = hkdf_sha256_32(
+            &*self.exporter_secret,
+            b"tendril-mailbox-v2",
+            host_static_pub,
+        );
+        (reconnect_secret, mailbox_secret)
     }
 
     /// Encrypts a transport payload under the outgoing cipher state.

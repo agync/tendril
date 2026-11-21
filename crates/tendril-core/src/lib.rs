@@ -12,6 +12,7 @@ pub mod pairing;
 pub mod policy;
 pub mod roster;
 pub mod session;
+pub mod v2;
 pub mod wire;
 
 pub use grants::{
@@ -20,10 +21,10 @@ pub use grants::{
 pub use pairing::{
     DEFAULT_ENROLLMENT_TTL_SECS, ENROLL_PROOF_DOMAIN, EnrollmentPolicy, MAX_ENROLLMENT_TTL_SECS,
 };
-pub use roster::{AnchorState, MAX_BURNED_ENROLLMENT_NONCES, TrustAnchor};
+pub use roster::{AnchorState, MAX_BURNED_ENROLLMENT_NONCES, TrustAnchor, V2PeerSecrets};
 pub use wire::{
-    AEAD_TAG_LEN, MAX_APP_DATA_LEN, MAX_FRAME_LEN, MAX_TRANSPORT_PLAINTEXT, NOISE_PATTERN,
-    PREAMBLE_LEN, PREAMBLE_MAGIC, WIRE_VERSION,
+    AEAD_TAG_LEN, FLAG_PAKE_PAIR, MAX_APP_DATA_LEN, MAX_FRAME_LEN, MAX_TRANSPORT_PLAINTEXT,
+    NOISE_PATTERN, PREAMBLE_FLAG_NONE, PREAMBLE_LEN, PREAMBLE_MAGIC, WIRE_VERSION, WIRE_VERSION_V2,
 };
 
 #[cfg(test)]

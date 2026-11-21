@@ -1,25 +1,35 @@
 //! Wire constants, preamble encoding, outer framing, and handshake payloads.
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::error::CoreError;
 use crate::grants::Grant;
 use crate::identity::RotationRecord;
 
-/// Fixed Noise protocol pattern for Tendril v1.
+/// Fixed Noise protocol pattern for Tendril v1 and v2.
 pub const NOISE_PATTERN: &str = "Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256";
 
 /// Three-byte ASCII magic opening every Tendril preamble.
 pub const PREAMBLE_MAGIC: [u8; 3] = *b"TND";
 
-/// Exact byte length of the cleartext preamble (and Noise prologue).
+/// Exact byte length of the cleartext preamble (and standard Noise prologue).
 pub const PREAMBLE_LEN: usize = 6;
 
-/// Wire protocol version encoded in the cleartext preamble.
+/// Wire protocol version v1 encoded in the cleartext preamble.
 pub const WIRE_VERSION: u8 = 0x01;
+
+/// Wire protocol version v2 (privacy profile) encoded in the cleartext preamble.
+pub const WIRE_VERSION_V2: u8 = 0x02;
 
 /// Reserved byte in the v1 preamble; must always be zero.
 pub const PREAMBLE_RESERVED: u8 = 0x00;
+
+/// Default v2 preamble flags byte (standard v2 session or standard v2 pairing).
+pub const PREAMBLE_FLAG_NONE: u8 = 0x00;
+
+/// Wire v2 pairing preamble flag enabling hybrid PAKE + ML-KEM-768 pairing (`intent == 0x02` only).
+pub const FLAG_PAKE_PAIR: u8 = 0x01;
 
 /// Length in bytes of the Noise ChaChaPoly AEAD authentication tag.
 pub const AEAD_TAG_LEN: usize = 16;
@@ -58,11 +68,12 @@ impl TryFrom<u8> for Intent {
     }
 }
 
-/// Parsed 6-byte cleartext preamble (and verbatim Noise prologue).
+/// Parsed 6-byte cleartext preamble (and verbatim Noise prologue for v1 and standard v2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preamble {
     pub version: u8,
     pub intent: Intent,
+    pub flags: u8,
 }
 
 impl Preamble {
@@ -72,6 +83,27 @@ impl Preamble {
         Self {
             version: WIRE_VERSION,
             intent,
+            flags: PREAMBLE_RESERVED,
+        }
+    }
+
+    /// Constructs a v2 preamble for `intent` and `flags`.
+    #[must_use]
+    pub const fn v2(intent: Intent, flags: u8) -> Self {
+        Self {
+            version: WIRE_VERSION_V2,
+            intent,
+            flags,
+        }
+    }
+
+    /// Constructs a v2 PAKE pairing preamble (`version = 0x02`, `intent = Pair`, `flags = 0x01`).
+    #[must_use]
+    pub const fn v2_pake_pair() -> Self {
+        Self {
+            version: WIRE_VERSION_V2,
+            intent: Intent::Pair,
+            flags: FLAG_PAKE_PAIR,
         }
     }
 
@@ -84,11 +116,11 @@ impl Preamble {
             PREAMBLE_MAGIC[2],
             self.version,
             self.intent as u8,
-            PREAMBLE_RESERVED,
+            self.flags,
         ]
     }
 
-    /// Strictly decodes and validates a 6-byte cleartext preamble.
+    /// Strictly decodes and validates a 6-byte cleartext preamble (v1 and v2).
     pub fn decode(bytes: &[u8]) -> Result<Self, CoreError> {
         if bytes.len() != PREAMBLE_LEN {
             return Err(CoreError::InvalidPreambleLength {
@@ -99,17 +131,41 @@ impl Preamble {
         if bytes[0..3] != PREAMBLE_MAGIC {
             return Err(CoreError::BadPreambleMagic);
         }
-        if bytes[3] != WIRE_VERSION {
-            return Err(CoreError::UnsupportedVersion(bytes[3]));
+        let version = bytes[3];
+        let intent_raw = bytes[4];
+        let flags = bytes[5];
+        match version {
+            WIRE_VERSION => {
+                let intent = Intent::try_from(intent_raw)?;
+                if flags != PREAMBLE_RESERVED {
+                    return Err(CoreError::NonZeroReserved(flags));
+                }
+                Ok(Self {
+                    version,
+                    intent,
+                    flags,
+                })
+            }
+            WIRE_VERSION_V2 => {
+                let intent = Intent::try_from(intent_raw)?;
+                let allowed = match intent {
+                    Intent::Session => flags == PREAMBLE_FLAG_NONE,
+                    Intent::Pair => flags == PREAMBLE_FLAG_NONE || flags == FLAG_PAKE_PAIR,
+                };
+                if !allowed {
+                    return Err(CoreError::InvalidPreambleFlags {
+                        intent: intent_raw,
+                        flags,
+                    });
+                }
+                Ok(Self {
+                    version,
+                    intent,
+                    flags,
+                })
+            }
+            other => Err(CoreError::UnsupportedVersion(other)),
         }
-        let intent = Intent::try_from(bytes[4])?;
-        if bytes[5] != PREAMBLE_RESERVED {
-            return Err(CoreError::NonZeroReserved(bytes[5]));
-        }
-        Ok(Self {
-            version: bytes[3],
-            intent,
-        })
     }
 }
 
@@ -167,6 +223,10 @@ pub enum InnerFrameType {
     Ping = 0x05,
     Pong = 0x06,
     Close = 0x07,
+    /// Wire v2 pure cover traffic frame (`0x08`), zero-filled and silently discarded after AEAD decrypt.
+    Padding = 0x08,
+    /// Wire v2 bucketed padded envelope (`0x09`) wrapping one `0x01..=0x07` inner frame.
+    Padded = 0x09,
 }
 
 impl TryFrom<u8> for InnerFrameType {
@@ -181,6 +241,8 @@ impl TryFrom<u8> for InnerFrameType {
             0x05 => Ok(Self::Ping),
             0x06 => Ok(Self::Pong),
             0x07 => Ok(Self::Close),
+            0x08 => Ok(Self::Padding),
+            0x09 => Ok(Self::Padded),
             other => Err(CoreError::UnknownInnerFrameType(other)),
         }
     }
@@ -216,7 +278,10 @@ pub fn decode_inner_frame(plaintext: &[u8]) -> Result<(InnerFrameType, &[u8]), C
     Ok((kind, payload))
 }
 
-fn validate_inner_payload(kind: InnerFrameType, payload: &[u8]) -> Result<(), CoreError> {
+pub(crate) fn validate_inner_payload(
+    kind: InnerFrameType,
+    payload: &[u8],
+) -> Result<(), CoreError> {
     match kind {
         InnerFrameType::Data | InnerFrameType::Grant | InnerFrameType::Revocation => {
             if payload.len() > MAX_APP_DATA_LEN {
@@ -246,6 +311,35 @@ fn validate_inner_payload(kind: InnerFrameType, payload: &[u8]) -> Result<(), Co
                 len: 1 + payload.len(),
                 max: MAX_TRANSPORT_PLAINTEXT,
             });
+        }
+        InnerFrameType::Padding => {
+            if payload.len() > MAX_APP_DATA_LEN {
+                return Err(CoreError::FrameTooLarge {
+                    len: 1 + payload.len(),
+                    max: MAX_TRANSPORT_PLAINTEXT,
+                });
+            }
+            let mut nonzero = 0u8;
+            for &b in payload {
+                nonzero |= b;
+            }
+            if !bool::from(nonzero.ct_eq(&0u8)) {
+                return Err(CoreError::InvalidInnerFramePayload(
+                    "PADDING cover frame must contain only zero bytes",
+                ));
+            }
+        }
+        InnerFrameType::Padded => {
+            if payload.len() > MAX_APP_DATA_LEN {
+                return Err(CoreError::FrameTooLarge {
+                    len: 1 + payload.len(),
+                    max: MAX_TRANSPORT_PLAINTEXT,
+                });
+            }
+            let mut full = Vec::with_capacity(1 + payload.len());
+            full.push(InnerFrameType::Padded as u8);
+            full.extend_from_slice(payload);
+            crate::v2::unpad_inner_frame(&full)?;
         }
         InnerFrameType::Rekey
         | InnerFrameType::Ping
@@ -458,8 +552,30 @@ mod tests {
             Err(CoreError::BadPreambleMagic)
         );
         assert_eq!(
+            Preamble::decode(b"TND\x03\x01\x00"),
+            Err(CoreError::UnsupportedVersion(0x03))
+        );
+        assert_eq!(
             Preamble::decode(b"TND\x02\x01\x00"),
-            Err(CoreError::UnsupportedVersion(0x02))
+            Ok(Preamble::v2(Intent::Session, PREAMBLE_FLAG_NONE))
+        );
+        assert_eq!(
+            Preamble::decode(b"TND\x02\x02\x01"),
+            Ok(Preamble::v2_pake_pair())
+        );
+        assert_eq!(
+            Preamble::decode(b"TND\x02\x01\x01"),
+            Err(CoreError::InvalidPreambleFlags {
+                intent: 0x01,
+                flags: 0x01
+            })
+        );
+        assert_eq!(
+            Preamble::decode(b"TND\x02\x02\x02"),
+            Err(CoreError::InvalidPreambleFlags {
+                intent: 0x02,
+                flags: 0x02
+            })
         );
         assert_eq!(
             Preamble::decode(b"TND\x01\x03\x00"),

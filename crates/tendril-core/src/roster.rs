@@ -1,11 +1,15 @@
 //! Peer roster state machine, pin verification, minting, rotation, and CRL tracking.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::{
-    HybridSigningPublicKey, b64url_encode, device_id, has_control_chars, is_valid_x25519_public_key,
+    HybridSigningPublicKey, b64url_decode_array, b64url_encode, device_id, has_control_chars,
+    is_valid_x25519_public_key,
 };
 use crate::error::CoreError;
 use crate::grants::{
@@ -15,6 +19,106 @@ use crate::grants::{
 use crate::identity::{
     EndpointIdentity, RotationRecord, format_rfc3339_utc, verify_rotation_chain,
 };
+use crate::wire::{WIRE_VERSION, WIRE_VERSION_V2};
+
+fn default_min_wire_version() -> u8 {
+    WIRE_VERSION
+}
+
+fn deserialize_min_wire_version<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = u8::deserialize(deserializer)?;
+    if v != WIRE_VERSION && v != WIRE_VERSION_V2 {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported min_wire_version {v}; expected 1 or 2"
+        )));
+    }
+    Ok(v)
+}
+
+/// Zeroizing, debug-redacted v2 shared secrets persisted per paired peer.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct V2PeerSecrets {
+    reconnect_secret: [u8; 32],
+    mailbox_secret: [u8; 32],
+}
+
+impl V2PeerSecrets {
+    /// Constructs a [`V2PeerSecrets`] pair from 32-byte reconnect and mailbox secrets.
+    #[must_use]
+    pub const fn new(reconnect_secret: [u8; 32], mailbox_secret: [u8; 32]) -> Self {
+        Self {
+            reconnect_secret,
+            mailbox_secret,
+        }
+    }
+
+    /// Returns the 32-byte pseudonymous reconnect secret.
+    #[must_use]
+    pub const fn reconnect_secret(&self) -> &[u8; 32] {
+        &self.reconnect_secret
+    }
+
+    /// Returns the 32-byte blinded relay mailbox secret.
+    #[must_use]
+    pub const fn mailbox_secret(&self) -> &[u8; 32] {
+        &self.mailbox_secret
+    }
+}
+
+impl PartialEq for V2PeerSecrets {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(
+            self.reconnect_secret.ct_eq(&other.reconnect_secret)
+                & self.mailbox_secret.ct_eq(&other.mailbox_secret),
+        )
+    }
+}
+
+impl Eq for V2PeerSecrets {}
+
+impl fmt::Debug for V2PeerSecrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("V2PeerSecrets")
+            .field("reconnect_secret", &"<redacted>")
+            .field("mailbox_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct V2PeerSecretsSerde {
+    reconnect_secret: String,
+    mailbox_secret: String,
+}
+
+impl Serialize for V2PeerSecrets {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let repr = V2PeerSecretsSerde {
+            reconnect_secret: b64url_encode(&self.reconnect_secret),
+            mailbox_secret: b64url_encode(&self.mailbox_secret),
+        };
+        repr.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for V2PeerSecrets {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = V2PeerSecretsSerde::deserialize(deserializer)?;
+        let reconnect_secret = Zeroizing::new(
+            b64url_decode_array::<32>(&repr.reconnect_secret).map_err(serde::de::Error::custom)?,
+        );
+        let mailbox_secret = Zeroizing::new(
+            b64url_decode_array::<32>(&repr.mailbox_secret).map_err(serde::de::Error::custom)?,
+        );
+        Ok(Self {
+            reconnect_secret: *reconnect_secret,
+            mailbox_secret: *mailbox_secret,
+        })
+    }
+}
 
 /// Lifecycle state of a peer entry on a Tendril endpoint roster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +146,13 @@ pub struct RosterEntry {
     pub grants: Vec<Grant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_hints: Vec<String>,
+    #[serde(
+        default = "default_min_wire_version",
+        deserialize_with = "deserialize_min_wire_version"
+    )]
+    pub min_wire_version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2_secrets: Option<V2PeerSecrets>,
 }
 
 impl RosterEntry {
@@ -178,6 +289,8 @@ impl Roster {
             last_pairing_sas: None,
             grants: Vec::new(),
             relay_hints,
+            min_wire_version: WIRE_VERSION,
+            v2_secrets: None,
         };
         self.entries.insert(host_id.clone(), entry);
         Ok(&self.entries[&host_id])
@@ -238,6 +351,8 @@ impl Roster {
             last_pairing_sas: Some(pairing_sas),
             grants: Vec::new(),
             relay_hints,
+            min_wire_version: WIRE_VERSION,
+            v2_secrets: None,
         };
         self.entries.insert(host_id.clone(), entry);
         Ok(&self.entries[&host_id])
@@ -308,6 +423,8 @@ impl Roster {
             last_pairing_sas: Some(pairing_sas),
             grants: Vec::new(),
             relay_hints: Vec::new(),
+            min_wire_version: WIRE_VERSION,
+            v2_secrets: None,
         };
         self.entries.insert(id.clone(), entry);
         Ok(&self.entries[&id])
@@ -482,6 +599,7 @@ impl Roster {
             if shares_static || shares_signing {
                 other.state = PeerState::Revoked;
                 other.grants.clear();
+                other.v2_secrets = None;
             }
         }
         if let Some(sig) = revoked_signing {
@@ -494,7 +612,7 @@ impl Roster {
     }
 
     /// Marks `peer_id` (and any sibling entry sharing its cryptographic keys) as `Revoked`
-    /// and clears any stored grants.
+    /// and clears any stored grants and v2 secrets.
     pub fn revoke_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
         let (revoked_static, revoked_signing) = {
             let entry = self
@@ -503,9 +621,106 @@ impl Roster {
                 .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
             entry.state = PeerState::Revoked;
             entry.grants.clear();
+            entry.v2_secrets = None;
             (entry.static_pub, entry.signing_pub.clone())
         };
         self.revoke_siblings_by_keys(revoked_static, revoked_signing.as_ref());
+        Ok(())
+    }
+
+    /// Raises the minimum wire protocol version required for `peer_id` (anti-downgrade floor).
+    ///
+    /// Refuses decreasing `min_wire_version` below the already-persisted floor and rejects
+    /// revoked or unknown peers.
+    pub fn set_peer_min_wire_version(
+        &mut self,
+        peer_id: &str,
+        min_wire_version: u8,
+    ) -> Result<(), CoreError> {
+        if min_wire_version != WIRE_VERSION && min_wire_version != WIRE_VERSION_V2 {
+            return Err(CoreError::UnsupportedVersion(min_wire_version));
+        }
+        let entry = self
+            .entries
+            .get_mut(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+        if entry.state == PeerState::Revoked {
+            return Err(CoreError::PeerRevoked(peer_id.to_string()));
+        }
+        if min_wire_version < entry.min_wire_version {
+            return Err(CoreError::VersionDowngrade {
+                peer_min: entry.min_wire_version,
+                negotiated: min_wire_version,
+            });
+        }
+        entry.min_wire_version = min_wire_version;
+        Ok(())
+    }
+
+    /// Returns the persisted anti-downgrade wire version floor (`1` or `2`) for `static_pub`.
+    #[must_use]
+    pub fn pairing_floor(&self, static_pub: &[u8; 32]) -> u8 {
+        self.entries
+            .values()
+            .filter(|e| &e.static_pub == static_pub)
+            .map(|e| e.min_wire_version)
+            .max()
+            .unwrap_or(WIRE_VERSION)
+    }
+
+    /// Enforces `peer_id`'s persisted `min_wire_version` floor against `negotiated_version`.
+    ///
+    /// Fails closed with [`CoreError::PeerNotFound`] if `peer_id` is absent from the roster.
+    pub fn enforce_min_wire_version(
+        &self,
+        peer_id: &str,
+        negotiated_version: u8,
+    ) -> Result<(), CoreError> {
+        let entry = self
+            .entries
+            .get(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+        if entry.min_wire_version > negotiated_version {
+            return Err(CoreError::VersionDowngrade {
+                peer_min: entry.min_wire_version,
+                negotiated: negotiated_version,
+            });
+        }
+        Ok(())
+    }
+
+    /// Stores zeroizing v2 reconnect and blinded mailbox secrets on a non-revoked peer entry.
+    pub fn set_peer_v2_secrets(
+        &mut self,
+        peer_id: &str,
+        secrets: V2PeerSecrets,
+    ) -> Result<(), CoreError> {
+        let entry = self
+            .entries
+            .get_mut(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+        if entry.state == PeerState::Revoked {
+            return Err(CoreError::PeerRevoked(peer_id.to_string()));
+        }
+        entry.v2_secrets = Some(secrets);
+        Ok(())
+    }
+
+    /// Upgrades a non-revoked peer to Wire v2 (`min_wire_version >= 2`) and stores its v2 secrets.
+    pub fn upgrade_peer_to_v2(
+        &mut self,
+        peer_id: &str,
+        secrets: V2PeerSecrets,
+    ) -> Result<(), CoreError> {
+        let entry = self
+            .entries
+            .get_mut(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+        if entry.state == PeerState::Revoked {
+            return Err(CoreError::PeerRevoked(peer_id.to_string()));
+        }
+        entry.min_wire_version = entry.min_wire_version.max(WIRE_VERSION_V2);
+        entry.v2_secrets = Some(secrets);
         Ok(())
     }
 
@@ -558,6 +773,7 @@ impl Roster {
                 let keys = self.entries.get_mut(peer_id).map(|entry| {
                     entry.state = PeerState::Revoked;
                     entry.grants.clear();
+                    entry.v2_secrets = None;
                     (entry.static_pub, entry.signing_pub.clone())
                 });
                 if let Some((revoked_static, revoked_signing)) = keys {
@@ -605,12 +821,14 @@ impl Roster {
             if let Some(entry) = self.entries.get_mut(revoked_id) {
                 entry.state = PeerState::Revoked;
                 entry.grants.clear();
+                entry.v2_secrets = None;
                 revoked_keys.push((entry.static_pub, entry.signing_pub.clone()));
             }
             for entry in self.entries.values_mut() {
                 if &entry.device_id == revoked_id {
                     entry.state = PeerState::Revoked;
                     entry.grants.clear();
+                    entry.v2_secrets = None;
                     revoked_keys.push((entry.static_pub, entry.signing_pub.clone()));
                 }
             }
@@ -959,6 +1177,8 @@ impl Roster {
             last_pairing_sas: None,
             grants: Vec::new(),
             relay_hints: Vec::new(),
+            min_wire_version: WIRE_VERSION,
+            v2_secrets: None,
         };
         self.entries.insert(id.clone(), entry);
         Ok(&self.entries[&id])
