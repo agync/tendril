@@ -2,13 +2,16 @@ package tendril_test
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -884,4 +887,513 @@ func TestM2mEnrollmentAndReplay(t *testing.T) {
 	if selfAcc.err != nil || selfInitRes.Status != "active" || selfAcc.res.Status != "active" {
 		t.Fatalf("self-issued M2M failed: init=%+v acc=%+v err=%v", selfInitRes, selfAcc.res, selfAcc.err)
 	}
+}
+
+func TestConfigureTransportsJSONValidation(t *testing.T) {
+	ep, err := tendril.NewEndpoint("", "go-cfg-test")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer ep.Close()
+
+	if err := ep.ConfigureTransportsJSON("{}"); err != nil {
+		t.Fatalf("ConfigureTransportsJSON empty object: %v", err)
+	}
+
+	// Unknown field must be rejected and secret scalars must never be echoed.
+	secretSentinel := "super-secret-value-999"
+	err = ep.ConfigureTransportsJSON(`{"relay_auth_secret":"` + secretSentinel + `","unknown_field":true}`)
+	if err == nil {
+		t.Fatalf("expected error for unknown_field")
+	}
+	if strings.Contains(err.Error(), secretSentinel) {
+		t.Fatalf("error leaked secret scalar: %v", err)
+	}
+
+	// Scalar type mismatch must be rejected without leaking scalar values.
+	err = ep.ConfigureTransportsJSON(`{"relay_auth_secret":12345}`)
+	if err == nil {
+		t.Fatalf("expected error for scalar type mismatch")
+	}
+	if strings.Contains(err.Error(), "12345") {
+		t.Fatalf("error leaked scalar value: %v", err)
+	}
+
+	// NUL byte must be rejected.
+	if err := ep.ConfigureTransportsJSON("{\x00}"); err == nil {
+		t.Fatalf("expected error for NUL byte in transportConfigJSON")
+	}
+}
+
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func ensureRelayBinary(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join("..", "..", "target", "debug", "tendril-relay")
+	if _, err := os.Stat(bin); err == nil {
+		return bin
+	}
+	cmd := exec.Command("cargo", "build", "-p", "tendril-relay", "--bin", "tendril-relay")
+	cmd.Dir = filepath.Join("..", "..")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build tendril-relay: %v\n%s", err, out)
+	}
+	return bin
+}
+
+func spawnRelay(t *testing.T, extraEnv []string, args ...string) (string, string) {
+	t.Helper()
+	bin := ensureRelayBinary(t)
+	fullArgs := append([]string{"--listen", "127.0.0.1:0", "--host", "127.0.0.1"}, args...)
+	cmd := exec.Command(bin, fullArgs...)
+	cmd.Env = append(os.Environ(), append([]string{"RUST_LOG=info"}, extraEnv...)...)
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("relay stdout pipe: %v", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("relay stderr pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start tendril-relay: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	urlCh := make(chan string, 1)
+	var mu sync.Mutex
+	var logs bytes.Buffer
+	scan := func(r io.Reader) {
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			line := ansiRe.ReplaceAllString(sc.Text(), "")
+			mu.Lock()
+			logs.WriteString(line)
+			logs.WriteByte('\n')
+			mu.Unlock()
+			if idx := strings.Index(line, "ws://127.0.0.1:"); idx >= 0 {
+				rest := line[idx:]
+				if end := strings.IndexAny(rest, " \t\r\n\""); end >= 0 {
+					rest = rest[:end]
+				}
+				if strings.HasSuffix(rest, "/v1/relay") {
+					select {
+					case urlCh <- rest:
+					default:
+					}
+				}
+			}
+		}
+	}
+	go scan(stdoutPipe)
+	go scan(stderrPipe)
+
+	select {
+	case v1URL := <-urlCh:
+		v2URL := strings.TrimSuffix(v1URL, "/v1/relay") + "/v2/relay"
+		return v1URL, v2URL
+	case <-time.After(10 * time.Second):
+		mu.Lock()
+		defer mu.Unlock()
+		t.Fatalf("timed out waiting for tendril-relay startup; logs:\n%s", logs.String())
+		return "", ""
+	}
+}
+
+func TestRelayAdmissionHMACAndTickets(t *testing.T) {
+	// 1. HMAC-gated relay (/v1/relay and /v2/relay)
+	const hmacSecret = "shared-relay-hmac-secret-123"
+	v1URL, v2URL := spawnRelay(t, []string{"TENDRIL_RELAY_AUTH_SECRET=" + hmacSecret}, "--auth-scope", "all")
+
+	hostEp, err := tendril.NewEndpoint("", "go-hmac-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint host: %v", err)
+	}
+	defer hostEp.Close()
+	cliEp, err := tendril.NewEndpoint("", "go-hmac-cli")
+	if err != nil {
+		t.Fatalf("NewEndpoint cli: %v", err)
+	}
+	defer cliEp.Close()
+
+	// Negative control: unconfigured and wrong-secret ServeRelay rejected.
+	if _, err := hostEp.ServeRelay(v1URL, "127.0.0.1"); err == nil {
+		t.Fatalf("expected unconfigured ServeRelay to fail on HMAC-gated relay")
+	}
+	if err := hostEp.ConfigureTransportsJSON(`{"relay_auth_secret":"wrong-secret"}`); err != nil {
+		t.Fatalf("ConfigureTransportsJSON wrong: %v", err)
+	}
+	if _, err := hostEp.ServeRelay(v1URL, "127.0.0.1"); err == nil {
+		t.Fatalf("expected wrong-secret ServeRelay to fail")
+	}
+
+	// Positive control: matching HMAC secret succeeds on /v1/relay and /v2/relay.
+	cfgJSON := `{"relay_auth_secret":"` + hmacSecret + `"}`
+	if err := hostEp.ConfigureTransportsJSON(cfgJSON); err != nil {
+		t.Fatalf("ConfigureTransportsJSON host: %v", err)
+	}
+	relayV1Ep, err := hostEp.ServeRelay(v1URL, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("ServeRelay with HMAC: %v", err)
+	}
+	code, err := hostEp.IssueCode("remote")
+	if err != nil {
+		t.Fatalf("IssueCode: %v", err)
+	}
+
+	// Negative control: unconfigured client rejected on /v1/relay pair.
+	if _, err := cliEp.PairV2Initiate(relayV1Ep, "127.0.0.1", code, "cli", "go", ""); err == nil {
+		t.Fatalf("expected unconfigured client PairV2Initiate to fail on HMAC-gated relay")
+	}
+	if err := cliEp.ConfigureTransportsJSON(cfgJSON); err != nil {
+		t.Fatalf("ConfigureTransportsJSON cli: %v", err)
+	}
+
+	type accRes struct {
+		r   tendril.PairAcceptResult
+		err error
+	}
+	accCh := make(chan accRes, 1)
+	go func() {
+		r, e := hostEp.PairV2Accept(5000)
+		accCh <- accRes{r, e}
+	}()
+	pInit, err := cliEp.PairV2Initiate(relayV1Ep, "127.0.0.1", code, "go-hmac-dev", "go", "")
+	if err != nil {
+		t.Fatalf("PairV2Initiate over HMAC relay: %v", err)
+	}
+	pAcc := <-accCh
+	if pAcc.err != nil || pAcc.r.SAS != pInit.SAS {
+		t.Fatalf("PairV2Accept failed: %+v", pAcc)
+	}
+	if err := hostEp.ConfirmPeer(pAcc.r.DeviceID, pAcc.r.SAS); err != nil {
+		t.Fatalf("host ConfirmPeer: %v", err)
+	}
+	if err := cliEp.ConfirmPeer("go-hmac-host", pInit.SAS); err != nil {
+		t.Fatalf("cli ConfirmPeer: %v", err)
+	}
+	grantJSON, err := hostEp.MintGrant(pAcc.r.DeviceID, []string{"fs.read"}, 300)
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+
+	// ServeRelayV2 on /v2/relay and ConnectV2/AcceptV2.
+	relayV2Ep, err := hostEp.ServeRelayV2(v2URL, "127.0.0.1", "")
+	if err != nil {
+		t.Fatalf("ServeRelayV2 with HMAC: %v", err)
+	}
+	// Negative control: wrong secret on client rejected on /v2/relay.
+	if err := cliEp.ConfigureTransportsJSON(`{"relay_auth_secret":"wrong-secret"}`); err != nil {
+		t.Fatalf("ConfigureTransportsJSON wrong cli: %v", err)
+	}
+	if _, err := cliEp.ConnectV2(relayV2Ep, "127.0.0.1", "go-hmac-host", grantJSON); err == nil {
+		t.Fatalf("expected wrong-secret ConnectV2 to fail on HMAC /v2/relay")
+	}
+	if err := cliEp.ConfigureTransportsJSON(cfgJSON); err != nil {
+		t.Fatalf("ConfigureTransportsJSON restore cli: %v", err)
+	}
+
+	sessCh := make(chan *tendril.Session, 1)
+	go func() {
+		s, e := hostEp.AcceptV2(5000)
+		if e == nil {
+			sessCh <- s
+		}
+	}()
+	cliSess, err := cliEp.ConnectV2(relayV2Ep, "127.0.0.1", "go-hmac-host", grantJSON)
+	if err != nil {
+		t.Fatalf("ConnectV2 over HMAC /v2/relay: %v", err)
+	}
+	defer cliSess.Close()
+	hostSess := <-sessCh
+	defer hostSess.Close()
+
+	if err := cliSess.SendData([]byte("hmac-v2-ok")); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
+	ev, err := hostSess.PollEvent(3000)
+	if err != nil || ev.Event != "data" {
+		t.Fatalf("PollEvent: ev=%+v err=%v", ev, err)
+	}
+	got, _ := base64.RawURLEncoding.DecodeString(ev.DataB64)
+	if string(got) != "hmac-v2-ok" {
+		t.Fatalf("unexpected payload: %q", got)
+	}
+
+	// 2. Ticket-gated relay (/v1/relay and /v2/relay)
+	issuerEp, err := tendril.NewEndpoint("", "go-ticket-issuer")
+	if err != nil {
+		t.Fatalf("NewEndpoint issuer: %v", err)
+	}
+	defer issuerEp.Close()
+	issuerInfo, err := issuerEp.Info()
+	if err != nil {
+		t.Fatalf("issuer Info: %v", err)
+	}
+	tv1URL, tv2URL := spawnRelay(t, nil, "--issuer-pub", issuerInfo.RelayPub, "--auth-scope", "all")
+
+	regTicket, err := issuerEp.MintRelayTicket("127.0.0.1", "register", "*", 300)
+	if err != nil {
+		t.Fatalf("MintRelayTicket register: %v", err)
+	}
+	dialTicket, err := issuerEp.MintRelayTicket("127.0.0.1", "dial", "*", 300)
+	if err != nil {
+		t.Fatalf("MintRelayTicket dial: %v", err)
+	}
+
+	tHost, err := tendril.NewEndpoint("", "go-ticket-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint tHost: %v", err)
+	}
+	defer tHost.Close()
+	tCli, err := tendril.NewEndpoint("", "go-ticket-cli")
+	if err != nil {
+		t.Fatalf("NewEndpoint tCli: %v", err)
+	}
+	defer tCli.Close()
+
+	// Wrong-role ticket (dial) rejected for register.
+	if err := tHost.ConfigureTransportsJSON(`{"relay_ticket":` + dialTicket + `}`); err != nil {
+		t.Fatalf("ConfigureTransportsJSON dial ticket on host: %v", err)
+	}
+	if _, err := tHost.ServeRelay(tv1URL, "127.0.0.1"); err == nil {
+		t.Fatalf("expected dial-role ticket to be rejected for ServeRelay")
+	}
+
+	if err := tHost.ConfigureTransportsJSON(`{"relay_ticket":` + regTicket + `}`); err != nil {
+		t.Fatalf("ConfigureTransportsJSON reg ticket on host: %v", err)
+	}
+	tV1Ep, err := tHost.ServeRelay(tv1URL, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("ServeRelay with register ticket: %v", err)
+	}
+	tCode, err := tHost.IssueCode("remote")
+	if err != nil {
+		t.Fatalf("tHost IssueCode: %v", err)
+	}
+
+	// Wrong-role ticket (register) rejected for dial.
+	if err := tCli.ConfigureTransportsJSON(`{"relay_ticket":` + regTicket + `}`); err != nil {
+		t.Fatalf("ConfigureTransportsJSON reg ticket on cli: %v", err)
+	}
+	if _, err := tCli.PairV2Initiate(tV1Ep, "127.0.0.1", tCode, "tcli", "go", ""); err == nil {
+		t.Fatalf("expected register-role ticket to be rejected for PairV2Initiate")
+	}
+
+	if err := tCli.ConfigureTransportsJSON(`{"relay_ticket":` + dialTicket + `}`); err != nil {
+		t.Fatalf("ConfigureTransportsJSON dial ticket on cli: %v", err)
+	}
+	go func() {
+		r, e := tHost.PairV2Accept(5000)
+		accCh <- accRes{r, e}
+	}()
+	tpInit, err := tCli.PairV2Initiate(tV1Ep, "127.0.0.1", tCode, "tcli", "go", "")
+	if err != nil {
+		t.Fatalf("PairV2Initiate with dial ticket: %v", err)
+	}
+	tpAcc := <-accCh
+	if tpAcc.err != nil || tpAcc.r.SAS != tpInit.SAS {
+		t.Fatalf("PairV2Accept with ticket failed: %+v", tpAcc)
+	}
+	if err := tHost.ConfirmPeer(tpAcc.r.DeviceID, tpAcc.r.SAS); err != nil {
+		t.Fatalf("tHost ConfirmPeer: %v", err)
+	}
+	if err := tCli.ConfirmPeer("go-ticket-host", tpInit.SAS); err != nil {
+		t.Fatalf("tCli ConfirmPeer: %v", err)
+	}
+	tGrant, err := tHost.MintGrant(tpAcc.r.DeviceID, []string{"fs.read"}, 300)
+	if err != nil {
+		t.Fatalf("tHost MintGrant: %v", err)
+	}
+
+	tV2Ep, err := tHost.ServeRelayV2(tv2URL, "127.0.0.1", "")
+	if err != nil {
+		t.Fatalf("ServeRelayV2 with register ticket: %v", err)
+	}
+	go func() {
+		s, e := tHost.AcceptV2(5000)
+		if e == nil {
+			sessCh <- s
+		}
+	}()
+	tCliSess, err := tCli.ConnectV2(tV2Ep, "127.0.0.1", "go-ticket-host", tGrant)
+	if err != nil {
+		t.Fatalf("ConnectV2 with dial ticket: %v", err)
+	}
+	defer tCliSess.Close()
+	tHostSess := <-sessCh
+	defer tHostSess.Close()
+
+	if err := tCliSess.SendData([]byte("ticket-v2-ok")); err != nil {
+		t.Fatalf("tCliSess SendData: %v", err)
+	}
+	tev, err := tHostSess.PollEvent(3000)
+	if err != nil || tev.Event != "data" {
+		t.Fatalf("tHostSess PollEvent: ev=%+v err=%v", tev, err)
+	}
+	tGot, _ := base64.RawURLEncoding.DecodeString(tev.DataB64)
+	if string(tGot) != "ticket-v2-ok" {
+		t.Fatalf("unexpected ticket payload: %q", tGot)
+	}
+}
+
+func TestWireV2ConformancePeerInterop(t *testing.T) {
+	// Direction 1: Rust conformance_peer serves v2, Go dials PairV2Initiate + ConnectV2.
+	peer := spawnPeer(t)
+	goClient, err := tendril.NewEndpoint("", "go-v2-client")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer goClient.Close()
+
+	peer.call(t, map[string]any{"op": "init", "host_id": "rust-v2-peer"})
+	srv := peer.call(t, map[string]any{"op": "serve_direct"})
+	ep := srv["endpoint"].(string)
+	code := peer.call(t, map[string]any{"op": "issue_code", "kind": "lan"})["code"].(string)
+
+	peer.send(t, map[string]any{"op": "pair_v2_accept", "timeout_ms": 5000})
+	pairRes, err := goClient.PairV2Initiate(ep, "", code, "go-v2-dev", "go", "")
+	if err != nil {
+		t.Fatalf("Go PairV2Initiate: %v", err)
+	}
+	if pairRes.WireVersion != 2 {
+		t.Fatalf("expected WireVersion=2, got %d", pairRes.WireVersion)
+	}
+	peerPair := peer.recv(t)
+	if ok, _ := peerPair["ok"].(bool); !ok || peerPair["sas"] != pairRes.SAS {
+		t.Fatalf("v2 pair SAS mismatch: go=%s peer=%v", pairRes.SAS, peerPair)
+	}
+	cliDevID := peerPair["device_id"].(string)
+
+	peer.call(t, map[string]any{"op": "confirm", "peer_id": cliDevID, "sas": pairRes.SAS})
+	grantBytes, _ := json.Marshal(peer.call(t, map[string]any{
+		"op": "mint", "peer_id": cliDevID, "caps": []string{"fs.read"},
+	})["grant"])
+	if err := goClient.ConfirmPeer("rust-v2-peer", pairRes.SAS); err != nil {
+		t.Fatalf("Go ConfirmPeer: %v", err)
+	}
+
+	peer.send(t, map[string]any{"op": "accept_v2", "timeout_ms": 5000})
+	sess, err := goClient.ConnectV2(ep, "", "rust-v2-peer", string(grantBytes))
+	if err != nil {
+		t.Fatalf("Go ConnectV2: %v", err)
+	}
+	defer sess.Close()
+	if ok, _ := peer.recv(t)["ok"].(bool); !ok {
+		t.Fatalf("peer accept_v2 failed")
+	}
+
+	if err := sess.SendData([]byte("v2-hello-from-go")); err != nil {
+		t.Fatalf("Go SendData: %v", err)
+	}
+	ev := peer.call(t, map[string]any{"op": "recv", "timeout_ms": 2000})
+	if ev["event"] != "data" || ev["data_utf8"] != "v2-hello-from-go" {
+		t.Fatalf("unexpected peer recv: %v", ev)
+	}
+	if err := sess.Rekey(); err != nil {
+		t.Fatalf("Go v2 Rekey: %v", err)
+	}
+	peer.call(t, map[string]any{"op": "send", "data_utf8": "v2-reply-from-rust"})
+	// Drain rekey/data events.
+	var gotData string
+	for i := 0; i < 4; i++ {
+		goEv, err := sess.PollEvent(2000)
+		if err != nil {
+			t.Fatalf("Go PollEvent: %v", err)
+		}
+		if goEv.Event == "data" {
+			b, _ := base64.RawURLEncoding.DecodeString(goEv.DataB64)
+			gotData = string(b)
+			break
+		}
+	}
+	if gotData != "v2-reply-from-rust" {
+		t.Fatalf("unexpected Go v2 payload: %q", gotData)
+	}
+	if allowed, err := sess.Authorize("fs.read"); err != nil || !allowed {
+		t.Fatalf("Go v2 Authorize fs.read: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, err := sess.Authorize("shell.exec"); err != nil || allowed {
+		t.Fatalf("Go v2 Authorize shell.exec expected false: allowed=%v err=%v", allowed, err)
+	}
+
+	// Revoke peer on host side, close session, and verify subsequent ConnectV2 fails.
+	peer.call(t, map[string]any{"op": "revoke", "peer_id": cliDevID})
+	_ = sess.CloseSession(1000, "revoked")
+	peer.send(t, map[string]any{"op": "accept_v2", "timeout_ms": 3000})
+	if _, err := goClient.ConnectV2(ep, "", "rust-v2-peer", string(grantBytes)); err == nil {
+		t.Fatalf("expected ConnectV2 after peer revocation to fail")
+	}
+	_ = peer.recv(t)
+	peer.call(t, map[string]any{"op": "shutdown"})
+
+	// Direction 2: Go serves PairV2Accept + ServeRelayV2 + AcceptV2 against conformance_peer.
+	_, v2URL := spawnRelay(t, nil)
+	goHost, err := tendril.NewEndpoint("", "go-v2-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint goHost: %v", err)
+	}
+	defer goHost.Close()
+	hostEp, err := goHost.ServeDirect("")
+	if err != nil {
+		t.Fatalf("Go ServeDirect: %v", err)
+	}
+	code2, err := goHost.IssueCode("lan")
+	if err != nil {
+		t.Fatalf("Go IssueCode: %v", err)
+	}
+	peer2 := spawnPeer(t)
+	peer2.call(t, map[string]any{"op": "init", "host_id": "rust-v2-client"})
+	peer2.send(t, map[string]any{"op": "pair_v2_initiate", "endpoint": hostEp, "code": code2})
+	accPair, err := goHost.PairV2Accept(5000)
+	if err != nil {
+		t.Fatalf("Go PairV2Accept: %v", err)
+	}
+	if accPair.WireVersion != 2 {
+		t.Fatalf("expected accPair WireVersion=2, got %d", accPair.WireVersion)
+	}
+	p2Pair := peer2.recv(t)
+	if ok, _ := p2Pair["ok"].(bool); !ok || p2Pair["sas"] != accPair.SAS {
+		t.Fatalf("PairV2Accept SAS mismatch: %s vs %v", accPair.SAS, p2Pair)
+	}
+	if err := goHost.ConfirmPeer(accPair.DeviceID, accPair.SAS); err != nil {
+		t.Fatalf("Go ConfirmPeer: %v", err)
+	}
+	peer2.call(t, map[string]any{"op": "confirm", "peer_id": "go-v2-host", "sas": accPair.SAS})
+	grantJSON2, err := goHost.MintGrant(accPair.DeviceID, []string{"fs.read"}, 300)
+	if err != nil {
+		t.Fatalf("Go MintGrant: %v", err)
+	}
+	var grantVal2 any
+	_ = json.Unmarshal([]byte(grantJSON2), &grantVal2)
+
+	relayV2Ep, err := goHost.ServeRelayV2(v2URL, "127.0.0.1", accPair.DeviceID)
+	if err != nil {
+		t.Fatalf("Go ServeRelayV2: %v", err)
+	}
+	peer2.send(t, map[string]any{
+		"op": "connect_v2", "endpoint": relayV2Ep, "target_host_id": "go-v2-host", "grant": grantVal2,
+	})
+	hostSess, err := goHost.AcceptV2(5000)
+	if err != nil {
+		t.Fatalf("Go AcceptV2: %v", err)
+	}
+	defer hostSess.Close()
+	if ok, _ := peer2.recv(t)["ok"].(bool); !ok {
+		t.Fatalf("peer2 connect_v2 failed")
+	}
+	if allowed, err := hostSess.Authorize("fs.read"); err != nil || !allowed {
+		t.Fatalf("Go AcceptV2 Authorize fs.read failed: allowed=%v err=%v", allowed, err)
+	}
+	if err := goHost.RevokePeer(accPair.DeviceID); err != nil {
+		t.Fatalf("Go RevokePeer: %v", err)
+	}
+	if allowed, err := hostSess.Authorize("fs.read"); err != nil || allowed {
+		t.Fatalf("Go Authorize after RevokePeer expected false: allowed=%v err=%v", allowed, err)
+	}
+	_ = hostSess.CloseSession(1000, "done")
+	peer2.call(t, map[string]any{"op": "shutdown"})
 }

@@ -54,6 +54,15 @@ final class TendrilNative {
   public static native String endpointServeRelay(
       long ptr, String relayUrl, String expectedHost);
 
+  public static native void endpointConfigureTransportsJson(
+      long ptr, String transportConfigJson);
+
+  public static native String endpointMintRelayTicket(
+      long ptr, String relayHost, String role, String targetPubOrWildcard, long ttlSecs);
+
+  public static native String endpointServeRelayV2(
+      long ptr, String relayUrl, String expectedHost, String peerIdOpt);
+
   public static native String endpointServeP2p(long ptr, String relayMode);
 
   public static native String endpointIssueCode(long ptr, String kind);
@@ -62,6 +71,17 @@ final class TendrilNative {
       long ptr, String endpoint, String relayHost, String code, String name, String kind);
 
   public static native String endpointPairAccept(long ptr, long timeoutMs);
+
+  public static native String endpointPairV2Initiate(
+      long ptr,
+      String endpoint,
+      String relayHost,
+      String code,
+      String name,
+      String kind,
+      String pinnedHostJson);
+
+  public static native String endpointPairV2Accept(long ptr, long timeoutMs);
 
   public static native void endpointConfirmPeer(long ptr, String peerId, String sas);
 
@@ -94,6 +114,11 @@ final class TendrilNative {
       long epPtr, String endpoint, String relayHost, String targetHostId, String grantJson);
 
   public static native long sessionAccept(long epPtr, long timeoutMs);
+
+  public static native long sessionConnectV2(
+      long epPtr, String endpoint, String relayHost, String targetHostId, String grantJson);
+
+  public static native long sessionAcceptV2(long epPtr, long timeoutMs);
 
   public static native void sessionShutdown(long ptr);
 

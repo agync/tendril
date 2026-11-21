@@ -508,6 +508,60 @@ public final class TendrilEndpoint {
     }
   }
 
+  public func configureTransportsJSON(_ transportConfigJson: String) throws {
+    try withHandle { h in
+      let rc = try withValidatedCString(transportConfigJson, name: "transportConfigJson") { cCfg in
+        tendril_endpoint_configure_transports_json(h, cCfg)
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_configure_transports_json failed")
+      }
+    }
+  }
+
+  public func mintRelayTicket(
+    relayHost: String,
+    role: String? = nil,
+    targetPubOrWildcard: String? = nil,
+    ttlSecs: UInt64 = 300
+  ) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withValidatedCString(relayHost, name: "relayHost") { cHost in
+        try withOptionalValidatedCString(role, name: "role") { cRole in
+          try withOptionalValidatedCString(targetPubOrWildcard, name: "targetPubOrWildcard") { cTarget in
+            tendril_endpoint_mint_relay_ticket(h, cHost, cRole, cTarget, ttlSecs, &out)
+          }
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_mint_relay_ticket failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  public func serveRelayV2(
+    relayUrl: String,
+    expectedHost: String? = nil,
+    peerIdOpt: String? = nil
+  ) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withValidatedCString(relayUrl, name: "relayUrl") { cUrl in
+        try withOptionalValidatedCString(expectedHost, name: "expectedHost") { cHost in
+          try withOptionalValidatedCString(peerIdOpt, name: "peerIdOpt") { cPeer in
+            tendril_endpoint_serve_relay_v2(h, cUrl, cHost, cPeer, &out)
+          }
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_serve_relay_v2 failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
   public func serveP2p(relayMode: String? = nil) throws -> String {
     try withHandle { h in
       var out: UnsafeMutablePointer<CChar>?
@@ -569,6 +623,62 @@ public final class TendrilEndpoint {
       let rc = tendril_endpoint_pair_accept(h, timeoutMs, &out)
       guard rc == TENDRIL_OK.rawValue else {
         let acceptErr = ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
+        if rc != TENDRIL_WOULD_BLOCK.rawValue && rc != TENDRIL_ERR_CLOSED.rawValue {
+          do {
+            try persistRoster(h)
+          } catch {
+            throw TendrilError.ffi(
+              code: rc,
+              message: "\(acceptErr) (roster persist error: \(error))"
+            )
+          }
+        }
+        throw acceptErr
+      }
+      let result = takeOutCString(out)
+      try persistRoster(h)
+      return result
+    }
+  }
+
+  public func pairV2Initiate(
+    endpoint: String,
+    relayHost: String? = nil,
+    code: String,
+    deviceName: String,
+    deviceKind: String = "ios",
+    pinnedHostJson: String? = nil
+  ) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withValidatedCString(endpoint, name: "endpoint") { cEp in
+        try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
+          try withValidatedCString(code, name: "code") { cCode in
+            try withValidatedCString(deviceName, name: "deviceName") { cName in
+              try withValidatedCString(deviceKind, name: "deviceKind") { cKind in
+                try withOptionalValidatedCString(pinnedHostJson, name: "pinnedHostJson") { cPinned in
+                  tendril_endpoint_pair_v2_initiate(h, cEp, cRh, cCode, cName, cKind, cPinned, &out)
+                }
+              }
+            }
+          }
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_pair_v2_initiate failed")
+      }
+      let result = takeOutCString(out)
+      try persistRoster(h)
+      return result
+    }
+  }
+
+  public func pairV2Accept(timeoutMs: UInt64) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_endpoint_pair_v2_accept(h, timeoutMs, &out)
+      guard rc == TENDRIL_OK.rawValue else {
+        let acceptErr = ffiError(rc, fallback: "tendril_endpoint_pair_v2_accept failed")
         if rc != TENDRIL_WOULD_BLOCK.rawValue && rc != TENDRIL_ERR_CLOSED.rawValue {
           do {
             try persistRoster(h)
@@ -790,6 +900,76 @@ public final class TendrilEndpoint {
     try withHandle { h in
       guard let raw = tendril_session_accept(h, timeoutMs) else {
         throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept failed")
+      }
+      #if canImport(CryptoKit) && canImport(Security)
+      return TendrilSession(handle: raw, stateStore: stateStore)
+      #else
+      return TendrilSession(handle: raw)
+      #endif
+    }
+  }
+
+  public func connectV2(
+    endpoint: String,
+    relayHost: String? = nil,
+    targetHostId: String,
+    grantJson: String? = nil
+  ) throws -> TendrilSession {
+    try withHandle { h in
+      let raw = try withValidatedCString(endpoint, name: "endpoint") { cEp in
+        try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
+          try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
+            try withOptionalValidatedCString(grantJson, name: "grantJson") { cGrant in
+              tendril_session_connect_v2(h, cEp, cRh, cTarget, cGrant)
+            }
+          }
+        }
+      }
+      guard let raw else {
+        let connectErr = ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect_v2 failed")
+        do {
+          try persistRoster(h)
+        } catch {
+          throw TendrilError.ffi(
+            code: TENDRIL_ERR_INTERNAL.rawValue,
+            message: "\(connectErr) (roster persist error: \(error))"
+          )
+        }
+        throw connectErr
+      }
+      do {
+        try persistRoster(h)
+      } catch {
+        tendril_session_free(raw)
+        throw error
+      }
+      #if canImport(CryptoKit) && canImport(Security)
+      return TendrilSession(handle: raw, stateStore: stateStore)
+      #else
+      return TendrilSession(handle: raw)
+      #endif
+    }
+  }
+
+  public func acceptV2(timeoutMs: UInt64) throws -> TendrilSession {
+    try withHandle { h in
+      guard let raw = tendril_session_accept_v2(h, timeoutMs) else {
+        let acceptErr = ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept_v2 failed")
+        do {
+          try persistRoster(h)
+        } catch {
+          throw TendrilError.ffi(
+            code: TENDRIL_ERR_INTERNAL.rawValue,
+            message: "\(acceptErr) (roster persist error: \(error))"
+          )
+        }
+        throw acceptErr
+      }
+      do {
+        try persistRoster(h)
+      } catch {
+        tendril_session_free(raw)
+        throw error
       }
       #if canImport(CryptoKit) && canImport(Security)
       return TendrilSession(handle: raw, stateStore: stateStore)

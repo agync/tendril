@@ -899,6 +899,397 @@ public final class TendrilJniConformanceTest {
     }
   }
 
+  private static Path ensureRelayBinary(Path root) throws Exception {
+    Path bin = root.resolve("target").resolve("debug").resolve("tendril-relay");
+    if (Files.isExecutable(bin)) {
+      return bin;
+    }
+    Process p =
+        new ProcessBuilder("cargo", "build", "-p", "tendril-relay", "--bin", "tendril-relay")
+            .directory(root.toFile())
+            .redirectErrorStream(true)
+            .start();
+    String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+    int code = p.waitFor();
+    check(code == 0, "failed to build tendril-relay: " + out);
+    return bin;
+  }
+
+  private static final class RelayProcess implements AutoCloseable {
+    final Process proc;
+    final String v1Url;
+    final String v2Url;
+
+    RelayProcess(Path bin, Map<String, String> extraEnv, String... extraArgs) throws Exception {
+      List<String> cmd = new ArrayList<>();
+      cmd.add(bin.toString());
+      cmd.add("--listen");
+      cmd.add("127.0.0.1:0");
+      cmd.add("--host");
+      cmd.add("127.0.0.1");
+      for (String a : extraArgs) {
+        cmd.add(a);
+      }
+      ProcessBuilder pb = new ProcessBuilder(cmd);
+      pb.redirectErrorStream(true);
+      pb.environment().put("RUST_LOG", "info");
+      if (extraEnv != null) {
+        pb.environment().putAll(extraEnv);
+      }
+      this.proc = pb.start();
+      BufferedReader br =
+          new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8));
+      StringBuilder logs = new StringBuilder();
+      String found = null;
+      long deadline = System.currentTimeMillis() + 10_000L;
+      while (System.currentTimeMillis() < deadline) {
+        if (!br.ready()) {
+          if (!proc.isAlive()) {
+            break;
+          }
+          Thread.sleep(20);
+          continue;
+        }
+        String line = br.readLine();
+        if (line == null) {
+          break;
+        }
+        String clean = line.replaceAll("\u001b\\[[0-9;]*m", "");
+        logs.append(clean).append('\n');
+        int idx = clean.indexOf("ws://127.0.0.1:");
+        if (idx >= 0) {
+          String rest = clean.substring(idx);
+          int end = rest.length();
+          for (int i = 0; i < rest.length(); i++) {
+            char c = rest.charAt(i);
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '"') {
+              end = i;
+              break;
+            }
+          }
+          String cand = rest.substring(0, end);
+          if (cand.endsWith("/v1/relay")) {
+            found = cand;
+            break;
+          }
+        }
+      }
+      if (found == null) {
+        proc.destroyForcibly();
+        throw new AssertionError("tendril-relay startup failed:\n" + logs);
+      }
+      this.v1Url = found;
+      this.v2Url = found.substring(0, found.length() - "/v1/relay".length()) + "/v2/relay";
+      Thread drain =
+          new Thread(
+              () -> {
+                try {
+                  while (br.readLine() != null) {}
+                } catch (IOException ignored) {
+                }
+              });
+      drain.setDaemon(true);
+      drain.start();
+    }
+
+    @Override
+    public void close() {
+      proc.destroyForcibly();
+      try {
+        proc.waitFor();
+      } catch (InterruptedException ignored) {
+        Thread.currentThread().interrupt();
+      }
+    }
+  }
+
+  private static void verifyConfigureTransportsAndRelayAdmission(Path root) throws Exception {
+    long cfgEp = TendrilNative.endpointNew(null, "jni-cfg-ep");
+    try {
+      TendrilNative.endpointConfigureTransportsJson(cfgEp, "{}");
+      String secretSentinel = "jni-secret-sentinel-777";
+      boolean unknownRejected = false;
+      try {
+        TendrilNative.endpointConfigureTransportsJson(
+            cfgEp, "{\"relay_auth_secret\":\"" + secretSentinel + "\",\"unknown_field\":true}");
+      } catch (IllegalStateException e) {
+        unknownRejected = true;
+        check(
+            e.getMessage() == null || !e.getMessage().contains(secretSentinel),
+            "configureTransportsJson leaked secret scalar");
+      }
+      check(unknownRejected, "unknown_field must be rejected");
+
+      boolean scalarRejected = false;
+      try {
+        TendrilNative.endpointConfigureTransportsJson(cfgEp, "{\"relay_auth_secret\":98765}");
+      } catch (IllegalStateException e) {
+        scalarRejected = true;
+        check(
+            e.getMessage() == null || !e.getMessage().contains("98765"),
+            "configureTransportsJson leaked scalar value");
+      }
+      check(scalarRejected, "scalar type mismatch must be rejected");
+    } finally {
+      TendrilNative.endpointFree(cfgEp);
+    }
+
+    Path relayBin = ensureRelayBinary(root);
+
+    // 1. HMAC-gated relay (/v1/relay and /v2/relay)
+    String hmacSecret = "jni-shared-relay-hmac-secret";
+    try (RelayProcess relay =
+        new RelayProcess(
+            relayBin, Map.of("TENDRIL_RELAY_AUTH_SECRET", hmacSecret), "--auth-scope", "all")) {
+      long hostEp = TendrilNative.endpointNew(null, "jni-hmac-host");
+      long cliEp = TendrilNative.endpointNew(null, "jni-hmac-cli");
+      try {
+        boolean unauthRejected = false;
+        try {
+          TendrilNative.endpointServeRelay(hostEp, relay.v1Url, "127.0.0.1");
+        } catch (IllegalStateException e) {
+          unauthRejected = true;
+        }
+        check(unauthRejected, "unconfigured serveRelay must fail on HMAC relay");
+
+        TendrilNative.endpointConfigureTransportsJson(
+            hostEp, "{\"relay_auth_secret\":\"wrong-secret\"}");
+        boolean wrongRejected = false;
+        try {
+          TendrilNative.endpointServeRelay(hostEp, relay.v1Url, "127.0.0.1");
+        } catch (IllegalStateException e) {
+          wrongRejected = true;
+        }
+        check(wrongRejected, "wrong-secret serveRelay must fail on HMAC relay");
+
+        String okCfg = "{\"relay_auth_secret\":\"" + hmacSecret + "\"}";
+        TendrilNative.endpointConfigureTransportsJson(hostEp, okCfg);
+        String v1Ep = TendrilNative.endpointServeRelay(hostEp, relay.v1Url, "127.0.0.1");
+        String code = TendrilNative.endpointIssueCode(hostEp, "remote");
+
+        boolean cliUnauthRejected = false;
+        try {
+          TendrilNative.endpointPairV2Initiate(cliEp, v1Ep, "127.0.0.1", code, "c", "jni", null);
+        } catch (IllegalStateException e) {
+          cliUnauthRejected = true;
+        }
+        check(cliUnauthRejected, "unconfigured client pairV2Initiate must fail on HMAC relay");
+
+        TendrilNative.endpointConfigureTransportsJson(cliEp, okCfg);
+        final String[] accJson = new String[1];
+        Thread accThread =
+            new Thread(() -> accJson[0] = TendrilNative.endpointPairV2Accept(hostEp, 5000));
+        accThread.start();
+        Map<String, Object> initRes =
+            asObj(
+                Json.parse(
+                    TendrilNative.endpointPairV2Initiate(
+                        cliEp, v1Ep, "127.0.0.1", code, "jni-hmac-dev", "jni", null)));
+        accThread.join(5000);
+        Map<String, Object> accRes = asObj(Json.parse(accJson[0]));
+        check(initRes.get("sas").equals(accRes.get("sas")), "HMAC v2 pair SAS mismatch");
+
+        TendrilNative.endpointConfirmPeer(
+            hostEp, asStr(accRes.get("device_id")), asStr(accRes.get("sas")));
+        TendrilNative.endpointConfirmPeer(cliEp, "jni-hmac-host", asStr(initRes.get("sas")));
+        String grantJson =
+            TendrilNative.endpointMintGrant(
+                hostEp, asStr(accRes.get("device_id")), "[\"fs.read\"]", 300);
+
+        String v2Ep = TendrilNative.endpointServeRelayV2(hostEp, relay.v2Url, "127.0.0.1", null);
+        TendrilNative.endpointConfigureTransportsJson(
+            cliEp, "{\"relay_auth_secret\":\"wrong-secret\"}");
+        boolean wrongV2Rejected = false;
+        try {
+          TendrilNative.sessionConnectV2(cliEp, v2Ep, "127.0.0.1", "jni-hmac-host", grantJson);
+        } catch (IllegalStateException e) {
+          wrongV2Rejected = true;
+        }
+        check(wrongV2Rejected, "wrong-secret sessionConnectV2 must fail on /v2/relay");
+        TendrilNative.endpointConfigureTransportsJson(cliEp, okCfg);
+
+        final long[] hostSess = new long[1];
+        Thread sAccThread =
+            new Thread(() -> hostSess[0] = TendrilNative.sessionAcceptV2(hostEp, 5000));
+        sAccThread.start();
+        long cliSess =
+            TendrilNative.sessionConnectV2(cliEp, v2Ep, "127.0.0.1", "jni-hmac-host", grantJson);
+        sAccThread.join(5000);
+        try {
+          TendrilNative.sessionSendData(cliSess, "jni-hmac-v2".getBytes(StandardCharsets.UTF_8));
+          Map<String, Object> ev =
+              asObj(Json.parse(TendrilNative.sessionPollEvent(hostSess[0], 3000)));
+          check("data".equals(ev.get("event")), "expected data event on HMAC v2 session");
+          String payload =
+              new String(b64UrlDecode(asStr(ev.get("data_b64"))), StandardCharsets.UTF_8);
+          check("jni-hmac-v2".equals(payload), "unexpected HMAC v2 payload: " + payload);
+          TendrilNative.sessionClose(cliSess, 1000, "done");
+        } finally {
+          TendrilNative.sessionFree(cliSess);
+          if (hostSess[0] != 0) {
+            TendrilNative.sessionFree(hostSess[0]);
+          }
+        }
+      } finally {
+        TendrilNative.endpointClose(hostEp);
+        TendrilNative.endpointFree(cliEp);
+        TendrilNative.endpointFree(hostEp);
+      }
+    }
+
+    // 2. Ticket-gated relay (/v1/relay and /v2/relay)
+    long issuerEp = TendrilNative.endpointNew(null, "jni-ticket-issuer");
+    try {
+      Map<String, Object> issuerInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(issuerEp)));
+      String issuerPub = asStr(issuerInfo.get("relay_pub"));
+      String regTicket =
+          TendrilNative.endpointMintRelayTicket(issuerEp, "127.0.0.1", "register", "*", 300);
+      String dialTicket =
+          TendrilNative.endpointMintRelayTicket(issuerEp, "127.0.0.1", "dial", "*", 300);
+
+      try (RelayProcess tRelay =
+          new RelayProcess(relayBin, null, "--issuer-pub", issuerPub, "--auth-scope", "all")) {
+        long tHost = TendrilNative.endpointNew(null, "jni-ticket-host");
+        long tCli = TendrilNative.endpointNew(null, "jni-ticket-cli");
+        try {
+          TendrilNative.endpointConfigureTransportsJson(tHost, "{\"relay_ticket\":" + dialTicket + "}");
+          boolean wrongRoleReg = false;
+          try {
+            TendrilNative.endpointServeRelay(tHost, tRelay.v1Url, "127.0.0.1");
+          } catch (IllegalStateException e) {
+            wrongRoleReg = true;
+          }
+          check(wrongRoleReg, "dial-role ticket must be rejected for serveRelay");
+
+          TendrilNative.endpointConfigureTransportsJson(tHost, "{\"relay_ticket\":" + regTicket + "}");
+          String tV1Ep = TendrilNative.endpointServeRelay(tHost, tRelay.v1Url, "127.0.0.1");
+          String tCode = TendrilNative.endpointIssueCode(tHost, "remote");
+
+          TendrilNative.endpointConfigureTransportsJson(tCli, "{\"relay_ticket\":" + regTicket + "}");
+          boolean wrongRoleDial = false;
+          try {
+            TendrilNative.endpointPairV2Initiate(
+                tCli, tV1Ep, "127.0.0.1", tCode, "tc", "jni", null);
+          } catch (IllegalStateException e) {
+            wrongRoleDial = true;
+          }
+          check(wrongRoleDial, "register-role ticket must be rejected for pairV2Initiate");
+
+          TendrilNative.endpointConfigureTransportsJson(tCli, "{\"relay_ticket\":" + dialTicket + "}");
+          final String[] tAccJson = new String[1];
+          Thread tAccThread =
+              new Thread(() -> tAccJson[0] = TendrilNative.endpointPairV2Accept(tHost, 5000));
+          tAccThread.start();
+          Map<String, Object> tInit =
+              asObj(
+                  Json.parse(
+                      TendrilNative.endpointPairV2Initiate(
+                          tCli, tV1Ep, "127.0.0.1", tCode, "tc", "jni", null)));
+          tAccThread.join(5000);
+          Map<String, Object> tAcc = asObj(Json.parse(tAccJson[0]));
+          check(tInit.get("sas").equals(tAcc.get("sas")), "ticket v2 pair SAS mismatch");
+          TendrilNative.endpointConfirmPeer(
+              tHost, asStr(tAcc.get("device_id")), asStr(tAcc.get("sas")));
+          TendrilNative.endpointConfirmPeer(tCli, "jni-ticket-host", asStr(tInit.get("sas")));
+          String tGrant =
+              TendrilNative.endpointMintGrant(
+                  tHost, asStr(tAcc.get("device_id")), "[\"fs.read\"]", 300);
+
+          String tV2Ep = TendrilNative.endpointServeRelayV2(tHost, tRelay.v2Url, "127.0.0.1", null);
+          final long[] tHostSess = new long[1];
+          Thread tsAcc =
+              new Thread(() -> tHostSess[0] = TendrilNative.sessionAcceptV2(tHost, 5000));
+          tsAcc.start();
+          long tCliSess =
+              TendrilNative.sessionConnectV2(tCli, tV2Ep, "127.0.0.1", "jni-ticket-host", tGrant);
+          tsAcc.join(5000);
+          try {
+            TendrilNative.sessionSendData(
+                tCliSess, "jni-ticket-v2".getBytes(StandardCharsets.UTF_8));
+            Map<String, Object> tev =
+                asObj(Json.parse(TendrilNative.sessionPollEvent(tHostSess[0], 3000)));
+            check("data".equals(tev.get("event")), "expected data event on ticket v2 session");
+            String tp =
+                new String(b64UrlDecode(asStr(tev.get("data_b64"))), StandardCharsets.UTF_8);
+            check("jni-ticket-v2".equals(tp), "unexpected ticket v2 payload: " + tp);
+            TendrilNative.sessionClose(tCliSess, 1000, "done");
+          } finally {
+            TendrilNative.sessionFree(tCliSess);
+            if (tHostSess[0] != 0) {
+              TendrilNative.sessionFree(tHostSess[0]);
+            }
+          }
+        } finally {
+          TendrilNative.endpointClose(tHost);
+          TendrilNative.endpointFree(tCli);
+          TendrilNative.endpointFree(tHost);
+        }
+      }
+    } finally {
+      TendrilNative.endpointFree(issuerEp);
+    }
+  }
+
+  private static void verifyWireV2ConformancePeer(Path peerBin) throws Exception {
+    try (PeerDriver peer = new PeerDriver(peerBin)) {
+      long cliEp = TendrilNative.endpointNew(null, "jni-v2-cli");
+      try {
+        peer.call(Map.of("op", "init", "host_id", "rust-jni-v2"));
+        String ep = asStr(peer.call(Map.of("op", "serve_direct")).get("endpoint"));
+        String code = asStr(peer.call(Map.of("op", "issue_code", "kind", "lan")).get("code"));
+
+        peer.send(Map.of("op", "pair_v2_accept", "timeout_ms", 5000));
+        Map<String, Object> initRes =
+            asObj(
+                Json.parse(
+                    TendrilNative.endpointPairV2Initiate(
+                        cliEp, ep, null, code, "jni-v2-dev", "jni", null)));
+        Map<String, Object> peerPair = peer.recv();
+        check(Boolean.TRUE.equals(peerPair.get("ok")), "peer pair_v2_accept failed");
+        check(initRes.get("sas").equals(peerPair.get("sas")), "v2 SAS mismatch");
+        String cliDevId = asStr(peerPair.get("device_id"));
+
+        peer.call(Map.of("op", "confirm", "peer_id", cliDevId, "sas", asStr(initRes.get("sas"))));
+        Object grantObj =
+            peer.call(Map.of("op", "mint", "peer_id", cliDevId, "caps", List.of("fs.read")))
+                .get("grant");
+        String grantJson = Json.stringify(grantObj);
+        TendrilNative.endpointConfirmPeer(cliEp, "rust-jni-v2", asStr(initRes.get("sas")));
+
+        peer.send(Map.of("op", "accept_v2", "timeout_ms", 5000));
+        long sess = TendrilNative.sessionConnectV2(cliEp, ep, null, "rust-jni-v2", grantJson);
+        try {
+          check(Boolean.TRUE.equals(peer.recv().get("ok")), "peer accept_v2 failed");
+          TendrilNative.sessionSendData(sess, "jni-v2-hello".getBytes(StandardCharsets.UTF_8));
+          Map<String, Object> ev = peer.call(Map.of("op", "recv", "timeout_ms", 2000));
+          check(
+              "data".equals(ev.get("event")) && "jni-v2-hello".equals(ev.get("data_utf8")),
+              "unexpected v2 recv: " + ev);
+          TendrilNative.sessionRekey(sess);
+          peer.call(Map.of("op", "send", "data_utf8", "rust-v2-reply"));
+          String got = null;
+          for (int i = 0; i < 4; i++) {
+            Map<String, Object> jev =
+                asObj(Json.parse(TendrilNative.sessionPollEvent(sess, 2000)));
+            if ("data".equals(jev.get("event"))) {
+              got = new String(b64UrlDecode(asStr(jev.get("data_b64"))), StandardCharsets.UTF_8);
+              break;
+            }
+          }
+          check("rust-v2-reply".equals(got), "unexpected rust v2 reply: " + got);
+          check(TendrilNative.sessionAuthorize(sess, "fs.read"), "fs.read should be allowed");
+          check(!TendrilNative.sessionAuthorize(sess, "shell.exec"), "shell.exec should be denied");
+          TendrilNative.sessionClose(sess, 1000, "done");
+        } finally {
+          TendrilNative.sessionFree(sess);
+        }
+        peer.call(Map.of("op", "shutdown"));
+      } finally {
+        TendrilNative.endpointFree(cliEp);
+      }
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     Path root = Paths.get("").toAbsolutePath().normalize();
     Path peerBin = root.resolve("target").resolve("debug").resolve("tendril-conformance-peer");
@@ -910,5 +1301,8 @@ public final class TendrilJniConformanceTest {
     System.out.println("JNI_LIVE_INTEROP_OK=true");
     verifyM2mEnrollment();
     System.out.println("JNI_M2M_OK=true");
+    verifyConfigureTransportsAndRelayAdmission(root);
+    verifyWireV2ConformancePeer(peerBin);
+    System.out.println("JNI_V2_RELAY_OK=true");
   }
 }

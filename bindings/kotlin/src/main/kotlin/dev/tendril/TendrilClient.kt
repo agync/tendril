@@ -205,6 +205,26 @@ class TendrilEndpoint private constructor(
   fun serveRelay(relayUrl: String, expectedHost: String? = null): String =
     withHandle { TendrilNative.endpointServeRelay(it, relayUrl, expectedHost) }
 
+  fun configureTransportsJson(transportConfigJson: String) =
+    withHandle { TendrilNative.endpointConfigureTransportsJson(it, transportConfigJson) }
+
+  fun mintRelayTicket(
+    relayHost: String,
+    role: String? = null,
+    targetPubOrWildcard: String? = null,
+    ttlSecs: Long = 300,
+  ): String =
+    withHandle {
+      TendrilNative.endpointMintRelayTicket(it, relayHost, role, targetPubOrWildcard, ttlSecs)
+    }
+
+  fun serveRelayV2(
+    relayUrl: String,
+    expectedHost: String? = null,
+    peerIdOpt: String? = null,
+  ): String =
+    withHandle { TendrilNative.endpointServeRelayV2(it, relayUrl, expectedHost, peerIdOpt) }
+
   fun serveP2p(relayMode: String? = null): String =
     withHandle { TendrilNative.endpointServeP2p(it, relayMode) }
 
@@ -228,6 +248,45 @@ class TendrilEndpoint private constructor(
     withHandle {
       try {
         val out = TendrilNative.endpointPairAccept(it, timeoutMs)
+        persistRoster(it)
+        out
+      } catch (t: Throwable) {
+        try {
+          persistRoster(it)
+        } catch (pe: Throwable) {
+          t.addSuppressed(pe)
+        }
+        throw t
+      }
+    }
+
+  fun pairV2Initiate(
+    endpoint: String,
+    relayHost: String? = null,
+    code: String,
+    deviceName: String,
+    deviceKind: String = "android",
+    pinnedHostJson: String? = null,
+  ): String =
+    withHandle {
+      val out =
+        TendrilNative.endpointPairV2Initiate(
+          it,
+          endpoint,
+          relayHost,
+          code,
+          deviceName,
+          deviceKind,
+          pinnedHostJson,
+        )
+      persistRoster(it)
+      out
+    }
+
+  fun pairV2Accept(timeoutMs: Long): String =
+    withHandle {
+      try {
+        val out = TendrilNative.endpointPairV2Accept(it, timeoutMs)
         persistRoster(it)
         out
       } catch (t: Throwable) {
@@ -341,6 +400,65 @@ class TendrilEndpoint private constructor(
 
   fun acceptSession(timeoutMs: Long): TendrilSession =
     withHandle { TendrilSession(TendrilNative.sessionAccept(it, timeoutMs), stateStore) }
+
+  fun connectV2(
+    endpoint: String,
+    relayHost: String? = null,
+    targetHostId: String,
+    grantJson: String? = null,
+  ): TendrilSession =
+    withHandle {
+      var sessionPtr = 0L
+      try {
+        sessionPtr = TendrilNative.sessionConnectV2(it, endpoint, relayHost, targetHostId, grantJson)
+        persistRoster(it)
+        val ownedPtr = sessionPtr
+        sessionPtr = 0L
+        TendrilSession(ownedPtr, stateStore)
+      } catch (t: Throwable) {
+        if (sessionPtr != 0L) {
+          try {
+            TendrilNative.sessionFree(sessionPtr)
+          } catch (freeErr: Throwable) {
+            t.addSuppressed(freeErr)
+          }
+        } else {
+          try {
+            persistRoster(it)
+          } catch (pe: Throwable) {
+            t.addSuppressed(pe)
+          }
+        }
+        throw t
+      }
+    }
+
+  fun acceptV2(timeoutMs: Long): TendrilSession =
+    withHandle {
+      var sessionPtr = 0L
+      try {
+        sessionPtr = TendrilNative.sessionAcceptV2(it, timeoutMs)
+        persistRoster(it)
+        val ownedPtr = sessionPtr
+        sessionPtr = 0L
+        TendrilSession(ownedPtr, stateStore)
+      } catch (t: Throwable) {
+        if (sessionPtr != 0L) {
+          try {
+            TendrilNative.sessionFree(sessionPtr)
+          } catch (freeErr: Throwable) {
+            t.addSuppressed(freeErr)
+          }
+        } else {
+          try {
+            persistRoster(it)
+          } catch (pe: Throwable) {
+            t.addSuppressed(pe)
+          }
+        }
+        throw t
+      }
+    }
 
   override fun close() {
     lock.read {

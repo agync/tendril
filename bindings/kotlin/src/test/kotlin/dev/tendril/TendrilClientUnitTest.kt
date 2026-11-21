@@ -54,4 +54,37 @@ class TendrilClientUnitTest {
       tmpDir.toFile().deleteRecursively()
     }
   }
+
+  @Test
+  fun tendrilEndpointAndNativeExposeWaveDV2Methods() {
+    val epMethods = TendrilEndpoint::class.java.declaredMethods.map { it.name }.toSet()
+    val expectedEp =
+      listOf(
+        "configureTransportsJson",
+        "mintRelayTicket",
+        "serveRelayV2",
+        "pairV2Initiate",
+        "pairV2Accept",
+        "connectV2",
+        "acceptV2",
+      )
+    for (name in expectedEp) {
+      assertTrue("missing TendrilEndpoint.$name", epMethods.contains(name))
+    }
+
+    val nativeMethods = TendrilNative::class.java.declaredMethods.map { it.name }.toSet()
+    val expectedNative =
+      listOf(
+        "endpointConfigureTransportsJson",
+        "endpointMintRelayTicket",
+        "endpointServeRelayV2",
+        "endpointPairV2Initiate",
+        "endpointPairV2Accept",
+        "sessionConnectV2",
+        "sessionAcceptV2",
+      )
+    for (name in expectedNative) {
+      assertTrue("missing TendrilNative.$name", nativeMethods.contains(name))
+    }
+  }
 }

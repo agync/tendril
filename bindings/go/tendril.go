@@ -49,16 +49,18 @@ type PairInitiateResult struct {
 	SAS           string `json:"sas"`
 	Status        string `json:"status,omitempty"`
 	HostConfirmed bool   `json:"host_confirmed,omitempty"`
+	WireVersion   uint8  `json:"wire_version,omitempty"`
 }
 
 // PairAcceptResult holds the server-side outcome of accepting a pairing connection.
 type PairAcceptResult struct {
-	DeviceID   string `json:"device_id"`
-	SAS        string `json:"sas,omitempty"`
-	Status     string `json:"status,omitempty"`
-	TokenNonce string `json:"token_nonce,omitempty"`
-	Name       string `json:"name"`
-	Kind       string `json:"kind"`
+	DeviceID    string `json:"device_id"`
+	SAS         string `json:"sas,omitempty"`
+	Status      string `json:"status,omitempty"`
+	TokenNonce  string `json:"token_nonce,omitempty"`
+	Name        string `json:"name"`
+	Kind        string `json:"kind"`
+	WireVersion uint8  `json:"wire_version,omitempty"`
 }
 
 // EnrollInitiateResult holds the client-side outcome of M2M enrollment initiation.
@@ -415,6 +417,78 @@ func (ep *Endpoint) ServeRelay(relayURL, expectedHost string) (string, error) {
 	return endpoint, err
 }
 
+// ConfigureTransportsJSON applies a JSON transport configuration (relay auth, P2P, wake) to this endpoint.
+func (ep *Endpoint) ConfigureTransportsJSON(transportConfigJSON string) error {
+	return ep.withHandle(func(h *C.TendrilEndpoint) error {
+		ccfg, err := toCStr(transportConfigJSON, "transportConfigJSON")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(ccfg))
+		rc := C.tendril_endpoint_configure_transports_json(h, ccfg)
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return nil
+	})
+}
+
+// MintRelayTicket mints a canonical signed stateless Ed25519 RelayTicket JSON object.
+func (ep *Endpoint) MintRelayTicket(relayHost, role, targetPubOrWildcard string, ttlSecs uint64) (string, error) {
+	var ticket string
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		chost, err := toCStr(relayHost, "relayHost")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(chost))
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptCStr(role, "role", func(cr *C.char) error {
+			return withOptCStr(targetPubOrWildcard, "targetPubOrWildcard", func(ct *C.char) error {
+				rc = C.tendril_endpoint_mint_relay_ticket(h, chost, cr, ct, C.uint64_t(ttlSecs), &out)
+				return nil
+			})
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		ticket = takeOutCStr(out)
+		return nil
+	})
+	return ticket, err
+}
+
+// ServeRelayV2 registers blinded /v2/relay epoch mailboxes for peerIDOpt (or all active v2 peers when empty).
+func (ep *Endpoint) ServeRelayV2(relayURL, expectedHost, peerIDOpt string) (string, error) {
+	var endpoint string
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		curl, err := toCStr(relayURL, "relayURL")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(curl))
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptCStr(expectedHost, "expectedHost", func(ch *C.char) error {
+			return withOptCStr(peerIDOpt, "peerIDOpt", func(cp *C.char) error {
+				rc = C.tendril_endpoint_serve_relay_v2(h, curl, ch, cp, &out)
+				return nil
+			})
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		endpoint = takeOutCStr(out)
+		return nil
+	})
+	return endpoint, err
+}
+
 // ServeP2p binds an iroh P2P listener ("default", "disabled", or relay URL) using the endpoint's derived P2P key.
 func (ep *Endpoint) ServeP2p(relayMode string) (string, error) {
 	var endpoint string
@@ -499,6 +573,60 @@ func (ep *Endpoint) PairAccept(timeoutMs uint64) (PairAcceptResult, error) {
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
 		var out *C.char
 		rc := C.tendril_endpoint_pair_accept(h, C.uint64_t(timeoutMs), &out)
+		if rc == C.TENDRIL_WOULD_BLOCK {
+			return ErrWouldBlock
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return json.Unmarshal([]byte(takeOutCStr(out)), &res)
+	})
+	return res, err
+}
+
+// PairV2Initiate initiates a Wire v2 hybrid Argon2id PAKE + ML-KEM-768 pairing handshake toward endpoint.
+func (ep *Endpoint) PairV2Initiate(endpoint, relayHost, code, name, kind, pinnedHostJSON string) (PairInitiateResult, error) {
+	var res PairInitiateResult
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cep, err := toCStr(endpoint, "endpoint")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cep))
+		ccode, err := toCStr(code, "code")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(ccode))
+
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptCStr(relayHost, "relayHost", func(cr *C.char) error {
+			return withOptCStr(name, "name", func(cn *C.char) error {
+				return withOptCStr(kind, "kind", func(ck *C.char) error {
+					return withOptCStr(pinnedHostJSON, "pinnedHostJSON", func(cp *C.char) error {
+						rc = C.tendril_endpoint_pair_v2_initiate(h, cep, cr, ccode, cn, ck, cp, &out)
+						return nil
+					})
+				})
+			})
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return json.Unmarshal([]byte(takeOutCStr(out)), &res)
+	})
+	return res, err
+}
+
+// PairV2Accept accepts the next incoming Wire v2 PAKE pairing connection within timeoutMs.
+func (ep *Endpoint) PairV2Accept(timeoutMs uint64) (PairAcceptResult, error) {
+	var res PairAcceptResult
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		var out *C.char
+		rc := C.tendril_endpoint_pair_v2_accept(h, C.uint64_t(timeoutMs), &out)
 		if rc == C.TENDRIL_WOULD_BLOCK {
 			return ErrWouldBlock
 		}
@@ -750,6 +878,53 @@ func (ep *Endpoint) AcceptSession(timeoutMs uint64) (*Session, error) {
 		raw := C.tendril_session_accept(h, C.uint64_t(timeoutMs))
 		if raw == nil {
 			return fmt.Errorf("tendril_session_accept failed: %s", lastError())
+		}
+		sess = newSession(raw)
+		return nil
+	})
+	return sess, err
+}
+
+// ConnectV2 opens an authenticated Wire v2 pseudonymous session toward targetHostID via endpoint.
+func (ep *Endpoint) ConnectV2(endpoint, relayHost, targetHostID, grantJSON string) (*Session, error) {
+	var sess *Session
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cep, err := toCStr(endpoint, "endpoint")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cep))
+		ctarget, err := toCStr(targetHostID, "targetHostID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(ctarget))
+
+		var raw *C.TendrilSession
+		if err := withOptCStr(relayHost, "relayHost", func(cr *C.char) error {
+			return withOptCStr(grantJSON, "grantJSON", func(cg *C.char) error {
+				raw = C.tendril_session_connect_v2(h, cep, cr, ctarget, cg)
+				return nil
+			})
+		}); err != nil {
+			return err
+		}
+		if raw == nil {
+			return fmt.Errorf("tendril_session_connect_v2 failed: %s", lastError())
+		}
+		sess = newSession(raw)
+		return nil
+	})
+	return sess, err
+}
+
+// AcceptV2 accepts and authenticates the next inbound Wire v2 session stream within timeoutMs.
+func (ep *Endpoint) AcceptV2(timeoutMs uint64) (*Session, error) {
+	var sess *Session
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		raw := C.tendril_session_accept_v2(h, C.uint64_t(timeoutMs))
+		if raw == nil {
+			return fmt.Errorf("tendril_session_accept_v2 failed: %s", lastError())
 		}
 		sess = newSession(raw)
 		return nil
