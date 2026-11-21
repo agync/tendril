@@ -12,7 +12,7 @@ Machine-to-machine (M2M) enrollment allows headless servers, CI runners, and wor
 
 ## Threat model and prerequisites
 
-- **Opt-in responder policy:** M2M enrollment is disabled by default (`EnrollmentPolicy::default().enabled == false`). Hosts enable it explicitly via `serve --allow-enroll` in `tendril-cli` or by registering trust anchors or minting enrollment tokens through the C ABI (`tendril-ffi`).
+- **Opt-in responder policy:** M2M enrollment is disabled by default (`EnrollmentPolicy::default().enabled == false`). Hosts enable it explicitly via `serve --allow-enroll` in `tendril-cli` or by registering active trust anchors or minting self-targeted enrollment tokens across `tendril-ffi`, Go, Python, Node.js, Android Kotlin JNI, and Apple Swift (while revoking the last active anchor with no self-issued token returns the host policy to disabled/`unauthorized`). On the sans-I/O browser SDK, `WasmIdentity`, `WasmRoster`, `WasmPairInitiator`, and `TendrilWebClient.{addTrustAnchor, revokeTrustAnchor, mintEnrollmentToken, enroll}` provide initiator enrollment, token minting, and roster trust-anchor management.
 - **Mandatory out-of-band initiator pinning:** Initiators MUST hold a `PinnedHost` (`host_id`, static X25519 key, Ed25519 signing key, and `rotation_seq`) and verify `HostHello` (and any `RotationRecord` chain) in `msg2` before sending `msg3`. Unpinned Trust On First Use (TOFU) is forbidden in M2M mode.
 - **Channel-bound proof (`enroll_proof`):** In `msg3`, the initiator sends a `PairClaim` carrying `enrollment_token`, `signing_pub`, and `enroll_proof = Ed25519(peer_signing_priv, "tendril-enroll-v1\0" || h || peer_static_pub || UTF-8(token.nonce))`, binding the token to the exact handshake transcript and peer identity.
 

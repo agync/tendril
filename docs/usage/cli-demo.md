@@ -35,8 +35,9 @@ tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --issue-code lan
 # Optional multi-rung host serving (zero-setup P2P or embedded relay):
 # tendril --state-dir ./host-state serve --p2p --embedded-relay --issue-code remote
 # tendril --state-dir ./host-state serve --p2p-relay https://relay.example/ --ephemeral-p2p
-# tendril --state-dir ./host-state serve --p2p-local --overlay 127.0.0.1:0 --broker 127.0.0.1:0 --issue-code remote
+# tendril --state-dir ./host-state serve --p2p-local --overlay 127.0.0.1:0 --overlay-allow-non-tailnet --broker 127.0.0.1:0 --issue-code remote
 # (Pass --p2p-local or TENDRIL_P2P_LOCAL=1 on serve/pair/dial for offline local P2P;
+#  --overlay rejects non-Tailscale CGNAT/ULA peer IPs by default unless --overlay-allow-non-tailnet is passed;
 #  custom --p2p-relay URLs disable n0 Pkarr/DNS publishing by default; pass --no-pkarr on default relay mode
 #  to opt out of Pkarr/DNS, or --include-direct-addrs to explicitly include non-metadata ?addr= hints.)
 
@@ -59,7 +60,7 @@ tendril --state-dir ./host-state revoke <client_device_id>
 
 ## Headless M2M enrollment and log redaction
 
-Autonomous devices enroll without SAS interaction using `serve --allow-enroll`, single-use enrollment tokens (`--token-file`, `--token-stdin`, or `TENDRIL_ENROLL_TOKEN`, avoiding shell history / argv exposure), and optional external trust anchors. Pass `--redact-logs` to `tendril serve` in shared environments so `pairing_code`, decrypted application payload `utf8`, and `token_nonce` are emitted as `"<redacted>"` instead of plaintext on stdout JSON logs:
+Autonomous devices enroll without SAS interaction using `serve --allow-enroll`, single-use enrollment tokens (`--token-file`, `--token-stdin`, or `TENDRIL_ENROLL_TOKEN`, avoiding shell history / argv exposure), and optional external trust anchors. Unknown, expired, and already-burned interactive pairing codes normalize computation with a uniform Argon2id dummy verification pass and return `"unauthorized"` on the wire so responders do not oracle-distinguish code validity. Pass `--redact-logs` to `tendril serve` in shared environments so `pairing_code`, decrypted application payload `utf8`, and `token_nonce` are emitted as `"<redacted>"` instead of plaintext on stdout JSON logs:
 
 ```bash
 # Register an external trust anchor (optional; omit for self-issued host tokens)
@@ -96,7 +97,9 @@ Cross-language SDK bindings spawn `tendril-conformance-peer` and exchange single
 | `init` | Initialize in-memory or `state_dir`-backed identity and roster |
 | `serve_direct`, `serve_relay` | Bind direct TCP or relay WSS listener onto background accept queue |
 | `issue_code` | Issue single-use LAN or remote pairing code |
-| `pair` | Run initiator (`endpoint` + `code`) or responder pairing exchange |
+| `add_trust_anchor`, `revoke_trust_anchor` | Manage M2M Ed25519 trust anchors and responder policy |
+| `mint_enrollment_token` | Mint single-use M2M enrollment token JSON (enables self-M2M when targeting self) |
+| `pair` | Run initiator (`endpoint` + `code`) or responder pairing/M2M exchange |
 | `confirm`, `mint`, `revoke` | Transition peer state and mint default-deny signed grants |
 | `connect`, `send`, `recv`, `rekey`, `close` | Drive Noise XX session, data exchange, key ratchet, and close |
 | `authorize` | Evaluate capability check and return structured `AuditEvent` |

@@ -48,18 +48,20 @@ Host app (Go / Python / Node.js)
 
 ### Go (`bindings/go`)
 
-- Exposes typed wrappers (`Endpoint`, `Session`, `EndpointInfo`, `PairInitiateResult`, `PairAcceptResult`, `SessionEvent` including `Audit`, `ErrWouldBlock`), `ServeDirect`, `ServeRelay`, `ServeP2p`, and pure helper functions (`DeviceID`, `FingerprintHost`, `FingerprintDevice`, `PairingSAS`, `ComputeCodeMAC`, `VerifyRotationChainJSON`, `VerifyGrantJSON`).
+- Exposes typed wrappers (`Endpoint`, `Session`, `EndpointInfo`, `PairInitiateResult`, `PairAcceptResult`, `EnrollInitiateResult`, `SessionEvent` including `Audit`, `ErrWouldBlock`), `ServeDirect`, `ServeRelay`, `ServeP2p`, M2M methods (`AddTrustAnchor`, `RevokeTrustAnchor`, `MintEnrollmentToken`, `EnrollInitiate`), and pure helper functions (`DeviceID`, `FingerprintHost`, `FingerprintDevice`, `PairingSAS`, `ComputeCodeMAC`, `VerifyRotationChainJSON`, `VerifyGrantJSON`).
 - Guards `Endpoint` with `sync.RWMutex` (so `Close()` signals `tendril_endpoint_close` while releasing in-flight calls before taking exclusive `Lock()` to free), guards `Session` with `sync.RWMutex` + `tendril_session_shutdown` (allowing concurrent full-duplex `SendData`/`Rekey`/`PollEvent`/`Close`), validates strings against embedded NUL bytes, pairs pointer and byte-slice reads with `runtime.KeepAlive`, and pins OS threads via `runtime.LockOSThread()` / `runtime.UnlockOSThread()` around cgo calls and `tendril_last_error()` reads under `go test -race`.
 
 ### Python (`bindings/python`)
 
-- Exposes `Endpoint` (including `serve_direct`, `serve_relay`, `serve_p2p`, plus `pair_initiate` and `connect` delegating dialing internally to `tendril-runtime::dial_endpoint` for `iroh://`, `overlay://`, `broker+ws(s)://`, `ws(s)://`, local, and direct targets), `Session`, `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, and `verify_grant_json` from `tendril`.
-- `compute_code_mac` and all blocking, mutex-acquiring, or disk-persisting `Endpoint` and `Session` methods release the GIL via `py.detach`, verified by a multi-threaded heartbeat test during concurrent `compute_code_mac` Argon2 execution and concurrent handshake threads.
+- Exposes `Endpoint` (including `serve_direct`, `serve_relay`, `serve_p2p`, `pair_initiate`, `connect` delegating dialing internally to `tendril-runtime::dial_endpoint` for `iroh://`, `overlay://`, `broker+ws(s)://`, `ws(s)://`, local, and direct targets, plus M2M methods `add_trust_anchor`, `revoke_trust_anchor`, `mint_enrollment_token`, and `enroll_initiate`), `Session`, `device_id`, `fingerprint_host`, `fingerprint_device`, `pairing_sas`, `compute_code_mac`, `verify_rotation_chain_json`, and `verify_grant_json` from `tendril`.
+- `compute_code_mac` and all blocking, mutex-acquiring, or disk-persisting `Endpoint` and `Session` methods release the GIL via `py.detach`, verified by a multi-threaded heartbeat test during concurrent `compute_code_mac` Argon2 execution, M2M replay/revocation tests, and concurrent handshake threads.
 
 ### Node.js (`bindings/node`)
 
-- Exposes `Endpoint`, `Session` (non-constructible directly via `private constructor()` in `bindings/node/index.d.ts`), synchronous hash/verifier helpers (`deviceId`, `fingerprintHost`, `fingerprintDevice`, `pairingSas`, `verifyRotationChainJson`, `verifyGrantJson`), and async `Promise` methods (`computeCodeMac`, `serveDirect`, `serveRelay`, `serveP2p`, `pairInitiate`, `pairAccept`, `connect`, `acceptSession`, `sendData`, `pollEvent`, `authorize`, `rekey`, `close`).
-- Verified by a `setInterval` timer responsiveness test running alongside concurrent `computeCodeMac` Argon2 promises and local P2P (`serveP2p("disabled")`) loopback conformance tests.
+- Exposes `Endpoint`, `Session` (non-constructible directly via `private constructor()` in `bindings/node/index.d.ts`), synchronous hash/verifier helpers (`deviceId`, `fingerprintHost`, `fingerprintDevice`, `pairingSas`, `verifyRotationChainJson`, `verifyGrantJson`), synchronous M2M management methods (`addTrustAnchor`, `revokeTrustAnchor`, `mintEnrollmentToken`), and async `Promise` methods (`computeCodeMac`, `serveDirect`, `serveRelay`, `serveP2p`, `pairInitiate`, `pairAccept`, `enrollInitiate`, `connect`, `acceptSession`, `sendData`, `pollEvent`, `authorize`, `rekey`, `close`).
+- Verified by a `setInterval` timer responsiveness test running alongside concurrent `computeCodeMac` Argon2 promises, local P2P (`serveP2p("disabled")`) loopback tests, and M2M enrollment/replay/revocation conformance tests.
+
+Full M2M enrollment parity (`addTrustAnchor`, `revokeTrustAnchor`, `mintEnrollmentToken`, and `enroll` / `enrollInitiate`) also extends across browser WebAssembly, Android Kotlin JNI, and Apple Swift; see [Web and mobile bindings](web-and-mobile.md).
 
 ## Gate #7 baselines (Linux `x86_64` release)
 
@@ -77,7 +79,7 @@ For mobile (`aarch64-linux-android`, Swift) and browser WASM bundle budgets and 
 
 ## Verification
 
-Each binding verifies the helper-level `spec/vectors/` files (`fingerprints.json`, `pairing_mac.json`, `rotation.json`, and `grants.json`) offline (while `spec/vectors/handshake.json` and `spec/vectors/m2m_enrollment.json` are verified in Rust and Go via `make vectors/check`) and runs bidirectional client/host live interop against `tendril-conformance-peer` (covering pairing, SAS confirmation, capability minting, encrypted data exchange, authorization, revocation, plus `rekey` in Python/Node bidirectional runs and Go concurrency tests):
+Each binding verifies the helper-level `spec/vectors/` files (`fingerprints.json`, `pairing_mac.json`, `rotation.json`, and `grants.json`) offline (while `spec/vectors/handshake.json` and `spec/vectors/m2m_enrollment.json` are verified in Rust and Go via `make vectors/check`) and runs bidirectional client/host live interop against `tendril-conformance-peer` (covering pairing, SAS confirmation, M2M enrollment/replay/anchor-revocation, capability minting, encrypted data exchange, authorization, revocation, plus `rekey` in Python/Node bidirectional runs and Go concurrency tests):
 
 ```bash
 make bindings/go      # build tendril-ffi and run Go cgo tests with -race
