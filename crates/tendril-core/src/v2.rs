@@ -13,10 +13,10 @@ use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::aead::{AeadInPlace, KeyInit as AeadKeyInit};
+use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey, VerifyingKey};
-use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -1663,7 +1663,7 @@ pub fn seal_v2_hello_envelope(
         .map_err(|err| CoreError::Noise(format!("hello seal init: {err}")))?;
     let mut buf = pt.to_vec();
     cipher
-        .encrypt_in_place(Nonce::from_slice(&[0u8; 12]), h_pre, &mut buf)
+        .encrypt_in_place(&Nonce::from([0u8; 12]), h_pre, &mut buf)
         .map_err(|_| CoreError::Noise("hello envelope seal failed".into()))?;
     Ok(buf)
 }
@@ -1683,7 +1683,7 @@ pub fn unseal_v2_hello_envelope(
         .map_err(|err| CoreError::Noise(format!("hello unseal init: {err}")))?;
     let mut pt = Zeroizing::new(envelope.to_vec());
     cipher
-        .decrypt_in_place(Nonce::from_slice(&[0u8; 12]), h_pre, &mut *pt)
+        .decrypt_in_place(&Nonce::from([0u8; 12]), h_pre, &mut *pt)
         .map_err(|_| CoreError::HostKeyUnverified)?;
     if pt.len() < 2 {
         return Err(CoreError::HostKeyUnverified);
@@ -3479,7 +3479,7 @@ pub fn seal_pake_host_hello(
     let mut buf = Vec::with_capacity(hello_json.len() + AEAD_TAG_LEN);
     buf.extend_from_slice(hello_json);
     cipher
-        .encrypt_in_place(Nonce::from_slice(&[0u8; 12]), h_pre, &mut buf)
+        .encrypt_in_place(&Nonce::from([0u8; 12]), h_pre, &mut buf)
         .map_err(|_| CoreError::PairingAuthFailed)?;
     Ok(buf)
 }
@@ -3494,7 +3494,7 @@ pub fn unseal_pake_host_hello(
         .map_err(|err| CoreError::Noise(format!("pake hello unseal init: {err}")))?;
     let mut buf = Zeroizing::new(sealed.to_vec());
     cipher
-        .decrypt_in_place(Nonce::from_slice(&[0u8; 12]), h_pre, &mut *buf)
+        .decrypt_in_place(&Nonce::from([0u8; 12]), h_pre, &mut *buf)
         .map_err(|_| CoreError::PairingAuthFailed)?;
     Ok(buf)
 }

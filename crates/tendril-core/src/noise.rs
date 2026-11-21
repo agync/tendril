@@ -12,11 +12,11 @@
 
 use std::fmt;
 
-use chacha20poly1305::aead::{AeadInPlace, KeyInit as AeadKeyInit};
+use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use fips203::ml_kem_768;
 use fips203::traits::{Decaps, Encaps, KeyGen, SerDes};
-use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
@@ -134,7 +134,7 @@ fn aead_encrypt(key: &[u8; 32], n: u64, ad: &[u8], plaintext: &[u8]) -> Result<V
     );
     buf.extend_from_slice(plaintext);
     cipher
-        .encrypt_in_place(Nonce::from_slice(&nonce_bytes), ad, &mut buf)
+        .encrypt_in_place(&Nonce::from(nonce_bytes), ad, &mut buf)
         .map_err(|_| CoreError::Noise("AEAD encryption failed".into()))?;
     Ok(buf)
 }
@@ -153,7 +153,7 @@ fn aead_decrypt(
     let nonce_bytes = make_nonce(n);
     let mut buf = Zeroizing::new(ciphertext.to_vec());
     cipher
-        .decrypt_in_place(Nonce::from_slice(&nonce_bytes), ad, &mut *buf)
+        .decrypt_in_place(&Nonce::from(nonce_bytes), ad, &mut *buf)
         .map_err(|_| CoreError::Noise("AEAD decryption failed".into()))?;
     Ok(buf)
 }

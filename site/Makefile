@@ -19,7 +19,7 @@ PORT ?= 4180
 
 # The checks run in the pinned Playwright image, which carries the browsers; npm ci installs the
 # matching playwright and axe packages from package-lock.json into node_modules/.
-PLAYWRIGHT_IMAGE ?= mcr.microsoft.com/playwright:v1.65.0-noble@sha256:f6fe3cf9a493670b9a20f33597a807262abb25c40c31839ba4ac1dbc51fe7366
+PLAYWRIGHT_IMAGE ?= mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579
 BUILD := build
 DIST := dist
 

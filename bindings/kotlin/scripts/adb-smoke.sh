@@ -97,7 +97,7 @@ fi
 
 GRADLE_CMD="${GRADLE_BIN:-$(command -v gradle || true)}"
 if [ -z "$GRADLE_CMD" ]; then
-  printf 'gradle not found in PATH; set GRADLE_BIN to a Gradle 8.14+ executable.\n' >&2
+  printf 'gradle not found in PATH; set GRADLE_BIN to a Gradle 9.6+ executable.\n' >&2
   exit 1
 fi
 
