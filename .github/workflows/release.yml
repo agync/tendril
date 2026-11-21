@@ -1,0 +1,633 @@
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag vX.Y.Z to build and attach (empty builds unsigned artifacts only)"
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  OCI_IMAGE: ${{ vars.OCI_IMAGE || 'ghcr.io/agync/tendril-relay' }}
+
+jobs:
+  plan:
+    name: plan release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      ref: ${{ steps.plan.outputs.ref }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PUSHED_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tag="$PUSHED_TAG"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          fi
+          if [ -z "$tag" ]; then
+            {
+              echo "build=true"
+              echo "ref=$SHA"
+              echo "tag="
+              echo "version=0.0.0-dev"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "invalid release tag: $tag" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          ref_json=$(gh api "repos/${REPO}/git/ref/tags/${tag}")
+          obj_type=$(printf '%s' "$ref_json" | jq -r '.object.type')
+          obj_sha=$(printf '%s' "$ref_json" | jq -r '.object.sha')
+          if [ "$obj_type" = "tag" ]; then
+            sha=$(gh api "repos/${REPO}/git/tags/${obj_sha}" --jq .object.sha)
+          else
+            sha="$obj_sha"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "tag not resolved to commit SHA: $tag" >&2; exit 1; }
+          mainsha=$(gh api "repos/${REPO}/git/ref/heads/main" --jq .object.sha)
+          status=$(gh api "repos/${REPO}/compare/${mainsha}...${sha}" --jq .status)
+          case "$status" in
+            identical | behind) ;;
+            *)
+              echo "tag commit $sha is not on main (status: $status)" >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "build=true"
+            echo "ref=$sha"
+            echo "tag=$tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  build-binaries:
+    name: binaries (${{ matrix.label }})
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            label: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            libname: libtendril_ffi.so
+          - runner: ubuntu-24.04-arm
+            label: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            libname: libtendril_ffi.so
+          - runner: macos-15
+            label: darwin-arm64
+            target: aarch64-apple-darwin
+            libname: libtendril_ffi.dylib
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build CLI, relay, and FFI
+        env:
+          TARGET: ${{ matrix.target }}
+          LABEL: ${{ matrix.label }}
+          LIBNAME: ${{ matrix.libname }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "$TARGET" -p tendril-cli --bin tendril
+          cargo build --locked --release --target "$TARGET" -p tendril-relay --bin tendril-relay
+          cargo build --locked --release --target "$TARGET" -p tendril-ffi --lib
+
+          mkdir -p dist-bin stage-bin stage-ffi
+          cp "target/${TARGET}/release/tendril" stage-bin/
+          cp "target/${TARGET}/release/tendril-relay" stage-bin/
+          cp "target/${TARGET}/release/${LIBNAME}" stage-ffi/
+          cp crates/tendril-ffi/include/tendril.h stage-ffi/
+          tar -czf "dist-bin/tendril-${VERSION}-${LABEL}.tar.gz" -C stage-bin .
+          tar -czf "dist-bin/tendril-ffi-${VERSION}-${LABEL}.tar.gz" -C stage-ffi .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-bin-${{ matrix.label }}
+          path: dist-bin/*
+
+  build-python-wheels:
+    name: python wheels (${{ matrix.label }})
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            label: linux-x86_64
+            target: x86_64
+            manylinux: 2_28
+          - runner: ubuntu-24.04-arm
+            label: linux-arm64
+            target: aarch64
+            manylinux: 2_28
+          - runner: macos-15
+            label: darwin-arm64
+            target: aarch64-apple-darwin
+            manylinux: ""
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - uses: pyo3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: build
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out ../../dist-py-${{ matrix.label }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-py-${{ matrix.label }}
+          path: dist-py-${{ matrix.label }}/*
+
+  build-web:
+    name: npm @tendril-sdk/web tarball
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Install pinned wasm-bindgen-cli
+        env:
+          WB_VERSION: "0.2.130"
+          WB_SHA256: "9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f"
+        run: |
+          set -euo pipefail
+          tgz="wasm-bindgen-${WB_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$tgz" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WB_VERSION}/${tgz}"
+          echo "${WB_SHA256}  $RUNNER_TEMP/${tgz}" | sha256sum --check --status -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$RUNNER_TEMP/$tgz" --strip-components=1 -C "$HOME/.local/bin" \
+            "wasm-bindgen-${WB_VERSION}-x86_64-unknown-linux-musl/wasm-bindgen"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build WASM and pack npm tarball
+        run: |
+          set -euo pipefail
+          if ! command -v clang >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm
+          fi
+          make bindings/wasm bindings/wasm-p2p
+          mkdir -p dist-web
+          (cd bindings/web && npm pack --pack-destination ../../dist-web)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-web
+          path: dist-web/*.tgz
+
+  build-android:
+    name: Android release AAR
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: aarch64-linux-android
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: "8.14"
+          cache-disabled: true
+      - name: Build Android NDK and release AAR
+        env:
+          NDK_VER: "27.1.12297006"
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          sdkroot="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ ! -d "$sdkroot/ndk/$NDK_VER" ] || [ ! -d "$sdkroot/cmake/3.22.1" ]; then
+            "$sdkroot/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VER" "cmake;3.22.1" >/dev/null
+          fi
+          export ANDROID_NDK_HOME="$sdkroot/ndk/$NDK_VER"
+          make bindings/android
+          gradle -p bindings/kotlin --no-daemon -Dorg.gradle.jvmargs="-Xmx3g" \
+            -PtendrilVersion="$VERSION" assembleRelease
+          mkdir -p dist-android
+          cp bindings/kotlin/build/outputs/aar/*-release.aar \
+            "dist-android/tendril-android-${VERSION}.aar"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-android
+          path: dist-android/*.aar
+
+  build-apple:
+    name: Apple XCFramework
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+      - name: Build XCFramework zip
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim; do
+            cargo build --locked --release --target "$target" -p tendril-ffi --lib
+          done
+          hdrs="$RUNNER_TEMP/xcframework-headers"
+          mkdir -p "$hdrs" dist-apple
+          cp crates/tendril-ffi/include/tendril.h "$hdrs/tendril.h"
+          cat > "$hdrs/module.modulemap" <<'EOF'
+          module TendrilFFI {
+            header "tendril.h"
+            export *
+          }
+          EOF
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-darwin/release/libtendril_ffi.a -headers "$hdrs" \
+            -library target/aarch64-apple-ios/release/libtendril_ffi.a -headers "$hdrs" \
+            -library target/aarch64-apple-ios-sim/release/libtendril_ffi.a -headers "$hdrs" \
+            -output "$RUNNER_TEMP/TendrilFFI.xcframework"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$RUNNER_TEMP/TendrilFFI.xcframework" \
+            "dist-apple/TendrilFFI.xcframework-${VERSION}.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-apple
+          path: dist-apple/*.zip
+
+  sign-and-attest:
+    name: checksums, Cosign, and SLSA provenance
+    needs:
+      - plan
+      - build-binaries
+      - build-python-wheels
+      - build-web
+      - build-android
+      - build-apple
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release-signing
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Install Cosign
+        if: needs.plan.outputs.tag != '' && !github.event.repository.private
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Keyless Cosign blob signatures
+        if: needs.plan.outputs.tag != '' && !github.event.repository.private
+        run: |
+          set -euo pipefail
+          cd release-assets
+          for f in *; do
+            case "$f" in
+              *.sigstore.json) continue ;;
+            esac
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+          done
+      - name: Attest SLSA build provenance
+        if: needs.plan.outputs.tag != '' && !github.event.repository.private
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-assets/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-release-assets
+          path: release-assets/*
+
+  build-oci:
+    name: OCI image (${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.tag != ''
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - id: build
+        uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
+        with:
+          image: ${{ env.OCI_IMAGE }}
+          tags: ${{ needs.plan.outputs.tag }}-${{ matrix.arch }}
+          containerfiles: Containerfile
+          context: .
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.plan.outputs.ref }}
+      - uses: redhat-actions/podman-login@50c2d9a331bb67c8fdab99b86455fad05e2e3252 # v2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37 # v3.0.0
+        with:
+          tags: ${{ steps.build.outputs.image-with-tag }}
+
+  publish-oci:
+    name: publish and sign OCI manifest
+    needs: [plan, build-oci]
+    if: needs.plan.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release-signing
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: redhat-actions/podman-login@50c2d9a331bb67c8fdab99b86455fad05e2e3252 # v2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push multi-arch OCI manifest
+        id: manifest
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for name in "$TAG" latest; do
+            podman manifest create "${OCI_IMAGE}:${name}"
+            for arch in amd64 arm64; do
+              podman manifest add --arch "$arch" --os linux "${OCI_IMAGE}:${name}" \
+                "docker://${OCI_IMAGE}:${TAG}-${arch}"
+            done
+            podman manifest push --all "${OCI_IMAGE}:${name}" "docker://${OCI_IMAGE}:${name}"
+          done
+          digest=$(skopeo inspect --raw "docker://${OCI_IMAGE}:${TAG}" | sha256sum | awk '{print "sha256:" $1}')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - if: '!github.event.repository.private'
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Log in Cosign to GHCR
+        if: '!github.event.repository.private'
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GITHUB_TOKEN" | cosign login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Cosign OCI manifest digest
+        if: '!github.event.repository.private'
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: cosign sign --yes "${OCI_IMAGE}@${DIGEST}"
+      - name: Attest OCI provenance
+        if: '!github.event.repository.private'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.OCI_IMAGE }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+  publish-gh-release:
+    name: publish GitHub Release
+    needs: [plan, sign-and-attest, publish-oci]
+    if: needs.plan.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release-app
+    permissions:
+      contents: read
+    steps:
+      - name: Get GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed-release-assets
+          path: assets
+      - name: Verify tag commit and publish release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.plan.outputs.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ref_json=$(gh api "repos/${REPO}/git/ref/tags/${TAG}")
+          obj_type=$(printf '%s' "$ref_json" | jq -r '.object.type')
+          obj_sha=$(printf '%s' "$ref_json" | jq -r '.object.sha')
+          if [ "$obj_type" = "tag" ]; then
+            actual=$(gh api "repos/${REPO}/git/tags/${obj_sha}" --jq .object.sha)
+          else
+            actual="$obj_sha"
+          fi
+          test "$actual" = "$EXPECTED_SHA"
+          gh release upload "$TAG" assets/* --clobber --repo "$REPO"
+          gh release edit "$TAG" --draft=false --repo "$REPO"
+
+  publish-maven-gh:
+    name: publish Android AAR to GitHub Packages
+    needs: [plan, sign-and-attest]
+    if: needs.plan.outputs.tag != '' && vars.PUBLISH_MAVEN_GH != 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: aarch64-linux-android
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: "8.14"
+          cache-disabled: true
+      - name: Publish dev.agync:tendril-android
+        env:
+          NDK_VER: "27.1.12297006"
+          VERSION: ${{ needs.plan.outputs.version }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sdkroot="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ ! -d "$sdkroot/ndk/$NDK_VER" ] || [ ! -d "$sdkroot/cmake/3.22.1" ]; then
+            "$sdkroot/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VER" "cmake;3.22.1" >/dev/null
+          fi
+          export ANDROID_NDK_HOME="$sdkroot/ndk/$NDK_VER"
+          make bindings/android
+          gradle -p bindings/kotlin --no-daemon -Dorg.gradle.jvmargs="-Xmx3g" \
+            -PtendrilVersion="$VERSION" publishReleasePublicationToGitHubPackagesRepository
+
+  publish-pypi:
+    name: publish Python to PyPI (OIDC)
+    needs: [plan, sign-and-attest]
+    if: needs.plan.outputs.tag != '' && !github.event.repository.private && vars.PUBLISH_PYPI == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-py-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist
+
+  publish-npm:
+    name: publish @tendril-sdk/web to npm (OIDC)
+    needs: [plan, sign-and-attest]
+    if: needs.plan.outputs.tag != '' && !github.event.repository.private && vars.PUBLISH_NPM == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-web
+          path: dist-web
+      - name: Verify npm CLI >= 11.5.1 and publish with provenance
+        run: |
+          set -euo pipefail
+          npm --version
+          npm publish dist-web/*.tgz --access public --provenance
+
+  publish-crates:
+    name: publish workspace crates to crates.io (OIDC)
+    needs: [plan, sign-and-attest]
+    if: needs.plan.outputs.tag != '' && !github.event.repository.private && vars.PUBLISH_CRATES == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: wasm32-unknown-unknown
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: Publish workspace crates cleanly
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --workspace --locked

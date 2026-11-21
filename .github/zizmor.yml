@@ -1,0 +1,4 @@
+# Disable self-repository (zizmor suggests $/..., which actionlint 1.7.12 rejects).
+rules:
+  self-repository:
+    disable: true

@@ -1,0 +1,109 @@
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release-app
+    permissions:
+      contents: read
+    steps:
+      - name: Get GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: ./.github/actions/rust-toolchain
+
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Refresh Cargo lockfiles on release PR
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          PRS: ${{ steps.release.outputs.prs }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          branch="$(printf '%s' "$PRS" | jq -r '.[0].headBranchName')"
+          if [ -z "$branch" ] || [ "$branch" = "null" ]; then
+            echo "no release PR branch reported"
+            exit 0
+          fi
+          auth=$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+          git fetch origin "$branch"
+          git checkout -B "$branch" FETCH_HEAD
+          version=$(python3 -I - <<'PY'
+          import tomllib
+          print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])
+          PY
+          )
+          cargo update --workspace
+          cargo update --manifest-path bindings/python/Cargo.toml --workspace
+          cargo update --manifest-path bindings/node/Cargo.toml --workspace
+          git add Cargo.lock bindings/python/Cargo.lock bindings/node/Cargo.lock
+          if git diff --cached --quiet; then
+            echo "lockfiles already at $version"
+            exit 0
+          fi
+          git config user.name "agync-release[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: refresh lockfiles for $version"
+          git push origin "$branch"
+
+      - name: Create Go submodule tag for release
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          RELEASES_JSON: ${{ toJSON(steps.release.outputs) }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+          version=$(python3 -I - <<'PY'
+          import json
+          with open(".release-please-manifest.json", encoding="utf-8") as fh:
+              print(json.load(fh)["."])
+          PY
+          )
+          tag="v${version}"
+          go_tag="bindings/go/${tag}"
+          git fetch origin tag "$tag"
+          commit=$(git rev-list -n 1 "refs/tags/${tag}")
+          if git ls-remote --exit-code --tags origin "refs/tags/${go_tag}" >/dev/null 2>&1; then
+            echo "$go_tag already exists"
+            exit 0
+          fi
+          git tag "$go_tag" "$commit"
+          git push origin "refs/tags/${go_tag}"
+          printf '%s\n' "$RELEASES_JSON" >/dev/null

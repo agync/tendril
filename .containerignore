@@ -1,0 +1,14 @@
+.git/
+.github/
+.agents/
+.worktrees/
+_site/
+.toolchain/
+target/
+bindings/
+docs/
+spec/
+scripts/
+site/
+*.md
+!README.md

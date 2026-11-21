@@ -1,0 +1,54 @@
+name: cache-prune
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: cache-prune
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: prune obsolete caches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Delete superseded main caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" \
+            --jq '.actions_caches[] | [.id, .ref, .key, .created_at, .last_accessed_at] | @tsv' \
+            > "$RUNNER_TEMP/caches.tsv"
+          python3 -I scripts/prune_caches.py < "$RUNNER_TEMP/caches.tsv" \
+            > "$RUNNER_TEMP/delete.tsv"
+          {
+            echo "### Caches pruned"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -s "$RUNNER_TEMP/delete.tsv" ]; then
+            echo "Nothing to prune." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          while IFS=$'\t' read -r id key; do
+            if answer=$(gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" 2>&1); then
+              echo "- \`$key\`" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$answer" == *"HTTP 404"* ]]; then
+              echo "- \`$key\` (already gone)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "$answer" >&2
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/delete.tsv"
