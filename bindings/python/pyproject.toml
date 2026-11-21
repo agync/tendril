@@ -3,11 +3,16 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "tendril"
+name = "tendril-sdk"
 version = "0.1.0"
 description = "Python bindings for Tendril private device-to-device links."
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
+
+[project.urls]
+Homepage = "https://tendril.agync.dev"
+Repository = "https://github.com/agync/tendril"
+Documentation = "https://tendril.agync.dev"
 
 [tool.maturin]
 module-name = "tendril._tendril"

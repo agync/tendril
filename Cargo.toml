@@ -8,6 +8,12 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.91"
+repository = "https://github.com/agync/tendril"
+homepage = "https://tendril.agync.dev"
+documentation = "https://tendril.agync.dev"
+readme = "README.md"
+keywords = ["p2p", "noise", "post-quantum", "e2ee", "networking"]
+categories = ["network-programming", "cryptography"]
 
 [workspace.dependencies]
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
@@ -42,9 +48,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 x25519-dalek = { version = "3.0", default-features = false, features = ["precomputed-tables", "static_secrets", "zeroize"] }
 zeroize = { version = "1.9", features = ["derive"] }
-tendril-core = { path = "crates/tendril-core" }
-tendril-relay = { path = "crates/tendril-relay" }
-tendril-runtime = { path = "crates/tendril-runtime" }
+tendril-core = { version = "0.1.0", path = "crates/tendril-core" }
+tendril-relay = { version = "0.1.0", path = "crates/tendril-relay" }
+tendril-runtime = { version = "0.1.0", path = "crates/tendril-runtime" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

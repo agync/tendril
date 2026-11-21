@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	tendril "tendril.dev/bindings/go"
+	tendril "github.com/agync/tendril/bindings/go"
 )
 
 func readJSONFile(t *testing.T, rel string) map[string]any {

@@ -1,10 +1,24 @@
 {
-  "name": "@tendril/node",
+  "name": "@tendril-sdk/node",
   "version": "0.1.0",
   "description": "Node.js N-API bindings for Tendril private device-to-device links.",
+  "homepage": "https://tendril.agync.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agync/tendril.git",
+    "directory": "bindings/node"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "Apache-2.0",
   "main": "index.js",
   "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "index.node"
+  ],
   "scripts": {
     "test": "node --test"
   },

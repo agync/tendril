@@ -1,3 +1,3 @@
-module tendril.dev/bindings/go
+module github.com/agync/tendril/bindings/go
 
 go 1.24

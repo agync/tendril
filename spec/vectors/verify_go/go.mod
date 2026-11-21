@@ -1,4 +1,4 @@
-module tendril.dev/spec/vectors/verify_go
+module github.com/agync/tendril/spec/vectors/verify_go
 
 go 1.26.0
 
