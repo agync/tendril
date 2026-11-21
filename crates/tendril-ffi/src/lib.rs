@@ -7,6 +7,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,21 +15,26 @@ use tendril_core::crypto::{
     b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
     fingerprint_host, pairing_sas, random_bytes,
 };
+use tendril_core::error::CoreError;
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
 use tendril_core::identity::{EndpointIdentity, RotationRecord, verify_rotation_chain};
-use tendril_core::pairing::{PairOutcome, PairingCodeKind, PairingConfig, PairingManager};
-use tendril_core::roster::Roster;
+use tendril_core::pairing::{
+    EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PinnedHost,
+    mint_enrollment_token,
+};
+use tendril_core::roster::{AnchorState, Roster};
 use tendril_runtime::{
     ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
     InboundRouter, PathListener, RelayListener, SessionDriver, SessionEvent, StateStore,
-    deserialize_identity_json, dial_endpoint, drive_pair_initiator,
-    drive_pair_responder_with_options, pairing_path_kind_for_provider, serialize_identity_json,
+    deserialize_identity_json, dial_endpoint, drive_m2m_enroll_initiator, drive_pair_initiator,
+    drive_pair_responder_with_policy_and_store, pairing_path_kind_for_provider,
+    serialize_identity_json,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{P2pListener, parse_p2p_relay_mode};
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const TENDRIL_OK: i32 = 0;
 pub const TENDRIL_WOULD_BLOCK: i32 = 1;
@@ -148,6 +154,8 @@ pub struct TendrilEndpoint {
     roster: Arc<StdMutex<Roster>>,
     pair_mgr: StdMutex<PairingManager>,
     router: InboundRouter,
+    self_m2m_enabled: AtomicBool,
+    m2m_enabled: AtomicBool,
 }
 
 impl TendrilEndpoint {
@@ -156,6 +164,14 @@ impl TendrilEndpoint {
             store.save_roster(roster).map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    fn refresh_m2m_enabled(&self, roster: &Roster) {
+        let enabled = self.self_m2m_enabled.load(Ordering::Acquire)
+            || roster
+                .trust_anchors()
+                .any(|(_, a)| a.state == AnchorState::Active);
+        self.m2m_enabled.store(enabled, Ordering::Release);
     }
 
     fn spawn_listener(&self, listener: Box<dyn PathListener>) {
@@ -178,6 +194,9 @@ fn build_endpoint_handle(
             return ptr::null_mut();
         }
     };
+    let has_active_anchor = roster
+        .trust_anchors()
+        .any(|(_, a)| a.state == AnchorState::Active);
     Box::into_raw(Box::new(TendrilEndpoint {
         rt,
         store,
@@ -185,6 +204,8 @@ fn build_endpoint_handle(
         roster: Arc::new(StdMutex::new(roster)),
         pair_mgr: StdMutex::new(PairingManager::new(PairingConfig::default())),
         router: InboundRouter::new(),
+        self_m2m_enabled: AtomicBool::new(false),
+        m2m_enabled: AtomicBool::new(has_active_anchor),
     }))
 }
 
@@ -1047,8 +1068,12 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
                     set_last_error(error);
                     TENDRIL_ERR_PROTOCOL
                 }
-                PairOutcome::ResponderPending { .. } => {
+                PairOutcome::ResponderPending { .. } | PairOutcome::ResponderEnrolled { .. } => {
                     set_last_error("unexpected responder outcome");
+                    TENDRIL_ERR_INTERNAL
+                }
+                PairOutcome::InitiatorEnrolled { .. } => {
+                    set_last_error("unexpected m2m enrollment outcome");
                     TENDRIL_ERR_INTERNAL
                 }
             },
@@ -1077,6 +1102,11 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
         }
         let ep = unsafe { &*ep };
         let wait = Duration::from_millis(timeout_ms);
+        let policy = if ep.m2m_enabled.load(Ordering::Acquire) {
+            EnrollmentPolicy::enabled_default()
+        } else {
+            EnrollmentPolicy::default()
+        };
         let res = ep.rt.block_on(async {
             let (mut stream, guard) = match ep.router.recv_pair(wait).await {
                 Ok(Some(pair)) => pair,
@@ -1087,13 +1117,15 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
             };
 
             let path_kind = pairing_path_kind_for_provider(stream.provider_id());
-            drive_pair_responder_with_options(
+            drive_pair_responder_with_policy_and_store(
                 stream.as_mut(),
                 &ep.identity,
                 &ep.pair_mgr,
                 &ep.roster,
+                ep.store.as_deref(),
                 path_kind,
                 now_unix(),
+                policy,
                 Some(ep.router.rate_limiter()),
                 Some(guard),
                 DEFAULT_PRE_AUTH_TIMEOUT,
@@ -1124,11 +1156,32 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
                     });
                     unsafe { write_out_cstring(out_json, &out.to_string()) }
                 }
+                PairOutcome::ResponderEnrolled {
+                    device_id,
+                    token_nonce,
+                    name,
+                    kind,
+                    ..
+                } => {
+                    let roster = ep.roster.lock().expect("roster mutex poisoned");
+                    if let Err(e) = ep.persist_roster(&roster) {
+                        set_last_error(e);
+                        return TENDRIL_ERR_INTERNAL;
+                    }
+                    let out = serde_json::json!({
+                        "device_id": device_id,
+                        "status": "active",
+                        "token_nonce": token_nonce,
+                        "name": name,
+                        "kind": kind,
+                    });
+                    unsafe { write_out_cstring(out_json, &out.to_string()) }
+                }
                 PairOutcome::Rejected { error } => {
                     set_last_error(error);
                     TENDRIL_ERR_PROTOCOL
                 }
-                PairOutcome::InitiatorPending { .. } => {
+                PairOutcome::InitiatorPending { .. } | PairOutcome::InitiatorEnrolled { .. } => {
                     set_last_error("unexpected initiator outcome");
                     TENDRIL_ERR_INTERNAL
                 }
@@ -1141,7 +1194,8 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
     })
 }
 
-/// Promotes a pending paired peer to `Active` (`pair.confirm`), optionally asserting SAS match.
+/// Promotes a pending paired peer to `Active` (`pair.confirm`), requiring SAS verification
+/// whenever a live pairing SAS was recorded (`sas` may be NULL only if no SAS was recorded).
 ///
 /// # Safety
 /// `ep` and `peer_id` must be non-null valid pointers; `sas` may be null or UTF-8.
@@ -1266,7 +1320,278 @@ pub unsafe extern "C" fn tendril_endpoint_revoke_peer(
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
         }
+        ep.refresh_m2m_enabled(&roster);
         TENDRIL_OK
+    })
+}
+
+/// Registers an active external Ed25519 trust anchor for M2M enrollment and enables M2M mode.
+///
+/// # Safety
+/// `ep` and `anchor_id` must be valid non-null pointers and `signing_pub_32` must point to 32 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_add_trust_anchor(
+    ep: *mut TendrilEndpoint,
+    anchor_id: *const c_char,
+    signing_pub_32: *const u8,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(anchor_s) = (unsafe { cstr_to_str(anchor_id, "anchor_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(signing_pub) = (unsafe { read_bytes32(signing_pub_32, "signing_pub_32") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let ep = unsafe { &*ep };
+        let mut roster = ep.roster.lock().expect("roster mutex poisoned");
+        if let Err(e) = roster.add_trust_anchor(anchor_s.to_owned(), signing_pub) {
+            set_last_error(e.to_string());
+            return match e {
+                CoreError::IncompletePin(_) => TENDRIL_ERR_INVALID_ARG,
+                _ => TENDRIL_ERR_PROTOCOL,
+            };
+        }
+        if let Err(e) = ep.persist_roster(&roster) {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
+        ep.refresh_m2m_enabled(&roster);
+        ep.router.set_pair_enabled(true);
+        TENDRIL_OK
+    })
+}
+
+/// Revokes an external Ed25519 trust anchor and any sibling anchors sharing its signing key.
+///
+/// # Safety
+/// `ep` and `anchor_id` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_revoke_trust_anchor(
+    ep: *mut TendrilEndpoint,
+    anchor_id: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(anchor_s) = (unsafe { cstr_to_str(anchor_id, "anchor_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let ep = unsafe { &*ep };
+        let mut roster = ep.roster.lock().expect("roster mutex poisoned");
+        if let Err(e) = roster.revoke_trust_anchor(anchor_s) {
+            set_last_error(e.to_string());
+            return TENDRIL_ERR_NOT_FOUND;
+        }
+        if let Err(e) = ep.persist_roster(&roster) {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
+        ep.refresh_m2m_enabled(&roster);
+        TENDRIL_OK
+    })
+}
+
+/// Mints a short-lived single-use M2M enrollment token JSON object; enables local M2M acceptance
+/// when `target_host_id` matches the local endpoint's `host_id`.
+///
+/// # Safety
+/// `ep`, `target_host_id`, and `out_token_json` must be valid non-null pointers; `subject_opt` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_mint_enrollment_token(
+    ep: *mut TendrilEndpoint,
+    target_host_id: *const c_char,
+    subject_opt: *const c_char,
+    ttl_secs: u64,
+    out_token_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_token_json.is_null() {
+            set_last_error("null endpoint or out_token_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(target_s) = (unsafe { cstr_to_str(target_host_id, "target_host_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(subject_s) = (unsafe { opt_cstr_to_str(subject_opt, "subject_opt") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let nonce = match random_bytes::<16>() {
+            Ok(n) => n,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return TENDRIL_ERR_INTERNAL;
+            }
+        };
+        let ep = unsafe { &*ep };
+        let token = match mint_enrollment_token(
+            &ep.identity,
+            target_s,
+            subject_s,
+            now_unix(),
+            ttl_secs,
+            nonce,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        if target_s == ep.identity.host_id() {
+            ep.self_m2m_enabled.store(true, Ordering::Release);
+            let roster = ep.roster.lock().expect("roster mutex poisoned");
+            ep.refresh_m2m_enabled(&roster);
+            ep.router.set_pair_enabled(true);
+        }
+        let json =
+            Zeroizing::new(serde_json::to_string(&token).expect("serialize enrollment token"));
+        unsafe { write_out_cstring(out_token_json, &json) }
+    })
+}
+
+/// Initiates autonomous M2M enrollment toward a pinned host using `token_json`.
+///
+/// # Safety
+/// `ep`, `endpoint`, `host_id`, `host_static_pub_32`, `host_signing_pub_32`, `token_json`, and
+/// `out_json` must be valid non-null pointers; optional strings may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
+    ep: *mut TendrilEndpoint,
+    endpoint: *const c_char,
+    relay_host_opt: *const c_char,
+    host_id: *const c_char,
+    host_static_pub_32: *const u8,
+    host_signing_pub_32: *const u8,
+    host_rotation_seq: u64,
+    token_json: *const c_char,
+    name: *const c_char,
+    kind: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(endpoint_s) = (unsafe { cstr_to_str(endpoint, "endpoint") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(relay_host_s) = (unsafe { opt_cstr_to_str(relay_host_opt, "relay_host_opt") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(host_id_s) = (unsafe { cstr_to_str(host_id, "host_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(static_pub) = (unsafe { read_bytes32(host_static_pub_32, "host_static_pub_32") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(signing_pub) = (unsafe { read_bytes32(host_signing_pub_32, "host_signing_pub_32") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(token_s) = (unsafe { cstr_to_str(token_json, "token_json") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(name_s) = (unsafe { opt_cstr_to_str(name, "name") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(kind_s) = (unsafe { opt_cstr_to_str(kind, "kind") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let token: Grant = match serde_json::from_str(token_s) {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(format!("invalid token_json: {e}"));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let pinned_host = PinnedHost {
+            host_id: Some(host_id_s.to_owned()),
+            static_pub,
+            signing_pub,
+            rotation_seq: host_rotation_seq,
+        };
+
+        let ep = unsafe { &*ep };
+        let res = ep.rt.block_on(async {
+            let mut stream = dial_endpoint(endpoint_s, relay_host_s)
+                .await
+                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
+            let pair_res = drive_m2m_enroll_initiator(
+                stream.as_mut(),
+                &ep.identity,
+                name_s.unwrap_or("ffi-machine").to_owned(),
+                kind_s.unwrap_or("machine").to_owned(),
+                token,
+                pinned_host,
+            )
+            .await
+            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()));
+            let _ = stream.close().await;
+            pair_res
+        });
+
+        match res {
+            Ok(pair_res) => match pair_res.outcome {
+                PairOutcome::InitiatorEnrolled {
+                    device_id,
+                    host_id,
+                    host_static_pub,
+                    host_signing_pub,
+                    host_rotation_seq,
+                    token_nonce,
+                } => {
+                    let mut roster = ep.roster.lock().expect("roster mutex poisoned");
+                    if let Err(e) = roster.insert_pinned_host(
+                        host_id.clone(),
+                        host_id.clone(),
+                        host_static_pub,
+                        Some(host_signing_pub),
+                        host_rotation_seq,
+                        Vec::new(),
+                    ) {
+                        set_last_error(e.to_string());
+                        return TENDRIL_ERR_PROTOCOL;
+                    }
+                    if let Err(e) = ep.persist_roster(&roster) {
+                        set_last_error(e);
+                        return TENDRIL_ERR_INTERNAL;
+                    }
+                    let out = serde_json::json!({
+                        "device_id": device_id,
+                        "host_id": host_id,
+                        "status": "active",
+                        "host_rotation_seq": host_rotation_seq,
+                        "token_nonce": token_nonce,
+                    });
+                    unsafe { write_out_cstring(out_json, &out.to_string()) }
+                }
+                PairOutcome::Rejected { error } => {
+                    set_last_error(error);
+                    TENDRIL_ERR_PROTOCOL
+                }
+                PairOutcome::InitiatorPending { .. } => {
+                    set_last_error("unexpected human pending outcome");
+                    TENDRIL_ERR_PROTOCOL
+                }
+                PairOutcome::ResponderPending { .. } | PairOutcome::ResponderEnrolled { .. } => {
+                    set_last_error("unexpected responder outcome");
+                    TENDRIL_ERR_INTERNAL
+                }
+            },
+            Err((rc, msg)) => {
+                set_last_error(msg);
+                rc
+            }
+        }
     })
 }
 

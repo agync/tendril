@@ -340,8 +340,12 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                             )
                         }
                         PairOutcome::Rejected { error } => (err_json(error), false),
-                        PairOutcome::ResponderPending { .. } => {
+                        PairOutcome::ResponderPending { .. }
+                        | PairOutcome::ResponderEnrolled { .. } => {
                             (err_json("unexpected responder outcome"), false)
+                        }
+                        PairOutcome::InitiatorEnrolled { .. } => {
+                            (err_json("unexpected m2m enrollment outcome"), false)
                         }
                     },
                     Err(e) => (err_json(e.to_string()), false),
@@ -418,8 +422,12 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                             )
                         }
                         PairOutcome::Rejected { error } => (err_json(error), false),
-                        PairOutcome::InitiatorPending { .. } => {
+                        PairOutcome::InitiatorPending { .. }
+                        | PairOutcome::InitiatorEnrolled { .. } => {
                             (err_json("unexpected initiator outcome"), false)
+                        }
+                        PairOutcome::ResponderEnrolled { .. } => {
+                            (err_json("unexpected m2m enrollment outcome"), false)
                         }
                     },
                     Err(e) => (err_json(e.to_string()), false),

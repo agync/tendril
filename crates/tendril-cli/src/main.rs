@@ -9,19 +9,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use tendril_core::PREAMBLE_LEN;
-use tendril_core::crypto::{b64url_encode, random_bytes};
+use tendril_core::crypto::{
+    SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode, random_bytes,
+};
 use tendril_core::grants::Grant;
 use tendril_core::pairing::{
-    PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PairingUri,
+    DEFAULT_ENROLLMENT_TTL_SECS, EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig,
+    PairingManager, PairingUri, PinnedHost, mint_enrollment_token,
 };
+use tendril_core::roster::AnchorState;
 use tendril_core::wire::{Intent, Preamble};
 use tendril_runtime::{
     BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
     DirectListener, EmbeddedRelay, HalfOpenGuard, OverlayListener, P2pDialer, P2pListener,
     P2pOptions, P2pRelayMode, PathDialer, PathListener, PathStream, PreAuthConfig,
     PreAuthRateLimiter, PrefixedPathStream, RelayListener, SessionDriver, SessionEvent, StateStore,
-    dial_endpoint as runtime_dial_endpoint, drive_pair_initiator,
-    drive_pair_responder_with_options, pairing_path_kind_for_provider, parse_p2p_relay_mode,
+    dial_endpoint as runtime_dial_endpoint, drive_m2m_enroll_initiator, drive_pair_initiator,
+    drive_pair_responder_with_store, pairing_path_kind_for_provider, parse_p2p_relay_mode,
     peek_exact,
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -40,6 +44,20 @@ struct Cli {
 enum PairKindArg {
     Lan,
     Remote,
+}
+
+#[derive(Debug, Subcommand)]
+enum AnchorCommand {
+    /// Register an active external Ed25519 trust anchor for M2M enrollment.
+    Add {
+        anchor_id: String,
+        #[arg(long)]
+        signing_pub: String,
+    },
+    /// Revoke an external trust anchor (and sibling anchors sharing its signing key).
+    Revoke { anchor_id: String },
+    /// List configured M2M trust anchors.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -77,6 +95,10 @@ enum Command {
         broker: Option<SocketAddr>,
         #[arg(long, value_enum)]
         issue_code: Option<PairKindArg>,
+        #[arg(long)]
+        allow_enroll: bool,
+        #[arg(long)]
+        redact_logs: bool,
     },
     /// Pair with a remote host using a one-time pairing code or `tendril://pair?...` URI.
     Pair {
@@ -103,11 +125,58 @@ enum Command {
         #[arg(long)]
         no_pkarr: bool,
     },
+    /// Manage external Ed25519 trust anchors for M2M enrollment.
+    Anchor {
+        #[command(subcommand)]
+        cmd: AnchorCommand,
+    },
+    /// Mint a short-lived, single-use M2M enrollment token (`pair.enroll:<target_host>`).
+    EnrollToken {
+        #[arg(long)]
+        target_host: String,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_ENROLLMENT_TTL_SECS)]
+        ttl_secs: u64,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Autonomously enroll with a pinned host using a single-use M2M enrollment token.
+    Enroll {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        host_id: String,
+        #[arg(long)]
+        host_static_pub: String,
+        #[arg(long)]
+        host_signing_pub: String,
+        #[arg(long, default_value_t = 0)]
+        host_rotation_seq: u64,
+        #[arg(long, value_name = "PATH", conflicts_with = "token_stdin")]
+        token_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "token_file")]
+        token_stdin: bool,
+        #[arg(long, default_value = "machine")]
+        name: String,
+        #[arg(long, default_value = "machine")]
+        kind: String,
+        #[arg(long)]
+        relay_host: Option<String>,
+        #[arg(long)]
+        p2p_local: bool,
+        #[arg(long, conflicts_with = "p2p_local", value_name = "MODE_OR_URL")]
+        p2p_relay: Option<String>,
+        #[arg(long)]
+        no_pkarr: bool,
+    },
     /// Confirm a pending paired peer (`pair.confirm`), moving it to Active with zero capabilities.
     Confirm {
         peer_id: String,
         #[arg(long)]
         sas: Option<String>,
+        #[arg(long, conflicts_with = "sas")]
+        allow_no_sas: bool,
     },
     /// Mint a signed capability grant (`pair.mint`) for an Active peer.
     Mint {
@@ -138,6 +207,10 @@ enum Command {
     },
     /// Revoke an existing peer (`pair.revoke`), failing closed on all future sessions.
     Revoke { peer_id: String },
+    /// Revoke an unused grant or enrollment token nonce on the signed local CRL.
+    RevokeToken { nonce: String },
+    /// Rotate local static and signing identity keys and re-sign any persisted self-CRL.
+    Rotate,
 }
 
 #[derive(Serialize)]
@@ -157,7 +230,8 @@ fn now_unix() -> u64 {
 
 fn print_json_line<T: Serialize>(value: &T) {
     if let Ok(line) = serde_json::to_string(value) {
-        println!("{line}");
+        let line = Zeroizing::new(line);
+        println!("{}", *line);
     }
 }
 
@@ -254,6 +328,89 @@ fn resolve_pair_code(
     Err("pairing code (--code, --code-stdin, --code-file, TENDRIL_PAIR_CODE, or --pairing-uri) is required".into())
 }
 
+fn write_private_token_file(path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+            return Err(format!(
+                "refusing to overwrite non-regular file or symlink '{}'",
+                path.display()
+            )
+            .into());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("token");
+        let nonce = random_bytes::<8>()?;
+        let tmp_path = parent.join(format!(".{file_name}.tmp.{}", b64url_encode(&nonce)));
+        let res = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp_path, path)?;
+            Ok(())
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        res
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+
+fn resolve_enroll_token(
+    token_file: Option<PathBuf>,
+    token_stdin: bool,
+) -> Result<Grant, Box<dyn std::error::Error>> {
+    let env_raw = match std::env::var("TENDRIL_ENROLL_TOKEN") {
+        Ok(val) if !val.trim().is_empty() => Some(Zeroizing::new(val)),
+        Ok(_) | Err(_) => None,
+    };
+    let sources = usize::from(token_file.is_some())
+        + usize::from(token_stdin)
+        + usize::from(env_raw.is_some());
+    if sources > 1 {
+        return Err(
+            "conflicting enrollment token sources: supply only one of --token-file, --token-stdin, or TENDRIL_ENROLL_TOKEN"
+                .into(),
+        );
+    }
+    let raw = if let Some(path) = token_file {
+        Zeroizing::new(std::fs::read_to_string(path)?)
+    } else if token_stdin {
+        let mut buf = Zeroizing::new(String::new());
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else if let Some(env_val) = env_raw {
+        env_val
+    } else {
+        return Err(
+            "enrollment token (--token-file, --token-stdin, or TENDRIL_ENROLL_TOKEN) is required"
+                .into(),
+        );
+    };
+    Ok(serde_json::from_str(raw.trim())?)
+}
+
 fn spawn_listener_pump(
     mut listener: Box<dyn PathListener>,
     tx: tokio::sync::mpsc::Sender<Box<dyn PathStream>>,
@@ -275,6 +432,7 @@ fn spawn_listener_pump(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_inbound(
     mut stream: Box<dyn PathStream>,
     pre_auth_guard: HalfOpenGuard,
@@ -283,6 +441,9 @@ async fn handle_inbound(
     identity: Arc<tendril_core::identity::EndpointIdentity>,
     pair_mgr: Arc<StdMutex<PairingManager>>,
     rate_limiter: PreAuthRateLimiter,
+    pair_enabled: bool,
+    allow_enroll: bool,
+    redact_logs: bool,
 ) {
     let Ok(Ok(peeked)) = tokio::time::timeout(
         DEFAULT_PRE_AUTH_TIMEOUT,
@@ -300,25 +461,25 @@ async fn handle_inbound(
 
     match preamble.intent {
         Intent::Pair => {
+            if !pair_enabled {
+                let _ = wrapped.close().await;
+                return;
+            }
             let path_kind = pairing_path_kind_for_provider(wrapped.provider_id());
-            let current_roster = {
-                let _guard = store_lock.lock().await;
-                match store.load_roster() {
-                    Ok(r) => r,
-                    Err(err) => {
-                        tracing::error!(error = %err, "failed to load roster before pair");
-                        return;
-                    }
-                }
+            let policy = if allow_enroll {
+                EnrollmentPolicy::enabled_default()
+            } else {
+                EnrollmentPolicy::default()
             };
-            let roster_sync = StdMutex::new(current_roster);
-            match drive_pair_responder_with_options(
+            match drive_pair_responder_with_store(
                 wrapped.as_mut(),
                 &identity,
                 &pair_mgr,
-                &roster_sync,
+                &store,
+                &store_lock,
                 path_kind,
                 now,
+                policy,
                 Some(&rate_limiter),
                 Some(pre_auth_guard),
                 DEFAULT_PRE_AUTH_TIMEOUT,
@@ -328,32 +489,33 @@ async fn handle_inbound(
                 Ok(res) => match res.outcome {
                     PairOutcome::ResponderPending {
                         device_id,
-                        device_static_pub,
                         pairing_sas,
-                        name,
-                        kind,
                         ..
                     } => {
-                        let _guard = store_lock.lock().await;
-                        if let Err(err) = store.update_roster(|persisted| {
-                            persisted
-                                .record_pending_pair(
-                                    device_static_pub,
-                                    None,
-                                    name,
-                                    kind,
-                                    pairing_sas.clone(),
-                                )
-                                .map(|_| ())
-                                .map_err(Into::into)
-                        }) {
-                            tracing::error!(error = %err, "failed to record paired peer");
-                            return;
-                        }
                         print_json_line(&serde_json::json!({
                             "event": "paired",
                             "device_id": device_id,
                             "sas": pairing_sas,
+                        }));
+                    }
+                    PairOutcome::ResponderEnrolled {
+                        device_id,
+                        token_nonce,
+                        name,
+                        kind,
+                        ..
+                    } => {
+                        let shown_nonce = if redact_logs {
+                            "<redacted>"
+                        } else {
+                            token_nonce.as_str()
+                        };
+                        print_json_line(&serde_json::json!({
+                            "event": "enrolled",
+                            "device_id": device_id,
+                            "name": name,
+                            "kind": kind,
+                            "token_nonce": shown_nonce,
                         }));
                     }
                     PairOutcome::Rejected { error } => {
@@ -362,7 +524,8 @@ async fn handle_inbound(
                             "error": error,
                         }));
                     }
-                    PairOutcome::InitiatorPending { .. } => {}
+                    PairOutcome::InitiatorPending { .. }
+                    | PairOutcome::InitiatorEnrolled { .. } => {}
                 },
                 Err(err) => {
                     tracing::debug!(error = %err, "pair responder error");
@@ -416,10 +579,15 @@ async fn handle_inbound(
                     .await;
                 match ev_res {
                     Ok(Some(SessionEvent::AppData(data))) => {
+                        let shown_utf8 = if redact_logs {
+                            "<redacted>".to_owned()
+                        } else {
+                            String::from_utf8_lossy(&data).into_owned()
+                        };
                         print_json_line(&serde_json::json!({
                             "event": "data",
                             "len": data.len(),
-                            "utf8": String::from_utf8_lossy(&data),
+                            "utf8": shown_utf8,
                         }));
                     }
                     Ok(Some(SessionEvent::RevocationUpdated { issuer, seq })) => {
@@ -610,11 +778,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             overlay,
             broker,
             issue_code,
+            allow_enroll,
+            redact_logs,
         } => {
             let identity = Arc::new(store.load_or_generate_identity(None)?);
             let store_lock = Arc::new(AsyncMutex::new(()));
             let pair_mgr = Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default())));
             let rate_limiter = PreAuthRateLimiter::new(PreAuthConfig::default());
+            let pair_enabled = issue_code.is_some() || allow_enroll;
 
             let issued = if let Some(kind_arg) = issue_code {
                 let kind = match kind_arg {
@@ -717,6 +888,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
+            let shown_code = if redact_logs {
+                issued.as_deref().map(|_| "<redacted>")
+            } else {
+                issued.as_deref()
+            };
             print_json_line(&serde_json::json!({
                 "event": "listening",
                 "host_id": identity.host_id(),
@@ -727,7 +903,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "p2p_endpoint": p2p_ep,
                 "overlay_endpoint": overlay_ep,
                 "broker_endpoint": broker_ep,
-                "pairing_code": issued,
+                "pairing_code": shown_code,
+                "allow_enroll": allow_enroll,
             }));
 
             let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(64);
@@ -752,6 +929,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Arc::clone(&identity),
                         Arc::clone(&pair_mgr),
                         rate_limiter.clone(),
+                        pair_enabled,
+                        allow_enroll,
+                        redact_logs,
                     ));
                 }
                 Err(err) => {
@@ -896,17 +1076,187 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PairOutcome::Rejected { error } => {
                     return Err(format!("pairing rejected: {error}").into());
                 }
-                PairOutcome::ResponderPending { .. } => {
+                PairOutcome::ResponderPending { .. } | PairOutcome::ResponderEnrolled { .. } => {
+                    return Err("unexpected responder outcome".into());
+                }
+                PairOutcome::InitiatorEnrolled { .. } => {
+                    return Err("unexpected m2m enrollment outcome".into());
+                }
+            }
+        }
+        Command::Anchor { cmd } => match cmd {
+            AnchorCommand::Add {
+                anchor_id,
+                signing_pub,
+            } => {
+                let signing_pub_bytes: [u8; 32] = b64url_decode_array(&signing_pub)?;
+                let id_clone = anchor_id.clone();
+                store.update_roster(|roster| {
+                    roster
+                        .add_trust_anchor(id_clone, signing_pub_bytes)
+                        .map(|_| ())
+                        .map_err(Into::into)
+                })?;
+                print_json_line(&serde_json::json!({
+                    "added_anchor": anchor_id,
+                    "signing_pub": signing_pub,
+                }));
+            }
+            AnchorCommand::Revoke { anchor_id } => {
+                store.update_roster(|roster| {
+                    roster.revoke_trust_anchor(&anchor_id).map_err(Into::into)
+                })?;
+                print_json_line(&serde_json::json!({ "revoked_anchor": anchor_id }));
+            }
+            AnchorCommand::List => {
+                let roster = store.load_roster()?;
+                let anchors: Vec<_> = roster
+                    .trust_anchors()
+                    .map(|(id, anchor)| {
+                        serde_json::json!({
+                            "anchor_id": id,
+                            "signing_pub": b64url_encode(&anchor.signing_pub),
+                            "state": match anchor.state {
+                                AnchorState::Active => "active",
+                                AnchorState::Revoked => "revoked",
+                            },
+                        })
+                    })
+                    .collect();
+                print_json_line(&serde_json::json!({ "anchors": anchors }));
+            }
+        },
+        Command::EnrollToken {
+            target_host,
+            subject,
+            ttl_secs,
+            out,
+        } => {
+            let identity = store.load_identity()?;
+            let now = now_unix();
+            let nonce = random_bytes::<16>()?;
+            let token = mint_enrollment_token(
+                &identity,
+                &target_host,
+                subject.as_deref(),
+                now,
+                ttl_secs,
+                nonce,
+            )?;
+            if let Some(out_path) = out {
+                let mut json = Zeroizing::new(serde_json::to_string_pretty(&token)?);
+                json.push('\n');
+                write_private_token_file(&out_path, &json)?;
+                print_json_line(&serde_json::json!({
+                    "wrote": out_path.display().to_string(),
+                    "issuer": token.issuer,
+                    "subject": token.subject,
+                    "nonce": token.nonce,
+                    "not_after": token.not_after,
+                }));
+            } else {
+                print_json_line(&token);
+            }
+        }
+        Command::Enroll {
+            endpoint,
+            host_id,
+            host_static_pub,
+            host_signing_pub,
+            host_rotation_seq,
+            token_file,
+            token_stdin,
+            name,
+            kind,
+            relay_host,
+            p2p_local,
+            p2p_relay,
+            no_pkarr,
+        } => {
+            let token = resolve_enroll_token(token_file, token_stdin)?;
+            let pinned_host = PinnedHost {
+                host_id: Some(host_id),
+                static_pub: b64url_decode_array(&host_static_pub)?,
+                signing_pub: b64url_decode_array(&host_signing_pub)?,
+                rotation_seq: host_rotation_seq,
+            };
+            let identity = store.load_or_generate_identity(None)?;
+            let mut stream = dial_endpoint(
+                &endpoint,
+                relay_host.as_deref(),
+                p2p_local,
+                p2p_relay.as_deref(),
+                no_pkarr,
+            )
+            .await?;
+            let res = drive_m2m_enroll_initiator(
+                stream.as_mut(),
+                &identity,
+                name,
+                kind,
+                token,
+                pinned_host,
+            )
+            .await;
+            let _ = stream.close().await;
+            let res = res?;
+            match res.outcome {
+                PairOutcome::InitiatorEnrolled {
+                    device_id,
+                    host_id,
+                    host_static_pub,
+                    host_signing_pub,
+                    host_rotation_seq,
+                    token_nonce,
+                } => {
+                    let host_id_out = host_id.clone();
+                    store.update_roster(|roster| {
+                        roster
+                            .insert_pinned_host(
+                                host_id,
+                                host_id_out.clone(),
+                                host_static_pub,
+                                Some(host_signing_pub),
+                                host_rotation_seq,
+                                Vec::new(),
+                            )
+                            .map(|_| ())
+                            .map_err(Into::into)
+                    })?;
+                    print_json_line(&serde_json::json!({
+                        "device_id": device_id,
+                        "enrolled_host_id": host_id_out,
+                        "status": "active",
+                        "host_rotation_seq": host_rotation_seq,
+                        "token_nonce": token_nonce,
+                        "static_pub": b64url_encode(&host_static_pub),
+                        "signing_pub": b64url_encode(&host_signing_pub),
+                    }));
+                }
+                PairOutcome::Rejected { error } => {
+                    return Err(format!("m2m enrollment rejected: {error}").into());
+                }
+                PairOutcome::InitiatorPending { .. } => {
+                    return Err("unexpected human pending outcome during m2m enrollment".into());
+                }
+                PairOutcome::ResponderPending { .. } | PairOutcome::ResponderEnrolled { .. } => {
                     return Err("unexpected responder outcome".into());
                 }
             }
         }
-        Command::Confirm { peer_id, sas } => {
+        Command::Confirm {
+            peer_id,
+            sas,
+            allow_no_sas,
+        } => {
             store.update_roster(|roster| {
-                roster
-                    .confirm_peer(&peer_id, sas.as_deref())
-                    .map(|_| ())
-                    .map_err(Into::into)
+                if allow_no_sas {
+                    roster.confirm_peer_without_sas(&peer_id)
+                } else {
+                    roster.confirm_peer(&peer_id, sas.as_deref())
+                }
+                .map(|_| ())
+                .map_err(Into::into)
             })?;
             print_json_line(&serde_json::json!({ "confirmed": peer_id }));
         }
@@ -1021,6 +1371,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Revoke { peer_id } => {
             store.update_roster(|roster| roster.revoke_peer(&peer_id).map_err(Into::into))?;
             print_json_line(&serde_json::json!({ "revoked": peer_id }));
+        }
+        Command::RevokeToken { nonce } => {
+            let identity = store.load_identity()?;
+            let now = now_unix();
+            let crl = store.update_roster(|roster| {
+                roster
+                    .revoke_nonce(&identity, &nonce, now)
+                    .map_err(Into::into)
+            })?;
+            print_json_line(&serde_json::json!({
+                "revoked_nonce": nonce,
+                "crl_seq": crl.seq,
+            }));
+        }
+        Command::Rotate => {
+            let mut identity = store.load_identity()?;
+            let new_static = StaticKeypair::generate()?;
+            let new_signing = SigningKeypair::generate()?;
+            let now = now_unix();
+            identity.rotate(new_static, new_signing, now)?;
+            store.save_identity(&identity)?;
+            store.update_roster(|roster| {
+                roster
+                    .resign_crl(&identity, now)
+                    .map(|_| ())
+                    .map_err(Into::into)
+            })?;
+            print_json_line(&serde_json::json!({
+                "host_id": identity.host_id(),
+                "rotation_seq": identity.rotation_seq(),
+                "static_pub": b64url_encode(identity.static_key().public_bytes()),
+                "signing_pub": b64url_encode(identity.signing_key().public_bytes()),
+            }));
         }
     }
 

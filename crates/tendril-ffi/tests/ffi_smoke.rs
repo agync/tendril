@@ -17,18 +17,20 @@ use tendril_core::wire::{
 };
 use tendril_ffi::{
     TENDRIL_EOF, TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_ERR_PROTOCOL, TENDRIL_OK,
-    TENDRIL_WOULD_BLOCK, tendril_compute_code_mac, tendril_device_id, tendril_endpoint_close,
-    tendril_endpoint_confirm_peer, tendril_endpoint_export_identity_json,
+    TENDRIL_WOULD_BLOCK, tendril_compute_code_mac, tendril_device_id,
+    tendril_endpoint_add_trust_anchor, tendril_endpoint_close, tendril_endpoint_confirm_peer,
+    tendril_endpoint_enroll_initiate, tendril_endpoint_export_identity_json,
     tendril_endpoint_export_roster_json, tendril_endpoint_free, tendril_endpoint_info_json,
-    tendril_endpoint_issue_code, tendril_endpoint_mint_grant, tendril_endpoint_new,
-    tendril_endpoint_new_from_state, tendril_endpoint_pair_accept, tendril_endpoint_pair_initiate,
-    tendril_endpoint_revoke_peer, tendril_endpoint_serve_direct, tendril_endpoint_serve_p2p,
-    tendril_fingerprint_device, tendril_fingerprint_host, tendril_last_error, tendril_pairing_sas,
-    tendril_session_accept, tendril_session_authorize, tendril_session_close,
-    tendril_session_connect, tendril_session_export_roster_json, tendril_session_free,
-    tendril_session_poll_event, tendril_session_rekey, tendril_session_send_data,
-    tendril_session_shutdown, tendril_string_free, tendril_verify_grant_json,
-    tendril_verify_rotation_chain_json,
+    tendril_endpoint_issue_code, tendril_endpoint_mint_enrollment_token,
+    tendril_endpoint_mint_grant, tendril_endpoint_new, tendril_endpoint_new_from_state,
+    tendril_endpoint_pair_accept, tendril_endpoint_pair_initiate, tendril_endpoint_revoke_peer,
+    tendril_endpoint_revoke_trust_anchor, tendril_endpoint_serve_direct,
+    tendril_endpoint_serve_p2p, tendril_fingerprint_device, tendril_fingerprint_host,
+    tendril_last_error, tendril_pairing_sas, tendril_session_accept, tendril_session_authorize,
+    tendril_session_close, tendril_session_connect, tendril_session_export_roster_json,
+    tendril_session_free, tendril_session_poll_event, tendril_session_rekey,
+    tendril_session_send_data, tendril_session_shutdown, tendril_string_free,
+    tendril_verify_grant_json, tendril_verify_rotation_chain_json,
 };
 use tendril_runtime::{
     DirectListener, PathListener, PathStream, PrefixedPathStream, SessionDriver, StateStore,
@@ -1453,6 +1455,366 @@ fn batch2b_sec08_sec17_sec32_sec37_ffi_hardening() {
         tendril_session_free(cli_sess);
         tendril_session_free(host_sess);
         tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
+}
+
+#[test]
+fn phase6_m2m_enrollment_and_replay_rejection() {
+    use tendril_core::crypto::b64url_decode_array;
+
+    let host_dir = TempDir::new().unwrap();
+    let cli1_dir = TempDir::new().unwrap();
+    let cli2_dir = TempDir::new().unwrap();
+    let host_dir_c = CString::new(host_dir.path().to_str().unwrap()).unwrap();
+    let cli1_dir_c = CString::new(cli1_dir.path().to_str().unwrap()).unwrap();
+    let cli2_dir_c = CString::new(cli2_dir.path().to_str().unwrap()).unwrap();
+    let host_name_c = CString::new("ffi-m2m-host").unwrap();
+
+    let host_ep = unsafe { tendril_endpoint_new(host_dir_c.as_ptr(), host_name_c.as_ptr()) };
+    let cli1_ep = unsafe { tendril_endpoint_new(cli1_dir_c.as_ptr(), ptr::null()) };
+    let cli2_ep = unsafe { tendril_endpoint_new(cli2_dir_c.as_ptr(), ptr::null()) };
+    let anchor_ep =
+        unsafe { tendril_endpoint_new(ptr::null(), CString::new("ffi-anchor").unwrap().as_ptr()) };
+    assert!(!host_ep.is_null() && !cli1_ep.is_null() && !cli2_ep.is_null() && !anchor_ep.is_null());
+
+    let mut host_info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(host_ep, &raw mut host_info_p) },
+        TENDRIL_OK
+    );
+    let host_info: Value = serde_json::from_str(&unsafe { take_cstr(host_info_p) }).unwrap();
+    let host_id = host_info["host_id"].as_str().unwrap().to_owned();
+    let host_static_pub: [u8; 32] =
+        b64url_decode_array(host_info["static_pub"].as_str().unwrap()).unwrap();
+    let host_signing_pub: [u8; 32] =
+        b64url_decode_array(host_info["signing_pub"].as_str().unwrap()).unwrap();
+
+    let mut anchor_info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(anchor_ep, &raw mut anchor_info_p) },
+        TENDRIL_OK
+    );
+    let anchor_info: Value = serde_json::from_str(&unsafe { take_cstr(anchor_info_p) }).unwrap();
+    let anchor_id = anchor_info["host_id"].as_str().unwrap().to_owned();
+    let anchor_signing_pub: [u8; 32] =
+        b64url_decode_array(anchor_info["signing_pub"].as_str().unwrap()).unwrap();
+
+    let mut cli1_info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(cli1_ep, &raw mut cli1_info_p) },
+        TENDRIL_OK
+    );
+    let cli1_info: Value = serde_json::from_str(&unsafe { take_cstr(cli1_info_p) }).unwrap();
+    let cli1_dev_id = cli1_info["device_id"].as_str().unwrap().to_owned();
+
+    let mut cli2_info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(cli2_ep, &raw mut cli2_info_p) },
+        TENDRIL_OK
+    );
+    let cli2_info: Value = serde_json::from_str(&unsafe { take_cstr(cli2_info_p) }).unwrap();
+    let cli2_dev_id = cli2_info["device_id"].as_str().unwrap().to_owned();
+
+    let listen_c = CString::new("127.0.0.1:0").unwrap();
+    let mut ep_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, listen_c.as_ptr(), &raw mut ep_p) },
+        TENDRIL_OK
+    );
+    let ep_str = unsafe { take_cstr(ep_p) };
+    let ep_c = CString::new(ep_str).unwrap();
+    let host_id_c = CString::new(host_id.as_str()).unwrap();
+    let cli1_dev_c = CString::new(cli1_dev_id.as_str()).unwrap();
+
+    // 1. Self-issued token enrolls cli1 directly to Active with zero app grants.
+    let mut tok1_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_enrollment_token(
+                host_ep,
+                host_id_c.as_ptr(),
+                cli1_dev_c.as_ptr(),
+                900,
+                &raw mut tok1_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let tok1_str = unsafe { take_cstr(tok1_p) };
+    let tok1_c = CString::new(tok1_str.as_str()).unwrap();
+    let name1_c = CString::new("m2m-1").unwrap();
+    let kind_c = CString::new("machine").unwrap();
+
+    let hep_usize = host_ep as usize;
+    let accept_thr1 = thread::spawn(move || {
+        let mut out_p: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out_p,
+            )
+        };
+        (
+            rc,
+            if out_p.is_null() {
+                String::new()
+            } else {
+                unsafe { take_cstr(out_p) }
+            },
+        )
+    });
+
+    let mut enroll1_p: *mut c_char = ptr::null_mut();
+    let rc1 = unsafe {
+        tendril_endpoint_enroll_initiate(
+            cli1_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            host_id_c.as_ptr(),
+            host_static_pub.as_ptr(),
+            host_signing_pub.as_ptr(),
+            0,
+            tok1_c.as_ptr(),
+            name1_c.as_ptr(),
+            kind_c.as_ptr(),
+            &raw mut enroll1_p,
+        )
+    };
+    assert_eq!(rc1, TENDRIL_OK, "enroll1 err: {}", read_last_err());
+    let enroll1_json: Value = serde_json::from_str(&unsafe { take_cstr(enroll1_p) }).unwrap();
+    assert_eq!(enroll1_json["status"], "active");
+    let (acc_rc1, acc_json1) = accept_thr1.join().unwrap();
+    assert_eq!(acc_rc1, TENDRIL_OK);
+    let acc1: Value = serde_json::from_str(&acc_json1).unwrap();
+    assert_eq!(acc1["status"], "active");
+    assert_eq!(acc1["device_id"], cli1_dev_id);
+
+    // 2. Single-use burn rejects immediate replay.
+    let accept_thr_rep = thread::spawn(move || {
+        let mut out_p: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out_p,
+            )
+        };
+        if !out_p.is_null() {
+            unsafe { tendril_string_free(out_p) };
+        }
+        rc
+    });
+    let mut rep_p: *mut c_char = ptr::null_mut();
+    let rep_rc = unsafe {
+        tendril_endpoint_enroll_initiate(
+            cli1_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            host_id_c.as_ptr(),
+            host_static_pub.as_ptr(),
+            host_signing_pub.as_ptr(),
+            0,
+            tok1_c.as_ptr(),
+            name1_c.as_ptr(),
+            kind_c.as_ptr(),
+            &raw mut rep_p,
+        )
+    };
+    assert_eq!(rep_rc, TENDRIL_ERR_PROTOCOL);
+    assert!(read_last_err().contains("token_replayed"));
+    assert_eq!(accept_thr_rep.join().unwrap(), TENDRIL_ERR_PROTOCOL);
+
+    // 3. Trust anchor enrollment works, then revoking the anchor blocks fresh tokens.
+    let anchor_id_c = CString::new(anchor_id.as_str()).unwrap();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_add_trust_anchor(
+                host_ep,
+                anchor_id_c.as_ptr(),
+                anchor_signing_pub.as_ptr(),
+            )
+        },
+        TENDRIL_OK
+    );
+    let cli2_dev_c = CString::new(cli2_dev_id.as_str()).unwrap();
+    let mut tok2_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_enrollment_token(
+                anchor_ep,
+                host_id_c.as_ptr(),
+                cli2_dev_c.as_ptr(),
+                900,
+                &raw mut tok2_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let tok2_c = CString::new(unsafe { take_cstr(tok2_p) }).unwrap();
+    let accept_thr2 = thread::spawn(move || {
+        let mut out_p: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out_p,
+            )
+        };
+        if !out_p.is_null() {
+            unsafe { tendril_string_free(out_p) };
+        }
+        rc
+    });
+    let mut enroll2_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_enroll_initiate(
+                cli2_ep,
+                ep_c.as_ptr(),
+                ptr::null(),
+                host_id_c.as_ptr(),
+                host_static_pub.as_ptr(),
+                host_signing_pub.as_ptr(),
+                0,
+                tok2_c.as_ptr(),
+                name1_c.as_ptr(),
+                kind_c.as_ptr(),
+                &raw mut enroll2_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    unsafe { tendril_string_free(enroll2_p) };
+    assert_eq!(accept_thr2.join().unwrap(), TENDRIL_OK);
+
+    assert_eq!(
+        unsafe { tendril_endpoint_revoke_trust_anchor(host_ep, anchor_id_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let mut tok3_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_enrollment_token(
+                anchor_ep,
+                host_id_c.as_ptr(),
+                ptr::null(),
+                900,
+                &raw mut tok3_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let tok3_c = CString::new(unsafe { take_cstr(tok3_p) }).unwrap();
+    let accept_thr3 = thread::spawn(move || {
+        let mut out_p: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out_p,
+            )
+        };
+        if !out_p.is_null() {
+            unsafe { tendril_string_free(out_p) };
+        }
+        rc
+    });
+    let mut enroll3_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_enroll_initiate(
+                cli2_ep,
+                ep_c.as_ptr(),
+                ptr::null(),
+                host_id_c.as_ptr(),
+                host_static_pub.as_ptr(),
+                host_signing_pub.as_ptr(),
+                0,
+                tok3_c.as_ptr(),
+                name1_c.as_ptr(),
+                kind_c.as_ptr(),
+                &raw mut enroll3_p,
+            )
+        },
+        TENDRIL_ERR_PROTOCOL
+    );
+    assert!(read_last_err().contains("untrusted_anchor"));
+    assert_eq!(accept_thr3.join().unwrap(), TENDRIL_ERR_PROTOCOL);
+
+    // 4. Default deny holds on enrolled peer until mint_grant is called.
+    let acc_sess_thr = thread::spawn(move || {
+        unsafe { tendril_session_accept(hep_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) }
+            .addr()
+    });
+    let sess1 = unsafe {
+        tendril_session_connect(
+            cli1_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            host_id_c.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(!sess1.is_null(), "connect failed: {}", read_last_err());
+    let host_sess1 = acc_sess_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess1.is_null());
+    let cap_c = CString::new("fs.read:/m2m/doc.txt").unwrap();
+    let mut allowed: u8 = 9;
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess1, cap_c.as_ptr(), &raw mut allowed) },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed, 0);
+
+    let caps_c = CString::new("[\"fs.read:/m2m/*\"]").unwrap();
+    let mut grant_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                cli1_dev_c.as_ptr(),
+                caps_c.as_ptr(),
+                300,
+                &raw mut grant_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_c = CString::new(unsafe { take_cstr(grant_p) }).unwrap();
+    let acc_sess2_thr = thread::spawn(move || {
+        unsafe { tendril_session_accept(hep_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) }
+            .addr()
+    });
+    let sess2 = unsafe {
+        tendril_session_connect(
+            cli1_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            host_id_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(!sess2.is_null());
+    let host_sess2 = acc_sess2_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess2.is_null());
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess2, cap_c.as_ptr(), &raw mut allowed) },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed, 1);
+
+    unsafe {
+        tendril_session_close(sess1, 1000, ptr::null());
+        tendril_session_free(sess1);
+        tendril_session_free(host_sess1);
+        tendril_session_close(sess2, 1000, ptr::null());
+        tendril_session_free(sess2);
+        tendril_session_free(host_sess2);
+        tendril_endpoint_free(anchor_ep);
+        tendril_endpoint_free(cli2_ep);
+        tendril_endpoint_free(cli1_ep);
         tendril_endpoint_free(host_ep);
     }
 }

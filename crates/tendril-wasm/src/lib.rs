@@ -475,8 +475,12 @@ impl WasmPairInitiator {
                         "error": error,
                     }));
                 }
-                PairAction::Completed(PairOutcome::ResponderPending { .. }) => {
+                PairAction::Completed(PairOutcome::ResponderPending { .. })
+                | PairAction::Completed(PairOutcome::ResponderEnrolled { .. }) => {
                     return Err("unexpected responder outcome".to_owned());
+                }
+                PairAction::Completed(PairOutcome::InitiatorEnrolled { .. }) => {
+                    return Err("unexpected m2m enrollment outcome".to_owned());
                 }
                 PairAction::CloseTransport(_) => {}
             }

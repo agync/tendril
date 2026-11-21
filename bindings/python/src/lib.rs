@@ -374,8 +374,11 @@ impl Endpoint {
                     .to_string())
                 }
                 PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
-                PairOutcome::ResponderPending { .. } => {
+                PairOutcome::ResponderPending { .. } | PairOutcome::ResponderEnrolled { .. } => {
                     Err(PyRuntimeError::new_err("unexpected responder outcome"))
+                }
+                PairOutcome::InitiatorEnrolled { .. } => {
+                    Err(PyRuntimeError::new_err("unexpected m2m enrollment outcome"))
                 }
             }
         })
@@ -434,8 +437,11 @@ impl Endpoint {
                     .to_string())
                 }
                 PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
-                PairOutcome::InitiatorPending { .. } => {
+                PairOutcome::InitiatorPending { .. } | PairOutcome::InitiatorEnrolled { .. } => {
                     Err(PyRuntimeError::new_err("unexpected initiator outcome"))
+                }
+                PairOutcome::ResponderEnrolled { .. } => {
+                    Err(PyRuntimeError::new_err("unexpected m2m enrollment outcome"))
                 }
             }
         })

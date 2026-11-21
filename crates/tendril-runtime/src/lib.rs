@@ -10,8 +10,11 @@ pub mod store;
 
 pub use driver::{
     ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, SessionDriver, SessionEvent, dial_with_policy,
-    dial_with_policy_verified, drive_pair_initiator, drive_pair_initiator_with_timeout,
-    drive_pair_responder, drive_pair_responder_with_options, pairing_path_kind_for_provider,
+    dial_with_policy_verified, drive_m2m_enroll_initiator, drive_m2m_enroll_initiator_with_timeout,
+    drive_pair_initiator, drive_pair_initiator_with_timeout, drive_pair_responder,
+    drive_pair_responder_with_options, drive_pair_responder_with_policy,
+    drive_pair_responder_with_policy_and_store, drive_pair_responder_with_store,
+    pairing_path_kind_for_provider,
 };
 pub use error::RuntimeError;
 pub use provider::{

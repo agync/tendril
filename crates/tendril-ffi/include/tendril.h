@@ -111,6 +111,33 @@ int32_t tendril_endpoint_mint_grant(
 );
 int32_t tendril_endpoint_revoke_peer(TendrilEndpoint *ep, const char *peer_id);
 
+int32_t tendril_endpoint_add_trust_anchor(
+    TendrilEndpoint *ep,
+    const char *anchor_id,
+    const uint8_t *signing_pub_32
+);
+int32_t tendril_endpoint_revoke_trust_anchor(TendrilEndpoint *ep, const char *anchor_id);
+int32_t tendril_endpoint_mint_enrollment_token(
+    TendrilEndpoint *ep,
+    const char *target_host_id,
+    const char *subject_opt,
+    uint64_t ttl_secs,
+    char **out_token_json
+);
+int32_t tendril_endpoint_enroll_initiate(
+    TendrilEndpoint *ep,
+    const char *endpoint,
+    const char *relay_host_opt,
+    const char *host_id,
+    const uint8_t *host_static_pub_32,
+    const uint8_t *host_signing_pub_32,
+    uint64_t host_rotation_seq,
+    const char *token_json,
+    const char *name,
+    const char *kind,
+    char **out_json
+);
+
 /* Session lifecycle and polled queue API (independent of TendrilEndpoint lifetime once opened). */
 TendrilSession *tendril_session_connect(
     TendrilEndpoint *ep,

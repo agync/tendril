@@ -396,8 +396,11 @@ impl Endpoint {
                 .to_string())
             }
             PairOutcome::Rejected { error } => Err(to_generic_err(error)),
-            PairOutcome::ResponderPending { .. } => {
+            PairOutcome::ResponderPending { .. } | PairOutcome::ResponderEnrolled { .. } => {
                 Err(to_generic_err("unexpected responder outcome"))
+            }
+            PairOutcome::InitiatorEnrolled { .. } => {
+                Err(to_generic_err("unexpected m2m enrollment outcome"))
             }
         }
     }
@@ -444,8 +447,11 @@ impl Endpoint {
                 .to_string())
             }
             PairOutcome::Rejected { error } => Err(to_generic_err(error)),
-            PairOutcome::InitiatorPending { .. } => {
+            PairOutcome::InitiatorPending { .. } | PairOutcome::InitiatorEnrolled { .. } => {
                 Err(to_generic_err("unexpected initiator outcome"))
+            }
+            PairOutcome::ResponderEnrolled { .. } => {
+                Err(to_generic_err("unexpected m2m enrollment outcome"))
             }
         }
     }

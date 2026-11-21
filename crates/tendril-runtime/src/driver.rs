@@ -10,21 +10,24 @@ use tendril_core::error::CoreError;
 use tendril_core::grants::{AuditEvent, Grant, RevocationList};
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
 use tendril_core::pairing::{
-    PairAction, PairOutcome, PairingInitiator, PairingManager, PairingPathKind, PairingResponder,
-    PinnedHost,
+    EnrollmentPolicy, PairAction, PairOutcome, PairingInitiator, PairingManager, PairingPathKind,
+    PairingResponder, PinnedHost,
 };
 use tendril_core::policy::{
     CandidateEndpoint, PathPlanner, PathPolicyConfig, PlannerAction, ProviderId,
 };
 use tendril_core::roster::Roster;
 use tendril_core::session::{RekeyDirection, SessionAction, SessionMachine};
-use tokio::sync::mpsc;
+use tendril_core::wire::{Intent, Preamble};
+use tendril_core::{MAX_FRAME_LEN, PREAMBLE_LEN};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
 
 use crate::error::RuntimeError;
 use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, PathWriter};
 use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
+use crate::store::StateStore;
 
 fn current_unix_secs() -> u64 {
     SystemTime::now()
@@ -154,8 +157,60 @@ pub async fn drive_pair_initiator_with_timeout(
     pinned_host: Option<PinnedHost>,
     handshake_timeout: Duration,
 ) -> Result<PairDriveResult, RuntimeError> {
-    let mut machine =
+    let machine =
         PairingInitiator::new(identity, device_name, device_kind, code, pinned_host, None)?;
+    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+}
+
+/// Drives an autonomous M2M enrollment initiator handshake to completion over `stream`
+/// within `DEFAULT_PRE_AUTH_TIMEOUT`, requiring a pinned host identity.
+pub async fn drive_m2m_enroll_initiator(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    device_name: String,
+    device_kind: String,
+    enrollment_token: Grant,
+    pinned_host: PinnedHost,
+) -> Result<PairDriveResult, RuntimeError> {
+    drive_m2m_enroll_initiator_with_timeout(
+        stream,
+        identity,
+        device_name,
+        device_kind,
+        enrollment_token,
+        pinned_host,
+        DEFAULT_PRE_AUTH_TIMEOUT,
+    )
+    .await
+}
+
+/// Drives an autonomous M2M enrollment initiator handshake to completion over `stream`
+/// within `handshake_timeout`, requiring a pinned host identity.
+pub async fn drive_m2m_enroll_initiator_with_timeout(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    device_name: String,
+    device_kind: String,
+    enrollment_token: Grant,
+    pinned_host: PinnedHost,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    let machine = PairingInitiator::new_m2m(
+        identity,
+        device_name,
+        device_kind,
+        enrollment_token,
+        pinned_host,
+        None,
+    )?;
+    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+}
+
+async fn drive_pairing_initiator_machine(
+    stream: &mut dyn PathStream,
+    mut machine: PairingInitiator,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
     let mut observed_sas = None;
     let deadline = TokioInstant::now() + handshake_timeout;
     let init_actions = machine.start()?;
@@ -246,7 +301,7 @@ pub async fn drive_pair_responder(
 }
 
 /// Drives a pairing responder handshake with an optional caller-held [`HalfOpenGuard`]
-/// and an explicit overall pre-auth handshake deadline.
+/// and an explicit overall pre-auth handshake deadline (M2M enrollment disabled).
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_pair_responder_with_options(
     stream: &mut dyn PathStream,
@@ -255,6 +310,155 @@ pub async fn drive_pair_responder_with_options(
     roster: &Mutex<Roster>,
     path_kind: PairingPathKind,
     now_unix: u64,
+    rate_limiter: Option<&PreAuthRateLimiter>,
+    existing_guard: Option<HalfOpenGuard>,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    drive_pair_responder_with_policy(
+        stream,
+        identity,
+        manager,
+        roster,
+        path_kind,
+        now_unix,
+        EnrollmentPolicy::default(),
+        rate_limiter,
+        existing_guard,
+        handshake_timeout,
+    )
+    .await
+}
+
+/// Drives a pairing responder handshake using an explicit [`EnrollmentPolicy`], updating `roster`.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_pair_responder_with_policy(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    manager: &Mutex<PairingManager>,
+    roster: &Mutex<Roster>,
+    path_kind: PairingPathKind,
+    now_unix: u64,
+    enrollment_policy: EnrollmentPolicy,
+    rate_limiter: Option<&PreAuthRateLimiter>,
+    existing_guard: Option<HalfOpenGuard>,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    drive_pair_responder_inner(
+        stream,
+        identity,
+        manager,
+        ResponderRosterBackend::InMemory {
+            roster,
+            store: None,
+        },
+        path_kind,
+        now_unix,
+        enrollment_policy,
+        rate_limiter,
+        existing_guard,
+        handshake_timeout,
+    )
+    .await
+}
+
+/// Drives a pairing responder handshake updating `roster` and persisting atomically to `store`
+/// before transmitting `PairResponse`.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_pair_responder_with_policy_and_store(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    manager: &Mutex<PairingManager>,
+    roster: &Mutex<Roster>,
+    store: Option<&StateStore>,
+    path_kind: PairingPathKind,
+    now_unix: u64,
+    enrollment_policy: EnrollmentPolicy,
+    rate_limiter: Option<&PreAuthRateLimiter>,
+    existing_guard: Option<HalfOpenGuard>,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    drive_pair_responder_inner(
+        stream,
+        identity,
+        manager,
+        ResponderRosterBackend::InMemory { roster, store },
+        path_kind,
+        now_unix,
+        enrollment_policy,
+        rate_limiter,
+        existing_guard,
+        handshake_timeout,
+    )
+    .await
+}
+
+/// Drives a pairing responder backed directly by [`StateStore`] (`tendril-cli` / concurrent host),
+/// executing `msg3` claim verification and nonce burn atomically under `store_lock` and `.roster.lock`
+/// before transmitting `PairResponse`.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_pair_responder_with_store(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    manager: &Mutex<PairingManager>,
+    store: &StateStore,
+    store_lock: &AsyncMutex<()>,
+    path_kind: PairingPathKind,
+    now_unix: u64,
+    enrollment_policy: EnrollmentPolicy,
+    rate_limiter: Option<&PreAuthRateLimiter>,
+    existing_guard: Option<HalfOpenGuard>,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    drive_pair_responder_inner(
+        stream,
+        identity,
+        manager,
+        ResponderRosterBackend::DiskStore { store, store_lock },
+        path_kind,
+        now_unix,
+        enrollment_policy,
+        rate_limiter,
+        existing_guard,
+        handshake_timeout,
+    )
+    .await
+}
+
+enum ResponderRosterBackend<'a> {
+    InMemory {
+        roster: &'a Mutex<Roster>,
+        store: Option<&'a StateStore>,
+    },
+    DiskStore {
+        store: &'a StateStore,
+        store_lock: &'a AsyncMutex<()>,
+    },
+}
+
+fn has_complete_outer_frame(buf: &[u8]) -> Result<bool, RuntimeError> {
+    if buf.len() < 2 {
+        return Ok(false);
+    }
+    let body_len = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
+    if body_len > MAX_FRAME_LEN {
+        return Err(CoreError::FrameTooLarge {
+            len: body_len,
+            max: MAX_FRAME_LEN,
+        }
+        .into());
+    }
+    Ok(buf.len() >= 2 + body_len)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_pair_responder_inner(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    manager: &Mutex<PairingManager>,
+    backend: ResponderRosterBackend<'_>,
+    path_kind: PairingPathKind,
+    now_unix: u64,
+    enrollment_policy: EnrollmentPolicy,
     rate_limiter: Option<&PreAuthRateLimiter>,
     existing_guard: Option<HalfOpenGuard>,
     handshake_timeout: Duration,
@@ -271,30 +475,104 @@ pub async fn drive_pair_responder_with_options(
             })
             .transpose()?,
     };
-    let mut machine = PairingResponder::new(identity, path_kind, None)?;
+    let mut machine =
+        PairingResponder::with_enrollment_policy(identity, path_kind, None, enrollment_policy)?;
     let mut observed_sas = None;
     let mut buf = vec![0u8; MAX_OUTER_FRAME_LEN];
+    let mut pre_claim_buf = Vec::new();
+    let mut pending_claim_bytes = Vec::new();
     let deadline = TokioInstant::now() + handshake_timeout;
 
     loop {
-        let n = match timeout_at(deadline, stream.recv_chunk(&mut buf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => return Err(err),
-            Err(_) => {
-                let _ = stream.close().await;
-                return Err(RuntimeError::Timeout(
-                    "pre-auth pairing handshake timed out",
-                ));
+        if !machine.is_awaiting_claim() || !has_complete_outer_frame(&pending_claim_bytes)? {
+            let n = match timeout_at(deadline, stream.recv_chunk(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    let _ = stream.close().await;
+                    return Err(RuntimeError::Timeout(
+                        "pre-auth pairing handshake timed out",
+                    ));
+                }
+            };
+            if n == 0 {
+                return Err(RuntimeError::Closed);
+            }
+            if !machine.is_awaiting_claim() {
+                pre_claim_buf.extend_from_slice(&buf[..n]);
+                if pre_claim_buf.len() > PREAMBLE_LEN + MAX_OUTER_FRAME_LEN {
+                    return Err(CoreError::BufferOverflow {
+                        len: pre_claim_buf.len(),
+                        max: PREAMBLE_LEN + MAX_OUTER_FRAME_LEN,
+                    }
+                    .into());
+                }
+            } else {
+                pending_claim_bytes.extend_from_slice(&buf[..n]);
+                if pending_claim_bytes.len() > MAX_OUTER_FRAME_LEN {
+                    return Err(CoreError::BufferOverflow {
+                        len: pending_claim_bytes.len(),
+                        max: MAX_OUTER_FRAME_LEN,
+                    }
+                    .into());
+                }
+            }
+        }
+
+        let actions = if !machine.is_awaiting_claim() {
+            if pre_claim_buf.len() < PREAMBLE_LEN {
+                continue;
+            }
+            let preamble = Preamble::decode(&pre_claim_buf[..PREAMBLE_LEN])?;
+            if preamble.intent != Intent::Pair {
+                return Err(CoreError::ProtocolViolation("expected pair preamble intent").into());
+            }
+            // Feed only the preamble + msg1 frame before entering AwaitMsg3 so coalesced msg3
+            // bytes can never execute against an empty roster.
+            let after_pre = &pre_claim_buf[PREAMBLE_LEN..];
+            if !has_complete_outer_frame(after_pre)? {
+                continue;
+            }
+            let body1_len = usize::from(u16::from_be_bytes([after_pre[0], after_pre[1]]));
+            let split_at = PREAMBLE_LEN + 2 + body1_len;
+            let trailing = pre_claim_buf.split_off(split_at);
+            pending_claim_bytes.extend_from_slice(&trailing);
+            let msg1_bytes = std::mem::take(&mut pre_claim_buf);
+
+            let mut mgr = manager.lock().expect("pairing manager mutex poisoned");
+            let mut empty_roster = Roster::new();
+            machine.feed_bytes(&msg1_bytes, now_unix, &mut mgr, &mut empty_roster)?
+        } else {
+            if !has_complete_outer_frame(&pending_claim_bytes)? {
+                continue;
+            }
+            let claim_bytes = std::mem::take(&mut pending_claim_bytes);
+            match &backend {
+                ResponderRosterBackend::InMemory { roster, store } => {
+                    let mut mgr = manager.lock().expect("pairing manager mutex poisoned");
+                    let mut rst = roster.lock().expect("roster mutex poisoned");
+                    let actions = machine.feed_bytes(&claim_bytes, now_unix, &mut mgr, &mut rst)?;
+                    if let Some(s) = store
+                        && actions
+                            .iter()
+                            .any(|a| matches!(a, PairAction::Completed(_)))
+                    {
+                        s.save_roster(&rst)?;
+                    }
+                    actions
+                }
+                ResponderRosterBackend::DiskStore { store, store_lock } => {
+                    let _guard = store_lock.lock().await;
+                    store.update_roster(|rst| {
+                        let mut mgr = manager.lock().expect("pairing manager mutex poisoned");
+                        machine
+                            .feed_bytes(&claim_bytes, now_unix, &mut mgr, rst)
+                            .map_err(Into::into)
+                    })?
+                }
             }
         };
-        if n == 0 {
-            return Err(RuntimeError::Closed);
-        }
-        let actions = {
-            let mut mgr = manager.lock().expect("pairing manager mutex poisoned");
-            let mut rst = roster.lock().expect("roster mutex poisoned");
-            machine.feed_bytes(&buf[..n], now_unix, &mut mgr, &mut rst)?
-        };
+
         if let Some(outcome) = dispatch_pair_actions(stream, actions, &mut observed_sas).await? {
             return Ok(PairDriveResult {
                 outcome,
