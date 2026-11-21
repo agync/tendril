@@ -2889,3 +2889,572 @@ async fn broker_dialer_debug_redacts_secrets_and_direct_dialer_timeout_works() {
         .expect("connect direct with timeout");
     assert_eq!(stream.provider_id(), ProviderId::Direct);
 }
+
+#[tokio::test]
+async fn relay_client_auth_v1_and_v2_hmac_and_tickets_end_to_end() {
+    use tendril_core::relay_auth::{
+        RelayAuthRole, RelayAuthScope, RelayAuthSecret, mint_relay_ticket,
+    };
+    use tendril_runtime::{
+        RelayClientAuth, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig,
+        dial_endpoint_with_auth,
+    };
+
+    let shared_secret = RelayAuthSecret::from_bytes(b"runtime-relay-client-auth-secret").unwrap();
+    let issuer_kp = SigningKeypair::generate().unwrap();
+    let issuer_sk = issuer_kp.ed25519_signing_key();
+    let issuer_pub = issuer_sk.verifying_key().to_bytes();
+
+    // Redaction check on RelayClientAuth::Debug.
+    let hmac_auth = RelayClientAuth::HmacSecret(shared_secret.clone());
+    let dbg = format!("{hmac_auth:?}");
+    assert!(dbg.contains("<redacted>"));
+    assert!(!dbg.contains("runtime-relay-client-auth-secret"));
+
+    let relay = RelayServer::bind(RelayConfig {
+        host: "relay.example".to_owned(),
+        auth_secret: Some(zeroize::Zeroizing::new(shared_secret.as_bytes().to_vec())),
+        trusted_issuers: vec![issuer_pub],
+        auth_scope: RelayAuthScope::All,
+        ..RelayConfig::default()
+    })
+    .await
+    .unwrap()
+    .spawn();
+
+    // 1. v1 RelayListener + RelayDialer + dial_endpoint_with_auth with HMAC and Ticket.
+    let listener_kp = SigningKeypair::generate().unwrap();
+    let unauth_listener = RelayListener::bind(
+        relay.ws_url(),
+        Some("relay.example".to_owned()),
+        listener_kp.ed25519_signing_key(),
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await;
+    assert!(unauth_listener.is_err());
+
+    let mut listener = RelayListener::bind_with_auth(
+        relay.ws_url(),
+        Some("relay.example".to_owned()),
+        listener_kp.ed25519_signing_key(),
+        DEFAULT_WRITE_TIMEOUT,
+        hmac_auth.clone(),
+    )
+    .await
+    .expect("bind authenticated v1 listener");
+    let ep = listener.local_endpoint();
+
+    let unauth_dial = RelayDialer::new()
+        .with_expected_host("relay.example")
+        .dial(&ep)
+        .await;
+    assert!(unauth_dial.is_err());
+
+    let now_u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let dial_ticket = mint_relay_ticket(
+        &issuer_sk,
+        "relay.example",
+        RelayAuthRole::Dial,
+        listener.mailbox_pub_b64(),
+        now_u64,
+        60,
+    )
+    .unwrap();
+
+    let (acc_res, dial_res) = tokio::join!(
+        listener.accept(),
+        dial_endpoint_with_auth(
+            &ep,
+            Some("relay.example"),
+            RelayClientAuth::Ticket(dial_ticket),
+        ),
+    );
+    let mut srv_s = acc_res.expect("accept v1");
+    let mut cli_s = dial_res.expect("dial v1");
+    send_tendril_frame(cli_s.as_mut(), b"v1-auth-ok")
+        .await
+        .unwrap();
+    let mut rd = ResumableFrameReader::new();
+    assert_eq!(
+        recv_tendril_frame(srv_s.as_mut(), &mut rd).await.unwrap(),
+        b"v1-auth-ok"
+    );
+    drop((srv_s, cli_s, listener));
+
+    // 2. v2 RelayV2Listener + RelayV2Dialer with HMAC & Ticket.
+    let mb_secret = [0x9A; 32];
+    let unauth_v2 = RelayV2Listener::bind(
+        relay.ws_v2_url(),
+        Some("relay.example".to_owned()),
+        mb_secret,
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await;
+    assert!(unauth_v2.is_err());
+
+    let mut v2_listener = RelayV2Listener::bind_with_auth(
+        relay.ws_v2_url(),
+        Some("relay.example".to_owned()),
+        mb_secret,
+        DEFAULT_WRITE_TIMEOUT,
+        hmac_auth.clone(),
+    )
+    .await
+    .expect("bind authenticated v2 listener");
+    let v2_ep = v2_listener.local_endpoint();
+
+    let unauth_v2_dial = RelayV2Dialer::new(mb_secret)
+        .with_expected_host("relay.example")
+        .dial(&v2_ep)
+        .await;
+    assert!(unauth_v2_dial.is_err());
+
+    let v2_dialer = RelayV2Dialer::new(mb_secret)
+        .with_expected_host("relay.example")
+        .with_auth(hmac_auth);
+    let (v2_acc_res, v2_dial_res) = tokio::join!(v2_listener.accept(), v2_dialer.dial(&v2_ep));
+    let mut v2_srv = v2_acc_res.expect("accept v2");
+    let mut v2_cli = v2_dial_res.expect("dial v2");
+    send_tendril_frame(v2_cli.as_mut(), b"v2-auth-ok")
+        .await
+        .unwrap();
+    let mut rd2 = ResumableFrameReader::new();
+    assert_eq!(
+        recv_tendril_frame(v2_srv.as_mut(), &mut rd2).await.unwrap(),
+        b"v2-auth-ok"
+    );
+
+    let _ = RelayV2ListenerConfig::default();
+    drop((v2_srv, v2_cli, v2_listener));
+    relay.stop().await.unwrap();
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn p2p_custom_many_validation_and_live_gated_iroh_relay_pairing_and_rekey() {
+    use std::net::TcpListener as StdTcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tendril_core::roster::Roster;
+    use tendril_core::session::RekeyDirection;
+    use tendril_runtime::{
+        MAX_P2P_CUSTOM_RELAYS, P2pOptions, P2pRelayAuth, V2ResponderState, V2SessionDriver,
+        drive_v2_pake_pair_initiator, drive_v2_pake_pair_responder, parse_p2p_relay_modes,
+    };
+    use zeroize::Zeroizing;
+
+    // 1. parse_p2p_relay_modes & P2pOptions validation.
+    assert!(parse_p2p_relay_modes(&[]).is_err());
+    assert_eq!(
+        parse_p2p_relay_modes(&["https://r1.example".to_owned()]).unwrap(),
+        P2pRelayMode::Custom("https://r1.example/".to_owned())
+    );
+    let many_urls: Vec<String> = (1..=MAX_P2P_CUSTOM_RELAYS)
+        .map(|i| format!("https://r{i}.example/"))
+        .collect();
+    assert_eq!(
+        parse_p2p_relay_modes(&many_urls).unwrap(),
+        P2pRelayMode::CustomMany(many_urls.clone())
+    );
+    let too_many: Vec<String> = (1..=MAX_P2P_CUSTOM_RELAYS + 1)
+        .map(|i| format!("https://r{i}.example/"))
+        .collect();
+    assert!(parse_p2p_relay_modes(&too_many).is_err());
+
+    let auth_tok =
+        P2pRelayAuth::BearerToken(Zeroizing::new("super-secret-bearer-token".to_owned()));
+    let dbg = format!("{auth_tok:?}");
+    assert!(dbg.contains("<redacted>"));
+    assert!(!dbg.contains("super-secret-bearer-token"));
+
+    assert!(
+        P2pListener::bind_with_options(
+            P2pOptions::for_listener(P2pRelayMode::Disabled)
+                .with_relay_auth(Some(auth_tok.clone())),
+            None,
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        P2pListener::bind_with_options(
+            P2pOptions::for_listener(P2pRelayMode::Custom("https://r1.example".to_owned()))
+                .with_relay_auth(Some(P2pRelayAuth::BearerToken(Zeroizing::new(
+                    String::new()
+                )))),
+            None,
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        P2pListener::bind_with_options(
+            P2pOptions::for_listener(P2pRelayMode::Custom("https://r1.example".to_owned()))
+                .with_relay_auth(Some(P2pRelayAuth::BearerToken(Zeroizing::new(
+                    "bad\ntoken".to_owned()
+                )))),
+            None,
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        P2pListener::bind_with_options(
+            P2pOptions::for_listener(P2pRelayMode::Custom("https://r1.example".to_owned()))
+                .with_relay_auth(Some(P2pRelayAuth::BearerToken(Zeroizing::new(
+                    "a".repeat(4097)
+                )))),
+            None,
+        )
+        .await
+        .is_err()
+    );
+
+    // 2. Spawn live in-process iroh_relay::server::Server requiring Bearer token.
+    #[derive(Debug)]
+    struct BearerAccess {
+        expected: String,
+        seen_good: Arc<AtomicUsize>,
+        seen_bad: Arc<AtomicUsize>,
+    }
+
+    impl iroh_relay::server::AccessControl for BearerAccess {
+        async fn on_connect(
+            &self,
+            request: &iroh_relay::server::ClientRequest,
+        ) -> iroh_relay::server::Access {
+            if request.auth_token().as_deref() == Some(self.expected.as_str()) {
+                self.seen_good.fetch_add(1, Ordering::AcqRel);
+                iroh_relay::server::Access::Allow
+            } else {
+                self.seen_bad.fetch_add(1, Ordering::AcqRel);
+                iroh_relay::server::Access::Deny {
+                    reason: Some("invalid token".to_owned()),
+                }
+            }
+        }
+    }
+
+    let seen_good = Arc::new(AtomicUsize::new(0));
+    let seen_bad = Arc::new(AtomicUsize::new(0));
+    let mut relay_cfg =
+        iroh_relay::server::RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    relay_cfg.key_cache_capacity = Some(1024);
+    relay_cfg.access = Arc::new(BearerAccess {
+        expected: "super-secret-bearer-token".to_owned(),
+        seen_good: Arc::clone(&seen_good),
+        seen_bad: Arc::clone(&seen_bad),
+    });
+    let mut server_cfg = iroh_relay::server::ServerConfig::default();
+    server_cfg.relay = Some(relay_cfg);
+    let iroh_srv = iroh_relay::server::Server::spawn(server_cfg)
+        .await
+        .expect("spawn iroh-relay server");
+    let live_relay_url = format!("http://{}", iroh_srv.http_addr().expect("http addr"));
+
+    // Reserve and close a dead loopback port so CustomMany([dead, live]) fails over to live.
+    let dead_sock = StdTcpListener::bind("127.0.0.1:0").expect("bind dead port");
+    let dead_url = format!("http://{}", dead_sock.local_addr().unwrap());
+    drop(dead_sock);
+
+    let custom_many = parse_p2p_relay_modes(&[dead_url, live_relay_url.clone()]).unwrap();
+    assert!(matches!(custom_many, P2pRelayMode::CustomMany(_)));
+
+    // Negative control: wrong token cannot authenticate to the gated relay and cannot pair over relay-only.
+    let bad_auth = P2pRelayAuth::BearerToken(Zeroizing::new("wrong-bearer-token".to_owned()));
+    let bad_listener = P2pListener::bind_with_options(
+        P2pOptions::for_listener(custom_many.clone()).with_relay_auth(Some(bad_auth.clone())),
+        None,
+    )
+    .await
+    .expect("bind bad listener");
+    let bad_ep = bad_listener.local_endpoint();
+    assert!(!bad_ep.contains("wrong-bearer-token"));
+    let bad_dialer = P2pDialer::bind_with_options(
+        P2pOptions::for_dialer(custom_many.clone()).with_relay_auth(Some(bad_auth)),
+    )
+    .await
+    .expect("bind bad dialer");
+    // Ensure wrong-token endpoint cannot connect via the relay (with direct addrs stripped/disabled).
+    let stripped_ep = format!(
+        "iroh://{}?relay={live_relay_url}/",
+        bad_listener.endpoint_id()
+    );
+    let bad_dial_res = timeout(Duration::from_millis(600), bad_dialer.dial(&stripped_ep)).await;
+    assert!(
+        !matches!(bad_dial_res, Ok(Ok(_))),
+        "wrong-token dial must not succeed"
+    );
+    assert!(seen_bad.load(Ordering::Acquire) > 0);
+    assert_eq!(seen_good.load(Ordering::Acquire), 0);
+    drop(bad_listener);
+    bad_dialer.close().await;
+
+    // Positive control: CustomMany + valid BearerToken completes Noise_XXhfs pairing + grant + REKEY.
+    let srv_opts =
+        P2pOptions::for_listener(custom_many.clone()).with_relay_auth(Some(auth_tok.clone()));
+    assert!(!srv_opts.publish_pkarr);
+    assert!(!srv_opts.resolve_pkarr);
+    assert!(!srv_opts.advertise_direct_addrs);
+    let mut listener = P2pListener::bind_with_options(srv_opts, None)
+        .await
+        .expect("bind gated p2p listener");
+
+    // Wait briefly until the endpoint homes onto the live relay URL.
+    let mut listener_ep = listener.local_endpoint();
+    for _ in 0..30 {
+        if listener_ep.contains("?relay=") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        listener_ep = listener.current_endpoint();
+    }
+    assert!(!listener_ep.contains("super-secret-bearer-token"));
+    assert!(
+        listener_ep.contains("?relay="),
+        "expected relay hint in {listener_ep}"
+    );
+
+    let cli_opts = P2pOptions::for_dialer(custom_many).with_relay_auth(Some(auth_tok));
+    let dialer = P2pDialer::bind_with_options(cli_opts)
+        .await
+        .expect("bind gated p2p dialer");
+
+    let host_id = EndpointIdentity::generate()
+        .unwrap()
+        .with_host_id("p2p-host");
+    let cli_id = EndpointIdentity::generate().unwrap();
+    let now_unix = 1_795_132_800;
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Remote3Group, now_unix)
+        .unwrap();
+    let mgr = Arc::new(Mutex::new(mgr));
+    let host_rst = Arc::new(Mutex::new(Roster::new()));
+    let v2_state = Arc::new(V2ResponderState::new());
+
+    // 1) PAKE pairing over gated custom relay.
+    let host_c = host_id.clone();
+    let mgr_c = Arc::clone(&mgr);
+    let rst_c = Arc::clone(&host_rst);
+    let state_c = Arc::clone(&v2_state);
+    let ep_pair = listener_ep.clone();
+    let srv_pair_task = tokio::spawn(async move {
+        let mut s = listener.accept().await.unwrap();
+        let res = drive_v2_pake_pair_responder(
+            s.as_mut(),
+            &host_c,
+            &mgr_c,
+            &rst_c,
+            PairingPathKind::Remote,
+            now_unix,
+            &state_c,
+            None,
+        )
+        .await
+        .unwrap();
+        (listener, res)
+    });
+
+    let mut pair_cli_s = dialer
+        .dial(&ep_pair)
+        .await
+        .expect("dial pair over gated relay");
+    let init_pair = drive_v2_pake_pair_initiator(
+        pair_cli_s.as_mut(),
+        &cli_id,
+        "Workstation".to_owned(),
+        "cli".to_owned(),
+        code,
+        None,
+    )
+    .await
+    .unwrap();
+    let (mut listener, resp_pair) = srv_pair_task.await.unwrap();
+    assert_eq!(init_pair.sas, resp_pair.sas);
+    drop(pair_cli_s);
+
+    // 2) Confirm peer, mint grant, and run Noise_XXhfs session + REKEY over gated relay.
+    let cli_dev = cli_id.device_id();
+    let grant = {
+        let mut rst = host_rst.lock().unwrap();
+        rst.confirm_peer(&cli_dev, init_pair.sas.as_deref())
+            .unwrap();
+        rst.mint_grant(
+            &host_id,
+            &cli_dev,
+            vec!["fs.read:/docs/*".to_owned()],
+            now_unix,
+            now_unix + 3600,
+            [0x33; 16],
+        )
+        .unwrap()
+    };
+    let mut cli_rst = Roster::new();
+    let v2_secrets = host_rst
+        .lock()
+        .unwrap()
+        .get(&cli_dev)
+        .unwrap()
+        .v2_secrets
+        .clone()
+        .unwrap();
+    cli_rst
+        .insert_pinned_host(
+            host_id.host_id().to_owned(),
+            "Host".to_owned(),
+            *host_id.static_key().public_bytes(),
+            Some(host_id.signing_key().public_key().clone()),
+            host_id.rotation_seq(),
+            vec![],
+        )
+        .unwrap();
+    cli_rst
+        .upgrade_peer_to_v2(host_id.host_id(), v2_secrets)
+        .unwrap();
+
+    let host_c2 = host_id.clone();
+    let rst_c2 = Arc::clone(&host_rst);
+    let state_c2 = Arc::clone(&v2_state);
+    let srv_sess_task = tokio::spawn(async move {
+        let s = listener.accept().await.unwrap();
+        let mut hr = rst_c2.lock().unwrap().clone();
+        let mut drv = V2SessionDriver::accept(s, &host_c2, &mut hr, now_unix, &state_c2, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            drv.next_event(now_unix, &mut hr).await.unwrap(),
+            Some(SessionEvent::Rekeyed {
+                direction: RekeyDirection::Incoming,
+            })
+        );
+        assert_eq!(
+            drv.next_event(now_unix, &mut hr).await.unwrap(),
+            Some(SessionEvent::AppData(b"p2p-gated-rekey-ok".to_vec()))
+        );
+        (listener, drv)
+    });
+
+    let sess_cli_s = dialer
+        .dial(&listener_ep)
+        .await
+        .expect("dial sess over gated relay");
+    let mut cli_drv = V2SessionDriver::connect(
+        sess_cli_s,
+        &cli_id,
+        host_id.host_id(),
+        Some(grant),
+        &mut cli_rst,
+        now_unix,
+    )
+    .await
+    .unwrap();
+    cli_drv.send_rekey().await.unwrap();
+    cli_drv.send_data(b"p2p-gated-rekey-ok").await.unwrap();
+    assert_eq!(
+        cli_drv.next_event(now_unix, &mut cli_rst).await.unwrap(),
+        Some(SessionEvent::Rekeyed {
+            direction: RekeyDirection::Outgoing,
+        })
+    );
+
+    let (listener, _srv_drv) = srv_sess_task.await.unwrap();
+    assert!(seen_good.load(Ordering::Acquire) >= 2);
+    drop((cli_drv, listener));
+    dialer.close().await;
+    let _ = iroh_srv.shutdown().await;
+}
+
+#[cfg(feature = "p2p-iroh-services")]
+#[tokio::test]
+async fn p2p_iroh_services_derives_rcan_token_on_custom_many_without_pkarr_leak() {
+    use std::net::TcpListener as StdTcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tendril_runtime::{P2pOptions, P2pRelayAuth, parse_p2p_relay_modes};
+    use zeroize::Zeroizing;
+
+    let api_secret_sk = iroh::SecretKey::from_bytes(&[0x44; 32]);
+    let svc_peer_id = iroh::SecretKey::from_bytes(&[0x45; 32]).public();
+    let api_secret = iroh_services::api_secret::ApiSecret::new(api_secret_sk, svc_peer_id);
+    let api_secret_str = api_secret.to_string();
+
+    #[derive(Debug)]
+    struct RcanAccess {
+        saw_valid_rcan: Arc<AtomicBool>,
+    }
+
+    impl iroh_relay::server::AccessControl for RcanAccess {
+        async fn on_connect(
+            &self,
+            request: &iroh_relay::server::ClientRequest,
+        ) -> iroh_relay::server::Access {
+            let Some(tok) = request.auth_token() else {
+                return iroh_relay::server::Access::Deny {
+                    reason: Some("missing token".to_owned()),
+                };
+            };
+            let Ok(decoded) =
+                data_encoding::BASE32_NOPAD.decode(tok.to_ascii_uppercase().as_bytes())
+            else {
+                return iroh_relay::server::Access::Deny {
+                    reason: Some("invalid base32 RCAN".to_owned()),
+                };
+            };
+            if decoded.is_empty() {
+                return iroh_relay::server::Access::Deny {
+                    reason: Some("empty RCAN".to_owned()),
+                };
+            }
+            self.saw_valid_rcan.store(true, Ordering::Release);
+            iroh_relay::server::Access::Allow
+        }
+    }
+
+    let saw_valid_rcan = Arc::new(AtomicBool::new(false));
+    let mut relay_cfg =
+        iroh_relay::server::RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    relay_cfg.key_cache_capacity = Some(1024);
+    relay_cfg.access = Arc::new(RcanAccess {
+        saw_valid_rcan: Arc::clone(&saw_valid_rcan),
+    });
+    let mut server_cfg = iroh_relay::server::ServerConfig::default();
+    server_cfg.relay = Some(relay_cfg);
+    let iroh_srv = iroh_relay::server::Server::spawn(server_cfg)
+        .await
+        .expect("spawn iroh-relay server");
+    let live_relay_url = format!("http://{}", iroh_srv.http_addr().expect("http addr"));
+
+    let dead_sock = StdTcpListener::bind("127.0.0.1:0").expect("bind dead");
+    let dead_url = format!("http://{}", dead_sock.local_addr().unwrap());
+    drop(dead_sock);
+
+    let mode = parse_p2p_relay_modes(&[dead_url, live_relay_url]).unwrap();
+    let auth = P2pRelayAuth::IrohServicesSecret(Zeroizing::new(api_secret_str.clone()));
+    assert!(format!("{auth:?}").contains("<redacted>"));
+    assert!(!format!("{auth:?}").contains(&api_secret_str));
+
+    let opts = P2pOptions::for_listener(mode).with_relay_auth(Some(auth));
+    assert!(!opts.publish_pkarr);
+    assert!(!opts.resolve_pkarr);
+
+    let listener = P2pListener::bind_with_options(opts, None)
+        .await
+        .expect("bind iroh-services p2p listener");
+
+    for _ in 0..40 {
+        if saw_valid_rcan.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_valid_rcan.load(Ordering::Acquire),
+        "expected iroh-services RCAN token to authenticate against gated relay"
+    );
+    let ep = listener.local_endpoint();
+    assert!(!ep.contains(&api_secret_str));
+    drop(listener);
+    let _ = iroh_srv.shutdown().await;
+}

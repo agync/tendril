@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tendril_core::PREAMBLE_LEN;
-use tendril_core::wire::{Intent, Preamble};
+use tendril_core::wire::{Intent, Preamble, WIRE_VERSION, WIRE_VERSION_V2};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -110,11 +110,16 @@ pub struct InboundRouter {
     rate_limiter: PreAuthRateLimiter,
     pair_limiter: PreAuthRateLimiter,
     session_limiter: PreAuthRateLimiter,
+    v2_pair_limiter: PreAuthRateLimiter,
+    v2_session_limiter: PreAuthRateLimiter,
     pair_enabled: Arc<AtomicBool>,
+    v2_pair_enabled: Arc<AtomicBool>,
     queue_ttl: Duration,
     shutdown_tx: watch::Sender<bool>,
     pair_queue: InboundQueue,
     session_queue: InboundQueue,
+    v2_pair_queue: InboundQueue,
+    v2_session_queue: InboundQueue,
     sweeper_started: AtomicBool,
     listener_tasks: StdMutex<Vec<AbortHandle>>,
 }
@@ -132,17 +137,24 @@ impl InboundRouter {
         let queue_cap = config.max_half_open.clamp(16, 128);
         let pair_limiter = PreAuthRateLimiter::new(config.clone());
         let session_limiter = PreAuthRateLimiter::new(config.clone());
+        let v2_pair_limiter = PreAuthRateLimiter::new(config.clone());
+        let v2_session_limiter = PreAuthRateLimiter::new(config.clone());
         let rate_limiter = PreAuthRateLimiter::new(config);
         let (shutdown_tx, _) = watch::channel(false);
         Self {
             rate_limiter,
             pair_limiter,
             session_limiter,
+            v2_pair_limiter,
+            v2_session_limiter,
             pair_enabled: Arc::new(AtomicBool::new(true)),
+            v2_pair_enabled: Arc::new(AtomicBool::new(true)),
             queue_ttl: queue_ttl.max(Duration::from_millis(10)),
             shutdown_tx,
             pair_queue: InboundQueue::new(queue_cap),
             session_queue: InboundQueue::new(queue_cap),
+            v2_pair_queue: InboundQueue::new(queue_cap),
+            v2_session_queue: InboundQueue::new(queue_cap),
             sweeper_started: AtomicBool::new(false),
             listener_tasks: StdMutex::new(Vec::new()),
         }
@@ -160,30 +172,58 @@ impl InboundRouter {
         &self.rate_limiter
     }
 
-    /// Returns the isolated half-open rate limiter dedicated to queued `Intent::Pair` streams.
+    /// Returns the isolated half-open rate limiter dedicated to queued v1 `Intent::Pair` streams.
     #[must_use]
     pub fn pair_rate_limiter(&self) -> &PreAuthRateLimiter {
         &self.pair_limiter
     }
 
-    /// Returns the isolated half-open rate limiter dedicated to queued `Intent::Session` streams.
+    /// Returns the isolated half-open rate limiter dedicated to queued v1 `Intent::Session` streams.
     #[must_use]
     pub fn session_rate_limiter(&self) -> &PreAuthRateLimiter {
         &self.session_limiter
     }
 
-    /// Enables or disables acceptance of `Intent::Pair` connections at the router boundary.
+    /// Returns the isolated half-open rate limiter dedicated to queued v2 `Intent::Pair` streams.
+    #[must_use]
+    pub fn v2_pair_rate_limiter(&self) -> &PreAuthRateLimiter {
+        &self.v2_pair_limiter
+    }
+
+    /// Returns the isolated half-open rate limiter dedicated to queued v2 `Intent::Session` streams.
+    #[must_use]
+    pub fn v2_session_rate_limiter(&self) -> &PreAuthRateLimiter {
+        &self.v2_session_limiter
+    }
+
+    /// Enables or disables acceptance of both v1 and v2 `Intent::Pair` connections at the router boundary.
     pub fn set_pair_enabled(&self, enabled: bool) {
         self.pair_enabled.store(enabled, Ordering::Release);
+        self.v2_pair_enabled.store(enabled, Ordering::Release);
         if !enabled {
             self.pair_queue.clear_items();
+            self.v2_pair_queue.clear_items();
         }
     }
 
-    /// Reports whether `Intent::Pair` connections are currently accepted by the router.
+    /// Reports whether v1 `Intent::Pair` connections are currently accepted by the router.
     #[must_use]
     pub fn is_pair_enabled(&self) -> bool {
         self.pair_enabled.load(Ordering::Acquire)
+    }
+
+    /// Enables or disables acceptance of v2 `Intent::Pair` connections at the router boundary.
+    pub fn set_v2_pair_enabled(&self, enabled: bool) {
+        self.v2_pair_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.v2_pair_queue.clear_items();
+        }
+    }
+
+    /// Reports whether v2 `Intent::Pair` connections are currently accepted by the router.
+    #[must_use]
+    pub fn is_v2_pair_enabled(&self) -> bool {
+        self.v2_pair_enabled.load(Ordering::Acquire)
     }
 
     fn register_background_task(&self, join: JoinHandle<()>) {
@@ -205,6 +245,8 @@ impl InboundRouter {
         }
         let pair_q = self.pair_queue.clone();
         let sess_q = self.session_queue.clone();
+        let v2_pair_q = self.v2_pair_queue.clone();
+        let v2_sess_q = self.v2_session_queue.clone();
         let mut shut = self.shutdown_tx.subscribe();
         if *shut.borrow() {
             return;
@@ -225,6 +267,8 @@ impl InboundRouter {
                         let now = TokioInstant::now();
                         pair_q.sweep(now);
                         sess_q.sweep(now);
+                        v2_pair_q.sweep(now);
+                        v2_sess_q.sweep(now);
                     }
                 }
             }
@@ -242,9 +286,14 @@ impl InboundRouter {
         let peek_limiter = self.rate_limiter.clone();
         let pair_limiter = self.pair_limiter.clone();
         let session_limiter = self.session_limiter.clone();
+        let v2_pair_limiter = self.v2_pair_limiter.clone();
+        let v2_session_limiter = self.v2_session_limiter.clone();
         let pair_enabled = Arc::clone(&self.pair_enabled);
+        let v2_pair_enabled = Arc::clone(&self.v2_pair_enabled);
         let pair_q = self.pair_queue.clone();
         let sess_q = self.session_queue.clone();
+        let v2_pair_q = self.v2_pair_queue.clone();
+        let v2_sess_q = self.v2_session_queue.clone();
         let queue_ttl = self.queue_ttl;
         let shutdown_tx = self.shutdown_tx.clone();
         let mut shut = shutdown_tx.subscribe();
@@ -275,9 +324,14 @@ impl InboundRouter {
                 };
                 let p_lim = pair_limiter.clone();
                 let s_lim = session_limiter.clone();
+                let v2_p_lim = v2_pair_limiter.clone();
+                let v2_s_lim = v2_session_limiter.clone();
                 let p_enabled = Arc::clone(&pair_enabled);
+                let v2_p_enabled = Arc::clone(&v2_pair_enabled);
                 let p_q = pair_q.clone();
                 let s_q = sess_q.clone();
+                let v2_p_q = v2_pair_q.clone();
+                let v2_s_q = v2_sess_q.clone();
                 let mut conn_shut = shutdown_tx.subscribe();
                 handle_clone.spawn(async move {
                     if *conn_shut.borrow() {
@@ -300,8 +354,8 @@ impl InboundRouter {
                     let wrapped: Box<dyn PathStream> =
                         Box::new(PrefixedPathStream::new(stream, peeked));
                     let expires_at = TokioInstant::now() + queue_ttl;
-                    match preamble.intent {
-                        Intent::Pair => {
+                    match (preamble.version, preamble.intent) {
+                        (WIRE_VERSION, Intent::Pair) => {
                             if !p_enabled.load(Ordering::Acquire) {
                                 return;
                             }
@@ -310,12 +364,30 @@ impl InboundRouter {
                             };
                             let _ = p_q.try_push((wrapped, guard), expires_at);
                         }
-                        Intent::Session => {
+                        (WIRE_VERSION, Intent::Session) => {
                             let Ok(guard) = s_lim.try_acquire_half_open_for_provider(provider) else {
                                 return;
                             };
                             let _ = s_q.try_push((wrapped, guard), expires_at);
                         }
+                        (WIRE_VERSION_V2, Intent::Pair) => {
+                            if !v2_p_enabled.load(Ordering::Acquire) {
+                                return;
+                            }
+                            let Ok(guard) = v2_p_lim.try_acquire_half_open_for_provider(provider)
+                            else {
+                                return;
+                            };
+                            let _ = v2_p_q.try_push((wrapped, guard), expires_at);
+                        }
+                        (WIRE_VERSION_V2, Intent::Session) => {
+                            let Ok(guard) = v2_s_lim.try_acquire_half_open_for_provider(provider)
+                            else {
+                                return;
+                            };
+                            let _ = v2_s_q.try_push((wrapped, guard), expires_at);
+                        }
+                        _ => {}
                     }
                 });
             }
@@ -324,24 +396,44 @@ impl InboundRouter {
         self.register_background_task(join);
     }
 
-    /// Waits up to `wait` for the next inbound `Intent::Pair` stream.
+    /// Waits up to `wait` for the next inbound v1 `Intent::Pair` stream.
     ///
     /// Returns `Ok(Some(..))` on arrival, `Ok(None)` when closed, or `Err(())` on timeout.
     pub async fn recv_pair(&self, wait: Duration) -> Result<Option<RoutedInbound>, ()> {
         recv_routed(&self.pair_queue, wait).await
     }
 
-    /// Waits up to `wait` for the next inbound `Intent::Session` stream.
+    /// Waits up to `wait` for the next inbound v1 `Intent::Session` stream.
     ///
     /// Returns `Ok(Some(..))` on arrival, `Ok(None)` when closed, or `Err(())` on timeout.
     pub async fn recv_session(&self, wait: Duration) -> Result<Option<RoutedInbound>, ()> {
         recv_routed(&self.session_queue, wait).await
     }
 
-    /// Returns shared queue handles suitable for detached worker futures.
+    /// Waits up to `wait` for the next inbound v2 `Intent::Pair` stream.
+    ///
+    /// Returns `Ok(Some(..))` on arrival, `Ok(None)` when closed, or `Err(())` on timeout.
+    pub async fn recv_v2_pair(&self, wait: Duration) -> Result<Option<RoutedInbound>, ()> {
+        recv_routed(&self.v2_pair_queue, wait).await
+    }
+
+    /// Waits up to `wait` for the next inbound v2 `Intent::Session` stream.
+    ///
+    /// Returns `Ok(Some(..))` on arrival, `Ok(None)` when closed, or `Err(())` on timeout.
+    pub async fn recv_v2_session(&self, wait: Duration) -> Result<Option<RoutedInbound>, ()> {
+        recv_routed(&self.v2_session_queue, wait).await
+    }
+
+    /// Returns shared v1 queue handles suitable for detached worker futures.
     #[must_use]
     pub fn split_queues(&self) -> (InboundQueue, InboundQueue) {
         (self.pair_queue.clone(), self.session_queue.clone())
+    }
+
+    /// Returns shared v2 queue handles suitable for detached worker futures.
+    #[must_use]
+    pub fn split_v2_queues(&self) -> (InboundQueue, InboundQueue) {
+        (self.v2_pair_queue.clone(), self.v2_session_queue.clone())
     }
 
     /// Aborts all spawned listeners and closes inbound queues so blocked waiters wake immediately.
@@ -349,6 +441,8 @@ impl InboundRouter {
         let _ = self.shutdown_tx.send(true);
         self.pair_queue.close();
         self.session_queue.close();
+        self.v2_pair_queue.close();
+        self.v2_session_queue.close();
         if let Ok(mut tasks) = self.listener_tasks.lock() {
             for h in tasks.drain(..) {
                 h.abort();

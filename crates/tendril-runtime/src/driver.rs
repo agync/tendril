@@ -213,58 +213,23 @@ pub async fn drive_pair_initiator_with_store(
     store: &StateStore,
     handshake_timeout: Duration,
 ) -> Result<PairDriveResult, RuntimeError> {
-    let was_unpinned = pinned_host.is_none();
-    let floor = match pinned_host.as_ref() {
-        Some(pin) => {
-            let roster = store.load_roster()?;
+    let roster = store.load_roster()?;
+    let floor = pinned_host
+        .as_ref()
+        .map_or(tendril_core::WIRE_VERSION, |pin| {
             pinned_pairing_floor(&roster, pin)
-        }
-        None => tendril_core::WIRE_VERSION,
-    };
-    let res = drive_pair_initiator_with_floor(
-        stream,
+        });
+    let machine = PairingInitiator::new_with_min_wire_version(
         identity,
         device_name,
         device_kind,
         code,
         pinned_host,
         floor,
-        handshake_timeout,
-    )
-    .await?;
-    if was_unpinned {
-        match &res.outcome {
-            PairOutcome::InitiatorPending {
-                host_id,
-                host_static_pub,
-                ..
-            }
-            | PairOutcome::InitiatorEnrolled {
-                host_id,
-                host_static_pub,
-                ..
-            } => {
-                let roster = store.load_roster()?;
-                let learned_floor = roster.pairing_floor(host_static_pub).max(
-                    roster
-                        .get(host_id)
-                        .map_or(tendril_core::WIRE_VERSION, |e| e.min_wire_version),
-                );
-                if learned_floor >= tendril_core::wire::WIRE_VERSION_V2 {
-                    let _ = stream.close().await;
-                    return Err(CoreError::VersionDowngrade {
-                        peer_min: learned_floor,
-                        negotiated: tendril_core::WIRE_VERSION,
-                    }
-                    .into());
-                }
-            }
-            PairOutcome::ResponderPending { .. }
-            | PairOutcome::ResponderEnrolled { .. }
-            | PairOutcome::Rejected { .. } => {}
-        }
-    }
-    Ok(res)
+        None,
+    )?
+    .with_roster_floors(&roster);
+    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
 }
 
 /// Drives an autonomous M2M enrollment initiator handshake to completion over `stream`

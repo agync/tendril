@@ -1,5 +1,6 @@
 //! Untrusted WebSocket relay path provider (`relay`) speaking `spec/relay-v1.md`.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +10,9 @@ use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use tendril_core::crypto::{b64url_decode_array, b64url_encode, random_bytes};
 use tendril_core::policy::ProviderId;
+use tendril_core::relay_auth::{
+    RelayAuthProof, RelayAuthSecret, RelayTicket, compute_relay_auth_hmac_b64,
+};
 use tendril_relay::protocol::{
     MAX_RELAY_FRAME_LEN, RelayClientMsg, RelayServerMsg, sign_relay_accept, sign_relay_register,
 };
@@ -26,6 +30,69 @@ use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStrea
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_ACCEPTS: usize = 16;
+
+/// Client-side admission credentials presented to `/v1/relay` and `/v2/relay` servers.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum RelayClientAuth {
+    #[default]
+    None,
+    HmacSecret(RelayAuthSecret),
+    Ticket(RelayTicket),
+}
+
+impl fmt::Debug for RelayClientAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("RelayClientAuth::None"),
+            Self::HmacSecret(_) => f.write_str("RelayClientAuth::HmacSecret(<redacted>)"),
+            Self::Ticket(ticket) => f
+                .debug_tuple("RelayClientAuth::Ticket")
+                .field(ticket)
+                .finish(),
+        }
+    }
+}
+
+pub(crate) fn build_relay_auth_proof(
+    auth: &RelayClientAuth,
+    auth_required: Option<&[String]>,
+    op: &str,
+    challenge_host: &str,
+    nonce: &[u8; 32],
+    pub_or_target: &[u8; 32],
+) -> Result<Option<RelayAuthProof>, RuntimeError> {
+    let required_scope = match op {
+        "register" | "accept" => "register",
+        "dial" => "dial",
+        other => {
+            return Err(RuntimeError::Protocol(format!(
+                "unsupported relay auth operation '{other}'"
+            )));
+        }
+    };
+    let Some(reqs) = auth_required else {
+        return Ok(None);
+    };
+    if !reqs.iter().any(|r| r == required_scope) {
+        return Ok(None);
+    }
+    match auth {
+        RelayClientAuth::None => Ok(None),
+        RelayClientAuth::HmacSecret(secret) => {
+            let mac = compute_relay_auth_hmac_b64(
+                secret.as_bytes(),
+                op,
+                challenge_host,
+                nonce,
+                pub_or_target,
+            )?;
+            Ok(Some(RelayAuthProof::Hmac { mac }))
+        }
+        RelayClientAuth::Ticket(ticket) => Ok(Some(RelayAuthProof::Ticket {
+            ticket: ticket.clone(),
+        })),
+    }
+}
 
 fn client_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     ws_binary_config()
@@ -100,7 +167,7 @@ fn extract_url_host(relay_url: &str) -> Result<String, RuntimeError> {
 async fn connect_and_verify_challenge(
     relay_url: &str,
     expected_host: Option<&str>,
-) -> Result<(ClientWsStream, String, [u8; 32]), RuntimeError> {
+) -> Result<(ClientWsStream, String, [u8; 32], Option<Vec<String>>), RuntimeError> {
     let required_host = match expected_host {
         Some(h) if !h.is_empty() => h.to_owned(),
         _ => extract_url_host(relay_url)?,
@@ -118,6 +185,7 @@ async fn connect_and_verify_challenge(
         nonce,
         host,
         max_frame,
+        auth_required,
     } = recv_control_msg(&mut ws).await?
     else {
         return Err(RuntimeError::Protocol(
@@ -135,7 +203,7 @@ async fn connect_and_verify_challenge(
         )));
     }
     let nonce_bytes = b64url_decode_array::<32>(&nonce)?;
-    Ok((ws, host, nonce_bytes))
+    Ok((ws, host, nonce_bytes, auth_required))
 }
 
 /// Active binary bridge stream over a Tendril v1 WebSocket relay.
@@ -206,16 +274,45 @@ impl RelayListener {
         signing_key: SigningKey,
         write_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        Self::bind_with_auth(
+            relay_url,
+            expected_host,
+            signing_key,
+            write_timeout,
+            RelayClientAuth::None,
+        )
+        .await
+    }
+
+    /// Connects to `relay_url` with admission credentials `auth`, proves mailbox ownership with
+    /// `signing_key`, and starts listening.
+    pub async fn bind_with_auth(
+        relay_url: impl Into<String>,
+        expected_host: Option<String>,
+        signing_key: SigningKey,
+        write_timeout: Duration,
+        auth: RelayClientAuth,
+    ) -> Result<Self, RuntimeError> {
         let parsed = super::validate_ws_url(&relay_url.into(), false)?;
         let relay_url = parsed.as_str().to_owned();
-        let (mut control_ws, challenge_host, nonce) =
+        let (mut control_ws, challenge_host, nonce, auth_required) =
             connect_and_verify_challenge(&relay_url, expected_host.as_deref()).await?;
         let (pub_b64, sig_b64) = sign_relay_register(&signing_key, &challenge_host, &nonce);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let reg_auth = build_relay_auth_proof(
+            &auth,
+            auth_required.as_deref(),
+            "register",
+            &challenge_host,
+            &nonce,
+            &pub_bytes,
+        )?;
         send_control_msg(
             &mut control_ws,
             &RelayClientMsg::Register {
                 pub_key: pub_b64.clone(),
                 sig: sig_b64,
+                auth: reg_auth,
             },
             write_timeout,
         )
@@ -241,6 +338,7 @@ impl RelayListener {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let accept_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_ACCEPTS));
         let signing_key = Arc::new(signing_key);
+        let auth = Arc::new(auth);
 
         let control_task = tokio::spawn(async move {
             loop {
@@ -262,6 +360,7 @@ impl RelayListener {
                                     let relay_url_c = relay_url.clone();
                                     let exp_host_c = expected_host.clone();
                                     let key_c = Arc::clone(&signing_key);
+                                    let auth_c = Arc::clone(&auth);
                                     let pub_c = pub_b64.clone();
                                     let tx_c = accepted_tx.clone();
                                     tokio::spawn(async move {
@@ -272,6 +371,7 @@ impl RelayListener {
                                             &key_c,
                                             &pub_c,
                                             &conn_id,
+                                            &auth_c,
                                             write_timeout,
                                         )
                                         .await
@@ -335,17 +435,29 @@ async fn accept_one_stream(
     signing_key: &SigningKey,
     pub_b64: &str,
     conn_id_b64: &str,
+    auth: &RelayClientAuth,
     write_timeout: Duration,
 ) -> Result<RelayStream, RuntimeError> {
     let conn_id_bytes = b64url_decode_array::<16>(conn_id_b64)?;
-    let (mut ws, host, nonce) = connect_and_verify_challenge(relay_url, expected_host).await?;
+    let (mut ws, host, nonce, auth_required) =
+        connect_and_verify_challenge(relay_url, expected_host).await?;
     let sig_b64 = sign_relay_accept(signing_key, &host, &nonce, &conn_id_bytes);
+    let pub_bytes = signing_key.verifying_key().to_bytes();
+    let acc_auth = build_relay_auth_proof(
+        auth,
+        auth_required.as_deref(),
+        "accept",
+        &host,
+        &nonce,
+        &pub_bytes,
+    )?;
     send_control_msg(
         &mut ws,
         &RelayClientMsg::Accept {
             pub_key: pub_b64.to_owned(),
             conn_id: conn_id_b64.to_owned(),
             sig: sig_b64,
+            auth: acc_auth,
         },
         write_timeout,
     )
@@ -370,6 +482,7 @@ pub struct RelayDialer {
     expected_host: Option<String>,
     write_timeout: Duration,
     allow_insecure_ws: bool,
+    auth: RelayClientAuth,
 }
 
 impl Default for RelayDialer {
@@ -386,6 +499,7 @@ impl RelayDialer {
             expected_host: None,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             allow_insecure_ws: false,
+            auth: RelayClientAuth::None,
         }
     }
 
@@ -410,6 +524,13 @@ impl RelayDialer {
         self
     }
 
+    /// Attaches stateless admission credentials for relays requiring dial auth.
+    #[must_use]
+    pub fn with_auth(mut self, auth: RelayClientAuth) -> Self {
+        self.auth = auth;
+        self
+    }
+
     /// Connects through `relay_url` to `target_signing_pub`.
     pub async fn connect(
         &self,
@@ -417,16 +538,25 @@ impl RelayDialer {
         target_signing_pub: &[u8; 32],
     ) -> Result<Box<dyn PathStream>, RuntimeError> {
         let parsed = super::validate_ws_url(relay_url, self.allow_insecure_ws)?;
-        let (mut ws, _host, _nonce) =
+        let (mut ws, host, nonce, auth_required) =
             connect_and_verify_challenge(parsed.as_str(), self.expected_host.as_deref()).await?;
         let conn_id_bytes = random_bytes::<16>()?;
         let conn_id_b64 = b64url_encode(&conn_id_bytes);
         let target_b64 = b64url_encode(target_signing_pub);
+        let dial_auth = build_relay_auth_proof(
+            &self.auth,
+            auth_required.as_deref(),
+            "dial",
+            &host,
+            &nonce,
+            target_signing_pub,
+        )?;
         send_control_msg(
             &mut ws,
             &RelayClientMsg::Dial {
                 target_pub: target_b64,
                 conn_id: conn_id_b64.clone(),
+                auth: dial_auth,
             },
             self.write_timeout,
         )

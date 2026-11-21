@@ -38,11 +38,11 @@ pub use overlay::{
 };
 #[cfg(feature = "p2p-iroh")]
 pub use p2p::{
-    P2pDialer, P2pListener, P2pOptions, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint,
-    format_p2p_endpoint_with_addrs, parse_p2p_endpoint, parse_p2p_endpoint_filtered,
-    parse_p2p_relay_mode,
+    MAX_P2P_CUSTOM_RELAYS, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode,
+    TENDRIL_P2P_ALPN, format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_endpoint,
+    parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
 };
-pub use relay::{EmbeddedRelay, RelayDialer, RelayListener};
+pub use relay::{EmbeddedRelay, RelayClientAuth, RelayDialer, RelayListener};
 pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};
 
 /// Dials any supported Tendril endpoint (`iroh://`, `overlay://`, `broker+ws(s)://`,
@@ -54,6 +54,16 @@ pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};
 pub async fn dial_endpoint(
     endpoint: &str,
     relay_host: Option<&str>,
+) -> Result<Box<dyn PathStream>, RuntimeError> {
+    dial_endpoint_with_auth(endpoint, relay_host, RelayClientAuth::None).await
+}
+
+/// Dials any supported Tendril endpoint while attaching optional [`RelayClientAuth`] for
+/// `ws(s)://` relay endpoints.
+pub async fn dial_endpoint_with_auth(
+    endpoint: &str,
+    relay_host: Option<&str>,
+    relay_auth: RelayClientAuth,
 ) -> Result<Box<dyn PathStream>, RuntimeError> {
     let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
@@ -90,7 +100,7 @@ pub async fn dial_endpoint(
         return BrokerDialer::new().dial(endpoint).await;
     }
     if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        let mut dialer = RelayDialer::new();
+        let mut dialer = RelayDialer::new().with_auth(relay_auth);
         if let Some(host) = normalized_host {
             dialer = dialer.with_expected_host(host);
         }

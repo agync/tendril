@@ -417,6 +417,7 @@ async fn sec13_global_connection_and_mailbox_caps() {
         let reg = serde_json::to_string(&RelayClientMsg::Register {
             pub_key: pub_b64,
             sig: sig_b64,
+            auth: None,
         })
         .expect("ser");
         ws.send(Message::Text(reg.into())).await.expect("send reg");
@@ -444,4 +445,911 @@ async fn sec13_global_connection_and_mailbox_caps() {
 
     drop((ws1, ws2));
     handle.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tendril_core::crypto::{b64url_decode_array, b64url_encode};
+    use tendril_core::relay_auth::{
+        RELAY_TICKET_CLOCK_SKEW_SECS, RelayAuthProof, RelayAuthRole, RelayAuthScope,
+        compute_relay_auth_hmac_b64, mint_relay_ticket,
+    };
+    use tendril_core::v2::{
+        derive_epoch_mailbox, sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register,
+    };
+    use tendril_relay::protocol::{RelayV2ClientMsg, RelayV2ServerMsg, sign_relay_accept};
+    use zeroize::Zeroizing;
+
+    let now_u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let clock_val = Arc::new(AtomicU64::new(now_u64));
+    let clock_fn = {
+        let c = Arc::clone(&clock_val);
+        Arc::new(move || c.load(Ordering::Acquire))
+    };
+
+    // 0. Open relay omits auth_required on both /v1/relay and /v2/relay.
+    {
+        let open_cfg = RelayConfig::default();
+        assert!(format!("{open_cfg:?}").contains("auth_secret: None"));
+        let open_srv = RelayServer::bind(open_cfg).await.unwrap().spawn();
+        let (mut v1_ws, _) = tokio_tungstenite::connect_async(&open_srv.ws_url())
+            .await
+            .unwrap();
+        let v1_ch: RelayServerMsg =
+            serde_json::from_str(&v1_ws.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        assert!(matches!(
+            v1_ch,
+            RelayServerMsg::Challenge {
+                auth_required: None,
+                ..
+            }
+        ));
+        let (mut v2_ws, _) = tokio_tungstenite::connect_async(&open_srv.ws_v2_url())
+            .await
+            .unwrap();
+        let v2_ch: RelayV2ServerMsg =
+            serde_json::from_str(&v2_ws.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        assert!(matches!(
+            v2_ch,
+            RelayV2ServerMsg::Challenge {
+                auth_required: None,
+                ..
+            }
+        ));
+        open_srv.stop().await.unwrap();
+    }
+
+    // 1. Tier 1 only (allowed_mailboxes): auth_required=["register"], dial open, non-allowlisted register/accept fail closed.
+    {
+        let allowed_v1_kp = SigningKeypair::generate().unwrap();
+        let allowed_v1_pub = allowed_v1_kp
+            .ed25519_signing_key()
+            .verifying_key()
+            .to_bytes();
+        let other_v1_kp = SigningKeypair::generate().unwrap();
+
+        let v2_secret = [0x22; 32];
+        let epoch = now_u64 / 3600;
+        let allowed_v2_mb = derive_epoch_mailbox(&v2_secret, epoch);
+        let other_v2_mb = derive_epoch_mailbox(&[0x23; 32], epoch);
+
+        let cfg = RelayConfig {
+            allowed_mailboxes: vec![allowed_v1_pub, allowed_v2_mb.mailbox_id],
+            ..RelayConfig::default()
+        };
+        let srv = RelayServer::bind(cfg).await.unwrap().spawn();
+
+        // /v1/relay challenge advertises ["register"] only.
+        let (mut reg_ws, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+            .await
+            .unwrap();
+        let RelayServerMsg::Challenge {
+            nonce,
+            host,
+            auth_required,
+            ..
+        } = serde_json::from_str(&reg_ws.next().await.unwrap().unwrap().into_text().unwrap())
+            .unwrap()
+        else {
+            panic!("expected v1 challenge");
+        };
+        assert_eq!(auth_required, Some(vec!["register".to_owned()]));
+        let nonce_b = b64url_decode_array::<32>(&nonce).unwrap();
+
+        // Non-allowlisted v1 register fails closed with unauthorized.
+        let (other_pub, other_sig) =
+            sign_relay_register(&other_v1_kp.ed25519_signing_key(), &host, &nonce_b);
+        reg_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayClientMsg::Register {
+                    pub_key: other_pub.clone(),
+                    sig: other_sig,
+                    auth: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let err: RelayServerMsg =
+            serde_json::from_str(&reg_ws.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        assert_eq!(
+            err,
+            RelayServerMsg::Error {
+                code: "unauthorized".to_owned()
+            }
+        );
+
+        // Allowlisted v1 register succeeds without auth proof.
+        let (mut ok_reg_ws, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+            .await
+            .unwrap();
+        let RelayServerMsg::Challenge { nonce, host, .. } = serde_json::from_str(
+            &ok_reg_ws
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap() else {
+            panic!("expected v1 challenge");
+        };
+        let nonce_b = b64url_decode_array::<32>(&nonce).unwrap();
+        let (ok_pub, ok_sig) =
+            sign_relay_register(&allowed_v1_kp.ed25519_signing_key(), &host, &nonce_b);
+        ok_reg_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayClientMsg::Register {
+                    pub_key: ok_pub.clone(),
+                    sig: ok_sig,
+                    auth: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RelayServerMsg>(
+                &ok_reg_ws
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Registered { .. }
+        ));
+
+        // Open dial on Tier 1 only returns "offline" for non-registered target (no token needed).
+        let (mut dial_ws, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+            .await
+            .unwrap();
+        let _ = dial_ws.next().await;
+        dial_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayClientMsg::Dial {
+                    target_pub: other_pub,
+                    conn_id: b64url_encode(&[0x55; 16]),
+                    auth: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let d_err: RelayServerMsg =
+            serde_json::from_str(&dial_ws.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        assert_eq!(
+            d_err,
+            RelayServerMsg::Error {
+                code: "offline".to_owned()
+            }
+        );
+
+        // /v2/relay Tier 1 only fails closed for non-allowlisted mailbox_id and allows allowlisted.
+        let (mut v2_bad, _) = tokio_tungstenite::connect_async(&srv.ws_v2_url())
+            .await
+            .unwrap();
+        let RelayV2ServerMsg::Challenge {
+            nonce,
+            host,
+            auth_required,
+            ..
+        } = serde_json::from_str(&v2_bad.next().await.unwrap().unwrap().into_text().unwrap())
+            .unwrap()
+        else {
+            panic!("expected v2 challenge");
+        };
+        assert_eq!(auth_required, Some(vec!["register".to_owned()]));
+        let n2 = b64url_decode_array::<32>(&nonce).unwrap();
+        let bad_sig = sign_v2_relay_register(&other_v2_mb, &host, &n2).unwrap();
+        v2_bad
+            .send(Message::Text(
+                serde_json::to_string(&RelayV2ClientMsg::Register {
+                    mailbox_id: other_v2_mb.mailbox_id_b64url(),
+                    epoch: other_v2_mb.epoch,
+                    sig: b64url_encode(&bad_sig),
+                    auth: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayV2ServerMsg>(
+                &v2_bad.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayV2ServerMsg::Error {
+                code: "unauthorized".to_owned()
+            }
+        );
+
+        let (mut v2_ok, _) = tokio_tungstenite::connect_async(&srv.ws_v2_url())
+            .await
+            .unwrap();
+        let RelayV2ServerMsg::Challenge { nonce, host, .. } =
+            serde_json::from_str(&v2_ok.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap()
+        else {
+            panic!("expected v2 challenge");
+        };
+        let n2_ok = b64url_decode_array::<32>(&nonce).unwrap();
+        let ok_sig = sign_v2_relay_register(&allowed_v2_mb, &host, &n2_ok).unwrap();
+        v2_ok
+            .send(Message::Text(
+                serde_json::to_string(&RelayV2ClientMsg::Register {
+                    mailbox_id: allowed_v2_mb.mailbox_id_b64url(),
+                    epoch: allowed_v2_mb.epoch,
+                    sig: b64url_encode(&ok_sig),
+                    auth: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RelayV2ServerMsg>(
+                &v2_ok.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayV2ServerMsg::Registered { .. }
+        ));
+
+        drop((ok_reg_ws, v2_ok));
+        srv.stop().await.unwrap();
+    }
+
+    // 2. Tier 2 (HMAC) + Tier 3 (Ed25519 Ticket) with Option 1A auth_scope = All.
+    {
+        let secret = b"super-secret-relay-hmac-key";
+        let issuer_kp = SigningKeypair::generate().unwrap();
+        let issuer_sk = issuer_kp.ed25519_signing_key();
+        let issuer_pub = issuer_sk.verifying_key().to_bytes();
+        let untrusted_issuer_kp = SigningKeypair::generate().unwrap();
+        let untrusted_sk = untrusted_issuer_kp.ed25519_signing_key();
+
+        let cfg = RelayConfig {
+            host: "relay.example".to_owned(),
+            auth_secret: Some(Zeroizing::new(secret.to_vec())),
+            trusted_issuers: vec![issuer_pub],
+            auth_scope: RelayAuthScope::All,
+            clock: Some(clock_fn.clone()),
+            ..RelayConfig::default()
+        };
+        let dbg_str = format!("{cfg:?}");
+        assert!(dbg_str.contains("<redacted>"));
+        assert!(!dbg_str.contains("super-secret-relay-hmac-key"));
+        let srv = RelayServer::bind(cfg).await.unwrap().spawn();
+
+        let v1_key = SigningKeypair::generate().unwrap();
+        let v1_sk = v1_key.ed25519_signing_key();
+        let v1_pub_bytes = v1_sk.verifying_key().to_bytes();
+        let v1_pub_b64 = b64url_encode(&v1_pub_bytes);
+
+        let v2_mb = derive_epoch_mailbox(&[0x77; 32], now_u64 / 3600);
+
+        // Unauthorized dial to unregistered target returns "unauthorized" (NOT "offline") on both v1 and v2.
+        for is_v2 in [false, true] {
+            if !is_v2 {
+                let (mut ws, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+                    .await
+                    .unwrap();
+                let RelayServerMsg::Challenge { auth_required, .. } =
+                    serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap())
+                        .unwrap()
+                else {
+                    panic!("v1 challenge");
+                };
+                assert_eq!(
+                    auth_required,
+                    Some(vec!["register".to_owned(), "dial".to_owned()])
+                );
+                ws.send(Message::Text(
+                    serde_json::to_string(&RelayClientMsg::Dial {
+                        target_pub: v1_pub_b64.clone(),
+                        conn_id: b64url_encode(&[0x11; 16]),
+                        auth: None,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<RelayServerMsg>(
+                        &ws.next().await.unwrap().unwrap().into_text().unwrap()
+                    )
+                    .unwrap(),
+                    RelayServerMsg::Error {
+                        code: "unauthorized".to_owned()
+                    }
+                );
+            } else {
+                let (mut ws, _) = tokio_tungstenite::connect_async(&srv.ws_v2_url())
+                    .await
+                    .unwrap();
+                let RelayV2ServerMsg::Challenge {
+                    nonce,
+                    host,
+                    auth_required,
+                    ..
+                } = serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap()
+                else {
+                    panic!("v2 challenge");
+                };
+                assert_eq!(
+                    auth_required,
+                    Some(vec!["register".to_owned(), "dial".to_owned()])
+                );
+                let n = b64url_decode_array::<32>(&nonce).unwrap();
+                let cid = [0x12; 16];
+                let tok = sign_v2_relay_dial(&v2_mb, &host, &n, &cid).unwrap();
+                ws.send(Message::Text(
+                    serde_json::to_string(&RelayV2ClientMsg::Dial {
+                        target_mailbox_id: v2_mb.mailbox_id_b64url(),
+                        epoch: v2_mb.epoch + 5, // out-of-skew epoch, yet auth MUST fail first!
+                        conn_id: b64url_encode(&cid),
+                        dial_token: b64url_encode(&tok),
+                        auth: None,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<RelayV2ServerMsg>(
+                        &ws.next().await.unwrap().unwrap().into_text().unwrap()
+                    )
+                    .unwrap(),
+                    RelayV2ServerMsg::Error {
+                        code: "unauthorized".to_owned()
+                    }
+                );
+            }
+        }
+
+        // Ticket rejections on /v1/relay register:
+        // (a) dial ticket rejected on register
+        let dial_ticket = mint_relay_ticket(
+            &issuer_sk,
+            "relay.example",
+            RelayAuthRole::Dial,
+            &v1_pub_b64,
+            now_u64,
+            60,
+        )
+        .unwrap();
+        // (b) wrong target_pub ticket rejected
+        let wrong_target_b64 = b64url_encode(&[0x33; 32]);
+        let wrong_target_ticket = mint_relay_ticket(
+            &issuer_sk,
+            "relay.example",
+            RelayAuthRole::Register,
+            &wrong_target_b64,
+            now_u64,
+            60,
+        )
+        .unwrap();
+        // (c) unknown issuer ticket rejected
+        let unknown_issuer_ticket = mint_relay_ticket(
+            &untrusted_sk,
+            "relay.example",
+            RelayAuthRole::Register,
+            &v1_pub_b64,
+            now_u64,
+            60,
+        )
+        .unwrap();
+        // (d) expired beyond +-30s clock skew rejected
+        let expired_ticket = mint_relay_ticket(
+            &issuer_sk,
+            "relay.example",
+            RelayAuthRole::Register,
+            &v1_pub_b64,
+            now_u64 - 100,
+            60, // not_after = now - 40 < now - 30
+        )
+        .unwrap();
+        // (e) within +-30s clock skew accepted!
+        let skew_edge_ticket = mint_relay_ticket(
+            &issuer_sk,
+            "relay.example",
+            RelayAuthRole::Register,
+            &v1_pub_b64,
+            now_u64 - 90,
+            60 + RELAY_TICKET_CLOCK_SKEW_SECS - 30, // not_after = now - 30
+        )
+        .unwrap();
+
+        for bad_ticket in [
+            dial_ticket.clone(),
+            wrong_target_ticket,
+            unknown_issuer_ticket,
+            expired_ticket,
+        ] {
+            let (mut ws, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+                .await
+                .unwrap();
+            let RelayServerMsg::Challenge { nonce, host, .. } =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap())
+                    .unwrap()
+            else {
+                panic!("challenge");
+            };
+            let n = b64url_decode_array::<32>(&nonce).unwrap();
+            let (pk, sig) = sign_relay_register(&v1_sk, &host, &n);
+            ws.send(Message::Text(
+                serde_json::to_string(&RelayClientMsg::Register {
+                    pub_key: pk,
+                    sig,
+                    auth: Some(RelayAuthProof::Ticket { ticket: bad_ticket }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::from_str::<RelayServerMsg>(
+                    &ws.next().await.unwrap().unwrap().into_text().unwrap()
+                )
+                .unwrap(),
+                RelayServerMsg::Error {
+                    code: "unauthorized".to_owned()
+                }
+            );
+        }
+
+        // Skew-edge ticket registers v1 mailbox, then dial ticket dials it, and HMAC accepts it!
+        let (mut v1_reg_ws, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+            .await
+            .unwrap();
+        let RelayServerMsg::Challenge { nonce, host, .. } = serde_json::from_str(
+            &v1_reg_ws
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap() else {
+            panic!("challenge");
+        };
+        let n = b64url_decode_array::<32>(&nonce).unwrap();
+        let (pk, sig) = sign_relay_register(&v1_sk, &host, &n);
+        v1_reg_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayClientMsg::Register {
+                    pub_key: pk.clone(),
+                    sig,
+                    auth: Some(RelayAuthProof::Ticket {
+                        ticket: skew_edge_ticket,
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RelayServerMsg>(
+                &v1_reg_ws
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Registered { .. }
+        ));
+
+        let (mut v1_dial_ws, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+            .await
+            .unwrap();
+        let _ = v1_dial_ws.next().await;
+        let cid1 = [0x61; 16];
+        v1_dial_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayClientMsg::Dial {
+                    target_pub: pk.clone(),
+                    conn_id: b64url_encode(&cid1),
+                    auth: Some(RelayAuthProof::Ticket {
+                        ticket: dial_ticket,
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RelayServerMsg>(
+                &v1_reg_ws
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Incoming { .. }
+        ));
+
+        // Accept with invalid HMAC rejected, then valid HMAC succeeds.
+        let (mut v1_acc_bad, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+            .await
+            .unwrap();
+        let RelayServerMsg::Challenge { nonce, host, .. } = serde_json::from_str(
+            &v1_acc_bad
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap() else {
+            panic!("challenge");
+        };
+        let an_bad = b64url_decode_array::<32>(&nonce).unwrap();
+        let acc_sig_bad = sign_relay_accept(&v1_sk, &host, &an_bad, &cid1);
+        v1_acc_bad
+            .send(Message::Text(
+                serde_json::to_string(&RelayClientMsg::Accept {
+                    pub_key: pk.clone(),
+                    conn_id: b64url_encode(&cid1),
+                    sig: acc_sig_bad,
+                    auth: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayServerMsg>(
+                &v1_acc_bad
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Error {
+                code: "unauthorized".to_owned()
+            }
+        );
+
+        let (mut v1_acc_ok, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+            .await
+            .unwrap();
+        let RelayServerMsg::Challenge { nonce, host, .. } = serde_json::from_str(
+            &v1_acc_ok
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap() else {
+            panic!("challenge");
+        };
+        let an_ok = b64url_decode_array::<32>(&nonce).unwrap();
+        let acc_sig_ok = sign_relay_accept(&v1_sk, &host, &an_ok, &cid1);
+        let acc_mac =
+            compute_relay_auth_hmac_b64(secret, "accept", &host, &an_ok, &v1_pub_bytes).unwrap();
+        v1_acc_ok
+            .send(Message::Text(
+                serde_json::to_string(&RelayClientMsg::Accept {
+                    pub_key: pk,
+                    conn_id: b64url_encode(&cid1),
+                    sig: acc_sig_ok,
+                    auth: Some(RelayAuthProof::Hmac { mac: acc_mac }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RelayServerMsg>(
+                &v1_acc_ok
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Ready { .. }
+        ));
+
+        // Same Tier 2/3 checks on /v2/relay: wildcard register ticket + dial HMAC + accept HMAC.
+        let wildcard_reg_ticket = mint_relay_ticket(
+            &issuer_sk,
+            "relay.example",
+            RelayAuthRole::Register,
+            "*",
+            now_u64,
+            60,
+        )
+        .unwrap();
+        let (mut v2_reg_ws, _) = tokio_tungstenite::connect_async(&srv.ws_v2_url())
+            .await
+            .unwrap();
+        let RelayV2ServerMsg::Challenge { nonce, host, .. } = serde_json::from_str(
+            &v2_reg_ws
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap() else {
+            panic!("v2 challenge");
+        };
+        let n2 = b64url_decode_array::<32>(&nonce).unwrap();
+        let sig2 = sign_v2_relay_register(&v2_mb, &host, &n2).unwrap();
+        v2_reg_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayV2ClientMsg::Register {
+                    mailbox_id: v2_mb.mailbox_id_b64url(),
+                    epoch: v2_mb.epoch,
+                    sig: b64url_encode(&sig2),
+                    auth: Some(RelayAuthProof::Ticket {
+                        ticket: wildcard_reg_ticket,
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RelayV2ServerMsg>(
+                &v2_reg_ws
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+            )
+            .unwrap(),
+            RelayV2ServerMsg::Registered { .. }
+        ));
+
+        // Dial /v2/relay with HMAC.
+        let (mut v2_dial_ws, _) = tokio_tungstenite::connect_async(&srv.ws_v2_url())
+            .await
+            .unwrap();
+        let RelayV2ServerMsg::Challenge { nonce, host, .. } = serde_json::from_str(
+            &v2_dial_ws
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap() else {
+            panic!("v2 dial challenge");
+        };
+        let dn2 = b64url_decode_array::<32>(&nonce).unwrap();
+        let cid2 = [0x62; 16];
+        let tok2 = sign_v2_relay_dial(&v2_mb, &host, &dn2, &cid2).unwrap();
+        let dial_mac =
+            compute_relay_auth_hmac_b64(secret, "dial", &host, &dn2, &v2_mb.mailbox_id).unwrap();
+        v2_dial_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayV2ClientMsg::Dial {
+                    target_mailbox_id: v2_mb.mailbox_id_b64url(),
+                    epoch: v2_mb.epoch,
+                    conn_id: b64url_encode(&cid2),
+                    dial_token: b64url_encode(&tok2),
+                    auth: Some(RelayAuthProof::Hmac { mac: dial_mac }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RelayV2ServerMsg>(
+                &v2_reg_ws
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+            )
+            .unwrap(),
+            RelayV2ServerMsg::Incoming { .. }
+        ));
+
+        // Accept /v2/relay with HMAC.
+        let (mut v2_acc_ws, _) = tokio_tungstenite::connect_async(&srv.ws_v2_url())
+            .await
+            .unwrap();
+        let RelayV2ServerMsg::Challenge { nonce, host, .. } = serde_json::from_str(
+            &v2_acc_ws
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap() else {
+            panic!("v2 acc challenge");
+        };
+        let an2 = b64url_decode_array::<32>(&nonce).unwrap();
+        let acc_sig2 = sign_v2_relay_accept(&v2_mb, &host, &an2, &cid2).unwrap();
+        let acc_mac2 =
+            compute_relay_auth_hmac_b64(secret, "accept", &host, &an2, &v2_mb.mailbox_id).unwrap();
+        v2_acc_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayV2ClientMsg::Accept {
+                    mailbox_id: v2_mb.mailbox_id_b64url(),
+                    epoch: v2_mb.epoch,
+                    conn_id: b64url_encode(&cid2),
+                    sig: b64url_encode(&acc_sig2),
+                    auth: Some(RelayAuthProof::Hmac { mac: acc_mac2 }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RelayV2ServerMsg>(
+                &v2_acc_ws
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+            )
+            .unwrap(),
+            RelayV2ServerMsg::Ready { .. }
+        ));
+
+        drop((
+            v1_reg_ws, v1_dial_ws, v1_acc_ok, v2_reg_ws, v2_dial_ws, v2_acc_ws,
+        ));
+        srv.stop().await.unwrap();
+    }
+
+    // 3. auth_scope = RegisterOnly with Tier 2 HMAC: challenge=["register"], dial allowed without auth, register/accept still require auth.
+    {
+        let secret = b"register-only-secret";
+        let cfg = RelayConfig {
+            auth_secret: Some(Zeroizing::new(secret.to_vec())),
+            auth_scope: RelayAuthScope::RegisterOnly,
+            ..RelayConfig::default()
+        };
+        let srv = RelayServer::bind(cfg).await.unwrap().spawn();
+
+        let kp = SigningKeypair::generate().unwrap();
+        let pub_b64 = b64url_encode(kp.ed25519_signing_key().verifying_key().as_bytes());
+        let (mut dial_ws, _) = tokio_tungstenite::connect_async(&srv.ws_url())
+            .await
+            .unwrap();
+        let RelayServerMsg::Challenge { auth_required, .. } =
+            serde_json::from_str(&dial_ws.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap()
+        else {
+            panic!("challenge");
+        };
+        assert_eq!(auth_required, Some(vec!["register".to_owned()]));
+        dial_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayClientMsg::Dial {
+                    target_pub: pub_b64,
+                    conn_id: b64url_encode(&[0x71; 16]),
+                    auth: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayServerMsg>(
+                &dial_ws.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Error {
+                code: "offline".to_owned()
+            }
+        );
+
+        let (mut v2_dial_ws, _) = tokio_tungstenite::connect_async(&srv.ws_v2_url())
+            .await
+            .unwrap();
+        let RelayV2ServerMsg::Challenge {
+            nonce,
+            host,
+            auth_required,
+            ..
+        } = serde_json::from_str(
+            &v2_dial_ws
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap()
+        else {
+            panic!("v2 challenge");
+        };
+        assert_eq!(auth_required, Some(vec!["register".to_owned()]));
+        let n = b64url_decode_array::<32>(&nonce).unwrap();
+        let mb = derive_epoch_mailbox(&[0x88; 32], now_u64 / 3600);
+        let cid = [0x72; 16];
+        let tok = sign_v2_relay_dial(&mb, &host, &n, &cid).unwrap();
+        v2_dial_ws
+            .send(Message::Text(
+                serde_json::to_string(&RelayV2ClientMsg::Dial {
+                    target_mailbox_id: mb.mailbox_id_b64url(),
+                    epoch: mb.epoch,
+                    conn_id: b64url_encode(&cid),
+                    dial_token: b64url_encode(&tok),
+                    auth: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayV2ServerMsg>(
+                &v2_dial_ws
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+            )
+            .unwrap(),
+            RelayV2ServerMsg::Error {
+                code: "offline".to_owned()
+            }
+        );
+
+        srv.stop().await.unwrap();
+    }
 }

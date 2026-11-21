@@ -9,12 +9,15 @@ rust-version.workspace = true
 [features]
 default = []
 p2p-iroh = ["dep:iroh"]
+p2p-iroh-services = ["p2p-iroh", "dep:iroh-services", "dep:data-encoding"]
 
 [dependencies]
 async-trait.workspace = true
+data-encoding = { workspace = true, optional = true }
 ed25519-dalek.workspace = true
 futures-util.workspace = true
 iroh = { workspace = true, optional = true }
+iroh-services = { workspace = true, optional = true }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -29,6 +32,7 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+iroh-relay = { version = "1.5", features = ["server"] }
 tempfile.workspace = true
 
 [lints]

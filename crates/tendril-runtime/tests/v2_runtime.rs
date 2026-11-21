@@ -252,6 +252,7 @@ async fn live_v2_relay_pake_pair_session_rekey_padding_and_security_rejections()
                     epoch,
                     conn_id: b64url_encode(&[0xFA; 16]),
                     dial_token: b64url_encode(&[0x00; 32]),
+                    auth: None,
                 })
                 .unwrap()
                 .into(),
@@ -423,6 +424,7 @@ async fn relay_v2_listener_drops_replayed_incoming_from_malicious_relay() {
                         host: canonical_relay_host("127.0.0.1").unwrap(),
                         epoch,
                         max_frame: MAX_RELAY_FRAME_LEN,
+                        auth_required: None,
                     })
                     .unwrap()
                     .into(),
@@ -718,8 +720,30 @@ async fn shared_rendezvous_replay_cache_and_argon2_semaphore_protect_responder()
         rec_code,
         None,
     );
-    let timer_tick = tokio::time::sleep(Duration::from_millis(5));
-    let (_, srv_res, cli_res) = tokio::join!(timer_tick, srv_rec, cli_rec);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_c = Arc::clone(&done);
+    let ticker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let mut ticks = 0usize;
+        while !done_c.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::select! {
+                _ = interval.tick() => {
+                    ticks += 1;
+                }
+                () = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+        }
+        ticks
+    });
+    let (srv_res, cli_res) = tokio::join!(srv_rec, cli_rec);
+    done.store(true, std::sync::atomic::Ordering::Release);
+    let ticks = ticker.await.unwrap();
+    assert!(
+        ticks >= 2,
+        "expected ticker progress during Argon2id, got {ticks}"
+    );
     srv_res.unwrap().unwrap();
     cli_res.unwrap();
 }
@@ -1986,4 +2010,270 @@ async fn v2_responders_reject_v1_preamble_with_unsupported_version() {
         err2,
         RuntimeError::Core(CoreError::UnsupportedVersion(1))
     ));
+}
+
+#[tokio::test]
+async fn inbound_router_isolates_v1_and_v2_pair_and_session_queues_concurrently() {
+    use tendril_core::PREAMBLE_LEN;
+    use tendril_core::wire::WIRE_VERSION;
+    use tendril_runtime::InboundRouter;
+
+    let sock_dir = tempdir().unwrap();
+    let listener = LocalListener::bind(sock_dir.path().join("router_v1_v2.sock")).unwrap();
+    let ep = listener.local_endpoint();
+    let router = InboundRouter::new();
+    let handle = tokio::runtime::Handle::current();
+    router.spawn_listener(&handle, Box::new(listener));
+
+    let mut c_v1_pair = LocalDialer::new().dial(&ep).await.unwrap();
+    let mut c_v1_sess = LocalDialer::new().dial(&ep).await.unwrap();
+    let mut c_v2_pair = LocalDialer::new().dial(&ep).await.unwrap();
+    let mut c_v2_sess = LocalDialer::new().dial(&ep).await.unwrap();
+
+    c_v1_pair
+        .send_chunk(&Preamble::v1(Intent::Pair).encode())
+        .await
+        .unwrap();
+    c_v1_sess
+        .send_chunk(&Preamble::v1(Intent::Session).encode())
+        .await
+        .unwrap();
+    c_v2_pair
+        .send_chunk(&Preamble::v2_pake_pair().encode())
+        .await
+        .unwrap();
+    c_v2_sess
+        .send_chunk(&Preamble::v2(Intent::Session, 0).encode())
+        .await
+        .unwrap();
+
+    let (mut s_v1_pair, _) = router
+        .recv_pair(Duration::from_secs(2))
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut s_v1_sess, _) = router
+        .recv_session(Duration::from_secs(2))
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut s_v2_pair, _) = router
+        .recv_v2_pair(Duration::from_secs(2))
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut s_v2_sess, _) = router
+        .recv_v2_session(Duration::from_secs(2))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut buf = [0u8; PREAMBLE_LEN];
+    assert_eq!(s_v1_pair.recv_chunk(&mut buf).await.unwrap(), PREAMBLE_LEN);
+    assert_eq!(Preamble::decode(&buf).unwrap().version, WIRE_VERSION);
+    assert_eq!(Preamble::decode(&buf).unwrap().intent, Intent::Pair);
+
+    assert_eq!(s_v1_sess.recv_chunk(&mut buf).await.unwrap(), PREAMBLE_LEN);
+    assert_eq!(Preamble::decode(&buf).unwrap().version, WIRE_VERSION);
+    assert_eq!(Preamble::decode(&buf).unwrap().intent, Intent::Session);
+
+    assert_eq!(s_v2_pair.recv_chunk(&mut buf).await.unwrap(), PREAMBLE_LEN);
+    assert_eq!(Preamble::decode(&buf).unwrap().version, WIRE_VERSION_V2);
+    assert_eq!(Preamble::decode(&buf).unwrap().intent, Intent::Pair);
+
+    assert_eq!(s_v2_sess.recv_chunk(&mut buf).await.unwrap(), PREAMBLE_LEN);
+    assert_eq!(Preamble::decode(&buf).unwrap().version, WIRE_VERSION_V2);
+    assert_eq!(Preamble::decode(&buf).unwrap().intent, Intent::Session);
+
+    // No cross-contamination into opposite queues.
+    assert!(router.recv_pair(Duration::from_millis(50)).await.is_err());
+    assert!(
+        router
+            .recv_v2_pair(Duration::from_millis(50))
+            .await
+            .is_err()
+    );
+
+    // Disabling v2 pair drops v2 Pair without affecting v1 Pair.
+    router.set_v2_pair_enabled(false);
+    assert!(!router.is_v2_pair_enabled());
+    let mut dropped_v2 = LocalDialer::new().dial(&ep).await.unwrap();
+    dropped_v2
+        .send_chunk(&Preamble::v2_pake_pair().encode())
+        .await
+        .unwrap();
+    assert!(
+        router
+            .recv_v2_pair(Duration::from_millis(80))
+            .await
+            .is_err()
+    );
+
+    let mut ok_v1 = LocalDialer::new().dial(&ep).await.unwrap();
+    ok_v1
+        .send_chunk(&Preamble::v1(Intent::Pair).encode())
+        .await
+        .unwrap();
+    assert!(
+        router
+            .recv_pair(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let (v2_pq, v2_sq) = router.split_v2_queues();
+    router.close();
+    assert!(
+        tendril_runtime::recv_routed(&v2_pq, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        tendril_runtime::recv_routed(&v2_sq, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn unpinned_v1_tofu_aborts_at_msg2_with_zero_msg3_bytes_on_wire() {
+    use tendril_core::pairing::{PairAction, PairingResponder};
+
+    let (host_id, cli_id) = make_identities();
+    let now_unix = now_unix_secs();
+
+    // Pre-populate client store with host at min_wire_version = 2.
+    let cli_dir = tempdir().unwrap();
+    let cli_store = StateStore::open_or_create(cli_dir.path()).unwrap();
+    let v2_secrets = V2PeerSecrets::new([0x71; 32], [0x72; 32]);
+    let (_, cli_roster) = setup_paired_v2_rosters(&host_id, &cli_id, &v2_secrets);
+    cli_store.save_roster(&cli_roster).unwrap();
+
+    // Test both matching static_pub AND rotated static_pub with matching host_id.
+    let rotated_host = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar([0x91; 32]),
+        SigningKeypair::from_seed([0x92; 32]),
+    )
+    .with_host_id(host_id.host_id().to_owned());
+
+    for responder_id in [host_id.clone(), rotated_host] {
+        let sock_dir = tempdir().unwrap();
+        let mut listener = LocalListener::bind(sock_dir.path().join("zero_msg3.sock")).unwrap();
+        let ep = listener.local_endpoint();
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr
+            .issue_code(PairingCodeKind::Remote3Group, now_unix)
+            .unwrap();
+        let mut rst = Roster::new();
+
+        let srv = tokio::spawn(async move {
+            let mut s = listener.accept().await.unwrap();
+            let mut resp =
+                PairingResponder::new(&responder_id, PairingPathKind::Remote, None).unwrap();
+            let mut buf = vec![0u8; 4096];
+            // Read msg1 (preamble + Noise e).
+            let n1 = s.recv_chunk(&mut buf).await.unwrap();
+            assert!(n1 > 0);
+            let actions = resp
+                .feed_bytes(&buf[..n1], now_unix, &mut mgr, &mut rst)
+                .unwrap();
+            let mut sent_msg2 = false;
+            for a in actions {
+                if let PairAction::WriteBytes(b) = a {
+                    s.send_chunk(&b).await.unwrap();
+                    sent_msg2 = true;
+                }
+            }
+            assert!(sent_msg2);
+            // Initiator MUST abort at msg2 and send ZERO msg3 (PairClaim) bytes!
+            let after_msg2 = s.recv_chunk(&mut buf).await;
+            match after_msg2 {
+                Ok(0) | Err(RuntimeError::Closed) | Err(RuntimeError::Io(_)) => {}
+                Ok(n) => panic!("expected zero msg3 bytes on wire after msg2, received {n} bytes"),
+                Err(e) => panic!("unexpected recv error after msg2: {e:?}"),
+            }
+        });
+
+        let mut cli_s = LocalDialer::new().dial(&ep).await.unwrap();
+        let err = drive_pair_initiator_with_store(
+            cli_s.as_mut(),
+            &cli_id,
+            "Workstation".to_owned(),
+            "cli".to_owned(),
+            code,
+            None,
+            &cli_store,
+            DEFAULT_PRE_AUTH_TIMEOUT,
+        )
+        .await
+        .expect_err("unpinned v1 TOFU against v2-floored host must fail at msg2");
+        assert!(matches!(
+            err,
+            RuntimeError::Core(CoreError::VersionDowngrade {
+                peer_min: 2,
+                negotiated: 1
+            })
+        ));
+        drop(cli_s);
+        srv.await.unwrap();
+    }
+}
+
+#[test]
+fn pinned_pairing_floor_takes_max_of_static_and_host_floors() {
+    let host_sk = StaticKeypair::from_scalar([0xA1; 32]);
+    let host_vk = SigningKeypair::from_seed([0xA2; 32]);
+    let other_sk = StaticKeypair::from_scalar([0xB1; 32]);
+    let other_vk = SigningKeypair::from_seed([0xB2; 32]);
+
+    // 1. Entry with host_id="h1" & static_pub=host_sk at v2; pin has different static_pub (other_sk) -> max(1, 2) == 2.
+    let mut roster = Roster::new();
+    roster
+        .insert_pinned_host(
+            "h1".to_owned(),
+            "Host1".to_owned(),
+            *host_sk.public_bytes(),
+            Some(host_vk.public_key().clone()),
+            0,
+            vec![],
+        )
+        .unwrap();
+    roster
+        .upgrade_peer_to_v2("h1", V2PeerSecrets::new([1; 32], [2; 32]))
+        .unwrap();
+
+    let pin_by_host = PinnedHost::with_full_key(
+        Some("h1".to_owned()),
+        *other_sk.public_bytes(),
+        other_vk.public_key().clone(),
+        0,
+    );
+    assert_eq!(
+        tendril_runtime::pinned_pairing_floor(&roster, &pin_by_host),
+        2
+    );
+
+    // 2. Pin with unknown host_id="h2" (or None) matching static_pub=host_sk -> max(2, 1) == 2.
+    let pin_by_static = PinnedHost::with_full_key(
+        Some("h2".to_owned()),
+        *host_sk.public_bytes(),
+        host_vk.public_key().clone(),
+        0,
+    );
+    assert_eq!(
+        tendril_runtime::pinned_pairing_floor(&roster, &pin_by_static),
+        2
+    );
+
+    // 3. Pin matching neither -> 1.
+    let pin_none = PinnedHost::with_full_key(
+        Some("h2".to_owned()),
+        *other_sk.public_bytes(),
+        other_vk.public_key().clone(),
+        0,
+    );
+    assert_eq!(tendril_runtime::pinned_pairing_floor(&roster, &pin_none), 1);
 }

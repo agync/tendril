@@ -1,6 +1,7 @@
 //! Stateless async WebSocket relay server implementing `spec/relay-v1.md` and `spec/relay-v2.md`.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -14,7 +15,12 @@ use futures_util::{SinkExt, StreamExt};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 use tendril_core::crypto::{b64url_decode_array, b64url_encode, random_bytes};
+use tendril_core::relay_auth::{
+    RelayAuthProof, RelayAuthRole, RelayAuthScope, validate_relay_auth_secret,
+    verify_relay_auth_hmac, verify_relay_ticket,
+};
 use tendril_core::v2::{
     RELAY_V2_EPOCH_SECS, canonical_relay_host, epoch_for_unix, epoch_within_skew,
     verify_v2_relay_accept, verify_v2_relay_register,
@@ -24,7 +30,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant as TokioInstant, timeout};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
@@ -32,6 +38,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::http::{HeaderMap, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use zeroize::Zeroizing;
 
 use crate::protocol::{
     MAX_RELAY_FRAME_LEN, RELAY_PATH, RELAY_V2_PATH, RelayClientMsg, RelayServerMsg,
@@ -175,7 +182,7 @@ impl FromStr for IpCidr {
 }
 
 /// Configuration for [`RelayServer`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RelayConfig {
     pub listen_addr: SocketAddr,
     pub host: String,
@@ -189,10 +196,49 @@ pub struct RelayConfig {
     pub ip_refill_per_sec: u32,
     pub accept_timeout: Duration,
     pub idle_timeout: Duration,
+    pub pong_timeout: Duration,
     pub write_timeout: Duration,
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
     pub trusted_proxies: Vec<IpCidr>,
+    pub allowed_mailboxes: Vec<[u8; 32]>,
+    pub auth_secret: Option<Zeroizing<Vec<u8>>>,
+    pub trusted_issuers: Vec<[u8; 32]>,
+    pub auth_scope: RelayAuthScope,
+    /// Test-only clock seam overriding wall-clock Unix seconds for deterministic expiry tests.
+    pub clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+}
+
+impl fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelayConfig")
+            .field("listen_addr", &self.listen_addr)
+            .field("host", &self.host)
+            .field("max_pending_per_mailbox", &self.max_pending_per_mailbox)
+            .field("max_active_per_ip", &self.max_active_per_ip)
+            .field("max_active_per_mailbox", &self.max_active_per_mailbox)
+            .field("max_total_connections", &self.max_total_connections)
+            .field("max_mailboxes", &self.max_mailboxes)
+            .field("max_tracked_ips", &self.max_tracked_ips)
+            .field("ip_burst_capacity", &self.ip_burst_capacity)
+            .field("ip_refill_per_sec", &self.ip_refill_per_sec)
+            .field("accept_timeout", &self.accept_timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("pong_timeout", &self.pong_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .field("tls_cert_path", &self.tls_cert_path)
+            .field("tls_key_path", &self.tls_key_path)
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field("allowed_mailboxes", &self.allowed_mailboxes.len())
+            .field(
+                "auth_secret",
+                &self.auth_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("trusted_issuers", &self.trusted_issuers.len())
+            .field("auth_scope", &self.auth_scope)
+            .field("clock", &self.clock.as_ref().map(|_| "<clock>"))
+            .finish()
+    }
 }
 
 impl Default for RelayConfig {
@@ -210,11 +256,48 @@ impl Default for RelayConfig {
             ip_refill_per_sec: 20,
             accept_timeout: Duration::from_secs(15),
             idle_timeout: Duration::from_secs(300),
+            pong_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(1),
             tls_cert_path: None,
             tls_key_path: None,
             trusted_proxies: Vec::new(),
+            allowed_mailboxes: Vec::new(),
+            auth_secret: None,
+            trusted_issuers: Vec::new(),
+            auth_scope: RelayAuthScope::All,
+            clock: None,
         }
+    }
+}
+
+impl RelayConfig {
+    fn has_tier2_or_3(&self) -> bool {
+        self.auth_secret.is_some() || !self.trusted_issuers.is_empty()
+    }
+
+    fn requires_register_admission(&self) -> bool {
+        !self.allowed_mailboxes.is_empty() || self.has_tier2_or_3()
+    }
+
+    fn requires_dial_admission(&self) -> bool {
+        self.has_tier2_or_3() && self.auth_scope.includes_dial()
+    }
+
+    fn challenge_auth_required(&self) -> Option<Vec<String>> {
+        if !self.requires_register_admission() {
+            return None;
+        }
+        if self.requires_dial_admission() {
+            Some(vec!["register".to_owned(), "dial".to_owned()])
+        } else {
+            Some(vec!["register".to_owned()])
+        }
+    }
+
+    fn now_unix_secs(&self) -> u64 {
+        self.clock
+            .as_ref()
+            .map_or_else(current_unix_secs, |clock| clock())
     }
 }
 
@@ -653,6 +736,14 @@ pub struct RelayServer {
 impl RelayServer {
     /// Binds a TCP listener using `config`, optionally enabling native `rustls` TLS.
     pub async fn bind(config: RelayConfig) -> Result<Self, RelayError> {
+        if let Some(secret) = &config.auth_secret {
+            validate_relay_auth_secret(secret)
+                .map_err(|err| RelayError::InvalidConfig(err.to_string()))?;
+        }
+        if config.has_tier2_or_3() {
+            canonical_relay_host(&config.host)
+                .map_err(|err| RelayError::InvalidConfig(err.to_string()))?;
+        }
         let tls_acceptor = match (&config.tls_cert_path, &config.tls_key_path) {
             (None, None) => None,
             (Some(_), None) | (None, Some(_)) => {
@@ -836,6 +927,84 @@ async fn send_v2_error_and_close(
     let _ = timeout(write_timeout, ws.close(None)).await;
 }
 
+fn is_mailbox_allowlisted(config: &RelayConfig, key: &[u8; 32]) -> bool {
+    config
+        .allowed_mailboxes
+        .iter()
+        .any(|allowed| bool::from(allowed.ct_eq(key)))
+}
+
+fn verify_admission_proof(
+    config: &RelayConfig,
+    op: &str,
+    role: RelayAuthRole,
+    nonce: &[u8; 32],
+    target_key: &[u8; 32],
+    auth: Option<&RelayAuthProof>,
+) -> bool {
+    let Some(proof) = auth else {
+        return false;
+    };
+    match proof {
+        RelayAuthProof::Hmac { mac } => {
+            let Some(secret) = config.auth_secret.as_ref() else {
+                return false;
+            };
+            verify_relay_auth_hmac(secret.as_slice(), op, &config.host, nonce, target_key, mac)
+                .is_ok()
+        }
+        RelayAuthProof::Ticket { ticket } => {
+            if config.trusted_issuers.is_empty() {
+                return false;
+            }
+            verify_relay_ticket(
+                ticket,
+                &config.trusted_issuers,
+                &config.host,
+                role,
+                target_key,
+                config.now_unix_secs(),
+            )
+            .is_ok()
+        }
+    }
+}
+
+fn verify_register_or_accept_admission(
+    config: &RelayConfig,
+    op: &str,
+    nonce: &[u8; 32],
+    mailbox_key: &[u8; 32],
+    auth: Option<&RelayAuthProof>,
+) -> bool {
+    if !config.requires_register_admission() {
+        return true;
+    }
+    if is_mailbox_allowlisted(config, mailbox_key) {
+        return true;
+    }
+    verify_admission_proof(
+        config,
+        op,
+        RelayAuthRole::Register,
+        nonce,
+        mailbox_key,
+        auth,
+    )
+}
+
+fn verify_dial_admission(
+    config: &RelayConfig,
+    nonce: &[u8; 32],
+    target_key: &[u8; 32],
+    auth: Option<&RelayAuthProof>,
+) -> bool {
+    if !config.requires_dial_admission() {
+        return true;
+    }
+    verify_admission_proof(config, "dial", RelayAuthRole::Dial, nonce, target_key, auth)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RelayProtocolVersion {
     V1,
@@ -1013,6 +1182,7 @@ async fn handle_connection(
         nonce: b64url_encode(&nonce),
         host: state.config.host.clone(),
         max_frame: MAX_RELAY_FRAME_LEN,
+        auth_required: state.config.challenge_auth_required(),
     };
     if !send_json(&mut ws, &challenge, state.config.write_timeout).await {
         return;
@@ -1037,19 +1207,41 @@ async fn handle_connection(
     };
 
     match cmd {
-        RelayClientMsg::Register { pub_key, sig } => {
-            handle_register(ws, global_guard, ip_guard, state, &nonce, pub_key, sig).await;
+        RelayClientMsg::Register { pub_key, sig, auth } => {
+            handle_register(
+                ws,
+                global_guard,
+                ip_guard,
+                state,
+                &nonce,
+                pub_key,
+                sig,
+                auth,
+            )
+            .await;
         }
         RelayClientMsg::Dial {
             target_pub,
             conn_id,
+            auth,
         } => {
-            handle_dial(ws, global_guard, ip_guard, state, target_pub, conn_id).await;
+            handle_dial(
+                ws,
+                global_guard,
+                ip_guard,
+                state,
+                &nonce,
+                target_pub,
+                conn_id,
+                auth,
+            )
+            .await;
         }
         RelayClientMsg::Accept {
             pub_key,
             conn_id,
             sig,
+            auth,
         } => {
             handle_accept(
                 ws,
@@ -1060,12 +1252,14 @@ async fn handle_connection(
                 pub_key,
                 conn_id,
                 sig,
+                auth,
             )
             .await;
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_register(
     mut ws: WebSocketStream<RelayTcpStream>,
     _global_guard: GlobalConnGuard,
@@ -1074,12 +1268,23 @@ async fn handle_register(
     nonce: &[u8; 32],
     pub_key_b64: String,
     sig_b64: String,
+    auth: Option<RelayAuthProof>,
 ) {
     let Ok(mailbox_pub) = verify_relay_register(&pub_key_b64, &sig_b64, &state.config.host, nonce)
     else {
         send_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
         return;
     };
+    if !verify_register_or_accept_admission(
+        &state.config,
+        "register",
+        nonce,
+        &mailbox_pub,
+        auth.as_ref(),
+    ) {
+        send_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
+        return;
+    }
 
     let chan_cap = state
         .config
@@ -1148,13 +1353,16 @@ async fn handle_register(
     let _ = timeout(state.config.write_timeout, ws.close(None)).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_dial(
     mut ws: WebSocketStream<RelayTcpStream>,
     _global_guard: GlobalConnGuard,
     _ip_guard: IpConnGuard,
     state: Arc<RelayState>,
+    nonce: &[u8; 32],
     target_pub_b64: String,
     conn_id_b64: String,
+    auth: Option<RelayAuthProof>,
 ) {
     let (Ok(target_pub), Ok(conn_id)) = (
         b64url_decode_array::<32>(&target_pub_b64),
@@ -1163,6 +1371,10 @@ async fn handle_dial(
         send_error_and_close(&mut ws, "invalid_request", state.config.write_timeout).await;
         return;
     };
+    if !verify_dial_admission(&state.config, nonce, &target_pub, auth.as_ref()) {
+        send_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
+        return;
+    }
 
     let (match_tx, match_rx) = oneshot::channel::<AcceptorTransfer>();
     let enqueue_res: Result<(mpsc::Sender<String>, u64), &'static str> = {
@@ -1270,6 +1482,7 @@ async fn handle_accept(
     pub_key_b64: String,
     conn_id_b64: String,
     sig_b64: String,
+    auth: Option<RelayAuthProof>,
 ) {
     let Ok((acceptor_pub, conn_id)) = verify_relay_accept(
         &pub_key_b64,
@@ -1281,6 +1494,16 @@ async fn handle_accept(
         send_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
         return;
     };
+    if !verify_register_or_accept_admission(
+        &state.config,
+        "accept",
+        nonce,
+        &acceptor_pub,
+        auth.as_ref(),
+    ) {
+        send_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
+        return;
+    }
 
     enum ClaimResult {
         Claimed {
@@ -1381,12 +1604,13 @@ async fn handle_v2_connection(
     let Ok(nonce) = random_bytes::<32>() else {
         return;
     };
-    let server_epoch = epoch_for_unix(current_unix_secs());
+    let server_epoch = epoch_for_unix(state.config.now_unix_secs());
     let challenge = RelayV2ServerMsg::Challenge {
         nonce: b64url_encode(&nonce),
         host: canonical_host.clone(),
         epoch: server_epoch,
         max_frame: MAX_RELAY_FRAME_LEN,
+        auth_required: state.config.challenge_auth_required(),
     };
     if !send_json(&mut ws, &challenge, state.config.write_timeout).await {
         return;
@@ -1415,6 +1639,7 @@ async fn handle_v2_connection(
             mailbox_id,
             epoch,
             sig,
+            auth,
         } => {
             handle_v2_register(
                 ws,
@@ -1427,6 +1652,7 @@ async fn handle_v2_connection(
                 mailbox_id,
                 epoch,
                 sig,
+                auth,
             )
             .await;
         }
@@ -1435,6 +1661,7 @@ async fn handle_v2_connection(
             epoch,
             conn_id,
             dial_token,
+            auth,
         } => {
             handle_v2_dial(
                 ws,
@@ -1447,6 +1674,7 @@ async fn handle_v2_connection(
                 epoch,
                 conn_id,
                 dial_token,
+                auth,
             )
             .await;
         }
@@ -1455,6 +1683,7 @@ async fn handle_v2_connection(
             epoch,
             conn_id,
             sig,
+            auth,
         } => {
             handle_v2_accept(
                 ws,
@@ -1468,6 +1697,7 @@ async fn handle_v2_connection(
                 epoch,
                 conn_id,
                 sig,
+                auth,
             )
             .await;
         }
@@ -1486,6 +1716,7 @@ async fn handle_v2_register(
     mailbox_id_b64: String,
     epoch: u64,
     sig_b64: String,
+    auth: Option<RelayAuthProof>,
 ) {
     let (Ok(mailbox_id), Ok(sig)) = (
         b64url_decode_array::<32>(&mailbox_id_b64),
@@ -1496,6 +1727,13 @@ async fn handle_v2_register(
     };
     if !epoch_within_skew(server_epoch, epoch)
         || verify_v2_relay_register(&mailbox_id, epoch, canonical_host, nonce, &sig).is_err()
+        || !verify_register_or_accept_admission(
+            &state.config,
+            "register",
+            nonce,
+            &mailbox_id,
+            auth.as_ref(),
+        )
     {
         send_v2_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
         return;
@@ -1552,20 +1790,26 @@ async fn handle_v2_register(
         return;
     }
 
-    let expire_secs = epoch
-        .saturating_add(2)
-        .saturating_mul(RELAY_V2_EPOCH_SECS)
-        .saturating_sub(current_unix_secs());
-    let epoch_expiry = tokio::time::sleep(Duration::from_secs(expire_secs));
-    tokio::pin!(epoch_expiry);
+    let expiry_unix = epoch.saturating_add(2).saturating_mul(RELAY_V2_EPOCH_SECS);
+    let expire_secs = expiry_unix.saturating_sub(state.config.now_unix_secs());
+    let wall_expiry = tokio::time::sleep(Duration::from_secs(expire_secs));
+    tokio::pin!(wall_expiry);
+    let has_custom_clock = state.config.clock.is_some();
+    let mut clock_poll = tokio::time::interval(Duration::from_millis(20));
+    clock_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let idle_sleep = tokio::time::sleep(state.config.idle_timeout.max(Duration::from_millis(1)));
     tokio::pin!(idle_sleep);
     let mut awaiting_pong = false;
 
     loop {
         tokio::select! {
-            () = &mut epoch_expiry => {
+            () = &mut wall_expiry, if !has_custom_clock => {
                 break;
+            }
+            _ = clock_poll.tick(), if has_custom_clock => {
+                if state.config.now_unix_secs() >= expiry_unix {
+                    break;
+                }
             }
             () = &mut idle_sleep => {
                 if awaiting_pong {
@@ -1583,7 +1827,7 @@ async fn handle_v2_register(
                 awaiting_pong = true;
                 idle_sleep
                     .as_mut()
-                    .reset(TokioInstant::now() + state.config.accept_timeout.max(Duration::from_millis(1)));
+                    .reset(TokioInstant::now() + state.config.pong_timeout.max(Duration::from_millis(1)));
             }
             maybe_note = incoming_rx.recv() => {
                 let Some(note) = maybe_note else {
@@ -1634,6 +1878,7 @@ async fn handle_v2_dial(
     epoch: u64,
     conn_id_b64: String,
     dial_token_b64: String,
+    auth: Option<RelayAuthProof>,
 ) {
     let (Ok(target_mailbox), Ok(conn_id), Ok(_dial_token)) = (
         b64url_decode_array::<32>(&target_mailbox_b64),
@@ -1643,6 +1888,10 @@ async fn handle_v2_dial(
         send_v2_error_and_close(&mut ws, "invalid_request", state.config.write_timeout).await;
         return;
     };
+    if !verify_dial_admission(&state.config, dial_nonce, &target_mailbox, auth.as_ref()) {
+        send_v2_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
+        return;
+    }
     if !epoch_within_skew(server_epoch, epoch) {
         send_v2_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
         return;
@@ -1788,6 +2037,7 @@ async fn handle_v2_accept(
     epoch: u64,
     conn_id_b64: String,
     sig_b64: String,
+    auth: Option<RelayAuthProof>,
 ) {
     let (Ok(acceptor_mailbox), Ok(conn_id), Ok(sig)) = (
         b64url_decode_array::<32>(&mailbox_id_b64),
@@ -1808,6 +2058,13 @@ async fn handle_v2_accept(
             &sig,
         )
         .is_err()
+        || !verify_register_or_accept_admission(
+            &state.config,
+            "accept",
+            nonce,
+            &acceptor_mailbox,
+            auth.as_ref(),
+        )
     {
         send_v2_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
         return;

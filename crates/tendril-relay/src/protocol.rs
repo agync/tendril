@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tendril_core::MAX_FRAME_LEN;
 use tendril_core::crypto::{b64url_decode_array, b64url_encode};
 use tendril_core::error::CoreError;
+use tendril_core::relay_auth::RelayAuthProof;
 
 /// Canonical WebSocket path for Tendril v1 relays.
 pub const RELAY_PATH: &str = "/v1/relay";
@@ -29,6 +30,8 @@ pub enum RelayServerMsg {
         nonce: String,
         host: String,
         max_frame: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_required: Option<Vec<String>>,
     },
     Registered {
         #[serde(rename = "pub")]
@@ -53,16 +56,22 @@ pub enum RelayClientMsg {
         #[serde(rename = "pub")]
         pub_key: String,
         sig: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RelayAuthProof>,
     },
     Dial {
         target_pub: String,
         conn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RelayAuthProof>,
     },
     Accept {
         #[serde(rename = "pub")]
         pub_key: String,
         conn_id: String,
         sig: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RelayAuthProof>,
     },
 }
 
@@ -75,6 +84,8 @@ pub enum RelayV2ServerMsg {
         host: String,
         epoch: u64,
         max_frame: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_required: Option<Vec<String>>,
     },
     Registered {
         mailbox_id: String,
@@ -103,18 +114,24 @@ pub enum RelayV2ClientMsg {
         mailbox_id: String,
         epoch: u64,
         sig: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RelayAuthProof>,
     },
     Dial {
         target_mailbox_id: String,
         epoch: u64,
         conn_id: String,
         dial_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RelayAuthProof>,
     },
     Accept {
         mailbox_id: String,
         epoch: u64,
         conn_id: String,
         sig: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RelayAuthProof>,
     },
 }
 

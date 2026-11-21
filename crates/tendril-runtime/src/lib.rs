@@ -32,15 +32,16 @@ pub use provider::{
 pub use providers::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DirectDialer, DirectListener, EmbeddedRelay,
     LocalDialer, LocalListener, OverlayConfig, OverlayDialer, OverlayHelperDialer,
-    OverlayHelperListener, OverlayListener, OverlayMode, OverlayResolvedMode, RelayDialer,
-    RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, dial_endpoint,
-    is_loopback_host, is_metadata_or_link_local_ip, is_tailnet_ip, select_overlay_mode,
+    OverlayHelperListener, OverlayListener, OverlayMode, OverlayResolvedMode, RelayClientAuth,
+    RelayDialer, RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig,
+    dial_endpoint, dial_endpoint_with_auth, is_loopback_host, is_metadata_or_link_local_ip,
+    is_tailnet_ip, select_overlay_mode,
 };
 #[cfg(feature = "p2p-iroh")]
 pub use providers::{
-    P2pDialer, P2pListener, P2pOptions, P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint,
-    format_p2p_endpoint_with_addrs, parse_p2p_endpoint, parse_p2p_endpoint_filtered,
-    parse_p2p_relay_mode,
+    MAX_P2P_CUSTOM_RELAYS, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode,
+    TENDRIL_P2P_ALPN, format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_endpoint,
+    parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
 };
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};

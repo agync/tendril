@@ -12,3 +12,4 @@ pub use protocol::{
 };
 pub use rate_limit::{IpTokenLimiter, normalize_rate_limit_ip};
 pub use server::{IpCidr, RelayConfig, RelayError, RelayHandle, RelayServer};
+pub use tendril_core::relay_auth::{RelayAuthProof, RelayAuthScope};

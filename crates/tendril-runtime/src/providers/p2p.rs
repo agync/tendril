@@ -1,5 +1,6 @@
 //! Iroh QUIC P2P path provider (`p2p`, zero-config hole-punching + public relay fallback).
 
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayConfig as IrohRelayConfig, RelayMap, RelayMode,
+    RelayUrl, SecretKey, TransportAddr,
+};
+use tendril_core::crypto::random_bytes;
 use tendril_core::policy::ProviderId;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -23,6 +28,11 @@ use crate::provider::{
 
 /// ALPN registered on iroh endpoints carrying Tendril `Intent::Pair` and `Intent::Session`.
 pub const TENDRIL_P2P_ALPN: &[u8] = b"tendril/p2p/v1";
+
+/// Maximum number of custom `iroh-relay` URLs accepted in [`P2pRelayMode::CustomMany`].
+pub const MAX_P2P_CUSTOM_RELAYS: usize = 8;
+
+const MAX_P2P_RELAY_AUTH_BYTES: usize = 4_096;
 
 const P2P_STREAM_MAGIC: u8 = 0x54;
 const P2P_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -98,26 +108,51 @@ impl<K: Eq + std::hash::Hash> Drop for PeerAcceptGuard<K> {
     }
 }
 
+/// Authentication credentials attached to managed `iroh-relay` connections.
+#[derive(Clone)]
+pub enum P2pRelayAuth {
+    /// Static or pre-minted bearer token attached to `iroh::RelayMap::with_auth_token`.
+    BearerToken(Zeroizing<String>),
+    /// Managed `iroh-services` API secret used to derive an endpoint-scoped `RelayCap::Use` RCAN token.
+    #[cfg(feature = "p2p-iroh-services")]
+    IrohServicesSecret(Zeroizing<String>),
+}
+
+impl fmt::Debug for P2pRelayAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BearerToken(_) => f.write_str("P2pRelayAuth::BearerToken(<redacted>)"),
+            #[cfg(feature = "p2p-iroh-services")]
+            Self::IrohServicesSecret(_) => {
+                f.write_str("P2pRelayAuth::IrohServicesSecret(<redacted>)")
+            }
+        }
+    }
+}
+
 /// Relay strategy used when constructing [`P2pListener`] and [`P2pDialer`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum P2pRelayMode {
     /// Zero-setup public relays (`RelayMode::Default`).
     #[default]
     Default,
-    /// Self-hosted or regional `iroh-relay` HTTPS URL (`https://...`).
+    /// Single self-hosted or regional `iroh-relay` URL (`https://...` or loopback `http://...`).
     Custom(String),
+    /// Multi-region custom `iroh-relay` URL list (`2..=8` URLs).
+    CustomMany(Vec<String>),
     /// Direct UDP socket addresses only (no relay server).
     Disabled,
 }
 
 /// Privacy and discovery options controlling `iroh` P2P endpoint construction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct P2pOptions {
     pub relay_mode: P2pRelayMode,
     pub publish_pkarr: bool,
     pub resolve_pkarr: bool,
     pub advertise_direct_addrs: bool,
     pub allow_private_addrs: bool,
+    pub relay_auth: Option<P2pRelayAuth>,
 }
 
 impl Default for P2pOptions {
@@ -130,7 +165,7 @@ impl P2pOptions {
     /// Default privacy-preserving options for a listening [`P2pListener`].
     ///
     /// - [`P2pRelayMode::Default`]: publishes and resolves via `n0` Pkarr/DNS; omits direct `?addr=` hints.
-    /// - [`P2pRelayMode::Custom`]: disables `n0` Pkarr/DNS (`presets::Minimal`) and omits direct `?addr=` hints.
+    /// - [`P2pRelayMode::Custom`] / [`P2pRelayMode::CustomMany`]: disables `n0` Pkarr/DNS (`presets::Minimal`) and omits direct `?addr=` hints.
     /// - [`P2pRelayMode::Disabled`]: disables `n0` Pkarr/DNS and advertises local `?addr=` hints.
     #[must_use]
     pub fn for_listener(relay_mode: P2pRelayMode) -> Self {
@@ -142,6 +177,7 @@ impl P2pOptions {
             resolve_pkarr: is_default,
             advertise_direct_addrs: is_disabled,
             allow_private_addrs: is_disabled,
+            relay_auth: None,
         }
     }
 
@@ -158,6 +194,7 @@ impl P2pOptions {
             resolve_pkarr: is_default,
             advertise_direct_addrs: false,
             allow_private_addrs: is_disabled,
+            relay_auth: None,
         }
     }
 
@@ -186,6 +223,13 @@ impl P2pOptions {
     #[must_use]
     pub fn with_allow_private_addrs(mut self, allow: bool) -> Self {
         self.allow_private_addrs = allow;
+        self
+    }
+
+    /// Attaches relay authentication credentials for managed `iroh-relay` servers.
+    #[must_use]
+    pub fn with_relay_auth(mut self, auth: Option<P2pRelayAuth>) -> Self {
+        self.relay_auth = auth;
         self
     }
 }
@@ -247,34 +291,167 @@ pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeE
     }
 }
 
+/// Parses one or more custom `iroh-relay` URLs (`1..=8`) into [`P2pRelayMode::Custom`] or
+/// [`P2pRelayMode::CustomMany`].
+pub fn parse_p2p_relay_modes(urls: &[String]) -> Result<P2pRelayMode, RuntimeError> {
+    if urls.is_empty() || urls.len() > MAX_P2P_CUSTOM_RELAYS {
+        return Err(RuntimeError::Protocol(format!(
+            "custom p2p relay list must contain 1..={MAX_P2P_CUSTOM_RELAYS} URLs"
+        )));
+    }
+    let mut validated_urls = Vec::with_capacity(urls.len());
+    for raw in urls {
+        let validated = super::validate_iroh_relay_url(raw)?;
+        let canonical = validated.as_str().to_owned();
+        let _ = RelayUrl::from_str(&canonical).map_err(|err| {
+            RuntimeError::Protocol(format!("invalid iroh relay URL '{raw}': {err}"))
+        })?;
+        validated_urls.push(canonical);
+    }
+    if validated_urls.len() == 1 {
+        Ok(P2pRelayMode::Custom(
+            validated_urls.into_iter().next().expect("len == 1"),
+        ))
+    } else {
+        Ok(P2pRelayMode::CustomMany(validated_urls))
+    }
+}
+
+fn validate_p2p_auth_str(raw: &str, label: &str) -> Result<(), RuntimeError> {
+    if raw.is_empty() || raw.len() > MAX_P2P_RELAY_AUTH_BYTES {
+        return Err(RuntimeError::Protocol(format!(
+            "{label} must be 1..={MAX_P2P_RELAY_AUTH_BYTES} bytes"
+        )));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err(RuntimeError::Protocol(format!(
+            "{label} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_p2p_options(options: &P2pOptions) -> Result<(), RuntimeError> {
+    if let Some(auth) = &options.relay_auth {
+        if matches!(options.relay_mode, P2pRelayMode::Disabled) {
+            return Err(RuntimeError::Protocol(
+                "relay_auth is invalid when relay_mode is Disabled".into(),
+            ));
+        }
+        match auth {
+            P2pRelayAuth::BearerToken(tok) => {
+                validate_p2p_auth_str(tok, "p2p relay bearer token")?;
+            }
+            #[cfg(feature = "p2p-iroh-services")]
+            P2pRelayAuth::IrohServicesSecret(sec) => {
+                validate_p2p_auth_str(sec, "iroh-services secret")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_custom_relay_map(urls: &[String]) -> Result<RelayMap, RuntimeError> {
+    if urls.is_empty() || urls.len() > MAX_P2P_CUSTOM_RELAYS {
+        return Err(RuntimeError::Protocol(format!(
+            "custom p2p relay list must contain 1..={MAX_P2P_CUSTOM_RELAYS} URLs"
+        )));
+    }
+    let mut configs = Vec::with_capacity(urls.len());
+    for raw in urls {
+        let validated = super::validate_iroh_relay_url(raw)?;
+        let url = RelayUrl::from_str(validated.as_str()).map_err(|err| {
+            RuntimeError::Protocol(format!("invalid iroh relay URL '{raw}': {err}"))
+        })?;
+        let cfg = if validated.scheme() == "http" {
+            IrohRelayConfig::new(url, None)
+        } else {
+            IrohRelayConfig::from(url)
+        };
+        configs.push(cfg);
+    }
+    Ok(RelayMap::from_iter(configs))
+}
+
+fn resolve_p2p_auth_token(
+    auth: Option<&P2pRelayAuth>,
+    #[cfg_attr(not(feature = "p2p-iroh-services"), allow(unused_variables))]
+    endpoint_pub: EndpointId,
+) -> Result<Option<Zeroizing<String>>, RuntimeError> {
+    let Some(auth) = auth else {
+        return Ok(None);
+    };
+    match auth {
+        P2pRelayAuth::BearerToken(tok) => Ok(Some(tok.clone())),
+        #[cfg(feature = "p2p-iroh-services")]
+        P2pRelayAuth::IrohServicesSecret(sec) => {
+            let api_secret =
+                iroh_services::api_secret::ApiSecret::from_str(sec.trim()).map_err(|err| {
+                    RuntimeError::Protocol(format!("invalid iroh-services API secret: {err}"))
+                })?;
+            let rcan = iroh_services::caps::create_api_token_from_secret_key(
+                api_secret.secret,
+                endpoint_pub,
+                Duration::from_secs(30 * 24 * 3600),
+                iroh_services::caps::Caps::relay_use(),
+            );
+            let encoded = data_encoding::BASE32_NOPAD
+                .encode(&rcan.encode())
+                .to_ascii_lowercase();
+            Ok(Some(Zeroizing::new(encoded)))
+        }
+    }
+}
+
 async fn build_iroh_endpoint(
     options: &P2pOptions,
     alpns: Vec<Vec<u8>>,
     secret_seed: Option<Zeroizing<[u8; 32]>>,
 ) -> Result<Endpoint, RuntimeError> {
-    let mut builder = match &options.relay_mode {
-        P2pRelayMode::Default => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Default),
-        P2pRelayMode::Custom(url_str) => {
-            let validated = super::validate_iroh_relay_url(url_str)?;
-            let url = RelayUrl::from_str(validated.as_str()).map_err(|err| {
-                RuntimeError::Protocol(format!("invalid iroh relay URL '{url_str}': {err}"))
-            })?;
-            Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(url.into()))
-        }
-        P2pRelayMode::Disabled => {
-            Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
-        }
+    validate_p2p_options(options)?;
+
+    let seed = match secret_seed {
+        Some(s) => s,
+        None => Zeroizing::new(random_bytes::<32>()?),
     };
+    let secret_key = SecretKey::from_bytes(&seed);
+    let auth_token = resolve_p2p_auth_token(options.relay_auth.as_ref(), secret_key.public())?;
+
+    let relay_mode = match &options.relay_mode {
+        P2pRelayMode::Default => match auth_token.as_ref() {
+            Some(tok) => RelayMode::Custom(
+                iroh::endpoint::default_relay_mode()
+                    .relay_map()
+                    .with_auth_token(tok.as_str()),
+            ),
+            None => RelayMode::Default,
+        },
+        P2pRelayMode::Custom(url_str) => {
+            let mut map = build_custom_relay_map(std::slice::from_ref(url_str))?;
+            if let Some(tok) = auth_token.as_ref() {
+                map = map.with_auth_token(tok.as_str());
+            }
+            RelayMode::Custom(map)
+        }
+        P2pRelayMode::CustomMany(urls) => {
+            let mut map = build_custom_relay_map(urls)?;
+            if let Some(tok) = auth_token.as_ref() {
+                map = map.with_auth_token(tok.as_str());
+            }
+            RelayMode::Custom(map)
+        }
+        P2pRelayMode::Disabled => RelayMode::Disabled,
+    };
+
+    let mut builder = Endpoint::builder(presets::Minimal)
+        .relay_mode(relay_mode)
+        .secret_key(secret_key);
     if options.publish_pkarr {
         builder = builder.address_lookup(iroh::address_lookup::PkarrPublisher::n0_dns());
     }
     if options.resolve_pkarr {
         builder = builder.address_lookup(iroh::address_lookup::PkarrResolver::n0_dns());
         builder = builder.address_lookup(iroh::address_lookup::DnsAddressLookup::n0_dns());
-    }
-    if let Some(seed) = secret_seed {
-        let sk = SecretKey::from_bytes(&seed);
-        builder = builder.secret_key(sk);
     }
     if !alpns.is_empty() {
         builder = builder.alpns(alpns);

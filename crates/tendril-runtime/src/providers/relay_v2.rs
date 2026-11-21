@@ -29,7 +29,7 @@ use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use super::relay::RelayStream;
+use super::relay::{RelayClientAuth, RelayStream, build_relay_auth_proof};
 use super::{ensure_rustls_ring_provider, ws_binary_config};
 use crate::error::RuntimeError;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
@@ -114,7 +114,16 @@ fn extract_expected_host(
 async fn connect_and_verify_v2_challenge(
     relay_url: &str,
     expected_host: &str,
-) -> Result<(ClientWsStream, VerifiedRelayHost, [u8; 32], u64), RuntimeError> {
+) -> Result<
+    (
+        ClientWsStream,
+        VerifiedRelayHost,
+        [u8; 32],
+        u64,
+        Option<Vec<String>>,
+    ),
+    RuntimeError,
+> {
     ensure_rustls_ring_provider();
     let (mut ws, _) = timeout(
         CONTROL_TIMEOUT,
@@ -129,6 +138,7 @@ async fn connect_and_verify_v2_challenge(
         host,
         epoch,
         max_frame,
+        auth_required,
     } = recv_v2_control_msg(&mut ws).await?
     else {
         return Err(RuntimeError::Protocol(
@@ -142,7 +152,7 @@ async fn connect_and_verify_v2_challenge(
     }
     let verified_host = VerifiedRelayHost::from_challenge(expected_host, &host)?;
     let nonce_bytes = b64url_decode_array::<32>(&nonce)?;
-    Ok((ws, verified_host, nonce_bytes, epoch))
+    Ok((ws, verified_host, nonce_bytes, epoch, auth_required))
 }
 
 /// Configuration for [`RelayV2Listener`].
@@ -153,6 +163,7 @@ pub struct RelayV2ListenerConfig {
     pub allow_insecure_ws: bool,
     pub replay_cache: Option<Arc<Mutex<RelayDialReplayCache>>>,
     pub unix_secs: Option<u64>,
+    pub auth: RelayClientAuth,
 }
 
 impl Default for RelayV2ListenerConfig {
@@ -163,6 +174,7 @@ impl Default for RelayV2ListenerConfig {
             allow_insecure_ws: false,
             replay_cache: None,
             unix_secs: None,
+            auth: RelayClientAuth::None,
         }
     }
 }
@@ -226,9 +238,30 @@ impl RelayV2Listener {
         mailbox_secret: [u8; 32],
         write_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        Self::bind_with_auth(
+            relay_url,
+            expected_host,
+            mailbox_secret,
+            write_timeout,
+            RelayClientAuth::None,
+        )
+        .await
+    }
+
+    /// Connects to `relay_url` with admission credentials `auth`, derives the active epoch
+    /// mailbox window from `mailbox_secret`, opens one independent control WebSocket per epoch
+    /// mailbox, and starts accepting streams.
+    pub async fn bind_with_auth(
+        relay_url: impl Into<String>,
+        expected_host: Option<String>,
+        mailbox_secret: [u8; 32],
+        write_timeout: Duration,
+        auth: RelayClientAuth,
+    ) -> Result<Self, RuntimeError> {
         let config = RelayV2ListenerConfig {
             expected_host,
             write_timeout,
+            auth,
             ..RelayV2ListenerConfig::default()
         };
         Self::bind_with_config(relay_url, mailbox_secret, config).await
@@ -241,6 +274,7 @@ impl RelayV2Listener {
         config: RelayV2ListenerConfig,
     ) -> Result<Self, RuntimeError> {
         let secret = Zeroizing::new(mailbox_secret);
+        let auth = Arc::new(config.auth);
         let parsed = super::validate_ws_url(&relay_url.into(), config.allow_insecure_ws)?;
         let required_host = extract_expected_host(&parsed, config.expected_host.as_deref())?;
         let relay_url = parsed.as_str().to_owned();
@@ -277,6 +311,7 @@ impl RelayV2Listener {
                 Arc::clone(&accept_sem),
                 accepted_tx.clone(),
                 Arc::clone(&active_control_sockets),
+                Arc::clone(&auth),
                 config.write_timeout,
                 Some(ready_tx),
             );
@@ -401,6 +436,7 @@ impl RelayV2Listener {
                                     Arc::clone(&accept_sem),
                                     accepted_tx.clone(),
                                     Arc::clone(&sockets_c),
+                                    Arc::clone(&auth),
                                     write_timeout,
                                     None,
                                 );
@@ -505,6 +541,7 @@ fn spawn_epoch_control_task(
     accept_sem: Arc<Semaphore>,
     accepted_tx: mpsc::Sender<RelayStream>,
     active_sockets: Arc<AtomicUsize>,
+    auth: Arc<RelayClientAuth>,
     write_timeout: Duration,
     ready_tx: Option<oneshot::Sender<Result<(), RuntimeError>>>,
 ) -> EpochSocketHandle {
@@ -518,7 +555,7 @@ fn spawn_epoch_control_task(
             if *shutdown_rx.borrow() {
                 break;
             }
-            let (mut control_ws, verified_host, nonce, _srv_epoch) =
+            let (mut control_ws, verified_host, nonce, _srv_epoch, auth_required) =
                 match connect_and_verify_v2_challenge(&relay_url, &expected_host).await {
                     Ok(v) => v,
                     Err(err) => {
@@ -547,6 +584,22 @@ fn spawn_epoch_control_task(
                     break;
                 }
             };
+            let reg_auth = match build_relay_auth_proof(
+                &auth,
+                auth_required.as_deref(),
+                "register",
+                verified_host.as_str(),
+                &nonce,
+                &mailbox.mailbox_id,
+            ) {
+                Ok(proof) => proof,
+                Err(err) => {
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(err));
+                    }
+                    break;
+                }
+            };
             let mailbox_b64 = mailbox.mailbox_id_b64url();
             if let Err(err) = send_v2_control_msg(
                 &mut control_ws,
@@ -554,6 +607,7 @@ fn spawn_epoch_control_task(
                     mailbox_id: mailbox_b64.clone(),
                     epoch: mailbox.epoch,
                     sig: b64url_encode(&sig),
+                    auth: reg_auth,
                 },
                 write_timeout,
             )
@@ -717,6 +771,7 @@ fn spawn_epoch_control_task(
                                     let url_c = relay_url.clone();
                                     let host_c = expected_host.clone();
                                     let tx_c = accepted_tx.clone();
+                                    let auth_c = Arc::clone(&auth);
                                     accept_tasks.spawn(async move {
                                         let _permit = permit;
                                         if let Ok(stream) = accept_one_v2_stream(
@@ -725,6 +780,7 @@ fn spawn_epoch_control_task(
                                             &matched_mailbox,
                                             &conn_id,
                                             &conn_id_bytes,
+                                            &auth_c,
                                             write_timeout,
                                         )
                                         .await
@@ -769,11 +825,20 @@ async fn accept_one_v2_stream(
     mailbox: &DerivedMailbox,
     conn_id_b64: &str,
     conn_id_bytes: &[u8; 16],
+    auth: &RelayClientAuth,
     write_timeout: Duration,
 ) -> Result<RelayStream, RuntimeError> {
-    let (mut ws, verified_host, nonce, _srv_epoch) =
+    let (mut ws, verified_host, nonce, _srv_epoch, auth_required) =
         connect_and_verify_v2_challenge(relay_url, expected_host).await?;
     let sig = sign_v2_relay_accept(mailbox, verified_host.as_str(), &nonce, conn_id_bytes)?;
+    let acc_auth = build_relay_auth_proof(
+        auth,
+        auth_required.as_deref(),
+        "accept",
+        verified_host.as_str(),
+        &nonce,
+        &mailbox.mailbox_id,
+    )?;
     send_v2_control_msg(
         &mut ws,
         &RelayV2ClientMsg::Accept {
@@ -781,6 +846,7 @@ async fn accept_one_v2_stream(
             epoch: mailbox.epoch,
             conn_id: conn_id_b64.to_owned(),
             sig: b64url_encode(&sig),
+            auth: acc_auth,
         },
         write_timeout,
     )
@@ -812,6 +878,8 @@ pub struct RelayV2Dialer {
     allow_insecure_ws: bool,
     #[zeroize(skip)]
     unix_secs: Option<u64>,
+    #[zeroize(skip)]
+    auth: RelayClientAuth,
 }
 
 impl std::fmt::Debug for RelayV2Dialer {
@@ -820,6 +888,7 @@ impl std::fmt::Debug for RelayV2Dialer {
             .field("expected_host", &self.expected_host)
             .field("allow_insecure_ws", &self.allow_insecure_ws)
             .field("mailbox_secret", &"<redacted>")
+            .field("auth", &self.auth)
             .finish()
     }
 }
@@ -834,6 +903,7 @@ impl RelayV2Dialer {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             allow_insecure_ws: false,
             unix_secs: None,
+            auth: RelayClientAuth::None,
         }
     }
 
@@ -865,6 +935,13 @@ impl RelayV2Dialer {
         self
     }
 
+    /// Attaches stateless admission credentials for relays requiring dial auth.
+    #[must_use]
+    pub fn with_auth(mut self, auth: RelayClientAuth) -> Self {
+        self.auth = auth;
+        self
+    }
+
     /// Connects through `relay_url` for the current epoch derived from clock.
     pub async fn connect(&self, relay_url: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
         let epoch = epoch_for_unix(self.unix_secs.unwrap_or_else(current_unix_secs));
@@ -879,13 +956,21 @@ impl RelayV2Dialer {
     ) -> Result<Box<dyn PathStream>, RuntimeError> {
         let parsed = super::validate_ws_url(relay_url, self.allow_insecure_ws)?;
         let required_host = extract_expected_host(&parsed, self.expected_host.as_deref())?;
-        let (mut ws, verified_host, nonce, _srv_epoch) =
+        let (mut ws, verified_host, nonce, _srv_epoch, auth_required) =
             connect_and_verify_v2_challenge(parsed.as_str(), &required_host).await?;
 
         let mailbox = derive_epoch_mailbox(&self.mailbox_secret, epoch);
         let conn_id = random_bytes::<16>()?;
         let conn_id_b64 = b64url_encode(&conn_id);
         let dial_token = sign_v2_relay_dial(&mailbox, verified_host.as_str(), &nonce, &conn_id)?;
+        let dial_auth = build_relay_auth_proof(
+            &self.auth,
+            auth_required.as_deref(),
+            "dial",
+            verified_host.as_str(),
+            &nonce,
+            &mailbox.mailbox_id,
+        )?;
 
         send_v2_control_msg(
             &mut ws,
@@ -894,6 +979,7 @@ impl RelayV2Dialer {
                 epoch,
                 conn_id: conn_id_b64.clone(),
                 dial_token: b64url_encode(&dial_token),
+                auth: dial_auth,
             },
             self.write_timeout,
         )

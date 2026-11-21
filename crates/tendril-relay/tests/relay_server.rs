@@ -42,12 +42,14 @@ async fn relay_register_dial_accept_and_bidirectional_binary_bridge() {
         nonce,
         host,
         max_frame,
+        auth_required,
     } = recv_server_msg(&mut listener_ws).await.expect("challenge")
     else {
         panic!("expected challenge");
     };
     assert_eq!(host, "localhost");
     assert_eq!(max_frame, MAX_RELAY_FRAME_LEN);
+    assert_eq!(auth_required, None);
     let nonce_bytes = b64url_decode_array::<32>(&nonce).expect("nonce bytes");
     let (pub_b64, sig_b64) = sign_relay_register(&listener_key, &host, &nonce_bytes);
     send_client_msg(
@@ -55,6 +57,7 @@ async fn relay_register_dial_accept_and_bidirectional_binary_bridge() {
         &RelayClientMsg::Register {
             pub_key: pub_b64.clone(),
             sig: sig_b64,
+            auth: None,
         },
     )
     .await;
@@ -76,6 +79,7 @@ async fn relay_register_dial_accept_and_bidirectional_binary_bridge() {
         &RelayClientMsg::Dial {
             target_pub: pub_b64.clone(),
             conn_id: conn_id_b64.clone(),
+            auth: None,
         },
     )
     .await;
@@ -106,6 +110,7 @@ async fn relay_register_dial_accept_and_bidirectional_binary_bridge() {
             pub_key: pub_b64,
             conn_id: conn_id_b64.clone(),
             sig: acc_sig_b64,
+            auth: None,
         },
     )
     .await;
@@ -181,6 +186,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
         &RelayClientMsg::Register {
             pub_key: pub_a.clone(),
             sig: bad_sig,
+            auth: None,
         },
     )
     .await;
@@ -199,6 +205,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
         &RelayClientMsg::Dial {
             target_pub: pub_a.clone(),
             conn_id: b64url_encode(&[1; 16]),
+            auth: None,
         },
     )
     .await;
@@ -223,6 +230,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
         &RelayClientMsg::Register {
             pub_key: pub_a.clone(),
             sig: sig_a,
+            auth: None,
         },
     )
     .await;
@@ -239,6 +247,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
         &RelayClientMsg::Dial {
             target_pub: pub_a.clone(),
             conn_id: b64url_encode(&[0x01; 16]),
+            auth: None,
         },
     )
     .await;
@@ -254,6 +263,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
         &RelayClientMsg::Dial {
             target_pub: pub_a.clone(),
             conn_id: b64url_encode(&[0x02; 16]),
+            auth: None,
         },
     )
     .await;
@@ -269,6 +279,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
         &RelayClientMsg::Dial {
             target_pub: pub_a.clone(),
             conn_id: b64url_encode(&[0x03; 16]),
+            auth: None,
         },
     )
     .await;
@@ -296,6 +307,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
             pub_key: att_pub,
             conn_id: b64url_encode(&[0x01; 16]),
             sig: att_sig,
+            auth: None,
         },
     )
     .await;
@@ -322,6 +334,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
             pub_key: pub_a.clone(),
             conn_id: b64url_encode(&[0x01; 16]),
             sig: legit_sig,
+            auth: None,
         },
     )
     .await;
@@ -360,6 +373,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
             pub_key: pub_a,
             conn_id: b64url_encode(&[0x02; 16]),
             sig: legit_sig2,
+            auth: None,
         },
     )
     .await;
@@ -410,6 +424,7 @@ async fn relay_rejects_zero_byte_binary_frames_without_forwarding() {
         &RelayClientMsg::Register {
             pub_key: pub_b64.clone(),
             sig: reg_sig,
+            auth: None,
         },
     )
     .await;
@@ -427,6 +442,7 @@ async fn relay_rejects_zero_byte_binary_frames_without_forwarding() {
         &RelayClientMsg::Dial {
             target_pub: pub_b64.clone(),
             conn_id: conn_id_b64.clone(),
+            auth: None,
         },
     )
     .await;
@@ -450,6 +466,7 @@ async fn relay_rejects_zero_byte_binary_frames_without_forwarding() {
             pub_key: pub_b64,
             conn_id: conn_id_b64,
             sig: acc_sig,
+            auth: None,
         },
     )
     .await;
