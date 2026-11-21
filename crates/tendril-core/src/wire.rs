@@ -7,7 +7,7 @@ use crate::grants::Grant;
 use crate::identity::RotationRecord;
 
 /// Fixed Noise protocol pattern for Tendril v1.
-pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
+pub const NOISE_PATTERN: &str = "Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256";
 
 /// Three-byte ASCII magic opening every Tendril preamble.
 pub const PREAMBLE_MAGIC: [u8; 3] = *b"TND";
@@ -261,6 +261,7 @@ fn validate_inner_payload(kind: InnerFrameType, payload: &[u8]) -> Result<(), Co
 pub struct HostHello {
     pub host_id: String,
     pub proto_version: u8,
+    pub signing_pub: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rotation: Vec<RotationRecord>,
 }

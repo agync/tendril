@@ -5,8 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
-    b64url_encode, device_id, has_control_chars, is_valid_ed25519_public_key,
-    is_valid_x25519_public_key,
+    HybridSigningPublicKey, b64url_encode, device_id, has_control_chars, is_valid_x25519_public_key,
 };
 use crate::error::CoreError;
 use crate::grants::{
@@ -34,7 +33,7 @@ pub struct RosterEntry {
     pub kind: String,
     pub static_pub: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signing_pub: Option<[u8; 32]>,
+    pub signing_pub: Option<HybridSigningPublicKey>,
     pub rotation_seq: u64,
     pub state: PeerState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,14 +53,18 @@ impl RosterEntry {
         Ok(self.static_pub)
     }
 
-    /// Confirms both X25519 `static_pub` and Ed25519 `signing_pub` pins are present and valid.
-    pub fn require_complete_pin(&self) -> Result<([u8; 32], [u8; 32]), CoreError> {
+    /// Confirms both X25519 `static_pub` and hybrid `signing_pub` pins are present and valid.
+    pub fn require_complete_pin(&self) -> Result<([u8; 32], HybridSigningPublicKey), CoreError> {
         let static_pub = self.require_static_pin()?;
-        let Some(signing_pub) = self.signing_pub.filter(is_valid_ed25519_public_key) else {
+        let Some(signing_pub) = self.signing_pub.clone() else {
             return Err(CoreError::IncompletePin(self.device_id.clone()));
         };
         Ok((static_pub, signing_pub))
     }
+}
+
+fn signing_keys_share_identity(a: &HybridSigningPublicKey, b: &HybridSigningPublicKey) -> bool {
+    a == b || a.ed25519_bytes() == b.ed25519_bytes()
 }
 
 /// Hard cap on tracked active burned M2M enrollment nonces in [`Roster`].
@@ -75,11 +78,11 @@ pub enum AnchorState {
     Revoked,
 }
 
-/// Trusted Ed25519 root signer authorized to issue M2M enrollment tokens.
+/// Trusted hybrid root signer authorized to issue M2M enrollment tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustAnchor {
     pub anchor_id: String,
-    pub signing_pub: [u8; 32],
+    pub signing_pub: HybridSigningPublicKey,
     pub state: AnchorState,
 }
 
@@ -128,21 +131,18 @@ impl Roster {
         host_id: String,
         name: String,
         static_pub: [u8; 32],
-        signing_pub: Option<[u8; 32]>,
+        signing_pub: Option<HybridSigningPublicKey>,
         rotation_seq: u64,
         relay_hints: Vec<String>,
     ) -> Result<&RosterEntry, CoreError> {
         if host_id.is_empty() || !is_valid_x25519_public_key(&static_pub) {
             return Err(CoreError::IncompletePin(host_id));
         }
-        if matches!(signing_pub, Some(sig) if !is_valid_ed25519_public_key(&sig)) {
-            return Err(CoreError::IncompletePin(host_id));
-        }
         if let Some(existing) = self.entries.get_mut(&host_id) {
             if existing.state == PeerState::Revoked {
                 return Err(CoreError::PeerRevoked(host_id));
             }
-            let signing_conflict = match (existing.signing_pub, signing_pub) {
+            let signing_conflict = match (&existing.signing_pub, &signing_pub) {
                 (Some(prev), Some(next)) => prev != next,
                 (Some(_), None) => true,
                 _ => false,
@@ -193,23 +193,22 @@ impl Roster {
         host_id: String,
         name: String,
         static_pub: [u8; 32],
-        signing_pub: [u8; 32],
+        signing_pub: HybridSigningPublicKey,
         rotation_seq: u64,
         pairing_sas: String,
         relay_hints: Vec<String>,
     ) -> Result<&RosterEntry, CoreError> {
-        if host_id.is_empty()
-            || !is_valid_x25519_public_key(&static_pub)
-            || !is_valid_ed25519_public_key(&signing_pub)
-        {
+        if host_id.is_empty() || !is_valid_x25519_public_key(&static_pub) {
             return Err(CoreError::IncompletePin(host_id));
         }
         if let Some(existing) = self.entries.get_mut(&host_id) {
             if existing.state == PeerState::Revoked {
                 return Err(CoreError::PeerRevoked(host_id));
             }
-            let signing_conflict =
-                matches!(existing.signing_pub, Some(prev) if prev != signing_pub);
+            let signing_conflict = existing
+                .signing_pub
+                .as_ref()
+                .is_some_and(|prev| prev != &signing_pub);
             if existing.static_pub != static_pub
                 || signing_conflict
                 || rotation_seq < existing.rotation_seq
@@ -269,7 +268,7 @@ impl Roster {
     pub fn record_pending_pair(
         &mut self,
         static_pub: [u8; 32],
-        signing_pub: Option<[u8; 32]>,
+        signing_pub: Option<HybridSigningPublicKey>,
         name: String,
         kind: String,
         pairing_sas: String,
@@ -278,9 +277,6 @@ impl Roster {
             return Err(CoreError::IncompletePin(
                 "invalid or low-order static_pub".to_string(),
             ));
-        }
-        if matches!(signing_pub, Some(sig) if !is_valid_ed25519_public_key(&sig)) {
-            return Err(CoreError::IncompletePin("invalid signing_pub".to_string()));
         }
         let id = device_id(&static_pub);
         if let Some(existing) = self.entries.get_mut(&id) {
@@ -323,24 +319,59 @@ impl Roster {
         expected_sas: Option<&str>,
         allow_skip_sas: bool,
     ) -> Result<&RosterEntry, CoreError> {
+        let (static_pub, signing_pub, device_id_str) = {
+            let entry = self
+                .entries
+                .get(peer_id)
+                .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+            if entry.state == PeerState::Revoked {
+                return Err(CoreError::PeerRevoked(peer_id.to_string()));
+            }
+            entry.require_static_pin()?;
+            if !allow_skip_sas && entry.last_pairing_sas.is_some() && expected_sas.is_none() {
+                return Err(CoreError::ProtocolViolation(
+                    "pairing SAS confirmation required",
+                ));
+            }
+            if let Some(sas) = expected_sas
+                && entry.last_pairing_sas.as_deref() != Some(sas)
+            {
+                return Err(CoreError::ProtocolViolation("pairing SAS mismatch"));
+            }
+            (
+                entry.static_pub,
+                entry.signing_pub.clone(),
+                entry.device_id.clone(),
+            )
+        };
+
+        let revoked_conflict = self.entries.iter().any(|(k, other)| {
+            k != peer_id
+                && other.state == PeerState::Revoked
+                && (other.static_pub == static_pub
+                    || other.device_id == device_id_str
+                    || matches!(
+                        (&signing_pub, &other.signing_pub),
+                        (Some(a), Some(b)) if signing_keys_share_identity(a, b)
+                    ))
+        }) || self.trust_anchors.values().any(|a| {
+            a.state == AnchorState::Revoked
+                && signing_pub
+                    .as_ref()
+                    .is_some_and(|s| signing_keys_share_identity(&a.signing_pub, s))
+        }) || self.crls.values().any(|c| {
+            c.revoked_devices
+                .iter()
+                .any(|d| d == peer_id || d == &device_id_str)
+        });
+        if revoked_conflict {
+            return Err(CoreError::PeerRevoked(peer_id.to_string()));
+        }
+
         let entry = self
             .entries
             .get_mut(peer_id)
             .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
-        if entry.state == PeerState::Revoked {
-            return Err(CoreError::PeerRevoked(peer_id.to_string()));
-        }
-        entry.require_static_pin()?;
-        if !allow_skip_sas && entry.last_pairing_sas.is_some() && expected_sas.is_none() {
-            return Err(CoreError::ProtocolViolation(
-                "pairing SAS confirmation required",
-            ));
-        }
-        if let Some(sas) = expected_sas
-            && entry.last_pairing_sas.as_deref() != Some(sas)
-        {
-            return Err(CoreError::ProtocolViolation("pairing SAS mismatch"));
-        }
         entry.state = PeerState::Active;
         Ok(&self.entries[peer_id])
     }
@@ -399,7 +430,6 @@ impl Roster {
             Capability::parse(cap)?;
         }
 
-        let signing_key = issuer.signing_key().signing_key();
         let grant = sign_grant(
             GrantUnsigned {
                 v: 1,
@@ -413,7 +443,7 @@ impl Roster {
                 uses: None,
                 machine: None,
             },
-            &signing_key,
+            issuer.signing_key(),
         )?;
         entry.grants.push(grant.clone());
         Ok(grant)
@@ -439,23 +469,24 @@ impl Roster {
     fn revoke_siblings_by_keys(
         &mut self,
         revoked_static: [u8; 32],
-        revoked_signing: Option<[u8; 32]>,
+        revoked_signing: Option<&HybridSigningPublicKey>,
     ) {
-        let has_signing = revoked_signing.is_some_and(|k| k != [0u8; 32]);
         for other in self.entries.values_mut() {
             let shares_static = revoked_static != [0u8; 32] && other.static_pub == revoked_static;
-            let shares_signing = has_signing
-                && matches!((revoked_signing, other.signing_pub), (Some(a), Some(b)) if a == b);
+            let shares_signing = revoked_signing.is_some_and(|r| {
+                other
+                    .signing_pub
+                    .as_ref()
+                    .is_some_and(|o| signing_keys_share_identity(r, o))
+            });
             if shares_static || shares_signing {
                 other.state = PeerState::Revoked;
                 other.grants.clear();
             }
         }
-        if let Some(sig) = revoked_signing
-            && has_signing
-        {
+        if let Some(sig) = revoked_signing {
             for anchor in self.trust_anchors.values_mut() {
-                if anchor.signing_pub == sig {
+                if signing_keys_share_identity(&anchor.signing_pub, sig) {
                     anchor.state = AnchorState::Revoked;
                 }
             }
@@ -472,9 +503,9 @@ impl Roster {
                 .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
             entry.state = PeerState::Revoked;
             entry.grants.clear();
-            (entry.static_pub, entry.signing_pub)
+            (entry.static_pub, entry.signing_pub.clone())
         };
-        self.revoke_siblings_by_keys(revoked_static, revoked_signing);
+        self.revoke_siblings_by_keys(revoked_static, revoked_signing.as_ref());
         Ok(())
     }
 
@@ -487,7 +518,7 @@ impl Roster {
         peer_id: &str,
         chain: &[RotationRecord],
         presented_static: &[u8; 32],
-        presented_signing: &[u8; 32],
+        presented_signing: &HybridSigningPublicKey,
     ) -> Result<u64, CoreError> {
         let (pinned_static, pinned_signing, pinned_seq) = {
             let entry = self
@@ -518,7 +549,7 @@ impl Roster {
                         .get_mut(peer_id)
                         .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
                     entry.static_pub = *presented_static;
-                    entry.signing_pub = Some(*presented_signing);
+                    entry.signing_pub = Some(presented_signing.clone());
                     entry.rotation_seq = new_seq;
                 }
                 Ok(new_seq)
@@ -527,10 +558,10 @@ impl Roster {
                 let keys = self.entries.get_mut(peer_id).map(|entry| {
                     entry.state = PeerState::Revoked;
                     entry.grants.clear();
-                    (entry.static_pub, entry.signing_pub)
+                    (entry.static_pub, entry.signing_pub.clone())
                 });
                 if let Some((revoked_static, revoked_signing)) = keys {
-                    self.revoke_siblings_by_keys(revoked_static, revoked_signing);
+                    self.revoke_siblings_by_keys(revoked_static, revoked_signing.as_ref());
                 }
                 Err(err)
             }
@@ -544,7 +575,7 @@ impl Roster {
         &mut self,
         crl: RevocationList,
         expected_issuer: &str,
-        issuer_signing_pub: &[u8; 32],
+        issuer_signing_pub: &HybridSigningPublicKey,
     ) -> Result<(), CoreError> {
         if crl.v != 1 {
             return Err(CoreError::CrlUnsupportedVersion(crl.v));
@@ -574,22 +605,22 @@ impl Roster {
             if let Some(entry) = self.entries.get_mut(revoked_id) {
                 entry.state = PeerState::Revoked;
                 entry.grants.clear();
-                revoked_keys.push((entry.static_pub, entry.signing_pub));
+                revoked_keys.push((entry.static_pub, entry.signing_pub.clone()));
             }
             for entry in self.entries.values_mut() {
                 if &entry.device_id == revoked_id {
                     entry.state = PeerState::Revoked;
                     entry.grants.clear();
-                    revoked_keys.push((entry.static_pub, entry.signing_pub));
+                    revoked_keys.push((entry.static_pub, entry.signing_pub.clone()));
                 }
             }
             if let Some(anchor) = self.trust_anchors.get_mut(revoked_id) {
                 anchor.state = AnchorState::Revoked;
-                revoked_keys.push(([0u8; 32], Some(anchor.signing_pub)));
+                revoked_keys.push(([0u8; 32], Some(anchor.signing_pub.clone())));
             }
         }
         for (revoked_static, revoked_signing) in revoked_keys {
-            self.revoke_siblings_by_keys(revoked_static, revoked_signing);
+            self.revoke_siblings_by_keys(revoked_static, revoked_signing.as_ref());
         }
 
         self.crls.insert(expected_issuer.to_string(), crl);
@@ -621,6 +652,17 @@ impl Roster {
         }
         if let Some(entry) = active {
             entry.require_static_pin()?;
+            if let Some(ref sig) = entry.signing_pub
+                && self.entries.values().any(|other| {
+                    other.state == PeerState::Revoked
+                        && other
+                            .signing_pub
+                            .as_ref()
+                            .is_some_and(|o| signing_keys_share_identity(sig, o))
+                })
+            {
+                return Err(CoreError::PeerRevoked(entry.device_id.clone()));
+            }
             return Ok(entry);
         }
         if let Some(entry) = pending {
@@ -629,10 +671,10 @@ impl Roster {
         Err(CoreError::PeerNotFound(device_id(static_pub)))
     }
 
-    /// Returns the pinned Ed25519 signing public key of an `Active` peer for grant verification,
+    /// Returns the pinned hybrid signing public key of an `Active` peer for grant verification,
     /// enforcing revocation precedence across sibling entries and ingested CRLs.
     #[must_use]
-    pub fn lookup_active_signing_key(&self, issuer_id: &str) -> Option<[u8; 32]> {
+    pub fn lookup_active_signing_key(&self, issuer_id: &str) -> Option<HybridSigningPublicKey> {
         if self.entries.iter().any(|(k, e)| {
             (k == issuer_id || e.device_id == issuer_id) && e.state == PeerState::Revoked
         }) {
@@ -647,7 +689,7 @@ impl Roster {
                     .values()
                     .find(|e| e.device_id == issuer_id && e.state == PeerState::Active)
             })?;
-        let sig_pub = entry.signing_pub.filter(is_valid_ed25519_public_key)?;
+        let sig_pub = entry.signing_pub.clone()?;
         let cand_derived_id = device_id(&entry.static_pub);
 
         let sibling_revoked = self.entries.values().any(|other| {
@@ -656,7 +698,12 @@ impl Roster {
                     || other.device_id == entry.device_id
                     || other.device_id == cand_derived_id
                     || other.static_pub == entry.static_pub
-                    || other.signing_pub == Some(sig_pub))
+                    || other
+                        .signing_pub
+                        .as_ref()
+                        .is_some_and(|o| signing_keys_share_identity(&sig_pub, o)))
+        }) || self.trust_anchors.values().any(|a| {
+            a.state == AnchorState::Revoked && signing_keys_share_identity(&a.signing_pub, &sig_pub)
         });
         if sibling_revoked {
             return None;
@@ -674,29 +721,29 @@ impl Roster {
         Some(sig_pub)
     }
 
-    /// Registers an active external Ed25519 trust anchor for autonomous M2M enrollment.
+    /// Registers an active external hybrid trust anchor for autonomous M2M enrollment.
     ///
     /// Fails closed if `anchor_id` is empty/malformed, `signing_pub` is invalid, any sibling
     /// sharing `signing_pub` (or `anchor_id`) is revoked, or an existing entry pins a differing key.
     pub fn add_trust_anchor(
         &mut self,
         anchor_id: String,
-        signing_pub: [u8; 32],
+        signing_pub: HybridSigningPublicKey,
     ) -> Result<&TrustAnchor, CoreError> {
-        if anchor_id.is_empty()
-            || anchor_id == "*"
-            || has_control_chars(&anchor_id)
-            || !is_valid_ed25519_public_key(&signing_pub)
-        {
+        if anchor_id.is_empty() || anchor_id == "*" || has_control_chars(&anchor_id) {
             return Err(CoreError::IncompletePin(anchor_id));
         }
 
         let sibling_revoked = self.trust_anchors.values().any(|a| {
             a.state == AnchorState::Revoked
-                && (a.anchor_id == anchor_id || a.signing_pub == signing_pub)
+                && (a.anchor_id == anchor_id
+                    || signing_keys_share_identity(&a.signing_pub, &signing_pub))
         }) || self.entries.values().any(|e| {
             e.state == PeerState::Revoked
-                && (e.device_id == anchor_id || e.signing_pub == Some(signing_pub))
+                && (e.device_id == anchor_id
+                    || e.signing_pub
+                        .as_ref()
+                        .is_some_and(|s| signing_keys_share_identity(s, &signing_pub)))
         }) || self
             .crls
             .values()
@@ -731,9 +778,9 @@ impl Roster {
                 .get_mut(anchor_id)
                 .ok_or_else(|| CoreError::PeerNotFound(anchor_id.to_string()))?;
             anchor.state = AnchorState::Revoked;
-            anchor.signing_pub
+            anchor.signing_pub.clone()
         };
-        self.revoke_siblings_by_keys([0u8; 32], Some(revoked_pub));
+        self.revoke_siblings_by_keys([0u8; 32], Some(&revoked_pub));
         Ok(())
     }
 
@@ -748,24 +795,28 @@ impl Roster {
         self.trust_anchors.iter()
     }
 
-    /// Returns the Ed25519 signing public key of an active trust anchor, enforcing sibling and
+    /// Returns the hybrid signing public key of an active trust anchor, enforcing sibling and
     /// CRL revocation checks.
     #[must_use]
-    pub fn lookup_active_anchor_key(&self, anchor_id: &str) -> Option<[u8; 32]> {
+    pub fn lookup_active_anchor_key(&self, anchor_id: &str) -> Option<HybridSigningPublicKey> {
         let anchor = self.trust_anchors.get(anchor_id)?;
-        if anchor.state != AnchorState::Active || !is_valid_ed25519_public_key(&anchor.signing_pub)
-        {
+        if anchor.state != AnchorState::Active {
             return None;
         }
         let sibling_anchor_revoked = self.trust_anchors.values().any(|other| {
-            other.state == AnchorState::Revoked && other.signing_pub == anchor.signing_pub
+            other.state == AnchorState::Revoked
+                && signing_keys_share_identity(&other.signing_pub, &anchor.signing_pub)
         });
         if sibling_anchor_revoked {
             return None;
         }
         let peer_revoked = self.entries.values().any(|other| {
             other.state == PeerState::Revoked
-                && (other.device_id == anchor_id || other.signing_pub == Some(anchor.signing_pub))
+                && (other.device_id == anchor_id
+                    || other
+                        .signing_pub
+                        .as_ref()
+                        .is_some_and(|s| signing_keys_share_identity(s, &anchor.signing_pub)))
         });
         if peer_revoked {
             return None;
@@ -777,7 +828,7 @@ impl Roster {
         if crl_revoked {
             return None;
         }
-        Some(anchor.signing_pub)
+        Some(anchor.signing_pub.clone())
     }
 
     /// Returns `true` if `nonce` has already been burned in an M2M enrollment claim.
@@ -834,7 +885,7 @@ impl Roster {
     pub fn record_enrolled_machine(
         &mut self,
         static_pub: [u8; 32],
-        signing_pub: [u8; 32],
+        signing_pub: HybridSigningPublicKey,
         name: String,
         kind: String,
     ) -> Result<&RosterEntry, CoreError> {
@@ -842,9 +893,6 @@ impl Roster {
             return Err(CoreError::IncompletePin(
                 "invalid or low-order static_pub".to_string(),
             ));
-        }
-        if !is_valid_ed25519_public_key(&signing_pub) {
-            return Err(CoreError::IncompletePin("invalid signing_pub".to_string()));
         }
         if name.is_empty()
             || kind.is_empty()
@@ -861,15 +909,17 @@ impl Roster {
             other.state == PeerState::Revoked
                 && (other.device_id == id
                     || other.static_pub == static_pub
-                    || other.signing_pub == Some(signing_pub))
+                    || other
+                        .signing_pub
+                        .as_ref()
+                        .is_some_and(|s| signing_keys_share_identity(s, &signing_pub)))
+        }) || self.trust_anchors.values().any(|a| {
+            a.state == AnchorState::Revoked
+                && signing_keys_share_identity(&a.signing_pub, &signing_pub)
         }) || self
-            .trust_anchors
+            .crls
             .values()
-            .any(|a| a.state == AnchorState::Revoked && a.signing_pub == signing_pub)
-            || self
-                .crls
-                .values()
-                .any(|c| c.revoked_devices.iter().any(|d| d == &id));
+            .any(|c| c.revoked_devices.iter().any(|d| d == &id));
         if sibling_or_crl_revoked {
             return Err(CoreError::PeerRevoked(id));
         }
@@ -883,8 +933,8 @@ impl Roster {
             if existing.state == PeerState::Revoked {
                 return Err(CoreError::PeerRevoked(id));
             }
-            if let Some(prev_sig) = existing.signing_pub
-                && prev_sig != signing_pub
+            if let Some(ref prev_sig) = existing.signing_pub
+                && prev_sig != &signing_pub
             {
                 return Err(CoreError::ProtocolViolation(
                     "signing_pub mismatch on existing peer",
@@ -939,9 +989,9 @@ impl Roster {
                 revoked_nonces,
                 ts: format_rfc3339_utc(now_unix)?,
             },
-            &issuer.signing_key().signing_key(),
+            issuer.signing_key(),
         )?;
-        self.ingest_crl(crl.clone(), &issuer_id, issuer.signing_key().public_bytes())?;
+        self.ingest_crl(crl.clone(), &issuer_id, issuer.signing_key().public_key())?;
         Ok(crl)
     }
 
@@ -983,13 +1033,13 @@ mod tests {
 
         let mut roster = Roster::new();
         let pub_k = *StaticKeypair::from_scalar([0x33u8; 32]).public_bytes();
-        let sig_k = *SigningKeypair::from_seed([0x44u8; 32]).public_bytes();
+        let sig_k = SigningKeypair::from_seed([0x44u8; 32]).public_key().clone();
         roster
             .insert_pinned_host(
                 "aa_revoked_host".to_string(),
                 "Revoked".to_string(),
                 pub_k,
-                Some(sig_k),
+                Some(sig_k.clone()),
                 0,
                 vec![],
             )
@@ -1019,13 +1069,13 @@ mod tests {
 
         let mut roster = Roster::new();
         let pub_k = *StaticKeypair::from_scalar([0x55u8; 32]).public_bytes();
-        let sig_k = *SigningKeypair::from_seed([0x66u8; 32]).public_bytes();
+        let sig_k = SigningKeypair::from_seed([0x66u8; 32]).public_key().clone();
         roster
             .insert_pinned_host(
                 "host-a".to_string(),
                 "Host A".to_string(),
                 pub_k,
-                Some(sig_k),
+                Some(sig_k.clone()),
                 3,
                 vec!["wss://relay1.example/v1/relay".to_string()],
             )
@@ -1059,15 +1109,29 @@ mod tests {
 
         let mut roster = Roster::new();
         let k1 = *StaticKeypair::from_scalar([0x21; 32]).public_bytes();
-        let s1 = *SigningKeypair::from_seed([0x22; 32]).public_bytes();
+        let s1 = SigningKeypair::from_seed([0x22; 32]).public_key().clone();
         let k2 = *StaticKeypair::from_scalar([0x23; 32]).public_bytes();
-        let s2 = *SigningKeypair::from_seed([0x24; 32]).public_bytes();
+        let s2 = SigningKeypair::from_seed([0x24; 32]).public_key().clone();
 
         roster
-            .insert_pinned_host("host-x".into(), "Host X".into(), k1, Some(s1), 0, vec![])
+            .insert_pinned_host(
+                "host-x".into(),
+                "Host X".into(),
+                k1,
+                Some(s1.clone()),
+                0,
+                vec![],
+            )
             .unwrap();
         assert!(matches!(
-            roster.insert_pinned_host("host-x".into(), "Evil".into(), k2, Some(s2), 0, vec![]),
+            roster.insert_pinned_host(
+                "host-x".into(),
+                "Evil".into(),
+                k2,
+                Some(s2.clone()),
+                0,
+                vec![]
+            ),
             Err(CoreError::ProtocolViolation(_))
         ));
         assert!(matches!(
@@ -1075,7 +1139,7 @@ mod tests {
                 "host-x".into(),
                 "Evil".into(),
                 k2,
-                s2,
+                s2.clone(),
                 0,
                 "evil sas1".into(),
                 vec![],
@@ -1128,66 +1192,67 @@ mod tests {
 
     #[test]
     fn rejects_weak_ed25519_keys_across_roster_pins() {
-        use crate::crypto::StaticKeypair;
+        use crate::crypto::{HYBRID_SIGNING_PUB_LEN, SigningKeypair, StaticKeypair};
 
-        let valid_static = *StaticKeypair::from_scalar([0x21; 32]).public_bytes();
-        let zero_sig = [0u8; 32];
-        let mut weak_sig = [0u8; 32];
-        weak_sig[0] = 1;
+        let valid = SigningKeypair::from_seed([0x29; 32]);
+        let mut zero_hybrid = vec![0u8; HYBRID_SIGNING_PUB_LEN];
+        zero_hybrid[32..].copy_from_slice(valid.public_key().mldsa65_bytes());
+        assert_eq!(
+            HybridSigningPublicKey::from_bytes(&zero_hybrid),
+            Err(CoreError::InvalidSignature)
+        );
 
-        assert!(!is_valid_ed25519_public_key(&zero_sig));
-        assert!(!is_valid_ed25519_public_key(&weak_sig));
+        let mut weak_hybrid = zero_hybrid;
+        weak_hybrid[0] = 1;
+        assert_eq!(
+            HybridSigningPublicKey::from_bytes(&weak_hybrid),
+            Err(CoreError::InvalidSignature)
+        );
+        assert_eq!(
+            HybridSigningPublicKey::from_bytes(&valid.public_bytes()[..32]),
+            Err(CoreError::InvalidLength {
+                expected: HYBRID_SIGNING_PUB_LEN,
+                actual: 32
+            })
+        );
 
+        // Revocation propagates across entries sharing the same 32-byte Ed25519 relay prefix.
+        let same_ed_diff_pq = SigningKeypair::from_seeds(*valid.seed_bytes(), [0x99u8; 32]);
         let mut roster = Roster::new();
-        for bad_sig in [zero_sig, weak_sig] {
-            assert!(matches!(
-                roster.insert_pinned_host(
-                    "host-bad".into(),
-                    "Bad".into(),
-                    valid_static,
-                    Some(bad_sig),
-                    0,
-                    vec![],
-                ),
-                Err(CoreError::IncompletePin(_))
-            ));
-            assert!(matches!(
-                roster.record_pending_host(
-                    "host-bad".into(),
-                    "Bad".into(),
-                    valid_static,
-                    bad_sig,
-                    0,
-                    "sas 1234".into(),
-                    vec![],
-                ),
-                Err(CoreError::IncompletePin(_))
-            ));
-            assert!(matches!(
-                roster.record_pending_pair(
-                    valid_static,
-                    Some(bad_sig),
-                    "Bad".into(),
-                    "cli".into(),
-                    "sas 1234".into(),
-                ),
-                Err(CoreError::IncompletePin(_))
-            ));
-        }
+        roster
+            .insert_pinned_host(
+                "host-a".into(),
+                "Host A".into(),
+                *StaticKeypair::from_scalar([0x21; 32]).public_bytes(),
+                Some(valid.public_key().clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        roster.revoke_peer("host-a").unwrap();
+        assert!(matches!(
+            roster.record_enrolled_machine(
+                *StaticKeypair::from_scalar([0x22; 32]).public_bytes(),
+                same_ed_diff_pq.public_key().clone(),
+                "Sibling".into(),
+                "cli".into(),
+            ),
+            Err(CoreError::PeerRevoked(_))
+        ));
     }
 
     #[test]
     fn crl_and_rotation_fork_propagate_revocation_to_sibling_entries() {
-        use crate::crypto::StaticKeypair;
+        use crate::crypto::{SigningKeypair, StaticKeypair};
         use crate::grants::{RevocationListUnsigned, sign_crl};
         use crate::identity::sign_rotation;
 
-        let root_sk = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
-        let root_pub = root_sk.verifying_key().to_bytes();
+        let root_sk = SigningKeypair::from_seed([0x11; 32]);
+        let root_pub = root_sk.public_key().clone();
 
         let alias_static = *StaticKeypair::from_scalar([0x22; 32]).public_bytes();
-        let alias_sk = ed25519_dalek::SigningKey::from_bytes(&[0x23; 32]);
-        let alias_sig = alias_sk.verifying_key().to_bytes();
+        let alias_sk = SigningKeypair::from_seed([0x23; 32]);
+        let alias_sig = alias_sk.public_key().clone();
 
         let mut roster = Roster::new();
         roster
@@ -1195,7 +1260,7 @@ mod tests {
                 "alias-a".into(),
                 "Alias A".into(),
                 alias_static,
-                Some(alias_sig),
+                Some(alias_sig.clone()),
                 0,
                 vec![],
             )
@@ -1228,14 +1293,14 @@ mod tests {
         assert_eq!(roster.get("alias-b").unwrap().state, PeerState::Revoked);
 
         let fork_static = *StaticKeypair::from_scalar([0x31; 32]).public_bytes();
-        let fork_sk = ed25519_dalek::SigningKey::from_bytes(&[0x32; 32]);
-        let fork_pub = fork_sk.verifying_key().to_bytes();
+        let fork_sk = SigningKeypair::from_seed([0x32; 32]);
+        let fork_pub = fork_sk.public_key().clone();
         roster
             .insert_pinned_host(
                 "fork-a".into(),
                 "Fork A".into(),
                 fork_static,
-                Some(fork_pub),
+                Some(fork_pub.clone()),
                 0,
                 vec![],
             )
@@ -1252,13 +1317,9 @@ mod tests {
             .unwrap();
 
         let next_stat_1 = *StaticKeypair::from_scalar([0x41; 32]).public_bytes();
-        let next_sig_1 = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
-            .verifying_key()
-            .to_bytes();
+        let next_sig_1 = SigningKeypair::from_seed([0x42; 32]).public_key().clone();
         let next_stat_2 = *StaticKeypair::from_scalar([0x51; 32]).public_bytes();
-        let next_sig_2 = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32])
-            .verifying_key()
-            .to_bytes();
+        let next_sig_2 = SigningKeypair::from_seed([0x52; 32]).public_key().clone();
         let rec1 = sign_rotation(1, &fork_sk, &next_sig_1, &next_stat_1, 1_795_133_000).unwrap();
         let rec2 = sign_rotation(1, &fork_sk, &next_sig_2, &next_stat_2, 1_795_133_001).unwrap();
 

@@ -5,19 +5,17 @@ use std::fmt;
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chacha20poly1305::aead::{AeadInPlace, KeyInit as AeadKeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
 use data_encoding::BASE32_NOPAD;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey, VerifyingKey};
+use fips203::ml_kem_768;
+use fips204::ml_dsa_65;
+use fips204::traits::{KeyGen as MlDsaKeyGen, SerDes as MlDsaSerDes, Signer as _, Verifier as _};
 use hmac::{Hmac, KeyInit, Mac};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use snow::Builder;
-use snow::params::{CipherChoice, DHChoice, HashChoice, NoiseParams};
-use snow::resolvers::{CryptoResolver, DefaultResolver};
-use snow::types::{Cipher, Dh, Hash, Random};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::error::CoreError;
 
@@ -50,6 +48,36 @@ pub const ARGON2_KEY_LEN: usize = 32;
 /// Number of leading handshake-hash bytes used as the Argon2id salt.
 pub const SALT_LEN: usize = 16;
 
+/// Byte length of an Ed25519 verifying public key.
+pub const ED25519_PUBLIC_LEN: usize = 32;
+
+/// Byte length of an Ed25519 signature.
+pub const ED25519_SIG_LEN: usize = 64;
+
+/// Byte length of an ML-DSA-65 public key.
+pub const MLDSA65_PUBLIC_LEN: usize = ml_dsa_65::PK_LEN;
+
+/// Byte length of an ML-DSA-65 signature.
+pub const MLDSA65_SIG_LEN: usize = ml_dsa_65::SIG_LEN;
+
+/// Byte length of a concatenated `Ed25519 || ML-DSA-65` hybrid signing public key (`1984`).
+pub const HYBRID_SIGNING_PUB_LEN: usize = ED25519_PUBLIC_LEN + MLDSA65_PUBLIC_LEN;
+
+/// Byte length of a concatenated `Ed25519 || ML-DSA-65` hybrid signature (`3373`).
+pub const HYBRID_SIG_LEN: usize = ED25519_SIG_LEN + MLDSA65_SIG_LEN;
+
+/// Byte length of the SHA-256 hash of a [`HybridSigningPublicKey`].
+pub const HYBRID_SIGNING_HASH_LEN: usize = 32;
+
+/// Byte length of an ML-KEM-768 encapsulation key (`1184`).
+pub const MLKEM768_EK_LEN: usize = ml_kem_768::EK_LEN;
+
+/// Byte length of an ML-KEM-768 ciphertext (`1088`).
+pub const MLKEM768_CT_LEN: usize = ml_kem_768::CT_LEN;
+
+/// FIPS 204 ML-DSA-65 context string binding all Tendril hybrid signatures.
+pub const HYBRID_MLDSA_CTX: &[u8] = b"tendril-hybrid-v1";
+
 /// Encodes arbitrary bytes as unpadded URL-safe base64 (RFC 4648 Section 5).
 #[must_use]
 pub fn b64url_encode(bytes: &[u8]) -> String {
@@ -71,6 +99,19 @@ pub fn b64url_decode_array<const N: usize>(encoded: &str) -> Result<[u8; N], Cor
         expected: N,
         actual,
     })
+}
+
+/// Decodes unpadded URL-safe base64 into a heap-boxed fixed byte array.
+pub fn b64url_decode_boxed<const N: usize>(encoded: &str) -> Result<Box<[u8; N]>, CoreError> {
+    let bytes = b64url_decode(encoded)?;
+    let actual = bytes.len();
+    bytes
+        .into_boxed_slice()
+        .try_into()
+        .map_err(|_| CoreError::InvalidLength {
+            expected: N,
+            actual,
+        })
 }
 
 /// Derives the X25519 public key from a raw 32-byte private scalar.
@@ -95,217 +136,134 @@ pub fn is_valid_ed25519_public_key(pub_bytes: &[u8; 32]) -> bool {
         && VerifyingKey::from_bytes(pub_bytes).is_ok_and(|vk| !vk.is_weak())
 }
 
-#[derive(Default, Zeroize, ZeroizeOnDrop)]
-struct ZeroizingCurve25519Dh {
-    privkey: [u8; 32],
-    #[zeroize(skip)]
-    pubkey: [u8; 32],
-}
+/// Concatenated `Ed25519 (32 B) || ML-DSA-65 (1952 B)` hybrid signing public key (`1984` B).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HybridSigningPublicKey(Box<[u8; HYBRID_SIGNING_PUB_LEN]>);
 
-impl Dh for ZeroizingCurve25519Dh {
-    fn name(&self) -> &'static str {
-        "25519"
+impl HybridSigningPublicKey {
+    /// Parses and validates a 1984-byte `Ed25519 || ML-DSA-65` public key slice.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CoreError> {
+        let actual = bytes.len();
+        let boxed: Box<[u8; HYBRID_SIGNING_PUB_LEN]> = bytes
+            .to_vec()
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| CoreError::InvalidLength {
+                expected: HYBRID_SIGNING_PUB_LEN,
+                actual,
+            })?;
+        Self::from_boxed(boxed)
     }
 
-    fn pub_len(&self) -> usize {
-        32
+    /// Parses and validates a heap-boxed `1984`-byte `Ed25519 || ML-DSA-65` public key.
+    pub fn from_boxed(bytes: Box<[u8; HYBRID_SIGNING_PUB_LEN]>) -> Result<Self, CoreError> {
+        let mut ed = [0u8; ED25519_PUBLIC_LEN];
+        ed.copy_from_slice(&bytes[..ED25519_PUBLIC_LEN]);
+        if !is_valid_ed25519_public_key(&ed) {
+            return Err(CoreError::InvalidSignature);
+        }
+        let mut mldsa = [0u8; MLDSA65_PUBLIC_LEN];
+        mldsa.copy_from_slice(&bytes[ED25519_PUBLIC_LEN..]);
+        ml_dsa_65::PublicKey::try_from_bytes(mldsa).map_err(|_| CoreError::InvalidSignature)?;
+        Ok(Self(bytes))
     }
 
-    fn priv_len(&self) -> usize {
-        32
+    /// Parses and validates a URL-safe unpadded base64 hybrid signing public key.
+    pub fn from_b64url(encoded: &str) -> Result<Self, CoreError> {
+        let boxed = b64url_decode_boxed::<HYBRID_SIGNING_PUB_LEN>(encoded)?;
+        Self::from_boxed(boxed)
     }
 
-    fn set(&mut self, privkey: &[u8]) {
-        self.privkey.zeroize();
-        let take = privkey.len().min(32);
-        self.privkey[..take].copy_from_slice(&privkey[..take]);
-        self.pubkey = x25519_public_from_scalar(&self.privkey);
+    /// Encodes the full 1984-byte hybrid public key as URL-safe unpadded base64.
+    #[must_use]
+    pub fn to_b64url(&self) -> String {
+        b64url_encode(&self.0[..])
     }
 
-    fn generate(&mut self, rng: &mut dyn Random) -> Result<(), snow::Error> {
-        let mut bytes = Zeroizing::new([0u8; 32]);
-        rng.try_fill_bytes(&mut *bytes)?;
-        self.set(&*bytes);
+    /// Returns the raw 1984-byte `Ed25519 || ML-DSA-65` slice.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; HYBRID_SIGNING_PUB_LEN] {
+        &self.0
+    }
+
+    /// Returns the 32-byte Ed25519 verifying key prefix (also used as relay control `relay_pub`).
+    #[must_use]
+    pub fn ed25519_bytes(&self) -> &[u8; ED25519_PUBLIC_LEN] {
+        self.0[..ED25519_PUBLIC_LEN]
+            .try_into()
+            .expect("32-byte Ed25519 prefix")
+    }
+
+    /// Returns the 1952-byte ML-DSA-65 public key suffix.
+    #[must_use]
+    pub fn mldsa65_bytes(&self) -> &[u8; MLDSA65_PUBLIC_LEN] {
+        self.0[ED25519_PUBLIC_LEN..]
+            .try_into()
+            .expect("1952-byte ML-DSA-65 suffix")
+    }
+
+    /// Computes `SHA-256(Ed25519 || ML-DSA-65)` used for QR `sh=` hash pinning.
+    #[must_use]
+    pub fn sha256_hash(&self) -> [u8; HYBRID_SIGNING_HASH_LEN] {
+        Sha256::digest(&self.0[..]).into()
+    }
+
+    /// Verifies a `3373`-byte `Ed25519 || ML-DSA-65` hybrid signature; BOTH components must pass.
+    pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), CoreError> {
+        if signature.len() != HYBRID_SIG_LEN {
+            return Err(CoreError::InvalidSignature);
+        }
+        let ed_vk = VerifyingKey::from_bytes(self.ed25519_bytes())
+            .map_err(|_| CoreError::InvalidSignature)?;
+        let ed_sig = Ed25519Signature::from_slice(&signature[..ED25519_SIG_LEN])
+            .map_err(|_| CoreError::InvalidSignature)?;
+        ed_vk
+            .verify_strict(message, &ed_sig)
+            .map_err(|_| CoreError::InvalidSignature)?;
+
+        let mldsa_pk = ml_dsa_65::PublicKey::try_from_bytes(*self.mldsa65_bytes())
+            .map_err(|_| CoreError::InvalidSignature)?;
+        let mldsa_sig: [u8; MLDSA65_SIG_LEN] = signature[ED25519_SIG_LEN..]
+            .try_into()
+            .map_err(|_| CoreError::InvalidSignature)?;
+        if !mldsa_pk.verify(message, &mldsa_sig, HYBRID_MLDSA_CTX) {
+            return Err(CoreError::InvalidSignature);
+        }
         Ok(())
     }
+}
 
-    fn pubkey(&self) -> &[u8] {
-        &self.pubkey
-    }
-
-    fn privkey(&self) -> &[u8] {
-        &self.privkey
-    }
-
-    fn dh(&self, pubkey: &[u8], out: &mut [u8]) -> Result<(), snow::Error> {
-        if pubkey.len() < 32 || out.len() < 32 {
-            return Err(snow::Error::Input);
-        }
-        let mut peer_bytes = [0u8; 32];
-        peer_bytes.copy_from_slice(&pubkey[..32]);
-        let secret = X25519StaticSecret::from(self.privkey);
-        let shared = secret.diffie_hellman(&X25519PublicKey::from(peer_bytes));
-        if !shared.was_contributory() || bool::from(shared.as_bytes().ct_eq(&[0u8; 32])) {
-            out[..32].zeroize();
-            return Err(snow::Error::Dh);
-        }
-        out[..32].copy_from_slice(shared.as_bytes());
-        Ok(())
-    }
-
-    fn dh_len(&self) -> usize {
-        32
+impl fmt::Debug for HybridSigningPublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HybridSigningPublicKey")
+            .field("hash", &b64url_encode(&self.sha256_hash()))
+            .finish()
     }
 }
 
-#[derive(Default, Zeroize, ZeroizeOnDrop)]
-struct ZeroizingChaChaPoly {
-    key: [u8; 32],
-}
-
-impl Cipher for ZeroizingChaChaPoly {
-    fn name(&self) -> &'static str {
-        "ChaChaPoly"
-    }
-
-    fn set(&mut self, key: &[u8; 32]) {
-        self.key.zeroize();
-        self.key.copy_from_slice(key);
-    }
-
-    fn encrypt(&self, nonce: u64, authtext: &[u8], plaintext: &[u8], out: &mut [u8]) -> usize {
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..].copy_from_slice(&nonce.to_le_bytes());
-        out[..plaintext.len()].copy_from_slice(plaintext);
-        let aead = ChaCha20Poly1305::new((&self.key).into());
-        let tag = aead
-            .encrypt_in_place_detached(
-                Nonce::from_slice(&nonce_bytes),
-                authtext,
-                &mut out[..plaintext.len()],
-            )
-            .expect("ChaChaPoly encryption within Noise frame bounds");
-        out[plaintext.len()..plaintext.len() + 16].copy_from_slice(tag.as_slice());
-        plaintext.len() + tag.len()
-    }
-
-    fn decrypt(
-        &self,
-        nonce: u64,
-        authtext: &[u8],
-        ciphertext: &[u8],
-        out: &mut [u8],
-    ) -> Result<usize, snow::Error> {
-        let Some(msg_len) = ciphertext.len().checked_sub(16) else {
-            return Err(snow::Error::Decrypt);
-        };
-        if out.len() < msg_len {
-            return Err(snow::Error::Input);
-        }
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..].copy_from_slice(&nonce.to_le_bytes());
-        out[..msg_len].copy_from_slice(&ciphertext[..msg_len]);
-        let aead = ChaCha20Poly1305::new((&self.key).into());
-        if aead
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&nonce_bytes),
-                authtext,
-                &mut out[..msg_len],
-                Tag::from_slice(&ciphertext[msg_len..]),
-            )
-            .is_err()
-        {
-            out[..msg_len].zeroize();
-            return Err(snow::Error::Decrypt);
-        }
-        Ok(msg_len)
-    }
-
-    fn rekey(&mut self) {
-        let mut out = Zeroizing::new([0u8; 48]);
-        let len = self.encrypt(u64::MAX, &[], &[0u8; 32], &mut out[..]);
-        debug_assert_eq!(len, 48);
-        self.key.zeroize();
-        self.key.copy_from_slice(&out[..32]);
+impl Serialize for HybridSigningPublicKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_b64url())
     }
 }
 
-#[derive(Default)]
-struct ZeroizingSha256 {
-    hasher: Sha256,
-}
-
-impl Drop for ZeroizingSha256 {
-    fn drop(&mut self) {
-        let _: &dyn ZeroizeOnDrop = &self.hasher;
+impl<'de> Deserialize<'de> for HybridSigningPublicKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        Self::from_b64url(&encoded).map_err(serde::de::Error::custom)
     }
 }
 
-impl ZeroizeOnDrop for ZeroizingSha256 {}
-
-impl Hash for ZeroizingSha256 {
-    fn block_len(&self) -> usize {
-        64
-    }
-
-    fn hash_len(&self) -> usize {
-        32
-    }
-
-    fn name(&self) -> &'static str {
-        "SHA256"
-    }
-
-    fn reset(&mut self) {
-        self.hasher = Sha256::default();
-    }
-
-    fn input(&mut self, data: &[u8]) {
-        self.hasher.update(data);
-    }
-
-    fn result(&mut self, out: &mut [u8]) {
-        let mut digest = Zeroizing::new([0u8; 32]);
-        digest.copy_from_slice(&self.hasher.finalize_reset());
-        let take = out.len().min(32);
-        out[..take].copy_from_slice(&digest[..take]);
-        self.reset();
-    }
-}
-
-pub(crate) struct TendrilCryptoResolver;
-
-impl CryptoResolver for TendrilCryptoResolver {
-    fn resolve_rng(&self) -> Option<Box<dyn Random>> {
-        DefaultResolver.resolve_rng()
-    }
-
-    fn resolve_dh(&self, choice: &DHChoice) -> Option<Box<dyn Dh>> {
-        match choice {
-            DHChoice::Curve25519 => Some(Box::new(ZeroizingCurve25519Dh::default())),
-            _ => DefaultResolver.resolve_dh(choice),
-        }
-    }
-
-    fn resolve_hash(&self, choice: &HashChoice) -> Option<Box<dyn Hash>> {
-        match choice {
-            HashChoice::SHA256 => Some(Box::new(ZeroizingSha256::default())),
-            _ => DefaultResolver.resolve_hash(choice),
-        }
-    }
-
-    fn resolve_cipher(&self, choice: &CipherChoice) -> Option<Box<dyn Cipher>> {
-        match choice {
-            CipherChoice::ChaChaPoly => Some(Box::new(ZeroizingChaChaPoly::default())),
-            _ => DefaultResolver.resolve_cipher(choice),
-        }
-    }
-}
-
-/// Builds a `snow` handshake builder enforcing RFC 7748 contributory DH and zeroizing primitives.
+/// Validates and decodes a raw byte slice as a [`HybridSigningPublicKey`].
 #[must_use]
-pub(crate) fn new_noise_builder(params: NoiseParams) -> Builder<'static> {
-    Builder::with_resolver(params, Box::new(TendrilCryptoResolver))
+pub fn is_valid_hybrid_signing_public_key(bytes: &[u8]) -> bool {
+    HybridSigningPublicKey::from_bytes(bytes).is_ok()
+}
+
+/// Computes `SHA-256` of a 1984-byte [`HybridSigningPublicKey`].
+#[must_use]
+pub fn signing_key_hash(key: &HybridSigningPublicKey) -> [u8; HYBRID_SIGNING_HASH_LEN] {
+    key.sha256_hash()
 }
 
 /// Derives the canonical `device_id` (`"dev_" + hex_lower(SHA-256(static_pub)[..8])`).
@@ -494,55 +452,126 @@ impl fmt::Debug for StaticKeypair {
     }
 }
 
-/// Ed25519 signing keypair whose seed is zeroized on drop and redacted from `Debug`.
+/// Hybrid `Ed25519 + ML-DSA-65` signing keypair whose seeds are zeroized on drop.
 #[derive(Clone)]
 pub struct SigningKeypair {
-    seed: Zeroizing<[u8; 32]>,
-    public: [u8; 32],
+    ed25519_seed: Zeroizing<[u8; 32]>,
+    mldsa_seed: Zeroizing<[u8; 32]>,
+    public: HybridSigningPublicKey,
 }
 
 impl SigningKeypair {
-    /// Generates a fresh Ed25519 signing keypair using the platform CSPRNG.
+    /// Generates a fresh hybrid signing keypair using independent OS CSPRNG entropy.
     pub fn generate() -> Result<Self, CoreError> {
-        let seed = random_bytes::<32>()?;
-        Ok(Self::from_seed(seed))
+        let ed_seed = Zeroizing::new(random_bytes::<32>()?);
+        let mldsa_seed = Zeroizing::new(random_bytes::<32>()?);
+        Ok(Self::from_seeds(*ed_seed, *mldsa_seed))
     }
 
-    /// Constructs a signing keypair from an existing 32-byte Ed25519 seed.
+    /// Constructs a hybrid signing keypair from independent 32-byte Ed25519 and ML-DSA-65 seeds.
     #[must_use]
-    pub fn from_seed(seed: [u8; 32]) -> Self {
-        let sk = SigningKey::from_bytes(&seed);
-        let public = sk.verifying_key().to_bytes();
+    pub fn from_seeds(ed25519_seed: [u8; 32], mldsa_seed: [u8; 32]) -> Self {
+        let ed_sk = SigningKey::from_bytes(&ed25519_seed);
+        let ed_pub = ed_sk.verifying_key().to_bytes();
+        let (mldsa_pk, _mldsa_sk) = ml_dsa_65::KG::keygen_from_seed(&mldsa_seed);
+        let mldsa_pub = mldsa_pk.into_bytes();
+
+        let mut combined = Box::new([0u8; HYBRID_SIGNING_PUB_LEN]);
+        combined[..ED25519_PUBLIC_LEN].copy_from_slice(&ed_pub);
+        combined[ED25519_PUBLIC_LEN..].copy_from_slice(&mldsa_pub);
         Self {
-            seed: Zeroizing::new(seed),
-            public,
+            ed25519_seed: Zeroizing::new(ed25519_seed),
+            mldsa_seed: Zeroizing::new(mldsa_seed),
+            public: HybridSigningPublicKey(combined),
         }
     }
 
-    /// Builds an `ed25519_dalek::SigningKey` from the zeroizing seed.
+    /// Deterministic single-seed constructor for tests and fixtures.
+    ///
+    /// Production identities MUST use [`SigningKeypair::generate`] or [`SigningKeypair::from_seeds`].
     #[must_use]
-    pub fn signing_key(&self) -> SigningKey {
-        SigningKey::from_bytes(&self.seed)
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tendril-test-mldsa65-seed-v1");
+        hasher.update(seed);
+        let mldsa_seed: [u8; 32] = hasher.finalize().into();
+        Self::from_seeds(seed, mldsa_seed)
+    }
+
+    /// Builds the `ed25519_dalek::SigningKey` strictly for untrusted relay control authentication.
+    #[must_use]
+    pub fn ed25519_signing_key(&self) -> SigningKey {
+        SigningKey::from_bytes(&self.ed25519_seed)
     }
 
     /// Returns the 32-byte Ed25519 signing seed.
     #[must_use]
     pub fn seed_bytes(&self) -> &[u8; 32] {
-        &self.seed
+        &self.ed25519_seed
     }
 
-    /// Returns the 32-byte Ed25519 verifying public key.
+    /// Returns the 32-byte ML-DSA-65 seed `xi`.
     #[must_use]
-    pub const fn public_bytes(&self) -> &[u8; 32] {
+    pub fn mldsa_seed_bytes(&self) -> &[u8; 32] {
+        &self.mldsa_seed
+    }
+
+    /// Returns the full 1984-byte [`HybridSigningPublicKey`].
+    #[must_use]
+    pub const fn public_key(&self) -> &HybridSigningPublicKey {
         &self.public
+    }
+
+    /// Returns the full 1984-byte `Ed25519 || ML-DSA-65` public key bytes.
+    #[must_use]
+    pub fn public_bytes(&self) -> &[u8; HYBRID_SIGNING_PUB_LEN] {
+        self.public.as_bytes()
+    }
+
+    /// Returns the 32-byte Ed25519 verifying key prefix (used as relay control `relay_pub`).
+    #[must_use]
+    pub fn ed25519_public_bytes(&self) -> &[u8; ED25519_PUBLIC_LEN] {
+        self.public.ed25519_bytes()
+    }
+
+    /// Returns the SHA-256 hash of the 1984-byte [`HybridSigningPublicKey`].
+    #[must_use]
+    pub fn signing_pub_hash(&self) -> [u8; HYBRID_SIGNING_HASH_LEN] {
+        self.public.sha256_hash()
+    }
+
+    /// Signs `message` with hedged randomness (`Ed25519 || ML-DSA-65`, `3373` bytes).
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CoreError> {
+        let hedging = Zeroizing::new(random_bytes::<32>()?);
+        self.sign_with_mldsa_rnd(message, &hedging)
+    }
+
+    /// Deterministically signs `message` (`Ed25519 || ML-DSA-65` with zero ML-DSA hedging seed).
+    pub fn sign_deterministic(&self, message: &[u8]) -> Result<Vec<u8>, CoreError> {
+        self.sign_with_mldsa_rnd(message, &[0u8; 32])
+    }
+
+    fn sign_with_mldsa_rnd(&self, message: &[u8], rnd: &[u8; 32]) -> Result<Vec<u8>, CoreError> {
+        let ed_sk = SigningKey::from_bytes(&self.ed25519_seed);
+        let ed_sig = ed_sk.sign(message);
+
+        let (_pk, mldsa_sk) = ml_dsa_65::KG::keygen_from_seed(&self.mldsa_seed);
+        let mldsa_sig = mldsa_sk
+            .try_sign_with_seed(rnd, message, HYBRID_MLDSA_CTX)
+            .map_err(|_| CoreError::InvalidSignature)?;
+
+        let mut out = Vec::with_capacity(HYBRID_SIG_LEN);
+        out.extend_from_slice(&ed_sig.to_bytes());
+        out.extend_from_slice(&mldsa_sig);
+        Ok(out)
     }
 }
 
 impl fmt::Debug for SigningKeypair {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SigningKeypair")
-            .field("public", &b64url_encode(&self.public))
-            .field("seed", &"<redacted>")
+            .field("public_hash", &b64url_encode(&self.signing_pub_hash()))
+            .field("seeds", &"<redacted>")
             .finish()
     }
 }
@@ -597,5 +626,34 @@ mod tests {
             hex::encode(*okm3),
             "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d"
         );
+    }
+
+    #[test]
+    fn hybrid_signing_and_half_tamper_rejection() {
+        let kp = SigningKeypair::from_seeds([0x11; 32], [0x22; 32]);
+        assert_eq!(kp.public_bytes().len(), HYBRID_SIGNING_PUB_LEN);
+        assert_eq!(kp.ed25519_public_bytes(), &kp.public_bytes()[..32]);
+
+        let sig = kp.sign_deterministic(b"tendril-hybrid-msg").unwrap();
+        assert_eq!(sig.len(), HYBRID_SIG_LEN);
+        kp.public_key().verify(b"tendril-hybrid-msg", &sig).unwrap();
+
+        let mut bad_ed = sig.clone();
+        bad_ed[0] ^= 0x01;
+        assert_eq!(
+            kp.public_key().verify(b"tendril-hybrid-msg", &bad_ed),
+            Err(CoreError::InvalidSignature)
+        );
+
+        let mut bad_mldsa = sig.clone();
+        bad_mldsa[ED25519_SIG_LEN + 10] ^= 0x01;
+        assert_eq!(
+            kp.public_key().verify(b"tendril-hybrid-msg", &bad_mldsa),
+            Err(CoreError::InvalidSignature)
+        );
+
+        let json = serde_json::to_string(kp.public_key()).unwrap();
+        let parsed: HybridSigningPublicKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(&parsed, kp.public_key());
     }
 }

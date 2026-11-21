@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod error;
 pub mod grants;
 pub mod identity;
+pub mod noise;
 pub mod pairing;
 pub mod policy;
 pub mod roster;

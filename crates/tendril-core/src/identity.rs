@@ -2,12 +2,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::crypto::{
-    P2P_IDENTITY_HKDF_LABEL, SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode,
-    hkdf_sha256_32, is_valid_ed25519_public_key, is_valid_x25519_public_key,
+    HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey,
+    P2P_IDENTITY_HKDF_LABEL, SigningKeypair, StaticKeypair, b64url_decode, b64url_decode_array,
+    b64url_encode, hkdf_sha256_32, is_valid_x25519_public_key,
 };
 use crate::error::CoreError;
 use zeroize::Zeroizing;
@@ -15,13 +16,32 @@ use zeroize::Zeroizing;
 /// 15-byte domain separator prefix for binary `RotationRecord` signatures.
 pub const ROTATION_DOMAIN: &[u8] = b"tendril-rot-v1\0";
 
-/// Total byte length of the binary payload signed inside [`RotationRecord`].
-pub const ROTATION_SIGNED_LEN: usize = 15 + 8 + 32 + 32 + 32 + 8;
+/// Total byte length of the binary payload signed inside [`RotationRecord`] (`4031` bytes).
+pub const ROTATION_SIGNED_LEN: usize =
+    15 + 8 + HYBRID_SIGNING_PUB_LEN + HYBRID_SIGNING_PUB_LEN + 32 + 8;
+
+/// Out-of-band pin over either a full 1984-byte signing public key or its 32-byte SHA-256 hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningKeyPin {
+    Full(HybridSigningPublicKey),
+    Hash([u8; HYBRID_SIGNING_HASH_LEN]),
+}
+
+impl SigningKeyPin {
+    /// Checks in constant time whether `key` matches this pin.
+    #[must_use]
+    pub fn matches(&self, key: &HybridSigningPublicKey) -> bool {
+        match self {
+            Self::Full(pinned) => bool::from(pinned.as_bytes().ct_eq(key.as_bytes())),
+            Self::Hash(hash) => bool::from(key.sha256_hash().ct_eq(hash)),
+        }
+    }
+}
 
 /// Maximum formatted UTC timestamp supported (`9999-12-31T23:59:59Z`).
 const MAX_UNIX_SECS: u64 = 253_402_300_799;
 
-/// Local endpoint identity combining X25519 static keys, Ed25519 signing keys, and
+/// Local endpoint identity combining X25519 static keys, hybrid signing keys, and
 /// signed rotation history.
 #[derive(Debug, Clone)]
 pub struct EndpointIdentity {
@@ -64,9 +84,7 @@ impl EndpointIdentity {
         if host_id.is_empty() {
             return Err(CoreError::IncompletePin("empty host_id".to_string()));
         }
-        if !is_valid_x25519_public_key(static_key.public_bytes())
-            || !is_valid_ed25519_public_key(signing_key.public_bytes())
-        {
+        if !is_valid_x25519_public_key(static_key.public_bytes()) {
             return Err(CoreError::IncompletePin(
                 "invalid or low-order public key".to_string(),
             ));
@@ -82,15 +100,15 @@ impl EndpointIdentity {
                     got: rotation_chain[0].seq,
                 });
             }
-            let genesis_signing: [u8; 32] =
-                b64url_decode_array(&rotation_chain[0].prev_signing_pub)?;
+            let genesis_signing =
+                HybridSigningPublicKey::from_b64url(&rotation_chain[0].prev_signing_pub)?;
             let final_seq = verify_rotation_chain(
                 &genesis_signing,
                 &[0u8; 32],
                 0,
                 &rotation_chain,
                 static_key.public_bytes(),
-                signing_key.public_bytes(),
+                signing_key.public_key(),
             )?;
             if final_seq != rotation_seq {
                 return Err(CoreError::RotationNonContiguous);
@@ -130,7 +148,7 @@ impl EndpointIdentity {
         &self.static_key
     }
 
-    /// Returns the active Ed25519 signing keypair.
+    /// Returns the active hybrid signing keypair.
     #[must_use]
     pub const fn signing_key(&self) -> &SigningKeypair {
         &self.signing_key
@@ -168,11 +186,10 @@ impl EndpointIdentity {
             .rotation_seq
             .checked_add(1)
             .ok_or(CoreError::RotationNonContiguous)?;
-        let outgoing = self.signing_key.signing_key();
         let rec = sign_rotation(
             next_seq,
-            &outgoing,
-            new_signing.public_bytes(),
+            &self.signing_key,
+            new_signing.public_key(),
             new_static.public_bytes(),
             now_unix,
         )?;
@@ -200,45 +217,81 @@ pub struct RotationRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedRotation {
     pub seq: u64,
-    pub prev_signing_pub: [u8; 32],
-    pub new_signing_pub: [u8; 32],
+    pub prev_signing_pub: HybridSigningPublicKey,
+    pub new_signing_pub: HybridSigningPublicKey,
     pub new_static_pub: [u8; 32],
     pub ts_unix: u64,
 }
 
 #[derive(PartialEq, Eq)]
 struct ForkOutcome {
-    new_signing_pub: [u8; 32],
+    new_signing_pub: HybridSigningPublicKey,
     new_static_pub: [u8; 32],
     ts_unix: u64,
 }
 
-/// Builds the exact 127-byte binary payload signed by the outgoing signing key.
+/// Builds the exact 4031-byte binary payload signed by the outgoing hybrid signing key.
 #[must_use]
 pub fn rotation_signed_bytes(
     seq: u64,
-    prev_signing_pub: &[u8; 32],
-    new_signing_pub: &[u8; 32],
+    prev_signing_pub: &HybridSigningPublicKey,
+    new_signing_pub: &HybridSigningPublicKey,
     new_static_pub: &[u8; 32],
     ts_unix: u64,
-) -> [u8; ROTATION_SIGNED_LEN] {
-    let mut out = [0u8; ROTATION_SIGNED_LEN];
-    out[0..15].copy_from_slice(ROTATION_DOMAIN);
-    out[15..23].copy_from_slice(&seq.to_be_bytes());
-    out[23..55].copy_from_slice(prev_signing_pub);
-    out[55..87].copy_from_slice(new_signing_pub);
-    out[87..119].copy_from_slice(new_static_pub);
-    out[119..127].copy_from_slice(&ts_unix.to_be_bytes());
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ROTATION_SIGNED_LEN);
+    out.extend_from_slice(ROTATION_DOMAIN);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(prev_signing_pub.as_bytes());
+    out.extend_from_slice(new_signing_pub.as_bytes());
+    out.extend_from_slice(new_static_pub);
+    out.extend_from_slice(&ts_unix.to_be_bytes());
     out
 }
 
-/// Signs a new [`RotationRecord`] using `prev_signing` over the 127-byte binary payload.
+/// Signs a new [`RotationRecord`] using `prev_signing` over the 4031-byte binary payload.
 pub fn sign_rotation(
     seq: u64,
-    prev_signing: &SigningKey,
-    new_signing_pub: &[u8; 32],
+    prev_signing: &SigningKeypair,
+    new_signing_pub: &HybridSigningPublicKey,
     new_static_pub: &[u8; 32],
     ts_unix: u64,
+) -> Result<RotationRecord, CoreError> {
+    sign_rotation_impl(
+        seq,
+        prev_signing,
+        new_signing_pub,
+        new_static_pub,
+        ts_unix,
+        false,
+    )
+}
+
+/// Deterministically signs a [`RotationRecord`] for reproducible test vectors.
+pub fn sign_rotation_deterministic(
+    seq: u64,
+    prev_signing: &SigningKeypair,
+    new_signing_pub: &HybridSigningPublicKey,
+    new_static_pub: &[u8; 32],
+    ts_unix: u64,
+) -> Result<RotationRecord, CoreError> {
+    sign_rotation_impl(
+        seq,
+        prev_signing,
+        new_signing_pub,
+        new_static_pub,
+        ts_unix,
+        true,
+    )
+}
+
+fn sign_rotation_impl(
+    seq: u64,
+    prev_signing: &SigningKeypair,
+    new_signing_pub: &HybridSigningPublicKey,
+    new_static_pub: &[u8; 32],
+    ts_unix: u64,
+    deterministic: bool,
 ) -> Result<RotationRecord, CoreError> {
     if seq == 0 {
         return Err(CoreError::RotationNonMonotonicSeq {
@@ -247,16 +300,20 @@ pub fn sign_rotation(
         });
     }
     let ts = format_rfc3339_utc(ts_unix)?;
-    let prev_pub = prev_signing.verifying_key().to_bytes();
-    let payload = rotation_signed_bytes(seq, &prev_pub, new_signing_pub, new_static_pub, ts_unix);
-    let sig: Signature = prev_signing.sign(&payload);
+    let prev_pub = prev_signing.public_key();
+    let payload = rotation_signed_bytes(seq, prev_pub, new_signing_pub, new_static_pub, ts_unix);
+    let sig = if deterministic {
+        prev_signing.sign_deterministic(&payload)?
+    } else {
+        prev_signing.sign(&payload)?
+    };
     Ok(RotationRecord {
         seq,
-        prev_signing_pub: b64url_encode(&prev_pub),
-        new_signing_pub: b64url_encode(new_signing_pub),
+        prev_signing_pub: prev_pub.to_b64url(),
+        new_signing_pub: new_signing_pub.to_b64url(),
         new_static_pub: b64url_encode(new_static_pub),
         ts,
-        sig: b64url_encode(&sig.to_bytes()),
+        sig: b64url_encode(&sig),
     })
 }
 
@@ -268,23 +325,17 @@ pub fn verify_rotation_record(record: &RotationRecord) -> Result<VerifiedRotatio
             got: 0,
         });
     }
-    let prev_signing_pub: [u8; 32] = b64url_decode_array(&record.prev_signing_pub)?;
-    let new_signing_pub: [u8; 32] = b64url_decode_array(&record.new_signing_pub)?;
+    let prev_signing_pub = HybridSigningPublicKey::from_b64url(&record.prev_signing_pub)?;
+    let new_signing_pub = HybridSigningPublicKey::from_b64url(&record.new_signing_pub)?;
     let new_static_pub: [u8; 32] = b64url_decode_array(&record.new_static_pub)?;
     if !is_valid_x25519_public_key(&new_static_pub) {
         return Err(CoreError::IncompletePin(
             "invalid or low-order rotated static key".to_string(),
         ));
     }
-    if !is_valid_ed25519_public_key(&new_signing_pub) {
-        return Err(CoreError::InvalidSignature);
-    }
-    let sig_bytes: [u8; 64] = b64url_decode_array(&record.sig)?;
+    let sig_bytes = b64url_decode(&record.sig)?;
     let ts_unix = parse_rfc3339_utc(&record.ts)?;
 
-    let vk =
-        VerifyingKey::from_bytes(&prev_signing_pub).map_err(|_| CoreError::InvalidSignature)?;
-    let sig = Signature::from_bytes(&sig_bytes);
     let payload = rotation_signed_bytes(
         record.seq,
         &prev_signing_pub,
@@ -292,8 +343,7 @@ pub fn verify_rotation_record(record: &RotationRecord) -> Result<VerifiedRotatio
         &new_static_pub,
         ts_unix,
     );
-    vk.verify_strict(&payload, &sig)
-        .map_err(|_| CoreError::InvalidSignature)?;
+    prev_signing_pub.verify(&payload, &sig_bytes)?;
 
     Ok(VerifiedRotation {
         seq: record.seq,
@@ -305,16 +355,16 @@ pub fn verify_rotation_record(record: &RotationRecord) -> Result<VerifiedRotatio
 }
 
 fn detect_fork_in_verified(records: &[VerifiedRotation]) -> Result<(), CoreError> {
-    let mut by_key: HashMap<(u64, [u8; 32]), ForkOutcome> = HashMap::new();
+    let mut by_key: HashMap<(u64, HybridSigningPublicKey), ForkOutcome> = HashMap::new();
     for r in records {
         let outcome = ForkOutcome {
-            new_signing_pub: r.new_signing_pub,
+            new_signing_pub: r.new_signing_pub.clone(),
             new_static_pub: r.new_static_pub,
             ts_unix: r.ts_unix,
         };
-        if let Some(prev) = by_key.insert((r.seq, r.prev_signing_pub), outcome) {
+        if let Some(prev) = by_key.insert((r.seq, r.prev_signing_pub.clone()), outcome) {
             let cur = ForkOutcome {
-                new_signing_pub: r.new_signing_pub,
+                new_signing_pub: r.new_signing_pub.clone(),
                 new_static_pub: r.new_static_pub,
                 ts_unix: r.ts_unix,
             };
@@ -344,15 +394,34 @@ pub fn detect_rotation_fork(records: &[RotationRecord]) -> Result<(), CoreError>
 ///
 /// Returns the final verified sequence number (`pinned_seq` when `chain` is empty and keys match).
 pub fn verify_rotation_chain(
-    pinned_signing: &[u8; 32],
+    pinned_signing: &HybridSigningPublicKey,
     pinned_static: &[u8; 32],
     pinned_seq: u64,
     chain: &[RotationRecord],
     current_static: &[u8; 32],
-    current_signing: &[u8; 32],
+    current_signing: &HybridSigningPublicKey,
+) -> Result<u64, CoreError> {
+    verify_rotation_chain_pin(
+        &SigningKeyPin::Full(pinned_signing.clone()),
+        pinned_static,
+        pinned_seq,
+        chain,
+        current_static,
+        current_signing,
+    )
+}
+
+/// Verifies `chain` against either a full public-key pin or a SHA-256 [`SigningKeyPin`].
+pub fn verify_rotation_chain_pin(
+    pinned_signing: &SigningKeyPin,
+    pinned_static: &[u8; 32],
+    pinned_seq: u64,
+    chain: &[RotationRecord],
+    current_static: &[u8; 32],
+    current_signing: &HybridSigningPublicKey,
 ) -> Result<u64, CoreError> {
     if chain.is_empty() {
-        if pinned_signing == current_signing && pinned_static == current_static {
+        if pinned_signing.matches(current_signing) && pinned_static == current_static {
             return Ok(pinned_seq);
         }
         return Err(CoreError::RotationEmptyChain);
@@ -364,13 +433,21 @@ pub fn verify_rotation_chain(
     }
 
     // Only keys reachable from `pinned_signing` at `seq > pinned_seq` may trigger fork revocation.
-    let mut trusted_keys = HashSet::from([*pinned_signing]);
+    let mut trusted_keys = HashSet::new();
+    for r in &decoded {
+        if pinned_signing.matches(&r.prev_signing_pub) {
+            trusted_keys.insert(r.prev_signing_pub.clone());
+        }
+        if pinned_signing.matches(&r.new_signing_pub) {
+            trusted_keys.insert(r.new_signing_pub.clone());
+        }
+    }
     loop {
         let mut progressed = false;
         for r in &decoded {
             if r.seq > pinned_seq
                 && trusted_keys.contains(&r.prev_signing_pub)
-                && trusted_keys.insert(r.new_signing_pub)
+                && trusted_keys.insert(r.new_signing_pub.clone())
             {
                 progressed = true;
             }
@@ -386,7 +463,7 @@ pub fn verify_rotation_chain(
         .collect();
     detect_fork_in_verified(&trusted_records)?;
 
-    let mut seen_keys = HashSet::from([decoded[0].prev_signing_pub]);
+    let mut seen_keys = HashSet::from([decoded[0].prev_signing_pub.clone()]);
     for (i, r) in decoded.iter().enumerate() {
         if i > 0 {
             let prev = &decoded[i - 1];
@@ -403,17 +480,17 @@ pub fn verify_rotation_chain(
                 return Err(CoreError::RotationNonContiguous);
             }
         }
-        if !seen_keys.insert(r.new_signing_pub) {
+        if !seen_keys.insert(r.new_signing_pub.clone()) {
             return Err(CoreError::RotationNonContiguous);
         }
     }
 
     let last = decoded.last().ok_or(CoreError::RotationEmptyChain)?;
-    if &last.new_signing_pub == pinned_signing
+    if pinned_signing.matches(&last.new_signing_pub)
         && &last.new_static_pub == pinned_static
         && last.seq == pinned_seq
     {
-        if current_signing == pinned_signing && current_static == pinned_static {
+        if pinned_signing.matches(current_signing) && current_static == pinned_static {
             return Ok(pinned_seq);
         }
         return Err(CoreError::RotationEndpointMismatch);
@@ -421,7 +498,7 @@ pub fn verify_rotation_chain(
 
     let start = decoded
         .iter()
-        .position(|r| &r.prev_signing_pub == pinned_signing)
+        .position(|r| pinned_signing.matches(&r.prev_signing_pub))
         .ok_or(CoreError::RotationRootMismatch)?;
 
     let Some(expected_anchor_seq) = pinned_seq.checked_add(1) else {
@@ -547,10 +624,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
-    fn mk_keys(seed: u8) -> (SigningKey, [u8; 32], [u8; 32]) {
-        let sk = SigningKey::from_bytes(&[seed; 32]);
-        let pk = sk.verifying_key().to_bytes();
-        let stat = [seed.wrapping_add(0x40); 32];
+    fn mk_keys(seed: u8) -> (SigningKeypair, HybridSigningPublicKey, [u8; 32]) {
+        let sk = SigningKeypair::from_seed([seed; 32]);
+        let pk = sk.public_key().clone();
+        let stat = StaticKeypair::from_scalar([seed.wrapping_add(0x40); 32])
+            .public_bytes()
+            .to_owned();
         (sk, pk, stat)
     }
 
@@ -608,6 +687,22 @@ mod tests {
                 expected_min: 1,
                 got: 0
             })
+        );
+
+        let mut bad_half_rec = sign_rotation(1, &sk0, &pk1, &stat1, 1_795_132_800).unwrap();
+        let mut sig_raw = b64url_decode(&bad_half_rec.sig).unwrap();
+        sig_raw[0] ^= 0x01;
+        bad_half_rec.sig = b64url_encode(&sig_raw);
+        assert_eq!(
+            verify_rotation_record(&bad_half_rec),
+            Err(CoreError::InvalidSignature)
+        );
+        sig_raw[0] ^= 0x01;
+        sig_raw[100] ^= 0x01;
+        bad_half_rec.sig = b64url_encode(&sig_raw);
+        assert_eq!(
+            verify_rotation_record(&bad_half_rec),
+            Err(CoreError::InvalidSignature)
         );
 
         rec.seq = 2;
@@ -687,8 +782,27 @@ mod tests {
             Err(CoreError::RotationEndpointMismatch)
         );
         assert_eq!(
-            verify_rotation_chain(&pk_other, &stat0, 0, &[r1, r2], &stat2, &pk2),
+            verify_rotation_chain(
+                &pk_other,
+                &stat0,
+                0,
+                &[r1.clone(), r2.clone()],
+                &stat2,
+                &pk2
+            ),
             Err(CoreError::RotationRootMismatch)
+        );
+        assert_eq!(
+            verify_rotation_chain_pin(
+                &SigningKeyPin::Hash(pk0.sha256_hash()),
+                &stat0,
+                0,
+                &[r1, r2],
+                &stat2,
+                &pk2
+            )
+            .unwrap(),
+            2
         );
     }
 
@@ -765,7 +879,10 @@ mod tests {
         let restored_unrotated = EndpointIdentity::from_persisted(
             id.host_id().to_string(),
             StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
-            SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+            SigningKeypair::from_seeds(
+                *id.signing_key().seed_bytes(),
+                *id.signing_key().mldsa_seed_bytes(),
+            ),
             id.rotation_chain().to_vec(),
             id.rotation_seq(),
         )
@@ -790,7 +907,10 @@ mod tests {
         let restored_rotated = EndpointIdentity::from_persisted(
             id.host_id().to_string(),
             StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
-            SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+            SigningKeypair::from_seeds(
+                *id.signing_key().seed_bytes(),
+                *id.signing_key().mldsa_seed_bytes(),
+            ),
             id.rotation_chain().to_vec(),
             id.rotation_seq(),
         )
@@ -803,7 +923,10 @@ mod tests {
             EndpointIdentity::from_persisted(
                 id.host_id().to_string(),
                 StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
-                SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+                SigningKeypair::from_seeds(
+                    *id.signing_key().seed_bytes(),
+                    *id.signing_key().mldsa_seed_bytes(),
+                ),
                 id.rotation_chain().to_vec(),
                 1,
             )
@@ -813,7 +936,10 @@ mod tests {
             EndpointIdentity::from_persisted(
                 id.host_id().to_string(),
                 StaticKeypair::from_scalar([0x37; 32]),
-                SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+                SigningKeypair::from_seeds(
+                    *id.signing_key().seed_bytes(),
+                    *id.signing_key().mldsa_seed_bytes(),
+                ),
                 id.rotation_chain().to_vec(),
                 id.rotation_seq(),
             )
@@ -832,7 +958,10 @@ mod tests {
         let reloaded = EndpointIdentity::from_persisted(
             id.host_id().to_string(),
             StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
-            SigningKeypair::from_seed(*id.signing_key().seed_bytes()),
+            SigningKeypair::from_seeds(
+                *id.signing_key().seed_bytes(),
+                *id.signing_key().mldsa_seed_bytes(),
+            ),
             id.rotation_chain().to_vec(),
             id.rotation_seq(),
         )

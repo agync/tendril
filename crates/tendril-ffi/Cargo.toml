@@ -22,7 +22,6 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-snow.workspace = true
 tempfile.workspace = true
 
 [lints.rust]

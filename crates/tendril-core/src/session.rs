@@ -2,13 +2,10 @@
 
 use std::fmt;
 
-use snow::params::NoiseParams;
-use snow::{HandshakeState, TransportState};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    b64url_decode_array, device_id, has_control_chars, is_valid_x25519_public_key,
-    new_noise_builder,
+    HybridSigningPublicKey, device_id, has_control_chars, is_valid_x25519_public_key,
 };
 use crate::error::CoreError;
 use crate::grants::{
@@ -16,10 +13,11 @@ use crate::grants::{
     verify_grant_with_chain,
 };
 use crate::identity::{EndpointIdentity, RotationRecord};
+use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::roster::{PeerState, Roster};
 use crate::wire::{
-    HostHello, InnerFrameType, Intent, MAX_FRAME_LEN, NOISE_PATTERN, Preamble,
-    ResumableFrameReader, SessionHello, decode_inner_frame, encode_frame, encode_inner_frame,
+    HostHello, InnerFrameType, Intent, Preamble, ResumableFrameReader, SessionHello,
+    decode_inner_frame, encode_frame, encode_inner_frame,
 };
 
 /// Maximum encrypted transport frames sent before triggering automatic `0x04 REKEY` (`2^20`).
@@ -81,23 +79,23 @@ pub enum SessionAction {
 }
 
 enum SessionPhase {
-    Init(Box<HandshakeState>),
-    AwaitMsg2(Box<HandshakeState>),
-    AwaitPreamble(Box<HandshakeState>),
-    AwaitMsg1(Box<HandshakeState>),
-    AwaitMsg3(Box<HandshakeState>),
-    Transport(Box<TransportState>),
+    Init(Box<NoiseHfsHandshake>),
+    AwaitMsg2(Box<NoiseHfsHandshake>),
+    AwaitPreamble(Box<NoiseHfsHandshake>),
+    AwaitMsg1(Box<NoiseHfsHandshake>),
+    AwaitMsg3(Box<NoiseHfsHandshake>),
+    Transport(Box<NoiseTransport>),
     Closed,
 }
 
-/// Pure Sans-I/O `intent = session` protocol driver (`Noise_XX_25519_ChaChaPoly_SHA256`).
+/// Pure Sans-I/O `intent = session` protocol driver (`Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256`).
 pub struct SessionMachine {
     role: SessionRole,
     phase: SessionPhase,
     reader: ResumableFrameReader,
     local_host_id: String,
     local_device_id: String,
-    local_signing_pub: [u8; 32],
+    local_signing_pub: HybridSigningPublicKey,
     local_rotation_chain: Vec<RotationRecord>,
     applied_rotation: Vec<RotationRecord>,
     target_host_id: Option<String>,
@@ -140,7 +138,7 @@ impl SessionMachine {
             reader: ResumableFrameReader::new(),
             local_host_id: local_identity.host_id().to_string(),
             local_device_id: local_identity.device_id(),
-            local_signing_pub: *local_identity.signing_key().public_bytes(),
+            local_signing_pub: local_identity.signing_key().public_key().clone(),
             local_rotation_chain: local_identity.rotation_chain().to_vec(),
             applied_rotation: Vec::new(),
             target_host_id: Some(target_host_id.into()),
@@ -169,7 +167,7 @@ impl SessionMachine {
             reader: ResumableFrameReader::with_preamble(),
             local_host_id: local_identity.host_id().to_string(),
             local_device_id: local_identity.device_id(),
-            local_signing_pub: *local_identity.signing_key().public_bytes(),
+            local_signing_pub: local_identity.signing_key().public_key().clone(),
             local_rotation_chain: local_identity.rotation_chain().to_vec(),
             applied_rotation: Vec::new(),
             target_host_id: None,
@@ -237,11 +235,8 @@ impl SessionMachine {
         let SessionPhase::Init(mut hs) = prev else {
             return Err(CoreError::NotReady("initiator already started"));
         };
-        let mut msg1 = vec![0u8; MAX_FRAME_LEN];
-        let n = hs
-            .write_message(&[], &mut msg1)
-            .map_err(|err| CoreError::Noise(format!("{err}")))?;
-        let frame = encode_frame(&msg1[..n])?;
+        let msg1 = hs.write_message_vec(&[])?;
+        let frame = encode_frame(&msg1)?;
         let preamble = Preamble::v1(Intent::Session).encode();
         let mut wire_bytes = Vec::with_capacity(preamble.len() + frame.len());
         wire_bytes.extend_from_slice(&preamble);
@@ -351,7 +346,7 @@ impl SessionMachine {
             return Err(CoreError::NotReady("session not in transport mode"));
         };
         let frame = encrypt_inner(tx, InnerFrameType::Rekey, &[])?;
-        tx.rekey_outgoing();
+        tx.rekey_outgoing()?;
         self.frames_sent = 0;
         self.last_rekey_outgoing_ms = now_ms;
         Ok(vec![
@@ -528,7 +523,7 @@ impl SessionMachine {
             || now_ms.saturating_sub(self.last_rekey_outgoing_ms) >= self.rekey_max_age_ms
         {
             let rekey_frame = encrypt_inner(tx, InnerFrameType::Rekey, &[])?;
-            tx.rekey_outgoing();
+            tx.rekey_outgoing()?;
             self.frames_sent = 0;
             self.last_rekey_outgoing_ms = now_ms;
             actions.push(SessionAction::WriteBytes(rekey_frame));
@@ -557,18 +552,19 @@ impl SessionMachine {
         let phase = std::mem::replace(&mut self.phase, SessionPhase::Closed);
         match phase {
             SessionPhase::AwaitMsg2(mut hs) => {
-                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
-                let n = hs
-                    .read_message(body, &mut pt)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let host_hello: HostHello = serde_json::from_slice(&pt[..n])
-                    .map_err(|err| CoreError::Json(err.to_string()))?;
+                let pt = hs.read_message_vec(body)?;
+                let host_hello: HostHello =
+                    serde_json::from_slice(&pt).map_err(|err| CoreError::Json(err.to_string()))?;
                 if host_hello.proto_version != 1 {
                     return Err(CoreError::UnsupportedVersion(host_hello.proto_version));
                 }
                 if host_hello.host_id.is_empty() || has_control_chars(&host_hello.host_id) {
                     return Err(CoreError::ProtocolViolation("invalid host_id in HostHello"));
                 }
+                let host_signing_pub = HybridSigningPublicKey::from_b64url(&host_hello.signing_pub)
+                    .map_err(|_| {
+                        CoreError::ProtocolViolation("invalid signing_pub in HostHello")
+                    })?;
 
                 let target_id = self
                     .target_host_id
@@ -578,16 +574,13 @@ impl SessionMachine {
                     return Err(CoreError::HostKeyUnverified);
                 }
 
-                let peer_static: [u8; 32] = hs
-                    .get_remote_static()
-                    .ok_or(CoreError::HostKeyUnverified)?
-                    .try_into()
-                    .map_err(|_| CoreError::HostKeyUnverified)?;
+                let peer_static: [u8; 32] =
+                    *hs.get_remote_static().ok_or(CoreError::HostKeyUnverified)?;
                 if !is_valid_x25519_public_key(&peer_static) {
                     return Err(CoreError::HostKeyUnverified);
                 }
 
-                let (_, pinned_signing) = match roster.get(target_id) {
+                let (pinned_static, pinned_signing) = match roster.get(target_id) {
                     Some(entry) => match entry.state {
                         PeerState::Pending => {
                             return Err(CoreError::PeerPending(target_id.to_string()));
@@ -600,22 +593,18 @@ impl SessionMachine {
                     None => return Err(CoreError::HostKeyUnverified),
                 };
 
-                let presented_signing = if host_hello.rotation.is_empty() {
-                    pinned_signing
-                } else {
-                    let last = host_hello
-                        .rotation
-                        .last()
-                        .ok_or(CoreError::HostKeyUnverified)?;
-                    b64url_decode_array(&last.new_signing_pub)
-                        .map_err(|_| CoreError::HostKeyUnverified)?
-                };
+                if host_hello.rotation.is_empty()
+                    && peer_static == pinned_static
+                    && host_signing_pub != pinned_signing
+                {
+                    return Err(CoreError::HostKeyUnverified);
+                }
 
                 match roster.apply_verified_rotation(
                     target_id,
                     &host_hello.rotation,
                     &peer_static,
-                    &presented_signing,
+                    &host_signing_pub,
                 ) {
                     Ok(_) => {
                         if !host_hello.rotation.is_empty() {
@@ -639,24 +628,16 @@ impl SessionMachine {
                 let hello_json = Zeroizing::new(
                     serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
                 );
-                let mut msg3 = vec![0u8; MAX_FRAME_LEN];
-                let n3 = hs
-                    .write_message(&hello_json, &mut msg3)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let final_hash: [u8; 32] = hs
-                    .get_handshake_hash()
-                    .try_into()
-                    .map_err(|_| CoreError::Noise("unexpected handshake hash length".into()))?;
-                let tx = hs
-                    .into_transport_mode()
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
+                let msg3 = hs.write_message_vec(&hello_json)?;
+                let final_hash = *hs.get_handshake_hash();
+                let tx = hs.into_transport_mode()?;
 
                 self.peer_device_id = Some(target_id.to_string());
                 self.peer_static_pub = Some(peer_static);
                 self.last_rekey_outgoing_ms = now_ms;
                 self.phase = SessionPhase::Transport(Box::new(tx));
 
-                actions.push(SessionAction::WriteBytes(encode_frame(&msg3[..n3])?));
+                actions.push(SessionAction::WriteBytes(encode_frame(&msg3)?));
                 actions.push(SessionAction::Established {
                     peer_device_id: target_id.to_string(),
                     peer_static_pub: peer_static,
@@ -665,11 +646,8 @@ impl SessionMachine {
                 Ok(())
             }
             SessionPhase::AwaitMsg1(mut hs) => {
-                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
-                let n = hs
-                    .read_message(body, &mut pt)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                if n != 0 {
+                let pt = hs.read_message_vec(body)?;
+                if !pt.is_empty() {
                     return Err(CoreError::ProtocolViolation(
                         "msg1 must carry empty payload",
                     ));
@@ -677,38 +655,29 @@ impl SessionMachine {
                 let hello = HostHello {
                     host_id: self.local_host_id.clone(),
                     proto_version: 1,
+                    signing_pub: self.local_signing_pub.to_b64url(),
                     rotation: self.local_rotation_chain.clone(),
                 };
                 let hello_json = Zeroizing::new(
                     serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
                 );
-                let mut msg2 = vec![0u8; MAX_FRAME_LEN];
-                let n2 = hs
-                    .write_message(&hello_json, &mut msg2)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                actions.push(SessionAction::WriteBytes(encode_frame(&msg2[..n2])?));
+                let msg2 = hs.write_message_vec(&hello_json)?;
+                actions.push(SessionAction::WriteBytes(encode_frame(&msg2)?));
                 self.phase = SessionPhase::AwaitMsg3(hs);
                 Ok(())
             }
             SessionPhase::AwaitMsg3(mut hs) => {
-                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
-                let n = hs
-                    .read_message(body, &mut pt)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let peer_static: [u8; 32] = hs
-                    .get_remote_static()
-                    .ok_or(CoreError::ProtocolViolation(
-                        "missing initiator static key in msg3",
-                    ))?
-                    .try_into()
-                    .map_err(|_| CoreError::ProtocolViolation("invalid initiator static length"))?;
+                let pt = hs.read_message_vec(body)?;
+                let peer_static: [u8; 32] = *hs.get_remote_static().ok_or(
+                    CoreError::ProtocolViolation("missing initiator static key in msg3"),
+                )?;
                 if !is_valid_x25519_public_key(&peer_static) {
                     return Err(CoreError::ProtocolViolation(
                         "invalid or low-order initiator static key",
                     ));
                 }
-                let hello: SessionHello = serde_json::from_slice(&pt[..n])
-                    .map_err(|err| CoreError::Json(err.to_string()))?;
+                let hello: SessionHello =
+                    serde_json::from_slice(&pt).map_err(|err| CoreError::Json(err.to_string()))?;
                 if hello.device_id != device_id(&peer_static) {
                     return Err(CoreError::ProtocolViolation(
                         "SessionHello device_id does not match static key",
@@ -738,13 +707,8 @@ impl SessionMachine {
                     self.active_grant = Some(grant.clone());
                 }
 
-                let final_hash: [u8; 32] = hs
-                    .get_handshake_hash()
-                    .try_into()
-                    .map_err(|_| CoreError::Noise("unexpected handshake hash length".into()))?;
-                let tx = hs
-                    .into_transport_mode()
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
+                let final_hash = *hs.get_handshake_hash();
+                let tx = hs.into_transport_mode()?;
 
                 self.peer_crl_seq = hello.crl_seq;
                 self.peer_device_id = Some(canonical_peer_id.clone());
@@ -760,11 +724,8 @@ impl SessionMachine {
                 Ok(())
             }
             SessionPhase::Transport(mut tx) => {
-                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
-                let n = tx
-                    .read_message(body, &mut pt)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let (kind, payload) = decode_inner_frame(&pt[..n])?;
+                let pt = tx.read_message_vec(body)?;
+                let (kind, payload) = decode_inner_frame(&pt)?;
                 self.phase = SessionPhase::Transport(tx);
 
                 match kind {
@@ -802,7 +763,7 @@ impl SessionMachine {
                     }
                     InnerFrameType::Rekey => {
                         if let SessionPhase::Transport(ref mut tx_mut) = self.phase {
-                            tx_mut.rekey_incoming();
+                            tx_mut.rekey_incoming()?;
                         }
                         self.verify_peer_and_active_grant(now_unix, roster)?;
                         actions.push(SessionAction::Rekeyed {
@@ -919,9 +880,13 @@ impl SessionMachine {
         }
     }
 
-    fn lookup_issuer_key(&self, roster: &Roster, issuer_id: &str) -> Option<[u8; 32]> {
+    fn lookup_issuer_key(
+        &self,
+        roster: &Roster,
+        issuer_id: &str,
+    ) -> Option<HybridSigningPublicKey> {
         if self.role == SessionRole::Responder && issuer_id == self.local_host_id {
-            Some(self.local_signing_pub)
+            Some(self.local_signing_pub.clone())
         } else {
             roster.lookup_active_signing_key(issuer_id)
         }
@@ -932,37 +897,28 @@ fn build_handshake(
     initiator: bool,
     identity: &EndpointIdentity,
     fixed_ephemeral: Option<[u8; 32]>,
-) -> Result<HandshakeState, CoreError> {
-    let params: NoiseParams = NOISE_PATTERN
-        .parse()
-        .map_err(|err| CoreError::Noise(format!("{err}")))?;
+) -> Result<NoiseHfsHandshake, CoreError> {
     let preamble = Preamble::v1(Intent::Session).encode();
-    let mut builder = new_noise_builder(params)
+    let mut builder = NoiseHfsHandshakeBuilder::new()
         .local_private_key(identity.static_key().secret_bytes())
-        .map_err(|err| CoreError::Noise(format!("{err}")))?
-        .prologue(&preamble)
-        .map_err(|err| CoreError::Noise(format!("{err}")))?;
-    if let Some(ref eph) = fixed_ephemeral {
-        builder = builder.fixed_ephemeral_key_for_testing_only(eph);
+        .prologue(&preamble);
+    if let Some(eph) = fixed_ephemeral {
+        builder = builder.fixed_ephemeral_for_testing_only(eph);
     }
     if initiator {
         builder.build_initiator()
     } else {
         builder.build_responder()
     }
-    .map_err(|err| CoreError::Noise(format!("{err}")))
 }
 
-fn encrypt_encoded_inner(tx: &mut TransportState, inner: &[u8]) -> Result<Vec<u8>, CoreError> {
-    let mut out_ct = vec![0u8; MAX_FRAME_LEN];
-    let n = tx
-        .write_message(inner, &mut out_ct)
-        .map_err(|err| CoreError::Noise(format!("{err}")))?;
-    encode_frame(&out_ct[..n])
+fn encrypt_encoded_inner(tx: &mut NoiseTransport, inner: &[u8]) -> Result<Vec<u8>, CoreError> {
+    let ct = tx.write_message_vec(inner)?;
+    encode_frame(&ct)
 }
 
 fn encrypt_inner(
-    tx: &mut TransportState,
+    tx: &mut NoiseTransport,
     kind: InnerFrameType,
     payload: &[u8],
 ) -> Result<Vec<u8>, CoreError> {
@@ -1004,7 +960,7 @@ mod tests {
                 host.host_id().to_string(),
                 "Host".to_string(),
                 *host.static_key().public_bytes(),
-                Some(*host.signing_key().public_bytes()),
+                Some(host.signing_key().public_key().clone()),
                 0,
                 vec![],
             )

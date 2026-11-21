@@ -2,14 +2,15 @@
 
 use std::collections::VecDeque;
 
-use snow::Builder;
-use snow::params::NoiseParams;
-
 use tendril_core::MAX_FRAME_LEN;
-use tendril_core::crypto::{SigningKeypair, StaticKeypair, b64url_encode, pairing_sas};
+use tendril_core::crypto::{
+    ED25519_SIG_LEN, HYBRID_SIG_LEN, HybridSigningPublicKey, SigningKeypair, StaticKeypair,
+    b64url_decode, b64url_encode, pairing_sas,
+};
 use tendril_core::error::CoreError;
 use tendril_core::grants::{GrantUnsigned, RevocationListUnsigned, sign_crl, sign_grant};
 use tendril_core::identity::{EndpointIdentity, sign_rotation};
+use tendril_core::noise::NoiseHfsHandshakeBuilder;
 use tendril_core::pairing::{
     PairAction, PairOutcome, PairingCodeKind, PairingConfig, PairingInitiator, PairingManager,
     PairingPathKind, PairingResponder, PairingUri, PinnedHost,
@@ -22,8 +23,7 @@ use tendril_core::session::{
     REKEY_MAX_AGE_MS, RekeyDirection, SessionAction, SessionCloseCode, SessionMachine,
 };
 use tendril_core::wire::{
-    HostHello, Intent, MAX_READ_BUFFER_LEN, NOISE_PATTERN, PairClaim, Preamble, decode_frame,
-    encode_frame,
+    HostHello, Intent, MAX_READ_BUFFER_LEN, PairClaim, Preamble, decode_frame, encode_frame,
 };
 
 const NOW_UNIX: u64 = 1_795_564_800; // 2026-11-25T00:00:00Z
@@ -168,7 +168,7 @@ fn full_pair_confirm_mint_data_rekey_rotate_delegate_revoke_close_lifecycle() {
         host_name: "Studio Host".to_string(),
         code: code.clone(),
         host_static_pub: *host_id.static_key().public_bytes(),
-        host_signing_pub: *host_id.signing_key().public_bytes(),
+        host_signing_pub_hash: host_id.signing_key().signing_pub_hash(),
         endpoints: vec!["direct:192.168.1.50:7000".to_string()],
         host_id: None,
         rotation_seq: None,
@@ -181,12 +181,7 @@ fn full_pair_confirm_mint_data_rekey_rotate_delegate_revoke_close_lifecycle() {
         "Workstation",
         "linux",
         &parsed_uri.code,
-        Some(PinnedHost {
-            host_id: None,
-            static_pub: parsed_uri.host_static_pub,
-            signing_pub: parsed_uri.host_signing_pub,
-            rotation_seq: 0,
-        }),
+        Some(parsed_uri.to_pinned_host()),
         None,
     )
     .unwrap();
@@ -533,7 +528,7 @@ fn full_pair_confirm_mint_data_rekey_rotate_delegate_revoke_close_lifecycle() {
             del_identity.host_id().to_string(),
             "Delegate Node".to_string(),
             *del_identity.static_key().public_bytes(),
-            Some(*del_identity.signing_key().public_bytes()),
+            Some(del_identity.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -568,7 +563,7 @@ fn full_pair_confirm_mint_data_rekey_rotate_delegate_revoke_close_lifecycle() {
             uses: None,
             machine: None,
         },
-        &del_identity.signing_key().signing_key(),
+        del_identity.signing_key(),
     )
     .unwrap();
     let del_wire = collect_session_writes(&s_init3.send_grant(&del_to_client, 1_000_100).unwrap());
@@ -599,7 +594,7 @@ fn full_pair_confirm_mint_data_rekey_rotate_delegate_revoke_close_lifecycle() {
             revoked_nonces: vec![del_to_client.nonce],
             ts: "2026-11-25T00:16:40Z".to_string(),
         },
-        &host_id.signing_key().signing_key(),
+        host_id.signing_key(),
     )
     .unwrap();
     let crl_wire = collect_session_writes(&s_init3.send_revocation(&crl, 1_000_200).unwrap());
@@ -639,7 +634,7 @@ fn adversarial_wire_and_framing_faults() {
             host_id.host_id().to_string(),
             "Host".into(),
             *host_id.static_key().public_bytes(),
-            Some(*host_id.signing_key().public_bytes()),
+            Some(host_id.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -909,43 +904,33 @@ fn adversarial_pairing_and_identity_faults() {
     let mut c_init =
         PairingInitiator::new(&fresh_client, "Dev", "ios", &mitm_code, None, None).unwrap();
 
-    let params: NoiseParams = NOISE_PATTERN.parse().unwrap();
     let pair_preamble = Preamble::v1(Intent::Pair).encode();
-    let mut mitm_to_client = Builder::new(params.clone())
+    let mut mitm_to_client = NoiseHfsHandshakeBuilder::new()
         .local_private_key(mitm_id.static_key().secret_bytes())
-        .unwrap()
         .prologue(&pair_preamble)
-        .unwrap()
         .build_responder()
         .unwrap();
-    let mut mitm_to_host = Builder::new(params.clone())
+    let mut mitm_to_host = NoiseHfsHandshakeBuilder::new()
         .local_private_key(mitm_id.static_key().secret_bytes())
-        .unwrap()
         .prologue(&pair_preamble)
-        .unwrap()
         .build_initiator()
         .unwrap();
     let mut h_resp = PairingResponder::new(&host_id, PairingPathKind::Remote, None).unwrap();
 
     let c_m1 = collect_pair_writes(&c_init.start().unwrap());
-    let mut pt_buf = vec![0u8; MAX_FRAME_LEN];
-    let mut ct_buf = vec![0u8; MAX_FRAME_LEN];
     // MITM completes msg1/msg2 toward Client AND msg1/msg2 toward Host independently.
     mitm_to_client
-        .read_message(decode_frame(&c_m1[6..]).unwrap().0, &mut pt_buf)
+        .read_message_vec(decode_frame(&c_m1[6..]).unwrap().0)
         .unwrap();
     let mitm_hello = serde_json::to_vec(&HostHello {
         host_id: mitm_id.host_id().to_string(),
         proto_version: 1,
+        signing_pub: mitm_id.signing_key().public_key().to_b64url(),
         rotation: vec![],
     })
     .unwrap();
-    let nm2_c = mitm_to_client
-        .write_message(&mitm_hello, &mut ct_buf)
-        .unwrap();
-    let c_ev2 = c_init
-        .feed_bytes(&encode_frame(&ct_buf[..nm2_c]).unwrap())
-        .unwrap();
+    let msg2_c = mitm_to_client.write_message_vec(&mitm_hello).unwrap();
+    let c_ev2 = c_init.feed_bytes(&encode_frame(&msg2_c).unwrap()).unwrap();
     let c_sas = c_ev2
         .iter()
         .find_map(|a| match a {
@@ -954,32 +939,30 @@ fn adversarial_pairing_and_identity_faults() {
         })
         .unwrap();
     let c_m3_wire = collect_pair_writes(&c_ev2);
-    let n_claim = mitm_to_client
-        .read_message(decode_frame(&c_m3_wire).unwrap().0, &mut pt_buf)
+    let pt_claim = mitm_to_client
+        .read_message_vec(decode_frame(&c_m3_wire).unwrap().0)
         .unwrap();
-    let relayed_claim: PairClaim = serde_json::from_slice(&pt_buf[..n_claim]).unwrap();
+    let relayed_claim: PairClaim = serde_json::from_slice(&pt_claim).unwrap();
 
     // MITM dials real Host and forwards Client's PairClaim (containing code_mac bound to h_client).
-    let nm1_h = mitm_to_host.write_message(&[], &mut ct_buf).unwrap();
+    let msg1_h = mitm_to_host.write_message_vec(&[]).unwrap();
     let mut to_h = pair_preamble.to_vec();
-    to_h.extend_from_slice(&encode_frame(&ct_buf[..nm1_h]).unwrap());
+    to_h.extend_from_slice(&encode_frame(&msg1_h).unwrap());
     let h_m2 = collect_pair_writes(
         &h_resp
             .feed_bytes(&to_h, NOW_UNIX, &mut mgr_mitm, &mut host_roster)
             .unwrap(),
     );
     mitm_to_host
-        .read_message(decode_frame(&h_m2).unwrap().0, &mut pt_buf)
+        .read_message_vec(decode_frame(&h_m2).unwrap().0)
         .unwrap();
-    let h_hash: [u8; 32] = mitm_to_host.get_handshake_hash().try_into().unwrap();
+    let h_hash = *mitm_to_host.get_handshake_hash();
     assert_ne!(c_sas, pairing_sas(&h_hash));
     let claim_bytes = serde_json::to_vec(&relayed_claim).unwrap();
-    let nm3_h = mitm_to_host
-        .write_message(&claim_bytes, &mut ct_buf)
-        .unwrap();
+    let msg3_h = mitm_to_host.write_message_vec(&claim_bytes).unwrap();
     let splice_ev = h_resp
         .feed_bytes(
-            &encode_frame(&ct_buf[..nm3_h]).unwrap(),
+            &encode_frame(&msg3_h).unwrap(),
             NOW_UNIX,
             &mut mgr_mitm,
             &mut host_roster,
@@ -996,12 +979,12 @@ fn adversarial_pairing_and_identity_faults() {
         "Dev",
         "ios",
         &mitm_code,
-        Some(PinnedHost {
-            host_id: Some(host_id.host_id().to_string()),
-            static_pub: *rogue_id.static_key().public_bytes(),
-            signing_pub: *rogue_id.signing_key().public_bytes(),
-            rotation_seq: 0,
-        }),
+        Some(PinnedHost::with_full_key(
+            Some(host_id.host_id().to_string()),
+            *rogue_id.static_key().public_bytes(),
+            rogue_id.signing_key().public_key().clone(),
+            0,
+        )),
         None,
     )
     .unwrap();
@@ -1049,7 +1032,7 @@ fn adversarial_pairing_and_identity_faults() {
             rogue_id.host_id().to_string(),
             "Rogue".into(),
             *rogue_id.static_key().public_bytes(),
-            Some(*rogue_id.signing_key().public_bytes()),
+            Some(rogue_id.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -1085,7 +1068,7 @@ fn adversarial_grants_crl_and_rotation_forks() {
         host_roster
             .record_pending_pair(
                 *peer.static_key().public_bytes(),
-                Some(*peer.signing_key().public_bytes()),
+                Some(peer.signing_key().public_key().clone()),
                 peer.host_id().to_string(),
                 "cli".into(),
                 "abcd".into(),
@@ -1100,7 +1083,7 @@ fn adversarial_grants_crl_and_rotation_forks() {
             host_id.host_id().to_string(),
             "Host".into(),
             *host_id.static_key().public_bytes(),
-            Some(*host_id.signing_key().public_bytes()),
+            Some(host_id.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -1130,7 +1113,7 @@ fn adversarial_grants_crl_and_rotation_forks() {
             uses: None,
             machine: None,
         },
-        &delegate_id.signing_key().signing_key(),
+        delegate_id.signing_key(),
     )
     .unwrap();
 
@@ -1168,7 +1151,7 @@ fn adversarial_grants_crl_and_rotation_forks() {
             uses: None,
             machine: None,
         },
-        &attacker_id.signing_key().signing_key(),
+        attacker_id.signing_key(),
     )
     .unwrap();
     let mut s_i2 =
@@ -1232,15 +1215,11 @@ fn adversarial_grants_crl_and_rotation_forks() {
             revoked_nonces: vec![],
             ts: "2026-11-25T00:00:00Z".to_string(),
         },
-        &host_id.signing_key().signing_key(),
+        host_id.signing_key(),
     )
     .unwrap();
     host_roster
-        .ingest_crl(
-            crl1,
-            host_id.host_id(),
-            host_id.signing_key().public_bytes(),
-        )
+        .ingest_crl(crl1, host_id.host_id(), host_id.signing_key().public_key())
         .unwrap();
     let stale_crl = sign_crl(
         RevocationListUnsigned {
@@ -1251,14 +1230,14 @@ fn adversarial_grants_crl_and_rotation_forks() {
             revoked_nonces: vec![],
             ts: "2026-11-25T00:01:00Z".to_string(),
         },
-        &host_id.signing_key().signing_key(),
+        host_id.signing_key(),
     )
     .unwrap();
     assert_eq!(
         host_roster.ingest_crl(
             stale_crl,
             host_id.host_id(),
-            host_id.signing_key().public_bytes()
+            host_id.signing_key().public_key()
         ),
         Err(CoreError::CrlStaleSeq { current: 2, got: 1 })
     );
@@ -1266,8 +1245,8 @@ fn adversarial_grants_crl_and_rotation_forks() {
     // 5. Unanchored MITM fork in HostHello fails handshake WITHOUT revoking legitimate host entry.
     let rogue_rot = sign_rotation(
         1,
-        &attacker_id.signing_key().signing_key(),
-        StaticKeypair::from_scalar([0xC1; 32]).public_bytes(),
+        attacker_id.signing_key(),
+        SigningKeypair::from_seed([0xC1; 32]).public_key(),
         StaticKeypair::from_scalar([0xC2; 32]).public_bytes(),
         NOW_UNIX + 50,
     )
@@ -1276,7 +1255,7 @@ fn adversarial_grants_crl_and_rotation_forks() {
         host_id.host_id(),
         &[rogue_rot],
         host_id.static_key().public_bytes(),
-        host_id.signing_key().public_bytes(),
+        host_id.signing_key().public_key(),
     );
     assert!(!matches!(
         unanch_res,
@@ -1294,8 +1273,8 @@ fn adversarial_grants_crl_and_rotation_forks() {
     let next_sig_b = SigningKeypair::from_seed([0x84; 32]);
     let fork_b = sign_rotation(
         1,
-        &host_id.signing_key().signing_key(),
-        next_sig_b.public_bytes(),
+        host_id.signing_key(),
+        next_sig_b.public_key(),
         next_stat_b.public_bytes(),
         NOW_UNIX + 200,
     )
@@ -1310,30 +1289,26 @@ fn adversarial_grants_crl_and_rotation_forks() {
     let mut s_fork_init =
         SessionMachine::new_initiator(&client_id, host_id.host_id(), None, None, None).unwrap();
     let fork_m1 = collect_session_writes(&s_fork_init.start().unwrap());
-    let params: NoiseParams = NOISE_PATTERN.parse().unwrap();
     let sess_pre = Preamble::v1(Intent::Session).encode();
-    let mut evil_resp = Builder::new(params)
+    let mut evil_resp = NoiseHfsHandshakeBuilder::new()
         .local_private_key(host_id.static_key().secret_bytes())
-        .unwrap()
         .prologue(&sess_pre)
-        .unwrap()
         .build_responder()
         .unwrap();
-    let mut pt_buf = vec![0u8; MAX_FRAME_LEN];
-    let mut ct_buf = vec![0u8; MAX_FRAME_LEN];
     evil_resp
-        .read_message(decode_frame(&fork_m1[6..]).unwrap().0, &mut pt_buf)
+        .read_message_vec(decode_frame(&fork_m1[6..]).unwrap().0)
         .unwrap();
     let forked_hello = serde_json::to_vec(&HostHello {
         host_id: host_id.host_id().to_string(),
         proto_version: 1,
+        signing_pub: host_id.signing_key().public_key().to_b64url(),
         rotation: forked_chain,
     })
     .unwrap();
-    let n_fm2 = evil_resp.write_message(&forked_hello, &mut ct_buf).unwrap();
+    let fm2 = evil_resp.write_message_vec(&forked_hello).unwrap();
     let fork_err = s_fork_init
         .feed_bytes(
-            &encode_frame(&ct_buf[..n_fm2]).unwrap(),
+            &encode_frame(&fm2).unwrap(),
             NOW_UNIX + 250,
             100,
             &mut client_roster,
@@ -1483,7 +1458,7 @@ fn batch1_sec09_rejects_low_order_curve25519_and_non_contributory_dh() {
                 format!("bad-{idx}"),
                 "Bad".into(),
                 *pt,
-                Some(*legit.signing_key().public_bytes()),
+                Some(legit.signing_key().public_key().clone()),
                 0,
                 vec![],
             ),
@@ -1499,9 +1474,9 @@ fn batch1_sec09_rejects_low_order_curve25519_and_non_contributory_dh() {
         ));
 
         let bad_uri = format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={}&s={}",
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={}&sh={}",
             b64url_encode(pt),
-            b64url_encode(legit.signing_key().public_bytes()),
+            b64url_encode(&legit.signing_key().signing_pub_hash()),
         );
         assert!(matches!(
             PairingUri::parse(&bad_uri),
@@ -1510,8 +1485,8 @@ fn batch1_sec09_rejects_low_order_curve25519_and_non_contributory_dh() {
 
         let rot = sign_rotation(
             1,
-            &legit.signing_key().signing_key(),
-            legit.signing_key().public_bytes(),
+            legit.signing_key(),
+            legit.signing_key().public_key(),
             pt,
             NOW_UNIX,
         )
@@ -1561,7 +1536,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             uses: None,
             machine: None,
         },
-        &root.signing_key().signing_key(),
+        root.signing_key(),
     )
     .unwrap();
     let g_leaf = sign_grant(
@@ -1577,7 +1552,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             uses: None,
             machine: None,
         },
-        &del.signing_key().signing_key(),
+        del.signing_key(),
     )
     .unwrap();
 
@@ -1587,7 +1562,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             root_id.clone(),
             "Root".into(),
             *root.static_key().public_bytes(),
-            Some(*root.signing_key().public_bytes()),
+            Some(root.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -1597,7 +1572,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             del_alias.clone(),
             "Delegate".into(),
             *del.static_key().public_bytes(),
-            Some(*del.signing_key().public_bytes()),
+            Some(del.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -1625,7 +1600,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             revoked_nonces: vec![],
             ts: "2026-11-22T00:00:00Z".into(),
         },
-        &root.signing_key().signing_key(),
+        root.signing_key(),
     )
     .unwrap();
     assert!(
@@ -1665,7 +1640,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             revoked_nonces: vec![],
             ts: "2026-11-22T00:00:00Z".into(),
         },
-        &rogue.signing_key().signing_key(),
+        rogue.signing_key(),
     )
     .unwrap();
     assert!(matches!(
@@ -1689,7 +1664,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             revoked_nonces: vec![],
             ts: "2026-11-22T00:00:00Z".into(),
         },
-        &root.signing_key().signing_key(),
+        root.signing_key(),
     )
     .unwrap();
     assert!(matches!(
@@ -1713,7 +1688,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             revoked_nonces: vec![],
             ts: "2026-11-22T00:00:00Z".into(),
         },
-        &root.signing_key().signing_key(),
+        root.signing_key(),
     )
     .unwrap();
     assert!(matches!(
@@ -1738,7 +1713,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             "del-alias-2".into(),
             "Delegate Clone".into(),
             *del.static_key().public_bytes(),
-            Some(*del.signing_key().public_bytes()),
+            Some(del.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -1764,7 +1739,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             root_id.clone(),
             "Root".into(),
             *root.static_key().public_bytes(),
-            Some(*root.signing_key().public_bytes()),
+            Some(root.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -1774,7 +1749,7 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             del_crl_only.device_id(),
             "CrlDelegate".into(),
             *del_crl_only.static_key().public_bytes(),
-            Some(*del_crl_only.signing_key().public_bytes()),
+            Some(del_crl_only.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -1788,11 +1763,11 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
             revoked_nonces: vec![],
             ts: "2026-11-22T00:00:00Z".into(),
         },
-        &root.signing_key().signing_key(),
+        root.signing_key(),
     )
     .unwrap();
     crl_roster
-        .ingest_crl(del_crl, &root_id, root.signing_key().public_bytes())
+        .ingest_crl(del_crl, &root_id, root.signing_key().public_key())
         .unwrap();
     assert_eq!(
         crl_roster.lookup_active_signing_key(&del_crl_only.device_id()),
@@ -1861,7 +1836,7 @@ fn batch1_sec10_rekey_does_not_desync_on_oversized_payload() {
             host.host_id().to_string(),
             "Host".into(),
             *host.static_key().public_bytes(),
-            Some(*host.signing_key().public_bytes()),
+            Some(host.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -1943,7 +1918,7 @@ fn batch1_sec11_qr_pinned_pairing_works_after_host_rotation() {
             host_name: "Rotated Host".into(),
             code,
             host_static_pub: *host.static_key().public_bytes(),
-            host_signing_pub: *host.signing_key().public_bytes(),
+            host_signing_pub_hash: host.signing_key().signing_pub_hash(),
             endpoints: vec!["direct:127.0.0.1:7000".into()],
             host_id: include_meta.then(|| host.host_id().to_string()),
             rotation_seq: include_meta.then(|| host.rotation_seq()),
@@ -2138,7 +2113,7 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
     use tendril_core::crypto::b64url_encode;
     use tendril_core::grants::{GrantUnsigned, sign_grant};
     use tendril_core::pairing::PairingUri;
-    use tendril_core::wire::{Intent, MAX_FRAME_LEN, PairClaim, Preamble};
+    use tendril_core::wire::{Intent, PairClaim, Preamble};
 
     // SEC-24: SessionMachine::authorize_path blocks traversal, double slashes, and segment spoofing.
     let host = mk_identity(81);
@@ -2162,7 +2137,7 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
             host.host_id().to_string(),
             "Host".into(),
             *host.static_key().public_bytes(),
-            Some(*host.signing_key().public_bytes()),
+            Some(host.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -2181,7 +2156,7 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
             uses: None,
             machine: None,
         },
-        &host.signing_key().signing_key(),
+        host.signing_key(),
     )
     .unwrap();
 
@@ -2243,7 +2218,7 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
                 uses: None,
                 machine: None,
             },
-            &host.signing_key().signing_key(),
+            host.signing_key(),
         )
         .unwrap();
         let bad_child = sign_grant(
@@ -2259,14 +2234,14 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
                 uses: None,
                 machine: None,
             },
-            &del.signing_key().signing_key(),
+            del.signing_key(),
         )
         .unwrap();
-        let lookup_del = |id: &str| -> Option<[u8; 32]> {
+        let lookup_del = |id: &str| -> Option<HybridSigningPublicKey> {
             if id == host.host_id() {
-                Some(*host.signing_key().public_bytes())
+                Some(host.signing_key().public_key().clone())
             } else if id == del.device_id() {
-                Some(*del.signing_key().public_bytes())
+                Some(del.signing_key().public_key().clone())
             } else {
                 None
             }
@@ -2297,7 +2272,7 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
                 uses: None,
                 machine: None,
             },
-            &host.signing_key().signing_key(),
+            host.signing_key(),
         )
         .unwrap();
         let good_child = sign_grant(
@@ -2313,7 +2288,7 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
                 uses: None,
                 machine: None,
             },
-            &del.signing_key().signing_key(),
+            del.signing_key(),
         )
         .unwrap();
         let (ok_res, ok_audit) = authorize_path_capability(
@@ -2376,41 +2351,42 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
 
     // SEC-29: PairingUri rejects unknown params, empty hosts, control chars, bad codes, and unsafe ep hints.
     let k_b64 = b64url_encode(host.static_key().public_bytes());
-    let s_b64 = b64url_encode(host.signing_key().public_bytes());
+    let sh_b64 = b64url_encode(&host.signing_key().signing_pub_hash());
     for bad_uri in [
-        format!("tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&extra=1"),
-        format!("tendril://pair?v=1&host=&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}"),
-        format!("tendril://pair?v=1&host=h%1b[31m&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}"),
-        format!("tendril://pair?v=1&host=h&code=tnd-aaaa-bbbb&k={k_b64}&s={s_b64}"),
+        format!("tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&extra=1"),
+        format!("tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={sh_b64}"),
+        format!("tendril://pair?v=1&host=&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}"),
+        format!("tendril://pair?v=1&host=h%1b[31m&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}"),
+        format!("tendril://pair?v=1&host=h&code=tnd-aaaa-bbbb&k={k_b64}&sh={sh_b64}"),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=javascript:alert(1)"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=javascript:alert(1)"
         ),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=file:/etc/passwd"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=file:/etc/passwd"
         ),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=relay:ws://evil.example/v1/relay"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=relay:ws://evil.example/v1/relay"
         ),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=direct:169.254.169.254:80"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=direct:169.254.169.254:80"
         ),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=iroh://abc?relay=http://169.254.169.254"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=iroh://abc?relay=http://169.254.169.254"
         ),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=relay:wss://metadata.google.internal./v1/relay"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=relay:wss://metadata.google.internal./v1/relay"
         ),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=direct:metadata.google.internal.:80"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=direct:metadata.google.internal.:80"
         ),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=overlay://169.254.169.254"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=overlay://169.254.169.254"
         ),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=direct:169.254.169.254.:80"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=direct:169.254.169.254.:80"
         ),
         format!(
-            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=relay:wss://169.254.169.254./v1/relay"
+            "tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=relay:wss://169.254.169.254./v1/relay"
         ),
     ] {
         assert!(
@@ -2419,7 +2395,7 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
         );
     }
     let ok_uri = format!(
-        "tendril://pair?v=1&host=Studio&code=TND-AAAA-BBBB&k={k_b64}&s={s_b64}&ep=direct:192.168.1.50:7000,relay:wss://relay.example/v1/relay"
+        "tendril://pair?v=1&host=Studio&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=direct:192.168.1.50:7000,relay:wss://relay.example/v1/relay"
     );
     assert!(PairingUri::parse(&ok_uri).is_ok());
 
@@ -2429,17 +2405,14 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
         .issue_code(PairingCodeKind::Lan2Group, NOW_UNIX)
         .unwrap();
     let mut p_resp = PairingResponder::new(&host, PairingPathKind::Lan, None).unwrap();
-    let mut hs_i = snow::Builder::new("Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap())
+    let mut hs_i = NoiseHfsHandshakeBuilder::new()
         .local_private_key(cli.static_key().secret_bytes())
-        .unwrap()
         .prologue(&Preamble::v1(Intent::Pair).encode())
-        .unwrap()
         .build_initiator()
         .unwrap();
-    let mut m1 = vec![0u8; MAX_FRAME_LEN];
-    let n1 = hs_i.write_message(&[], &mut m1).unwrap();
+    let m1 = hs_i.write_message_vec(&[]).unwrap();
     let mut w1 = Preamble::v1(Intent::Pair).encode().to_vec();
-    w1.extend_from_slice(&tendril_core::wire::encode_frame(&m1[..n1]).unwrap());
+    w1.extend_from_slice(&tendril_core::wire::encode_frame(&m1).unwrap());
     let r2 = p_resp
         .feed_bytes(&w1, NOW_UNIX, &mut mgr, &mut host_roster)
         .unwrap();
@@ -2453,9 +2426,8 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
     let mut reader = tendril_core::wire::ResumableFrameReader::new();
     reader.push(&f2).unwrap();
     let body2 = reader.next_frame().unwrap().unwrap();
-    let mut pt2 = vec![0u8; MAX_FRAME_LEN];
-    hs_i.read_message(&body2, &mut pt2).unwrap();
-    let h_pair: [u8; 32] = hs_i.get_handshake_hash().try_into().unwrap();
+    hs_i.read_message_vec(&body2).unwrap();
+    let h_pair = *hs_i.get_handshake_hash();
     let mac = tendril_core::crypto::compute_code_mac(&code, &h_pair).unwrap();
     let bad_claim = PairClaim {
         name: "Evil\x1b[31mDevice".into(),
@@ -2465,11 +2437,10 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
         signing_pub: None,
         enroll_proof: None,
     };
-    let mut m3 = vec![0u8; MAX_FRAME_LEN];
-    let n3 = hs_i
-        .write_message(&serde_json::to_vec(&bad_claim).unwrap(), &mut m3)
+    let m3 = hs_i
+        .write_message_vec(&serde_json::to_vec(&bad_claim).unwrap())
         .unwrap();
-    let f3 = tendril_core::wire::encode_frame(&m3[..n3]).unwrap();
+    let f3 = tendril_core::wire::encode_frame(&m3).unwrap();
     let mut tx_i = hs_i.into_transport_mode().unwrap();
     let r3 = p_resp
         .feed_bytes(&f3, NOW_UNIX, &mut mgr, &mut host_roster)
@@ -2484,12 +2455,11 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
     let mut er = tendril_core::wire::ResumableFrameReader::new();
     er.push(&err_frame).unwrap();
     let eb = er.next_frame().unwrap().unwrap();
-    let mut ept = vec![0u8; MAX_FRAME_LEN];
-    let ne = tx_i.read_message(&eb, &mut ept).unwrap();
+    let ept = tx_i.read_message_vec(&eb).unwrap();
     assert!(
-        String::from_utf8_lossy(&ept[..ne]).contains("protocol_error"),
+        String::from_utf8_lossy(&ept).contains("protocol_error"),
         "expected protocol_error response, got {}",
-        String::from_utf8_lossy(&ept[..ne])
+        String::from_utf8_lossy(&ept)
     );
 }
 
@@ -2504,12 +2474,12 @@ fn completed_pair_outcome(actions: &[PairAction]) -> PairOutcome {
 }
 
 fn host_pinned(host: &EndpointIdentity) -> PinnedHost {
-    PinnedHost {
-        host_id: Some(host.host_id().to_string()),
-        static_pub: *host.static_key().public_bytes(),
-        signing_pub: *host.signing_key().public_bytes(),
-        rotation_seq: host.rotation_seq(),
-    }
+    PinnedHost::with_full_key(
+        Some(host.host_id().to_string()),
+        *host.static_key().public_bytes(),
+        host.signing_key().public_key().clone(),
+        host.rotation_seq(),
+    )
 }
 
 #[test]
@@ -2525,14 +2495,17 @@ fn phase6_m2m_self_and_anchor_delegated_enrollment_and_default_deny() {
 
     let mut host_roster = Roster::new();
     host_roster
-        .add_trust_anchor("anchor-prod".into(), *anchor.signing_key().public_bytes())
+        .add_trust_anchor(
+            "anchor-prod".into(),
+            anchor.signing_key().public_key().clone(),
+        )
         .unwrap();
     host_roster
         .insert_pinned_host(
             "anchor-delegate".into(),
             "Delegate".into(),
             *delegate.static_key().public_bytes(),
-            Some(*delegate.signing_key().public_bytes()),
+            Some(delegate.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -2584,7 +2557,7 @@ fn phase6_m2m_self_and_anchor_delegated_enrollment_and_default_deny() {
     assert_eq!(entry.state, PeerState::Active);
     assert_eq!(
         entry.signing_pub,
-        Some(*peer_self.signing_key().public_bytes())
+        Some(peer_self.signing_key().public_key().clone())
     );
     assert!(entry.grants.is_empty());
 
@@ -2595,7 +2568,7 @@ fn phase6_m2m_self_and_anchor_delegated_enrollment_and_default_deny() {
             host.host_id().to_string(),
             "Host".into(),
             *host.static_key().public_bytes(),
-            Some(*host.signing_key().public_bytes()),
+            Some(host.signing_key().public_key().clone()),
             0,
             vec![],
         )
@@ -2621,7 +2594,7 @@ fn phase6_m2m_self_and_anchor_delegated_enrollment_and_default_deny() {
         "fs.read:/secret",
         NOW_UNIX,
         None,
-        |id| (id == host.host_id()).then_some(*host.signing_key().public_bytes()),
+        |id| (id == host.host_id()).then(|| host.signing_key().public_key().clone()),
     );
     assert!(deny_res.is_err());
     assert!(!audit_deny.allow);
@@ -2643,7 +2616,7 @@ fn phase6_m2m_self_and_anchor_delegated_enrollment_and_default_deny() {
         "fs.read:/secret/doc.txt",
         NOW_UNIX,
         None,
-        |id| (id == host.host_id()).then_some(*host.signing_key().public_bytes()),
+        |id| (id == host.host_id()).then(|| host.signing_key().public_key().clone()),
     );
     assert!(ok_res.is_ok());
     assert!(audit_ok.allow);
@@ -2665,7 +2638,7 @@ fn phase6_m2m_self_and_anchor_delegated_enrollment_and_default_deny() {
             uses: None,
             machine: None,
         },
-        &anchor.signing_key().signing_key(),
+        anchor.signing_key(),
     )
     .unwrap();
     let child_enroll = sign_grant(
@@ -2681,7 +2654,7 @@ fn phase6_m2m_self_and_anchor_delegated_enrollment_and_default_deny() {
             uses: Some(1),
             machine: Some(true),
         },
-        &delegate.signing_key().signing_key(),
+        delegate.signing_key(),
     )
     .unwrap();
 
@@ -2789,10 +2762,13 @@ fn phase6_m2m_negative_expiry_anchor_crl_revoked_burn_rotation_and_sas() {
 
     let mut roster = Roster::new();
     roster
-        .add_trust_anchor("anchor-a".into(), *anchor.signing_key().public_bytes())
+        .add_trust_anchor("anchor-a".into(), anchor.signing_key().public_key().clone())
         .unwrap();
     roster
-        .add_trust_anchor("anchor-b-sibling".into(), *sibling_anchor_sk.public_bytes())
+        .add_trust_anchor(
+            "anchor-b-sibling".into(),
+            sibling_anchor_sk.public_key().clone(),
+        )
         .unwrap();
 
     // 1. Expired token -> token_expired
@@ -2922,7 +2898,7 @@ fn phase6_m2m_negative_expiry_anchor_crl_revoked_burn_rotation_and_sas() {
     roster
         .record_enrolled_machine(
             *peer.static_key().public_bytes(),
-            *peer.signing_key().public_bytes(),
+            peer.signing_key().public_key().clone(),
             "revoked-peer".into(),
             "machine".into(),
         )
@@ -3058,7 +3034,7 @@ fn phase6_m2m_negative_expiry_anchor_crl_revoked_burn_rotation_and_sas() {
 
     // 7. Purpose separation, SAS confirmation, and structural validation checks
     let lookup_host =
-        |id: &str| (id == host.host_id()).then_some(*host.signing_key().public_bytes());
+        |id: &str| (id == host.host_id()).then(|| host.signing_key().public_key().clone());
     let bad_uses0 = sign_grant(
         GrantUnsigned {
             v: 1,
@@ -3072,7 +3048,7 @@ fn phase6_m2m_negative_expiry_anchor_crl_revoked_burn_rotation_and_sas() {
             uses: Some(0),
             machine: Some(true),
         },
-        &host.signing_key().signing_key(),
+        host.signing_key(),
     )
     .unwrap();
     assert!(matches!(
@@ -3112,14 +3088,14 @@ fn phase6_m2m_negative_expiry_anchor_crl_revoked_burn_rotation_and_sas() {
             uses: Some(1),
             machine: Some(true),
         },
-        &host.signing_key().signing_key(),
+        host.signing_key(),
     )
     .unwrap();
     assert!(matches!(
         verify_enrollment_token(
             &bad_app_cap,
             host.host_id(),
-            host.signing_key().public_bytes(),
+            host.signing_key().public_key(),
             &innocent.device_id(),
             NOW_UNIX,
             &policy,
@@ -3161,7 +3137,7 @@ fn phase6_m2m_negative_expiry_anchor_crl_revoked_burn_rotation_and_sas() {
             uses: None,
             machine: Some(false),
         },
-        &host.signing_key().signing_key(),
+        host.signing_key(),
     )
     .unwrap();
     assert!(matches!(
@@ -3228,7 +3204,6 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
 
     let host = mk_identity(140);
     let peer = mk_identity(141);
-    let params: NoiseParams = NOISE_PATTERN.parse().unwrap();
     let preamble = Preamble::v1(Intent::Pair).encode();
 
     // 1. M2M initiator rejects responder returning status == "pending" instead of "active".
@@ -3243,44 +3218,37 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
     .unwrap();
     let mut init_m2m =
         PairingInitiator::new_m2m(&peer, "m", "machine", tok, host_pinned(&host), None).unwrap();
-    let mut raw_resp = Builder::new(params.clone())
+    let mut raw_resp = NoiseHfsHandshakeBuilder::new()
         .local_private_key(host.static_key().secret_bytes())
-        .unwrap()
         .prologue(&preamble)
-        .unwrap()
         .build_responder()
         .unwrap();
-    let mut buf = vec![0u8; MAX_FRAME_LEN];
-    let mut pt = vec![0u8; MAX_FRAME_LEN];
     let m1 = collect_pair_writes(&init_m2m.start().unwrap());
     raw_resp
-        .read_message(decode_frame(&m1[6..]).unwrap().0, &mut pt)
+        .read_message_vec(decode_frame(&m1[6..]).unwrap().0)
         .unwrap();
     let hh = serde_json::to_vec(&HostHello {
         host_id: host.host_id().to_string(),
         proto_version: 1,
+        signing_pub: host.signing_key().public_key().to_b64url(),
         rotation: vec![],
     })
     .unwrap();
-    let n2 = raw_resp.write_message(&hh, &mut buf).unwrap();
-    let m3 = collect_pair_writes(
-        &init_m2m
-            .feed_bytes(&encode_frame(&buf[..n2]).unwrap())
-            .unwrap(),
-    );
+    let msg2 = raw_resp.write_message_vec(&hh).unwrap();
+    let m3 = collect_pair_writes(&init_m2m.feed_bytes(&encode_frame(&msg2).unwrap()).unwrap());
     raw_resp
-        .read_message(decode_frame(&m3).unwrap().0, &mut pt)
+        .read_message_vec(decode_frame(&m3).unwrap().0)
         .unwrap();
     let mut tx_r = raw_resp.into_transport_mode().unwrap();
     let wrong_status = serde_json::to_vec(&PairResponse::Success {
         device_id: peer.device_id(),
         status: "pending".to_string(),
-        host_signing_pub: b64url_encode(host.signing_key().public_bytes()),
+        host_signing_pub: host.signing_key().public_key().to_b64url(),
     })
     .unwrap();
-    let n4 = tx_r.write_message(&wrong_status, &mut buf).unwrap();
+    let msg4 = tx_r.write_message_vec(&wrong_status).unwrap();
     assert_eq!(
-        init_m2m.feed_bytes(&encode_frame(&buf[..n4]).unwrap()),
+        init_m2m.feed_bytes(&encode_frame(&msg4).unwrap()),
         Err(CoreError::ProtocolViolation(
             "unexpected pair response fields"
         ))
@@ -3293,36 +3261,30 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
         .unwrap();
     let mut init_hum =
         PairingInitiator::new(&peer, "h", "cli", code, Some(host_pinned(&host)), None).unwrap();
-    let mut raw_resp2 = Builder::new(params.clone())
+    let mut raw_resp2 = NoiseHfsHandshakeBuilder::new()
         .local_private_key(host.static_key().secret_bytes())
-        .unwrap()
         .prologue(&preamble)
-        .unwrap()
         .build_responder()
         .unwrap();
     let hm1 = collect_pair_writes(&init_hum.start().unwrap());
     raw_resp2
-        .read_message(decode_frame(&hm1[6..]).unwrap().0, &mut pt)
+        .read_message_vec(decode_frame(&hm1[6..]).unwrap().0)
         .unwrap();
-    let hn2 = raw_resp2.write_message(&hh, &mut buf).unwrap();
-    let hm3 = collect_pair_writes(
-        &init_hum
-            .feed_bytes(&encode_frame(&buf[..hn2]).unwrap())
-            .unwrap(),
-    );
+    let hmsg2 = raw_resp2.write_message_vec(&hh).unwrap();
+    let hm3 = collect_pair_writes(&init_hum.feed_bytes(&encode_frame(&hmsg2).unwrap()).unwrap());
     raw_resp2
-        .read_message(decode_frame(&hm3).unwrap().0, &mut pt)
+        .read_message_vec(decode_frame(&hm3).unwrap().0)
         .unwrap();
     let mut tx_r2 = raw_resp2.into_transport_mode().unwrap();
     let wrong_active = serde_json::to_vec(&PairResponse::Success {
         device_id: device_id(peer.static_key().public_bytes()),
         status: "active".to_string(),
-        host_signing_pub: b64url_encode(host.signing_key().public_bytes()),
+        host_signing_pub: host.signing_key().public_key().to_b64url(),
     })
     .unwrap();
-    let hn4 = tx_r2.write_message(&wrong_active, &mut buf).unwrap();
+    let hmsg4 = tx_r2.write_message_vec(&wrong_active).unwrap();
     assert_eq!(
-        init_hum.feed_bytes(&encode_frame(&buf[..hn4]).unwrap()),
+        init_hum.feed_bytes(&encode_frame(&hmsg4).unwrap()),
         Err(CoreError::ProtocolViolation(
             "unexpected pair response fields"
         ))
@@ -3342,39 +3304,37 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
     let mut forged_resp =
         PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
             .unwrap();
-    let mut raw_init = Builder::new(params.clone())
+    let mut raw_init = NoiseHfsHandshakeBuilder::new()
         .local_private_key(peer.static_key().secret_bytes())
-        .unwrap()
         .prologue(&preamble)
-        .unwrap()
         .build_initiator()
         .unwrap();
-    let n1 = raw_init.write_message(&[], &mut buf).unwrap();
+    let msg1 = raw_init.write_message_vec(&[]).unwrap();
     let mut f1 = preamble.to_vec();
-    f1.extend_from_slice(&encode_frame(&buf[..n1]).unwrap());
+    f1.extend_from_slice(&encode_frame(&msg1).unwrap());
     let out2 = collect_pair_writes(
         &forged_resp
             .feed_bytes(&f1, NOW_UNIX, &mut mgr, &mut Roster::new())
             .unwrap(),
     );
     raw_init
-        .read_message(decode_frame(&out2).unwrap().0, &mut pt)
+        .read_message_vec(decode_frame(&out2).unwrap().0)
         .unwrap();
     let forged_claim = PairClaim {
         name: "m".into(),
         kind: "machine".into(),
         code_mac: None,
         enrollment_token: Some(tok2.clone()),
-        signing_pub: Some(b64url_encode(peer.signing_key().public_bytes())),
-        enroll_proof: Some(b64url_encode(&[0x42u8; 64])),
+        signing_pub: Some(peer.signing_key().public_key().to_b64url()),
+        enroll_proof: Some(b64url_encode(&vec![0x42u8; HYBRID_SIG_LEN])),
     };
-    let n3 = raw_init
-        .write_message(&serde_json::to_vec(&forged_claim).unwrap(), &mut buf)
+    let msg3 = raw_init
+        .write_message_vec(&serde_json::to_vec(&forged_claim).unwrap())
         .unwrap();
     let mut r_forged = Roster::new();
     let r_acts = forged_resp
         .feed_bytes(
-            &encode_frame(&buf[..n3]).unwrap(),
+            &encode_frame(&msg3).unwrap(),
             NOW_UNIX,
             &mut mgr,
             &mut r_forged,
@@ -3392,38 +3352,36 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
     let mut conflict_resp =
         PairingResponder::with_enrollment_policy(&host, PairingPathKind::Remote, None, policy)
             .unwrap();
-    let mut raw_init2 = Builder::new(params)
+    let mut raw_init2 = NoiseHfsHandshakeBuilder::new()
         .local_private_key(peer.static_key().secret_bytes())
-        .unwrap()
         .prologue(&preamble)
-        .unwrap()
         .build_initiator()
         .unwrap();
-    let cn1 = raw_init2.write_message(&[], &mut buf).unwrap();
+    let cmsg1 = raw_init2.write_message_vec(&[]).unwrap();
     let mut cf1 = preamble.to_vec();
-    cf1.extend_from_slice(&encode_frame(&buf[..cn1]).unwrap());
+    cf1.extend_from_slice(&encode_frame(&cmsg1).unwrap());
     let cout2 = collect_pair_writes(
         &conflict_resp
             .feed_bytes(&cf1, NOW_UNIX, &mut mgr, &mut Roster::new())
             .unwrap(),
     );
     raw_init2
-        .read_message(decode_frame(&cout2).unwrap().0, &mut pt)
+        .read_message_vec(decode_frame(&cout2).unwrap().0)
         .unwrap();
     let conflict_claim = PairClaim {
         name: "m".into(),
         kind: "machine".into(),
         code_mac: Some(b64url_encode(&[0x11u8; 32])),
         enrollment_token: Some(tok2),
-        signing_pub: Some(b64url_encode(peer.signing_key().public_bytes())),
-        enroll_proof: Some(b64url_encode(&[0x42u8; 64])),
+        signing_pub: Some(peer.signing_key().public_key().to_b64url()),
+        enroll_proof: Some(b64url_encode(&vec![0x42u8; HYBRID_SIG_LEN])),
     };
-    let cn3 = raw_init2
-        .write_message(&serde_json::to_vec(&conflict_claim).unwrap(), &mut buf)
+    let cmsg3 = raw_init2
+        .write_message_vec(&serde_json::to_vec(&conflict_claim).unwrap())
         .unwrap();
     let c_acts = conflict_resp
         .feed_bytes(
-            &encode_frame(&buf[..cn3]).unwrap(),
+            &encode_frame(&cmsg3).unwrap(),
             NOW_UNIX,
             &mut mgr,
             &mut Roster::new(),
@@ -3434,5 +3392,246 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
         PairOutcome::Rejected {
             error: "protocol_error".to_string()
         }
+    );
+}
+
+#[test]
+fn pq_hybrid_kem_and_half_tampered_signature_adversarial_suite() {
+    use tendril_core::grants::{verify_crl_signature, verify_grant_signature};
+    use tendril_core::identity::verify_rotation_record;
+    use tendril_core::pairing::{
+        EnrollmentPolicy, mint_enrollment_token, sign_enroll_proof, verify_enroll_proof,
+    };
+    use tendril_core::wire::{PairResponse, encode_frame};
+
+    let host = mk_identity(150);
+    let rogue = mk_identity(151);
+    let peer = mk_identity(152);
+    let preamble_sess = Preamble::v1(Intent::Session).encode();
+    let preamble_pair = Preamble::v1(Intent::Pair).encode();
+
+    // 1. Invalid ML-KEM-768 encapsulation key modulus in msg1 must fail closed on SessionMachine & PairingResponder.
+    let mut sess_resp = SessionMachine::new_responder(&host, None).unwrap();
+    let mut hs_i = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(peer.static_key().secret_bytes())
+        .prologue(&preamble_sess)
+        .build_initiator()
+        .unwrap();
+    let mut bad_m1 = hs_i.write_message_vec(&[]).unwrap();
+    bad_m1[32] = 0xFF;
+    bad_m1[33] = 0xFF;
+    let mut wire_bad_m1 = preamble_sess.to_vec();
+    wire_bad_m1.extend_from_slice(&encode_frame(&bad_m1).unwrap());
+    let mut host_roster = Roster::new();
+    assert!(matches!(
+        sess_resp.feed_bytes(&wire_bad_m1, NOW_UNIX, 0, &mut host_roster),
+        Err(CoreError::Noise(_))
+    ));
+
+    // 2. Bit-flipped ML-KEM-768 ciphertext (`ekem1`) in msg2 fails closed before sending msg3.
+    let mut peer_roster = Roster::new();
+    peer_roster
+        .insert_pinned_host(
+            host.host_id().to_string(),
+            "Host".into(),
+            *host.static_key().public_bytes(),
+            Some(host.signing_key().public_key().clone()),
+            0,
+            vec![],
+        )
+        .unwrap();
+    let mut s_init =
+        SessionMachine::new_initiator(&peer, host.host_id(), None, None, None).unwrap();
+    let mut s_resp2 = SessionMachine::new_responder(&host, None).unwrap();
+    let sm1 = collect_session_writes(&s_init.start().unwrap());
+    let mut sm2_wire = collect_session_writes(
+        &s_resp2
+            .feed_bytes(&sm1, NOW_UNIX, 0, &mut host_roster)
+            .unwrap(),
+    );
+    // Flip a bit inside the encrypted `ekem1` region after the 2-byte length prefix and 32-byte e.
+    sm2_wire[2 + 32 + 64] ^= 0x80;
+    assert!(matches!(
+        s_init.feed_bytes(&sm2_wire, NOW_UNIX, 1, &mut peer_roster),
+        Err(CoreError::Noise(_))
+    ));
+    assert!(s_init.is_closed());
+
+    // 3. Half-tampered signatures (Ed25519-only vs ML-DSA-65-only) must fail on grants, CRLs, rotations, and enroll_proof.
+    let grant = sign_grant(
+        GrantUnsigned {
+            v: 1,
+            issuer: host.host_id().to_string(),
+            subject: peer.device_id(),
+            caps: vec!["fs.read:/a".into()],
+            not_before: "2026-11-20T00:00:00Z".into(),
+            not_after: "2026-12-20T00:00:00Z".into(),
+            nonce: b64url_encode(&[0xF1; 16]),
+            delegated_from: vec![],
+            uses: None,
+            machine: None,
+        },
+        host.signing_key(),
+    )
+    .unwrap();
+    for flip_idx in [5usize, ED25519_SIG_LEN + 25] {
+        let mut tampered = grant.clone();
+        let mut raw = b64url_decode(&tampered.sig).unwrap();
+        raw[flip_idx] ^= 0x40;
+        tampered.sig = b64url_encode(&raw);
+        assert_eq!(
+            verify_grant_signature(&tampered, host.signing_key().public_key()),
+            Err(CoreError::InvalidSignature)
+        );
+    }
+
+    let crl = sign_crl(
+        RevocationListUnsigned {
+            v: 1,
+            issuer: host.host_id().to_string(),
+            seq: 1,
+            revoked_devices: vec![],
+            revoked_nonces: vec![],
+            ts: "2026-11-25T00:00:00Z".into(),
+        },
+        host.signing_key(),
+    )
+    .unwrap();
+    for flip_idx in [5usize, ED25519_SIG_LEN + 25] {
+        let mut tampered = crl.clone();
+        let mut raw = b64url_decode(&tampered.sig).unwrap();
+        raw[flip_idx] ^= 0x40;
+        tampered.sig = b64url_encode(&raw);
+        assert_eq!(
+            verify_crl_signature(&tampered, host.signing_key().public_key()),
+            Err(CoreError::InvalidSignature)
+        );
+    }
+
+    let rot = sign_rotation(
+        1,
+        host.signing_key(),
+        peer.signing_key().public_key(),
+        peer.static_key().public_bytes(),
+        NOW_UNIX,
+    )
+    .unwrap();
+    for flip_idx in [5usize, ED25519_SIG_LEN + 25] {
+        let mut tampered = rot.clone();
+        let mut raw = b64url_decode(&tampered.sig).unwrap();
+        raw[flip_idx] ^= 0x40;
+        tampered.sig = b64url_encode(&raw);
+        assert_eq!(
+            verify_rotation_record(&tampered),
+            Err(CoreError::InvalidSignature)
+        );
+    }
+
+    let proof = sign_enroll_proof(
+        peer.signing_key(),
+        &[0xAA; 32],
+        peer.static_key().public_bytes(),
+        "nonce-pq-01",
+    )
+    .unwrap();
+    for flip_idx in [5usize, ED25519_SIG_LEN + 25] {
+        let mut tampered = proof.clone();
+        tampered[flip_idx] ^= 0x40;
+        assert_eq!(
+            verify_enroll_proof(
+                peer.signing_key().public_key(),
+                &[0xAA; 32],
+                peer.static_key().public_bytes(),
+                "nonce-pq-01",
+                &tampered,
+            ),
+            Err(CoreError::InvalidSignature)
+        );
+    }
+
+    // 4. QR `sh=` pin rejects mismatched HostHello.signing_pub at msg2 AND rejects mismatched PairResponse.host_signing_pub.
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Lan2Group, NOW_UNIX)
+        .unwrap();
+    let pin = PinnedHost::with_hash(
+        Some(host.host_id().to_string()),
+        *host.static_key().public_bytes(),
+        host.signing_key().signing_pub_hash(),
+        0,
+    );
+    let mut init_unverified_hh =
+        PairingInitiator::new(&peer, "p", "cli", code.clone(), Some(pin), None).unwrap();
+    let mut raw_host = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(host.static_key().secret_bytes())
+        .prologue(&preamble_pair)
+        .build_responder()
+        .unwrap();
+    let pm1 = collect_pair_writes(&init_unverified_hh.start().unwrap());
+    raw_host
+        .read_message_vec(decode_frame(&pm1[6..]).unwrap().0)
+        .unwrap();
+    let bad_hh = serde_json::to_vec(&HostHello {
+        host_id: host.host_id().to_string(),
+        proto_version: 1,
+        signing_pub: rogue.signing_key().public_key().to_b64url(),
+        rotation: vec![],
+    })
+    .unwrap();
+    let bad_msg2 = raw_host.write_message_vec(&bad_hh).unwrap();
+    assert_eq!(
+        init_unverified_hh.feed_bytes(&encode_frame(&bad_msg2).unwrap()),
+        Err(CoreError::HostKeyUnverified)
+    );
+
+    // Also test HostHello carrying host's real signing_pub followed by PairResponse carrying rogue signing_pub.
+    let tok = mint_enrollment_token(
+        &host,
+        host.host_id(),
+        Some(&peer.device_id()),
+        NOW_UNIX,
+        900,
+        [0xE9; 16],
+    )
+    .unwrap();
+    let _ = EnrollmentPolicy::enabled_default();
+    let mut init_resp_mismatch =
+        PairingInitiator::new_m2m(&peer, "m", "machine", tok, host_pinned(&host), None).unwrap();
+    let mut raw_host2 = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(host.static_key().secret_bytes())
+        .prologue(&preamble_pair)
+        .build_responder()
+        .unwrap();
+    let pm1_ok = collect_pair_writes(&init_resp_mismatch.start().unwrap());
+    raw_host2
+        .read_message_vec(decode_frame(&pm1_ok[6..]).unwrap().0)
+        .unwrap();
+    let ok_hh = serde_json::to_vec(&HostHello {
+        host_id: host.host_id().to_string(),
+        proto_version: 1,
+        signing_pub: host.signing_key().public_key().to_b64url(),
+        rotation: vec![],
+    })
+    .unwrap();
+    let ok_m2 = raw_host2.write_message_vec(&ok_hh).unwrap();
+    let pm3_ok = collect_pair_writes(
+        &init_resp_mismatch
+            .feed_bytes(&encode_frame(&ok_m2).unwrap())
+            .unwrap(),
+    );
+    raw_host2
+        .read_message_vec(decode_frame(&pm3_ok).unwrap().0)
+        .unwrap();
+    let mut tx_h = raw_host2.into_transport_mode().unwrap();
+    let bad_resp = serde_json::to_vec(&PairResponse::Success {
+        device_id: peer.device_id(),
+        status: "active".to_string(),
+        host_signing_pub: rogue.signing_key().public_key().to_b64url(),
+    })
+    .unwrap();
+    let bad_m4 = tx_h.write_message_vec(&bad_resp).unwrap();
+    assert_eq!(
+        init_resp_mismatch.feed_bytes(&encode_frame(&bad_m4).unwrap()),
+        Err(CoreError::HostKeyUnverified)
     );
 }

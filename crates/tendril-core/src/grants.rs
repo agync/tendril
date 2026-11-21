@@ -3,10 +3,11 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::crypto::{b64url_decode_array, b64url_encode};
+use crate::crypto::{
+    HybridSigningPublicKey, SigningKeypair, b64url_decode, b64url_decode_array, b64url_encode,
+};
 use crate::error::CoreError;
 use crate::identity::parse_rfc3339_utc;
 
@@ -398,9 +399,32 @@ pub fn grant_signed_bytes(unsigned: &GrantUnsigned) -> Result<Vec<u8>, CoreError
 }
 
 /// Signs a capability grant using `signing_key`.
-pub fn sign_grant(unsigned: GrantUnsigned, signing_key: &SigningKey) -> Result<Grant, CoreError> {
+pub fn sign_grant(
+    unsigned: GrantUnsigned,
+    signing_key: &SigningKeypair,
+) -> Result<Grant, CoreError> {
+    sign_grant_impl(unsigned, signing_key, false)
+}
+
+/// Deterministically signs a capability grant for reproducible test vectors.
+pub fn sign_grant_deterministic(
+    unsigned: GrantUnsigned,
+    signing_key: &SigningKeypair,
+) -> Result<Grant, CoreError> {
+    sign_grant_impl(unsigned, signing_key, true)
+}
+
+fn sign_grant_impl(
+    unsigned: GrantUnsigned,
+    signing_key: &SigningKeypair,
+    deterministic: bool,
+) -> Result<Grant, CoreError> {
     let msg = grant_signed_bytes(&unsigned)?;
-    let sig: Signature = signing_key.sign(&msg);
+    let sig = if deterministic {
+        signing_key.sign_deterministic(&msg)?
+    } else {
+        signing_key.sign(&msg)?
+    };
     Ok(Grant {
         v: unsigned.v,
         issuer: unsigned.issuer,
@@ -412,22 +436,18 @@ pub fn sign_grant(unsigned: GrantUnsigned, signing_key: &SigningKey) -> Result<G
         delegated_from: unsigned.delegated_from,
         uses: unsigned.uses,
         machine: unsigned.machine,
-        sig: b64url_encode(&sig.to_bytes()),
+        sig: b64url_encode(&sig),
     })
 }
 
-/// Strictly verifies a grant signature against `issuer_signing_pub`.
+/// Strictly verifies a hybrid grant signature against `issuer_signing_pub`.
 pub fn verify_grant_signature(
     grant: &Grant,
-    issuer_signing_pub: &[u8; 32],
+    issuer_signing_pub: &HybridSigningPublicKey,
 ) -> Result<(), CoreError> {
-    let sig_bytes: [u8; 64] = b64url_decode_array(&grant.sig)?;
-    let vk =
-        VerifyingKey::from_bytes(issuer_signing_pub).map_err(|_| CoreError::InvalidSignature)?;
-    let sig = Signature::from_bytes(&sig_bytes);
+    let sig_bytes = b64url_decode(&grant.sig)?;
     let msg = grant_signed_bytes(&grant.unsigned())?;
-    vk.verify_strict(&msg, &sig)
-        .map_err(|_| CoreError::InvalidSignature)
+    issuer_signing_pub.verify(&msg, &sig_bytes)
 }
 
 /// Checks that `child` is a valid subset delegation of `parent` (syntax, `pair.mint`, time, caps).
@@ -500,7 +520,7 @@ pub fn verify_grant_with_chain<F>(
     lookup_issuer_key: F,
 ) -> Result<(), CoreError>
 where
-    F: FnMut(&str) -> Option<[u8; 32]>,
+    F: FnMut(&str) -> Option<HybridSigningPublicKey>,
 {
     verify_chain_with_mode(
         grant,
@@ -527,7 +547,7 @@ pub fn verify_enrollment_grant_chain<F>(
     lookup_issuer_key: F,
 ) -> Result<(), CoreError>
 where
-    F: FnMut(&str) -> Option<[u8; 32]>,
+    F: FnMut(&str) -> Option<HybridSigningPublicKey>,
 {
     verify_chain_with_mode(
         grant,
@@ -552,7 +572,7 @@ fn verify_chain_with_mode<F>(
     mut lookup_issuer_key: F,
 ) -> Result<(), CoreError>
 where
-    F: FnMut(&str) -> Option<[u8; 32]>,
+    F: FnMut(&str) -> Option<HybridSigningPublicKey>,
 {
     if let Some(list) = crl {
         if list.v != 1 {
@@ -600,7 +620,7 @@ fn verify_grant_node<F>(
     lookup_issuer_key: &mut F,
 ) -> Result<(), CoreError>
 where
-    F: FnMut(&str) -> Option<[u8; 32]>,
+    F: FnMut(&str) -> Option<HybridSigningPublicKey>,
 {
     if depth > MAX_DELEGATION_DEPTH {
         return Err(CoreError::DelegationDenied(
@@ -752,7 +772,7 @@ pub fn authorize_grant<F>(
     lookup_issuer_key: F,
 ) -> (Result<(), CoreError>, AuditEvent)
 where
-    F: FnMut(&str) -> Option<[u8; 32]>,
+    F: FnMut(&str) -> Option<HybridSigningPublicKey>,
 {
     authorize_grant_inner(
         grant,
@@ -780,7 +800,7 @@ pub fn authorize_path_capability<F>(
     lookup_issuer_key: F,
 ) -> (Result<(), CoreError>, AuditEvent)
 where
-    F: FnMut(&str) -> Option<[u8; 32]>,
+    F: FnMut(&str) -> Option<HybridSigningPublicKey>,
 {
     let raw_display = format!("{action}:{raw_path}");
     if action.contains(':') {
@@ -838,7 +858,7 @@ fn authorize_grant_inner<F>(
     lookup_issuer_key: F,
 ) -> (Result<(), CoreError>, AuditEvent)
 where
-    F: FnMut(&str) -> Option<[u8; 32]>,
+    F: FnMut(&str) -> Option<HybridSigningPublicKey>,
 {
     let deny = |err: CoreError, nonce: Option<String>| -> (Result<(), CoreError>, AuditEvent) {
         let audit = AuditEvent {
@@ -952,10 +972,30 @@ pub fn crl_signed_bytes(unsigned: &RevocationListUnsigned) -> Result<Vec<u8>, Co
 /// Signs a [`RevocationListUnsigned`] using `signing_key`.
 pub fn sign_crl(
     unsigned: RevocationListUnsigned,
-    signing_key: &SigningKey,
+    signing_key: &SigningKeypair,
+) -> Result<RevocationList, CoreError> {
+    sign_crl_impl(unsigned, signing_key, false)
+}
+
+/// Deterministically signs a [`RevocationListUnsigned`] for reproducible test vectors.
+pub fn sign_crl_deterministic(
+    unsigned: RevocationListUnsigned,
+    signing_key: &SigningKeypair,
+) -> Result<RevocationList, CoreError> {
+    sign_crl_impl(unsigned, signing_key, true)
+}
+
+fn sign_crl_impl(
+    unsigned: RevocationListUnsigned,
+    signing_key: &SigningKeypair,
+    deterministic: bool,
 ) -> Result<RevocationList, CoreError> {
     let msg = crl_signed_bytes(&unsigned)?;
-    let sig: Signature = signing_key.sign(&msg);
+    let sig = if deterministic {
+        signing_key.sign_deterministic(&msg)?
+    } else {
+        signing_key.sign(&msg)?
+    };
     Ok(RevocationList {
         v: unsigned.v,
         issuer: unsigned.issuer,
@@ -963,38 +1003,34 @@ pub fn sign_crl(
         revoked_devices: unsigned.revoked_devices,
         revoked_nonces: unsigned.revoked_nonces,
         ts: unsigned.ts,
-        sig: b64url_encode(&sig.to_bytes()),
+        sig: b64url_encode(&sig),
     })
 }
 
-/// Strictly verifies a [`RevocationList`] signature and whole-second UTC timestamp against
+/// Strictly verifies a hybrid [`RevocationList`] signature and whole-second UTC timestamp against
 /// `issuer_signing_pub`.
 pub fn verify_crl_signature(
     crl: &RevocationList,
-    issuer_signing_pub: &[u8; 32],
+    issuer_signing_pub: &HybridSigningPublicKey,
 ) -> Result<(), CoreError> {
     parse_rfc3339_utc(&crl.ts)?;
-    let sig_bytes: [u8; 64] = b64url_decode_array(&crl.sig)?;
-    let vk =
-        VerifyingKey::from_bytes(issuer_signing_pub).map_err(|_| CoreError::InvalidSignature)?;
-    let sig = Signature::from_bytes(&sig_bytes);
+    let sig_bytes = b64url_decode(&crl.sig)?;
     let msg = crl_signed_bytes(&crl.unsigned())?;
-    vk.verify_strict(&msg, &sig)
-        .map_err(|_| CoreError::InvalidSignature)
+    issuer_signing_pub.verify(&msg, &sig_bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn mk_signer(seed: u8) -> (SigningKey, [u8; 32]) {
-        let sk = SigningKey::from_bytes(&[seed; 32]);
-        let pk = sk.verifying_key().to_bytes();
+    fn mk_signer(seed: u8) -> (SigningKeypair, HybridSigningPublicKey) {
+        let sk = SigningKeypair::from_seed([seed; 32]);
+        let pk = sk.public_key().clone();
         (sk, pk)
     }
 
     fn mk_grant(
-        sk: &SigningKey,
+        sk: &SigningKeypair,
         issuer: &str,
         subject: &str,
         caps: Vec<&str>,
@@ -1051,9 +1087,9 @@ mod tests {
         );
 
         let lookup = |issuer: &str| match issuer {
-            "dev_root" => Some(pk_root),
-            "dev_a" => Some(pk_a),
-            "dev_b" => Some(pk_b),
+            "dev_root" => Some(pk_root.clone()),
+            "dev_a" => Some(pk_a.clone()),
+            "dev_b" => Some(pk_b.clone()),
             _ => None,
         };
 
@@ -1075,7 +1111,7 @@ mod tests {
         );
         let nb = parse_rfc3339_utc(&root_g.not_before).unwrap();
         let na = parse_rfc3339_utc(&root_g.not_after).unwrap();
-        let lookup = |issuer: &str| (issuer == "dev_root").then_some(pk_root);
+        let lookup = |issuer: &str| (issuer == "dev_root").then(|| pk_root.clone());
 
         assert!(
             verify_grant_with_chain(
@@ -1129,8 +1165,8 @@ mod tests {
             vec![g_root],
         );
         let lookup = |issuer: &str| match issuer {
-            "dev_root" => Some(pk_root),
-            "dev_del" => Some(pk_del),
+            "dev_root" => Some(pk_root.clone()),
+            "dev_del" => Some(pk_del.clone()),
             _ => None,
         };
         let now = parse_rfc3339_utc("2026-11-25T00:00:00Z").unwrap();
@@ -1190,17 +1226,17 @@ mod tests {
 
     #[test]
     fn rejects_delegation_depth_cycles_arity_mint_window_and_syntax() {
-        let signers: Vec<(SigningKey, [u8; 32], String)> = (0u8..=6)
+        let signers: Vec<(SigningKeypair, HybridSigningPublicKey, String)> = (0u8..=6)
             .map(|i| {
                 let (sk, pk) = mk_signer(0x30 + i);
                 (sk, pk, format!("dev_{i}"))
             })
             .collect();
-        let lookup = |issuer: &str| -> Option<[u8; 32]> {
+        let lookup = |issuer: &str| -> Option<HybridSigningPublicKey> {
             signers
                 .iter()
                 .find(|(_, _, id)| id == issuer)
-                .map(|(_, pk, _)| *pk)
+                .map(|(_, pk, _)| pk.clone())
         };
         let now = parse_rfc3339_utc("2026-11-25T00:00:00Z").unwrap();
 
@@ -1379,7 +1415,7 @@ mod tests {
             "au_1",
             vec![],
         );
-        let lookup_auth = |id: &str| (id == "dev_root").then_some(pk_auth);
+        let lookup_auth = |id: &str| (id == "dev_root").then(|| pk_auth.clone());
         let (none_res, none_audit) = authorize_grant(
             None,
             "dev_leaf",
@@ -1477,5 +1513,69 @@ mod tests {
 
         let dbl_slash = Capability::parse("fs.read://*").unwrap();
         assert!(!dbl_slash.covers_path(&Capability::parse("fs.read:/etc/passwd").unwrap()));
+    }
+
+    #[test]
+    fn rejects_half_tampered_hybrid_grant_and_crl_signatures() {
+        let (sk, pk) = mk_signer(0x71);
+        let grant = mk_grant(
+            &sk,
+            "dev_root",
+            "dev_leaf",
+            vec!["fs.read:/a"],
+            "ht_1",
+            vec![],
+        );
+        verify_grant_signature(&grant, &pk).unwrap();
+
+        let mut g_ed = grant.clone();
+        let mut sig_raw = b64url_decode(&g_ed.sig).unwrap();
+        sig_raw[0] ^= 0x01;
+        g_ed.sig = b64url_encode(&sig_raw);
+        assert_eq!(
+            verify_grant_signature(&g_ed, &pk),
+            Err(CoreError::InvalidSignature)
+        );
+
+        let mut g_pq = grant.clone();
+        sig_raw[0] ^= 0x01;
+        sig_raw[crate::crypto::ED25519_SIG_LEN + 12] ^= 0x01;
+        g_pq.sig = b64url_encode(&sig_raw);
+        assert_eq!(
+            verify_grant_signature(&g_pq, &pk),
+            Err(CoreError::InvalidSignature)
+        );
+
+        let crl = sign_crl_deterministic(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: "dev_root".to_string(),
+                seq: 1,
+                revoked_devices: vec!["dev_x".to_string()],
+                revoked_nonces: vec![],
+                ts: "2026-11-22T00:00:00Z".to_string(),
+            },
+            &sk,
+        )
+        .unwrap();
+        verify_crl_signature(&crl, &pk).unwrap();
+
+        let mut crl_ed = crl.clone();
+        let mut crl_sig = b64url_decode(&crl_ed.sig).unwrap();
+        crl_sig[0] ^= 0x01;
+        crl_ed.sig = b64url_encode(&crl_sig);
+        assert_eq!(
+            verify_crl_signature(&crl_ed, &pk),
+            Err(CoreError::InvalidSignature)
+        );
+
+        let mut crl_pq = crl;
+        crl_sig[0] ^= 0x01;
+        crl_sig[crate::crypto::ED25519_SIG_LEN + 20] ^= 0x01;
+        crl_pq.sig = b64url_encode(&crl_sig);
+        assert_eq!(
+            verify_crl_signature(&crl_pq, &pk),
+            Err(CoreError::InvalidSignature)
+        );
     }
 }

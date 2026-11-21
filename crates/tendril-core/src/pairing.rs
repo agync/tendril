@@ -4,28 +4,26 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use snow::params::NoiseParams;
-use snow::{HandshakeState, TransportState};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    CODE_ALPHABET, SigningKeypair, b64url_decode_array, b64url_encode, compute_code_mac, device_id,
-    fingerprint_device, has_control_chars, is_valid_ed25519_public_key, is_valid_x25519_public_key,
-    new_noise_builder, pairing_sas, random_bytes, verify_code_mac,
+    CODE_ALPHABET, HYBRID_SIGNING_HASH_LEN, HybridSigningPublicKey, SigningKeypair, b64url_decode,
+    b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
+    has_control_chars, is_valid_x25519_public_key, pairing_sas, random_bytes, verify_code_mac,
 };
 use crate::error::CoreError;
 use crate::grants::{
     Capability, Grant, GrantUnsigned, MAX_CLOCK_SKEW_SECS, MAX_DELEGATION_DEPTH, parse_caps,
-    sign_grant, verify_enrollment_grant_chain,
+    sign_grant, sign_grant_deterministic, verify_enrollment_grant_chain,
 };
 use crate::identity::{
-    EndpointIdentity, RotationRecord, format_rfc3339_utc, parse_rfc3339_utc, verify_rotation_chain,
+    EndpointIdentity, RotationRecord, SigningKeyPin, format_rfc3339_utc, parse_rfc3339_utc,
+    verify_rotation_chain_pin,
 };
+use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::roster::{AnchorState, Roster};
 use crate::wire::{
-    HostHello, Intent, MAX_FRAME_LEN, NOISE_PATTERN, PairClaim, PairResponse, Preamble,
-    ResumableFrameReader, encode_frame,
+    HostHello, Intent, PairClaim, PairResponse, Preamble, ResumableFrameReader, encode_frame,
 };
 
 /// Default lifetime of a newly issued pairing code (`15` minutes).
@@ -40,7 +38,7 @@ pub const DEFAULT_ENROLLMENT_TTL_SECS: u64 = 900;
 /// Hard upper bound on M2M enrollment token lifetime (`24` hours).
 pub const MAX_ENROLLMENT_TTL_SECS: u64 = 86_400;
 
-/// 18-byte domain prefix prepended to Ed25519 channel-binding M2M enrollment proofs.
+/// 18-byte domain prefix prepended to channel-binding M2M enrollment proofs.
 pub const ENROLL_PROOF_DOMAIN: &[u8] = b"tendril-enroll-v1\0";
 
 /// Policy controlling autonomous Machine-to-Machine enrollment on a responder.
@@ -319,25 +317,25 @@ pub struct PairingUri {
     pub host_name: String,
     pub code: String,
     pub host_static_pub: [u8; 32],
-    pub host_signing_pub: [u8; 32],
+    pub host_signing_pub_hash: [u8; HYBRID_SIGNING_HASH_LEN],
     pub endpoints: Vec<String>,
     pub host_id: Option<String>,
     pub rotation_seq: Option<u64>,
 }
 
 impl PairingUri {
-    /// Converts this URI's out-of-band cryptographic pin into a [`PinnedHost`].
+    /// Converts this URI's out-of-band cryptographic hash pin into a [`PinnedHost`].
     #[must_use]
     pub fn to_pinned_host(&self) -> PinnedHost {
-        PinnedHost {
-            host_id: self.host_id.clone(),
-            static_pub: self.host_static_pub,
-            signing_pub: self.host_signing_pub,
-            rotation_seq: self.rotation_seq.unwrap_or(0),
-        }
+        PinnedHost::with_hash(
+            self.host_id.clone(),
+            self.host_static_pub,
+            self.host_signing_pub_hash,
+            self.rotation_seq.unwrap_or(0),
+        )
     }
 
-    /// Encodes this pairing payload as a `tendril://pair?v=1&...` URI.
+    /// Encodes this pairing payload as a `tendril://pair?v=1&...` URI using `sh=` hash pinning.
     #[must_use]
     pub fn encode(&self) -> String {
         let ep_joined = self
@@ -347,11 +345,11 @@ impl PairingUri {
             .collect::<Vec<_>>()
             .join(",");
         let mut out = format!(
-            "tendril://pair?v=1&host={}&code={}&k={}&s={}",
+            "tendril://pair?v=1&host={}&code={}&k={}&sh={}",
             pct_encode(&self.host_name),
             pct_encode(&self.code),
             b64url_encode(&self.host_static_pub),
-            b64url_encode(&self.host_signing_pub),
+            b64url_encode(&self.host_signing_pub_hash),
         );
         if let Some(ref host_id) = self.host_id
             && !host_id.is_empty()
@@ -379,7 +377,7 @@ impl PairingUri {
             let (k, v) = pair
                 .split_once('=')
                 .ok_or_else(|| CoreError::InvalidPairingUri("malformed query pair".into()))?;
-            if !matches!(k, "v" | "host" | "code" | "k" | "s" | "id" | "seq" | "ep") {
+            if !matches!(k, "v" | "host" | "code" | "k" | "sh" | "id" | "seq" | "ep") {
                 return Err(CoreError::InvalidPairingUri(format!(
                     "unknown query parameter {k}"
                 )));
@@ -425,15 +423,10 @@ impl PairingUri {
             ));
         }
 
-        let s_raw = params
-            .get("s")
-            .ok_or_else(|| CoreError::InvalidPairingUri("missing host signing key s".into()))?;
-        let host_signing_pub: [u8; 32] = b64url_decode_array(s_raw)?;
-        if !is_valid_ed25519_public_key(&host_signing_pub) {
-            return Err(CoreError::InvalidPairingUri(
-                "invalid host signing key".into(),
-            ));
-        }
+        let sh_raw = params
+            .get("sh")
+            .ok_or_else(|| CoreError::InvalidPairingUri("missing host signing hash sh".into()))?;
+        let host_signing_pub_hash: [u8; HYBRID_SIGNING_HASH_LEN] = b64url_decode_array(sh_raw)?;
 
         let host_id = match params.get("id").copied() {
             None => None,
@@ -483,7 +476,7 @@ impl PairingUri {
             host_name,
             code,
             host_static_pub,
-            host_signing_pub,
+            host_signing_pub_hash,
             endpoints,
             host_id,
             rotation_seq,
@@ -765,8 +758,42 @@ fn from_hex(b: u8) -> Result<u8, CoreError> {
 pub struct PinnedHost {
     pub host_id: Option<String>,
     pub static_pub: [u8; 32],
-    pub signing_pub: [u8; 32],
+    pub signing_pin: SigningKeyPin,
     pub rotation_seq: u64,
+}
+
+impl PinnedHost {
+    /// Pins a host using its full 1984-byte [`HybridSigningPublicKey`].
+    #[must_use]
+    pub fn with_full_key(
+        host_id: Option<String>,
+        static_pub: [u8; 32],
+        signing_pub: HybridSigningPublicKey,
+        rotation_seq: u64,
+    ) -> Self {
+        Self {
+            host_id,
+            static_pub,
+            signing_pin: SigningKeyPin::Full(signing_pub),
+            rotation_seq,
+        }
+    }
+
+    /// Pins a host using the SHA-256 hash of its 1984-byte [`HybridSigningPublicKey`].
+    #[must_use]
+    pub fn with_hash(
+        host_id: Option<String>,
+        static_pub: [u8; 32],
+        signing_pub_hash: [u8; HYBRID_SIGNING_HASH_LEN],
+        rotation_seq: u64,
+    ) -> Self {
+        Self {
+            host_id,
+            static_pub,
+            signing_pin: SigningKeyPin::Hash(signing_pub_hash),
+            rotation_seq,
+        }
+    }
 }
 
 /// Actions produced by [`PairingInitiator`] and [`PairingResponder`].
@@ -789,7 +816,7 @@ pub enum PairOutcome {
         device_id: String,
         host_id: String,
         host_static_pub: [u8; 32],
-        host_signing_pub: [u8; 32],
+        host_signing_pub: HybridSigningPublicKey,
         host_rotation_seq: u64,
         pairing_sas: String,
         host_pin_verified: bool,
@@ -806,14 +833,14 @@ pub enum PairOutcome {
         device_id: String,
         host_id: String,
         host_static_pub: [u8; 32],
-        host_signing_pub: [u8; 32],
+        host_signing_pub: HybridSigningPublicKey,
         host_rotation_seq: u64,
         token_nonce: String,
     },
     ResponderEnrolled {
         device_id: String,
         device_static_pub: [u8; 32],
-        device_signing_pub: [u8; 32],
+        device_signing_pub: HybridSigningPublicKey,
         token_nonce: String,
         name: String,
         kind: String,
@@ -831,6 +858,46 @@ pub fn mint_enrollment_token(
     not_before_unix: u64,
     ttl_secs: u64,
     nonce: [u8; 16],
+) -> Result<Grant, CoreError> {
+    mint_enrollment_token_impl(
+        issuer,
+        target_host_id,
+        subject_device_id,
+        not_before_unix,
+        ttl_secs,
+        nonce,
+        false,
+    )
+}
+
+/// Deterministically mints an M2M enrollment token for reproducible test vectors.
+pub fn mint_enrollment_token_deterministic(
+    issuer: &EndpointIdentity,
+    target_host_id: &str,
+    subject_device_id: Option<&str>,
+    not_before_unix: u64,
+    ttl_secs: u64,
+    nonce: [u8; 16],
+) -> Result<Grant, CoreError> {
+    mint_enrollment_token_impl(
+        issuer,
+        target_host_id,
+        subject_device_id,
+        not_before_unix,
+        ttl_secs,
+        nonce,
+        true,
+    )
+}
+
+fn mint_enrollment_token_impl(
+    issuer: &EndpointIdentity,
+    target_host_id: &str,
+    subject_device_id: Option<&str>,
+    not_before_unix: u64,
+    ttl_secs: u64,
+    nonce: [u8; 16],
+    deterministic: bool,
 ) -> Result<Grant, CoreError> {
     if target_host_id.is_empty()
         || target_host_id.contains('*')
@@ -864,24 +931,26 @@ pub fn mint_enrollment_token(
         .checked_add(ttl_secs)
         .ok_or_else(|| CoreError::InvalidTimestamp("enrollment timestamp overflow".to_string()))?;
 
-    sign_grant(
-        GrantUnsigned {
-            v: 1,
-            issuer: issuer.host_id().to_string(),
-            subject,
-            caps: vec![cap],
-            not_before: format_rfc3339_utc(not_before_unix)?,
-            not_after: format_rfc3339_utc(not_after_unix)?,
-            nonce: b64url_encode(&nonce),
-            delegated_from: Vec::new(),
-            uses: Some(1),
-            machine: Some(true),
-        },
-        &issuer.signing_key().signing_key(),
-    )
+    let unsigned = GrantUnsigned {
+        v: 1,
+        issuer: issuer.host_id().to_string(),
+        subject,
+        caps: vec![cap],
+        not_before: format_rfc3339_utc(not_before_unix)?,
+        not_after: format_rfc3339_utc(not_after_unix)?,
+        nonce: b64url_encode(&nonce),
+        delegated_from: Vec::new(),
+        uses: Some(1),
+        machine: Some(true),
+    };
+    if deterministic {
+        sign_grant_deterministic(unsigned, issuer.signing_key())
+    } else {
+        sign_grant(unsigned, issuer.signing_key())
+    }
 }
 
-/// Builds the canonical Ed25519 signature input for `PairClaim.enroll_proof`:
+/// Builds the canonical signature input for `PairClaim.enroll_proof`:
 /// `"tendril-enroll-v1\0" (18 B) || h (32 B) || peer_static_pub (32 B) || UTF-8(token_nonce)`.
 #[must_use]
 pub fn enroll_proof_bytes(
@@ -898,33 +967,37 @@ pub fn enroll_proof_bytes(
 }
 
 /// Signs the M2M channel-binding proof binding `handshake_hash`, `peer_static_pub`, and `token_nonce`.
-#[must_use]
 pub fn sign_enroll_proof(
-    signing_key: &SigningKey,
+    signing_key: &SigningKeypair,
     handshake_hash: &[u8; 32],
     peer_static_pub: &[u8; 32],
     token_nonce: &str,
-) -> [u8; 64] {
+) -> Result<Vec<u8>, CoreError> {
     let msg = enroll_proof_bytes(handshake_hash, peer_static_pub, token_nonce);
-    signing_key.sign(&msg).to_bytes()
+    signing_key.sign(&msg)
 }
 
-/// Strictly verifies a channel-bound M2M `enroll_proof` Ed25519 signature.
-pub fn verify_enroll_proof(
-    signing_pub: &[u8; 32],
+/// Deterministically signs the M2M channel-binding proof for reproducible test vectors.
+pub fn sign_enroll_proof_deterministic(
+    signing_key: &SigningKeypair,
     handshake_hash: &[u8; 32],
     peer_static_pub: &[u8; 32],
     token_nonce: &str,
-    sig_bytes: &[u8; 64],
-) -> Result<(), CoreError> {
-    if !is_valid_ed25519_public_key(signing_pub) {
-        return Err(CoreError::IncompletePin("invalid signing_pub".to_string()));
-    }
-    let vk = VerifyingKey::from_bytes(signing_pub).map_err(|_| CoreError::InvalidSignature)?;
-    let sig = Signature::from_bytes(sig_bytes);
+) -> Result<Vec<u8>, CoreError> {
     let msg = enroll_proof_bytes(handshake_hash, peer_static_pub, token_nonce);
-    vk.verify_strict(&msg, &sig)
-        .map_err(|_| CoreError::InvalidSignature)
+    signing_key.sign_deterministic(&msg)
+}
+
+/// Strictly verifies a channel-bound hybrid M2M `enroll_proof` signature.
+pub fn verify_enroll_proof(
+    signing_pub: &HybridSigningPublicKey,
+    handshake_hash: &[u8; 32],
+    peer_static_pub: &[u8; 32],
+    token_nonce: &str,
+    sig_bytes: &[u8],
+) -> Result<(), CoreError> {
+    let msg = enroll_proof_bytes(handshake_hash, peer_static_pub, token_nonce);
+    signing_pub.verify(&msg, sig_bytes)
 }
 
 fn validate_enrollment_token_structure(
@@ -1001,7 +1074,7 @@ fn find_enrollment_root_issuer(token: &Grant) -> Result<String, CoreError> {
 pub fn verify_enrollment_token(
     token: &Grant,
     responder_host_id: &str,
-    responder_signing_pub: &[u8; 32],
+    responder_signing_pub: &HybridSigningPublicKey,
     peer_device_id: &str,
     now_unix: u64,
     policy: &EnrollmentPolicy,
@@ -1032,7 +1105,7 @@ pub fn verify_enrollment_token(
     let root_issuer = find_enrollment_root_issuer(token)?;
     let self_issued = root_issuer == responder_host_id;
     let self_anchor_ok = if let Some(anchor) = roster.trust_anchor(&root_issuer) {
-        anchor.state == AnchorState::Active && anchor.signing_pub == *responder_signing_pub
+        anchor.state == AnchorState::Active && &anchor.signing_pub == responder_signing_pub
     } else {
         true
     };
@@ -1054,7 +1127,7 @@ pub fn verify_enrollment_token(
         crl,
         |issuer_id| {
             if issuer_id == responder_host_id && policy.allow_self_issued && self_anchor_ok {
-                Some(*responder_signing_pub)
+                Some(responder_signing_pub.clone())
             } else {
                 roster
                     .lookup_active_anchor_key(issuer_id)
@@ -1077,13 +1150,13 @@ pub fn verify_enrollment_token(
 }
 
 enum InitiatorPhase {
-    Init(Box<HandshakeState>),
-    AwaitMsg2(Box<HandshakeState>),
+    Init(Box<NoiseHfsHandshake>),
+    AwaitMsg2(Box<NoiseHfsHandshake>),
     AwaitResponse {
-        transport: Box<TransportState>,
+        transport: Box<NoiseTransport>,
         host_id: String,
         host_static_pub: [u8; 32],
-        expected_signing_pub: Option<[u8; 32]>,
+        verified_host_signing_pub: HybridSigningPublicKey,
         verified_seq: Option<u64>,
         presented_rotation: Vec<RotationRecord>,
         pairing_sas: String,
@@ -1132,10 +1205,9 @@ impl PairingInitiator {
         identity: &EndpointIdentity,
         pinned_host: Option<&PinnedHost>,
         fixed_ephemeral: Option<[u8; 32]>,
-    ) -> Result<HandshakeState, CoreError> {
+    ) -> Result<NoiseHfsHandshake, CoreError> {
         if let Some(pin) = pinned_host
-            && (!is_valid_x25519_public_key(&pin.static_pub)
-                || !is_valid_ed25519_public_key(&pin.signing_pub))
+            && !is_valid_x25519_public_key(&pin.static_pub)
         {
             return Err(CoreError::IncompletePin(
                 pin.host_id
@@ -1143,21 +1215,14 @@ impl PairingInitiator {
                     .unwrap_or_else(|| "pinned_host".to_string()),
             ));
         }
-        let params: NoiseParams = NOISE_PATTERN
-            .parse()
-            .map_err(|err| CoreError::Noise(format!("{err}")))?;
         let preamble = Preamble::v1(Intent::Pair).encode();
-        let mut builder = new_noise_builder(params)
+        let mut builder = NoiseHfsHandshakeBuilder::new()
             .local_private_key(identity.static_key().secret_bytes())
-            .map_err(|err| CoreError::Noise(format!("{err}")))?
-            .prologue(&preamble)
-            .map_err(|err| CoreError::Noise(format!("{err}")))?;
-        if let Some(ref eph) = fixed_ephemeral {
-            builder = builder.fixed_ephemeral_key_for_testing_only(eph);
+            .prologue(&preamble);
+        if let Some(eph) = fixed_ephemeral {
+            builder = builder.fixed_ephemeral_for_testing_only(eph);
         }
-        builder
-            .build_initiator()
-            .map_err(|err| CoreError::Noise(format!("{err}")))
+        builder.build_initiator()
     }
 
     /// Creates a new human pairing initiator ready to emit the pairing preamble and `msg1`.
@@ -1235,11 +1300,8 @@ impl PairingInitiator {
         let InitiatorPhase::Init(mut hs) = prev else {
             return Err(CoreError::NotReady("pairing initiator already started"));
         };
-        let mut msg1 = vec![0u8; MAX_FRAME_LEN];
-        let n = hs
-            .write_message(&[], &mut msg1)
-            .map_err(|err| CoreError::Noise(format!("{err}")))?;
-        let frame = encode_frame(&msg1[..n])?;
+        let msg1 = hs.write_message_vec(&[])?;
+        let frame = encode_frame(&msg1)?;
         let preamble = Preamble::v1(Intent::Pair).encode();
         let mut wire_bytes = Vec::with_capacity(preamble.len() + frame.len());
         wire_bytes.extend_from_slice(&preamble);
@@ -1291,31 +1353,27 @@ impl PairingInitiator {
         let phase = std::mem::replace(&mut self.phase, InitiatorPhase::Closed);
         match phase {
             InitiatorPhase::AwaitMsg2(mut hs) => {
-                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
-                let n_pt = hs
-                    .read_message(body, &mut pt)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let host_hello: HostHello = serde_json::from_slice(&pt[..n_pt])
-                    .map_err(|err| CoreError::Json(err.to_string()))?;
+                let pt = hs.read_message_vec(body)?;
+                let host_hello: HostHello =
+                    serde_json::from_slice(&pt).map_err(|err| CoreError::Json(err.to_string()))?;
                 if host_hello.proto_version != 1 {
                     return Err(CoreError::UnsupportedVersion(host_hello.proto_version));
                 }
                 if host_hello.host_id.is_empty() || has_control_chars(&host_hello.host_id) {
                     return Err(CoreError::ProtocolViolation("invalid host_id in HostHello"));
                 }
+                let host_signing_pub = HybridSigningPublicKey::from_b64url(&host_hello.signing_pub)
+                    .map_err(|_| {
+                        CoreError::ProtocolViolation("invalid signing_pub in HostHello")
+                    })?;
 
-                let remote_static: [u8; 32] = hs
-                    .get_remote_static()
-                    .ok_or(CoreError::ProtocolViolation(
-                        "missing responder static key in msg2",
-                    ))?
-                    .try_into()
-                    .map_err(|_| CoreError::ProtocolViolation("invalid responder static length"))?;
+                let remote_static: [u8; 32] = *hs.get_remote_static().ok_or(
+                    CoreError::ProtocolViolation("missing responder static key in msg2"),
+                )?;
                 if !is_valid_x25519_public_key(&remote_static) {
                     return Err(CoreError::HostKeyUnverified);
                 }
 
-                let mut expected_signing_pub = None;
                 let mut verified_seq = None;
                 if let Some(pin) = &self.pinned_host {
                     if let Some(ref exp_id) = pin.host_id
@@ -1323,44 +1381,33 @@ impl PairingInitiator {
                     {
                         return Err(CoreError::HostKeyUnverified);
                     }
-                    let presented_signing = if host_hello.rotation.is_empty() {
-                        pin.signing_pub
-                    } else {
-                        let last = host_hello
-                            .rotation
-                            .last()
-                            .ok_or(CoreError::HostKeyUnverified)?;
-                        b64url_decode_array(&last.new_signing_pub)
-                            .map_err(|_| CoreError::HostKeyUnverified)?
-                    };
                     let verify_res = if pin.rotation_seq == 0
                         && !host_hello.rotation.is_empty()
                         && host_hello.rotation[0].seq == 1
                         && remote_static == pin.static_pub
-                        && presented_signing == pin.signing_pub
+                        && pin.signing_pin.matches(&host_signing_pub)
                     {
                         let last_seq = host_hello.rotation.last().map_or(0, |r| r.seq);
-                        verify_rotation_chain(
-                            &pin.signing_pub,
+                        verify_rotation_chain_pin(
+                            &pin.signing_pin,
                             &pin.static_pub,
                             last_seq,
                             &host_hello.rotation,
                             &remote_static,
-                            &presented_signing,
+                            &host_signing_pub,
                         )
                     } else {
-                        verify_rotation_chain(
-                            &pin.signing_pub,
+                        verify_rotation_chain_pin(
+                            &pin.signing_pin,
                             &pin.static_pub,
                             pin.rotation_seq,
                             &host_hello.rotation,
                             &remote_static,
-                            &presented_signing,
+                            &host_signing_pub,
                         )
                     };
                     match verify_res {
                         Ok(seq) => {
-                            expected_signing_pub = Some(presented_signing);
                             verified_seq = Some(seq);
                         }
                         Err(err @ CoreError::RotationForkDetected { .. }) => return Err(err),
@@ -1368,10 +1415,7 @@ impl PairingInitiator {
                     }
                 }
 
-                let h: [u8; 32] = hs
-                    .get_handshake_hash()
-                    .try_into()
-                    .map_err(|_| CoreError::Noise("unexpected handshake hash length".into()))?;
+                let h = *hs.get_handshake_hash();
                 let sas = pairing_sas(&h);
                 let claim = match &self.auth {
                     InitiatorAuth::Human { code } => {
@@ -1392,17 +1436,17 @@ impl PairingInitiator {
                     }
                     InitiatorAuth::M2m { token, signing_key } => {
                         let proof = sign_enroll_proof(
-                            &signing_key.signing_key(),
+                            signing_key,
                             &h,
                             &self.local_static_pub,
                             &token.nonce,
-                        );
+                        )?;
                         PairClaim {
                             name: self.device_name.clone(),
                             kind: self.device_kind.clone(),
                             code_mac: None,
                             enrollment_token: Some(token.as_ref().clone()),
-                            signing_pub: Some(b64url_encode(signing_key.public_bytes())),
+                            signing_pub: Some(signing_key.public_key().to_b64url()),
                             enroll_proof: Some(b64url_encode(&proof)),
                         }
                     }
@@ -1410,21 +1454,16 @@ impl PairingInitiator {
                 let claim_json = Zeroizing::new(
                     serde_json::to_vec(&claim).map_err(|err| CoreError::Json(err.to_string()))?,
                 );
-                let mut msg3 = vec![0u8; MAX_FRAME_LEN];
-                let n3 = hs
-                    .write_message(&claim_json, &mut msg3)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let msg3_frame = encode_frame(&msg3[..n3])?;
+                let msg3 = hs.write_message_vec(&claim_json)?;
+                let msg3_frame = encode_frame(&msg3)?;
                 actions.push(PairAction::WriteBytes(msg3_frame));
 
-                let transport = hs
-                    .into_transport_mode()
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
+                let transport = hs.into_transport_mode()?;
                 self.phase = InitiatorPhase::AwaitResponse {
                     transport: Box::new(transport),
                     host_id: host_hello.host_id,
                     host_static_pub: remote_static,
-                    expected_signing_pub,
+                    verified_host_signing_pub: host_signing_pub,
                     verified_seq,
                     presented_rotation: host_hello.rotation,
                     pairing_sas: sas,
@@ -1436,18 +1475,15 @@ impl PairingInitiator {
                 mut transport,
                 host_id,
                 host_static_pub,
-                expected_signing_pub,
+                verified_host_signing_pub,
                 verified_seq,
                 presented_rotation,
                 pairing_sas,
                 host_pin_verified,
             } => {
-                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
-                let n = transport
-                    .read_message(body, &mut pt)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let resp: PairResponse = serde_json::from_slice(&pt[..n])
-                    .map_err(|err| CoreError::Json(err.to_string()))?;
+                let pt = transport.read_message_vec(body)?;
+                let resp: PairResponse =
+                    serde_json::from_slice(&pt).map_err(|err| CoreError::Json(err.to_string()))?;
                 match resp {
                     PairResponse::Success {
                         device_id: resp_dev_id,
@@ -1465,22 +1501,20 @@ impl PairingInitiator {
                                 "unexpected pair response fields",
                             ));
                         }
-                        let host_signing: [u8; 32] = b64url_decode_array(&host_signing_pub)?;
-                        if !is_valid_ed25519_public_key(&host_signing) {
-                            return Err(CoreError::IncompletePin(host_id));
-                        }
-                        if let Some(expected) = expected_signing_pub
-                            && expected != host_signing
-                        {
+                        let host_signing =
+                            HybridSigningPublicKey::from_b64url(&host_signing_pub)
+                                .map_err(|_| CoreError::IncompletePin(host_id.clone()))?;
+                        if host_signing != verified_host_signing_pub {
                             return Err(CoreError::HostKeyUnverified);
                         }
                         let host_rotation_seq = if let Some(seq) = verified_seq {
                             seq
                         } else if let Some(first) = presented_rotation.first() {
-                            let root_sig: [u8; 32] = b64url_decode_array(&first.prev_signing_pub)
-                                .map_err(|_| CoreError::HostKeyUnverified)?;
-                            verify_rotation_chain(
-                                &root_sig,
+                            let root_sig =
+                                HybridSigningPublicKey::from_b64url(&first.prev_signing_pub)
+                                    .map_err(|_| CoreError::HostKeyUnverified)?;
+                            verify_rotation_chain_pin(
+                                &SigningKeyPin::Full(root_sig),
                                 &host_static_pub,
                                 first.seq.saturating_sub(1),
                                 &presented_rotation,
@@ -1535,10 +1569,10 @@ impl PairingInitiator {
 }
 
 enum ResponderPhase {
-    AwaitPreamble(Box<HandshakeState>),
-    AwaitMsg1(Box<HandshakeState>),
+    AwaitPreamble(Box<NoiseHfsHandshake>),
+    AwaitMsg1(Box<NoiseHfsHandshake>),
     AwaitMsg3 {
-        hs: Box<HandshakeState>,
+        hs: Box<NoiseHfsHandshake>,
         post_msg2_hash: [u8; 32],
     },
     Closed,
@@ -1549,7 +1583,7 @@ pub struct PairingResponder {
     phase: ResponderPhase,
     reader: ResumableFrameReader,
     host_hello: HostHello,
-    host_signing_pub: [u8; 32],
+    host_signing_pub: HybridSigningPublicKey,
     path: PairingPathKind,
     enrollment_policy: EnrollmentPolicy,
 }
@@ -1582,21 +1616,14 @@ impl PairingResponder {
         fixed_ephemeral: Option<[u8; 32]>,
         enrollment_policy: EnrollmentPolicy,
     ) -> Result<Self, CoreError> {
-        let params: NoiseParams = NOISE_PATTERN
-            .parse()
-            .map_err(|err| CoreError::Noise(format!("{err}")))?;
         let preamble = Preamble::v1(Intent::Pair).encode();
-        let mut builder = new_noise_builder(params)
+        let mut builder = NoiseHfsHandshakeBuilder::new()
             .local_private_key(identity.static_key().secret_bytes())
-            .map_err(|err| CoreError::Noise(format!("{err}")))?
-            .prologue(&preamble)
-            .map_err(|err| CoreError::Noise(format!("{err}")))?;
-        if let Some(ref eph) = fixed_ephemeral {
-            builder = builder.fixed_ephemeral_key_for_testing_only(eph);
+            .prologue(&preamble);
+        if let Some(eph) = fixed_ephemeral {
+            builder = builder.fixed_ephemeral_for_testing_only(eph);
         }
-        let hs = builder
-            .build_responder()
-            .map_err(|err| CoreError::Noise(format!("{err}")))?;
+        let hs = builder.build_responder()?;
 
         Ok(Self {
             phase: ResponderPhase::AwaitPreamble(Box::new(hs)),
@@ -1604,9 +1631,10 @@ impl PairingResponder {
             host_hello: HostHello {
                 host_id: identity.host_id().to_string(),
                 proto_version: 1,
+                signing_pub: identity.signing_key().public_key().to_b64url(),
                 rotation: identity.rotation_chain().to_vec(),
             },
-            host_signing_pub: *identity.signing_key().public_bytes(),
+            host_signing_pub: identity.signing_key().public_key().clone(),
             path,
             enrollment_policy,
         })
@@ -1691,11 +1719,8 @@ impl PairingResponder {
         let phase = std::mem::replace(&mut self.phase, ResponderPhase::Closed);
         match phase {
             ResponderPhase::AwaitMsg1(mut hs) => {
-                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
-                let n = hs
-                    .read_message(body, &mut pt)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                if n != 0 {
+                let pt = hs.read_message_vec(body)?;
+                if !pt.is_empty() {
                     return Err(CoreError::ProtocolViolation(
                         "msg1 must carry empty payload",
                     ));
@@ -1705,15 +1730,9 @@ impl PairingResponder {
                     serde_json::to_vec(&self.host_hello)
                         .map_err(|err| CoreError::Json(err.to_string()))?,
                 );
-                let mut msg2 = vec![0u8; MAX_FRAME_LEN];
-                let n2 = hs
-                    .write_message(&hello_json, &mut msg2)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let post_msg2_hash: [u8; 32] = hs
-                    .get_handshake_hash()
-                    .try_into()
-                    .map_err(|_| CoreError::Noise("unexpected handshake hash length".into()))?;
-                let frame2 = encode_frame(&msg2[..n2])?;
+                let msg2 = hs.write_message_vec(&hello_json)?;
+                let post_msg2_hash = *hs.get_handshake_hash();
+                let frame2 = encode_frame(&msg2)?;
                 actions.push(PairAction::WriteBytes(frame2));
                 self.phase = ResponderPhase::AwaitMsg3 { hs, post_msg2_hash };
                 Ok(())
@@ -1722,28 +1741,19 @@ impl PairingResponder {
                 mut hs,
                 post_msg2_hash,
             } => {
-                let mut pt = Zeroizing::new(vec![0u8; MAX_FRAME_LEN]);
-                let n_pt = hs
-                    .read_message(body, &mut pt)
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
-                let peer_static: [u8; 32] = hs
-                    .get_remote_static()
-                    .ok_or(CoreError::ProtocolViolation(
-                        "missing initiator static key in msg3",
-                    ))?
-                    .try_into()
-                    .map_err(|_| CoreError::ProtocolViolation("invalid initiator static length"))?;
+                let pt = hs.read_message_vec(body)?;
+                let peer_static: [u8; 32] = *hs.get_remote_static().ok_or(
+                    CoreError::ProtocolViolation("missing initiator static key in msg3"),
+                )?;
                 if !is_valid_x25519_public_key(&peer_static) {
                     return Err(CoreError::ProtocolViolation(
                         "invalid or low-order initiator static key",
                     ));
                 }
 
-                let mut transport = hs
-                    .into_transport_mode()
-                    .map_err(|err| CoreError::Noise(format!("{err}")))?;
+                let mut transport = hs.into_transport_mode()?;
 
-                let claim: PairClaim = match serde_json::from_slice(&pt[..n_pt]) {
+                let claim: PairClaim = match serde_json::from_slice(&pt) {
                     Ok(c) => c,
                     Err(_) => {
                         return write_pair_error(&mut transport, "protocol_error", actions);
@@ -1823,13 +1833,18 @@ impl PairingResponder {
                         if !self.enrollment_policy.enabled {
                             return write_pair_error(&mut transport, "unauthorized", actions);
                         }
-                        let peer_signing_pub: [u8; 32] = match b64url_decode_array(&sig_pub_b64) {
-                            Ok(k) => k,
-                            Err(_) => {
-                                return write_pair_error(&mut transport, "protocol_error", actions);
-                            }
-                        };
-                        let proof_bytes: [u8; 64] = match b64url_decode_array(&proof_b64) {
+                        let peer_signing_pub =
+                            match HybridSigningPublicKey::from_b64url(&sig_pub_b64) {
+                                Ok(k) => k,
+                                Err(_) => {
+                                    return write_pair_error(
+                                        &mut transport,
+                                        "protocol_error",
+                                        actions,
+                                    );
+                                }
+                            };
+                        let proof_bytes = match b64url_decode(&proof_b64) {
                             Ok(p) => p,
                             Err(_) => {
                                 return write_pair_error(&mut transport, "protocol_error", actions);
@@ -1881,7 +1896,7 @@ impl PairingResponder {
 
                         let registered_id = match roster.record_enrolled_machine(
                             peer_static,
-                            peer_signing_pub,
+                            peer_signing_pub.clone(),
                             claim.name.clone(),
                             claim.kind.clone(),
                         ) {
@@ -1930,32 +1945,29 @@ impl PairingResponder {
 }
 
 fn write_pair_success(
-    transport: &mut TransportState,
+    transport: &mut NoiseTransport,
     device_id: &str,
     status: &str,
-    host_signing_pub: &[u8; 32],
+    host_signing_pub: &HybridSigningPublicKey,
     outcome: PairOutcome,
     actions: &mut Vec<PairAction>,
 ) -> Result<(), CoreError> {
     let resp = PairResponse::Success {
         device_id: device_id.to_string(),
         status: status.to_string(),
-        host_signing_pub: b64url_encode(host_signing_pub),
+        host_signing_pub: host_signing_pub.to_b64url(),
     };
     let resp_json =
         Zeroizing::new(serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?);
-    let mut out_ct = vec![0u8; MAX_FRAME_LEN];
-    let n_ct = transport
-        .write_message(&resp_json, &mut out_ct)
-        .map_err(|err| CoreError::Noise(format!("{err}")))?;
-    actions.push(PairAction::WriteBytes(encode_frame(&out_ct[..n_ct])?));
+    let out_ct = transport.write_message_vec(&resp_json)?;
+    actions.push(PairAction::WriteBytes(encode_frame(&out_ct)?));
     actions.push(PairAction::Completed(outcome));
     actions.push(PairAction::CloseTransport("pairing complete".to_string()));
     Ok(())
 }
 
 fn write_pair_error(
-    transport: &mut TransportState,
+    transport: &mut NoiseTransport,
     error_code: &str,
     actions: &mut Vec<PairAction>,
 ) -> Result<(), CoreError> {
@@ -1964,11 +1976,8 @@ fn write_pair_error(
     };
     let resp_json =
         Zeroizing::new(serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?);
-    let mut out_ct = vec![0u8; MAX_FRAME_LEN];
-    let n_ct = transport
-        .write_message(&resp_json, &mut out_ct)
-        .map_err(|err| CoreError::Noise(format!("{err}")))?;
-    actions.push(PairAction::WriteBytes(encode_frame(&out_ct[..n_ct])?));
+    let out_ct = transport.write_message_vec(&resp_json)?;
+    actions.push(PairAction::WriteBytes(encode_frame(&out_ct)?));
     actions.push(PairAction::Completed(PairOutcome::Rejected {
         error: error_code.to_string(),
     }));
@@ -1990,7 +1999,7 @@ mod tests {
             host_name: "Home Server & Lab".to_string(),
             code: "TND-4F9K-22XQ".to_string(),
             host_static_pub: *host_id_keys.static_key().public_bytes(),
-            host_signing_pub: *host_id_keys.signing_key().public_bytes(),
+            host_signing_pub_hash: host_id_keys.signing_key().signing_pub_hash(),
             endpoints: vec![
                 "direct:192.168.1.10:7000".to_string(),
                 "relay:wss://relay.example/v1/relay".to_string(),
@@ -1999,6 +2008,8 @@ mod tests {
             rotation_seq: None,
         };
         let encoded = uri.encode();
+        assert!(encoded.contains("&sh="));
+        assert!(!encoded.contains("&s="));
         let parsed = PairingUri::parse(&encoded).unwrap();
         assert_eq!(parsed, uri);
 
@@ -2007,11 +2018,20 @@ mod tests {
             Err(CoreError::InvalidPairingUri(_))
         ));
         assert!(matches!(
-            PairingUri::parse("tendril://pair?v=2&host=a&code=b&k=AA&s=AA"),
+            PairingUri::parse("tendril://pair?v=2&host=a&code=TND-AAAA-BBBB&k=AA&sh=AA"),
+            Err(CoreError::InvalidPairingUri(_))
+        ));
+        // Legacy `s=` parameter must be rejected.
+        assert!(matches!(
+            PairingUri::parse(&format!(
+                "tendril://pair?v=1&host=a&code=TND-AAAA-BBBB&k={}&s={}",
+                b64url_encode(host_id_keys.static_key().public_bytes()),
+                b64url_encode(&[0x11; 32]),
+            )),
             Err(CoreError::InvalidPairingUri(_))
         ));
         assert!(matches!(
-            PairingUri::parse("tendril://pair?v=1&host=a%ZZ&code=b&k=AA&s=AA"),
+            PairingUri::parse("tendril://pair?v=1&host=a%ZZ&code=TND-AAAA-BBBB&k=AA&sh=AA"),
             Err(CoreError::InvalidPairingUri(_))
         ));
     }
@@ -2087,15 +2107,142 @@ mod tests {
                 "Dev",
                 "cli",
                 "TND-AAAA-BBBB",
-                Some(PinnedHost {
-                    host_id: Some("host-1".to_string()),
-                    static_pub: [0u8; 32],
-                    signing_pub: [0x11; 32],
-                    rotation_seq: 0,
-                }),
+                Some(PinnedHost::with_hash(
+                    Some("host-1".to_string()),
+                    [0u8; 32],
+                    [0x11; 32],
+                    0,
+                )),
                 None,
             ),
             Err(CoreError::IncompletePin(_))
+        ));
+    }
+
+    #[test]
+    fn qr_hash_pin_verifies_pre_and_post_rotation_and_rejects_mismatch() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+
+        let mut host_id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x51; 32]),
+            SigningKeypair::from_seed([0x52; 32]),
+        )
+        .with_host_id("qr-host");
+        let dev_id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x61; 32]),
+            SigningKeypair::from_seed([0x62; 32]),
+        );
+
+        let qr = PairingUri {
+            host_name: "QR Host".into(),
+            code: "TND-AAAA-BBBB".into(),
+            host_static_pub: *host_id.static_key().public_bytes(),
+            host_signing_pub_hash: host_id.signing_key().signing_pub_hash(),
+            endpoints: vec![],
+            host_id: Some(host_id.host_id().to_string()),
+            rotation_seq: Some(0),
+        };
+        let parsed = PairingUri::parse(&qr.encode()).unwrap();
+
+        // Wrong signing hash pin must abort at msg2 before sending msg3.
+        let mut wrong_pin = parsed.to_pinned_host();
+        wrong_pin.signing_pin = SigningKeyPin::Hash([0x99; 32]);
+        let mut mgr_bad = PairingManager::new(PairingConfig::default());
+        mgr_bad
+            .issue_code_with_entropy(PairingCodeKind::Lan2Group, 1000, &[0x11; 32])
+            .unwrap();
+        let mut init_bad = PairingInitiator::new(
+            &dev_id,
+            "Dev",
+            "cli",
+            "TND-AAAA-BBBB",
+            Some(wrong_pin),
+            None,
+        )
+        .unwrap();
+        let mut resp_bad = PairingResponder::new(&host_id, PairingPathKind::Lan, None).unwrap();
+        let m1 = match &init_bad.start().unwrap()[0] {
+            PairAction::WriteBytes(b) => b.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        let mut roster_bad = Roster::new();
+        let m2 = match &resp_bad
+            .feed_bytes(&m1, 1000, &mut mgr_bad, &mut roster_bad)
+            .unwrap()[0]
+        {
+            PairAction::WriteBytes(b) => b.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(init_bad.feed_bytes(&m2), Err(CoreError::HostKeyUnverified));
+
+        // Rotate host identity and verify original `sh=` QR pin still anchors the rotation chain.
+        host_id
+            .rotate(
+                StaticKeypair::from_scalar([0x53; 32]),
+                SigningKeypair::from_seed([0x54; 32]),
+                1_795_132_800,
+            )
+            .unwrap();
+
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr
+            .issue_code_with_entropy(PairingCodeKind::Lan2Group, 1000, &[0x22; 32])
+            .unwrap();
+        let mut roster = Roster::new();
+        let mut init = PairingInitiator::new(
+            &dev_id,
+            "Dev",
+            "cli",
+            &code,
+            Some(parsed.to_pinned_host()),
+            None,
+        )
+        .unwrap();
+        let mut resp = PairingResponder::new(&host_id, PairingPathKind::Lan, None).unwrap();
+
+        let msg1 = match &init.start().unwrap()[0] {
+            PairAction::WriteBytes(b) => b.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        let msg2 = match &resp.feed_bytes(&msg1, 1001, &mut mgr, &mut roster).unwrap()[0] {
+            PairAction::WriteBytes(b) => b.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        let msg3 = init
+            .feed_bytes(&msg2)
+            .unwrap()
+            .into_iter()
+            .find_map(|a| match a {
+                PairAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .unwrap();
+        let msg4 = resp
+            .feed_bytes(&msg3, 1002, &mut mgr, &mut roster)
+            .unwrap()
+            .into_iter()
+            .find_map(|a| match a {
+                PairAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .unwrap();
+        let outcome = init
+            .feed_bytes(&msg4)
+            .unwrap()
+            .into_iter()
+            .find_map(|a| match a {
+                PairAction::Completed(o) => Some(o),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PairOutcome::InitiatorPending {
+                host_rotation_seq: 1,
+                host_pin_verified: true,
+                ref host_signing_pub,
+                ..
+            } if host_signing_pub == host_id.signing_key().public_key()
         ));
     }
 }
