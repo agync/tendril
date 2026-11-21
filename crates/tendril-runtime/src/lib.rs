@@ -7,6 +7,7 @@ pub mod providers;
 pub mod rate_limit;
 pub mod router;
 pub mod store;
+pub mod wake;
 
 pub use driver::{
     ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, SessionDriver, SessionEvent, dial_with_policy,
@@ -38,3 +39,12 @@ pub use providers::{
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
 pub use store::{RosterStamp, StateStore, deserialize_identity_json, serialize_identity_json};
+pub use wake::{
+    ApnsAps, ApnsPayload, DEFAULT_WAKE_COALESCE_INTERVAL_SECS, DEFAULT_WAKE_TIMEOUT,
+    FcmAndroidConfig, FcmDataFields, FcmMessage, FcmPayload, HttpWakeProvider,
+    MAX_WAKE_COALESCE_TARGETS, MAX_WAKE_ENDPOINT_URL_LEN, MemoryWakeProvider, NoopWakeProvider,
+    RecordedWake, WAKE_EPOCH_SECS, WAKE_TAG_LEN, WakeAdapterKind, WakeChannel, WakeCoalescer,
+    WakeEnvelope, WakeOutcome, WakeProvider, WakeSecret, WakeTag, WakeTarget, build_wake_payload,
+    derive_epoch_wake_tag, validate_wake_endpoint_url, verify_epoch_wake_tag_window, wake_epoch,
+    wake_epoch_start_secs,
+};
