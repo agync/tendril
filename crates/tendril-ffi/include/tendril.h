@@ -171,6 +171,14 @@ int32_t tendril_session_authorize(
 int32_t tendril_session_rekey(TendrilSession *sess);
 int32_t tendril_session_close(TendrilSession *sess, uint16_t code, const char *reason);
 
+int32_t tendril_endpoint_configure_transports_json(TendrilEndpoint *ep, const char *transport_config_json);
+int32_t tendril_endpoint_mint_relay_ticket(TendrilEndpoint *ep, const char *relay_host, const char *role, const char *target_pub_b64_or_wildcard, uint64_t ttl_secs, char **out_ticket_json);
+int32_t tendril_endpoint_serve_relay_v2(TendrilEndpoint *ep, const char *relay_url, const char *expected_host, const char *peer_id_opt, char **out_endpoint);
+int32_t tendril_endpoint_pair_v2_initiate(TendrilEndpoint *ep, const char *endpoint, const char *relay_host_opt, const char *code, const char *name, const char *kind, const char *pinned_host_json_opt, char **out_json);
+int32_t tendril_endpoint_pair_v2_accept(TendrilEndpoint *ep, uint64_t timeout_ms, char **out_json);
+TendrilSession *tendril_session_connect_v2(TendrilEndpoint *ep, const char *endpoint, const char *relay_host_opt, const char *target_host_id, const char *grant_json_opt);
+TendrilSession *tendril_session_accept_v2(TendrilEndpoint *ep, uint64_t timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

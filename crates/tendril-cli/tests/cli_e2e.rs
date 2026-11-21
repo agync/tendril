@@ -1676,3 +1676,919 @@ fn cli_accepts_leading_hyphen_b64url_args() {
         "pair must parse leading-hyphen --code instead of failing in clap: {pair_stderr}"
     );
 }
+
+#[tokio::test]
+async fn cli_e2e_relay_auth_ticket_and_hmac_gate() {
+    use tendril_core::crypto::{b64url_decode_array, b64url_encode};
+    use tendril_core::relay_auth::{RelayAuthScope, RelayTicket};
+    use zeroize::Zeroizing;
+
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+
+    let init_host = run_tendril(host_dir.path(), &["init", "--host-id", "host-gated"]);
+    assert!(init_host.status.success());
+    let host_info: serde_json::Value =
+        serde_json::from_slice(&init_host.stdout).expect("parse host init");
+    let host_relay_pub_b64 = host_info["relay_pub"]
+        .as_str()
+        .expect("host relay_pub")
+        .to_owned();
+    let host_relay_pub: [u8; 32] =
+        b64url_decode_array(&host_relay_pub_b64).expect("decode host relay_pub");
+
+    let init_cli = run_tendril(client_dir.path(), &["init"]);
+    assert!(init_cli.status.success());
+    let cli_info: serde_json::Value =
+        serde_json::from_slice(&init_cli.stdout).expect("parse cli init");
+    let cli_dev_id = cli_info["device_id"]
+        .as_str()
+        .expect("cli dev id")
+        .to_owned();
+
+    // Exercise relay-ticket subcommand targeting host_relay_pub and leading-hyphen target parsing.
+    let ticket_out = run_tendril(
+        host_dir.path(),
+        &[
+            "relay-ticket",
+            "--relay-host",
+            "localhost",
+            "--role",
+            "any",
+            "--target-pub",
+            &host_relay_pub_b64,
+            "--ttl-secs",
+            "300",
+        ],
+    );
+    assert!(
+        ticket_out.status.success(),
+        "relay-ticket failed: {}",
+        String::from_utf8_lossy(&ticket_out.stderr)
+    );
+    let ticket: RelayTicket =
+        serde_json::from_slice(&ticket_out.stdout).expect("parse relay ticket");
+    assert_eq!(ticket.target_pub, host_relay_pub_b64);
+    assert_eq!(ticket.relay_host, "localhost");
+
+    let hyphen_target = b64url_encode(&[0xFB; 32]);
+    assert!(hyphen_target.starts_with('-'));
+    let hyphen_ticket_out = run_tendril(
+        host_dir.path(),
+        &[
+            "relay-ticket",
+            "--relay-host",
+            "localhost",
+            "--role",
+            "dial",
+            "--target-pub",
+            &hyphen_target,
+        ],
+    );
+    assert!(
+        hyphen_ticket_out.status.success(),
+        "relay-ticket should accept leading-hyphen --target-pub: {}",
+        String::from_utf8_lossy(&hyphen_ticket_out.stderr)
+    );
+
+    let secret_file = host_dir.path().join("relay-secret.txt");
+    std::fs::write(&secret_file, "cli-gated-hmac-secret\n").expect("write relay secret");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let world_readable_secret = host_dir.path().join("insecure-secret.txt");
+    std::fs::write(&world_readable_secret, "cli-gated-hmac-secret\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &world_readable_secret,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+    }
+    let wrong_secret_file = client_dir.path().join("wrong-secret.txt");
+    std::fs::write(&wrong_secret_file, "wrong-hmac-secret\n").expect("write wrong secret");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrong_secret_file, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+    let ticket_file = client_dir.path().join("relay-ticket.json");
+    std::fs::write(&ticket_file, &ticket_out.stdout).expect("write ticket file");
+
+    let relay = RelayServer::bind(RelayConfig {
+        host: "localhost".to_owned(),
+        auth_secret: Some(Zeroizing::new(b"cli-gated-hmac-secret".to_vec())),
+        trusted_issuers: vec![host_relay_pub],
+        auth_scope: RelayAuthScope::All,
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind gated relay");
+    let relay_handle = relay.spawn();
+    let relay_url = relay_handle.ws_url();
+
+    tokio::task::spawn_blocking(move || {
+        // Negative: insecure 0644 secret file must fail closed on Unix.
+        #[cfg(unix)]
+        {
+            let bad_perm_serve = Command::new(tendril_bin())
+                .arg("--state-dir")
+                .arg(host_dir.path())
+                .args([
+                    "serve",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--relay",
+                    &relay_url,
+                    "--relay-host",
+                    "localhost",
+                    "--relay-auth-secret-file",
+                ])
+                .arg(&world_readable_secret)
+                .output()
+                .expect("run bad perm serve");
+            assert!(
+                !bad_perm_serve.status.success(),
+                "0644 secret file must be rejected"
+            );
+            assert!(
+                String::from_utf8_lossy(&bad_perm_serve.stderr).contains("0600"),
+                "stderr should recommend 0600: {}",
+                String::from_utf8_lossy(&bad_perm_serve.stderr)
+            );
+        }
+
+        // Negative: --relay-v2 without --wire-v2 must fail fast.
+        let bad_v2_combo = run_tendril(
+            host_dir.path(),
+            &[
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--relay",
+                &relay_url,
+                "--relay-v2",
+            ],
+        );
+        assert!(
+            !bad_v2_combo.status.success(),
+            "--relay-v2 without --wire-v2 must fail"
+        );
+
+        // Negative: unauthenticated serve fails when RelayAuthScope::All is enabled.
+        let bad_serve = run_tendril(
+            host_dir.path(),
+            &[
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--relay",
+                &relay_url,
+                "--relay-host",
+                "localhost",
+            ],
+        );
+        assert!(
+            !bad_serve.status.success(),
+            "serve without auth must fail against gated relay"
+        );
+
+        let mut serve = KillOnDrop(
+            Command::new(tendril_bin())
+                .arg("--state-dir")
+                .arg(host_dir.path())
+                .args([
+                    "serve",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--relay",
+                    &relay_url,
+                    "--relay-host",
+                    "localhost",
+                    "--relay-auth-secret-file",
+                ])
+                .arg(&secret_file)
+                .args(["--issue-code", "remote"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn gated serve"),
+        );
+
+        let mut stdout = BufReader::new(serve.0.stdout.take().expect("serve stdout"));
+        let listening = read_json_line(&mut stdout);
+        let relay_ep = listening["relay_endpoint"]
+            .as_str()
+            .expect("relay_endpoint")
+            .to_owned();
+        let code = listening["pairing_code"]
+            .as_str()
+            .expect("pairing_code")
+            .to_owned();
+
+        // Negative: pair with wrong HMAC secret fails.
+        let bad_pair = Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(client_dir.path())
+            .args([
+                "pair",
+                "--endpoint",
+                &relay_ep,
+                "--relay-host",
+                "localhost",
+                "--code",
+                &code,
+                "--relay-auth-secret-file",
+            ])
+            .arg(&wrong_secret_file)
+            .output()
+            .expect("run bad pair");
+        assert!(
+            !bad_pair.status.success(),
+            "pair with wrong secret must fail against gated relay"
+        );
+
+        // Positive: client authenticates using Ed25519 relay ticket file.
+        let ok_pair = Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(client_dir.path())
+            .args([
+                "pair",
+                "--endpoint",
+                &relay_ep,
+                "--relay-host",
+                "localhost",
+                "--code",
+                &code,
+                "--relay-ticket-file",
+            ])
+            .arg(&ticket_file)
+            .output()
+            .expect("run ticket pair");
+        assert!(
+            ok_pair.status.success(),
+            "ticket pair failed: {}",
+            String::from_utf8_lossy(&ok_pair.stderr)
+        );
+        let paired_info: serde_json::Value =
+            serde_json::from_slice(&ok_pair.stdout).expect("pair json");
+        let sas = paired_info["sas"].as_str().expect("sas");
+        let paired_ev = read_json_line(&mut stdout);
+        assert_eq!(paired_ev["event"], "paired");
+        assert_eq!(paired_ev["sas"], sas);
+
+        assert!(
+            run_tendril(client_dir.path(), &["confirm", "host-gated", "--sas", sas])
+                .status
+                .success()
+        );
+        assert!(
+            run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", sas])
+                .status
+                .success()
+        );
+        let mint = run_tendril(host_dir.path(), &["mint", &cli_dev_id, "--cap", "fs.read"]);
+        assert!(mint.status.success());
+        let grant = String::from_utf8(mint.stdout).unwrap();
+
+        let dial_out = Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(client_dir.path())
+            .args([
+                "dial",
+                "--target",
+                "host-gated",
+                "--endpoint",
+                &relay_ep,
+                "--relay-host",
+                "localhost",
+                "--relay-ticket-file",
+            ])
+            .arg(&ticket_file)
+            .args(["--grant", &grant, "--message", "hello-gated-v1"])
+            .output()
+            .expect("run ticket dial");
+        assert!(
+            dial_out.status.success(),
+            "ticket dial failed: {}",
+            String::from_utf8_lossy(&dial_out.stderr)
+        );
+        let est = read_json_line(&mut stdout);
+        assert_eq!(est["event"], "session_established");
+        let ev = read_json_line(&mut stdout);
+        assert_eq!(ev["event"], "data");
+        assert_eq!(ev["utf8"], "hello-gated-v1");
+    })
+    .await
+    .expect("spawn_blocking");
+}
+
+#[tokio::test]
+async fn cli_e2e_wire_v2_pair_relay_v2_downgrade_guard_and_http_wake() {
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tendril_core::crypto::b64url_decode_array;
+    use tendril_core::relay_auth::RelayAuthScope;
+    use tendril_runtime::{WakeTag, verify_epoch_wake_tag_window};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
+    use zeroize::Zeroizing;
+
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+
+    let init_host = run_tendril(host_dir.path(), &["init", "--host-id", "host-v2"]);
+    assert!(init_host.status.success());
+    let host_info: serde_json::Value = serde_json::from_slice(&init_host.stdout).unwrap();
+    let host_relay_pub: [u8; 32] =
+        b64url_decode_array(host_info["relay_pub"].as_str().unwrap()).unwrap();
+
+    let init_cli = run_tendril(client_dir.path(), &["init"]);
+    assert!(init_cli.status.success());
+    let cli_info: serde_json::Value = serde_json::from_slice(&init_cli.stdout).unwrap();
+    let cli_dev_id = cli_info["device_id"].as_str().unwrap().to_owned();
+
+    let ticket_out = run_tendril(
+        host_dir.path(),
+        &["relay-ticket", "--relay-host", "localhost", "--role", "any"],
+    );
+    assert!(ticket_out.status.success());
+    let ticket_file = client_dir.path().join("v2-ticket.json");
+    std::fs::write(&ticket_file, &ticket_out.stdout).unwrap();
+
+    let secret_file = host_dir.path().join("v2-hmac.txt");
+    std::fs::write(&secret_file, "v2-cli-hmac-secret\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let wake_secret = [0x42u8; 32];
+    let wake_secret_file = client_dir.path().join("wake-secret.txt");
+    std::fs::write(
+        &wake_secret_file,
+        tendril_core::crypto::b64url_encode(&wake_secret),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wake_secret_file, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+    let wake_auth_file = client_dir.path().join("wake-auth.txt");
+    std::fs::write(&wake_auth_file, "wake-bearer-tok\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wake_auth_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let relay = RelayServer::bind(RelayConfig {
+        host: "localhost".to_owned(),
+        auth_secret: Some(Zeroizing::new(b"v2-cli-hmac-secret".to_vec())),
+        trusted_issuers: vec![host_relay_pub],
+        auth_scope: RelayAuthScope::All,
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind v2 relay");
+    let relay_handle = relay.spawn();
+    let relay_v1_url = relay_handle.ws_url();
+    let relay_v2_url = relay_handle.ws_v2_url();
+
+    // Loopback HTTP wake sink #1 (pre-wake with bearer token verification).
+    let sink1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink1_addr = sink1.local_addr().unwrap();
+    let sink1_task = tokio::spawn(async move {
+        let (mut sock, _) = sink1.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end;
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer wake-bearer-tok"),
+            "missing wake auth header: {headers}"
+        );
+        let clen = headers
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        while buf.len() < header_end + clen {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
+        let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(verify_epoch_wake_tag_window(&wake_secret, &tag, now_s));
+        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    // Loopback HTTP wake sink #2 (wake-on-demand when host serve is sleeping).
+    let sink2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink2_addr = sink2.local_addr().unwrap();
+    let woken_notify = Arc::new(Notify::new());
+    let woken_notify_c = Arc::clone(&woken_notify);
+    let sink2_task = tokio::spawn(async move {
+        let (mut sock, _) = sink2.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end;
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
+        let clen = headers
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        while buf.len() < header_end + clen {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
+        let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(verify_epoch_wake_tag_window(&wake_secret, &tag, now_s));
+        woken_notify_c.notify_one();
+        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let host_dir_path = host_dir.path().to_path_buf();
+    let client_dir_path = client_dir.path().to_path_buf();
+    let secret_file_c = secret_file.clone();
+    let ticket_file_c = ticket_file.clone();
+    let wake_secret_c = wake_secret_file.clone();
+    let wake_auth_c = wake_auth_file.clone();
+    let v1_c = relay_v1_url.clone();
+    let v2_c = relay_v2_url.clone();
+
+    let grant = tokio::task::spawn_blocking(move || {
+        let mut serve1 = KillOnDrop(
+            Command::new(tendril_bin())
+                .arg("--state-dir")
+                .arg(&host_dir_path)
+                .args([
+                    "serve",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--relay",
+                    &v1_c,
+                    "--relay-host",
+                    "localhost",
+                    "--wire-v2",
+                    "--relay-v2",
+                    "--relay-auth-secret-file",
+                ])
+                .arg(&secret_file_c)
+                .args(["--issue-code", "remote"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn serve1"),
+        );
+
+        let mut stdout1 = BufReader::new(serve1.0.stdout.take().expect("serve1 stdout"));
+        let listening1 = read_json_line(&mut stdout1);
+        assert_eq!(listening1["wire_v2"], true);
+        let relay_ep = listening1["relay_endpoint"]
+            .as_str()
+            .expect("relay_endpoint")
+            .to_owned();
+        let code = listening1["pairing_code"]
+            .as_str()
+            .expect("pairing_code")
+            .to_owned();
+
+        // Pair with --wire-v2 over gated /v1/relay.
+        let pair_v2 = Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(&client_dir_path)
+            .args([
+                "pair",
+                "--endpoint",
+                &relay_ep,
+                "--relay-host",
+                "localhost",
+                "--wire-v2",
+                "--code",
+                &code,
+                "--relay-ticket-file",
+            ])
+            .arg(&ticket_file_c)
+            .output()
+            .expect("pair --wire-v2");
+        assert!(
+            pair_v2.status.success(),
+            "pair --wire-v2 failed: {}",
+            String::from_utf8_lossy(&pair_v2.stderr)
+        );
+        let paired_info: serde_json::Value =
+            serde_json::from_slice(&pair_v2.stdout).expect("pair v2 json");
+        let sas = paired_info["sas"].as_str().expect("sas");
+        let paired_ev = read_json_line(&mut stdout1);
+        assert_eq!(paired_ev["event"], "paired");
+        assert_eq!(paired_ev["sas"], sas);
+
+        assert!(
+            run_tendril(&client_dir_path, &["confirm", "host-v2", "--sas", sas])
+                .status
+                .success()
+        );
+        assert!(
+            run_tendril(&host_dir_path, &["confirm", &cli_dev_id, "--sas", sas])
+                .status
+                .success()
+        );
+        let mint = run_tendril(&host_dir_path, &["mint", &cli_dev_id, "--cap", "fs.read"]);
+        assert!(mint.status.success());
+        let grant = String::from_utf8(mint.stdout).unwrap();
+
+        // Anti-downgrade: dialing a v2-pinned host without --wire-v2 must fail closed.
+        let downgraded = Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(&client_dir_path)
+            .args([
+                "dial",
+                "--target",
+                "host-v2",
+                "--endpoint",
+                &relay_ep,
+                "--relay-host",
+                "localhost",
+                "--relay-ticket-file",
+            ])
+            .arg(&ticket_file_c)
+            .args(["--grant", &grant, "--message", "must-not-downgrade"])
+            .output()
+            .expect("run downgraded dial");
+        assert!(
+            !downgraded.status.success(),
+            "dial without --wire-v2 against v2-pinned host must fail closed"
+        );
+
+        // Wait briefly for dynamic RelayV2Listener sync inside running serve1, then dial /v2/relay with --wake-pre-wake.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let wake_url1 = format!("http://{sink1_addr}/wake");
+        let dial_v2 = Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(&client_dir_path)
+            .args([
+                "dial",
+                "--target",
+                "host-v2",
+                "--endpoint",
+                &v2_c,
+                "--relay-host",
+                "localhost",
+                "--wire-v2",
+                "--relay-v2",
+                "--wake-url",
+                &wake_url1,
+                "--wake-adapter",
+                "webhook",
+                "--wake-secret-file",
+            ])
+            .arg(&wake_secret_c)
+            .arg("--wake-auth-header-file")
+            .arg(&wake_auth_c)
+            .arg("--wake-pre-wake")
+            .arg("--relay-ticket-file")
+            .arg(&ticket_file_c)
+            .args(["--grant", &grant, "--message", "hello-v2-dynamic"])
+            .output()
+            .expect("run v2 dial");
+        assert!(
+            dial_v2.status.success(),
+            "v2 dial failed: {}",
+            String::from_utf8_lossy(&dial_v2.stderr)
+        );
+        let est1 = read_json_line(&mut stdout1);
+        assert_eq!(est1["event"], "session_established");
+        let ev1 = read_json_line(&mut stdout1);
+        assert_eq!(ev1["event"], "data");
+        assert_eq!(ev1["utf8"], "hello-v2-dynamic");
+
+        drop(serve1);
+        grant
+    })
+    .await
+    .unwrap();
+
+    sink1_task.await.unwrap();
+
+    // Phase 2: host sleeps until HTTP wake sink2 fires, then starts serve --relay-v2 and accepts client dial.
+    let v2_ep2 = relay_v2_url.clone();
+    let wake_url2 = format!("http://{sink2_addr}/wake");
+    let c_dir2 = client_dir.path().to_path_buf();
+    let w_sec2 = wake_secret_file.clone();
+    let t_file2 = ticket_file.clone();
+    let grant_c = grant.clone();
+    let dial_task = tokio::task::spawn_blocking(move || {
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(&c_dir2)
+            .args([
+                "dial",
+                "--target",
+                "host-v2",
+                "--endpoint",
+                &v2_ep2,
+                "--relay-host",
+                "localhost",
+                "--wire-v2",
+                "--relay-v2",
+                "--wake-url",
+                &wake_url2,
+                "--wake-secret-file",
+            ])
+            .arg(&w_sec2)
+            .arg("--relay-ticket-file")
+            .arg(&t_file2)
+            .args(["--grant", &grant_c, "--message", "woken-by-cli-http"])
+            .output()
+            .expect("run sleeping-host v2 dial")
+    });
+
+    woken_notify.notified().await;
+    sink2_task.await.unwrap();
+
+    let h_dir2 = host_dir.path().to_path_buf();
+    let v1_u2 = relay_v1_url.clone();
+    let sec_f2 = secret_file.clone();
+    let serve2_task = tokio::task::spawn_blocking(move || {
+        let mut serve2 = KillOnDrop(
+            Command::new(tendril_bin())
+                .arg("--state-dir")
+                .arg(&h_dir2)
+                .args([
+                    "serve",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--relay",
+                    &v1_u2,
+                    "--relay-host",
+                    "localhost",
+                    "--wire-v2",
+                    "--relay-v2",
+                    "--relay-auth-secret-file",
+                ])
+                .arg(&sec_f2)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn serve2"),
+        );
+        let mut stdout2 = BufReader::new(serve2.0.stdout.take().expect("serve2 stdout"));
+        let listening2 = read_json_line(&mut stdout2);
+        let v2_eps = listening2["relay_v2_endpoints"]
+            .as_array()
+            .expect("relay_v2_endpoints array");
+        assert!(
+            !v2_eps.is_empty(),
+            "pre-paired v2 host serve must report relay_v2_endpoints: {listening2:?}"
+        );
+        let est2 = read_json_line(&mut stdout2);
+        assert_eq!(est2["event"], "session_established");
+        let ev2 = read_json_line(&mut stdout2);
+        assert_eq!(ev2["event"], "data");
+        assert_eq!(ev2["utf8"], "woken-by-cli-http");
+        serve2
+    });
+
+    let (dial_res, serve2_res) = tokio::join!(dial_task, serve2_task);
+    let dial_out2 = dial_res.unwrap();
+    assert!(
+        dial_out2.status.success(),
+        "woken dial failed: {}",
+        String::from_utf8_lossy(&dial_out2.stderr)
+    );
+    let _serve2_guard = serve2_res.unwrap();
+}
+
+#[tokio::test]
+async fn cli_e2e_conformance_peer_v2_relay_auth_and_wake() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tendril_core::crypto::{b64url_decode_array, b64url_encode};
+    use tendril_core::relay_auth::RelayAuthScope;
+    use tendril_runtime::{WakeTag, verify_epoch_wake_tag_window};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use zeroize::Zeroizing;
+
+    let mut host = PeerProc::spawn();
+    let mut client = PeerProc::spawn();
+
+    let host_init = host.call(serde_json::json!({ "op": "init", "host_id": "peer-v2-host" }));
+    let host_relay_pub: [u8; 32] =
+        b64url_decode_array(host_init["relay_pub"].as_str().unwrap()).unwrap();
+    let client_init = client.call(serde_json::json!({ "op": "init" }));
+    let client_dev_id = client_init["device_id"].as_str().unwrap().to_owned();
+
+    let relay = RelayServer::bind(RelayConfig {
+        host: "localhost".to_owned(),
+        auth_secret: Some(Zeroizing::new(b"peer-hmac-secret".to_vec())),
+        trusted_issuers: vec![host_relay_pub],
+        auth_scope: RelayAuthScope::All,
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind gated relay");
+    let relay_handle = relay.spawn();
+    let relay_v1_url = relay_handle.ws_url();
+    let relay_v2_url = relay_handle.ws_v2_url();
+
+    // Unknown transport config field must fail closed.
+    host.send_cmd(&serde_json::json!({
+        "op": "configure_transports",
+        "unknown_field": true
+    }));
+    let bad_cfg = host.recv_resp();
+    assert_eq!(bad_cfg["ok"], false);
+
+    host.call(serde_json::json!({
+        "op": "configure_transports",
+        "relay_auth_secret": "peer-hmac-secret",
+        "p2p_relay_mode": "disabled"
+    }));
+    let ticket_resp = host.call(serde_json::json!({
+        "op": "mint_relay_ticket",
+        "relay_host": "localhost",
+        "role": "any",
+        "target_pub": "*",
+        "ttl_secs": 300
+    }));
+    let ticket_val = ticket_resp["ticket"].clone();
+
+    let wake_secret = [0x5Au8; 32];
+    let wake_sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let wake_addr = wake_sink.local_addr().unwrap();
+    let wake_task = tokio::spawn(async move {
+        let (mut sock, _) = wake_sink.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end;
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
+        let clen = headers
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        while buf.len() < header_end + clen {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
+        let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(verify_epoch_wake_tag_window(&wake_secret, &tag, now_s));
+        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    client.call(serde_json::json!({
+        "op": "configure_transports",
+        "relay_ticket": ticket_val,
+        "p2p_relay_mode": "disabled",
+        "wake_url": format!("http://{wake_addr}/wake"),
+        "wake_adapter": "webhook",
+        "wake_secret_b64": b64url_encode(&wake_secret),
+        "wake_pre_wake": true,
+        "wake_retry_delay_ms": 50,
+        "wake_max_attempts": 25
+    }));
+
+    tokio::task::spawn_blocking(move || {
+        let srv = host.call(serde_json::json!({
+            "op": "serve_relay",
+            "relay_url": relay_v1_url,
+            "expected_host": "localhost"
+        }));
+        let ep1 = srv["endpoint"].as_str().unwrap().to_owned();
+        let issued = host.call(serde_json::json!({ "op": "issue_code", "kind": "remote" }));
+        let code = issued["code"].as_str().unwrap().to_owned();
+
+        host.send_cmd(&serde_json::json!({ "op": "pair_v2_accept", "timeout_ms": 10000 }));
+        let init_v2 = client.call(serde_json::json!({
+            "op": "pair_v2_initiate",
+            "endpoint": ep1,
+            "relay_host": "localhost",
+            "code": code,
+            "name": "peer-cli",
+            "kind": "cli"
+        }));
+        let acc_v2 = host.recv_resp();
+        assert_eq!(acc_v2["ok"], true, "pair_v2_accept failed: {acc_v2:?}");
+        assert_eq!(init_v2["host_id"], "peer-v2-host");
+        assert_eq!(init_v2["wire_version"], 2);
+        let sas = init_v2["sas"].as_str().unwrap().to_owned();
+
+        client.call(serde_json::json!({ "op": "confirm", "peer_id": "peer-v2-host", "sas": sas }));
+        host.call(serde_json::json!({ "op": "confirm", "peer_id": client_dev_id, "sas": sas }));
+        let grant_resp = host.call(serde_json::json!({
+            "op": "mint",
+            "peer_id": client_dev_id,
+            "caps": ["fs.read"]
+        }));
+        let grant = grant_resp["grant"].clone();
+
+        let srv2 = host.call(serde_json::json!({
+            "op": "serve_relay_v2",
+            "relay_url": relay_v2_url,
+            "expected_host": "localhost"
+        }));
+        let ep2 = srv2["endpoint"].as_str().unwrap().to_owned();
+
+        host.send_cmd(&serde_json::json!({ "op": "accept_v2", "timeout_ms": 10000 }));
+        client.call(serde_json::json!({
+            "op": "connect_v2",
+            "endpoint": ep2,
+            "relay_host": "localhost",
+            "target_host_id": "peer-v2-host",
+            "grant": grant
+        }));
+        let acc_sess = host.recv_resp();
+        assert_eq!(acc_sess["ok"], true, "accept_v2 failed: {acc_sess:?}");
+
+        client.call(serde_json::json!({ "op": "send", "data_utf8": "hello-peer-v2" }));
+        let recv_ev = host.call(serde_json::json!({ "op": "recv", "timeout_ms": 5000 }));
+        assert_eq!(recv_ev["data_utf8"], "hello-peer-v2");
+
+        let auth = host.call(serde_json::json!({ "op": "authorize", "cap": "fs.read" }));
+        assert_eq!(auth["allowed"], true);
+        client.call(serde_json::json!({ "op": "rekey" }));
+        client.call(serde_json::json!({ "op": "close" }));
+    })
+    .await
+    .expect("spawn_blocking peer test");
+
+    wake_task.await.unwrap();
+}

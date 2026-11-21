@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "tendril-conformance-peer"
 path = "src/bin/conformance_peer.rs"
 
+[features]
+default = []
+p2p-iroh-services = ["tendril-runtime/p2p-iroh-services"]
+
 [dependencies]
 clap.workspace = true
 serde.workspace = true

@@ -12,6 +12,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [features]
 default = ["p2p-iroh"]
 p2p-iroh = ["tendril-runtime/p2p-iroh"]
+p2p-iroh-services = ["p2p-iroh", "tendril-runtime/p2p-iroh-services"]
 
 [dependencies]
 serde.workspace = true
@@ -23,6 +24,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tendril-relay.workspace = true
 
 [lints.rust]
 unsafe_code = "allow"

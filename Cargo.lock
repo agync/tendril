@@ -3882,6 +3882,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tendril-core",
+ "tendril-relay",
  "tendril-runtime",
  "tokio",
  "zeroize",

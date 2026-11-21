@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
+use std::fmt;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -11,34 +12,49 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Deserialize;
 use tendril_core::crypto::{
-    HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, b64url_decode_array,
-    b64url_encode, compute_code_mac, device_id, fingerprint_device, fingerprint_host, pairing_sas,
-    random_bytes,
+    HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, b64url_decode,
+    b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
+    fingerprint_host, pairing_sas, random_bytes,
 };
 use tendril_core::error::CoreError;
-use tendril_core::grants::{Grant, RevocationList, authorize_grant};
+use tendril_core::grants::{Grant, RevocationList, authorize_grant, canonical_json};
 use tendril_core::identity::{
     EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
 };
 use tendril_core::pairing::{
-    EnrollmentPolicy, PairOutcome, PairingCodeKind, PairingConfig, PairingManager, PinnedHost,
-    mint_enrollment_token,
+    EnrollmentPolicy, PairAction, PairOutcome, PairingCodeKind, PairingConfig, PairingInitiator,
+    PairingManager, PinnedHost, mint_enrollment_token,
 };
-use tendril_core::roster::{AnchorState, Roster};
+use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket};
+use tendril_core::roster::{AnchorState, PeerState, Roster};
+use tendril_core::v2::{
+    V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
+};
 use tendril_runtime::{
-    ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectListener,
-    InboundRouter, PathListener, RelayListener, SessionDriver, SessionEvent, StateStore,
-    deserialize_identity_json, dial_endpoint, drive_m2m_enroll_initiator_with_floor,
-    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_floor,
-    drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
-    pairing_path_kind_for_provider, pinned_pairing_floor, serialize_identity_json,
+    BrokerDialer, ConcurrentSession, ConcurrentV2Session, DEFAULT_PRE_AUTH_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, HttpWakeProvider, InboundRouter,
+    LocalDialer, MAX_OUTER_FRAME_LEN, OverlayDialer, PathDialer, PathListener, PathStream,
+    RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer, RelayV2Listener,
+    RelayV2ListenerConfig, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
+    V2SessionDriver, WakeAdapterKind, WakeDialOptions, WakeSecret, WakeTarget,
+    deserialize_identity_json, dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
+    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_store,
+    drive_pair_responder_with_policy_and_store, drive_v2_pake_pair_initiator_with_store,
+    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
+    drive_v2_pake_pair_responder_with_store, pairing_path_kind_for_provider, pinned_pairing_floor,
+    serialize_identity_json, wake_and_dial_v2,
 };
 #[cfg(feature = "p2p-iroh")]
-use tendril_runtime::{P2pListener, parse_p2p_relay_mode};
+use tendril_runtime::{
+    P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, parse_p2p_relay_mode,
+    parse_p2p_relay_modes,
+};
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const TENDRIL_OK: i32 = 0;
 pub const TENDRIL_WOULD_BLOCK: i32 = 1;
@@ -198,14 +214,643 @@ fn persist_store_roster(
     Ok(())
 }
 
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+struct TransportConfigInput {
+    relay_auth_secret: Option<String>,
+    #[zeroize(skip)]
+    relay_ticket: Option<RelayTicket>,
+    #[zeroize(skip)]
+    p2p_relay_mode: Option<String>,
+    #[zeroize(skip)]
+    p2p_relay_urls: Option<Vec<String>>,
+    #[zeroize(skip)]
+    p2p_pkarr: Option<bool>,
+    #[zeroize(skip)]
+    p2p_advertise_direct_addrs: Option<bool>,
+    #[zeroize(skip)]
+    p2p_allow_private_addrs: Option<bool>,
+    p2p_relay_auth_token: Option<String>,
+    p2p_api_secret: Option<String>,
+    #[zeroize(skip)]
+    wake_url: Option<String>,
+    #[zeroize(skip)]
+    wake_adapter: Option<WakeAdapterKind>,
+    wake_secret_b64: Option<String>,
+    wake_auth_token: Option<String>,
+    #[zeroize(skip)]
+    wake_pre_wake: Option<bool>,
+    #[zeroize(skip)]
+    wake_retry_delay_ms: Option<u64>,
+    #[zeroize(skip)]
+    wake_max_attempts: Option<usize>,
+    #[zeroize(skip)]
+    wake_timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+struct WakeTransportConfig {
+    #[zeroize(skip)]
+    target: WakeTarget,
+    #[zeroize(skip)]
+    secret: WakeSecret,
+    pre_wake: bool,
+    retry_delay_ms: u64,
+    max_attempts: usize,
+    timeout_ms: u64,
+}
+
+impl fmt::Debug for WakeTransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WakeTransportConfig")
+            .field("target", &self.target)
+            .field("secret", &"<redacted>")
+            .field("pre_wake", &self.pre_wake)
+            .field("retry_delay_ms", &self.retry_delay_ms)
+            .field("max_attempts", &self.max_attempts)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
+struct EndpointTransportConfig {
+    relay_auth: RelayClientAuth,
+    #[cfg(feature = "p2p-iroh")]
+    p2p_relay_mode: Option<P2pRelayMode>,
+    #[cfg(feature = "p2p-iroh")]
+    p2p_pkarr: Option<bool>,
+    #[cfg(feature = "p2p-iroh")]
+    p2p_advertise_direct_addrs: Option<bool>,
+    #[cfg(feature = "p2p-iroh")]
+    p2p_allow_private_addrs: Option<bool>,
+    #[cfg(feature = "p2p-iroh")]
+    p2p_relay_auth: Option<P2pRelayAuth>,
+    wake: Option<WakeTransportConfig>,
+}
+
+impl fmt::Debug for EndpointTransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut dbg = f.debug_struct("EndpointTransportConfig");
+        dbg.field("relay_auth", &self.relay_auth);
+        #[cfg(feature = "p2p-iroh")]
+        {
+            dbg.field("p2p_relay_mode", &self.p2p_relay_mode)
+                .field("p2p_pkarr", &self.p2p_pkarr)
+                .field(
+                    "p2p_advertise_direct_addrs",
+                    &self.p2p_advertise_direct_addrs,
+                )
+                .field("p2p_allow_private_addrs", &self.p2p_allow_private_addrs)
+                .field("p2p_relay_auth", &self.p2p_relay_auth);
+        }
+        dbg.field("wake", &self.wake).finish()
+    }
+}
+
+impl Drop for EndpointTransportConfig {
+    fn drop(&mut self) {
+        self.relay_auth = RelayClientAuth::None;
+        #[cfg(feature = "p2p-iroh")]
+        {
+            self.p2p_relay_auth = None;
+        }
+        self.wake = None;
+    }
+}
+
+impl EndpointTransportConfig {
+    fn from_input(mut input: TransportConfigInput) -> Result<Self, (i32, String)> {
+        if input.relay_auth_secret.is_some() && input.relay_ticket.is_some() {
+            return Err((
+                TENDRIL_ERR_INVALID_ARG,
+                "relay_auth_secret and relay_ticket are mutually exclusive".to_owned(),
+            ));
+        }
+        if input.p2p_relay_auth_token.is_some() && input.p2p_api_secret.is_some() {
+            return Err((
+                TENDRIL_ERR_INVALID_ARG,
+                "p2p_relay_auth_token and p2p_api_secret are mutually exclusive".to_owned(),
+            ));
+        }
+        if input.p2p_relay_mode.is_some() && input.p2p_relay_urls.is_some() {
+            return Err((
+                TENDRIL_ERR_INVALID_ARG,
+                "p2p_relay_mode and p2p_relay_urls are mutually exclusive".to_owned(),
+            ));
+        }
+
+        let relay_auth = if let Some(sec) = input.relay_auth_secret.take().map(Zeroizing::new) {
+            let trimmed = sec.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+                return Err((
+                    TENDRIL_ERR_INVALID_ARG,
+                    "invalid relay_auth_secret".to_owned(),
+                ));
+            }
+            let parsed = RelayAuthSecret::from_bytes(trimmed.as_bytes()).map_err(|_| {
+                (
+                    TENDRIL_ERR_INVALID_ARG,
+                    "invalid relay_auth_secret".to_owned(),
+                )
+            })?;
+            RelayClientAuth::HmacSecret(parsed)
+        } else if let Some(ticket) = input.relay_ticket.take() {
+            canonical_relay_host(&ticket.relay_host)
+                .map_err(|e| (TENDRIL_ERR_INVALID_ARG, e.to_string()))?;
+            if ticket.issuer_pub.is_empty() || ticket.target_pub.is_empty() || ticket.sig.is_empty()
+            {
+                return Err((
+                    TENDRIL_ERR_INVALID_ARG,
+                    "relay_ticket has empty required fields".to_owned(),
+                ));
+            }
+            RelayClientAuth::Ticket(ticket)
+        } else {
+            RelayClientAuth::None
+        };
+
+        #[cfg(not(feature = "p2p-iroh"))]
+        {
+            if input.p2p_relay_mode.is_some()
+                || input.p2p_relay_urls.is_some()
+                || input.p2p_relay_auth_token.is_some()
+                || input.p2p_api_secret.is_some()
+                || input.p2p_pkarr == Some(true)
+                || input.p2p_advertise_direct_addrs == Some(true)
+                || input.p2p_allow_private_addrs == Some(true)
+            {
+                return Err((
+                    TENDRIL_ERR_PROTOCOL,
+                    "tendril-ffi built without p2p-iroh feature".to_owned(),
+                ));
+            }
+        }
+
+        #[cfg(feature = "p2p-iroh")]
+        let (p2p_relay_mode, p2p_relay_auth) = {
+            let mode = if let Some(ref mode_s) = input.p2p_relay_mode {
+                Some(
+                    parse_p2p_relay_mode(Some(mode_s))
+                        .map_err(|e| (TENDRIL_ERR_INVALID_ARG, e.to_string()))?,
+                )
+            } else if let Some(ref urls) = input.p2p_relay_urls {
+                Some(
+                    parse_p2p_relay_modes(urls)
+                        .map_err(|e| (TENDRIL_ERR_INVALID_ARG, e.to_string()))?,
+                )
+            } else {
+                None
+            };
+
+            let auth = if let Some(tok) = input.p2p_relay_auth_token.take().map(Zeroizing::new) {
+                if tok.is_empty() || tok.chars().any(char::is_control) {
+                    return Err((
+                        TENDRIL_ERR_INVALID_ARG,
+                        "invalid p2p_relay_auth_token".to_owned(),
+                    ));
+                }
+                Some(P2pRelayAuth::BearerToken(tok))
+            } else if let Some(sec) = input.p2p_api_secret.take().map(Zeroizing::new) {
+                #[cfg(feature = "p2p-iroh-services")]
+                {
+                    if sec.is_empty() || sec.chars().any(char::is_control) {
+                        return Err((TENDRIL_ERR_INVALID_ARG, "invalid p2p_api_secret".to_owned()));
+                    }
+                    Some(P2pRelayAuth::IrohServicesSecret(sec))
+                }
+                #[cfg(not(feature = "p2p-iroh-services"))]
+                {
+                    let _ = sec;
+                    return Err((
+                        TENDRIL_ERR_PROTOCOL,
+                        "tendril-ffi built without p2p-iroh-services feature".to_owned(),
+                    ));
+                }
+            } else {
+                None
+            };
+
+            if auth.is_some() && matches!(mode, Some(P2pRelayMode::Disabled)) {
+                return Err((
+                    TENDRIL_ERR_INVALID_ARG,
+                    "p2p relay auth is invalid when p2p_relay_mode is disabled".to_owned(),
+                ));
+            }
+            (mode, auth)
+        };
+
+        let wake = if let Some(url) = input.wake_url.take() {
+            let adapter = input.wake_adapter.unwrap_or(WakeAdapterKind::Webhook);
+            let mut target = WakeTarget::new(adapter, &url)
+                .map_err(|e| (TENDRIL_ERR_INVALID_ARG, e.to_string()))?;
+            if let Some(tok) = input.wake_auth_token.take().map(Zeroizing::new) {
+                target = target.with_auth_token(tok.as_str()).map_err(|_| {
+                    (
+                        TENDRIL_ERR_INVALID_ARG,
+                        "invalid wake_auth_token".to_owned(),
+                    )
+                })?;
+            }
+            let secret_b64 = input
+                .wake_secret_b64
+                .take()
+                .map(Zeroizing::new)
+                .ok_or_else(|| {
+                    (
+                        TENDRIL_ERR_INVALID_ARG,
+                        "wake_secret_b64 is required when wake_url is set".to_owned(),
+                    )
+                })?;
+            let secret_bytes =
+                Zeroizing::new(b64url_decode_array::<32>(secret_b64.trim()).map_err(|_| {
+                    (
+                        TENDRIL_ERR_INVALID_ARG,
+                        "invalid wake_secret_b64".to_owned(),
+                    )
+                })?);
+            Some(WakeTransportConfig {
+                target,
+                secret: WakeSecret::from_bytes(*secret_bytes),
+                pre_wake: input.wake_pre_wake.unwrap_or(false),
+                retry_delay_ms: input.wake_retry_delay_ms.unwrap_or(100),
+                max_attempts: input.wake_max_attempts.unwrap_or(10).max(1),
+                timeout_ms: input.wake_timeout_ms.unwrap_or(3_000),
+            })
+        } else if input.wake_adapter.is_some()
+            || input.wake_secret_b64.is_some()
+            || input.wake_auth_token.is_some()
+            || input.wake_pre_wake.is_some()
+            || input.wake_retry_delay_ms.is_some()
+            || input.wake_max_attempts.is_some()
+            || input.wake_timeout_ms.is_some()
+        {
+            return Err((
+                TENDRIL_ERR_INVALID_ARG,
+                "wake_* options require wake_url".to_owned(),
+            ));
+        } else {
+            None
+        };
+
+        Ok(Self {
+            relay_auth,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_relay_mode,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_pkarr: input.p2p_pkarr,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_advertise_direct_addrs: input.p2p_advertise_direct_addrs,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_allow_private_addrs: input.p2p_allow_private_addrs,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_relay_auth,
+            wake,
+        })
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn build_p2p_listener_options(
+        &self,
+        relay_mode_override: Option<&str>,
+    ) -> Result<P2pOptions, RuntimeError> {
+        let mode = match relay_mode_override.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => parse_p2p_relay_mode(Some(raw))?,
+            None => self.p2p_relay_mode.clone().unwrap_or(P2pRelayMode::Default),
+        };
+        let mut opts = P2pOptions::for_listener(mode);
+        if let Some(pkarr) = self.p2p_pkarr {
+            opts = opts.with_publish_pkarr(pkarr).with_resolve_pkarr(pkarr);
+        }
+        if let Some(adv) = self.p2p_advertise_direct_addrs {
+            opts = opts.with_advertise_direct_addrs(adv);
+        }
+        if let Some(allow_priv) = self.p2p_allow_private_addrs {
+            opts = opts.with_allow_private_addrs(allow_priv);
+        }
+        opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
+        Ok(opts)
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn build_p2p_dialer_options(
+        &self,
+        relay_host: Option<&str>,
+    ) -> Result<P2pOptions, RuntimeError> {
+        let mode = if let Some(ref m) = self.p2p_relay_mode {
+            m.clone()
+        } else if let Some(spec) = relay_host.map(str::trim).filter(|s| !s.is_empty()) {
+            parse_p2p_relay_mode(Some(spec))?
+        } else if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") {
+            P2pRelayMode::Disabled
+        } else {
+            P2pRelayMode::Default
+        };
+        let mut opts = P2pOptions::for_dialer(mode);
+        if let Some(pkarr) = self.p2p_pkarr {
+            opts = opts.with_resolve_pkarr(pkarr);
+        }
+        if let Some(allow_priv) = self.p2p_allow_private_addrs {
+            opts = opts.with_allow_private_addrs(allow_priv);
+        } else if matches!(opts.relay_mode, P2pRelayMode::Disabled) {
+            opts = opts.with_allow_private_addrs(true);
+        }
+        opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
+        Ok(opts)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FfiPinnedHostInput {
+    host_id: Option<String>,
+    #[serde(alias = "static_pub")]
+    static_pub_b64: String,
+    #[serde(alias = "signing_pub", alias = "signing_pin")]
+    signing_pin_b64: String,
+    #[serde(default)]
+    rotation_seq: u64,
+    #[serde(default)]
+    min_wire_version: Option<u8>,
+}
+
+fn parse_signing_pin_b64(encoded: &str) -> Result<SigningKeyPin, String> {
+    let bytes = b64url_decode(encoded).map_err(|e| e.to_string())?;
+    if bytes.len() == HYBRID_SIGNING_PUB_LEN {
+        HybridSigningPublicKey::from_bytes(&bytes)
+            .map(SigningKeyPin::Full)
+            .map_err(|e| e.to_string())
+    } else if bytes.len() == HYBRID_SIGNING_HASH_LEN {
+        let hash: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "invalid signing key hash length".to_owned())?;
+        Ok(SigningKeyPin::Hash(hash))
+    } else {
+        Err(format!("invalid signing pin length {}", bytes.len()))
+    }
+}
+
+fn ws_path(endpoint: &str) -> &str {
+    let without_frag = endpoint.split_once('#').map_or(endpoint, |(u, _)| u);
+    let without_query = without_frag
+        .split_once('?')
+        .map_or(without_frag, |(u, _)| u);
+    if let Some(rest) = without_query
+        .strip_prefix("ws://")
+        .or_else(|| without_query.strip_prefix("wss://"))
+    {
+        rest.split_once('/').map_or("", |(_, path)| path)
+    } else {
+        ""
+    }
+}
+
+fn is_v2_relay_endpoint(endpoint: &str) -> bool {
+    (endpoint.starts_with("ws://") || endpoint.starts_with("wss://"))
+        && ws_path(endpoint) == "v2/relay"
+}
+
+fn lookup_v2_mailbox_secret_for_target(
+    roster: &Roster,
+    target_host_id: &str,
+) -> Result<[u8; 32], (i32, String)> {
+    let entry = roster.get(target_host_id).ok_or_else(|| {
+        (
+            TENDRIL_ERR_NOT_FOUND,
+            format!("target '{target_host_id}' not found in roster"),
+        )
+    })?;
+    if entry.state == PeerState::Revoked {
+        return Err((
+            TENDRIL_ERR_PROTOCOL,
+            format!("target '{target_host_id}' is revoked"),
+        ));
+    }
+    entry
+        .v2_secrets
+        .as_ref()
+        .map(|s| *s.mailbox_secret())
+        .ok_or_else(|| {
+            (
+                TENDRIL_ERR_PROTOCOL,
+                format!("target '{target_host_id}' has no v2 mailbox_secret"),
+            )
+        })
+}
+
+fn lookup_v2_mailbox_secret_for_pair(
+    roster: &Roster,
+    pinned: Option<&PinnedHost>,
+    endpoint: &str,
+    now_unix: u64,
+) -> Result<[u8; 32], RuntimeError> {
+    if let Some(pin) = pinned {
+        if let Some(ref hid) = pin.host_id
+            && let Some(entry) = roster.get(hid)
+            && entry.state != PeerState::Revoked
+            && let Some(ref secrets) = entry.v2_secrets
+        {
+            return Ok(*secrets.mailbox_secret());
+        }
+        for (_, entry) in roster.entries() {
+            if entry.state != PeerState::Revoked
+                && entry.static_pub == pin.static_pub
+                && let Some(ref secrets) = entry.v2_secrets
+            {
+                return Ok(*secrets.mailbox_secret());
+            }
+        }
+    }
+    if let Some((_, frag)) = endpoint.split_once('#')
+        && !frag.is_empty()
+    {
+        for (_, entry) in roster.entries() {
+            if entry.state != PeerState::Revoked
+                && let Some(ref secrets) = entry.v2_secrets
+            {
+                let win = derive_epoch_mailbox_window(secrets.mailbox_secret(), now_unix);
+                if win
+                    .mailboxes()
+                    .iter()
+                    .any(|mb| mb.mailbox_id_b64url() == frag)
+                {
+                    return Ok(*secrets.mailbox_secret());
+                }
+            }
+        }
+    }
+    Err(RuntimeError::Protocol(
+        "no matching v2 mailbox_secret in roster for /v2/relay endpoint".to_owned(),
+    ))
+}
+
+async fn dial_endpoint_v2_with_options(
+    endpoint: &str,
+    relay_host: Option<&str>,
+    cfg: &EndpointTransportConfig,
+    v2_mailbox_secret: Option<[u8; 32]>,
+) -> Result<Box<dyn PathStream>, RuntimeError> {
+    let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
+    if endpoint.starts_with("iroh://") {
+        #[cfg(feature = "p2p-iroh")]
+        {
+            let opts = cfg.build_p2p_dialer_options(normalized_host)?;
+            let dialer = P2pDialer::bind_with_options(opts).await?;
+            return match dialer.dial(endpoint).await {
+                Ok(stream) => Ok(stream),
+                Err(err) => {
+                    dialer.close().await;
+                    Err(err)
+                }
+            };
+        }
+        #[cfg(not(feature = "p2p-iroh"))]
+        {
+            let _ = normalized_host;
+            return Err(RuntimeError::Protocol(
+                "p2p-iroh feature is not enabled in tendril-ffi".to_owned(),
+            ));
+        }
+    }
+    if let Some(secret) = v2_mailbox_secret {
+        let mut dialer = RelayV2Dialer::new(secret).with_auth(cfg.relay_auth.clone());
+        if let Some(host) = normalized_host {
+            dialer = dialer.with_expected_host(host);
+        }
+        return dialer.dial(endpoint).await;
+    }
+    dial_endpoint_with_auth(endpoint, normalized_host, cfg.relay_auth.clone()).await
+}
+
+async fn build_dialer_with_options(
+    endpoint: &str,
+    relay_host: Option<&str>,
+    cfg: &EndpointTransportConfig,
+    v2_mailbox_secret: Option<[u8; 32]>,
+) -> Result<Box<dyn PathDialer>, RuntimeError> {
+    let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
+    if endpoint.starts_with("iroh://") {
+        #[cfg(feature = "p2p-iroh")]
+        {
+            let opts = cfg.build_p2p_dialer_options(normalized_host)?;
+            return Ok(Box::new(P2pDialer::bind_with_options(opts).await?));
+        }
+        #[cfg(not(feature = "p2p-iroh"))]
+        {
+            let _ = normalized_host;
+            return Err(RuntimeError::Protocol(
+                "p2p-iroh feature is not enabled in tendril-ffi".to_owned(),
+            ));
+        }
+    }
+    if endpoint.starts_with("overlay://") {
+        return Ok(Box::new(OverlayDialer::new()));
+    }
+    if endpoint.starts_with("broker+ws://") || endpoint.starts_with("broker+wss://") {
+        return Ok(Box::new(BrokerDialer::new()));
+    }
+    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        if let Some(secret) = v2_mailbox_secret {
+            let mut dialer = RelayV2Dialer::new(secret).with_auth(cfg.relay_auth.clone());
+            if let Some(host) = normalized_host {
+                dialer = dialer.with_expected_host(host);
+            }
+            return Ok(Box::new(dialer));
+        }
+        let mut dialer = RelayDialer::new().with_auth(cfg.relay_auth.clone());
+        if let Some(host) = normalized_host {
+            dialer = dialer.with_expected_host(host);
+        }
+        return Ok(Box::new(dialer));
+    }
+    if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
+        return Ok(Box::new(LocalDialer::new()));
+    }
+    Ok(Box::new(DirectDialer::new()))
+}
+
+async fn drive_v1_pair_initiator_with_roster_floors(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    device_name: String,
+    device_kind: String,
+    code: String,
+    roster: &Roster,
+) -> Result<PairOutcome, RuntimeError> {
+    let mut machine = PairingInitiator::new_with_min_wire_version(
+        identity,
+        device_name,
+        device_kind,
+        code,
+        None,
+        tendril_core::WIRE_VERSION,
+        None,
+    )?
+    .with_roster_floors(roster);
+    timeout(DEFAULT_PRE_AUTH_TIMEOUT, async {
+        let init_actions = machine.start()?;
+        let mut should_close = false;
+        for action in init_actions {
+            match action {
+                PairAction::WriteBytes(bytes) => {
+                    for chunk in bytes.chunks(MAX_OUTER_FRAME_LEN) {
+                        stream.send_chunk(chunk).await?;
+                    }
+                }
+                PairAction::SasReady { .. } => {}
+                PairAction::Completed(outcome) => return Ok(outcome),
+                PairAction::CloseTransport(_) => {
+                    should_close = true;
+                }
+            }
+        }
+        if should_close {
+            let _ = stream.close().await;
+        }
+        let mut buf = vec![0u8; MAX_OUTER_FRAME_LEN];
+        loop {
+            let n = stream.recv_chunk(&mut buf).await?;
+            if n == 0 {
+                return Err(RuntimeError::Closed);
+            }
+            let actions = machine.feed_bytes(&buf[..n])?;
+            let mut completed = None;
+            let mut close_now = false;
+            for action in actions {
+                match action {
+                    PairAction::WriteBytes(bytes) => {
+                        for chunk in bytes.chunks(MAX_OUTER_FRAME_LEN) {
+                            stream.send_chunk(chunk).await?;
+                        }
+                    }
+                    PairAction::SasReady { .. } => {}
+                    PairAction::Completed(outcome) => completed = Some(outcome),
+                    PairAction::CloseTransport(_) => close_now = true,
+                }
+            }
+            if close_now {
+                let _ = stream.close().await;
+            }
+            if let Some(outcome) = completed {
+                return Ok(outcome);
+            }
+        }
+    })
+    .await
+    .map_err(|_| RuntimeError::Timeout("pre-auth pairing handshake timed out"))?
+}
+
 /// Opaque endpoint handle owning a Tokio runtime, identity, roster, and background listeners.
 pub struct TendrilEndpoint {
     rt: Arc<Runtime>,
     store: Option<Arc<StateStore>>,
+    store_lock: Arc<AsyncMutex<()>>,
     identity: EndpointIdentity,
     roster: Arc<StdMutex<Roster>>,
-    pair_mgr: StdMutex<PairingManager>,
+    pair_mgr: Arc<StdMutex<PairingManager>>,
     router: InboundRouter,
+    v2_state: Arc<V2ResponderState>,
+    transport_cfg: StdMutex<EndpointTransportConfig>,
     self_m2m_enabled: AtomicBool,
     m2m_enabled: AtomicBool,
 }
@@ -216,6 +861,22 @@ impl TendrilEndpoint {
             store.save_roster(roster).map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    fn sync_roster_from_store(&self) -> Result<(), String> {
+        if let Some(store) = &self.store {
+            let disk = store.load_roster().map_err(|e| e.to_string())?;
+            let mut guard = self.roster.lock().expect("roster mutex poisoned");
+            *guard = disk;
+        }
+        Ok(())
+    }
+
+    fn snapshot_transport_cfg(&self) -> EndpointTransportConfig {
+        self.transport_cfg
+            .lock()
+            .expect("transport_cfg mutex poisoned")
+            .clone()
     }
 
     fn refresh_m2m_enabled(&self, roster: &Roster) {
@@ -252,10 +913,13 @@ fn build_endpoint_handle(
     Box::into_raw(Box::new(TendrilEndpoint {
         rt,
         store,
+        store_lock: Arc::new(AsyncMutex::new(())),
         identity,
         roster: Arc::new(StdMutex::new(roster)),
-        pair_mgr: StdMutex::new(PairingManager::new(PairingConfig::default())),
+        pair_mgr: Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default()))),
         router: InboundRouter::new(),
+        v2_state: Arc::new(V2ResponderState::new()),
+        transport_cfg: StdMutex::new(EndpointTransportConfig::default()),
         self_m2m_enabled: AtomicBool::new(false),
         m2m_enabled: AtomicBool::new(has_active_anchor),
     }))
@@ -275,12 +939,69 @@ unsafe fn write_roster_json_out(roster_arc: &StdMutex<Roster>, out_json: *mut *m
     unsafe { write_out_cstring(out_json, &json) }
 }
 
+enum SessionBackend {
+    V1(ConcurrentSession),
+    V2(ConcurrentV2Session),
+}
+
+impl SessionBackend {
+    fn shutdown(&self) {
+        match self {
+            Self::V1(s) => s.shutdown(),
+            Self::V2(s) => s.shutdown(),
+        }
+    }
+
+    async fn send_data(&self, payload: &[u8]) -> Result<(), RuntimeError> {
+        match self {
+            Self::V1(s) => s.send_data(payload).await,
+            Self::V2(s) => s.send_data(payload).await,
+        }
+    }
+
+    async fn next_event_locked_now(
+        &self,
+        roster: &StdMutex<Roster>,
+    ) -> Result<Option<SessionEvent>, RuntimeError> {
+        match self {
+            Self::V1(s) => s.next_event_locked_now(roster).await,
+            Self::V2(s) => s.next_event_locked_now(roster).await,
+        }
+    }
+
+    fn authorize_locked(
+        &self,
+        requested_cap: &str,
+        now_unix: u64,
+        roster: &StdMutex<Roster>,
+    ) -> (Result<(), CoreError>, tendril_core::grants::AuditEvent) {
+        match self {
+            Self::V1(s) => s.authorize_locked(requested_cap, now_unix, roster),
+            Self::V2(s) => s.authorize_locked(requested_cap, now_unix, roster),
+        }
+    }
+
+    async fn send_rekey(&self) -> Result<(), RuntimeError> {
+        match self {
+            Self::V1(s) => s.send_rekey().await,
+            Self::V2(s) => s.send_rekey().await,
+        }
+    }
+
+    async fn send_close(&self, code: u16, reason: &str) -> Result<(), RuntimeError> {
+        match self {
+            Self::V1(s) => s.send_close(code, reason).await,
+            Self::V2(s) => s.send_close(code, reason).await,
+        }
+    }
+}
+
 /// Opaque authenticated session handle sharing the endpoint's Tokio runtime and roster state.
 pub struct TendrilSession {
     rt: Arc<Runtime>,
     store: Option<Arc<StateStore>>,
     roster: Arc<StdMutex<Roster>>,
-    session: ConcurrentSession,
+    session: SessionBackend,
 }
 
 /// Copies the last thread-local FFI error string into `buf`.
@@ -904,12 +1625,14 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay(
             Err(rc) => return rc,
         };
         let ep = unsafe { &*ep };
+        let cfg = ep.snapshot_transport_cfg();
         let signing_key = ep.identity.signing_key().ed25519_signing_key();
-        match ep.rt.block_on(RelayListener::bind(
+        match ep.rt.block_on(RelayListener::bind_with_auth(
             url,
             exp_host,
             signing_key,
             DEFAULT_WRITE_TIMEOUT,
+            cfg.relay_auth.clone(),
         )) {
             Ok(listener) => {
                 let local_ep = listener.local_endpoint();
@@ -948,15 +1671,19 @@ pub unsafe extern "C" fn tendril_endpoint_serve_p2p(
         let ep = unsafe { &*ep };
         #[cfg(feature = "p2p-iroh")]
         {
-            let mode = match parse_p2p_relay_mode(mode_opt) {
-                Ok(m) => m,
+            let cfg = ep.snapshot_transport_cfg();
+            let opts = match cfg.build_p2p_listener_options(mode_opt) {
+                Ok(o) => o,
                 Err(e) => {
                     set_last_error(e.to_string());
                     return TENDRIL_ERR_INVALID_ARG;
                 }
             };
             let seed = ep.identity.derive_p2p_identity_seed();
-            match ep.rt.block_on(P2pListener::bind_with_secret(mode, seed)) {
+            match ep
+                .rt
+                .block_on(P2pListener::bind_with_options(opts, Some(seed)))
+            {
                 Ok(listener) => {
                     let local_ep = listener.local_endpoint();
                     ep.spawn_listener(Box::new(listener));
@@ -1052,10 +1779,30 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
         };
 
         let ep = unsafe { &*ep };
+        let cfg = ep.snapshot_transport_cfg();
+        let roster_snapshot = {
+            ep.roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        let v2_secret = if is_v2_relay_endpoint(endpoint_s) {
+            match lookup_v2_mailbox_secret_for_pair(&roster_snapshot, None, endpoint_s, now_unix())
+            {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return TENDRIL_ERR_PROTOCOL;
+                }
+            }
+        } else {
+            None
+        };
         let res = ep.rt.block_on(async {
-            let mut stream = dial_endpoint(endpoint_s, relay_host_s)
-                .await
-                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
+            let mut stream =
+                dial_endpoint_v2_with_options(endpoint_s, relay_host_s, &cfg, v2_secret)
+                    .await
+                    .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
             let device_name = name_s.unwrap_or("ffi-device").to_owned();
             let device_kind = kind_s.unwrap_or("ffi").to_owned();
             let pair_res = if let Some(ref store) = ep.store {
@@ -1070,16 +1817,15 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
                     DEFAULT_PRE_AUTH_TIMEOUT,
                 )
                 .await
+                .map(|r| r.outcome)
             } else {
-                drive_pair_initiator_with_floor(
+                drive_v1_pair_initiator_with_roster_floors(
                     stream.as_mut(),
                     &ep.identity,
                     device_name,
                     device_kind,
                     code_s.to_owned(),
-                    None,
-                    tendril_core::WIRE_VERSION,
-                    DEFAULT_PRE_AUTH_TIMEOUT,
+                    &roster_snapshot,
                 )
                 .await
             }
@@ -1089,7 +1835,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
         });
 
         match res {
-            Ok(pair_res) => match pair_res.outcome {
+            Ok(outcome) => match outcome {
                 PairOutcome::InitiatorPending {
                     device_id,
                     host_id,
@@ -1590,6 +2336,7 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
         };
 
         let ep = unsafe { &*ep };
+        let cfg = ep.snapshot_transport_cfg();
         let fallback_floor = {
             let roster = ep
                 .roster
@@ -1598,7 +2345,7 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
             pinned_pairing_floor(&roster, &pinned_host)
         };
         let res = ep.rt.block_on(async {
-            let mut stream = dial_endpoint(endpoint_s, relay_host_s)
+            let mut stream = dial_endpoint_v2_with_options(endpoint_s, relay_host_s, &cfg, None)
                 .await
                 .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
             let device_name = name_s.unwrap_or("ffi-machine").to_owned();
@@ -1730,8 +2477,24 @@ pub unsafe extern "C" fn tendril_session_connect(
         };
 
         let ep = unsafe { &*ep };
+        let cfg = ep.snapshot_transport_cfg();
+        let v2_secret = if is_v2_relay_endpoint(ep_s) {
+            let roster = ep
+                .roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match lookup_v2_mailbox_secret_for_target(&roster, target_s) {
+                Ok(s) => Some(s),
+                Err((_, msg)) => {
+                    set_last_error(msg);
+                    return ptr::null_mut();
+                }
+            }
+        } else {
+            None
+        };
         let res = ep.rt.block_on(async {
-            let stream = dial_endpoint(ep_s, relay_host_s)
+            let stream = dial_endpoint_v2_with_options(ep_s, relay_host_s, &cfg, v2_secret)
                 .await
                 .map_err(|e| e.to_string())?;
             SessionDriver::connect_locked(
@@ -1756,7 +2519,7 @@ pub unsafe extern "C" fn tendril_session_connect(
                     rt: Arc::clone(&ep.rt),
                     store: ep.store.clone(),
                     roster: Arc::clone(&ep.roster),
-                    session: driver.into_concurrent(),
+                    session: SessionBackend::V1(driver.into_concurrent()),
                 }))
             }
             Err(e) => {
@@ -1812,7 +2575,7 @@ pub unsafe extern "C" fn tendril_session_accept(
                 rt: Arc::clone(&ep.rt),
                 store: ep.store.clone(),
                 roster: Arc::clone(&ep.roster),
-                session: driver.into_concurrent(),
+                session: SessionBackend::V1(driver.into_concurrent()),
             })),
             Err(e) => {
                 set_last_error(e);
@@ -1948,7 +2711,25 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                         "grant": g,
                     }),
                     SessionEvent::RevocationUpdated { issuer, seq } => {
-                        if let Err(e) = persist_store_roster(sess.store.as_ref(), &sess.roster) {
+                        if matches!(sess.session, SessionBackend::V2(_))
+                            && let Some(ref store) = sess.store
+                        {
+                            match store.load_roster() {
+                                Ok(disk) => {
+                                    let mut guard = sess
+                                        .roster
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    *guard = disk;
+                                }
+                                Err(e) => {
+                                    set_last_error(e.to_string());
+                                    return TENDRIL_ERR_INTERNAL;
+                                }
+                            }
+                        } else if let Err(e) =
+                            persist_store_roster(sess.store.as_ref(), &sess.roster)
+                        {
                             set_last_error(e);
                             return TENDRIL_ERR_INTERNAL;
                         }
@@ -1976,7 +2757,18 @@ pub unsafe extern "C" fn tendril_session_poll_event(
             }
             Ok(Ok(None)) => TENDRIL_EOF,
             Ok(Err(e)) => {
-                if let Err(pe) = persist_store_roster(sess.store.as_ref(), &sess.roster) {
+                if matches!(sess.session, SessionBackend::V2(_))
+                    && let Some(ref store) = sess.store
+                {
+                    if let Ok(disk) = store.load_roster() {
+                        let mut guard = sess
+                            .roster
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *guard = disk;
+                    }
+                    set_last_error(e.to_string());
+                } else if let Err(pe) = persist_store_roster(sess.store.as_ref(), &sess.roster) {
                     set_last_error(format!("{e} (roster persist error: {pe})"));
                 } else {
                     set_last_error(e.to_string());
@@ -2066,6 +2858,729 @@ pub unsafe extern "C" fn tendril_session_close(
             Err(e) => {
                 set_last_error(e.to_string());
                 TENDRIL_ERR_PROTOCOL
+            }
+        }
+    })
+}
+
+/// Configures relay admission, P2P transport, and `WakeProvider` options on `ep` from JSON.
+///
+/// # Safety
+/// `ep` and `transport_config_json` must be non-null valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_configure_transports_json(
+    ep: *mut TendrilEndpoint,
+    transport_config_json: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(cfg_s) = (unsafe { cstr_to_str(transport_config_json, "transport_config_json") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let input: TransportConfigInput = match serde_json::from_str(cfg_s) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(format!(
+                    "invalid transport_config_json: {:?} at line {} column {}",
+                    e.classify(),
+                    e.line(),
+                    e.column()
+                ));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let parsed = match EndpointTransportConfig::from_input(input) {
+            Ok(cfg) => cfg,
+            Err((rc, msg)) => {
+                set_last_error(msg);
+                return rc;
+            }
+        };
+        let ep = unsafe { &*ep };
+        let mut guard = ep
+            .transport_cfg
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = parsed;
+        TENDRIL_OK
+    })
+}
+
+/// Mints a canonical signed stateless Ed25519 [`RelayTicket`] JSON object.
+///
+/// # Safety
+/// `ep`, `relay_host`, and `out_ticket_json` must be valid non-null pointers; `role` and
+/// `target_pub_b64_or_wildcard` may be null or UTF-8. Free output with [`tendril_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_mint_relay_ticket(
+    ep: *mut TendrilEndpoint,
+    relay_host: *const c_char,
+    role: *const c_char,
+    target_pub_b64_or_wildcard: *const c_char,
+    ttl_secs: u64,
+    out_ticket_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_ticket_json.is_null() {
+            set_last_error("null endpoint or out_ticket_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(host_s) = (unsafe { cstr_to_str(relay_host, "relay_host") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(role_opt) = (unsafe { opt_cstr_to_str(role, "role") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(target_opt) =
+            (unsafe { opt_cstr_to_str(target_pub_b64_or_wildcard, "target_pub_b64_or_wildcard") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let role_enum = match role_opt.map(str::trim) {
+            None | Some("" | "any") => RelayAuthRole::Any,
+            Some("register") => RelayAuthRole::Register,
+            Some("dial") => RelayAuthRole::Dial,
+            Some(other) => {
+                set_last_error(format!("invalid relay ticket role '{other}'"));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let target_s = target_opt.filter(|s| !s.is_empty()).unwrap_or("*");
+        let ep = unsafe { &*ep };
+        let ticket =
+            match ep
+                .identity
+                .mint_relay_ticket(host_s, role_enum, target_s, now_unix(), ttl_secs)
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return TENDRIL_ERR_INVALID_ARG;
+                }
+            };
+        let json = match canonical_json(&ticket) {
+            Ok(j) => Zeroizing::new(j),
+            Err(e) => {
+                set_last_error(e.to_string());
+                return TENDRIL_ERR_INTERNAL;
+            }
+        };
+        unsafe { write_out_cstring(out_ticket_json, &json) }
+    })
+}
+
+/// Registers blinded `/v2/relay` epoch mailboxes for `peer_id_opt` (or all active v2 peers when null).
+///
+/// # Safety
+/// `ep`, `relay_url`, and `out_endpoint` must be valid non-null pointers; `expected_host` and `peer_id_opt` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_serve_relay_v2(
+    ep: *mut TendrilEndpoint,
+    relay_url: *const c_char,
+    expected_host: *const c_char,
+    peer_id_opt: *const c_char,
+    out_endpoint: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_endpoint.is_null() {
+            set_last_error("null endpoint or out_endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(url_s) = (unsafe { cstr_to_str(relay_url, "relay_url") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(exp_host) = (unsafe { opt_cstr_to_str(expected_host, "expected_host") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(peer_opt) = (unsafe { opt_cstr_to_str(peer_id_opt, "peer_id_opt") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let ep = unsafe { &*ep };
+        let cfg = ep.snapshot_transport_cfg();
+        let secrets: Vec<[u8; 32]> = {
+            let roster = ep
+                .roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(pid) = peer_opt.filter(|s| !s.is_empty()) {
+                match lookup_v2_mailbox_secret_for_target(&roster, pid) {
+                    Ok(sec) => vec![sec],
+                    Err((rc, msg)) => {
+                        set_last_error(msg);
+                        return rc;
+                    }
+                }
+            } else {
+                let list: Vec<[u8; 32]> = roster
+                    .entries()
+                    .filter(|(_, e)| e.state == PeerState::Active)
+                    .filter_map(|(_, e)| e.v2_secrets.as_ref().map(|s| *s.mailbox_secret()))
+                    .collect();
+                if list.is_empty() {
+                    set_last_error("no active v2 peers with mailbox_secret in roster");
+                    return TENDRIL_ERR_NOT_FOUND;
+                }
+                list
+            }
+        };
+
+        let mut bound_listeners: Vec<RelayV2Listener> = Vec::with_capacity(secrets.len());
+        for secret in secrets {
+            let lcfg = RelayV2ListenerConfig {
+                expected_host: exp_host.map(ToOwned::to_owned),
+                write_timeout: DEFAULT_WRITE_TIMEOUT,
+                allow_insecure_ws: false,
+                replay_cache: None,
+                unix_secs: None,
+                auth: cfg.relay_auth.clone(),
+            };
+            match ep
+                .rt
+                .block_on(RelayV2Listener::bind_with_config(url_s, secret, lcfg))
+            {
+                Ok(listener) => bound_listeners.push(listener),
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return TENDRIL_ERR_PROTOCOL;
+                }
+            }
+        }
+        let first_ep = bound_listeners.first().map(|l| l.local_endpoint());
+        for listener in bound_listeners {
+            ep.spawn_listener(Box::new(listener));
+        }
+        let local_ep = first_ep.unwrap_or_else(|| url_s.to_owned());
+        unsafe { write_out_cstring(out_endpoint, &local_ep) }
+    })
+}
+
+/// Initiates a Wire v2 hybrid `Argon2id` PAKE + `ML-KEM-768` pairing handshake toward `endpoint`.
+///
+/// # Safety
+/// `ep`, `endpoint`, `code`, and `out_json` must be valid non-null pointers; optional strings may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_pair_v2_initiate(
+    ep: *mut TendrilEndpoint,
+    endpoint: *const c_char,
+    relay_host_opt: *const c_char,
+    code: *const c_char,
+    name: *const c_char,
+    kind: *const c_char,
+    pinned_host_json_opt: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(endpoint_s) = (unsafe { cstr_to_str(endpoint, "endpoint") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(relay_host_s) = (unsafe { opt_cstr_to_str(relay_host_opt, "relay_host_opt") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(code_s) = (unsafe { cstr_to_str(code, "code") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(name_s) = (unsafe { opt_cstr_to_str(name, "name") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(kind_s) = (unsafe { opt_cstr_to_str(kind, "kind") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(pinned_opt) =
+            (unsafe { opt_cstr_to_str(pinned_host_json_opt, "pinned_host_json_opt") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+
+        let ep = unsafe { &*ep };
+        let cfg = ep.snapshot_transport_cfg();
+        let roster_snapshot = {
+            ep.roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+
+        let v2_pinned = match pinned_opt.filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let pin_in: FfiPinnedHostInput = match serde_json::from_str(raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        set_last_error(format!(
+                            "invalid pinned_host_json_opt: {:?} at line {} column {}",
+                            e.classify(),
+                            e.line(),
+                            e.column()
+                        ));
+                        return TENDRIL_ERR_INVALID_ARG;
+                    }
+                };
+                let static_pub = match b64url_decode_array::<32>(&pin_in.static_pub_b64) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        set_last_error(e.to_string());
+                        return TENDRIL_ERR_INVALID_ARG;
+                    }
+                };
+                let signing_pin = match parse_signing_pin_b64(&pin_in.signing_pin_b64) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        set_last_error(e);
+                        return TENDRIL_ERR_INVALID_ARG;
+                    }
+                };
+                let pinned = PinnedHost {
+                    host_id: pin_in.host_id,
+                    static_pub,
+                    signing_pin,
+                    rotation_seq: pin_in.rotation_seq,
+                };
+                let base_floor = pinned_pairing_floor(&roster_snapshot, &pinned);
+                let floor = pin_in
+                    .min_wire_version
+                    .map_or(base_floor, |v| base_floor.max(v));
+                match V2PinnedHost::new(pinned, floor) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        set_last_error(e.to_string());
+                        return TENDRIL_ERR_INVALID_ARG;
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let v2_secret = if is_v2_relay_endpoint(endpoint_s) {
+            match lookup_v2_mailbox_secret_for_pair(
+                &roster_snapshot,
+                v2_pinned.as_ref().map(|p| &p.pinned),
+                endpoint_s,
+                now_unix(),
+            ) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return TENDRIL_ERR_PROTOCOL;
+                }
+            }
+        } else {
+            None
+        };
+
+        let device_name = name_s.unwrap_or("ffi-device").to_owned();
+        let device_kind = kind_s.unwrap_or("ffi").to_owned();
+        let res = ep.rt.block_on(async {
+            let mut stream =
+                dial_endpoint_v2_with_options(endpoint_s, relay_host_s, &cfg, v2_secret)
+                    .await
+                    .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
+            let pair_res = if let Some(ref store) = ep.store {
+                drive_v2_pake_pair_initiator_with_store(
+                    stream.as_mut(),
+                    &ep.identity,
+                    device_name,
+                    device_kind,
+                    code_s.to_owned(),
+                    v2_pinned,
+                    "paired-host".to_owned(),
+                    Vec::new(),
+                    store,
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            } else {
+                drive_v2_pake_pair_initiator_with_timeout(
+                    stream.as_mut(),
+                    &ep.identity,
+                    device_name,
+                    device_kind,
+                    code_s.to_owned(),
+                    v2_pinned,
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            }
+            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()));
+            let _ = stream.close().await;
+            pair_res
+        });
+
+        match res {
+            Ok(pair_res) => match pair_res.outcome {
+                V2PairOutcome::InitiatorPending {
+                    ref device_id,
+                    ref host_id,
+                    ref pairing_sas,
+                    host_pin_verified,
+                    ..
+                } => {
+                    let dev_id = device_id.clone();
+                    let h_id = host_id.clone();
+                    let sas = pairing_sas.clone();
+                    if ep.store.is_some() {
+                        if let Err(e) = ep.sync_roster_from_store() {
+                            set_last_error(e);
+                            return TENDRIL_ERR_INTERNAL;
+                        }
+                    } else {
+                        let mut roster = ep
+                            .roster
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Err(e) = roster.apply_v2_pair_initiator_outcome(
+                            &pair_res.outcome,
+                            h_id.clone(),
+                            Vec::new(),
+                        ) {
+                            set_last_error(e.to_string());
+                            return TENDRIL_ERR_PROTOCOL;
+                        }
+                    }
+                    let out = serde_json::json!({
+                        "device_id": dev_id,
+                        "host_id": h_id,
+                        "sas": sas,
+                        "status": if host_pin_verified { "active" } else { "pending" },
+                        "host_confirmed": host_pin_verified,
+                        "wire_version": 2,
+                    });
+                    unsafe { write_out_cstring(out_json, &out.to_string()) }
+                }
+                V2PairOutcome::Rejected { error } => {
+                    set_last_error(error);
+                    TENDRIL_ERR_PROTOCOL
+                }
+                V2PairOutcome::ResponderPending { .. } => {
+                    set_last_error("unexpected responder outcome");
+                    TENDRIL_ERR_INTERNAL
+                }
+            },
+            Err((rc, msg)) => {
+                set_last_error(msg);
+                rc
+            }
+        }
+    })
+}
+
+/// Accepts the next incoming Wire v2 (`0x02`) PAKE pairing connection within `timeout_ms`.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer and `out_json` must be non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_pair_v2_accept(
+    ep: *mut TendrilEndpoint,
+    timeout_ms: u64,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let ep = unsafe { &*ep };
+        let wait = Duration::from_millis(timeout_ms);
+        let res = ep.rt.block_on(async {
+            let (mut stream, guard) = match ep.router.recv_v2_pair(wait).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => return Err((TENDRIL_ERR_CLOSED, "listener closed".to_owned())),
+                Err(()) => {
+                    return Err((
+                        TENDRIL_WOULD_BLOCK,
+                        "timed out accepting v2 pair".to_owned(),
+                    ));
+                }
+            };
+            let path_kind = pairing_path_kind_for_provider(stream.provider_id());
+            if let Some(ref store) = ep.store {
+                drive_v2_pake_pair_responder_with_store(
+                    stream.as_mut(),
+                    &ep.identity,
+                    &ep.pair_mgr,
+                    store,
+                    &ep.store_lock,
+                    path_kind,
+                    now_unix(),
+                    &ep.v2_state,
+                    Some(ep.router.v2_pair_rate_limiter()),
+                    Some(guard),
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            } else {
+                drive_v2_pake_pair_responder_with_options(
+                    stream.as_mut(),
+                    &ep.identity,
+                    &ep.pair_mgr,
+                    &ep.roster,
+                    path_kind,
+                    now_unix(),
+                    &ep.v2_state,
+                    Some(ep.router.v2_pair_rate_limiter()),
+                    Some(guard),
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            }
+            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
+        });
+
+        match res {
+            Ok(pair_res) => match pair_res.outcome {
+                V2PairOutcome::ResponderPending {
+                    device_id,
+                    pairing_sas,
+                    name,
+                    kind,
+                    ..
+                } => {
+                    if let Err(e) = ep.sync_roster_from_store() {
+                        set_last_error(e);
+                        return TENDRIL_ERR_INTERNAL;
+                    }
+                    let out = serde_json::json!({
+                        "device_id": device_id,
+                        "sas": pairing_sas,
+                        "name": name,
+                        "kind": kind,
+                        "wire_version": 2,
+                    });
+                    unsafe { write_out_cstring(out_json, &out.to_string()) }
+                }
+                V2PairOutcome::Rejected { error } => {
+                    set_last_error(error);
+                    TENDRIL_ERR_PROTOCOL
+                }
+                V2PairOutcome::InitiatorPending { .. } => {
+                    set_last_error("unexpected initiator outcome");
+                    TENDRIL_ERR_INTERNAL
+                }
+            },
+            Err((rc, msg)) => {
+                set_last_error(msg);
+                rc
+            }
+        }
+    })
+}
+
+/// Opens an authenticated Wire v2 (`0x02`) pseudonymous session toward `target_host_id` via `endpoint`.
+///
+/// Honors configured `RelayClientAuth`, `P2pOptions`, and `WakeProvider` (`wake_and_connect_v2_session`).
+///
+/// # Safety
+/// `ep`, `endpoint`, and `target_host_id` must be valid non-null pointers; `relay_host_opt` and
+/// `grant_json_opt` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_connect_v2(
+    ep: *mut TendrilEndpoint,
+    endpoint: *const c_char,
+    relay_host_opt: *const c_char,
+    target_host_id: *const c_char,
+    grant_json_opt: *const c_char,
+) -> *mut TendrilSession {
+    ffi_ptr(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return ptr::null_mut();
+        }
+        let Ok(ep_s) = (unsafe { cstr_to_str(endpoint, "endpoint") }) else {
+            return ptr::null_mut();
+        };
+        let Ok(relay_host_s) = (unsafe { opt_cstr_to_str(relay_host_opt, "relay_host_opt") })
+        else {
+            return ptr::null_mut();
+        };
+        let Ok(target_s) = (unsafe { cstr_to_str(target_host_id, "target_host_id") }) else {
+            return ptr::null_mut();
+        };
+        let Ok(grant_opt) = (unsafe { opt_cstr_to_str(grant_json_opt, "grant_json_opt") }) else {
+            return ptr::null_mut();
+        };
+        let grant: Option<Grant> = match grant_opt {
+            Some(g) if !g.is_empty() => match serde_json::from_str(g) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    set_last_error(format!("invalid grant_json_opt: {e}"));
+                    return ptr::null_mut();
+                }
+            },
+            _ => None,
+        };
+
+        let ep = unsafe { &*ep };
+        let cfg = ep.snapshot_transport_cfg();
+        let v2_secret = if is_v2_relay_endpoint(ep_s) {
+            let roster = ep
+                .roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match lookup_v2_mailbox_secret_for_target(&roster, target_s) {
+                Ok(s) => Some(s),
+                Err((_, msg)) => {
+                    set_last_error(msg);
+                    return ptr::null_mut();
+                }
+            }
+        } else {
+            None
+        };
+
+        let res: Result<V2SessionDriver, String> = ep.rt.block_on(async {
+            let stream = if let Some(ref wake_cfg) = cfg.wake {
+                let dialer = build_dialer_with_options(ep_s, relay_host_s, &cfg, v2_secret)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let http_wake = Arc::new(
+                    HttpWakeProvider::new()
+                        .with_cooldown_secs(0)
+                        .with_timeout(Duration::from_millis(wake_cfg.timeout_ms)),
+                );
+                let wake_opts = WakeDialOptions::new(
+                    http_wake,
+                    wake_cfg.target.clone(),
+                    wake_cfg.secret.clone(),
+                )
+                .with_pre_wake(wake_cfg.pre_wake)
+                .with_retry_delay(Duration::from_millis(wake_cfg.retry_delay_ms))
+                .with_max_attempts(wake_cfg.max_attempts)
+                .with_wake_timeout(Duration::from_millis(wake_cfg.timeout_ms));
+                wake_and_dial_v2(&*dialer, ep_s, &wake_opts, now_unix())
+                    .await
+                    .map(|(stream, _)| stream)
+                    .map_err(|e| e.to_string())?
+            } else {
+                dial_endpoint_v2_with_options(ep_s, relay_host_s, &cfg, v2_secret)
+                    .await
+                    .map_err(|e| e.to_string())?
+            };
+            if let Some(ref store) = ep.store {
+                V2SessionDriver::connect_with_store(
+                    stream,
+                    &ep.identity,
+                    target_s,
+                    grant,
+                    store,
+                    &ep.store_lock,
+                    now_unix(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+            } else {
+                V2SessionDriver::connect_locked(
+                    stream,
+                    &ep.identity,
+                    target_s,
+                    grant,
+                    &ep.roster,
+                    now_unix(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
+        });
+
+        match res {
+            Ok(driver) => {
+                if ep.store.is_some()
+                    && let Err(e) = ep.sync_roster_from_store()
+                {
+                    set_last_error(e);
+                    return ptr::null_mut();
+                }
+                Box::into_raw(Box::new(TendrilSession {
+                    rt: Arc::clone(&ep.rt),
+                    store: ep.store.clone(),
+                    roster: Arc::clone(&ep.roster),
+                    session: SessionBackend::V2(driver.into_concurrent()),
+                }))
+            }
+            Err(e) => {
+                if ep.store.is_some() {
+                    let _ = ep.sync_roster_from_store();
+                }
+                set_last_error(e);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Accepts and authenticates the next inbound Wire v2 (`0x02`) session stream within `timeout_ms`.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_accept_v2(
+    ep: *mut TendrilEndpoint,
+    timeout_ms: u64,
+) -> *mut TendrilSession {
+    ffi_ptr(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return ptr::null_mut();
+        }
+        let ep = unsafe { &*ep };
+        let wait = Duration::from_millis(timeout_ms);
+        let res = ep.rt.block_on(async {
+            let (stream, guard) = match ep.router.recv_v2_session(wait).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => return Err("listener closed".to_owned()),
+                Err(()) => return Err("timed out accepting v2 session".to_owned()),
+            };
+            if let Some(ref store) = ep.store {
+                V2SessionDriver::accept_with_store(
+                    stream,
+                    &ep.identity,
+                    store,
+                    &ep.store_lock,
+                    now_unix(),
+                    &ep.v2_state,
+                    Some(ep.router.v2_session_rate_limiter()),
+                    Some(guard),
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            } else {
+                V2SessionDriver::accept_locked(
+                    stream,
+                    &ep.identity,
+                    &ep.roster,
+                    now_unix(),
+                    &ep.v2_state,
+                    Some(ep.router.v2_session_rate_limiter()),
+                    Some(guard),
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            }
+            .map_err(|e| e.to_string())
+        });
+
+        match res {
+            Ok(driver) => {
+                if let Err(e) = ep.sync_roster_from_store() {
+                    set_last_error(e);
+                    return ptr::null_mut();
+                }
+                Box::into_raw(Box::new(TendrilSession {
+                    rt: Arc::clone(&ep.rt),
+                    store: ep.store.clone(),
+                    roster: Arc::clone(&ep.roster),
+                    session: SessionBackend::V2(driver.into_concurrent()),
+                }))
+            }
+            Err(e) => {
+                set_last_error(e);
+                ptr::null_mut()
             }
         }
     })

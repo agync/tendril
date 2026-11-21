@@ -19,19 +19,23 @@ use tendril_core::wire::{HostHello, Intent, Preamble, ResumableFrameReader, enco
 use tendril_ffi::{
     TENDRIL_EOF, TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_ERR_PROTOCOL, TENDRIL_OK,
     TENDRIL_WOULD_BLOCK, tendril_compute_code_mac, tendril_device_id,
-    tendril_endpoint_add_trust_anchor, tendril_endpoint_close, tendril_endpoint_confirm_peer,
+    tendril_endpoint_add_trust_anchor, tendril_endpoint_close,
+    tendril_endpoint_configure_transports_json, tendril_endpoint_confirm_peer,
     tendril_endpoint_enroll_initiate, tendril_endpoint_export_identity_json,
     tendril_endpoint_export_roster_json, tendril_endpoint_free, tendril_endpoint_info_json,
     tendril_endpoint_issue_code, tendril_endpoint_mint_enrollment_token,
-    tendril_endpoint_mint_grant, tendril_endpoint_new, tendril_endpoint_new_from_state,
-    tendril_endpoint_pair_accept, tendril_endpoint_pair_initiate, tendril_endpoint_revoke_peer,
-    tendril_endpoint_revoke_trust_anchor, tendril_endpoint_serve_direct,
-    tendril_endpoint_serve_p2p, tendril_fingerprint_device, tendril_fingerprint_host,
-    tendril_last_error, tendril_pairing_sas, tendril_session_accept, tendril_session_authorize,
-    tendril_session_close, tendril_session_connect, tendril_session_export_roster_json,
-    tendril_session_free, tendril_session_poll_event, tendril_session_rekey,
-    tendril_session_send_data, tendril_session_shutdown, tendril_string_free,
-    tendril_verify_grant_json, tendril_verify_rotation_chain_json,
+    tendril_endpoint_mint_grant, tendril_endpoint_mint_relay_ticket, tendril_endpoint_new,
+    tendril_endpoint_new_from_state, tendril_endpoint_pair_accept, tendril_endpoint_pair_initiate,
+    tendril_endpoint_pair_v2_accept, tendril_endpoint_pair_v2_initiate,
+    tendril_endpoint_revoke_peer, tendril_endpoint_revoke_trust_anchor,
+    tendril_endpoint_serve_direct, tendril_endpoint_serve_p2p, tendril_endpoint_serve_relay,
+    tendril_endpoint_serve_relay_v2, tendril_fingerprint_device, tendril_fingerprint_host,
+    tendril_last_error, tendril_pairing_sas, tendril_session_accept, tendril_session_accept_v2,
+    tendril_session_authorize, tendril_session_close, tendril_session_connect,
+    tendril_session_connect_v2, tendril_session_export_roster_json, tendril_session_free,
+    tendril_session_poll_event, tendril_session_rekey, tendril_session_send_data,
+    tendril_session_shutdown, tendril_string_free, tendril_verify_grant_json,
+    tendril_verify_rotation_chain_json,
 };
 use tendril_runtime::{
     DirectListener, PathListener, PathStream, PrefixedPathStream, SessionDriver, StateStore,
@@ -726,10 +730,7 @@ fn ffi_persists_host_rotation_and_fork_revocation_across_restart() {
     )
     .unwrap();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let (fep_str, fork_srv) = rt.block_on(async {
         let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
             .await
@@ -815,10 +816,7 @@ fn ffi_persists_session_terminating_crl_across_restart() {
     let revoked_nonce = grant.nonce.clone();
     let expected_nonce = revoked_nonce.clone();
     // Bring up raw runtime host listener so we can push a signed 0x03 REVOCATION revoking the active grant.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let (ep_str, accept_handle) = rt.block_on(async {
         let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
             .await
@@ -1860,4 +1858,1291 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
         tendril_endpoint_free(cli1_ep);
         tendril_endpoint_free(host_ep);
     }
+}
+
+#[test]
+fn ffi_configure_transports_json_validation_and_feature_gates() {
+    let ep = unsafe { tendril_endpoint_new(ptr::null(), ptr::null()) };
+    assert!(!ep.is_null());
+
+    // NULL pointer safety checks across all 7 new C ABI symbols.
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ptr::null_mut(), ptr::null()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, ptr::null()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    let mut null_out: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_relay_ticket(
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                &raw mut null_out,
+            )
+        },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_relay_ticket(
+                ep,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+            )
+        },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay_v2(
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &raw mut null_out,
+            )
+        },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &raw mut null_out,
+            )
+        },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_pair_v2_accept(ptr::null_mut(), 10, &raw mut null_out) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_pair_v2_accept(ep, 10, ptr::null_mut()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(
+        unsafe {
+            tendril_session_connect_v2(
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+            )
+        }
+        .is_null()
+    );
+    assert!(unsafe { tendril_session_accept_v2(ptr::null_mut(), 10) }.is_null());
+
+    // Strict deny_unknown_fields (must not echo unexpected keys or scalar values).
+    let bad_unknown = CString::new("{\"unknown_field\":1}").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, bad_unknown.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    let err_unknown = read_last_err();
+    assert!(
+        err_unknown.contains("invalid transport_config_json"),
+        "unexpected err: {err_unknown}"
+    );
+    assert!(!err_unknown.contains("unknown_field"));
+
+    // Non-string scalar type error on secret field must NEVER echo the scalar value.
+    let bad_scalar_secret = CString::new("{\"relay_auth_secret\":123456}").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, bad_scalar_secret.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    let err_scalar = read_last_err();
+    assert!(err_scalar.contains("invalid transport_config_json"));
+    assert!(
+        !err_scalar.contains("123456"),
+        "last_error leaked scalar secret value: {err_scalar}"
+    );
+
+    // Mutually exclusive relay auth fields.
+    let bad_relay_mutex = CString::new(
+        r#"{"relay_auth_secret":"sec","relay_ticket":{"v":1,"issuer_pub":"AA","relay_host":"h","role":"any","target_pub":"*","not_before":1,"not_after":2,"sig":"AA"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, bad_relay_mutex.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("mutually exclusive"));
+
+    // Empty relay_ticket fields rejected.
+    let bad_empty_ticket = CString::new(
+        r#"{"relay_ticket":{"v":1,"issuer_pub":"","relay_host":"h","role":"any","target_pub":"*","not_before":1,"not_after":2,"sig":""}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, bad_empty_ticket.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+
+    // Mutually exclusive P2P auth and P2P relay mode fields.
+    let bad_p2p_auth_mutex =
+        CString::new(r#"{"p2p_relay_auth_token":"tok","p2p_api_secret":"sec"}"#).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, bad_p2p_auth_mutex.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("mutually exclusive"));
+
+    let bad_p2p_mode_mutex =
+        CString::new(r#"{"p2p_relay_mode":"default","p2p_relay_urls":["https://relay.example"]}"#)
+            .unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, bad_p2p_mode_mutex.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("mutually exclusive"));
+
+    // Control character in secret fails closed and does not echo secret in error message.
+    let secret_with_ctrl =
+        CString::new("{\"relay_auth_secret\":\"leaked-secret\\u0007\"}").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, secret_with_ctrl.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(!read_last_err().contains("leaked-secret"));
+
+    // Wake options validation: require wake_url, wake_secret_b64, and valid base64url 32 bytes.
+    let wake_no_url = CString::new("{\"wake_pre_wake\":true}").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, wake_no_url.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    let wake_no_secret = CString::new("{\"wake_url\":\"http://127.0.0.1:9/wake\"}").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, wake_no_secret.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    let wake_bad_secret =
+        CString::new("{\"wake_url\":\"http://127.0.0.1:9/wake\",\"wake_secret_b64\":\"not-32\"}")
+            .unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(ep, wake_bad_secret.as_ptr()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("wake_secret_b64"));
+
+    // Invalid P2P auth with disabled relay mode.
+    let p2p_disabled_auth =
+        CString::new("{\"p2p_relay_mode\":\"disabled\",\"p2p_relay_auth_token\":\"tok\"}").unwrap();
+    let rc_dis =
+        unsafe { tendril_endpoint_configure_transports_json(ep, p2p_disabled_auth.as_ptr()) };
+    #[cfg(feature = "p2p-iroh")]
+    assert_eq!(rc_dis, TENDRIL_ERR_INVALID_ARG);
+    #[cfg(not(feature = "p2p-iroh"))]
+    assert_eq!(rc_dis, TENDRIL_ERR_PROTOCOL);
+
+    // p2p_api_secret requires p2p-iroh-services (and p2p-iroh).
+    let api_sec = CString::new(
+        "{\"p2p_relay_mode\":\"https://relay.example\",\"p2p_api_secret\":\"api-sec\"}",
+    )
+    .unwrap();
+    let rc_api = unsafe { tendril_endpoint_configure_transports_json(ep, api_sec.as_ptr()) };
+    #[cfg(feature = "p2p-iroh-services")]
+    assert_eq!(
+        rc_api,
+        TENDRIL_OK,
+        "p2p_api_secret err: {}",
+        read_last_err()
+    );
+    #[cfg(not(feature = "p2p-iroh-services"))]
+    assert_eq!(rc_api, TENDRIL_ERR_PROTOCOL);
+
+    unsafe { tendril_endpoint_free(ep) };
+}
+
+#[test]
+fn ffi_relay_auth_mint_ticket_and_gated_v1_relay() {
+    use tendril_core::crypto::b64url_decode_array;
+    use tendril_core::relay_auth::RelayAuthScope;
+    use tendril_relay::RelayConfig;
+    use tendril_runtime::EmbeddedRelay;
+    use zeroize::Zeroizing;
+
+    let host_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+    let hd_c = CString::new(host_dir.path().to_str().unwrap()).unwrap();
+    let cd_c = CString::new(cli_dir.path().to_str().unwrap()).unwrap();
+    let hname_c = CString::new("ffi-gated-host").unwrap();
+
+    let host_ep = unsafe { tendril_endpoint_new(hd_c.as_ptr(), hname_c.as_ptr()) };
+    let cli_ep = unsafe { tendril_endpoint_new(cd_c.as_ptr(), ptr::null()) };
+    assert!(!host_ep.is_null() && !cli_ep.is_null());
+
+    let mut host_id_json_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(host_ep, &raw mut host_id_json_p) },
+        TENDRIL_OK
+    );
+    let host_id_val: Value = serde_json::from_str(&unsafe { take_cstr(host_id_json_p) }).unwrap();
+    let host_relay_pub_b64 = host_id_val["relay_pub"].as_str().unwrap().to_owned();
+    let host_relay_pub: [u8; 32] = b64url_decode_array(&host_relay_pub_b64).unwrap();
+
+    let mut cli_id_json_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(cli_ep, &raw mut cli_id_json_p) },
+        TENDRIL_OK
+    );
+    let cli_id_val: Value = serde_json::from_str(&unsafe { take_cstr(cli_id_json_p) }).unwrap();
+    let cli_dev_id = cli_id_val["device_id"].as_str().unwrap().to_owned();
+
+    // Mint relay ticket using FFI (also check invalid role rejection).
+    let rhost_c = CString::new("localhost").unwrap();
+    let bad_role_c = CString::new("bogus").unwrap();
+    let star_c = CString::new("*").unwrap();
+    let mut bad_tkt_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_relay_ticket(
+                host_ep,
+                rhost_c.as_ptr(),
+                bad_role_c.as_ptr(),
+                star_c.as_ptr(),
+                300,
+                &raw mut bad_tkt_p,
+            )
+        },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(bad_tkt_p.is_null());
+
+    let role_any_c = CString::new("any").unwrap();
+    let host_rpub_c = CString::new(host_relay_pub_b64).unwrap();
+    let mut ticket_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_relay_ticket(
+                host_ep,
+                rhost_c.as_ptr(),
+                role_any_c.as_ptr(),
+                host_rpub_c.as_ptr(),
+                300,
+                &raw mut ticket_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let ticket_json_str = unsafe { take_cstr(ticket_p) };
+    let ticket_val: Value = serde_json::from_str(&ticket_json_str).unwrap();
+
+    // Test NULL role + NULL target_pub defaulting to "any" + "*".
+    let mut default_ticket_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_relay_ticket(
+                host_ep,
+                rhost_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                300,
+                &raw mut default_ticket_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let default_ticket_val: Value =
+        serde_json::from_str(&unsafe { take_cstr(default_ticket_p) }).unwrap();
+    assert_eq!(default_ticket_val["role"], "any");
+    assert_eq!(default_ticket_val["target_pub"], "*");
+
+    // Mint dial-only and register-only tickets for negative admission tests.
+    let role_dial_c = CString::new("dial").unwrap();
+    let mut dial_only_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_relay_ticket(
+                host_ep,
+                rhost_c.as_ptr(),
+                role_dial_c.as_ptr(),
+                ptr::null(),
+                300,
+                &raw mut dial_only_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let dial_only_val: Value = serde_json::from_str(&unsafe { take_cstr(dial_only_p) }).unwrap();
+
+    let role_reg_c = CString::new("register").unwrap();
+    let mut reg_only_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_relay_ticket(
+                host_ep,
+                rhost_c.as_ptr(),
+                role_reg_c.as_ptr(),
+                ptr::null(),
+                300,
+                &raw mut reg_only_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let reg_only_val: Value = serde_json::from_str(&unsafe { take_cstr(reg_only_p) }).unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let relay_handle = rt.block_on(async {
+        EmbeddedRelay::start(RelayConfig {
+            host: "localhost".to_owned(),
+            auth_secret: Some(Zeroizing::new(b"ffi-gated-secret".to_vec())),
+            trusted_issuers: vec![host_relay_pub],
+            auth_scope: RelayAuthScope::All,
+            ..RelayConfig::default()
+        })
+        .await
+        .expect("bind gated relay")
+    });
+    let ws_v1_url = relay_handle.ws_url();
+    let ws_v1_c = CString::new(ws_v1_url).unwrap();
+
+    // Negative 1: unauthenticated serve_relay must fail when RelayAuthScope::All is enabled.
+    let mut bad_ep_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay(
+                host_ep,
+                ws_v1_c.as_ptr(),
+                rhost_c.as_ptr(),
+                &raw mut bad_ep_p,
+            )
+        },
+        TENDRIL_ERR_PROTOCOL
+    );
+    assert!(bad_ep_p.is_null());
+
+    // Negative 2: wrong HMAC secret must fail.
+    let wrong_hmac_c = CString::new("{\"relay_auth_secret\":\"wrong-hmac-secret\"}").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(host_ep, wrong_hmac_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay(
+                host_ep,
+                ws_v1_c.as_ptr(),
+                rhost_c.as_ptr(),
+                &raw mut bad_ep_p,
+            )
+        },
+        TENDRIL_ERR_PROTOCOL
+    );
+    assert!(bad_ep_p.is_null());
+
+    // Negative 3: dial-only ticket cannot register.
+    let dial_only_cfg_c =
+        CString::new(serde_json::json!({ "relay_ticket": dial_only_val }).to_string()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(host_ep, dial_only_cfg_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay(
+                host_ep,
+                ws_v1_c.as_ptr(),
+                rhost_c.as_ptr(),
+                &raw mut bad_ep_p,
+            )
+        },
+        TENDRIL_ERR_PROTOCOL
+    );
+    assert!(bad_ep_p.is_null());
+
+    // Configure host with valid HMAC secret and register host listener.
+    let host_cfg_c = CString::new("{\"relay_auth_secret\":\"ffi-gated-secret\"}").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(host_ep, host_cfg_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let cli_cfg_c =
+        CString::new(serde_json::json!({ "relay_ticket": ticket_val }).to_string()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(cli_ep, cli_cfg_c.as_ptr()) },
+        TENDRIL_OK
+    );
+
+    let mut relay_ep_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay(
+                host_ep,
+                ws_v1_c.as_ptr(),
+                rhost_c.as_ptr(),
+                &raw mut relay_ep_p,
+            )
+        },
+        TENDRIL_OK,
+        "serve_relay failed: {}",
+        read_last_err()
+    );
+    let relay_ep = unsafe { take_cstr(relay_ep_p) };
+    let relay_ep_c = CString::new(relay_ep).unwrap();
+
+    let kind_c = CString::new("remote").unwrap();
+    let mut code_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, kind_c.as_ptr(), &raw mut code_p) },
+        TENDRIL_OK
+    );
+    let code_c = CString::new(unsafe { take_cstr(code_p) }).unwrap();
+
+    // Negative 4: register-only ticket cannot dial gated relay on pair_initiate.
+    let reg_only_cfg_c =
+        CString::new(serde_json::json!({ "relay_ticket": reg_only_val }).to_string()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(cli_ep, reg_only_cfg_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let name_c = CString::new("ffi-cli").unwrap();
+    let dev_kind_c = CString::new("desktop").unwrap();
+    let mut rejected_pair_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_initiate(
+                cli_ep,
+                relay_ep_c.as_ptr(),
+                rhost_c.as_ptr(),
+                code_c.as_ptr(),
+                name_c.as_ptr(),
+                dev_kind_c.as_ptr(),
+                &raw mut rejected_pair_p,
+            )
+        },
+        TENDRIL_ERR_PROTOCOL
+    );
+    assert!(rejected_pair_p.is_null());
+
+    // Reconfigure client with valid "any" ticket and complete pairing + session.
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(cli_ep, cli_cfg_c.as_ptr()) },
+        TENDRIL_OK
+    );
+
+    let hep_usize = host_ep.addr();
+    let acc_pair_thr = thread::spawn(move || {
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK, "pair_accept failed");
+        unsafe { take_cstr(out) };
+    });
+
+    let mut pair_out_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_initiate(
+                cli_ep,
+                relay_ep_c.as_ptr(),
+                rhost_c.as_ptr(),
+                code_c.as_ptr(),
+                name_c.as_ptr(),
+                dev_kind_c.as_ptr(),
+                &raw mut pair_out_p,
+            )
+        },
+        TENDRIL_OK,
+        "pair_initiate over gated v1 relay failed: {}",
+        read_last_err()
+    );
+    let pair_out_val: Value = serde_json::from_str(&unsafe { take_cstr(pair_out_p) }).unwrap();
+    let sas_c = CString::new(pair_out_val["sas"].as_str().unwrap()).unwrap();
+    acc_pair_thr.join().unwrap();
+
+    let cli_dev_c = CString::new(cli_dev_id).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(cli_ep, hname_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, cli_dev_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let caps_c = CString::new("[\"fs.read\"]").unwrap();
+    let mut grant_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                cli_dev_c.as_ptr(),
+                caps_c.as_ptr(),
+                300,
+                &raw mut grant_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_c = CString::new(unsafe { take_cstr(grant_p) }).unwrap();
+
+    let acc_sess_thr = thread::spawn(move || {
+        unsafe { tendril_session_accept(hep_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) }
+            .addr()
+    });
+    let cli_sess = unsafe {
+        tendril_session_connect(
+            cli_ep,
+            relay_ep_c.as_ptr(),
+            rhost_c.as_ptr(),
+            hname_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(
+        !cli_sess.is_null(),
+        "gated v1 connect failed: {}",
+        read_last_err()
+    );
+    let host_sess = acc_sess_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess.is_null());
+
+    let msg = b"hello-ffi-gated-v1";
+    assert_eq!(
+        unsafe { tendril_session_send_data(cli_sess, msg.as_ptr(), msg.len()) },
+        TENDRIL_OK
+    );
+    let mut ev_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_poll_event(host_sess, 2_000, &raw mut ev_p) },
+        TENDRIL_OK
+    );
+    let ev: Value = serde_json::from_str(&unsafe { take_cstr(ev_p) }).unwrap();
+    assert_eq!(ev["event"], "data");
+    assert_eq!(ev["data_b64"], b64url_encode(msg));
+
+    unsafe {
+        tendril_session_close(cli_sess, 1000, ptr::null());
+        tendril_session_free(cli_sess);
+        tendril_session_free(host_sess);
+        tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
+    drop(relay_handle);
+}
+
+#[test]
+fn ffi_wire_v2_pair_relay_v2_downgrade_guard_wake_rekey_and_revoke() {
+    use tendril_core::crypto::b64url_decode_array;
+    use tendril_core::relay_auth::RelayAuthScope;
+    use tendril_relay::RelayConfig;
+    use tendril_runtime::{EmbeddedRelay, WakeTag, verify_epoch_wake_tag_window};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use zeroize::Zeroizing;
+
+    let host_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+    let hd_c = CString::new(host_dir.path().to_str().unwrap()).unwrap();
+    let cd_c = CString::new(cli_dir.path().to_str().unwrap()).unwrap();
+    let hname_c = CString::new("ffi-v2-host").unwrap();
+
+    let host_ep = unsafe { tendril_endpoint_new(hd_c.as_ptr(), hname_c.as_ptr()) };
+    let cli_ep = unsafe { tendril_endpoint_new(cd_c.as_ptr(), ptr::null()) };
+    assert!(!host_ep.is_null() && !cli_ep.is_null());
+
+    let mut host_id_json_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(host_ep, &raw mut host_id_json_p) },
+        TENDRIL_OK
+    );
+    let host_id_val: Value = serde_json::from_str(&unsafe { take_cstr(host_id_json_p) }).unwrap();
+    let host_relay_pub: [u8; 32] =
+        b64url_decode_array(host_id_val["relay_pub"].as_str().unwrap()).unwrap();
+
+    let mut cli_id_json_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(cli_ep, &raw mut cli_id_json_p) },
+        TENDRIL_OK
+    );
+    let cli_id_val: Value = serde_json::from_str(&unsafe { take_cstr(cli_id_json_p) }).unwrap();
+    let cli_dev_id = cli_id_val["device_id"].as_str().unwrap().to_owned();
+
+    let rhost_c = CString::new("localhost").unwrap();
+    let role_any_c = CString::new("any").unwrap();
+    let star_c = CString::new("*").unwrap();
+    let mut ticket_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_relay_ticket(
+                host_ep,
+                rhost_c.as_ptr(),
+                role_any_c.as_ptr(),
+                star_c.as_ptr(),
+                300,
+                &raw mut ticket_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let ticket_val: Value = serde_json::from_str(&unsafe { take_cstr(ticket_p) }).unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let wake_secret = [0x6Bu8; 32];
+    let (relay_handle, wake_addr, wake_task) = rt.block_on(async {
+        let relay_handle = EmbeddedRelay::start(RelayConfig {
+            host: "localhost".to_owned(),
+            auth_secret: Some(Zeroizing::new(b"ffi-v2-hmac".to_vec())),
+            trusted_issuers: vec![host_relay_pub],
+            auth_scope: RelayAuthScope::All,
+            ..RelayConfig::default()
+        })
+        .await
+        .expect("bind gated v2 relay");
+
+        let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let wake_addr = sink.local_addr().unwrap();
+        let wake_task = tokio::spawn(async move {
+            let (mut sock, _) = sink.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let header_end;
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                assert!(n > 0);
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = pos + 4;
+                    break;
+                }
+            }
+            let headers = std::str::from_utf8(&buf[..header_end]).unwrap().to_owned();
+            let clen = headers
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap();
+            while buf.len() < header_end + clen {
+                let n = sock.read(&mut tmp).await.unwrap();
+                assert!(n > 0);
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let json: Value = serde_json::from_slice(&buf[header_end..header_end + clen]).unwrap();
+            let tag = WakeTag::from_b64url(json["wake_tag"].as_str().unwrap()).unwrap();
+            let now_s = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert!(verify_epoch_wake_tag_window(&wake_secret, &tag, now_s));
+            sock.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+        (relay_handle, wake_addr, wake_task)
+    });
+
+    let host_cfg_c = CString::new("{\"relay_auth_secret\":\"ffi-v2-hmac\"}").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(host_ep, host_cfg_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let cli_cfg_c = CString::new(
+        serde_json::json!({
+            "relay_ticket": &ticket_val,
+            "wake_url": format!("http://{wake_addr}/wake"),
+            "wake_adapter": "webhook",
+            "wake_secret_b64": b64url_encode(&wake_secret),
+            "wake_pre_wake": true,
+            "wake_retry_delay_ms": 50,
+            "wake_max_attempts": 25
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(cli_ep, cli_cfg_c.as_ptr()) },
+        TENDRIL_OK
+    );
+
+    let ws_v1_c = CString::new(relay_handle.ws_url()).unwrap();
+    let ws_v2_c = CString::new(relay_handle.ws_v2_url()).unwrap();
+
+    let mut ep1_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay(
+                host_ep,
+                ws_v1_c.as_ptr(),
+                rhost_c.as_ptr(),
+                &raw mut ep1_p,
+            )
+        },
+        TENDRIL_OK,
+        "serve_relay v1 failed: {}",
+        read_last_err()
+    );
+    let ep1 = unsafe { take_cstr(ep1_p) };
+    let ep1_c = CString::new(ep1).unwrap();
+
+    // Before pairing any v2 peer, serve_relay_v2 with NULL peer_id must fail NOT_FOUND.
+    let mut empty_v2_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay_v2(
+                host_ep,
+                ws_v2_c.as_ptr(),
+                rhost_c.as_ptr(),
+                ptr::null(),
+                &raw mut empty_v2_p,
+            )
+        },
+        TENDRIL_ERR_NOT_FOUND
+    );
+    assert!(empty_v2_p.is_null());
+
+    let kind_c = CString::new("remote").unwrap();
+    let mut code_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, kind_c.as_ptr(), &raw mut code_p) },
+        TENDRIL_OK
+    );
+    let code_c = CString::new(unsafe { take_cstr(code_p) }).unwrap();
+
+    let hep_usize = host_ep.addr();
+    let acc_v2_thr = thread::spawn(move || {
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_v2_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                10_000,
+                &raw mut out,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK, "pair_v2_accept failed");
+        serde_json::from_str::<Value>(&unsafe { take_cstr(out) }).unwrap()
+    });
+
+    let name_c = CString::new("ffi-v2-cli").unwrap();
+    let dev_kind_c = CString::new("cli").unwrap();
+    let mut pair_v2_out_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                cli_ep,
+                ep1_c.as_ptr(),
+                rhost_c.as_ptr(),
+                code_c.as_ptr(),
+                name_c.as_ptr(),
+                dev_kind_c.as_ptr(),
+                ptr::null(),
+                &raw mut pair_v2_out_p,
+            )
+        },
+        TENDRIL_OK,
+        "pair_v2_initiate failed: {}",
+        read_last_err()
+    );
+    let pair_v2_val: Value = serde_json::from_str(&unsafe { take_cstr(pair_v2_out_p) }).unwrap();
+    assert_eq!(pair_v2_val["host_id"], "ffi-v2-host");
+    assert_eq!(pair_v2_val["wire_version"], 2);
+    let host_acc_val = acc_v2_thr.join().unwrap();
+    assert_eq!(host_acc_val["wire_version"], 2);
+
+    let sas_c = CString::new(pair_v2_val["sas"].as_str().unwrap()).unwrap();
+    let cli_dev_c = CString::new(cli_dev_id).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(cli_ep, hname_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, cli_dev_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let caps_c = CString::new("[\"fs.read:/v2/*\"]").unwrap();
+    let mut grant_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                cli_dev_c.as_ptr(),
+                caps_c.as_ptr(),
+                300,
+                &raw mut grant_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_c = CString::new(unsafe { take_cstr(grant_p) }).unwrap();
+
+    // Anti-downgrade: v1 tendril_session_connect against a v2-pinned host must fail closed.
+    let downgraded = unsafe {
+        tendril_session_connect(
+            cli_ep,
+            ep1_c.as_ptr(),
+            rhost_c.as_ptr(),
+            hname_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(
+        downgraded.is_null(),
+        "v1 session connect must not downgrade v2 peer"
+    );
+
+    // Bind /v2/relay listener for the paired peer.
+    let mut ep2_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay_v2(
+                host_ep,
+                ws_v2_c.as_ptr(),
+                rhost_c.as_ptr(),
+                cli_dev_c.as_ptr(),
+                &raw mut ep2_p,
+            )
+        },
+        TENDRIL_OK,
+        "serve_relay_v2 failed: {}",
+        read_last_err()
+    );
+    let ep2 = unsafe { take_cstr(ep2_p) };
+    assert!(ep2.contains("/v2/relay"), "unexpected ep2: {ep2}");
+    let ep2_c = CString::new(ep2).unwrap();
+
+    // Also test serve_relay_v2 with NULL peer_id_opt binding active v2 peers.
+    let mut ep2_null_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay_v2(
+                host_ep,
+                ws_v2_c.as_ptr(),
+                rhost_c.as_ptr(),
+                ptr::null(),
+                &raw mut ep2_null_p,
+            )
+        },
+        TENDRIL_OK,
+        "serve_relay_v2(NULL) failed: {}",
+        read_last_err()
+    );
+    let ep2_null = unsafe { take_cstr(ep2_null_p) };
+    assert!(ep2_null.contains("/v2/relay"));
+
+    // Short-timeout accept negatives on v2 pairing and v2 session.
+    let mut timeout_out_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_pair_v2_accept(host_ep, 20, &raw mut timeout_out_p) },
+        TENDRIL_WOULD_BLOCK
+    );
+    assert!(timeout_out_p.is_null());
+    assert!(unsafe { tendril_session_accept_v2(host_ep, 20) }.is_null());
+
+    let acc_sess_v2_thr = thread::spawn(move || {
+        unsafe { tendril_session_accept_v2(hep_usize as *mut tendril_ffi::TendrilEndpoint, 10_000) }
+            .addr()
+    });
+    let cli_sess_v2 = unsafe {
+        tendril_session_connect_v2(
+            cli_ep,
+            ep2_c.as_ptr(),
+            rhost_c.as_ptr(),
+            hname_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(
+        !cli_sess_v2.is_null(),
+        "session_connect_v2 failed: {}",
+        read_last_err()
+    );
+    let host_sess_v2 = acc_sess_v2_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess_v2.is_null(), "session_accept_v2 returned null");
+
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), wake_task)
+            .await
+            .expect("wake webhook timed out")
+            .unwrap();
+    });
+
+    let msg = b"hello-ffi-v2-relay";
+    assert_eq!(
+        unsafe { tendril_session_send_data(cli_sess_v2, msg.as_ptr(), msg.len()) },
+        TENDRIL_OK
+    );
+    let mut ev_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_poll_event(host_sess_v2, 2_000, &raw mut ev_p) },
+        TENDRIL_OK
+    );
+    let ev: Value = serde_json::from_str(&unsafe { take_cstr(ev_p) }).unwrap();
+    assert_eq!(ev["event"], "data");
+    assert_eq!(ev["data_b64"], b64url_encode(msg));
+
+    // Authorize check (allowed + denied), rekey, and roster export over v2 session.
+    let mut allowed = 0u8;
+    let ok_cap_c = CString::new("fs.read:/v2/note").unwrap();
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess_v2, ok_cap_c.as_ptr(), &raw mut allowed) },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed, 1);
+
+    let denied_cap_c = CString::new("fs.write:/v2/note").unwrap();
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess_v2, denied_cap_c.as_ptr(), &raw mut allowed) },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed, 0);
+
+    assert_eq!(unsafe { tendril_session_rekey(cli_sess_v2) }, TENDRIL_OK);
+    let mut sess_roster_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_export_roster_json(cli_sess_v2, &raw mut sess_roster_p) },
+        TENDRIL_OK
+    );
+    let sess_roster_val: Value =
+        serde_json::from_str(&unsafe { take_cstr(sess_roster_p) }).unwrap();
+    assert_eq!(sess_roster_val["entries"]["ffi-v2-host"]["state"], "active");
+    assert_eq!(
+        sess_roster_val["entries"]["ffi-v2-host"]["min_wire_version"],
+        2
+    );
+
+    assert_eq!(
+        unsafe { tendril_session_close(cli_sess_v2, 1000, ptr::null()) },
+        TENDRIL_OK
+    );
+
+    // Reconfigure client without wake sink (since single-shot wake sink finished) and test revoke fail-closed.
+    let cli_cfg_nowake_c =
+        CString::new(serde_json::json!({ "relay_ticket": &ticket_val }).to_string()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(cli_ep, cli_cfg_nowake_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_revoke_peer(host_ep, cli_dev_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let acc_revoked_thr = thread::spawn(move || {
+        unsafe { tendril_session_accept_v2(hep_usize as *mut tendril_ffi::TendrilEndpoint, 2_000) }
+            .addr()
+    });
+    let rev_sess = unsafe {
+        tendril_session_connect_v2(
+            cli_ep,
+            ep2_c.as_ptr(),
+            rhost_c.as_ptr(),
+            hname_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    let rev_host_sess = acc_revoked_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(rev_sess.is_null() && rev_host_sess.is_null());
+
+    unsafe {
+        tendril_session_free(cli_sess_v2);
+        tendril_session_free(host_sess_v2);
+        tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
+    drop(relay_handle);
+}
+
+#[test]
+fn ffi_v2_pinned_pair_wrong_code_and_mid_session_crl_revocation() {
+    use tendril_core::roster::Roster;
+    use tendril_runtime::V2SessionDriver;
+
+    let host_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+    let hd_c = CString::new(host_dir.path().to_str().unwrap()).unwrap();
+    let cd_c = CString::new(cli_dir.path().to_str().unwrap()).unwrap();
+    let hname_c = CString::new("ffi-pin-host").unwrap();
+
+    let host_ep = unsafe { tendril_endpoint_new(hd_c.as_ptr(), hname_c.as_ptr()) };
+    let cli_ep = unsafe { tendril_endpoint_new(cd_c.as_ptr(), ptr::null()) };
+    assert!(!host_ep.is_null() && !cli_ep.is_null());
+
+    let mut host_info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(host_ep, &raw mut host_info_p) },
+        TENDRIL_OK
+    );
+    let host_info: Value = serde_json::from_str(&unsafe { take_cstr(host_info_p) }).unwrap();
+
+    let mut cli_info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(cli_ep, &raw mut cli_info_p) },
+        TENDRIL_OK
+    );
+    let cli_info: Value = serde_json::from_str(&unsafe { take_cstr(cli_info_p) }).unwrap();
+    let cli_dev_id = cli_info["device_id"].as_str().unwrap().to_owned();
+
+    let bind_c = CString::new("127.0.0.1:0").unwrap();
+    let mut dep_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, bind_c.as_ptr(), &raw mut dep_p) },
+        TENDRIL_OK
+    );
+    let dep = unsafe { take_cstr(dep_p) };
+    let dep_c = CString::new(dep.clone()).unwrap();
+
+    let kind_c = CString::new("lan").unwrap();
+    let mut code_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, kind_c.as_ptr(), &raw mut code_p) },
+        TENDRIL_OK
+    );
+    let code_c = CString::new(unsafe { take_cstr(code_p) }).unwrap();
+
+    // Negative 1: unknown field in pinned_host_json_opt must fail with TENDRIL_ERR_INVALID_ARG.
+    let bad_pin_c = CString::new("{\"unknown_pin_field\":true}").unwrap();
+    let name_c = CString::new("pin-cli").unwrap();
+    let dev_kind_c = CString::new("cli").unwrap();
+    let mut out_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                cli_ep,
+                dep_c.as_ptr(),
+                ptr::null(),
+                code_c.as_ptr(),
+                name_c.as_ptr(),
+                dev_kind_c.as_ptr(),
+                bad_pin_c.as_ptr(),
+                &raw mut out_p,
+            )
+        },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(out_p.is_null());
+    assert!(read_last_err().contains("invalid pinned_host_json_opt"));
+
+    // Negative 2: wrong PAKE pairing code fails closed without adding peer.
+    let hep_usize = host_ep.addr();
+    let acc_wrong_thr = thread::spawn(move || {
+        let mut out: *mut c_char = ptr::null_mut();
+        unsafe {
+            tendril_endpoint_pair_v2_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out,
+            )
+        }
+    });
+    let wrong_code_c = CString::new("0000-0000").unwrap();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                cli_ep,
+                dep_c.as_ptr(),
+                ptr::null(),
+                wrong_code_c.as_ptr(),
+                name_c.as_ptr(),
+                dev_kind_c.as_ptr(),
+                ptr::null(),
+                &raw mut out_p,
+            )
+        },
+        TENDRIL_ERR_PROTOCOL
+    );
+    assert!(out_p.is_null());
+    assert_eq!(acc_wrong_thr.join().unwrap(), TENDRIL_ERR_PROTOCOL);
+
+    // Positive: valid pinned_host_json_opt pairs immediately into Active (host_confirmed = true).
+    let mut code2_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, kind_c.as_ptr(), &raw mut code2_p) },
+        TENDRIL_OK
+    );
+    let code2_c = CString::new(unsafe { take_cstr(code2_p) }).unwrap();
+    let pinned_c = CString::new(
+        serde_json::json!({
+            "host_id": "ffi-pin-host",
+            "static_pub_b64": host_info["static_pub"],
+            "signing_pin_b64": host_info["signing_pub"],
+            "rotation_seq": 0,
+            "min_wire_version": 2
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let acc_ok_thr = thread::spawn(move || {
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_v2_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK);
+        serde_json::from_str::<Value>(&unsafe { take_cstr(out) }).unwrap()
+    });
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                cli_ep,
+                dep_c.as_ptr(),
+                ptr::null(),
+                code2_c.as_ptr(),
+                name_c.as_ptr(),
+                dev_kind_c.as_ptr(),
+                pinned_c.as_ptr(),
+                &raw mut out_p,
+            )
+        },
+        TENDRIL_OK,
+        "pinned pair_v2_initiate failed: {}",
+        read_last_err()
+    );
+    let init_val: Value = serde_json::from_str(&unsafe { take_cstr(out_p) }).unwrap();
+    assert_eq!(init_val["status"], "active");
+    assert_eq!(init_val["host_confirmed"], true);
+    let acc_val = acc_ok_thr.join().unwrap();
+    let sas_c = CString::new(acc_val["sas"].as_str().unwrap()).unwrap();
+
+    let cli_dev_c = CString::new(cli_dev_id).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, cli_dev_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let caps_c = CString::new("[\"fs.read:/crl/*\"]").unwrap();
+    let mut grant_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                cli_dev_c.as_ptr(),
+                caps_c.as_ptr(),
+                300,
+                &raw mut grant_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_str = unsafe { take_cstr(grant_p) };
+    let grant: Grant = serde_json::from_str(&grant_str).unwrap();
+    let grant_c = CString::new(grant_str).unwrap();
+    let crl_ts = grant.not_before.clone();
+    let revoked_nonce = grant.nonce.clone();
+    let expected_nonce = revoked_nonce.clone();
+
+    // Free host_ep so we can drive a raw V2SessionDriver host pushing a live 0x03 CRL revocation frame.
+    unsafe { tendril_endpoint_free(host_ep) };
+
+    let host_store = StateStore::open_or_create(host_dir.path()).unwrap();
+    let host_id = host_store.load_or_generate_identity(None).unwrap();
+    let mut host_roster: Roster = host_store.load_roster().unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (v2_ep_str, accept_handle) = rt.block_on(async {
+        let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let ep = listener.local_endpoint();
+        let h_id = host_id.clone();
+        let handle = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut drv = V2SessionDriver::accept(
+                stream,
+                &h_id,
+                &mut host_roster,
+                now,
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            let crl = sign_crl(
+                RevocationListUnsigned {
+                    v: 1,
+                    issuer: h_id.host_id().to_owned(),
+                    seq: 1,
+                    revoked_devices: Vec::new(),
+                    revoked_nonces: vec![revoked_nonce],
+                    ts: crl_ts,
+                },
+                h_id.signing_key(),
+            )
+            .unwrap();
+            drv.send_revocation(&crl).await.unwrap();
+            drv
+        });
+        (ep, handle)
+    });
+    let v2_ep_c = CString::new(v2_ep_str.clone()).unwrap();
+
+    let cli_sess = unsafe {
+        tendril_session_connect_v2(
+            cli_ep,
+            v2_ep_c.as_ptr(),
+            ptr::null(),
+            hname_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(
+        !cli_sess.is_null(),
+        "v2 connect failed: {}",
+        read_last_err()
+    );
+    let drv_host = rt.block_on(accept_handle).unwrap();
+
+    let mut ev_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_poll_event(cli_sess, 2_000, &raw mut ev_p) },
+        TENDRIL_ERR_PROTOCOL
+    );
+    assert!(ev_p.is_null());
+
+    // Reopen cli_ep from disk and verify the CRL persisted across restart and rejects the revoked nonce.
+    unsafe {
+        tendril_session_free(cli_sess);
+        tendril_endpoint_free(cli_ep);
+    }
+    drop(drv_host);
+
+    let cli_ep2 = unsafe { tendril_endpoint_new(cd_c.as_ptr(), ptr::null()) };
+    assert!(!cli_ep2.is_null());
+    let mut persisted_roster_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_roster_json(cli_ep2, &raw mut persisted_roster_p) },
+        TENDRIL_OK
+    );
+    let persisted_roster: Value =
+        serde_json::from_str(&unsafe { take_cstr(persisted_roster_p) }).unwrap();
+    let crl_nonces = persisted_roster["crls"]["ffi-pin-host"]["revoked_nonces"]
+        .as_array()
+        .expect("persisted CRL nonces");
+    assert!(crl_nonces.iter().any(|v| v == &expected_nonce));
+
+    unsafe { tendril_endpoint_free(cli_ep2) };
 }
