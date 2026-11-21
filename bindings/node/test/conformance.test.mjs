@@ -477,16 +477,16 @@ test("Node binding validates safe integers and runs full-duplex session ops conc
     assert.equal(hostEv.event, "data");
     assert.ok(Date.now() - t0 < 1500, "full-duplex Node ops stalled behind pollEvent");
 
-    // SEC-31: grant expiring while hostSess.pollEvent(5000) is awaiting rejects incoming rekey.
-    const shortGrant = hostEp.mintGrant(acc.device_id, ["fs.read"], 1);
+    // SEC-31: grant expiring while hostSess.pollEvent(6000) is awaiting rejects incoming rekey.
+    const shortGrant = hostEp.mintGrant(acc.device_id, ["fs.read"], 3);
     const [cliSess2, hostSess2] = await Promise.all([
       cliEp.connect(addr, "node-sec07-host", shortGrant),
       hostEp.acceptSession(5000),
     ]);
-    const expPollPromise = hostSess2.pollEvent(5000);
-    await new Promise((r) => setTimeout(r, 2200));
+    const expPollCheck = assert.rejects(hostSess2.pollEvent(6000));
+    await new Promise((r) => setTimeout(r, 3500));
     await cliSess2.rekey();
-    await assert.rejects(expPollPromise);
+    await expPollCheck;
     await cliSess2.close(1000, "done");
     await cliSess.close(1000, "done");
   } finally {

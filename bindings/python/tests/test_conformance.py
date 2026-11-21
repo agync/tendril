@@ -481,8 +481,8 @@ class TendrilPythonTests(unittest.TestCase):
             self.assertLess(time.monotonic() - t0, 1.5)
             self.assertEqual(json.loads(poll_holder["ev"])["event"], "data")
 
-            # SEC-31: grant expiring while poll_event(5000) is parked must reject incoming rekey.
-            short_grant = host_ep.mint_grant(cli_pair["device_id"], ["fs.read"], 1)
+            # SEC-31: grant expiring while poll_event(6000) is parked must reject incoming rekey.
+            short_grant = host_ep.mint_grant(cli_pair["device_id"], ["fs.read"], 3)
             sess2_holder: dict = {}
             t_acc2 = threading.Thread(
                 target=lambda: sess2_holder.__setitem__("sess", host_ep.accept_session(5000))
@@ -495,13 +495,13 @@ class TendrilPythonTests(unittest.TestCase):
 
             def poll_exp() -> None:
                 try:
-                    poll2_err["ev"] = host_sess2.poll_event(5000)
+                    poll2_err["ev"] = host_sess2.poll_event(6000)
                 except RuntimeError as exc:
                     poll2_err["err"] = str(exc)
 
             t_exp = threading.Thread(target=poll_exp)
             t_exp.start()
-            time.sleep(2.2)
+            time.sleep(3.5)
             cli_sess2.rekey()
             t_exp.join(timeout=3)
             self.assertIn("err", poll2_err)
