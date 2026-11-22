@@ -722,6 +722,7 @@ class TendrilPythonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             secret_file = pathlib.Path(tmpdir) / "relay.secret"
             secret_file.write_text(secret_val, encoding="utf-8")
+            secret_file.chmod(0o600)
 
             relay_proc = subprocess.Popen(
                 [
