@@ -1549,7 +1549,11 @@ func TestRevokePeerRacesPollEventAndAuthorize(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s ExportRosterJSON: %v", name, err)
 		}
-		entry, ok := parseRoster(t, raw).Entries[acc.DeviceID]
+		doc := parseRoster(t, raw)
+		for i := range raw {
+			raw[i] = 0
+		}
+		entry, ok := doc.Entries[acc.DeviceID]
 		if !ok || entry.State != "revoked" || len(entry.Grants) != 0 {
 			t.Fatalf("%s roster resurrected revoked peer: %+v", name, entry)
 		}

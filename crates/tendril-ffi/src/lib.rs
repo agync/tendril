@@ -2,7 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::fmt;
 use std::net::SocketAddr;
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tendril_core::crypto::{
     HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, b64url_decode,
     b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
@@ -28,7 +28,7 @@ use tendril_core::pairing::{
     PairingManager, PinnedHost, mint_enrollment_token,
 };
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket};
-use tendril_core::roster::{AnchorState, PeerState, Roster, RosterEntry, TrustAnchor};
+use tendril_core::roster::{AnchorState, PeerState, Roster};
 use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
@@ -40,12 +40,10 @@ use tendril_runtime::{
     RelayV2ListenerConfig, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
     V2SessionDriver, WakeAdapterKind, WakeDialOptions, WakeSecret, WakeTarget,
     deserialize_identity_json, dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
-    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_store,
     drive_pair_responder_with_policy, drive_pair_responder_with_store,
-    drive_v2_pake_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_timeout,
-    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
-    pairing_path_kind_for_provider, pinned_pairing_floor, serialize_identity_json,
-    wake_and_dial_v2,
+    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
+    drive_v2_pake_pair_responder_with_store, pairing_path_kind_for_provider, pinned_pairing_floor,
+    serialize_identity_json, wake_and_dial_v2,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{
@@ -210,85 +208,11 @@ fn lock_roster(roster: &StdMutex<Roster>) -> std::sync::MutexGuard<'_, Roster> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Serde shape of [`Roster`] used to merge in-memory session state into the on-disk roster.
-///
-/// Unknown top-level fields are carried through `rest` so a merge never drops state.
-#[derive(Serialize, Deserialize)]
-struct RosterShadow {
-    entries: BTreeMap<String, RosterEntry>,
-    crls: BTreeMap<String, RevocationList>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    trust_anchors: BTreeMap<String, TrustAnchor>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    burned_enrollment_nonces: BTreeMap<String, u64>,
-    #[serde(flatten)]
-    rest: BTreeMap<String, serde_json::Value>,
-}
-
-/// Merges the monotonic security state of `mem` (revocations, newer CRLs, rotations, raised wire
-/// floors, burned nonces) into `disk`. The disk roster stays authoritative for existence and
-/// for any entry already revoked, so a stale in-memory snapshot can never resurrect a peer or
-/// drop a revocation that was committed concurrently.
-fn merge_roster_state(disk: &Roster, mem: &Roster) -> Result<Roster, String> {
-    let disk_bytes = Zeroizing::new(serde_json::to_vec(disk).map_err(|e| e.to_string())?);
-    let mem_bytes = Zeroizing::new(serde_json::to_vec(mem).map_err(|e| e.to_string())?);
-    if *disk_bytes == *mem_bytes {
-        return Ok(disk.clone());
-    }
-    let mut merged: RosterShadow =
-        serde_json::from_slice(&disk_bytes).map_err(|e| e.to_string())?;
-    let session: RosterShadow = serde_json::from_slice(&mem_bytes).map_err(|e| e.to_string())?;
-    for (id, mem_entry) in &session.entries {
-        let Some(entry) = merged.entries.get_mut(id) else {
-            continue;
-        };
-        if entry.state == PeerState::Revoked {
-            continue;
-        }
-        if mem_entry.state == PeerState::Revoked {
-            entry.state = PeerState::Revoked;
-            entry.grants.clear();
-            entry.v2_secrets = None;
-            continue;
-        }
-        if mem_entry.rotation_seq > entry.rotation_seq {
-            entry.static_pub = mem_entry.static_pub;
-            entry.signing_pub.clone_from(&mem_entry.signing_pub);
-            entry.rotation_seq = mem_entry.rotation_seq;
-        }
-        entry.min_wire_version = entry.min_wire_version.max(mem_entry.min_wire_version);
-    }
-    for (issuer, crl) in session.crls {
-        let newer = merged
-            .crls
-            .get(&issuer)
-            .is_none_or(|existing| crl.seq > existing.seq);
-        if newer {
-            merged.crls.insert(issuer, crl);
-        }
-    }
-    for (id, mem_anchor) in &session.trust_anchors {
-        if mem_anchor.state == AnchorState::Revoked
-            && let Some(anchor) = merged.trust_anchors.get_mut(id)
-        {
-            anchor.state = AnchorState::Revoked;
-        }
-    }
-    for (nonce, expiry) in session.burned_enrollment_nonces {
-        merged
-            .burned_enrollment_nonces
-            .entry(nonce)
-            .or_insert(expiry);
-    }
-    let out = Zeroizing::new(serde_json::to_vec(&merged).map_err(|e| e.to_string())?);
-    serde_json::from_slice(&out).map_err(|e| e.to_string())
-}
-
 /// Applies `f` to the roster. The caller must already hold `store_lock` when `store` is `Some`.
 ///
 /// Lock order is `store_lock` then `roster`. With a store, `f` runs transactionally on the
-/// latest on-disk roster after the in-memory security state is merged in, and the committed
-/// roster replaces the in-memory copy before `roster` is released.
+/// latest on-disk roster and the committed roster replaces the in-memory copy before `roster`
+/// is released.
 fn commit_roster_update<T, F>(
     store: Option<&Arc<StateStore>>,
     roster: &StdMutex<Roster>,
@@ -303,8 +227,6 @@ where
     };
     let mut failure: Option<(i32, String)> = None;
     let res = store.update_roster_with_state(|disk| {
-        let merged = merge_roster_state(disk, &guard).map_err(RuntimeError::Storage)?;
-        *disk = merged;
         f(disk).map_err(|e| {
             failure = Some(e);
             RuntimeError::Protocol(String::new())
@@ -319,9 +241,9 @@ where
     }
 }
 
-/// Merges in-memory session state into the store and reloads the committed roster, serialized
-/// under `store_lock` (lock order `store_lock` then `roster`). No-op without a store.
-fn sync_roster_from_store_locked(
+/// Reloads the on-disk roster into `roster` under `store_lock` (lock order `store_lock` then
+/// `roster`) without taking an exclusive write lock or rewriting `roster.json`.
+fn load_roster_from_store_locked(
     store: Option<&Arc<StateStore>>,
     store_lock: &AsyncMutex<()>,
     rt: &Runtime,
@@ -331,7 +253,9 @@ fn sync_roster_from_store_locked(
         return Ok(());
     };
     let _store_guard = rt.block_on(store_lock.lock());
-    commit_roster_update(Some(store), roster, |_| Ok(())).map_err(|(_, msg)| msg)
+    let disk = store.load_roster().map_err(|e| e.to_string())?;
+    *lock_roster(roster) = disk;
+    Ok(())
 }
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -987,8 +911,8 @@ impl TendrilEndpoint {
         commit_roster_update(self.store.as_ref(), &self.roster, f)
     }
 
-    fn sync_roster_from_store(&self) -> Result<(), String> {
-        sync_roster_from_store_locked(
+    fn load_roster_from_store(&self) -> Result<(), String> {
+        load_roster_from_store_locked(
             self.store.as_ref(),
             &self.store_lock,
             &self.rt,
@@ -1126,17 +1050,56 @@ pub struct TendrilSession {
     store: Option<Arc<StateStore>>,
     store_lock: Arc<AsyncMutex<()>>,
     roster: Arc<StdMutex<Roster>>,
+    v1_root_id: Option<String>,
+    v1_local_signing: Option<(String, HybridSigningPublicKey)>,
     session: SessionBackend,
 }
 
 impl TendrilSession {
-    fn sync_roster_from_store(&self) -> Result<(), String> {
-        sync_roster_from_store_locked(
+    fn load_roster_from_store(&self) -> Result<(), String> {
+        load_roster_from_store_locked(
             self.store.as_ref(),
             &self.store_lock,
             &self.rt,
             &self.roster,
         )
+    }
+
+    fn persist_v1_crl_if_newer(&self, issuer: &str) -> Result<(), String> {
+        let Some(ref store) = self.store else {
+            return Ok(());
+        };
+        let _store_guard = self.rt.block_on(self.store_lock.lock());
+        let mut guard = lock_roster(&self.roster);
+        let disk = store.load_roster().map_err(|e| e.to_string())?;
+        let Some(crl) = guard.crl(issuer).cloned() else {
+            *guard = disk;
+            return Ok(());
+        };
+        let needs_persist = disk
+            .crl(issuer)
+            .is_none_or(|existing| crl.seq > existing.seq);
+        if !needs_persist {
+            *guard = disk;
+            return Ok(());
+        }
+        let issuer_pub = if let Some((ref local_id, ref local_pub)) = self.v1_local_signing
+            && local_id == issuer
+        {
+            local_pub.clone()
+        } else {
+            disk.lookup_active_signing_key(issuer)
+                .or_else(|| guard.get(issuer).and_then(|e| e.signing_pub.clone()))
+                .ok_or_else(|| format!("missing signing key for CRL issuer '{issuer}'"))?
+        };
+        let (_out, committed, _stamp) = store
+            .update_roster_with_state(|d| match d.ingest_crl(crl, issuer, &issuer_pub) {
+                Ok(()) | Err(CoreError::CrlStaleSeq { .. }) => Ok(()),
+                Err(err) => Err(err.into()),
+            })
+            .map_err(|e| e.to_string())?;
+        *guard = committed;
+        Ok(())
     }
 }
 
@@ -1651,6 +1614,10 @@ pub unsafe extern "C" fn tendril_endpoint_export_roster_json(
             return TENDRIL_ERR_INVALID_ARG;
         }
         let ep = unsafe { &*ep };
+        if let Err(e) = ep.load_roster_from_store() {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
         unsafe { write_roster_json_out(&ep.roster, out_json) }
     })
 }
@@ -1870,7 +1837,10 @@ pub unsafe extern "C" fn tendril_endpoint_issue_code(
         let ep = unsafe { &*ep };
         let mut mgr = ep.pair_mgr.lock().expect("pair_mgr mutex poisoned");
         match mgr.issue_code(pk, now_unix()) {
-            Ok(code) => unsafe { write_out_cstring(out_code, &code) },
+            Ok(code) => {
+                let code = Zeroizing::new(code);
+                unsafe { write_out_cstring(out_code, &code) }
+            }
             Err(e) => {
                 set_last_error(e.to_string());
                 TENDRIL_ERR_INTERNAL
@@ -1916,12 +1886,11 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
 
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
-        let roster_snapshot = {
-            ep.roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        };
+        if let Err(e) = ep.load_roster_from_store() {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
+        let roster_snapshot = lock_roster(&ep.roster).clone();
         let v2_secret = if is_v2_relay_endpoint(endpoint_s) {
             match lookup_v2_mailbox_secret_for_pair(&roster_snapshot, None, endpoint_s, now_unix())
             {
@@ -1941,30 +1910,15 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
                     .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
             let device_name = name_s.unwrap_or("ffi-device").to_owned();
             let device_kind = kind_s.unwrap_or("ffi").to_owned();
-            let pair_res = if let Some(ref store) = ep.store {
-                drive_pair_initiator_with_store(
-                    stream.as_mut(),
-                    &ep.identity,
-                    device_name,
-                    device_kind,
-                    code_s.to_owned(),
-                    None,
-                    store,
-                    DEFAULT_PRE_AUTH_TIMEOUT,
-                )
-                .await
-                .map(|r| r.outcome)
-            } else {
-                drive_v1_pair_initiator_with_roster_floors(
-                    stream.as_mut(),
-                    &ep.identity,
-                    device_name,
-                    device_kind,
-                    code_s.to_owned(),
-                    &roster_snapshot,
-                )
-                .await
-            }
+            let pair_res = drive_v1_pair_initiator_with_roster_floors(
+                stream.as_mut(),
+                &ep.identity,
+                device_name,
+                device_kind,
+                code_s.to_owned(),
+                &roster_snapshot,
+            )
+            .await
             .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()));
             let _ = stream.close().await;
             pair_res
@@ -2104,7 +2058,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
             .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
         });
         if !matches!(res, Err((TENDRIL_WOULD_BLOCK | TENDRIL_ERR_CLOSED, _)))
-            && let Err(e) = ep.sync_roster_from_store()
+            && let Err(e) = ep.load_roster_from_store()
         {
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
@@ -2495,11 +2449,12 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
 
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
-        let fallback_floor = {
-            let roster = ep
-                .roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = ep.load_roster_from_store() {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
+        let pairing_floor = {
+            let roster = lock_roster(&ep.roster);
             pinned_pairing_floor(&roster, &pinned_host)
         };
         let res = ep.rt.block_on(async {
@@ -2508,31 +2463,17 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
                 .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
             let device_name = name_s.unwrap_or("ffi-machine").to_owned();
             let device_kind = kind_s.unwrap_or("machine").to_owned();
-            let pair_res = if let Some(ref store) = ep.store {
-                drive_m2m_enroll_initiator_with_store(
-                    stream.as_mut(),
-                    &ep.identity,
-                    device_name,
-                    device_kind,
-                    token,
-                    pinned_host,
-                    store,
-                    DEFAULT_PRE_AUTH_TIMEOUT,
-                )
-                .await
-            } else {
-                drive_m2m_enroll_initiator_with_floor(
-                    stream.as_mut(),
-                    &ep.identity,
-                    device_name,
-                    device_kind,
-                    token,
-                    pinned_host,
-                    fallback_floor,
-                    DEFAULT_PRE_AUTH_TIMEOUT,
-                )
-                .await
-            }
+            let pair_res = drive_m2m_enroll_initiator_with_floor(
+                stream.as_mut(),
+                &ep.identity,
+                device_name,
+                device_kind,
+                token,
+                pinned_host,
+                pairing_floor,
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
             .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()));
             let _ = stream.close().await;
             pair_res
@@ -2636,19 +2577,18 @@ pub unsafe extern "C" fn tendril_session_connect(
 
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
-        if let Err(e) = ep.sync_roster_from_store() {
+        if let Err(e) = ep.load_roster_from_store() {
             set_last_error(e);
             return ptr::null_mut();
         }
-        if let Err(e) =
-            tendril_core::session::check_peer_allows_wire_v1(&lock_roster(&ep.roster), target_s)
+        let mut working_roster = lock_roster(&ep.roster).clone();
+        if let Err(e) = tendril_core::session::check_peer_allows_wire_v1(&working_roster, target_s)
         {
             set_last_error(e.to_string());
             return ptr::null_mut();
         }
         let v2_secret = if is_v2_relay_endpoint(ep_s) {
-            let roster = lock_roster(&ep.roster);
-            match lookup_v2_mailbox_secret_for_target(&roster, target_s) {
+            match lookup_v2_mailbox_secret_for_target(&working_roster, target_s) {
                 Ok(s) => Some(s),
                 Err((_, msg)) => {
                     set_last_error(msg);
@@ -2658,25 +2598,48 @@ pub unsafe extern "C" fn tendril_session_connect(
         } else {
             None
         };
+        let was_revoked = working_roster
+            .get(target_s)
+            .is_some_and(|e| e.state == PeerState::Revoked);
         let res = ep.rt.block_on(async {
             let stream = dial_endpoint_v2_with_options(ep_s, relay_host_s, &cfg, v2_secret)
                 .await
-                .map_err(|e| e.to_string())?;
-            SessionDriver::connect_locked(
+                .map_err(|e| RuntimeError::Protocol(e.to_string()))?;
+            SessionDriver::connect(
                 stream,
                 &ep.identity,
                 target_s,
                 grant,
-                &ep.roster,
+                &mut working_roster,
                 now_unix(),
             )
             .await
-            .map_err(|e| e.to_string())
         });
 
         match res {
             Ok(driver) => {
-                if let Err(e) = ep.sync_roster_from_store() {
+                let applied_rotation = driver.applied_rotation().to_vec();
+                let sync_res = if !applied_rotation.is_empty()
+                    && let Some(entry) = working_roster.get(target_s)
+                    && let Some(ref presented_signing) = entry.signing_pub
+                {
+                    let peer_static = entry.static_pub;
+                    let presented_signing = presented_signing.clone();
+                    ep.mutate_roster(|rst| {
+                        rst.apply_verified_rotation(
+                            target_s,
+                            &applied_rotation,
+                            &peer_static,
+                            &presented_signing,
+                        )
+                        .map(|_| ())
+                        .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
+                    })
+                    .map_err(|(_, msg)| msg)
+                } else {
+                    ep.load_roster_from_store()
+                };
+                if let Err(e) = sync_res {
                     set_last_error(e);
                     return ptr::null_mut();
                 }
@@ -2685,14 +2648,33 @@ pub unsafe extern "C" fn tendril_session_connect(
                     store: ep.store.clone(),
                     store_lock: Arc::clone(&ep.store_lock),
                     roster: Arc::clone(&ep.roster),
+                    v1_root_id: Some(target_s.to_owned()),
+                    v1_local_signing: None,
                     session: SessionBackend::V1(driver.into_concurrent()),
                 }))
             }
-            Err(e) => {
-                if let Err(pe) = ep.sync_roster_from_store() {
-                    set_last_error(format!("{e} (roster persist error: {pe})"));
+            Err(err) => {
+                let fork = matches!(
+                    err,
+                    RuntimeError::Core(CoreError::RotationForkDetected { .. })
+                );
+                let fresh_revoked = !was_revoked
+                    && working_roster
+                        .get(target_s)
+                        .is_some_and(|e| e.state == PeerState::Revoked);
+                let sync_res = if fork || fresh_revoked {
+                    ep.mutate_roster(|rst| match rst.revoke_peer(target_s) {
+                        Ok(()) | Err(CoreError::PeerNotFound(_)) => Ok(()),
+                        Err(e) => Err((TENDRIL_ERR_INTERNAL, e.to_string())),
+                    })
+                    .map_err(|(_, msg)| msg)
                 } else {
-                    set_last_error(e);
+                    ep.load_roster_from_store()
+                };
+                if let Err(pe) = sync_res {
+                    set_last_error(format!("{err} (roster persist error: {pe})"));
+                } else {
+                    set_last_error(err.to_string());
                 }
                 ptr::null_mut()
             }
@@ -2725,20 +2707,43 @@ pub unsafe extern "C" fn tendril_session_accept(
             };
             accepted.set(true);
 
-            SessionDriver::accept_locked(
-                stream,
-                &ep.identity,
-                &ep.roster,
-                now_unix(),
-                Some(ep.router.rate_limiter()),
-                Some(guard),
-                DEFAULT_PRE_AUTH_TIMEOUT,
-            )
-            .await
+            if let Some(ref store) = ep.store {
+                let mut working_roster = {
+                    let _store_guard = ep.store_lock.lock().await;
+                    let store_c = store.as_ref().clone();
+                    let disk = tokio::task::spawn_blocking(move || store_c.load_roster())
+                        .await
+                        .map_err(|e| format!("load roster task failed: {e}"))?
+                        .map_err(|e| e.to_string())?;
+                    *lock_roster(&ep.roster) = disk.clone();
+                    disk
+                };
+                SessionDriver::accept_with_options(
+                    stream,
+                    &ep.identity,
+                    &mut working_roster,
+                    now_unix(),
+                    Some(ep.router.rate_limiter()),
+                    Some(guard),
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            } else {
+                SessionDriver::accept_locked(
+                    stream,
+                    &ep.identity,
+                    &ep.roster,
+                    now_unix(),
+                    Some(ep.router.rate_limiter()),
+                    Some(guard),
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+            }
             .map_err(|e| e.to_string())
         });
         let synced = if accepted.get() {
-            ep.sync_roster_from_store()
+            ep.load_roster_from_store()
         } else {
             Ok(())
         };
@@ -2749,11 +2754,15 @@ pub unsafe extern "C" fn tendril_session_accept(
                     set_last_error(e);
                     return ptr::null_mut();
                 }
+                let local_id = ep.identity.host_id().to_owned();
+                let local_sig = ep.identity.signing_key().public_key().clone();
                 Box::into_raw(Box::new(TendrilSession {
                     rt: Arc::clone(&ep.rt),
                     store: ep.store.clone(),
                     store_lock: Arc::clone(&ep.store_lock),
                     roster: Arc::clone(&ep.roster),
+                    v1_root_id: Some(local_id.clone()),
+                    v1_local_signing: Some((local_id, local_sig)),
                     session: SessionBackend::V1(driver.into_concurrent()),
                 }))
             }
@@ -2802,6 +2811,10 @@ pub unsafe extern "C" fn tendril_session_export_roster_json(
             return TENDRIL_ERR_INVALID_ARG;
         }
         let sess = unsafe { &*sess };
+        if let Err(e) = sess.load_roster_from_store() {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
         unsafe { write_roster_json_out(&sess.roster, out_json) }
     })
 }
@@ -2881,10 +2894,14 @@ pub unsafe extern "C" fn tendril_session_poll_event(
         }) {
             Ok(Ok(Some(ev))) => {
                 let val = match ev {
-                    SessionEvent::AppData(data) => serde_json::json!({
-                        "event": "data",
-                        "data_b64": b64url_encode(&data),
-                    }),
+                    SessionEvent::AppData(mut data) => {
+                        let encoded = Zeroizing::new(b64url_encode(&data));
+                        data.zeroize();
+                        serde_json::json!({
+                            "event": "data",
+                            "data_b64": &*encoded,
+                        })
+                    }
                     SessionEvent::Rekeyed { direction } => serde_json::json!({
                         "event": "rekeyed",
                         "direction": format!("{direction:?}"),
@@ -2894,7 +2911,12 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                         "grant": g,
                     }),
                     SessionEvent::RevocationUpdated { issuer, seq } => {
-                        if let Err(e) = sess.sync_roster_from_store() {
+                        let res = if matches!(sess.session, SessionBackend::V1(_)) {
+                            sess.persist_v1_crl_if_newer(&issuer)
+                        } else {
+                            sess.load_roster_from_store()
+                        };
+                        if let Err(e) = res {
                             set_last_error(e);
                             return TENDRIL_ERR_INTERNAL;
                         }
@@ -2918,11 +2940,21 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                         "reason": reason,
                     }),
                 };
-                unsafe { write_out_cstring(out_event_json, &val.to_string()) }
+                let serialized = Zeroizing::new(val.to_string());
+                unsafe { write_out_cstring(out_event_json, &serialized) }
             }
             Ok(Ok(None)) => TENDRIL_EOF,
             Ok(Err(e)) => {
-                match sess.sync_roster_from_store() {
+                let sync_res = if matches!(sess.session, SessionBackend::V1(_)) {
+                    if let Some(ref root_id) = sess.v1_root_id {
+                        sess.persist_v1_crl_if_newer(root_id)
+                    } else {
+                        sess.load_roster_from_store()
+                    }
+                } else {
+                    sess.load_roster_from_store()
+                };
+                match sync_res {
                     Ok(()) => set_last_error(e.to_string()),
                     Err(pe) => set_last_error(format!("{e} (roster persist error: {pe})")),
                 }
@@ -3154,11 +3186,12 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay_v2(
         };
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
+        if let Err(e) = ep.load_roster_from_store() {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
         let secrets: Vec<[u8; 32]> = {
-            let roster = ep
-                .roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let roster = lock_roster(&ep.roster);
             if let Some(pid) = peer_opt.filter(|s| !s.is_empty()) {
                 match lookup_v2_mailbox_secret_for_target(&roster, pid) {
                     Ok(sec) => vec![sec],
@@ -3255,12 +3288,11 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_initiate(
 
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
-        let roster_snapshot = {
-            ep.roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        };
+        if let Err(e) = ep.load_roster_from_store() {
+            set_last_error(e);
+            return TENDRIL_ERR_INTERNAL;
+        }
+        let roster_snapshot = lock_roster(&ep.roster).clone();
 
         let v2_pinned = match pinned_opt.filter(|s| !s.is_empty()) {
             Some(raw) => {
@@ -3335,32 +3367,16 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_initiate(
                 dial_endpoint_v2_with_options(endpoint_s, relay_host_s, &cfg, v2_secret)
                     .await
                     .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
-            let pair_res = if let Some(ref store) = ep.store {
-                drive_v2_pake_pair_initiator_with_store(
-                    stream.as_mut(),
-                    &ep.identity,
-                    device_name,
-                    device_kind,
-                    code_s.to_owned(),
-                    v2_pinned,
-                    "paired-host".to_owned(),
-                    Vec::new(),
-                    store,
-                    DEFAULT_PRE_AUTH_TIMEOUT,
-                )
-                .await
-            } else {
-                drive_v2_pake_pair_initiator_with_timeout(
-                    stream.as_mut(),
-                    &ep.identity,
-                    device_name,
-                    device_kind,
-                    code_s.to_owned(),
-                    v2_pinned,
-                    DEFAULT_PRE_AUTH_TIMEOUT,
-                )
-                .await
-            }
+            let pair_res = drive_v2_pake_pair_initiator_with_timeout(
+                stream.as_mut(),
+                &ep.identity,
+                device_name,
+                device_kind,
+                code_s.to_owned(),
+                v2_pinned,
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
             .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()));
             let _ = stream.close().await;
             pair_res
@@ -3378,24 +3394,18 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_initiate(
                     let dev_id = device_id.clone();
                     let h_id = host_id.clone();
                     let sas = pairing_sas.clone();
-                    if ep.store.is_some() {
-                        if let Err(e) = ep.sync_roster_from_store() {
-                            set_last_error(e);
-                            return TENDRIL_ERR_INTERNAL;
-                        }
-                    } else {
-                        let mut roster = ep
-                            .roster
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Err(e) = roster.apply_v2_pair_initiator_outcome(
-                            &pair_res.outcome,
-                            h_id.clone(),
-                            Vec::new(),
-                        ) {
-                            set_last_error(e.to_string());
-                            return TENDRIL_ERR_PROTOCOL;
-                        }
+                    if let Err((rc, msg)) = ep.mutate_roster(|roster| {
+                        roster
+                            .apply_v2_pair_initiator_outcome(
+                                &pair_res.outcome,
+                                h_id.clone(),
+                                Vec::new(),
+                            )
+                            .map(|_| ())
+                            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
+                    }) {
+                        set_last_error(msg);
+                        return rc;
                     }
                     let out = serde_json::json!({
                         "device_id": dev_id,
@@ -3441,6 +3451,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_accept(
         }
         let ep = unsafe { &*ep };
         let wait = Duration::from_millis(timeout_ms);
+        let accepted = std::cell::Cell::new(false);
         let res = ep.rt.block_on(async {
             let (mut stream, guard) = match ep.router.recv_v2_pair(wait).await {
                 Ok(Some(pair)) => pair,
@@ -3452,6 +3463,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_accept(
                     ));
                 }
             };
+            accepted.set(true);
             let path_kind = pairing_path_kind_for_provider(stream.provider_id());
             if let Some(ref store) = ep.store {
                 drive_v2_pake_pair_responder_with_store(
@@ -3486,6 +3498,17 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_accept(
             .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
         });
 
+        if accepted.get()
+            && let Err(e) = ep.load_roster_from_store()
+        {
+            if let Err((_, msg)) = res {
+                set_last_error(format!("{msg} (roster sync error: {e})"));
+            } else {
+                set_last_error(e);
+            }
+            return TENDRIL_ERR_INTERNAL;
+        }
+
         match res {
             Ok(pair_res) => match pair_res.outcome {
                 V2PairOutcome::ResponderPending {
@@ -3495,10 +3518,6 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_accept(
                     kind,
                     ..
                 } => {
-                    if let Err(e) = ep.sync_roster_from_store() {
-                        set_last_error(e);
-                        return TENDRIL_ERR_INTERNAL;
-                    }
                     let out = serde_json::json!({
                         "device_id": device_id,
                         "sas": pairing_sas,
@@ -3571,11 +3590,12 @@ pub unsafe extern "C" fn tendril_session_connect_v2(
 
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
+        if let Err(e) = ep.load_roster_from_store() {
+            set_last_error(e);
+            return ptr::null_mut();
+        }
         let v2_secret = if is_v2_relay_endpoint(ep_s) {
-            let roster = ep
-                .roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let roster = lock_roster(&ep.roster);
             match lookup_v2_mailbox_secret_for_target(&roster, target_s) {
                 Ok(s) => Some(s),
                 Err((_, msg)) => {
@@ -3643,7 +3663,7 @@ pub unsafe extern "C" fn tendril_session_connect_v2(
 
         match res {
             Ok(driver) => {
-                if let Err(e) = ep.sync_roster_from_store() {
+                if let Err(e) = ep.load_roster_from_store() {
                     set_last_error(e);
                     return ptr::null_mut();
                 }
@@ -3652,11 +3672,13 @@ pub unsafe extern "C" fn tendril_session_connect_v2(
                     store: ep.store.clone(),
                     store_lock: Arc::clone(&ep.store_lock),
                     roster: Arc::clone(&ep.roster),
+                    v1_root_id: None,
+                    v1_local_signing: None,
                     session: SessionBackend::V2(driver.into_concurrent()),
                 }))
             }
             Err(e) => {
-                match ep.sync_roster_from_store() {
+                match ep.load_roster_from_store() {
                     Ok(()) => set_last_error(e),
                     Err(pe) => set_last_error(format!("{e} (roster sync error: {pe})")),
                 }
@@ -3720,7 +3742,7 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
         });
 
         let synced = if accepted.get() {
-            ep.sync_roster_from_store()
+            ep.load_roster_from_store()
         } else {
             Ok(())
         };
@@ -3735,6 +3757,8 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
                     store: ep.store.clone(),
                     store_lock: Arc::clone(&ep.store_lock),
                     roster: Arc::clone(&ep.roster),
+                    v1_root_id: None,
+                    v1_local_signing: None,
                     session: SessionBackend::V2(driver.into_concurrent()),
                 }))
             }

@@ -17,11 +17,13 @@ use tendril_ffi::{
     TENDRIL_OK, TendrilEndpoint, TendrilSession, tendril_endpoint_confirm_peer,
     tendril_endpoint_export_roster_json, tendril_endpoint_free, tendril_endpoint_issue_code,
     tendril_endpoint_mint_grant, tendril_endpoint_new, tendril_endpoint_pair_accept,
-    tendril_endpoint_pair_initiate, tendril_endpoint_revoke_peer, tendril_endpoint_serve_direct,
-    tendril_last_error, tendril_session_accept, tendril_session_authorize, tendril_session_close,
-    tendril_session_connect, tendril_session_connect_v2, tendril_session_export_roster_json,
-    tendril_session_free, tendril_session_poll_event, tendril_session_rekey,
-    tendril_session_send_data, tendril_session_shutdown, tendril_string_free,
+    tendril_endpoint_pair_initiate, tendril_endpoint_pair_v2_accept,
+    tendril_endpoint_pair_v2_initiate, tendril_endpoint_revoke_peer, tendril_endpoint_serve_direct,
+    tendril_last_error, tendril_session_accept, tendril_session_accept_v2,
+    tendril_session_authorize, tendril_session_close, tendril_session_connect,
+    tendril_session_connect_v2, tendril_session_export_roster_json, tendril_session_free,
+    tendril_session_poll_event, tendril_session_rekey, tendril_session_send_data,
+    tendril_session_shutdown, tendril_string_free,
 };
 use tendril_runtime::StateStore;
 
@@ -231,43 +233,301 @@ fn sec04_endpoint_revoke_races_sync_paths_without_resurrection() {
 
 #[test]
 fn sec03_disk_revocation_propagates_into_endpoint_roster_on_v2_connect_error() {
-    let dir = TempDir::new().unwrap();
-    let ids = vec!["peer-a".to_owned(), "peer-b".to_owned()];
-    seed_roster(&dir, &ids, 1);
-    let ep = endpoint_at(&dir);
-    assert_eq!(peer_state(&endpoint_roster_json(ep), "peer-a"), "active");
+    let host_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+    let hd = cstr(host_dir.path().to_str().unwrap());
+    let cd = cstr(cli_dir.path().to_str().unwrap());
+    let hn = cstr("sec03-conn-host");
+    let host_ep = unsafe { tendril_endpoint_new(hd.as_ptr(), hn.as_ptr()) };
+    let cli_ep = unsafe { tendril_endpoint_new(cd.as_ptr(), ptr::null()) };
+    assert!(!host_ep.is_null() && !cli_ep.is_null());
+
+    let (endpoint, cli_dev_id, grant) =
+        v2_pair_and_mint(host_ep, cli_ep, "sec03-conn-host", "[\"fs.read\"]");
+    let (host_sess, cli_sess) =
+        open_v2_session(host_ep, cli_ep, &endpoint, "sec03-conn-host", &grant);
+
+    let cap = cstr("fs.read");
+    let mut allowed = 0u8;
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess, cap.as_ptr(), &raw mut allowed) },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed, 1);
 
     // Simulates the runtime v2 driver committing a revocation straight to disk.
-    StateStore::open_or_create(dir.path())
+    StateStore::open_or_create(host_dir.path())
         .unwrap()
         .update_roster(|r| {
-            r.revoke_peer("peer-a")
+            r.revoke_peer(&cli_dev_id)
                 .map_err(|e| tendril_runtime::RuntimeError::Protocol(e.to_string()))
         })
         .unwrap();
 
     let dead = cstr(DEAD_ENDPOINT);
-    let target = cstr("peer-a");
+    let target = cstr(&cli_dev_id);
     let s = unsafe {
-        tendril_session_connect_v2(ep, dead.as_ptr(), ptr::null(), target.as_ptr(), ptr::null())
+        tendril_session_connect_v2(
+            host_ep,
+            dead.as_ptr(),
+            ptr::null(),
+            target.as_ptr(),
+            ptr::null(),
+        )
     };
     assert!(s.is_null());
 
-    let json = endpoint_roster_json(ep);
-    assert_eq!(peer_state(&json, "peer-a"), "revoked");
-    assert_eq!(peer_state(&json, "peer-b"), "active");
-
-    // A later in-memory mutation must not write the stale pre-revocation state back.
-    let b = cstr("peer-b");
+    // Immediate in-memory propagation into live session sharing ep.roster.
+    let mut allowed_after = 1u8;
     assert_eq!(
-        unsafe { tendril_endpoint_confirm_peer(ep, b.as_ptr(), ptr::null()) },
+        unsafe { tendril_session_authorize(host_sess, cap.as_ptr(), &raw mut allowed_after) },
         TENDRIL_OK
     );
     assert_eq!(
-        disk_roster(&dir).get("peer-a").unwrap().state,
-        PeerState::Revoked
+        allowed_after, 0,
+        "live authorize must flip 1 -> 0 after connect_v2 sync"
     );
-    unsafe { tendril_endpoint_free(ep) };
+
+    let json = endpoint_roster_json(host_ep);
+    assert_eq!(peer_state(&json, &cli_dev_id), "revoked");
+
+    unsafe {
+        tendril_session_close(cli_sess, 1000, ptr::null());
+        tendril_session_free(cli_sess);
+        tendril_session_free(host_sess);
+        tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
+}
+
+#[test]
+fn sec03_disk_revocation_propagates_on_v2_accept_ok_and_err() {
+    let host_dir = TempDir::new().unwrap();
+    let cli1_dir = TempDir::new().unwrap();
+    let cli2_dir = TempDir::new().unwrap();
+    let hd = cstr(host_dir.path().to_str().unwrap());
+    let c1d = cstr(cli1_dir.path().to_str().unwrap());
+    let c2d = cstr(cli2_dir.path().to_str().unwrap());
+    let hn = cstr("sec03-acc-host");
+    let host_ep = unsafe { tendril_endpoint_new(hd.as_ptr(), hn.as_ptr()) };
+    let cli1_ep = unsafe { tendril_endpoint_new(c1d.as_ptr(), ptr::null()) };
+    let cli2_ep = unsafe { tendril_endpoint_new(c2d.as_ptr(), ptr::null()) };
+    assert!(!host_ep.is_null() && !cli1_ep.is_null() && !cli2_ep.is_null());
+
+    let (endpoint, cli1_id, grant1) =
+        v2_pair_and_mint(host_ep, cli1_ep, "sec03-acc-host", "[\"fs.read\"]");
+    let (_, cli2_id, grant2) =
+        v2_pair_and_mint(host_ep, cli2_ep, "sec03-acc-host", "[\"fs.read\"]");
+
+    let (host_sess1, cli1_sess) =
+        open_v2_session(host_ep, cli1_ep, &endpoint, "sec03-acc-host", &grant1);
+    let cap = cstr("fs.read");
+    let mut allowed = 0u8;
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess1, cap.as_ptr(), &raw mut allowed) },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed, 1);
+
+    // 1. Revoke cli1 directly on disk, then accept a valid v2 session from cli2 (Ok path).
+    StateStore::open_or_create(host_dir.path())
+        .unwrap()
+        .update_roster(|r| {
+            r.revoke_peer(&cli1_id)
+                .map_err(|e| tendril_runtime::RuntimeError::Protocol(e.to_string()))
+        })
+        .unwrap();
+
+    let (host_sess2, cli2_sess) =
+        open_v2_session(host_ep, cli2_ep, &endpoint, "sec03-acc-host", &grant2);
+    let mut allowed1_after = 1u8;
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess1, cap.as_ptr(), &raw mut allowed1_after) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        allowed1_after, 0,
+        "live authorize for cli1 must flip 1 -> 0 after accept_v2 Ok"
+    );
+    assert_eq!(
+        peer_state(&endpoint_roster_json(host_ep), &cli1_id),
+        "revoked"
+    );
+
+    // 2. Verify cli2 authorizes before disk revocation, revoke cli2 on disk, then fail accept_v2 (Err path).
+    let mut allowed2 = 0u8;
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess2, cap.as_ptr(), &raw mut allowed2) },
+        TENDRIL_OK
+    );
+    assert_eq!(allowed2, 1);
+
+    StateStore::open_or_create(host_dir.path())
+        .unwrap()
+        .update_roster(|r| {
+            r.revoke_peer(&cli2_id)
+                .map_err(|e| tendril_runtime::RuntimeError::Protocol(e.to_string()))
+        })
+        .unwrap();
+
+    let host_addr = host_ep as usize;
+    let accept_err_thr = thread::spawn(move || {
+        let s = unsafe { tendril_session_accept_v2(host_addr as *mut TendrilEndpoint, 5_000) };
+        assert!(s.is_null(), "revoked v2 peer must be rejected on accept_v2");
+    });
+    let ep_c = cstr(&endpoint);
+    let g2_c = cstr(&grant2);
+    let bad_cli_sess = unsafe {
+        tendril_session_connect_v2(
+            cli2_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            hn.as_ptr(),
+            g2_c.as_ptr(),
+        )
+    };
+    assert!(
+        bad_cli_sess.is_null(),
+        "revoked v2 client connect must fail"
+    );
+    accept_err_thr.join().unwrap();
+
+    let mut allowed2_after = 1u8;
+    assert_eq!(
+        unsafe { tendril_session_authorize(host_sess2, cap.as_ptr(), &raw mut allowed2_after) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        allowed2_after, 0,
+        "live authorize for cli2 must flip 1 -> 0 after accept_v2 Err"
+    );
+    assert_eq!(
+        peer_state(&endpoint_roster_json(host_ep), &cli2_id),
+        "revoked"
+    );
+
+    unsafe {
+        tendril_session_close(cli1_sess, 1000, ptr::null());
+        tendril_session_close(cli2_sess, 1000, ptr::null());
+        tendril_session_free(cli1_sess);
+        tendril_session_free(cli2_sess);
+        tendril_session_free(host_sess1);
+        tendril_session_free(host_sess2);
+        tendril_endpoint_free(cli1_ep);
+        tendril_endpoint_free(cli2_ep);
+        tendril_endpoint_free(host_ep);
+    }
+}
+
+fn v2_pair_and_mint(
+    host_ep: *mut TendrilEndpoint,
+    cli_ep: *mut TendrilEndpoint,
+    host_name: &str,
+    caps_json: &str,
+) -> (String, String, String) {
+    let mut out: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, ptr::null(), &raw mut out) },
+        TENDRIL_OK
+    );
+    let endpoint = unsafe { take_cstr(out) };
+    let mut code_out: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, ptr::null(), &raw mut code_out) },
+        TENDRIL_OK
+    );
+    let code = unsafe { take_cstr(code_out) };
+
+    let host_addr = host_ep as usize;
+    let accept = thread::spawn(move || {
+        let mut o: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_v2_accept(host_addr as *mut TendrilEndpoint, 5_000, &raw mut o)
+        };
+        assert_eq!(rc, TENDRIL_OK, "pair_v2_accept: {}", last_err());
+        unsafe { take_cstr(o) }
+    });
+    let ep_c = cstr(&endpoint);
+    let code_c = cstr(&code);
+    let mut pair_out: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                cli_ep,
+                ep_c.as_ptr(),
+                ptr::null(),
+                code_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &raw mut pair_out,
+            )
+        },
+        TENDRIL_OK,
+        "pair_v2_initiate: {}",
+        last_err()
+    );
+    let cli_pair: Value = serde_json::from_str(&unsafe { take_cstr(pair_out) }).unwrap();
+    let host_pair: Value = serde_json::from_str(&accept.join().unwrap()).unwrap();
+    let sas = cstr(host_pair["sas"].as_str().unwrap());
+    let cli_dev_id = host_pair["device_id"].as_str().unwrap().to_owned();
+    let peer_c = cstr(&cli_dev_id);
+    let hn_c = cstr(host_name);
+    assert_eq!(cli_pair["sas"], host_pair["sas"]);
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, peer_c.as_ptr(), sas.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(cli_ep, hn_c.as_ptr(), sas.as_ptr()) },
+        TENDRIL_OK
+    );
+    let caps = cstr(caps_json);
+    let mut grant_out: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                peer_c.as_ptr(),
+                caps.as_ptr(),
+                3600,
+                &raw mut grant_out,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant = unsafe { take_cstr(grant_out) };
+    (endpoint, cli_dev_id, grant)
+}
+
+fn open_v2_session(
+    host_ep: *mut TendrilEndpoint,
+    cli_ep: *mut TendrilEndpoint,
+    endpoint: &str,
+    host_name: &str,
+    grant: &str,
+) -> (*mut TendrilSession, *mut TendrilSession) {
+    let host_addr = host_ep as usize;
+    let accept_thr = thread::spawn(move || {
+        let s = unsafe { tendril_session_accept_v2(host_addr as *mut TendrilEndpoint, 5_000) };
+        assert!(!s.is_null(), "session_accept_v2: {}", last_err());
+        s as usize
+    });
+    let ep_c = cstr(endpoint);
+    let hn_c = cstr(host_name);
+    let g_c = cstr(grant);
+    let cli_sess = unsafe {
+        tendril_session_connect_v2(
+            cli_ep,
+            ep_c.as_ptr(),
+            ptr::null(),
+            hn_c.as_ptr(),
+            g_c.as_ptr(),
+        )
+    };
+    assert!(!cli_sess.is_null(), "session_connect_v2: {}", last_err());
+    let host_sess = accept_thr.join().unwrap() as *mut TendrilSession;
+    (host_sess, cli_sess)
 }
 
 #[test]

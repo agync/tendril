@@ -7,6 +7,7 @@ package tendril
 #cgo darwin LDFLAGS: -L${SRCDIR}/../../target/debug -L${SRCDIR}/../../target/release -ltendril_ffi -Wl,-rpath,${SRCDIR}/../../target/debug -Wl,-rpath,${SRCDIR}/../../target/release
 
 #include <stdlib.h>
+#include <string.h>
 #include "tendril.h"
 */
 import "C"
@@ -16,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"runtime"
 	"strings"
 	"sync"
@@ -1062,6 +1064,21 @@ func (s *Session) CloseSession(code uint16, reason string) error {
 	})
 }
 
+func takeOutCBytes(p *C.char) ([]byte, error) {
+	if p == nil {
+		return nil, nil
+	}
+	defer C.tendril_string_free(p)
+	n := C.strlen(p)
+	if n == 0 {
+		return []byte{}, nil
+	}
+	if n > C.size_t(math.MaxInt32) {
+		return nil, errors.New("tendril: exported buffer exceeds max C.int size")
+	}
+	return C.GoBytes(unsafe.Pointer(p), C.int(n)), nil
+}
+
 // ExportRosterJSON returns the endpoint's current roster JSON. The result is secret material;
 // callers should zero the returned slice once persisted.
 func (ep *Endpoint) ExportRosterJSON() ([]byte, error) {
@@ -1071,8 +1088,9 @@ func (ep *Endpoint) ExportRosterJSON() ([]byte, error) {
 		if rc := C.tendril_endpoint_export_roster_json(h, &raw); rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}
-		out = []byte(takeOutCStr(raw))
-		return nil
+		var err error
+		out, err = takeOutCBytes(raw)
+		return err
 	})
 	return out, err
 }
@@ -1086,8 +1104,9 @@ func (s *Session) ExportRosterJSON() ([]byte, error) {
 		if rc := C.tendril_session_export_roster_json(h, &raw); rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}
-		out = []byte(takeOutCStr(raw))
-		return nil
+		var err error
+		out, err = takeOutCBytes(raw)
+		return err
 	})
 	return out, err
 }
