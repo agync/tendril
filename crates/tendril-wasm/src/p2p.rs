@@ -309,6 +309,65 @@ async fn dial_with_relay_mode(
     }
 }
 
+fn resolve_dial_relay_mode(
+    addr: &EndpointAddr,
+    relay_url_override: Option<&str>,
+) -> Result<(RelayMode, bool), String> {
+    if relay_url_override.is_some_and(|raw| raw.chars().any(char::is_control)) {
+        return Err("iroh relay URL contains control characters".to_owned());
+    }
+    if let Some(url_str) = relay_url_override.map(str::trim).filter(|s| !s.is_empty()) {
+        let validated = validate_iroh_relay_url_wasm(url_str)?;
+        let url = RelayUrl::from_str(validated.as_str())
+            .map_err(|e| format!("invalid relay URL '{url_str}': {e}"))?;
+        return Ok((RelayMode::Custom(url.into()), false));
+    }
+    let addr_relays: Vec<RelayConfig> = addr.relay_urls().cloned().map(RelayConfig::from).collect();
+    if addr_relays.len() > MAX_P2P_RELAY_URLS {
+        return Err(format!(
+            "iroh endpoint URI must contain at most {MAX_P2P_RELAY_URLS} relay URLs"
+        ));
+    }
+    if !addr_relays.is_empty() {
+        return Ok((RelayMode::Custom(RelayMap::from_iter(addr_relays)), false));
+    }
+    Ok((RelayMode::Default, true))
+}
+
+fn resolve_dial_with_options_relay_mode(
+    addr: &EndpointAddr,
+    relay_urls_json_opt: Option<&str>,
+    auth_token: Option<&str>,
+) -> Result<(RelayMode, bool), String> {
+    if let Some(json_str) = relay_urls_json_opt {
+        let urls: Vec<String> =
+            serde_json::from_str(json_str).map_err(|e| format!("invalid relay_urls_json: {e}"))?;
+        let map = build_relay_map_wasm(&urls, auth_token)?;
+        return Ok((RelayMode::Custom(map), false));
+    }
+    let addr_relays: Vec<RelayConfig> = addr.relay_urls().cloned().map(RelayConfig::from).collect();
+    if addr_relays.len() > MAX_P2P_RELAY_URLS {
+        return Err(format!(
+            "iroh endpoint URI must contain at most {MAX_P2P_RELAY_URLS} relay URLs"
+        ));
+    }
+    if !addr_relays.is_empty() {
+        let map = RelayMap::from_iter(addr_relays);
+        let map = match auth_token {
+            Some(tok) => map.with_auth_token(tok),
+            None => map,
+        };
+        return Ok((RelayMode::Custom(map), false));
+    }
+    if auth_token.is_some() {
+        return Err(
+            "p2pRelayAuthToken requires explicit p2pRelayUrls, relayUrlOverride, or ?relay= in endpoint URI; refusing to attach bearer token to default public n0 relays"
+                .to_owned(),
+        );
+    }
+    Ok((RelayMode::Default, true))
+}
+
 #[wasm_bindgen]
 impl WasmIrohStream {
     /// Connects a fresh ephemeral `iroh` endpoint to `endpoint` and opens a Tendril tunnel stream.
@@ -319,25 +378,8 @@ impl WasmIrohStream {
         timeout_ms: Option<u32>,
     ) -> Result<WasmIrohStream, JsValue> {
         let addr = parse_p2p_endpoint_filtered(&endpoint, false).map_err(to_js_err)?;
-        if relay_url_override
-            .as_deref()
-            .is_some_and(|raw| raw.chars().any(char::is_control))
-        {
-            return Err(to_js_err("iroh relay URL contains control characters"));
-        }
-        let (relay_mode, allow_n0_dns) = match relay_url_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(url_str) => {
-                let validated = validate_iroh_relay_url_wasm(url_str).map_err(to_js_err)?;
-                let url = RelayUrl::from_str(validated.as_str())
-                    .map_err(|e| to_js_err(format!("invalid relay URL '{url_str}': {e}")))?;
-                (RelayMode::Custom(url.into()), false)
-            }
-            None => (RelayMode::Default, true),
-        };
+        let (relay_mode, allow_n0_dns) =
+            resolve_dial_relay_mode(&addr, relay_url_override.as_deref()).map_err(to_js_err)?;
         dial_with_relay_mode(addr, relay_mode, allow_n0_dns, timeout_ms).await
     }
 
@@ -354,24 +396,12 @@ impl WasmIrohStream {
             .map(validate_p2p_auth_token_wasm)
             .transpose()
             .map_err(to_js_err)?;
-        let (relay_mode, allow_n0_dns) = match relay_urls_json_opt {
-            Some(json_str) => {
-                let urls: Vec<String> = serde_json::from_str(&json_str)
-                    .map_err(|e| to_js_err(format!("invalid relay_urls_json: {e}")))?;
-                let map = build_relay_map_wasm(&urls, token.as_deref().map(String::as_str))
-                    .map_err(to_js_err)?;
-                (RelayMode::Custom(map), false)
-            }
-            None => match token {
-                Some(tok) => {
-                    let map = iroh::endpoint::default_relay_mode()
-                        .relay_map()
-                        .with_auth_token(tok.as_str());
-                    (RelayMode::Custom(map), false)
-                }
-                None => (RelayMode::Default, true),
-            },
-        };
+        let (relay_mode, allow_n0_dns) = resolve_dial_with_options_relay_mode(
+            &addr,
+            relay_urls_json_opt.as_deref(),
+            token.as_deref().map(String::as_str),
+        )
+        .map_err(to_js_err)?;
         dial_with_relay_mode(addr, relay_mode, allow_n0_dns, timeout_ms).await
     }
 
@@ -487,5 +517,57 @@ mod tests {
         assert!(!priv_addrs.iter().any(|a| a.starts_with("169.254.")));
         assert!(priv_addrs.contains(&"[::1]:4433".to_owned()));
         assert!(priv_addrs.contains(&"192.168.1.5:4433".to_owned()));
+    }
+
+    #[test]
+    fn priv01_custom_relay_extraction_and_auth_token_fail_closed() {
+        let ep_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
+        let with_relay = parse_p2p_endpoint_filtered(
+            &format!("iroh://{ep_id}?relay=https://custom.relay.example/"),
+            false,
+        )
+        .expect("with relay");
+        let bare = parse_p2p_endpoint_filtered(&format!("iroh://{ep_id}"), false).expect("bare");
+
+        let expected_url = RelayUrl::from_str("https://custom.relay.example/").unwrap();
+        // dial() with ?relay= uses RelayMode::Custom and disables n0 DNS
+        let (mode, allow_n0) = resolve_dial_relay_mode(&with_relay, None).expect("custom");
+        assert!(!allow_n0);
+        match mode {
+            RelayMode::Custom(map) => {
+                assert_eq!(map.len(), 1);
+                assert!(map.get(&expected_url).is_some());
+            }
+            other => panic!("expected RelayMode::Custom, got {other:?}"),
+        }
+
+        // dial() without ?relay= or override uses RelayMode::Default
+        let (mode_def, allow_n0_def) = resolve_dial_relay_mode(&bare, None).expect("default");
+        assert!(allow_n0_def);
+        assert!(matches!(mode_def, RelayMode::Default));
+
+        // dial_with_options() with auth_token and NO explicit relay URLs and NO ?relay= MUST fail closed
+        let err = resolve_dial_with_options_relay_mode(&bare, None, Some("secret-bearer"))
+            .expect_err("must fail closed");
+        assert!(err.contains("refusing to attach bearer token"));
+
+        // dial_with_options() with auth_token and ?relay= builds Custom RelayMap and disables n0 DNS
+        let (mode_tok, allow_n0_tok) =
+            resolve_dial_with_options_relay_mode(&with_relay, None, Some("secret-bearer"))
+                .expect("token with ?relay=");
+        assert!(!allow_n0_tok);
+        match mode_tok {
+            RelayMode::Custom(map) => {
+                assert_eq!(map.len(), 1);
+                assert!(map.get(&expected_url).is_some());
+            }
+            other => panic!("expected RelayMode::Custom, got {other:?}"),
+        }
+
+        // dial_with_options() without auth_token and with ?relay= builds Custom RelayMap and disables n0 DNS
+        let (mode_no_tok, allow_n0_no_tok) =
+            resolve_dial_with_options_relay_mode(&with_relay, None, None).expect("no token");
+        assert!(!allow_n0_no_tok);
+        assert!(matches!(mode_no_tok, RelayMode::Custom(_)));
     }
 }

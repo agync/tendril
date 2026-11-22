@@ -29,11 +29,12 @@ use tendril_core::relay_auth::{
     mint_relay_ticket as core_mint_relay_ticket,
 };
 use tendril_core::roster::Roster;
-use tendril_core::session::{SessionAction, SessionMachine};
+use tendril_core::session::{SessionAction, SessionMachine, check_peer_allows_wire_v1};
 use tendril_core::v2::{
     PaddingPolicy, PakeArgon2Params, V2PairAction, V2PairOutcome, V2PakePairInitiator,
-    V2PinnedHost, V2SessionAction, V2SessionInitiator, VerifiedRelayHost, derive_epoch_mailbox,
-    epoch_for_unix, epoch_within_skew, sign_v2_relay_dial,
+    V2PinnedHost, V2SessionAction, V2SessionInitiator, VerifiedRelayHost,
+    canonical_relay_host as core_canonical_relay_host, derive_epoch_mailbox, epoch_for_unix,
+    epoch_within_skew, sign_v2_relay_dial,
 };
 use tendril_core::wire::WIRE_VERSION_V2;
 use wasm_bindgen::prelude::*;
@@ -212,6 +213,11 @@ pub fn v2_epoch_within_skew(server_epoch: f64, claimed_epoch: f64) -> Result<boo
 }
 
 #[wasm_bindgen]
+pub fn canonical_relay_host(host: &str) -> Result<String, JsValue> {
+    core_canonical_relay_host(host).map_err(to_js_err)
+}
+
+#[wasm_bindgen]
 pub fn verify_rotation_chain_json(
     pinned_signing_b64: &str,
     pinned_static_b64: &str,
@@ -324,7 +330,7 @@ impl WasmIdentity {
         Ok(Self { inner: id })
     }
 
-    fn serialize_json(&self) -> Result<String, String> {
+    fn serialize_json(&self) -> Result<Zeroizing<String>, String> {
         let doc = PersistedWasmIdentity {
             host_id: self.inner.host_id().to_owned(),
             static_secret_b64: b64url_encode(self.inner.static_key().secret_bytes()),
@@ -333,22 +339,41 @@ impl WasmIdentity {
             rotation_chain: self.inner.rotation_chain().to_vec(),
             rotation_seq: self.inner.rotation_seq(),
         };
-        serde_json::to_string(&doc).map_err(|e| e.to_string())
+        serde_json::to_string(&doc)
+            .map(Zeroizing::new)
+            .map_err(|e| e.to_string())
+    }
+
+    fn serialize_json_bytes(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        let doc = PersistedWasmIdentity {
+            host_id: self.inner.host_id().to_owned(),
+            static_secret_b64: b64url_encode(self.inner.static_key().secret_bytes()),
+            signing_seed_b64: b64url_encode(self.inner.signing_key().seed_bytes()),
+            pq_signing_seed_b64: b64url_encode(self.inner.signing_key().mldsa_seed_bytes()),
+            rotation_chain: self.inner.rotation_chain().to_vec(),
+            rotation_seq: self.inner.rotation_seq(),
+        };
+        serde_json::to_vec(&doc)
+            .map(Zeroizing::new)
+            .map_err(|e| e.to_string())
     }
 
     fn parse_json(json_str: &str) -> Result<Self, String> {
         let doc: PersistedWasmIdentity =
             serde_json::from_str(json_str).map_err(|e| e.to_string())?;
-        let static_scalar: [u8; 32] =
-            b64url_decode_array(&doc.static_secret_b64).map_err(|e| e.to_string())?;
-        let signing_seed: [u8; 32] =
-            b64url_decode_array(&doc.signing_seed_b64).map_err(|e| e.to_string())?;
-        let pq_signing_seed: [u8; 32] =
-            b64url_decode_array(&doc.pq_signing_seed_b64).map_err(|e| e.to_string())?;
+        let static_scalar = Zeroizing::new(
+            b64url_decode_array::<32>(&doc.static_secret_b64).map_err(|e| e.to_string())?,
+        );
+        let signing_seed = Zeroizing::new(
+            b64url_decode_array::<32>(&doc.signing_seed_b64).map_err(|e| e.to_string())?,
+        );
+        let pq_signing_seed = Zeroizing::new(
+            b64url_decode_array::<32>(&doc.pq_signing_seed_b64).map_err(|e| e.to_string())?,
+        );
         let inner = EndpointIdentity::from_persisted(
             doc.host_id.clone(),
-            StaticKeypair::from_scalar(static_scalar),
-            SigningKeypair::from_seeds(signing_seed, pq_signing_seed),
+            StaticKeypair::from_scalar(*static_scalar),
+            SigningKeypair::from_seeds(*signing_seed, *pq_signing_seed),
             doc.rotation_chain.clone(),
             doc.rotation_seq,
         )
@@ -382,8 +407,25 @@ impl WasmIdentity {
     }
 
     #[wasm_bindgen]
+    pub fn from_json_bytes(json_bytes: &mut [u8]) -> Result<WasmIdentity, JsValue> {
+        let res = match core::str::from_utf8(json_bytes) {
+            Ok(s) => Self::parse_json(s).map_err(to_js_err),
+            Err(err) => Err(to_js_err(format!("invalid UTF-8 identity JSON: {err}"))),
+        };
+        json_bytes.zeroize();
+        res
+    }
+
+    #[wasm_bindgen]
     pub fn to_json(&self) -> Result<String, JsValue> {
-        self.serialize_json().map_err(to_js_err)
+        let serialized = self.serialize_json().map_err(to_js_err)?;
+        Ok((*serialized).clone())
+    }
+
+    #[wasm_bindgen]
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, JsValue> {
+        let serialized = self.serialize_json_bytes().map_err(to_js_err)?;
+        Ok(serialized.to_vec())
     }
 
     #[wasm_bindgen]
@@ -472,14 +514,43 @@ impl WasmRoster {
     }
 
     #[wasm_bindgen]
+    pub fn from_json_bytes(json_bytes: &mut [u8]) -> Result<WasmRoster, JsValue> {
+        let res = serde_json::from_slice::<Roster>(json_bytes)
+            .map(|inner| Self { inner })
+            .map_err(to_js_err);
+        json_bytes.zeroize();
+        res
+    }
+
+    #[wasm_bindgen]
     pub fn to_json(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.inner).map_err(to_js_err)
+        let serialized = Zeroizing::new(serde_json::to_string(&self.inner).map_err(to_js_err)?);
+        Ok((*serialized).clone())
+    }
+
+    #[wasm_bindgen]
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, JsValue> {
+        let serialized = Zeroizing::new(serde_json::to_vec(&self.inner).map_err(to_js_err)?);
+        Ok(serialized.to_vec())
     }
 
     #[wasm_bindgen]
     pub fn replace_from_json(&mut self, json: &str) -> Result<(), JsValue> {
         self.inner = serde_json::from_str(json).map_err(to_js_err)?;
         Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn replace_from_json_bytes(&mut self, json_bytes: &mut [u8]) -> Result<(), JsValue> {
+        let res = serde_json::from_slice::<Roster>(json_bytes).map_err(to_js_err);
+        json_bytes.zeroize();
+        self.inner = res?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn check_allows_wire_v1(&self, target_host_id: &str) -> Result<(), JsValue> {
+        check_peer_allows_wire_v1(&self.inner, target_host_id).map_err(to_js_err)
     }
 
     #[wasm_bindgen]
@@ -1063,6 +1134,18 @@ impl WasmSessionClient {
     }
 
     #[wasm_bindgen]
+    pub fn new_with_roster(
+        identity: &WasmIdentity,
+        target_host_id: &str,
+        roster: &WasmRoster,
+        grant_json: Option<String>,
+        crl_seq: Option<f64>,
+    ) -> Result<WasmSessionClient, JsValue> {
+        check_peer_allows_wire_v1(&roster.inner, target_host_id).map_err(to_js_err)?;
+        Self::new_inner(identity, target_host_id, grant_json.as_deref(), crl_seq).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
     pub fn start(&mut self) -> Result<Vec<u8>, JsValue> {
         let actions = self.inner.start().map_err(to_js_err)?;
         Ok(collect_session_writes(actions))
@@ -1314,6 +1397,29 @@ impl WasmV2PakePairInitiator {
             pinned_host_json.as_deref(),
         )
         .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn new_bytes(
+        identity: &WasmIdentity,
+        device_name: &str,
+        device_kind: &str,
+        code: &mut [u8],
+        pinned_host_json: Option<String>,
+    ) -> Result<WasmV2PakePairInitiator, JsValue> {
+        let res = match core::str::from_utf8(code) {
+            Ok(code_str) => Self::new_inner(
+                identity,
+                device_name,
+                device_kind,
+                code_str,
+                pinned_host_json.as_deref(),
+            )
+            .map_err(to_js_err),
+            Err(err) => Err(to_js_err(format!("invalid UTF-8 pairing code: {err}"))),
+        };
+        code.zeroize();
+        res
     }
 
     #[wasm_bindgen]
@@ -1604,6 +1710,17 @@ impl WasmV2SessionInitiator {
         };
         let delay = machine.next_ping_delay_ms().map_err(to_js_err)?;
         u64_to_f64(delay).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn send_ping(&mut self, cookie: f64, now_ms: f64) -> Result<Vec<u8>, JsValue> {
+        let c = f64_to_u64(cookie, "cookie").map_err(to_js_err)?;
+        let now_m = f64_to_u64(now_ms, "now_ms").map_err(to_js_err)?;
+        let V2WasmSessionPhase::Active(ref mut machine) = self.phase else {
+            return Err(to_js_err("v2 session closed"));
+        };
+        let actions = machine.seal_ping(c, now_m).map_err(to_js_err)?;
+        Ok(collect_v2_writes(actions))
     }
 
     #[wasm_bindgen]
@@ -2144,6 +2261,35 @@ mod tests {
                 .any(|a| matches!(a, V2SessionAction::Rekeyed { .. }))
         );
 
+        // PRIV-05: send_ping on WasmV2SessionInitiator produces an encrypted ping answered with pong.
+        let ping_wire = cli_sess.send_ping(1337.0, 56.0).unwrap();
+        let ping_acts = host_sess
+            .feed_bytes(&ping_wire, now, 57, &mut host_roster)
+            .unwrap();
+        let pong_wire: Vec<u8> = ping_acts
+            .into_iter()
+            .filter_map(|a| match a {
+                V2SessionAction::WriteBytes(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(!pong_wire.is_empty());
+        #[allow(clippy::cast_precision_loss)]
+        cli_sess
+            .step_bytes(&pong_wire, now as f64, 58.0, &mut cli_roster)
+            .unwrap();
+        let evs: serde_json::Value = serde_json::from_str(&cli_sess.drain_events_json()).unwrap();
+        assert!(
+            evs.as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["event"] == "pong" && e["cookie"] == 1337.0)
+        );
+
+        // PRIV-04: v1 session pre-flight check against a v2 peer fails closed before emitting msg1.
+        assert!(check_peer_allows_wire_v1(&cli_roster.inner, "wasm-v2-host").is_err());
+
         let close_wire = cli_sess.close(1000.0, "bye", 60.0).unwrap();
         assert!(cli_sess.is_closed());
         let close_acts = host_sess
@@ -2301,5 +2447,41 @@ mod tests {
         assert!(rev_res.is_err());
         assert!(cli_sess.is_closed());
         assert!(!cli_sess.is_established());
+    }
+
+    #[test]
+    fn sec12_canonical_relay_host_and_priv07_byte_zeroization() {
+        assert_eq!(core_canonical_relay_host("[::1]").unwrap(), "[::1]");
+        assert_eq!(
+            core_canonical_relay_host("[0:0:0:0:0:0:0:1]").unwrap(),
+            "[::1]"
+        );
+        assert_eq!(
+            core_canonical_relay_host("Relay.Example.").unwrap(),
+            "relay.example"
+        );
+        assert!(core_canonical_relay_host("relay.example:443").is_err());
+
+        // PRIV-07: byte-slice serialization and zeroization on load
+        let id = WasmIdentity::generate_inner(Some("zeroize-cli")).unwrap();
+        let mut id_bytes = id.serialize_json_bytes().unwrap().to_vec();
+        assert!(!id_bytes.is_empty());
+        let reloaded = WasmIdentity::from_json_bytes(&mut id_bytes).unwrap();
+        assert!(id_bytes.iter().all(|&b| b == 0));
+        assert_eq!(id.info_string(), reloaded.info_string());
+
+        let mut roster = WasmRoster::new();
+        let mut r_bytes = serde_json::to_vec(&roster.inner).unwrap();
+        let r2 = WasmRoster::from_json_bytes(&mut r_bytes).unwrap();
+        assert!(r_bytes.iter().all(|&b| b == 0));
+        let mut r2_bytes = serde_json::to_vec(&r2.inner).unwrap();
+        roster.replace_from_json_bytes(&mut r2_bytes).unwrap();
+        assert!(r2_bytes.iter().all(|&b| b == 0));
+
+        let mut code_bytes = b"4829-1704-9999".to_vec();
+        let _pake =
+            WasmV2PakePairInitiator::new_bytes(&reloaded, "web", "browser", &mut code_bytes, None)
+                .unwrap();
+        assert!(code_bytes.iter().all(|&b| b == 0));
     }
 }
