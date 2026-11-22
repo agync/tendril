@@ -284,6 +284,17 @@ impl PreAuthRateLimiter {
         self.try_acquire_slot(is_untrusted, key)
     }
 
+    /// Acquires one bounded half-open handshake slot enforcing the per-key, per-provider, and
+    /// global caps for the stream's peer identity, source IP, or unattributed bucket.
+    pub fn try_acquire_half_open_for_stream(
+        &self,
+        provider: ProviderId,
+        ip: Option<IpAddr>,
+        peer_transport_id: Option<&str>,
+    ) -> Result<HalfOpenGuard, RuntimeError> {
+        self.try_acquire_for_stream(provider, ip, peer_transport_id)
+    }
+
     /// Acquires one bounded half-open handshake slot in the default (trusted) partition.
     pub fn try_acquire_half_open(&self) -> Result<HalfOpenGuard, RuntimeError> {
         self.try_acquire_slot(false, None)

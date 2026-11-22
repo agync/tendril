@@ -10,11 +10,15 @@ use tendril_core::wire::{Intent, Preamble, WIRE_VERSION, WIRE_VERSION_V2};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinHandle};
-use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout, timeout_at};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, sleep, timeout, timeout_at};
 
 use crate::driver::DEFAULT_PRE_AUTH_TIMEOUT;
+use crate::error::RuntimeError;
 use crate::provider::{PathListener, PathStream, PrefixedPathStream, peek_exact};
 use crate::rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
+
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(20);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Pre-authenticated inbound stream paired with its bounded half-open guard.
 pub type RoutedInbound = (Box<dyn PathStream>, HalfOpenGuard);
@@ -302,6 +306,7 @@ impl InboundRouter {
         }
         let handle_clone = handle.clone();
         let join = handle.spawn(async move {
+            let mut backoff = ACCEPT_BACKOFF_MIN;
             loop {
                 if *shut.borrow() {
                     break;
@@ -310,15 +315,30 @@ impl InboundRouter {
                     biased;
                     _ = shut.changed() => break,
                     res = listener.accept() => match res {
-                        Ok(s) => s,
-                        Err(_) => break,
+                        Ok(s) => {
+                            backoff = ACCEPT_BACKOFF_MIN;
+                            s
+                        }
+                        Err(RuntimeError::Closed) => break,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "inbound accept failed, retrying");
+                            tokio::select! {
+                                biased;
+                                _ = shut.changed() => break,
+                                () = sleep(backoff) => {}
+                            }
+                            backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                            continue;
+                        }
                     },
                 };
                 let provider = stream.provider_id();
+                let peer_ip = stream.peer_ip();
+                let peer_transport_id = stream.peer_transport_id();
                 let Ok(peek_guard) = peek_limiter.try_acquire_for_stream(
                     provider,
-                    stream.peer_ip(),
-                    stream.peer_transport_id().as_deref(),
+                    peer_ip,
+                    peer_transport_id.as_deref(),
                 ) else {
                     continue;
                 };
@@ -359,13 +379,13 @@ impl InboundRouter {
                             if !p_enabled.load(Ordering::Acquire) {
                                 return;
                             }
-                            let Ok(guard) = p_lim.try_acquire_half_open_for_provider(provider) else {
+                            let Ok(guard) = p_lim.try_acquire_half_open_for_stream(provider, peer_ip, peer_transport_id.as_deref()) else {
                                 return;
                             };
                             let _ = p_q.try_push((wrapped, guard), expires_at);
                         }
                         (WIRE_VERSION, Intent::Session) => {
-                            let Ok(guard) = s_lim.try_acquire_half_open_for_provider(provider) else {
+                            let Ok(guard) = s_lim.try_acquire_half_open_for_stream(provider, peer_ip, peer_transport_id.as_deref()) else {
                                 return;
                             };
                             let _ = s_q.try_push((wrapped, guard), expires_at);
@@ -374,14 +394,14 @@ impl InboundRouter {
                             if !v2_p_enabled.load(Ordering::Acquire) {
                                 return;
                             }
-                            let Ok(guard) = v2_p_lim.try_acquire_half_open_for_provider(provider)
+                            let Ok(guard) = v2_p_lim.try_acquire_half_open_for_stream(provider, peer_ip, peer_transport_id.as_deref())
                             else {
                                 return;
                             };
                             let _ = v2_p_q.try_push((wrapped, guard), expires_at);
                         }
                         (WIRE_VERSION_V2, Intent::Session) => {
-                            let Ok(guard) = v2_s_lim.try_acquire_half_open_for_provider(provider)
+                            let Ok(guard) = v2_s_lim.try_acquire_half_open_for_stream(provider, peer_ip, peer_transport_id.as_deref())
                             else {
                                 return;
                             };
