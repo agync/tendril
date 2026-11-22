@@ -135,4 +135,31 @@ final class TendrilNative {
   public static native void sessionRekey(long ptr);
 
   public static native void sessionClose(long ptr, int code, String reason);
+
+  public static native String groupCreate(
+      long epPtr, String name, int minWireVersion, String endpointsJson);
+
+  public static native String groupAddMember(
+      long epPtr, String groupId, String peerId, String capsJson, String endpointsJson);
+
+  public static native String groupRemoveMember(long epPtr, String groupId, String peerId);
+
+  public static native String groupIngestManifest(
+      long epPtr, String manifestJson, String senderPeerId);
+
+  public static native long groupOpen(long epPtr, String groupId, String listenAddr);
+
+  public static native String groupLocalEndpoint(long ptr);
+
+  public static native String groupSync(long ptr);
+
+  public static native String groupBroadcast(long ptr, String requiredCap, byte[] data);
+
+  public static native String groupPollEvent(long ptr, long timeoutMs);
+
+  public static native void groupAuthorizePeer(long ptr, String peerId, String cap);
+
+  public static native void groupClose(long ptr);
+
+  public static native void groupFree(long ptr);
 }

@@ -1373,3 +1373,306 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_sessionClose(
     throw_ffi_error(env, rc, "tendril_session_close failed");
   }
 }
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_groupCreate(
+    JNIEnv *env, jclass cls, jlong ep_ptr, jstring name, jint min_wire_version,
+    jstring endpoints_json) {
+  (void)cls;
+  if (ep_ptr == 0 || name == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid groupCreate arguments");
+    return NULL;
+  }
+  if (min_wire_version < 0 || min_wire_version > 255) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "min_wire_version must be 0..=255");
+    return NULL;
+  }
+  char *c_name = NULL;
+  char *c_endpoints = NULL;
+  char *out = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, name, &c_name) && dup_opt_utf8(env, endpoints_json, &c_endpoints)) {
+    rc = tendril_group_create(
+        (TendrilEndpoint *)(uintptr_t)ep_ptr, c_name, (uint8_t)min_wire_version, c_endpoints, &out);
+  }
+  free(c_name);
+  free(c_endpoints);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_group_create failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_groupAddMember(
+    JNIEnv *env, jclass cls, jlong ep_ptr, jstring group_id, jstring peer_id, jstring caps_json,
+    jstring endpoints_json) {
+  (void)cls;
+  if (ep_ptr == 0 || group_id == NULL || peer_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid groupAddMember arguments");
+    return NULL;
+  }
+  char *c_gid = NULL;
+  char *c_peer = NULL;
+  char *c_caps = NULL;
+  char *c_endpoints = NULL;
+  char *out = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, group_id, &c_gid) && dup_opt_utf8(env, peer_id, &c_peer) &&
+      dup_opt_utf8(env, caps_json, &c_caps) && dup_opt_utf8(env, endpoints_json, &c_endpoints)) {
+    rc = tendril_group_add_member(
+        (TendrilEndpoint *)(uintptr_t)ep_ptr, c_gid, c_peer, c_caps, c_endpoints, &out);
+  }
+  free(c_gid);
+  free(c_peer);
+  free(c_caps);
+  free(c_endpoints);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_group_add_member failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_groupRemoveMember(
+    JNIEnv *env, jclass cls, jlong ep_ptr, jstring group_id, jstring peer_id) {
+  (void)cls;
+  if (ep_ptr == 0 || group_id == NULL || peer_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid groupRemoveMember arguments");
+    return NULL;
+  }
+  char *c_gid = NULL;
+  char *c_peer = NULL;
+  char *out = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, group_id, &c_gid) && dup_opt_utf8(env, peer_id, &c_peer)) {
+    rc = tendril_group_remove_member((TendrilEndpoint *)(uintptr_t)ep_ptr, c_gid, c_peer, &out);
+  }
+  free(c_gid);
+  free(c_peer);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_group_remove_member failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_groupIngestManifest(
+    JNIEnv *env, jclass cls, jlong ep_ptr, jstring manifest_json, jstring sender_peer_id) {
+  (void)cls;
+  if (ep_ptr == 0 || manifest_json == NULL || sender_peer_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid groupIngestManifest arguments");
+    return NULL;
+  }
+  char *c_manifest = NULL;
+  char *c_sender = NULL;
+  char *out = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, manifest_json, &c_manifest) &&
+      dup_opt_utf8(env, sender_peer_id, &c_sender)) {
+    rc = tendril_group_ingest_manifest(
+        (TendrilEndpoint *)(uintptr_t)ep_ptr, c_manifest, c_sender, &out);
+  }
+  free(c_manifest);
+  free(c_sender);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_group_ingest_manifest failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_groupOpen(
+    JNIEnv *env, jclass cls, jlong ep_ptr, jstring group_id, jstring listen_addr) {
+  (void)cls;
+  if (ep_ptr == 0 || group_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid groupOpen arguments");
+    return 0;
+  }
+  char *c_gid = NULL;
+  char *c_listen = NULL;
+  TendrilGroup *group = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, group_id, &c_gid) && dup_opt_utf8(env, listen_addr, &c_listen)) {
+    rc = tendril_group_open((TendrilEndpoint *)(uintptr_t)ep_ptr, c_gid, c_listen, &group);
+  }
+  free(c_gid);
+  free(c_listen);
+  if ((*env)->ExceptionCheck(env)) {
+    if (group != NULL) {
+      tendril_group_free(group);
+    }
+    return 0;
+  }
+  if (rc != TENDRIL_OK || group == NULL) {
+    throw_ffi_error(env, rc, "tendril_group_open failed");
+    return 0;
+  }
+  return (jlong)(uintptr_t)group;
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_groupLocalEndpoint(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "group closed");
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_group_local_endpoint((TendrilGroup *)(uintptr_t)ptr, &out);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_group_local_endpoint failed");
+    return NULL;
+  }
+  if (out == NULL) {
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_groupSync(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "group closed");
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_group_sync((TendrilGroup *)(uintptr_t)ptr, &out);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_group_sync failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_groupBroadcast(
+    JNIEnv *env, jclass cls, jlong ptr, jstring required_cap, jbyteArray data) {
+  (void)cls;
+  if (ptr == 0 || data == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid groupBroadcast arguments");
+    return NULL;
+  }
+  jsize len = (*env)->GetArrayLength(env, data);
+  if (len < 0) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid data length");
+    return NULL;
+  }
+  char *c_cap = NULL;
+  if (!dup_opt_utf8(env, required_cap, &c_cap)) {
+    return NULL;
+  }
+  uint8_t stack_buf[4096];
+  uint8_t *heap_buf = NULL;
+  uint8_t *buf = stack_buf;
+  if (len > (jsize)sizeof(stack_buf)) {
+    heap_buf = (uint8_t *)malloc((size_t)len);
+    if (heap_buf == NULL) {
+      free(c_cap);
+      throw_ex(env, "java/lang/OutOfMemoryError", "malloc failed");
+      return NULL;
+    }
+    buf = heap_buf;
+  }
+  if (len > 0) {
+    (*env)->GetByteArrayRegion(env, data, 0, len, (jbyte *)buf);
+    if ((*env)->ExceptionCheck(env)) {
+      zeroize_bytes(buf, (size_t)len);
+      free(heap_buf);
+      free(c_cap);
+      return NULL;
+    }
+  }
+  char *out = NULL;
+  int32_t rc = tendril_group_broadcast(
+      (TendrilGroup *)(uintptr_t)ptr, c_cap, len > 0 ? buf : NULL, (size_t)len, &out);
+  if (len > 0) {
+    zeroize_bytes(buf, (size_t)len);
+  }
+  free(heap_buf);
+  free(c_cap);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_group_broadcast failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_groupPollEvent(
+    JNIEnv *env, jclass cls, jlong ptr, jlong timeout_ms) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "group closed");
+    return NULL;
+  }
+  if (!require_non_negative_jlong(env, timeout_ms, "timeout_ms")) {
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_group_poll_event(
+      (TendrilGroup *)(uintptr_t)ptr, (uint64_t)timeout_ms, &out);
+  if (rc == TENDRIL_WOULD_BLOCK) {
+    return NULL;
+  }
+  if (rc == TENDRIL_EOF) {
+    throw_ex(env, "java/lang/IllegalStateException", "group pool closed");
+    return NULL;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_group_poll_event failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_groupAuthorizePeer(
+    JNIEnv *env, jclass cls, jlong ptr, jstring peer_id, jstring cap) {
+  (void)cls;
+  if (ptr == 0 || peer_id == NULL || cap == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid groupAuthorizePeer arguments");
+    return;
+  }
+  char *c_peer = NULL;
+  char *c_cap = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, peer_id, &c_peer) && dup_opt_utf8(env, cap, &c_cap)) {
+    rc = tendril_group_authorize_peer((TendrilGroup *)(uintptr_t)ptr, c_peer, c_cap);
+  }
+  free(c_peer);
+  free(c_cap);
+  if ((*env)->ExceptionCheck(env)) {
+    return;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_group_authorize_peer failed");
+  }
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_groupClose(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)env;
+  (void)cls;
+  if (ptr != 0) {
+    tendril_group_close((TendrilGroup *)(uintptr_t)ptr);
+  }
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_groupFree(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)env;
+  (void)cls;
+  if (ptr != 0) {
+    tendril_group_free((TendrilGroup *)(uintptr_t)ptr);
+  }
+}

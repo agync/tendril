@@ -1333,6 +1333,174 @@ public final class TendrilJniConformanceTest {
     }
   }
 
+
+  private static String tempStateDir(String prefix) throws IOException {
+    Path dir = Files.createTempDirectory(prefix);
+    dir.toFile().deleteOnExit();
+    return dir.toString();
+  }
+
+  private static void groupEnroll(long host, Map<String, Object> hostInfo, String hostAddr, long peer, String peerId)
+      throws Exception {
+    byte[] hostStatic = b64UrlDecode(asStr(hostInfo.get("static_pub")));
+    byte[] hostSigning = b64UrlDecode(asStr(hostInfo.get("signing_pub")));
+    String hostId = asStr(hostInfo.get("host_id"));
+    String token = TendrilNative.endpointMintEnrollmentToken(host, hostId, peerId, 900);
+    final Throwable[] failure = new Throwable[1];
+    Thread accept =
+        new Thread(
+            () -> {
+              try {
+                TendrilNative.endpointPairAccept(host, 10000);
+              } catch (Throwable t) {
+                failure[0] = t;
+              }
+            });
+    accept.start();
+    Map<String, Object> res =
+        asObj(
+            Json.parse(
+                TendrilNative.endpointEnrollInitiate(
+                    peer, hostAddr, null, hostId, hostStatic, hostSigning, 0, token, "peer", "machine")));
+    accept.join(10000);
+    check(failure[0] == null, "enroll accept failed: " + failure[0]);
+    check("active".equals(res.get("status")), "expected active enrollment: " + res);
+  }
+
+  private static Map<String, Object> waitGroupEvent(long group, String want) {
+    long deadline = System.nanoTime() + 15_000_000_000L;
+    while (System.nanoTime() < deadline) {
+      String raw = TendrilNative.groupPollEvent(group, 500);
+      if (raw == null) {
+        continue;
+      }
+      Map<String, Object> ev = asObj(Json.parse(raw));
+      if (want.equals(ev.get("event"))) {
+        return ev;
+      }
+    }
+    throw new AssertionError("no " + want + " event in time");
+  }
+
+  private static String freeLoopbackAddr() throws Exception {
+    try (java.net.ServerSocket probe =
+        new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+      return "127.0.0.1:" + probe.getLocalPort();
+    }
+  }
+
+  private static void verifyGroupMesh() throws Exception {
+    long a = TendrilNative.endpointNew(tempStateDir("tendril-jni-ga-"), null);
+    long b = TendrilNative.endpointNew(tempStateDir("tendril-jni-gb-"), null);
+    long c = TendrilNative.endpointNew(tempStateDir("tendril-jni-gc-"), null);
+    long mem = TendrilNative.endpointNewFromState(null, null, null);
+    long ga = 0;
+    long gb = 0;
+    long gc = 0;
+    try {
+      Map<String, Object> aInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(a)));
+      Map<String, Object> bInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(b)));
+      Map<String, Object> cInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(c)));
+      String aId = asStr(aInfo.get("device_id"));
+      String bId = asStr(bInfo.get("device_id"));
+      String cId = asStr(cInfo.get("device_id"));
+      String aAddr = TendrilNative.endpointServeDirect(a, "127.0.0.1:0");
+      String bAddr = freeLoopbackAddr();
+      String cAddr = freeLoopbackAddr();
+      groupEnroll(a, aInfo, aAddr, b, bId);
+      groupEnroll(a, aInfo, aAddr, c, cId);
+
+      String created =
+          TendrilNative.groupCreate(a, "jni-mesh", 1, Json.stringify(List.of(aAddr)));
+      String gid = asStr(asObj(Json.parse(created)).get("group_id"));
+      check(!created.contains("rendezvous_key"), "manifest must not carry the rendezvous key");
+      TendrilNative.groupAddMember(a, gid, bId, null, Json.stringify(List.of(bAddr)));
+      String manifest =
+          TendrilNative.groupAddMember(a, gid, cId, null, Json.stringify(List.of(cAddr)));
+      check(gid.equals(TendrilNative.groupIngestManifest(b, manifest, aId)), "ingest b");
+      check(gid.equals(TendrilNative.groupIngestManifest(c, manifest, aId)), "ingest c");
+
+      ga = TendrilNative.groupOpen(a, gid, "127.0.0.1:0");
+      gb = TendrilNative.groupOpen(b, gid, bAddr);
+      gc = TendrilNative.groupOpen(c, gid, cAddr);
+
+      String bound = TendrilNative.groupLocalEndpoint(ga);
+      check(bound != null && bound.contains("127.0.0.1:"), "listener endpoint: " + bound);
+      check(bAddr.equals(TendrilNative.groupLocalEndpoint(gb)), "member listener endpoint");
+      check(TendrilNative.groupPollEvent(gb, 0) == null, "idle poll returns null");
+      Map<String, Object> synced = asObj(Json.parse(TendrilNative.groupSync(ga)));
+      check(asArr(synced.get("delivered")).size() == 2, "sync reaches both members: " + synced);
+
+      byte[] payload = "hello-jni-group".getBytes(StandardCharsets.UTF_8);
+      Map<String, Object> report =
+          asObj(Json.parse(TendrilNative.groupBroadcast(ga, null, payload)));
+      check(asArr(report.get("delivered")).size() == 2, "expected two deliveries: " + report);
+      check(asArr(report.get("failed")).isEmpty(), "unexpected failures: " + report);
+      for (long g : new long[] {gb, gc}) {
+        Map<String, Object> ev = waitGroupEvent(g, "app_data");
+        check(aId.equals(ev.get("sender_device_id")), "sender mismatch: " + ev);
+        check(!ev.containsKey("group_id"), "canonical event shape: " + ev);
+        check(
+            "hello-jni-group"
+                .equals(new String(b64UrlDecode(asStr(ev.get("payload_b64"))), StandardCharsets.UTF_8)),
+            "payload mismatch: " + ev);
+      }
+
+      TendrilNative.groupAuthorizePeer(ga, bId, "group.send:" + gid);
+      boolean adminRefused = false;
+      try {
+        TendrilNative.groupAuthorizePeer(ga, bId, "group.admin:" + gid);
+      } catch (IllegalStateException e) {
+        adminRefused = true;
+      }
+      check(adminRefused, "authorizePeer must refuse a missing capability");
+
+      String revoked = TendrilNative.groupRemoveMember(a, gid, cId);
+      check(gid.equals(TendrilNative.groupIngestManifest(b, revoked, aId)), "ingest revocation");
+      check(cId.equals(waitGroupEvent(gb, "member_revoked").get("device_id")), "revoked device");
+
+      boolean memEndpointRefused = false;
+      try {
+        TendrilNative.groupIngestManifest(mem, manifest, aId);
+      } catch (IllegalStateException e) {
+        memEndpointRefused = e.getMessage() != null && e.getMessage().contains("state directory");
+      }
+      check(memEndpointRefused, "in-memory endpoint must refuse group operations");
+
+      boolean unknownRefused = false;
+      try {
+        TendrilNative.groupOpen(a, "no-such-group", null);
+      } catch (IllegalStateException e) {
+        unknownRefused = e.getMessage() != null && e.getMessage().contains("(-2)");
+      }
+      check(unknownRefused, "unknown group must map to not-found");
+
+      TendrilNative.groupClose(ga);
+      TendrilNative.groupClose(ga);
+      boolean closedRefused = false;
+      try {
+        TendrilNative.groupBroadcast(ga, null, payload);
+      } catch (IllegalStateException e) {
+        closedRefused = e.getMessage() != null && e.getMessage().contains("(-5)");
+      }
+      check(closedRefused, "broadcast after close must map to closed");
+      TendrilNative.groupFree(ga);
+      ga = 0;
+      TendrilNative.groupFree(0);
+      TendrilNative.groupClose(0);
+    } finally {
+      for (long g : new long[] {ga, gb, gc}) {
+        if (g != 0) {
+          TendrilNative.groupFree(g);
+        }
+      }
+      for (long ep : new long[] {a, b, c, mem}) {
+        TendrilNative.endpointClose(ep);
+        TendrilNative.endpointFree(ep);
+      }
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     Path root = Paths.get("").toAbsolutePath().normalize();
     Path peerBin = root.resolve("target").resolve("debug").resolve("tendril-conformance-peer");
@@ -1347,5 +1515,7 @@ public final class TendrilJniConformanceTest {
     verifyConfigureTransportsAndRelayAdmission(root);
     verifyWireV2ConformancePeer(peerBin);
     System.out.println("JNI_V2_RELAY_OK=true");
+    verifyGroupMesh();
+    System.out.println("JNI_GROUP_OK=true");
   }
 }

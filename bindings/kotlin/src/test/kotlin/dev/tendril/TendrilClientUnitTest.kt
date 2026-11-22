@@ -87,4 +87,43 @@ class TendrilClientUnitTest {
       assertTrue("missing TendrilNative.$name", nativeMethods.contains(name))
     }
   }
+
+  @Test
+  fun tendrilEndpointGroupAndNativeExposeGroupMethods() {
+    val epMethods = TendrilEndpoint::class.java.declaredMethods.map { it.name }.toSet()
+    for (name in
+      listOf(
+        "groupCreate",
+        "groupAddMember",
+        "groupRemoveMember",
+        "groupIngestManifest",
+        "openGroup",
+      )) {
+      assertTrue("missing TendrilEndpoint.$name", epMethods.contains(name))
+    }
+
+    val groupMethods = TendrilGroup::class.java.declaredMethods.map { it.name }.toSet()
+    for (name in listOf("broadcast", "sync", "localEndpoint", "pollEvent", "authorizePeer", "close")) {
+      assertTrue("missing TendrilGroup.$name", groupMethods.contains(name))
+    }
+
+    val nativeMethods = TendrilNative::class.java.declaredMethods.map { it.name }.toSet()
+    for (name in
+      listOf(
+        "groupCreate",
+        "groupAddMember",
+        "groupRemoveMember",
+        "groupIngestManifest",
+        "groupOpen",
+        "groupLocalEndpoint",
+        "groupSync",
+        "groupBroadcast",
+        "groupPollEvent",
+        "groupAuthorizePeer",
+        "groupClose",
+        "groupFree",
+      )) {
+      assertTrue("missing TendrilNative.$name", nativeMethods.contains(name))
+    }
+  }
 }

@@ -460,6 +460,38 @@ class TendrilEndpoint private constructor(
       }
     }
 
+  /**
+   * Creates a group rooted at this endpoint and returns the signed manifest JSON. Group APIs are
+   * not available on sealed mobile endpoints yet: they fail with an invalid-argument error
+   * ("groups require a state directory endpoint"). [endpointsJson] is null or a JSON array of
+   * strings.
+   */
+  fun groupCreate(name: String, minWireVersion: Int = 1, endpointsJson: String? = null): String =
+    withHandle { TendrilNative.groupCreate(it, name, minWireVersion, endpointsJson) }
+
+  fun groupAddMember(
+    groupId: String,
+    peerId: String,
+    capsJson: String? = null,
+    endpointsJson: String? = null,
+  ): String =
+    withHandle { TendrilNative.groupAddMember(it, groupId, peerId, capsJson, endpointsJson) }
+
+  fun groupRemoveMember(groupId: String, peerId: String): String =
+    withHandle { TendrilNative.groupRemoveMember(it, groupId, peerId) }
+
+  /** Ingests a manifest received from the authenticated peer [senderPeerId]; returns its group id. */
+  fun groupIngestManifest(manifestJson: String, senderPeerId: String): String =
+    withHandle { TendrilNative.groupIngestManifest(it, manifestJson, senderPeerId) }
+
+  /**
+   * Opens the group pool. A non-null [listenAddr] also binds a direct listener the group serves
+   * (see [TendrilGroup.localEndpoint]). Configure transports before the first call; afterwards inbound sessions
+   * are routed through the group hub and ordinary sessions still arrive through [acceptSession].
+   */
+  fun openGroup(groupId: String, listenAddr: String? = null): TendrilGroup =
+    withHandle { TendrilGroup(TendrilNative.groupOpen(it, groupId, listenAddr)) }
+
   override fun close() {
     lock.read {
       val ptr = handleValue
@@ -562,6 +594,59 @@ class TendrilSession internal constructor(
       if (ptr != 0L) {
         handleValue = 0L
         TendrilNative.sessionFree(ptr)
+      }
+    }
+  }
+}
+
+class TendrilGroup internal constructor(handle: Long) : Closeable {
+  private val lock = ReentrantReadWriteLock()
+  private var handleValue: Long = handle
+
+  private inline fun <T> withHandle(fn: (Long) -> T): T =
+    lock.read {
+      val ptr = handleValue
+      check(ptr != 0L) { "TendrilGroup is closed" }
+      fn(ptr)
+    }
+
+  /** Sends [data] to every reachable member and returns the `{delivered, offline, failed}` JSON. */
+  fun broadcast(data: ByteArray, requiredCap: String? = null): String =
+    withHandle { TendrilNative.groupBroadcast(it, requiredCap, data) }
+
+  /**
+   * Pushes the stored manifest (and, for an admin, the rendezvous key) to members and returns the
+   * report JSON. Wire v2 groups need it; the runtime refuses non-admins.
+   */
+  fun sync(): String = withHandle { TendrilNative.groupSync(it) }
+
+  /** Returns the endpoint bound by `listenAddr` at open time, or null when none was requested. */
+  fun localEndpoint(): String? = withHandle { TendrilNative.groupLocalEndpoint(it) }
+
+  /**
+   * Waits up to [timeoutMs] for the next event JSON (`app_data`, `manifest_updated`,
+   * `member_joined`, `member_revoked`, `audit`) and returns null on timeout. Throws once the pool
+   * is closed, and a call parked in the wait throws promptly when [close] is called.
+   */
+  fun pollEvent(timeoutMs: Long): String? =
+    withHandle { TendrilNative.groupPollEvent(it, timeoutMs) }
+
+  /** Throws unless [peerId] currently holds [cap] in the group. */
+  fun authorizePeer(peerId: String, cap: String) =
+    withHandle { TendrilNative.groupAuthorizePeer(it, peerId, cap) }
+
+  override fun close() {
+    lock.read {
+      val ptr = handleValue
+      if (ptr != 0L) {
+        TendrilNative.groupClose(ptr)
+      }
+    }
+    lock.write {
+      val ptr = handleValue
+      if (ptr != 0L) {
+        handleValue = 0L
+        TendrilNative.groupFree(ptr)
       }
     }
   }
