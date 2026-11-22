@@ -800,6 +800,14 @@ impl Roster {
         ) {
             Ok(new_seq) => {
                 if new_seq > pinned_seq {
+                    if self.revoked_key_conflict(
+                        peer_id,
+                        peer_id,
+                        presented_static,
+                        Some(presented_signing),
+                    ) {
+                        return Err(CoreError::PeerRevoked(peer_id.to_string()));
+                    }
                     let entry = self
                         .entries
                         .get_mut(peer_id)
@@ -1320,10 +1328,72 @@ mod tests {
         ));
         assert!(roster.get("zz_active_host").is_none());
 
+        // A tampered or legacy serialized roster can still carry an Active duplicate beside the
+        // Revoked entry, so lookups must keep revocation precedence.
+        let mut tampered = serde_json::to_value(&roster).unwrap();
+        let mut dup = serde_json::to_value(roster.get("aa_revoked_host").unwrap()).unwrap();
+        dup["device_id"] = "zz_active_host".into();
+        dup["state"] = "active".into();
+        tampered["entries"]["zz_active_host"] = dup;
+        let tampered: Roster = serde_json::from_value(tampered).unwrap();
+        assert_eq!(
+            tampered.get("zz_active_host").unwrap().state,
+            PeerState::Active
+        );
         assert!(matches!(
-            roster.lookup_active_by_static(&pub_k),
+            tampered.lookup_active_by_static(&pub_k),
             Err(CoreError::PeerRevoked(_))
         ));
+        assert_eq!(tampered.lookup_active_signing_key("zz_active_host"), None);
+    }
+
+    #[test]
+    fn sec01_rotation_onto_crl_revoked_identity_is_refused() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+        use crate::grants::{RevocationListUnsigned, sign_crl};
+        use crate::identity::sign_rotation;
+
+        let root_sk = SigningKeypair::from_seed([0x11; 32]);
+        let old_static = *StaticKeypair::from_scalar([0x21; 32]).public_bytes();
+        let old_sk = SigningKeypair::from_seed([0x22; 32]);
+        let next_static = *StaticKeypair::from_scalar([0x31; 32]).public_bytes();
+        let next_sig = SigningKeypair::from_seed([0x32; 32]).public_key().clone();
+
+        let mut roster = Roster::new();
+        roster
+            .insert_pinned_host(
+                "rotating-host".into(),
+                "Host".into(),
+                old_static,
+                Some(old_sk.public_key().clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: "root-id".into(),
+                seq: 1,
+                revoked_devices: vec![device_id(&next_static)],
+                revoked_nonces: vec![],
+                ts: "2026-11-20T00:00:00Z".into(),
+            },
+            &root_sk,
+        )
+        .unwrap();
+        roster
+            .ingest_crl(crl, "root-id", root_sk.public_key())
+            .unwrap();
+
+        let rec = sign_rotation(1, &old_sk, &next_sig, &next_static, 1_795_133_000).unwrap();
+        assert!(matches!(
+            roster.apply_verified_rotation("rotating-host", &[rec], &next_static, &next_sig),
+            Err(CoreError::PeerRevoked(_))
+        ));
+        let entry = roster.get("rotating-host").unwrap();
+        assert_eq!(entry.static_pub, old_static);
+        assert_eq!(entry.rotation_seq, 0);
     }
 
     #[test]

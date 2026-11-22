@@ -1720,6 +1720,24 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
         Err(CoreError::PeerRevoked(_))
     ));
     assert_eq!(roster.lookup_active_signing_key("del-alias-2"), None);
+
+    // Defense in depth: a tampered serialized roster carrying an Active duplicate beside the
+    // Revoked entry must still resolve to no signing key.
+    let mut tampered = serde_json::to_value(&roster).unwrap();
+    let mut dup = serde_json::to_value(roster.get("del-alias").unwrap()).unwrap();
+    dup["device_id"] = "del-alias-2".into();
+    dup["state"] = "active".into();
+    tampered["entries"]["del-alias-2"] = dup;
+    let tampered: Roster = serde_json::from_value(tampered).unwrap();
+    assert_eq!(
+        tampered.get("del-alias-2").map(|e| e.state),
+        Some(PeerState::Active)
+    );
+    assert_eq!(tampered.lookup_active_signing_key("del-alias-2"), None);
+    assert!(matches!(
+        tampered.lookup_active_by_static(del.static_key().public_bytes()),
+        Err(CoreError::PeerRevoked(_))
+    ));
     assert!(matches!(
         verify_grant_with_chain(
             &g_leaf,

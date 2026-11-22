@@ -855,7 +855,12 @@ impl SessionMachine {
         self.ensure_peer_active_in_roster(roster)?;
         let root_id = self.authoritative_root_id()?.to_string();
         let crl = roster.crl(&root_id);
-        if roster.crl_revokes_id(&self.local_device_id)
+        let local_revoked = crl.is_some_and(|list| {
+            list.revoked_devices
+                .iter()
+                .any(|d| d == &self.local_device_id)
+        });
+        if local_revoked
             || self
                 .peer_device_id
                 .as_deref()
@@ -944,13 +949,16 @@ impl SessionMachine {
 /// Fails closed with [`CoreError::VersionDowngrade`] when `roster` pins `target_host_id` to a
 /// `min_wire_version` above Wire v1, before any v1 bytes are emitted.
 pub fn check_peer_allows_wire_v1(roster: &Roster, target_host_id: &str) -> Result<(), CoreError> {
-    if let Some(entry) = roster.get(target_host_id)
-        && entry.min_wire_version > WIRE_VERSION
-    {
-        return Err(CoreError::VersionDowngrade {
-            peer_min: entry.min_wire_version,
-            negotiated: WIRE_VERSION,
-        });
+    if let Some(entry) = roster.get(target_host_id) {
+        let floor = entry
+            .min_wire_version
+            .max(roster.pairing_floor(&entry.static_pub));
+        if floor > WIRE_VERSION {
+            return Err(CoreError::VersionDowngrade {
+                peer_min: floor,
+                negotiated: WIRE_VERSION,
+            });
+        }
     }
     Ok(())
 }
@@ -1145,7 +1153,23 @@ mod tests {
                 &roster
             )
             .err(),
-            Some(expected)
+            Some(expected.clone())
+        );
+
+        // A sibling alias pinning the same static key inherits the stricter floor.
+        roster
+            .insert_pinned_host(
+                "host-floor-alias".to_string(),
+                "Alias".to_string(),
+                *host.static_key().public_bytes(),
+                Some(host.signing_key().public_key().clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            check_peer_allows_wire_v1(&roster, "host-floor-alias"),
+            Err(expected)
         );
     }
 }
