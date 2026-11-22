@@ -13,6 +13,7 @@ package tendril
 import "C"
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,6 +87,14 @@ type SessionEvent struct {
 	Code      uint16          `json:"code,omitempty"`
 	Reason    string          `json:"reason,omitempty"`
 	Audit     json.RawMessage `json:"audit,omitempty"`
+	// Endpoints with a state directory ingest ordinary-session group frames in the runtime and
+	// report "group_manifest_ingested", "group_manifest_rejected", "group_rendezvous_ingested" or
+	// "group_rendezvous_rejected" with GroupID, Seq and, on a rejection, Error. Rendezvous keys
+	// never cross the boundary. Store-less endpoints report "group_manifest_unverified" (with
+	// ManifestJSON, the input to Endpoint.GroupIngestManifest) and "group_rendezvous_unverified".
+	GroupID      string `json:"group_id,omitempty"`
+	ManifestJSON string `json:"manifest_json,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 func lastError() string {
@@ -1109,4 +1118,326 @@ func (s *Session) ExportRosterJSON() ([]byte, error) {
 		return err
 	})
 	return out, err
+}
+
+// BroadcastReport is the per-peer outcome of Group.Broadcast. Each Failed entry is
+// [deviceID, error].
+type BroadcastReport struct {
+	Delivered []string    `json:"delivered"`
+	Offline   []string    `json:"offline"`
+	Failed    [][2]string `json:"failed"`
+}
+
+// GroupEvent is one event from Group.PollEvent. Event is one of "app_data", "manifest_updated",
+// "member_joined", "member_revoked", or "audit".
+type GroupEvent struct {
+	Event          string          `json:"event"`
+	SenderDeviceID string          `json:"sender_device_id,omitempty"`
+	PayloadB64     string          `json:"payload_b64,omitempty"`
+	Seq            uint64          `json:"seq,omitempty"`
+	DeviceID       string          `json:"device_id,omitempty"`
+	Audit          json.RawMessage `json:"audit,omitempty"`
+}
+
+// Payload decodes the application payload of an "app_data" event.
+func (e *GroupEvent) Payload() ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(e.PayloadB64)
+}
+
+func optJSONList(items []string, name string, fn func(*C.char) error) error {
+	if len(items) == 0 {
+		return fn(nil)
+	}
+	raw, err := json.Marshal(items)
+	if err != nil {
+		return fmt.Errorf("tendril: encode %s: %w", name, err)
+	}
+	return withOptCStr(string(raw), name, fn)
+}
+
+// GroupCreate creates a group rooted at this endpoint's identity and returns the signed manifest
+// JSON. The endpoint needs a state directory.
+func (ep *Endpoint) GroupCreate(name string, minWireVersion uint8, endpoints []string) (string, error) {
+	var manifest string
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cname, err := toCStr(name, "name")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cname))
+		var out *C.char
+		var rc C.int32_t
+		if err := optJSONList(endpoints, "endpoints", func(ce *C.char) error {
+			rc = C.tendril_group_create(h, cname, C.uint8_t(minWireVersion), ce, &out)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		manifest = takeOutCStr(out)
+		return nil
+	})
+	return manifest, err
+}
+
+// GroupAddMember adds the enrolled peer peerID to a group this endpoint roots and returns the new
+// manifest JSON. Empty caps grant the default send and receive capabilities.
+func (ep *Endpoint) GroupAddMember(groupID, peerID string, caps, endpoints []string) (string, error) {
+	var manifest string
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cgid, err := toCStr(groupID, "groupID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cgid))
+		cpeer, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cpeer))
+		var out *C.char
+		var rc C.int32_t
+		if err := optJSONList(caps, "caps", func(cc *C.char) error {
+			return optJSONList(endpoints, "endpoints", func(ce *C.char) error {
+				rc = C.tendril_group_add_member(h, cgid, cpeer, cc, ce, &out)
+				return nil
+			})
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		manifest = takeOutCStr(out)
+		return nil
+	})
+	return manifest, err
+}
+
+// GroupRemoveMember revokes peerID from a group this endpoint roots, rotates its keys, and returns
+// the new manifest JSON.
+func (ep *Endpoint) GroupRemoveMember(groupID, peerID string) (string, error) {
+	var manifest string
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cgid, err := toCStr(groupID, "groupID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cgid))
+		cpeer, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cpeer))
+		var out *C.char
+		if rc := C.tendril_group_remove_member(h, cgid, cpeer, &out); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		manifest = takeOutCStr(out)
+		return nil
+	})
+	return manifest, err
+}
+
+// GroupIngestManifest ingests a manifest received from the authenticated peer senderPeerID and
+// returns its group id.
+func (ep *Endpoint) GroupIngestManifest(manifestJSON, senderPeerID string) (string, error) {
+	var groupID string
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cm, err := toCStr(manifestJSON, "manifestJSON")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cm))
+		cs, err := toCStr(senderPeerID, "senderPeerID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cs))
+		var out *C.char
+		if rc := C.tendril_group_ingest_manifest(h, cm, cs, &out); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		groupID = takeOutCStr(out)
+		return nil
+	})
+	return groupID, err
+}
+
+// OpenGroup opens the lazy full-mesh pool for groupID. A non-empty listenAddr also binds a direct
+// listener that the group serves, reported by Group.LocalEndpoint. Configure transports before the
+// first call; after it, inbound sessions are routed through the group hub and ordinary sessions
+// still arrive through AcceptSession and AcceptV2.
+func (ep *Endpoint) OpenGroup(groupID, listenAddr string) (*Group, error) {
+	var grp *Group
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cgid, err := toCStr(groupID, "groupID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cgid))
+		var raw *C.TendrilGroup
+		var rc C.int32_t
+		if err := withOptCStr(listenAddr, "listenAddr", func(cl *C.char) error {
+			rc = C.tendril_group_open(h, cgid, cl, &raw)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		grp = &Group{ptr: raw}
+		runtime.SetFinalizer(grp, (*Group).Close)
+		return nil
+	})
+	return grp, err
+}
+
+// Group wraps an opaque C TendrilGroup handle.
+type Group struct {
+	mu  sync.RWMutex
+	ptr *C.TendrilGroup
+}
+
+// Close closes the group handle and frees it. It is idempotent. A PollEvent already waiting
+// returns io.EOF promptly instead of running out its timeout.
+func (g *Group) Close() error {
+	g.mu.RLock()
+	h := g.ptr
+	if h != nil {
+		C.tendril_group_close(h)
+	}
+	runtime.KeepAlive(g)
+	g.mu.RUnlock()
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.ptr != nil {
+		C.tendril_group_free(g.ptr)
+		g.ptr = nil
+		runtime.SetFinalizer(g, nil)
+	}
+	return nil
+}
+
+func (g *Group) withHandle(fn func(*C.TendrilGroup) error) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	defer runtime.KeepAlive(g)
+	if g.ptr == nil {
+		return errors.New("tendril: group closed")
+	}
+	return fn(g.ptr)
+}
+
+// Broadcast sends data to every reachable member holding the receive capability. An empty
+// requiredCap uses the group's default send capability.
+func (g *Group) Broadcast(data []byte, requiredCap string) (*BroadcastReport, error) {
+	defer runtime.KeepAlive(data)
+	var report BroadcastReport
+	err := g.withHandle(func(h *C.TendrilGroup) error {
+		var ptr *C.uint8_t
+		if len(data) > 0 {
+			ptr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
+		}
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptCStr(requiredCap, "requiredCap", func(cc *C.char) error {
+			rc = C.tendril_group_broadcast(h, cc, ptr, C.size_t(len(data)), &out)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return json.Unmarshal([]byte(takeOutCStr(out)), &report)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
+// PollEvent waits up to timeoutMs for the next group event. It returns (nil, nil) on timeout and
+// io.EOF once the pool is closed or this handle is closed while the call is waiting.
+func (g *Group) PollEvent(timeoutMs uint64) (*GroupEvent, error) {
+	var ev *GroupEvent
+	err := g.withHandle(func(h *C.TendrilGroup) error {
+		var out *C.char
+		rc := C.tendril_group_poll_event(h, C.uint64_t(timeoutMs), &out)
+		switch rc {
+		case C.TENDRIL_OK:
+			var parsed GroupEvent
+			if err := json.Unmarshal([]byte(takeOutCStr(out)), &parsed); err != nil {
+				return err
+			}
+			ev = &parsed
+			return nil
+		case C.TENDRIL_WOULD_BLOCK:
+			return nil
+		case C.TENDRIL_EOF:
+			return io.EOF
+		default:
+			return ffiErr(rc)
+		}
+	})
+	return ev, err
+}
+
+// Sync pushes the stored manifest (and, for an admin, the rendezvous key) to every member. Wire v2
+// groups need it to keep members current; the runtime refuses it for non-admins.
+func (g *Group) Sync() (*BroadcastReport, error) {
+	var report BroadcastReport
+	err := g.withHandle(func(h *C.TendrilGroup) error {
+		var out *C.char
+		if rc := C.tendril_group_sync(h, &out); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return json.Unmarshal([]byte(takeOutCStr(out)), &report)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
+// LocalEndpoint returns the endpoint bound by OpenGroup's listenAddr, or "" when none was set.
+func (g *Group) LocalEndpoint() (string, error) {
+	var endpoint string
+	err := g.withHandle(func(h *C.TendrilGroup) error {
+		var out *C.char
+		if rc := C.tendril_group_local_endpoint(h, &out); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		endpoint = takeOutCStr(out)
+		return nil
+	})
+	return endpoint, err
+}
+
+// AuthorizePeer returns nil when peerID currently holds capability in the group, and the core error
+// otherwise.
+func (g *Group) AuthorizePeer(peerID, capability string) error {
+	return g.withHandle(func(h *C.TendrilGroup) error {
+		cpeer, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cpeer))
+		ccap, err := toCStr(capability, "capability")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(ccap))
+		if rc := C.tendril_group_authorize_peer(h, cpeer, ccap); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return nil
+	})
 }
