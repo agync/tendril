@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>How Tendril works</title>
-<meta name="description" content="How Tendril links two devices: keys made on each device, pairing with a code and a check string, default-deny grants, revocation, a hybrid post-quantum handshake, enrolling machines with no screen, six network paths, blind relays, and the limits of what it protects.">
+<meta name="description" content="How Tendril links two devices: keys made on each device, pairing with a code and a check string, default-deny grants, revocation, groups of up to 32 devices, a hybrid post-quantum handshake, enrolling machines with no screen, six network paths, blind relays, and the limits of what it protects.">
 <link rel="canonical" href="{{SITE_URL}}/how-it-works">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Tendril">
@@ -448,6 +448,49 @@
       <p class="more-link">Read more: <a href="/docs/design/grants.html">Grants design</a></p>
     </div>
   </details>
+  <div class="sub-part" id="groups">
+    <h3>Groups of up to 32 devices</h3>
+    <p class="part-lead">Say the Mac mini has enrolled a NAS and a server, and the server should back up to the NAS without going through the Mac mini. Without a group, the two would have to enroll with each other too, and every new machine with every other one. Instead, the Mac mini can root a group. It signs a list of the members and what each may do, and every member checks the others against that list.</p>
+    <p class="part-lead">A group is not group encryption. Each pair of members still runs its own handshake, so what passes between two of them is sealed with keys only those two hold.</p>
+    <figure class="fig">
+      <svg class="dia" viewBox="0 0 400 224" role="img" aria-label="The Mac mini, as root, signs the membership list, which every member holds. The Mac mini, a NAS and a server are each linked to the other two by their own session, three sessions in all.">
+        <rect class="b b-acc" x="136" y="4" width="128" height="44"/>
+        <text class="t-s t-strong" x="200" y="23" text-anchor="middle">Mac mini</text>
+        <text class="t-xs t-mut" x="200" y="39" text-anchor="middle">root · signs the list</text>
+        <rect class="b" x="4" y="150" width="112" height="44"/>
+        <text class="t-s t-strong" x="60" y="169" text-anchor="middle">NAS</text>
+        <text class="t-xs t-mut" x="60" y="185" text-anchor="middle">member</text>
+        <rect class="b" x="284" y="150" width="112" height="44"/>
+        <text class="t-s t-strong" x="340" y="169" text-anchor="middle">server</text>
+        <text class="t-xs t-mut" x="340" y="185" text-anchor="middle">member</text>
+        <path class="w-acc" d="M136 26H60V150M264 26H340V150M116 172H284"/>
+        <text class="t-xs" x="96" y="18" text-anchor="middle">own session</text>
+        <text class="t-xs" x="304" y="18" text-anchor="middle">own session</text>
+        <text class="t-xs" x="200" y="164" text-anchor="middle">own session</text>
+        <text class="t-s t-acc" x="200" y="94" text-anchor="middle">membership list</text>
+        <text class="t-xs t-mut" x="200" y="110" text-anchor="middle">who is in, what each may do</text>
+        <text class="t-xs t-mut" x="200" y="125" text-anchor="middle">held by every member</text>
+        <text class="t-xs t-mut" x="200" y="218" text-anchor="middle">three pairs, three sessions, each with its own keys</text>
+      </svg>
+      <figcaption>Illustrative. A group links up to 32 devices the same way.</figcaption>
+    </figure>
+    <ul class="gains" aria-label="What this means">
+      <li>Each device enrolls once, with the root, not with every other member.</li>
+      <li>Removing a member from the list cuts it off from all the others.</li>
+      <li>A relay learns nothing about the group.</li>
+    </ul>
+    <details class="more">
+      <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+      <div class="more-body">
+        <p><strong>The list.</strong> A signed manifest names up to 32 members, each with its keys, where to reach it and what it may do. Every capability in it must name this group, such as <code>group.send:&lt;group_id&gt;</code>, so the list cannot grant anything outside the group. The root signs it with Ed25519 and ML-DSA-65 together, and each new version carries a higher number, so an older list cannot undo a newer one. A list lasts 30 days by default and never more than 90. Once it expires, members refuse group traffic until the root signs a new one.</p>
+        <p><strong>Who can join.</strong> A member must already be an active peer of the root whose signing key the root knows, as a machine that enrolled with a token is. A device paired by code cannot join, because the root never learns its signing key. Members stay off each other's rosters, so one member cannot open an ordinary session with another, or get a grant from it, without pairing.</p>
+        <p><strong>Sending.</strong> Members dial each other only when there is something to send, at most 8 at a time and each within 5 seconds, and send to each member over its own session. A member that is offline is reported back and never holds up the rest. The root's <code>sync</code> pushes the latest list to every member, and members that connect pass a newer list on.</p>
+        <p><strong>Removing a member.</strong> Removal is permanent: the device goes on a revoked list that only grows, and cannot be added back. Members that get the new list close their links to it and drop the secrets they shared with it. The root also makes a new first-contact key, which members use with Wire v2 to admit each other the first time they connect. A member that is offline learns of the removal when it next gets the list.</p>
+        <p><strong>Where it runs.</strong> <code>tendril group</code> in the CLI, and Rust, Go, Python and Node. Swift and Kotlin have the same calls, but endpoints that seal their keys with the Keychain or Android Keystore cannot hold a group yet. A browser can be a member, but cannot create a group, run <code>sync</code> or listen. Members cannot yet link through <code>/v2/relay</code>, the hourly mailbox relay. The other paths, including <code>/v1/relay</code>, work.</p>
+        <p class="more-link">Read more: <a href="/docs/design/groups.html">Small peer mesh groups design</a></p>
+      </div>
+    </details>
+  </div>
 </section>
 
 <section id="paths" class="part" aria-labelledby="h-paths">
@@ -593,7 +636,7 @@
         </tbody>
       </table>
       <p>Wire v2 still leaves IP addresses, when devices send and roughly how much in view. Both devices must turn it on. A host with it on still answers version 1 for older peers, so a stranger can still learn its id that way. Two devices that have used Wire v2 refuse to fall back. Padding frames that hide idle time exist, but your app has to send them. <code>tendril serve --redact-logs</code> keeps pairing codes, payloads and token nonces out of the CLI's own logs.</p>
-      <p>Group encryption, hosted accounts and replacing TLS for the web are out of scope for v1.</p>
+      <p>Hosted accounts and replacing TLS for the web are out of scope for v1. So is group encryption, where one key seals messages for a whole group, as in MLS. A <a href="#groups">group</a> of up to 32 devices gives each pair of members its own session instead.</p>
       <p class="more-link">Read more: <a href="/docs/overview.html">Scope and explicit limits</a>, <a href="/docs/adr/0004-hybrid-post-quantum-v1.html">the hybrid post-quantum decision</a>, <a href="/docs/design/wire-v2-privacy.html">Wire v2 privacy</a> and <a href="/docs/design/wake-providers.html">wake hints</a>. Found a problem? <a href="https://github.com/agync/tendril/security">Report it privately</a> on GitHub.</p>
     </div>
   </details>
