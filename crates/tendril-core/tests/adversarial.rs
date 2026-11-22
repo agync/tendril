@@ -1704,20 +1704,21 @@ fn batch1_sec02_sec12_sec19_grants_crl_sibling_and_jcs_hardening() {
     ));
 
     // SEC-12: revoking `dev_xxx` immediately invalidates sibling alias `del-alias`,
-    // and inserting a new active alias sharing the revoked keys still returns `None`.
+    // and a new alias sharing the revoked keys is refused (SEC-01) and never resolves.
     roster.revoke_peer(&del_dev).unwrap();
     assert_eq!(roster.lookup_active_signing_key(&del_dev), None);
     assert_eq!(roster.lookup_active_signing_key("del-alias"), None);
-    roster
-        .insert_pinned_host(
+    assert!(matches!(
+        roster.insert_pinned_host(
             "del-alias-2".into(),
             "Delegate Clone".into(),
             *del.static_key().public_bytes(),
             Some(del.signing_key().public_key().clone()),
             0,
             vec![],
-        )
-        .unwrap();
+        ),
+        Err(CoreError::PeerRevoked(_))
+    ));
     assert_eq!(roster.lookup_active_signing_key("del-alias-2"), None);
     assert!(matches!(
         verify_grant_with_chain(

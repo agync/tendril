@@ -232,6 +232,54 @@ impl Roster {
         self.crls.get(issuer)
     }
 
+    /// Returns `true` if any ingested CRL revokes `id`, matching either the supplied roster key or
+    /// device identifier and the canonical `device_id` derived from `static_pub`.
+    #[must_use]
+    pub fn crl_revokes_identity(&self, id: &str, static_pub: &[u8; 32]) -> bool {
+        self.crl_revokes_id(id) || self.crl_revokes_id(&device_id(static_pub))
+    }
+
+    /// Returns `true` if any ingested CRL lists exactly `id` in `revoked_devices`.
+    #[must_use]
+    pub fn crl_revokes_id(&self, id: &str) -> bool {
+        self.crls
+            .values()
+            .any(|crl| crl.revoked_devices.iter().any(|d| d == id))
+    }
+
+    /// Returns `true` if any ingested CRL revokes `entry` by its stored `device_id` or by the
+    /// canonical `device_id` derived from its `static_pub`.
+    #[must_use]
+    pub fn crl_revokes_entry(&self, entry: &RosterEntry) -> bool {
+        self.crl_revokes_identity(&entry.device_id, &entry.static_pub)
+    }
+
+    fn revoked_key_conflict(
+        &self,
+        skip_key: &str,
+        id: &str,
+        static_pub: &[u8; 32],
+        signing_pub: Option<&HybridSigningPublicKey>,
+    ) -> bool {
+        self.crl_revokes_identity(id, static_pub)
+            || self.entries.iter().any(|(k, other)| {
+                k != skip_key
+                    && other.state == PeerState::Revoked
+                    && (other.static_pub == *static_pub
+                        || other.device_id == id
+                        || matches!(
+                            (signing_pub, &other.signing_pub),
+                            (Some(a), Some(b)) if signing_keys_share_identity(a, b)
+                        ))
+            })
+            || signing_pub.is_some_and(|sig| {
+                self.trust_anchors.values().any(|a| {
+                    a.state == AnchorState::Revoked
+                        && signing_keys_share_identity(&a.signing_pub, sig)
+                })
+            })
+    }
+
     /// Inserts or updates a verified client-side `Active` pin for a remote host before session connect.
     ///
     /// Refuses to overwrite a `Revoked` entry or any existing entry whose `static_pub`,
@@ -248,6 +296,9 @@ impl Roster {
     ) -> Result<&RosterEntry, CoreError> {
         if host_id.is_empty() || !is_valid_x25519_public_key(&static_pub) {
             return Err(CoreError::IncompletePin(host_id));
+        }
+        if self.revoked_key_conflict(&host_id, &host_id, &static_pub, signing_pub.as_ref()) {
+            return Err(CoreError::PeerRevoked(host_id));
         }
         if let Some(existing) = self.entries.get_mut(&host_id) {
             if existing.state == PeerState::Revoked {
@@ -313,6 +364,9 @@ impl Roster {
     ) -> Result<&RosterEntry, CoreError> {
         if host_id.is_empty() || !is_valid_x25519_public_key(&static_pub) {
             return Err(CoreError::IncompletePin(host_id));
+        }
+        if self.revoked_key_conflict(&host_id, &host_id, &static_pub, Some(&signing_pub)) {
+            return Err(CoreError::PeerRevoked(host_id));
         }
         if let Some(existing) = self.entries.get_mut(&host_id) {
             if existing.state == PeerState::Revoked {
@@ -394,6 +448,9 @@ impl Roster {
             ));
         }
         let id = device_id(&static_pub);
+        if self.revoked_key_conflict(&id, &id, &static_pub, signing_pub.as_ref()) {
+            return Err(CoreError::PeerRevoked(id));
+        }
         if let Some(existing) = self.entries.get_mut(&id) {
             if existing.static_pub != static_pub {
                 return Err(CoreError::ProtocolViolation(
@@ -462,25 +519,9 @@ impl Roster {
             )
         };
 
-        let revoked_conflict = self.entries.iter().any(|(k, other)| {
-            k != peer_id
-                && other.state == PeerState::Revoked
-                && (other.static_pub == static_pub
-                    || other.device_id == device_id_str
-                    || matches!(
-                        (&signing_pub, &other.signing_pub),
-                        (Some(a), Some(b)) if signing_keys_share_identity(a, b)
-                    ))
-        }) || self.trust_anchors.values().any(|a| {
-            a.state == AnchorState::Revoked
-                && signing_pub
-                    .as_ref()
-                    .is_some_and(|s| signing_keys_share_identity(&a.signing_pub, s))
-        }) || self.crls.values().any(|c| {
-            c.revoked_devices
-                .iter()
-                .any(|d| d == peer_id || d == &device_id_str)
-        });
+        let revoked_conflict =
+            self.revoked_key_conflict(peer_id, &device_id_str, &static_pub, signing_pub.as_ref())
+                || self.crl_revokes_identity(peer_id, &static_pub);
         if revoked_conflict {
             return Err(CoreError::PeerRevoked(peer_id.to_string()));
         }
@@ -818,14 +859,11 @@ impl Roster {
 
         let mut revoked_keys = Vec::new();
         for revoked_id in &crl.revoked_devices {
-            if let Some(entry) = self.entries.get_mut(revoked_id) {
-                entry.state = PeerState::Revoked;
-                entry.grants.clear();
-                entry.v2_secrets = None;
-                revoked_keys.push((entry.static_pub, entry.signing_pub.clone()));
-            }
-            for entry in self.entries.values_mut() {
-                if &entry.device_id == revoked_id {
+            for (key, entry) in &mut self.entries {
+                if key == revoked_id
+                    || &entry.device_id == revoked_id
+                    || &device_id(&entry.static_pub) == revoked_id
+                {
                     entry.state = PeerState::Revoked;
                     entry.grants.clear();
                     entry.v2_secrets = None;
@@ -870,6 +908,9 @@ impl Roster {
         }
         if let Some(entry) = active {
             entry.require_static_pin()?;
+            if self.crl_revokes_entry(entry) {
+                return Err(CoreError::PeerRevoked(entry.device_id.clone()));
+            }
             if let Some(ref sig) = entry.signing_pub
                 && self.entries.values().any(|other| {
                     other.state == PeerState::Revoked
@@ -1266,16 +1307,18 @@ mod tests {
             .unwrap();
         roster.revoke_peer("aa_revoked_host").unwrap();
 
-        roster
-            .insert_pinned_host(
+        assert!(matches!(
+            roster.insert_pinned_host(
                 "zz_active_host".to_string(),
                 "Active".to_string(),
                 pub_k,
                 Some(sig_k),
                 0,
                 vec![],
-            )
-            .unwrap();
+            ),
+            Err(CoreError::PeerRevoked(_))
+        ));
+        assert!(roster.get("zz_active_host").is_none());
 
         assert!(matches!(
             roster.lookup_active_by_static(&pub_k),

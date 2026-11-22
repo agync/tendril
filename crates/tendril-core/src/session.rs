@@ -155,6 +155,27 @@ impl SessionMachine {
         })
     }
 
+    /// Creates an initiator after verifying `roster` does not pin `target_host_id` to a
+    /// `min_wire_version` above Wire v1, so no v1 preamble or `msg1` is ever emitted to such a peer.
+    pub fn new_initiator_with_roster(
+        local_identity: &EndpointIdentity,
+        target_host_id: impl Into<String>,
+        initial_grant: Option<Grant>,
+        crl_seq: Option<u64>,
+        fixed_ephemeral: Option<[u8; 32]>,
+        roster: &Roster,
+    ) -> Result<Self, CoreError> {
+        let target_host_id = target_host_id.into();
+        check_peer_allows_wire_v1(roster, &target_host_id)?;
+        Self::new_initiator(
+            local_identity,
+            target_host_id,
+            initial_grant,
+            crl_seq,
+            fixed_ephemeral,
+        )
+    }
+
     /// Creates a responder session listening for an inbound initiator preamble.
     pub fn new_responder(
         local_identity: &EndpointIdentity,
@@ -599,7 +620,12 @@ impl SessionMachine {
                             PeerState::Revoked => {
                                 return Err(CoreError::PeerRevoked(target_id.to_string()));
                             }
-                            PeerState::Active => entry.require_complete_pin()?,
+                            PeerState::Active => {
+                                if roster.crl_revokes_entry(entry) {
+                                    return Err(CoreError::PeerRevoked(target_id.to_string()));
+                                }
+                                entry.require_complete_pin()?
+                            }
                         }
                     }
                     None => return Err(CoreError::HostKeyUnverified),
@@ -705,8 +731,7 @@ impl SessionMachine {
                 }
                 let canonical_peer_id = peer_entry.device_id.clone();
                 let crl = roster.crl(&self.local_host_id);
-                if let Some(list) = crl
-                    && list.revoked_devices.iter().any(|d| d == &canonical_peer_id)
+                if roster.crl_revokes_entry(peer_entry) || roster.crl_revokes_id(&canonical_peer_id)
                 {
                     return Err(CoreError::PeerRevoked(canonical_peer_id));
                 }
@@ -830,10 +855,11 @@ impl SessionMachine {
         self.ensure_peer_active_in_roster(roster)?;
         let root_id = self.authoritative_root_id()?.to_string();
         let crl = roster.crl(&root_id);
-        if let Some(list) = crl
-            && list.revoked_devices.iter().any(|d| {
-                d == &self.local_device_id || Some(d.as_str()) == self.peer_device_id.as_deref()
-            })
+        if roster.crl_revokes_id(&self.local_device_id)
+            || self
+                .peer_device_id
+                .as_deref()
+                .is_some_and(|peer| roster.crl_revokes_id(peer))
         {
             return Err(CoreError::PeerRevoked(
                 self.peer_device_id
@@ -871,6 +897,9 @@ impl SessionMachine {
                     PeerState::Pending => Err(CoreError::PeerPending(host_id.to_string())),
                     PeerState::Revoked => Err(CoreError::PeerRevoked(host_id.to_string())),
                     PeerState::Active => {
+                        if roster.crl_revokes_entry(entry) {
+                            return Err(CoreError::PeerRevoked(host_id.to_string()));
+                        }
                         entry.require_complete_pin()?;
                         Ok(())
                     }
@@ -910,6 +939,20 @@ impl SessionMachine {
             roster.lookup_active_signing_key(issuer_id)
         }
     }
+}
+
+/// Fails closed with [`CoreError::VersionDowngrade`] when `roster` pins `target_host_id` to a
+/// `min_wire_version` above Wire v1, before any v1 bytes are emitted.
+pub fn check_peer_allows_wire_v1(roster: &Roster, target_host_id: &str) -> Result<(), CoreError> {
+    if let Some(entry) = roster.get(target_host_id)
+        && entry.min_wire_version > WIRE_VERSION
+    {
+        return Err(CoreError::VersionDowngrade {
+            peer_min: entry.min_wire_version,
+            negotiated: WIRE_VERSION,
+        });
+    }
+    Ok(())
 }
 
 fn build_handshake(
@@ -1040,6 +1083,69 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, SessionAction::WriteBytes(_)))
+        );
+    }
+
+    #[test]
+    fn priv04_preflight_rejects_v2_floor_before_any_v1_bytes() {
+        use crate::wire::WIRE_VERSION_V2;
+
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x61; 32]),
+            SigningKeypair::from_seed([0x62; 32]),
+        )
+        .with_host_id("host-floor");
+        let cli = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x63; 32]),
+            SigningKeypair::from_seed([0x64; 32]),
+        );
+        let mut roster = Roster::new();
+        roster
+            .insert_pinned_host(
+                "host-floor".to_string(),
+                "Host".to_string(),
+                *host.static_key().public_bytes(),
+                Some(host.signing_key().public_key().clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(check_peer_allows_wire_v1(&roster, "host-floor"), Ok(()));
+        assert_eq!(check_peer_allows_wire_v1(&roster, "unknown-host"), Ok(()));
+        assert!(
+            SessionMachine::new_initiator_with_roster(
+                &cli,
+                "host-floor",
+                None,
+                None,
+                None,
+                &roster
+            )
+            .is_ok()
+        );
+
+        roster
+            .set_peer_min_wire_version("host-floor", WIRE_VERSION_V2)
+            .unwrap();
+        let expected = CoreError::VersionDowngrade {
+            peer_min: WIRE_VERSION_V2,
+            negotiated: WIRE_VERSION,
+        };
+        assert_eq!(
+            check_peer_allows_wire_v1(&roster, "host-floor"),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            SessionMachine::new_initiator_with_roster(
+                &cli,
+                "host-floor",
+                None,
+                None,
+                None,
+                &roster
+            )
+            .err(),
+            Some(expected)
         );
     }
 }
