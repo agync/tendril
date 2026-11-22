@@ -1,20 +1,22 @@
 //! Regression tests for the core protocol and crypto audit findings.
 
+use tendril_core::MAX_LIVE_PAIRING_CODES;
 use tendril_core::crypto::{SigningKeypair, StaticKeypair, device_id};
 use tendril_core::error::CoreError;
 use tendril_core::grants::{RevocationListUnsigned, sign_crl};
 use tendril_core::identity::EndpointIdentity;
-use tendril_core::pairing::{PairingCodeKind, PairingConfig, PairingManager, PairingPathKind};
+use tendril_core::pairing::{
+    DEFAULT_MAX_PAIRING_ATTEMPTS, PairingCodeKind, PairingConfig, PairingManager, PairingPathKind,
+};
 use tendril_core::roster::{PeerState, Roster, V2PeerSecrets};
 use tendril_core::v2::{
     PakeArgon2Params, RelayDialReplayCache, RendezvousReplayCache, V2_RENDEZVOUS_MAX_SKEW_SECS,
-    V2PairAction, V2PakePairInitiator, V2PakePairResponder, V2SessionAction, V2SessionInitiator,
-    V2SessionResponder,
+    V2PairAction, V2PairOutcome, V2PakePairInitiator, V2PakePairResponder, V2SessionAction,
+    V2SessionInitiator, V2SessionResponder,
 };
 use tendril_core::wire::{AEAD_TAG_LEN, WIRE_VERSION, WIRE_VERSION_V2, decode_frame};
 
 const NOW: u64 = 1_795_564_800;
-const MAX_LIVE_PAIRING_CODES: usize = 4;
 
 fn host_and_cli() -> (EndpointIdentity, EndpointIdentity) {
     let host = EndpointIdentity::from_keys(
@@ -197,7 +199,7 @@ fn sec07_rendezvous_replay_cache_prunes_oldest_timestamp_first() {
 }
 
 #[test]
-fn sec13_live_code_count_is_capped_and_expiry_or_burn_frees_slots() {
+fn sec13_live_code_count_is_capped_and_expiry_frees_slots() {
     let mut mgr = PairingManager::new(PairingConfig::default());
     for i in 0..MAX_LIVE_PAIRING_CODES {
         let entropy = [u8::try_from(i).unwrap() + 1; 32];
@@ -214,6 +216,25 @@ fn sec13_live_code_count_is_capped_and_expiry_or_burn_frees_slots() {
     mgr.issue_code_with_entropy(PairingCodeKind::Remote3Group, far_future, &[0x78; 32])
         .unwrap();
     assert_eq!(mgr.live_code_count(far_future), 1);
+}
+
+#[test]
+fn sec13_burned_codes_free_live_slots() {
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    for i in 0..MAX_LIVE_PAIRING_CODES {
+        let entropy = [u8::try_from(i).unwrap() + 1; 32];
+        mgr.issue_code_with_entropy(PairingCodeKind::Remote3Group, NOW, &entropy)
+            .unwrap();
+    }
+    for _ in 0..DEFAULT_MAX_PAIRING_ATTEMPTS {
+        assert_eq!(
+            mgr.verify_claim(&[0x01; 32], &[0x02; 32], PairingPathKind::Remote, NOW),
+            Err(CoreError::PairingCodeInvalid)
+        );
+    }
+    assert_eq!(mgr.live_code_count(NOW), 0);
+    mgr.issue_code_with_entropy(PairingCodeKind::Remote3Group, NOW, &[0x79; 32])
+        .unwrap();
 }
 
 #[test]
@@ -237,9 +258,10 @@ fn sec14_established_v2_session_raises_min_wire_version_on_both_peers() {
     host_roster
         .set_peer_v2_secrets(&cli.device_id(), secrets.clone())
         .unwrap();
-    host_roster
-        .set_peer_min_wire_version(&cli.device_id(), WIRE_VERSION_V2)
-        .unwrap();
+    assert_eq!(
+        host_roster.get(&cli.device_id()).unwrap().min_wire_version,
+        WIRE_VERSION
+    );
 
     let mut cli_roster = Roster::new();
     cli_roster
@@ -314,7 +336,11 @@ fn sec06_lan_code_over_remote_path_yields_decoy_and_keeps_code_live() {
     assert_eq!(mgr.live_code_count(NOW), 1);
 }
 
-fn pake_pair_lengths(device_name: &str) -> (usize, usize) {
+/// Runs a full PAKE pairing and returns `(msg3 frame len, PairResponse frame len)`.
+///
+/// With `late = true` the responder sees `msg3` after the code expired, producing an error
+/// `PairResponse` instead of a success.
+fn pake_pair_lengths(device_name: &str, late: bool) -> (usize, usize) {
     let (host, cli) = host_and_cli();
     let mut roster = Roster::new();
     let mut mgr = PairingManager::new(PairingConfig::default());
@@ -337,30 +363,37 @@ fn pake_pair_lengths(device_name: &str) -> (usize, usize) {
     let m1 = wire(&init.start().unwrap());
     let m2 = wire(&resp.feed_bytes(&m1, NOW, &mut mgr, &mut roster).unwrap());
     let m3 = wire(&init.feed_bytes(&m2).unwrap());
-    let m4 = wire(&resp.feed_bytes(&m3, NOW, &mut mgr, &mut roster).unwrap());
+    let msg3_time = if late { NOW + 1_000_000 } else { NOW };
+    let m4_actions = resp
+        .feed_bytes(&m3, msg3_time, &mut mgr, &mut roster)
+        .unwrap();
+    let m4 = wire(&m4_actions);
     let completed = init.feed_bytes(&m4).unwrap();
-    assert!(
-        completed
-            .iter()
-            .any(|a| matches!(a, V2PairAction::Completed(_)))
-    );
-    let body4 = decode_frame(&m4).unwrap().0.len();
-    (m3.len(), body4)
+    let outcome = completed
+        .iter()
+        .find_map(|a| match a {
+            V2PairAction::Completed(o) => Some(o),
+            _ => None,
+        })
+        .expect("pairing completes");
+    assert_eq!(matches!(outcome, V2PairOutcome::Rejected { .. }), late);
+    (m3.len(), decode_frame(&m4).unwrap().0.len())
 }
 
 #[test]
-fn priv03_pake_msg3_and_pair_response_lengths_hide_claim_and_response_size() {
-    let (short_m3, short_m4) = pake_pair_lengths("A");
-    let (long_m3, long_m4) = pake_pair_lengths(&"N".repeat(200));
+fn priv03_pake_msg3_and_pair_response_lengths_hide_claim_and_outcome() {
+    let (short_m3, short_ok) = pake_pair_lengths("A", false);
+    let (long_m3, long_ok) = pake_pair_lengths(&"N".repeat(200), false);
+    let (_, rejected) = pake_pair_lengths("A", true);
+
     assert_eq!(
         short_m3, long_m3,
         "msg3 length must not reveal the PairClaim size"
     );
-    assert_eq!(short_m4, long_m4);
-
-    let payload_len = short_m4 - AEAD_TAG_LEN;
-    assert!(
-        [512, 1024, 2048, 4096, 8192, 16_384, 32_768, 63_488].contains(&payload_len),
-        "PairResponse payload length {payload_len} must be a padding bucket"
+    assert_eq!(short_ok, long_ok);
+    assert_eq!(
+        short_ok, rejected,
+        "success and error PairResponse frames must be the same length"
     );
+    assert_eq!(short_ok - AEAD_TAG_LEN, 4096);
 }

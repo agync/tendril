@@ -2201,7 +2201,7 @@ func TestWireV2AndRelayAuth(t *testing.T) {
 	}
 
 	pRespPayload := padBucketed(
-		[]int{512, 1024, 2048, 4096, 8192, 16384, 32768, 63488},
+		[]int{4096, 16384, 32768, 63488},
 		[]byte{0, 0},
 		[]byte(pk.PairResponseJSON),
 	)

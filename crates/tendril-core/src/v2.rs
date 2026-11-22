@@ -1703,46 +1703,74 @@ pub fn unseal_v2_hello_envelope(
     Ok(Zeroizing::new(pt[2..2 + json_len].to_vec()))
 }
 
-/// Pads a v2 `msg3` `SessionHello` JSON payload into the smallest `V2_MSG3_BUCKETS` bucket.
-pub fn pad_msg3_payload(json: &[u8]) -> Result<Vec<u8>, CoreError> {
+fn pad_len_prefixed(buckets: &[usize], json: &[u8]) -> Result<Vec<u8>, CoreError> {
     let needed = 2 + json.len();
-    let bucket = V2_MSG3_BUCKETS
+    let max = *buckets.last().unwrap_or(&63_488);
+    let bucket = buckets
         .iter()
         .copied()
         .find(|&b| b >= needed)
-        .ok_or(CoreError::FrameTooLarge {
-            len: needed,
-            max: *V2_MSG3_BUCKETS.last().unwrap_or(&63_488),
-        })?;
-    let json_len = u16::try_from(json.len()).map_err(|_| CoreError::FrameTooLarge {
-        len: needed,
-        max: *V2_MSG3_BUCKETS.last().unwrap_or(&63_488),
-    })?;
+        .ok_or(CoreError::FrameTooLarge { len: needed, max })?;
+    let json_len =
+        u16::try_from(json.len()).map_err(|_| CoreError::FrameTooLarge { len: needed, max })?;
     let mut out = vec![0u8; bucket];
     out[..2].copy_from_slice(&json_len.to_be_bytes());
     out[2..2 + json.len()].copy_from_slice(json);
     Ok(out)
 }
 
-/// Unpads a v2 `msg3` `SessionHello` payload, enforcing zero padding in constant time.
-pub fn unpad_msg3_payload(padded: &[u8]) -> Result<&[u8], CoreError> {
+fn unpad_len_prefixed<'a>(
+    buckets: &[usize],
+    padded: &'a [u8],
+    what: &'static str,
+) -> Result<&'a [u8], CoreError> {
     if padded.len() < 2 {
-        return Err(CoreError::ProtocolViolation("truncated v2 msg3 payload"));
+        return Err(CoreError::ProtocolViolation(what));
+    }
+    if !buckets.contains(&padded.len()) {
+        return Err(CoreError::ProtocolViolation(what));
     }
     let json_len = usize::from(u16::from_be_bytes([padded[0], padded[1]]));
     if json_len > padded.len() - 2 {
-        return Err(CoreError::ProtocolViolation("invalid v2 msg3 payload len"));
+        return Err(CoreError::ProtocolViolation(what));
     }
     let mut nonzero = 0u8;
     for &b in &padded[2 + json_len..] {
         nonzero |= b;
     }
     if !bool::from(nonzero.ct_eq(&0u8)) {
-        return Err(CoreError::ProtocolViolation(
-            "non-zero padding in v2 msg3 payload",
-        ));
+        return Err(CoreError::ProtocolViolation(what));
     }
     Ok(&padded[2..2 + json_len])
+}
+
+/// Pads a v2 `msg3` `SessionHello` JSON payload into the smallest `V2_MSG3_BUCKETS` bucket.
+pub fn pad_msg3_payload(json: &[u8]) -> Result<Vec<u8>, CoreError> {
+    pad_len_prefixed(&V2_MSG3_BUCKETS, json)
+}
+
+/// Unpads a v2 `msg3` `SessionHello` payload, enforcing `V2_MSG3_BUCKETS` membership and
+/// constant-time zero padding.
+pub fn unpad_msg3_payload(padded: &[u8]) -> Result<&[u8], CoreError> {
+    unpad_len_prefixed(&V2_MSG3_BUCKETS, padded, "invalid v2 msg3 payload")
+}
+
+/// Pads a v2 PAKE `PairResponse` JSON payload into the smallest `V2_HANDSHAKE_BUCKETS` bucket.
+///
+/// `Success` (which embeds a hybrid signing key) and `Error` responses therefore share the same
+/// minimum wire length and cannot be told apart by an observer.
+pub fn pad_v2_pair_response(json: &[u8]) -> Result<Vec<u8>, CoreError> {
+    pad_len_prefixed(&V2_HANDSHAKE_BUCKETS, json)
+}
+
+/// Unpads a v2 PAKE `PairResponse` payload, enforcing `V2_HANDSHAKE_BUCKETS` membership and
+/// constant-time zero padding.
+pub fn unpad_v2_pair_response(padded: &[u8]) -> Result<&[u8], CoreError> {
+    unpad_len_prefixed(
+        &V2_HANDSHAKE_BUCKETS,
+        padded,
+        "invalid v2 pair response payload",
+    )
 }
 
 /// Pads a v2 PAKE `msg3` plaintext as `init_mac (32 B) || uint16_be(len) || claim_json || 0x00...`
@@ -2259,10 +2287,12 @@ impl V2SessionInitiator {
             }
         }
         let crl = roster.crl(&self.target_host_id);
-        if roster.crl_revokes_entry(entry)
-            || roster.crl_revokes_id(&self.local_device_id)
-            || roster.crl_revokes_id(&self.target_host_id)
-        {
+        let local_revoked = crl.is_some_and(|list| {
+            list.revoked_devices
+                .iter()
+                .any(|d| d == &self.local_device_id)
+        });
+        if roster.crl_revokes_entry(entry) || local_revoked {
             return Err(CoreError::PeerRevoked(self.local_device_id.clone()));
         }
         if let Some(ref grant) = self.active_grant {
@@ -3918,7 +3948,7 @@ impl V2PakePairInitiator {
                 host_pin_verified,
             } => {
                 let pt = transport.read_message_vec(body)?;
-                let resp: PairResponse = serde_json::from_slice(unpad_msg3_payload(&pt)?)
+                let resp: PairResponse = serde_json::from_slice(unpad_v2_pair_response(&pt)?)
                     .map_err(|err| CoreError::Json(err.to_string()))?;
                 match resp {
                     PairResponse::Success {
@@ -4202,6 +4232,12 @@ impl V2PakePairResponder {
         &mut self,
         bytes: &[u8],
     ) -> Result<Option<V2PakeMsg1Work>, CoreError> {
+        if matches!(
+            self.phase,
+            PakeRespPhase::Msg1Pending | PakeRespPhase::AwaitMsg3 { .. }
+        ) {
+            return Err(CoreError::NotReady("v2 PAKE msg1 already parsed"));
+        }
         self.ingest_chunk(bytes)?;
         if !matches!(self.phase, PakeRespPhase::AwaitMsg1) {
             return Ok(None);
@@ -4494,7 +4530,7 @@ impl V2PakePairResponder {
                     status: "pending".to_string(),
                     host_signing_pub: self.host_signing_pub.to_b64url(),
                 };
-                let json = Zeroizing::new(pad_msg3_payload(
+                let json = Zeroizing::new(pad_v2_pair_response(
                     &serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?,
                 )?);
                 let ct = transport.write_message_vec(&json)?;
@@ -4556,7 +4592,7 @@ fn write_v2_pair_error(
     let resp = PairResponse::Error {
         error: code.to_string(),
     };
-    let json = Zeroizing::new(pad_msg3_payload(
+    let json = Zeroizing::new(pad_v2_pair_response(
         &serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?,
     )?);
     let ct = transport.write_message_vec(&json)?;
@@ -5048,6 +5084,35 @@ mod tests {
         assert_eq!(
             unpad_pake_msg3_payload(&over_len),
             Err(CoreError::PairingAuthFailed)
+        );
+    }
+
+    #[test]
+    fn priv03_pair_response_padding_uses_handshake_buckets_and_checks_membership() {
+        let success = pad_v2_pair_response(&[b's'; 2800]).unwrap();
+        let error = pad_v2_pair_response(br#"{"error":"revoked"}"#).unwrap();
+        assert_eq!(success.len(), 4096);
+        assert_eq!(error.len(), 4096);
+        assert_eq!(
+            unpad_v2_pair_response(&error).unwrap(),
+            br#"{"error":"revoked"}"#
+        );
+
+        let off_bucket = pad_msg3_payload(b"{}").unwrap();
+        assert_eq!(off_bucket.len(), 512);
+        assert!(unpad_v2_pair_response(&off_bucket).is_err());
+        assert!(unpad_msg3_payload(&[0u8; 700]).is_err());
+        let mut dirty = error;
+        *dirty.last_mut().unwrap() = 1;
+        assert!(unpad_v2_pair_response(&dirty).is_err());
+    }
+
+    #[test]
+    fn sec05_parse_msg1_rejects_calls_after_msg1_was_taken() {
+        let (_init, _m2, mut resp, _mgr) = split_msg2_with_recorded(true);
+        assert_eq!(
+            resp.parse_pake_msg1_header(&[1, 2, 3]).err(),
+            Some(CoreError::NotReady("v2 PAKE msg1 already parsed"))
         );
     }
 }

@@ -37,13 +37,13 @@ use tendril_core::v2::{
     PakeArgon2Params, V2_PAKE_SALT_LEN, canonical_relay_host, compute_pake_init_mac,
     compute_pake_msg1_mac, compute_pake_resp_mac, compute_rendezvous_mac, decode_v2_inner_frame,
     derive_epoch_mailbox, derive_pake_keys, derive_pake_master, encode_dummy_cover_frame,
-    epoch_for_unix, pad_inner_frame, pad_msg3_payload, pad_pake_msg3_payload,
+    epoch_for_unix, pad_inner_frame, pad_msg3_payload, pad_pake_msg3_payload, pad_v2_pair_response,
     pake_msg2_bucket_for_hello_len, pake_noise_prologue, seal_pake_host_hello,
     seal_v2_hello_envelope, sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register,
-    unpad_inner_frame, unpad_msg3_payload, unpad_pake_msg3_payload, unseal_pake_host_hello,
-    unseal_v2_hello_envelope, v2_relay_accept_signed_bytes, v2_relay_dial_signed_bytes,
-    v2_relay_register_signed_bytes, verify_v2_relay_accept, verify_v2_relay_dial,
-    verify_v2_relay_register,
+    unpad_inner_frame, unpad_msg3_payload, unpad_pake_msg3_payload, unpad_v2_pair_response,
+    unseal_pake_host_hello, unseal_v2_hello_envelope, v2_relay_accept_signed_bytes,
+    v2_relay_dial_signed_bytes, v2_relay_register_signed_bytes, verify_v2_relay_accept,
+    verify_v2_relay_dial, verify_v2_relay_register,
 };
 use tendril_core::wire::{
     HostHello, InnerFrameType, Intent, NOISE_PATTERN, PREAMBLE_FLAG_NONE, PairClaim, PairResponse,
@@ -1713,13 +1713,16 @@ fn build_v2_pake_vector(preamble: &[u8; 6]) -> Result<V2PakeVector, Box<dyn std:
         host_signing_pub: resp_signing.public_key().to_b64url(),
     };
     let pair_response_json = serde_json::to_string(&pair_resp)?;
-    let pair_response_payload = pad_msg3_payload(pair_response_json.as_bytes())?;
+    let pair_response_payload = pad_v2_pair_response(pair_response_json.as_bytes())?;
     let resp_ct = resp_tx.write_message_vec(&pair_response_payload)?;
     let pair_response_frame = encode_frame(&resp_ct)?;
     let (body4, _) = decode_frame(&pair_response_frame)?;
     let dec4 = init_tx.read_message_vec(body4)?;
     assert_eq!(&*dec4, pair_response_payload.as_slice());
-    assert_eq!(unpad_msg3_payload(&dec4)?, pair_response_json.as_bytes());
+    assert_eq!(
+        unpad_v2_pair_response(&dec4)?,
+        pair_response_json.as_bytes()
+    );
 
     Ok(V2PakeVector {
         preamble_hex: hex::encode(preamble),
