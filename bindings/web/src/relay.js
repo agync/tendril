@@ -1,6 +1,10 @@
 // Browser WebSocket relay client implementing spec/relay-v1.md and /v2/relay dialer framing.
 
-import { compute_relay_auth_hmac_b64, v2_epoch_within_skew } from "../pkg/tendril_wasm.js";
+import {
+  canonical_relay_host,
+  compute_relay_auth_hmac_b64,
+  v2_epoch_within_skew,
+} from "../pkg/tendril_wasm.js";
 
 export const MAX_RELAY_FRAME_LEN = 65521;
 export const MAX_QUEUED_BYTES = 16 * MAX_RELAY_FRAME_LEN;
@@ -172,7 +176,8 @@ export function validateRelayWsUrl(relayUrl, allowInsecureWs = false) {
   if (parsed.username !== "" || parsed.password !== "") {
     throw new Error("relayUrl userinfo credentials are not permitted");
   }
-  const bareHost = stripHostBrackets(parsed.hostname);
+  const host = parsed.hostname;
+  const bareHost = stripHostBrackets(host);
   if (!bareHost) {
     throw new Error("relayUrl is missing a hostname");
   }
@@ -182,7 +187,7 @@ export function validateRelayWsUrl(relayUrl, allowInsecureWs = false) {
   if (parsed.protocol === "ws:" && !allowInsecureWs && !isLoopbackHost(bareHost)) {
     throw new Error("cleartext ws:// relayUrl requires allowInsecureWs: true outside loopback");
   }
-  return { url: parsed.toString(), bareHost };
+  return { url: parsed.toString(), bareHost, host };
 }
 
 function randomConnIdB64() {
@@ -467,8 +472,8 @@ async function openRelayHandshake({
   timeoutMs = 15000,
   buildDialMsg,
 }) {
-  const { url: canonicalUrl, bareHost } = validateRelayWsUrl(relayUrl, allowInsecureWs);
-  const expHost = expectedHost || bareHost;
+  const { url: canonicalUrl, host: urlHost } = validateRelayWsUrl(relayUrl, allowInsecureWs);
+  const expHost = canonical_relay_host(expectedHost || urlHost);
 
   const ws = new WebSocket(canonicalUrl);
   ws.binaryType = "arraybuffer";
@@ -616,11 +621,21 @@ async function openRelayHandshake({
     if (!challenge || challenge.op !== "challenge") {
       throw new Error(`expected relay challenge, got ${JSON.stringify(challenge)}`);
     }
-    if (challenge.host !== expHost) {
+    if (typeof challenge.host !== "string") {
+      throw new Error("relay challenge missing host");
+    }
+    let challengeHost;
+    try {
+      challengeHost = canonical_relay_host(challenge.host);
+    } catch (err) {
+      throw new Error(`invalid relay challenge host '${challenge.host}': ${err.message || err}`);
+    }
+    if (challengeHost !== expHost) {
       throw new Error(
-        `relay challenge host mismatch: expected '${expHost}', got '${challenge.host}'`
+        `relay challenge host mismatch: expected '${expHost}', got '${challengeHost}'`
       );
     }
+    challenge.host = challengeHost;
     if (challenge.max_frame !== undefined) {
       stream._setMaxFrame(challenge.max_frame);
     }

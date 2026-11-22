@@ -50,6 +50,7 @@ const MIME = {
 };
 const COMPRESSIBLE_EXTS = new Set([".wasm", ".js", ".mjs", ".html", ".css", ".json"]);
 const DEMO_PUBLIC_FILES = new Set(["index.html", "app.js"]);
+const ALLOWED_RELAY_PATHS = new Set(["/v1/relay", "/v2/relay"]);
 const ALLOWED_UPGRADE_HEADERS = new Set([
   "host",
   "upgrade",
@@ -252,7 +253,12 @@ server.on("upgrade", (req, socket, head) => {
     rejectUpgrade(socket, "400 Bad Request");
     return;
   }
-  if (req.method !== "GET" || url.pathname !== "/v1/relay" || !cfg.relayHost || !cfg.relayPort) {
+  if (
+    req.method !== "GET" ||
+    !ALLOWED_RELAY_PATHS.has(url.pathname) ||
+    !cfg.relayHost ||
+    !cfg.relayPort
+  ) {
     rejectUpgrade(socket, "404 Not Found");
     return;
   }
@@ -297,7 +303,7 @@ server.on("upgrade", (req, socket, head) => {
   upstream.on("connect", () => {
     connected = true;
     clearTimeout(connectTimer);
-    const reqHead = `GET /v1/relay HTTP/1.1\r\n${headerLines.join("\r\n")}\r\n\r\n`;
+    const reqHead = `GET ${url.pathname} HTTP/1.1\r\n${headerLines.join("\r\n")}\r\n\r\n`;
     upstream.write(reqHead);
     socket.pipe(upstream);
     upstream.pipe(socket);

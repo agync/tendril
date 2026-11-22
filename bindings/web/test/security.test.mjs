@@ -18,15 +18,19 @@ import {
   TendrilWebClient,
   WasmV2PakePairInitiator,
   WasmV2SessionInitiator,
+  canonicalRelayHost,
   computeCodeMac,
   computeCodeMacBytes,
   computeCodeMacWorker,
   computeRelayAuthHmacB64,
+  createIndexedDbVault,
   deriveV2RelayDial,
   dialIrohStream,
   dialRelayStream,
   dialRelayV2Stream,
   initTendril,
+  initTendrilP2p,
+  openTendrilVault,
   v2EpochWithinSkew,
   validateRelayWsUrl,
 } from "../src/index.js";
@@ -1307,5 +1311,425 @@ test("TendrilWebSession v2 tick() self-terminates when grant expires", async () 
     client.free();
     peer.close();
     relay.child.kill();
+  }
+});
+
+test("SEC-12 relay challenge host canonicalization accepts [::1], trailing dot, and mixed case", async () => {
+  await ensureWasm();
+  const nonceB64 = Buffer.from(new Uint8Array(32).fill(0x42)).toString("base64url");
+  const targetPub = Buffer.from(new Uint8Array(32).fill(0x77)).toString("base64url");
+  const serverEpoch = Math.floor(Date.now() / 1000 / 3600);
+  const mbSecret = new Uint8Array(32).fill(0x21);
+
+  // 1. Mock server returning canonical IPv6 "[::1]" host over IPv6 loopback (or expectedHost)
+  let challengeHostToSend = "[::1]";
+  const mock = await startMockRelayWsServer((reqUrl) => {
+    const isV2 = reqUrl.startsWith("/v2/relay");
+    return {
+      challenge: isV2
+        ? {
+            op: "challenge",
+            host: challengeHostToSend,
+            nonce: nonceB64,
+            epoch: serverEpoch,
+            max_frame: MAX_RELAY_FRAME_LEN,
+          }
+        : {
+            op: "challenge",
+            host: challengeHostToSend,
+            nonce: nonceB64,
+            max_frame: MAX_RELAY_FRAME_LEN,
+          },
+      handleDial: (msg) => ({ op: "ready", conn_id: msg.conn_id }),
+    };
+  });
+
+  // Also test real IPv6 loopback URL ws://[::1]:port/v2/relay without explicit expectedHost
+  let ipv6Server = null;
+  const ipv6Sockets = new Set();
+  try {
+    ipv6Server = await new Promise((resolve, reject) => {
+      const srv = http.createServer();
+      srv.on("upgrade", (req, socket) => {
+        ipv6Sockets.add(socket);
+        socket.on("close", () => ipv6Sockets.delete(socket));
+        socket.on("error", () => {});
+        const key = req.headers["sec-websocket-key"];
+        const accept = crypto
+          .createHash("sha1")
+          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+          .digest("base64");
+        socket.write(
+          "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+        );
+        socket.write(
+          encodeWsTextFrame(
+            JSON.stringify({
+              op: "challenge",
+              host: "[::1]",
+              nonce: nonceB64,
+              epoch: serverEpoch,
+              max_frame: MAX_RELAY_FRAME_LEN,
+            })
+          )
+        );
+        let acc = Buffer.alloc(0);
+        socket.on("data", (chunk) => {
+          acc = Buffer.concat([acc, chunk]);
+          const frame = decodeWsClientFrame(acc);
+          if (frame !== null) {
+            acc = Buffer.alloc(0);
+            if (frame.close) {
+              socket.end();
+              return;
+            }
+            const msg = JSON.parse(frame.text);
+            socket.write(encodeWsTextFrame(JSON.stringify({ op: "ready", conn_id: msg.conn_id })));
+          }
+        });
+      });
+      srv.on("error", reject);
+      srv.listen(0, "::1", () => resolve(srv));
+    });
+  } catch {
+    ipv6Server = null;
+  }
+
+  try {
+    // Trailing dot and mixed case must canonicalize to equal host
+    challengeHostToSend = "Relay.Example.";
+    const sCase = await dialRelayStream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+      targetPub,
+      expectedHost: "RELAY.EXAMPLE",
+      allowInsecureWs: true,
+    });
+    sCase.close();
+
+    // [::1] via expectedHost
+    challengeHostToSend = "[::1]";
+    const sV6Exp = await dialRelayV2Stream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v2/relay`,
+      expectedHost: "[0:0:0:0:0:0:0:1]",
+      allowInsecureWs: true,
+      deriveV2Dial: ({ relayHost, nonceBytes, connIdBytes }) =>
+        deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, nonceBytes, connIdBytes),
+    });
+    sV6Exp.close();
+
+    // Real ws://[::1]:port/v2/relay with default expectedHost from URL hostname
+    if (ipv6Server) {
+      const v6Port = ipv6Server.address().port;
+      const sV6Url = await dialRelayV2Stream({
+        relayUrl: `ws://[::1]:${v6Port}/v2/relay`,
+        allowInsecureWs: true,
+        deriveV2Dial: ({ relayHost, nonceBytes, connIdBytes }) =>
+          deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, nonceBytes, connIdBytes),
+      });
+      sV6Url.close();
+    }
+  } finally {
+    if (ipv6Server) {
+      for (const s of ipv6Sockets) {
+        s.destroy();
+      }
+      await new Promise((r) => {
+        ipv6Server.closeAllConnections?.();
+        ipv6Server.close(r);
+      });
+    }
+    await mock.close();
+  }
+});
+
+test("PRIV-04 & PRIV-05 v1 connect fails pre-flight on v2 peer before dialing; v2 session.ping() works", async () => {
+  await ensureWasm();
+  const relay = await spawnRelay();
+  const peer = spawnPeer();
+  const client = await TendrilWebClient.create({ hostId: "web-priv04-05" });
+  let sess = null;
+  let dialAttempts = 0;
+  const spyServer = net.createServer((sock) => {
+    dialAttempts += 1;
+    sock.destroy();
+  });
+  await new Promise((r) => spyServer.listen(0, "127.0.0.1", r));
+  const spyPort = spyServer.address().port;
+
+  try {
+    const init = await peer.call({ op: "init", host_id: "priv04-v2-host" });
+    await peer.call({
+      op: "serve_relay",
+      relay_url: relay.wsUrl,
+      expected_host: "127.0.0.1",
+    });
+    const code = (await peer.call({ op: "issue_code", kind: "remote" })).code;
+    const pairPromise = peer.call({ op: "pair_v2_accept", timeout_ms: 10000 });
+    const bound = await client.pairV2({
+      relayUrl: relay.wsUrl,
+      targetPub: init.relay_pub,
+      expectedHost: "127.0.0.1",
+      code,
+      allowInsecureWs: true,
+    });
+    const hostBound = await pairPromise;
+    await client.confirmPeer("priv04-v2-host", bound.sas);
+    await peer.call({ op: "confirm", peer_id: hostBound.device_id, sas: hostBound.sas });
+
+    // PRIV-04: v1 client.connect() MUST fail closed BEFORE dialing the relay socket
+    await assert.rejects(
+      () =>
+        client.connect({
+          relayUrl: `ws://127.0.0.1:${spyPort}/v1/relay`,
+          targetPub: init.relay_pub,
+          expectedHost: "127.0.0.1",
+          targetHostId: "priv04-v2-host",
+          allowInsecureWs: true,
+        }),
+      /downgrade|version/i
+    );
+    assert.equal(dialAttempts, 0, "v1 connect must fail pre-flight before opening a socket");
+
+    // PRIV-05: v2 session.ping() sends encrypted 0x05 PING and receives 0x06 PONG
+    const { grant } = await peer.call({
+      op: "mint",
+      peer_id: hostBound.device_id,
+      caps: ["fs.read"],
+      ttl_secs: 300,
+    });
+    const acceptPromise = peer.call({ op: "accept_v2", timeout_ms: 10000 });
+    sess = await client.connectV2({
+      relayUrl: relay.wsUrl,
+      targetPub: init.relay_pub,
+      expectedHost: "127.0.0.1",
+      targetHostId: "priv04-v2-host",
+      grantJson: JSON.stringify(grant),
+      allowInsecureWs: true,
+    });
+    await acceptPromise;
+
+    await sess.ping(4242);
+    await sess.sendData("after-v2-ping");
+    const rPing = await peer.call({ op: "recv", timeout_ms: 2000 });
+    assert.equal(rPing.data_utf8, "after-v2-ping");
+    let gotPong = false;
+    for (let i = 0; i < 4; i += 1) {
+      const ev = await sess.pollEvent(1000);
+      if (ev.event === "pong" && ev.cookie === 4242) {
+        gotPong = true;
+        break;
+      }
+    }
+    assert.equal(gotPong, true, "v2 session must receive matching pong after ping()");
+  } finally {
+    if (sess && !sess.isClosed()) {
+      await sess.close(1000, "done").catch(() => {});
+    }
+    spyServer.close();
+    client.free();
+    peer.close();
+    relay.child.kill();
+  }
+});
+
+test("PRIV-08 demo/server.mjs allows /v2/relay upgrade while rejecting query strings", async () => {
+  const upstreamCaptured = [];
+  const upstreamServer = net.createServer((sock) => {
+    let acc = Buffer.alloc(0);
+    sock.on("data", (chunk) => {
+      acc = Buffer.concat([acc, chunk]);
+      const str = acc.toString("utf8");
+      const endIdx = str.indexOf("\r\n\r\n");
+      if (endIdx >= 0) {
+        upstreamCaptured.push(str.slice(0, endIdx + 4));
+        sock.write(
+          "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+        );
+        sock.end();
+      }
+    });
+  });
+  await new Promise((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+  const upstreamPort = upstreamServer.address().port;
+
+  let demoServer;
+  try {
+    demoServer = await spawnDemoServer({
+      relayHost: "127.0.0.1",
+      relayPort: upstreamPort,
+    });
+    const validKey = "dGhlIHNhbXBsZSBub25jZQ==";
+    const badV2Query =
+      `GET /v2/relay?leak=1 HTTP/1.1\r\n` +
+      `Host: 127.0.0.1:${demoServer.port}\r\n` +
+      `Upgrade: websocket\r\n` +
+      `Connection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: ${validKey}\r\n` +
+      `Sec-WebSocket-Version: 13\r\n\r\n`;
+    const badResp = await sendRawTcpRequest(demoServer.port, badV2Query);
+    assert.ok(badResp.startsWith("HTTP/1.1 400 "), badResp);
+
+    const goodV2 =
+      `GET /v2/relay HTTP/1.1\r\n` +
+      `Host: 127.0.0.1:${demoServer.port}\r\n` +
+      `Upgrade: websocket\r\n` +
+      `Connection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: ${validKey}\r\n` +
+      `Sec-WebSocket-Version: 13\r\n\r\n`;
+    const okResp = await sendRawTcpRequest(demoServer.port, goodV2);
+    assert.ok(okResp.startsWith("HTTP/1.1 101 "), okResp);
+    assert.equal(upstreamCaptured.length, 1);
+    assert.match(upstreamCaptured[0], /^GET \/v2\/relay HTTP\/1\.1\r\n/);
+  } finally {
+    if (demoServer) demoServer.child.kill();
+    upstreamServer.close();
+  }
+});
+
+test("PRIV-01 dialIrohStream fails closed when p2pRelayAuthToken is passed without explicit relay or ?relay=", async () => {
+  const p2pWasmPath = path.join(WEB_ROOT, "pkg-p2p", "tendril_wasm_bg.wasm");
+  await initTendrilP2p({ module_or_path: fs.readFileSync(p2pWasmPath) });
+  const sampleEndpoint = `iroh://${"0".repeat(64)}`;
+  const tok = new TextEncoder().encode("scoped-bearer-secret");
+  await assert.rejects(
+    () =>
+      dialIrohStream({
+        endpoint: sampleEndpoint,
+        p2pRelayAuthToken: tok,
+      }),
+    /refusing to attach bearer token/i
+  );
+  assert.equal(tok.every((b) => b === 0), true, "p2pRelayAuthToken Uint8Array must be zeroized");
+});
+
+test("PRIV-07 byte-slice identity, roster, and PAKE code APIs zeroize caller buffers", async () => {
+  await ensureWasm();
+  assert.equal(canonicalRelayHost("[0:0:0:0:0:0:0:1]"), "[::1]");
+  assert.equal(canonicalRelayHost("Relay.Example."), "relay.example");
+
+  const c1 = await TendrilWebClient.create({ hostId: "priv07-client" });
+  const info1 = c1.info();
+  const idBytes = c1.exportIdentityBytes();
+  const rosterBytes = c1.exportRosterBytes();
+  assert.ok(idBytes instanceof Uint8Array && idBytes.length > 0);
+  assert.ok(rosterBytes instanceof Uint8Array && rosterBytes.length > 0);
+  c1.free();
+
+  const c2 = await TendrilWebClient.create({
+    identityBytes: idBytes,
+    rosterBytes,
+  });
+  try {
+    assert.equal(idBytes.every((b) => b === 0), true, "identityBytes must be zeroized");
+    assert.equal(rosterBytes.every((b) => b === 0), true, "rosterBytes must be zeroized");
+    assert.deepEqual(c2.info(), info1);
+
+    const { WasmIdentity } = await import("../pkg/tendril_wasm.js");
+    const wid = WasmIdentity.generate("priv07-pake");
+    const codeBuf = new TextEncoder().encode("4829-1704-9999");
+    const pake = WasmV2PakePairInitiator.new_bytes(wid, "web", "browser", codeBuf, null);
+    try {
+      assert.equal(codeBuf.every((b) => b === 0), true, "PAKE code buffer must be zeroized");
+      assert.ok(pake.start().length > 0);
+    } finally {
+      pake.free();
+      wid.free();
+    }
+  } finally {
+    c2.free();
+  }
+});
+
+test("PRIV-09 createIndexedDbVault encrypts with non-extractable AES-256-GCM and index.d.ts covers all exports", async () => {
+  // 1. In-memory mock IndexedDB + real WebCrypto AES-256-GCM verification
+  const stores = new Map();
+  const fakeIdb = {
+    open(name) {
+      const req = { result: null, error: null, onupgradeneeded: null, onsuccess: null, onerror: null };
+      queueMicrotask(() => {
+        if (!stores.has(name)) {
+          stores.set(name, new Map());
+        }
+        const dbStores = stores.get(name);
+        const db = {
+          objectStoreNames: {
+            contains: (s) => dbStores.has(s),
+          },
+          createObjectStore(s) {
+            if (!dbStores.has(s)) dbStores.set(s, new Map());
+          },
+          transaction(s) {
+            const map = dbStores.get(s);
+            const tx = { oncomplete: null, onerror: null, onabort: null };
+            const scheduleComplete = () => {
+              setTimeout(() => tx.oncomplete?.(), 0);
+            };
+            tx.objectStore = () => ({
+              get(k) {
+                const r = { result: undefined, onsuccess: null, onerror: null };
+                queueMicrotask(() => {
+                  r.result = map.get(k);
+                  r.onsuccess?.();
+                  scheduleComplete();
+                });
+                return r;
+              },
+              put(v, k) {
+                map.set(k, v);
+                scheduleComplete();
+              },
+              delete(k) {
+                map.delete(k);
+                scheduleComplete();
+              },
+              clear() {
+                map.clear();
+                scheduleComplete();
+              },
+            });
+            return tx;
+          },
+          close() {},
+        };
+        req.result = db;
+        req.onupgradeneeded?.();
+        req.onsuccess?.();
+      });
+      return req;
+    },
+  };
+
+  assert.equal(openTendrilVault, createIndexedDbVault);
+  const vault = createIndexedDbVault({
+    dbName: "test-vault",
+    isSecureContext: true,
+    cryptoSubtle: globalThis.crypto.subtle,
+    getRandomValues: (b) => globalThis.crypto.getRandomValues(b),
+    indexedDB: fakeIdb,
+  });
+  await vault.writeString("identity", '{"secret":"value"}');
+  const rawRecord = stores.get("test-vault").get("vault").get("identity");
+  assert.ok(rawRecord.iv instanceof Uint8Array && rawRecord.iv.length === 12);
+  assert.ok(rawRecord.ct instanceof Uint8Array);
+  assert.equal(Buffer.from(rawRecord.ct).toString("utf8").includes("secret"), false);
+  const wrapKey = stores.get("test-vault").get("vault").get("wrapping-key");
+  assert.equal(wrapKey.extractable, false, "wrapping key must be non-extractable");
+  assert.equal(await vault.readString("identity"), '{"secret":"value"}');
+  await vault.delete("identity");
+  assert.equal(await vault.readString("identity"), null);
+  await vault.close();
+
+  // 2. Verify every runtime export from bindings/web/src/index.js is declared in bindings/web/index.d.ts
+  const sdkMod = await import("../src/index.js");
+  const dts = fs.readFileSync(path.join(WEB_ROOT, "index.d.ts"), "utf8");
+  for (const name of Object.keys(sdkMod)) {
+    const declRe = new RegExp(`export\\s+(?:declare\\s+)?(?:function|class|const|let|var)\\s+${name}\\b`);
+    assert.match(dts, declRe, `index.d.ts missing export declaration for '${name}'`);
   }
 });

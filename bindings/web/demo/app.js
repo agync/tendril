@@ -1,17 +1,31 @@
-import { TendrilWebClient, b64urlDecode, benchmarkArgon2 } from "/src/index.js";
+import {
+  TendrilWebClient,
+  b64urlDecode,
+  benchmarkArgon2,
+  createIndexedDbVault,
+} from "/src/index.js";
 
 const LEGACY_IDENTITY_KEY = "tendril.demo.identity.v1";
 const LEGACY_ROSTER_KEY = "tendril.demo.roster.v1";
-const VAULT_DB_NAME = "tendril-demo-vault-v1";
-const VAULT_STORE = "vault";
-const WRAPPING_KEY_ID = "wrapping-key";
 const IDENTITY_VAULT_ID = "identity";
 const ROSTER_VAULT_ID = "roster";
+
+const vault = createIndexedDbVault({
+  dbName: "tendril-demo-vault-v1",
+  storeName: "vault",
+  wrappingKeyId: "wrapping-key",
+  aadPrefix: "tendril.demo.vault.v1",
+});
 
 const $ = (id) => document.getElementById(id);
 const logEl = $("log");
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+function isLogRedacted() {
+  const el = $("redact-log-toggle");
+  return el ? el.checked : true;
+}
 
 function appendLog(msg) {
   const ts = new Date().toISOString().slice(11, 23);
@@ -22,116 +36,6 @@ function appendLog(msg) {
 function defaultRelayUrl() {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${window.location.host}/v1/relay`;
-}
-
-function requireSecureVaultSupport() {
-  if (!window.isSecureContext || !globalThis.crypto?.subtle || !globalThis.indexedDB) {
-    throw new Error(
-      "Secure WebCrypto AES-GCM and IndexedDB context required for demo keystore"
-    );
-  }
-}
-
-function idbRequest(req) {
-  return new Promise((resolve, reject) => {
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error || new Error("IndexedDB request failed"));
-  });
-}
-
-function idbTransactionDone(tx) {
-  return new Promise((resolve, reject) => {
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error || new Error("IndexedDB transaction failed"));
-    tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
-  });
-}
-
-let vaultDbPromise = null;
-
-function openVaultDb() {
-  requireSecureVaultSupport();
-  if (!vaultDbPromise) {
-    vaultDbPromise = new Promise((resolve, reject) => {
-      const req = indexedDB.open(VAULT_DB_NAME, 1);
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains(VAULT_STORE)) {
-          db.createObjectStore(VAULT_STORE);
-        }
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => {
-        vaultDbPromise = null;
-        reject(req.error || new Error("failed opening IndexedDB vault"));
-      };
-    });
-  }
-  return vaultDbPromise;
-}
-
-async function getOrCreateWrappingKey(db) {
-  const readTx = db.transaction(VAULT_STORE, "readonly");
-  const existing = await idbRequest(readTx.objectStore(VAULT_STORE).get(WRAPPING_KEY_ID));
-  await idbTransactionDone(readTx);
-  if (existing) {
-    return existing;
-  }
-  const generated = await crypto.subtle.generateKey(
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  );
-  const writeTx = db.transaction(VAULT_STORE, "readwrite");
-  const store = writeTx.objectStore(VAULT_STORE);
-  const current = await idbRequest(store.get(WRAPPING_KEY_ID));
-  if (current) {
-    await idbTransactionDone(writeTx);
-    return current;
-  }
-  store.put(generated, WRAPPING_KEY_ID);
-  await idbTransactionDone(writeTx);
-  return generated;
-}
-
-async function writeVaultString(entryId, value) {
-  const db = await openVaultDb();
-  const key = await getOrCreateWrappingKey(db);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const aad = encoder.encode(`tendril.demo.vault.v1:${entryId}`);
-  const ct = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv, additionalData: aad },
-    key,
-    encoder.encode(value)
-  );
-  const tx = db.transaction(VAULT_STORE, "readwrite");
-  tx.objectStore(VAULT_STORE).put({ iv, ct: new Uint8Array(ct) }, entryId);
-  await idbTransactionDone(tx);
-}
-
-async function readVaultString(entryId) {
-  const db = await openVaultDb();
-  const key = await getOrCreateWrappingKey(db);
-  const tx = db.transaction(VAULT_STORE, "readonly");
-  const record = await idbRequest(tx.objectStore(VAULT_STORE).get(entryId));
-  await idbTransactionDone(tx);
-  if (!record || !record.iv || !record.ct) {
-    return null;
-  }
-  const aad = encoder.encode(`tendril.demo.vault.v1:${entryId}`);
-  const ptBuf = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: record.iv, additionalData: aad },
-    key,
-    record.ct
-  );
-  return decoder.decode(ptBuf);
-}
-
-async function clearVault() {
-  const db = await openVaultDb();
-  const tx = db.transaction(VAULT_STORE, "readwrite");
-  tx.objectStore(VAULT_STORE).clear();
-  await idbTransactionDone(tx);
 }
 
 function scrubLegacyLocalStorage() {
@@ -157,29 +61,34 @@ let pendingHostId = null;
 let pendingHostSas = null;
 
 async function initClient() {
-  let identityJson = await readVaultString(IDENTITY_VAULT_ID);
-  let rosterJson = await readVaultString(ROSTER_VAULT_ID);
+  let identityBytes = await vault.readBytes(IDENTITY_VAULT_ID);
+  let rosterBytes = await vault.readBytes(ROSTER_VAULT_ID);
 
   const legacyIdentity = localStorage.getItem(LEGACY_IDENTITY_KEY);
   const legacyRoster = localStorage.getItem(LEGACY_ROSTER_KEY);
-  if (!identityJson && legacyIdentity) {
-    identityJson = legacyIdentity;
-    await writeVaultString(IDENTITY_VAULT_ID, identityJson);
+  if (!identityBytes && legacyIdentity) {
+    await vault.writeString(IDENTITY_VAULT_ID, legacyIdentity);
+    identityBytes = await vault.readBytes(IDENTITY_VAULT_ID);
   }
-  if (!rosterJson && legacyRoster) {
-    rosterJson = legacyRoster;
-    await writeVaultString(ROSTER_VAULT_ID, rosterJson);
+  if (!rosterBytes && legacyRoster) {
+    await vault.writeString(ROSTER_VAULT_ID, legacyRoster);
+    rosterBytes = await vault.readBytes(ROSTER_VAULT_ID);
   }
   scrubLegacyLocalStorage();
 
   client = await TendrilWebClient.create({
-    identityJson,
-    rosterJson,
+    identityBytes,
+    rosterBytes,
     onPersistRoster: async (rj) => {
-      await writeVaultString(ROSTER_VAULT_ID, rj);
+      await vault.writeString(ROSTER_VAULT_ID, rj);
     },
   });
-  await writeVaultString(IDENTITY_VAULT_ID, client.exportIdentityJson());
+  const exportedId = client.exportIdentityBytes();
+  try {
+    await vault.writeBytes(IDENTITY_VAULT_ID, exportedId);
+  } finally {
+    exportedId.fill(0);
+  }
   const info = client.info();
   $("status").textContent = "WASM core ready (Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256)";
   $("device-id").textContent = `device_id: ${info.device_id}`;
@@ -191,12 +100,15 @@ async function applyPreconfig() {
   const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
   const urlParam = (name) => hashParams.get(name) ?? searchParams.get(name);
 
+  const leakedQuerySecrets = searchParams.has("code") || searchParams.has("uri");
+
   const urlEndpoint = urlParam("endpoint") || urlParam("relay");
   if (urlEndpoint) $("relay-url").value = urlEndpoint;
   if (urlParam("pub")) $("target-pub").value = urlParam("pub");
   if (urlParam("host")) $("target-host-id").value = urlParam("host");
-  if (urlParam("code")) $("pair-code").value = urlParam("code");
-  if (urlParam("uri")) $("pair-uri").value = urlParam("uri");
+  // Secrets (code, uri) are ONLY accepted from the URL fragment (#), never query strings (?).
+  if (hashParams.get("code")) $("pair-code").value = hashParams.get("code");
+  if (hashParams.get("uri")) $("pair-uri").value = hashParams.get("uri");
 
   let serverConfigSetTarget = false;
   try {
@@ -235,9 +147,20 @@ async function applyPreconfig() {
     window.history.replaceState(null, "", cleanUrl);
   }
 
-  const warningEl = $("url-warning");
+  const warnings = [];
+  if (leakedQuerySecrets) {
+    warnings.push(
+      "Warning: pairing code/URI in URL query string was ignored and scrubbed; pass secrets only in the URL fragment (#code=... or #uri=...)."
+    );
+  }
   if (urlEndpoint && !serverConfigSetTarget && isThirdPartyTarget(urlEndpoint)) {
-    const msg = `Warning: endpoint/relay overridden by URL parameters (${urlEndpoint}); verify destination before pairing or connecting.`;
+    warnings.push(
+      `Warning: endpoint/relay overridden by URL parameters (${urlEndpoint}); verify destination before pairing or connecting.`
+    );
+  }
+  const warningEl = $("url-warning");
+  if (warnings.length > 0) {
+    const msg = warnings.join(" ");
     warningEl.textContent = msg;
     warningEl.hidden = false;
     appendLog(msg);
@@ -266,8 +189,15 @@ async function pollLoop(activeSession) {
         break;
       }
       if (ev.event === "data") {
-        const text = decoder.decode(b64urlDecode(ev.data_b64));
-        appendLog(`RX DATA: ${text}`);
+        const rawBytes = b64urlDecode(ev.data_b64);
+        if (isLogRedacted()) {
+          appendLog(`RX DATA: [REDACTED (${rawBytes.byteLength} bytes)]`);
+        } else {
+          const text = decoder.decode(rawBytes);
+          appendLog(`RX DATA: ${text}`);
+        }
+      } else if (isLogRedacted()) {
+        appendLog(`RX ${ev.event}: [REDACTED]`);
       } else {
         appendLog(`RX ${ev.event}: ${JSON.stringify(ev)}`);
       }
@@ -307,7 +237,7 @@ $("reset-btn").addEventListener("click", async () => {
     await session.close(1000, "reset");
     session = null;
   }
-  await clearVault();
+  await vault.clear();
   scrubLegacyLocalStorage();
   client.free();
   await initClient();
@@ -355,7 +285,8 @@ $("pair-btn").addEventListener("click", async () => {
       $("pair-meta").textContent =
         `Paired host=${res.host_id} in ${elapsedSec}s: verify SAS match on host, then click Confirm Host SAS`;
     }
-    appendLog(`Pairing pending: host=${res.host_id} sas=${res.sas} elapsed=${elapsedSec}s`);
+    const sasLog = isLogRedacted() ? "[REDACTED]" : res.sas;
+    appendLog(`Pairing pending: host=${res.host_id} sas=${sasLog} elapsed=${elapsedSec}s`);
   } catch (err) {
     appendLog(`Pairing failed: ${err.message || err}`);
   }
@@ -419,7 +350,11 @@ $("send-btn").addEventListener("click", async () => {
   const text = $("msg-input").value;
   try {
     await session.sendData(text);
-    appendLog(`TX DATA: ${text}`);
+    if (isLogRedacted()) {
+      appendLog(`TX DATA: [REDACTED (${encoder.encode(text).byteLength} bytes)]`);
+    } else {
+      appendLog(`TX DATA: ${text}`);
+    }
   } catch (err) {
     appendLog(`Send error: ${err.message || err}`);
   }

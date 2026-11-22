@@ -5,6 +5,7 @@ import initWasm, {
   WasmSessionClient,
   WasmV2PakePairInitiator,
   WasmV2SessionInitiator,
+  canonical_relay_host,
   compute_code_mac,
   compute_code_mac_bytes,
   compute_relay_auth_hmac_b64,
@@ -27,14 +28,17 @@ import {
   dialRelayV2Stream,
   validateRelayWsUrl,
 } from "./relay.js";
+import { createIndexedDbVault, openTendrilVault } from "./vault.js";
 
 export {
   MAX_QUEUED_BYTES,
   MAX_QUEUED_FRAMES,
   MAX_RELAY_FRAME_LEN,
   RelayStream,
+  createIndexedDbVault,
   dialRelayStream,
   dialRelayV2Stream,
+  openTendrilVault,
   validateRelayWsUrl,
 };
 
@@ -347,6 +351,10 @@ export function v2EpochWithinSkew(serverEpoch, claimedEpoch) {
   return v2_epoch_within_skew(serverEpoch, claimedEpoch);
 }
 
+export function canonicalRelayHost(host) {
+  return canonical_relay_host(host);
+}
+
 export { WasmV2PakePairInitiator, WasmV2SessionInitiator };
 
 export class TendrilWebClient {
@@ -371,14 +379,47 @@ export class TendrilWebClient {
   static async create({
     hostId = null,
     identityJson = null,
+    identityBytes = null,
     rosterJson = null,
+    rosterBytes = null,
     onPersistRoster = null,
   } = {}) {
     await initTendril();
-    const identity = identityJson
-      ? WasmIdentity.from_json(identityJson)
-      : WasmIdentity.generate(hostId);
-    const roster = rosterJson ? WasmRoster.from_json(rosterJson) : new WasmRoster();
+    let identity;
+    if (identityBytes !== null && identityBytes !== undefined) {
+      if (!(identityBytes instanceof Uint8Array)) {
+        throw new TypeError("identityBytes must be a Uint8Array");
+      }
+      try {
+        identity = WasmIdentity.from_json_bytes(identityBytes);
+      } finally {
+        identityBytes.fill(0);
+      }
+    } else if (identityJson) {
+      identity = WasmIdentity.from_json(identityJson);
+    } else {
+      identity = WasmIdentity.generate(hostId);
+    }
+    let roster;
+    try {
+      if (rosterBytes !== null && rosterBytes !== undefined) {
+        if (!(rosterBytes instanceof Uint8Array)) {
+          throw new TypeError("rosterBytes must be a Uint8Array");
+        }
+        try {
+          roster = WasmRoster.from_json_bytes(rosterBytes);
+        } finally {
+          rosterBytes.fill(0);
+        }
+      } else if (rosterJson) {
+        roster = WasmRoster.from_json(rosterJson);
+      } else {
+        roster = new WasmRoster();
+      }
+    } catch (err) {
+      identity.free();
+      throw err;
+    }
     return new TendrilWebClient(CLIENT_TOKEN, identity, roster, onPersistRoster);
   }
 
@@ -437,9 +478,31 @@ export class TendrilWebClient {
     return this.#identity.to_json();
   }
 
+  exportIdentityBytes() {
+    this.#ensureOpen();
+    return this.#identity.to_json_bytes();
+  }
+
   exportRosterJson() {
     this.#ensureOpen();
     return this.#roster.to_json();
+  }
+
+  exportRosterBytes() {
+    this.#ensureOpen();
+    return this.#roster.to_json_bytes();
+  }
+
+  #snapshotRosterBytes() {
+    return typeof this.#onPersistRoster === "function" ? this.#roster.to_json_bytes() : null;
+  }
+
+  #restoreRosterBytes(prevBytes) {
+    if (prevBytes && !this.#wasmFreed) {
+      try {
+        this.#roster.replace_from_json_bytes(prevBytes);
+      } catch {}
+    }
   }
 
   getPeer(peerId) {
@@ -450,68 +513,76 @@ export class TendrilWebClient {
 
   async confirmPeer(peerId, sas = null) {
     return this.#withHold(async () => {
-      const prevRoster = this.#roster.to_json();
-      this.#roster.confirm_peer(peerId, sas);
+      const prevRoster = this.#snapshotRosterBytes();
       try {
-        await this.#persistRoster();
-      } catch (err) {
-        if (!this.#wasmFreed) {
-          try {
-            this.#roster.replace_from_json(prevRoster);
-          } catch {}
+        this.#roster.confirm_peer(peerId, sas);
+        try {
+          await this.#persistRoster();
+        } catch (err) {
+          this.#restoreRosterBytes(prevRoster);
+          throw err;
         }
-        throw err;
+      } finally {
+        if (prevRoster) {
+          prevRoster.fill(0);
+        }
       }
     });
   }
 
   async removePendingPeer(peerId) {
     return this.#withHold(async () => {
-      const prevRoster = this.#roster.to_json();
-      this.#roster.remove_pending_peer(peerId);
+      const prevRoster = this.#snapshotRosterBytes();
       try {
-        await this.#persistRoster();
-      } catch (err) {
-        if (!this.#wasmFreed) {
-          try {
-            this.#roster.replace_from_json(prevRoster);
-          } catch {}
+        this.#roster.remove_pending_peer(peerId);
+        try {
+          await this.#persistRoster();
+        } catch (err) {
+          this.#restoreRosterBytes(prevRoster);
+          throw err;
         }
-        throw err;
+      } finally {
+        if (prevRoster) {
+          prevRoster.fill(0);
+        }
       }
     });
   }
 
   async addTrustAnchor(anchorId, signingPubB64) {
     return this.#withHold(async () => {
-      const prevRoster = this.#roster.to_json();
-      this.#roster.add_trust_anchor(anchorId, signingPubB64);
+      const prevRoster = this.#snapshotRosterBytes();
       try {
-        await this.#persistRoster();
-      } catch (err) {
-        if (!this.#wasmFreed) {
-          try {
-            this.#roster.replace_from_json(prevRoster);
-          } catch {}
+        this.#roster.add_trust_anchor(anchorId, signingPubB64);
+        try {
+          await this.#persistRoster();
+        } catch (err) {
+          this.#restoreRosterBytes(prevRoster);
+          throw err;
         }
-        throw err;
+      } finally {
+        if (prevRoster) {
+          prevRoster.fill(0);
+        }
       }
     });
   }
 
   async revokeTrustAnchor(anchorId) {
     return this.#withHold(async () => {
-      const prevRoster = this.#roster.to_json();
-      this.#roster.revoke_trust_anchor(anchorId);
+      const prevRoster = this.#snapshotRosterBytes();
       try {
-        await this.#persistRoster();
-      } catch (err) {
-        if (!this.#wasmFreed) {
-          try {
-            this.#roster.replace_from_json(prevRoster);
-          } catch {}
+        this.#roster.revoke_trust_anchor(anchorId);
+        try {
+          await this.#persistRoster();
+        } catch (err) {
+          this.#restoreRosterBytes(prevRoster);
+          throw err;
         }
-        throw err;
+      } finally {
+        if (prevRoster) {
+          prevRoster.fill(0);
+        }
       }
     });
   }
@@ -619,35 +690,38 @@ export class TendrilWebClient {
           if (frame.status === "eof") {
             throw new Error("m2m enrollment stream closed before completion");
           }
-          const prevRoster = this.#roster.to_json();
-          const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
-          if (res.write_b64) {
-            await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
-          }
-          if (res.outcome) {
-            if (res.outcome.status === "active") {
-              try {
-                await this.#persistRoster();
-              } catch (err) {
-                if (!this.#wasmFreed) {
-                  try {
-                    this.#roster.replace_from_json(prevRoster);
-                  } catch {}
+          const prevRoster = this.#snapshotRosterBytes();
+          let res;
+          try {
+            res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
+            if (res.write_b64) {
+              await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+            }
+            if (res.outcome) {
+              if (res.outcome.status === "active") {
+                try {
+                  await this.#persistRoster();
+                } catch (err) {
+                  this.#restoreRosterBytes(prevRoster);
+                  throw err;
                 }
-                throw err;
+                return {
+                  device_id: res.outcome.device_id,
+                  host_id: res.outcome.host_id,
+                  status: "active",
+                  host_rotation_seq: res.outcome.host_rotation_seq,
+                  token_nonce: res.outcome.token_nonce,
+                };
               }
-              return {
-                device_id: res.outcome.device_id,
-                host_id: res.outcome.host_id,
-                status: "active",
-                host_rotation_seq: res.outcome.host_rotation_seq,
-                token_nonce: res.outcome.token_nonce,
-              };
+              if (res.outcome.status === "rejected") {
+                throw new Error(`m2m enrollment rejected: ${res.outcome.error}`);
+              }
+              throw new Error(`unexpected enrollment outcome: ${JSON.stringify(res.outcome)}`);
             }
-            if (res.outcome.status === "rejected") {
-              throw new Error(`m2m enrollment rejected: ${res.outcome.error}`);
+          } finally {
+            if (prevRoster) {
+              prevRoster.fill(0);
             }
-            throw new Error(`unexpected enrollment outcome: ${JSON.stringify(res.outcome)}`);
           }
         }
       } finally {
@@ -761,34 +835,36 @@ export class TendrilWebClient {
           if (frame.status === "eof") {
             throw new Error("pairing stream closed before completion");
           }
-          const prevRoster = this.#roster.to_json();
-          const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
-          if (res.write_b64) {
-            await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
-          }
-          if (res.outcome) {
-            if (res.outcome.status === "pending") {
-              try {
-                await this.#persistRoster();
-              } catch (err) {
-                if (!this.#wasmFreed) {
-                  try {
-                    this.#roster.replace_from_json(prevRoster);
-                  } catch {}
+          const prevRoster = this.#snapshotRosterBytes();
+          try {
+            const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
+            if (res.write_b64) {
+              await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+            }
+            if (res.outcome) {
+              if (res.outcome.status === "pending") {
+                try {
+                  await this.#persistRoster();
+                } catch (err) {
+                  this.#restoreRosterBytes(prevRoster);
+                  throw err;
                 }
-                throw err;
+                return {
+                  device_id: res.outcome.device_id,
+                  host_id: res.outcome.host_id,
+                  sas: res.outcome.sas,
+                  host_confirmed: Boolean(res.outcome.host_confirmed),
+                };
               }
-              return {
-                device_id: res.outcome.device_id,
-                host_id: res.outcome.host_id,
-                sas: res.outcome.sas,
-                host_confirmed: Boolean(res.outcome.host_confirmed),
-              };
+              if (res.outcome.status === "rejected") {
+                throw new Error(`pairing rejected: ${res.outcome.error}`);
+              }
+              throw new Error(`unexpected pairing outcome: ${JSON.stringify(res.outcome)}`);
             }
-            if (res.outcome.status === "rejected") {
-              throw new Error(`pairing rejected: ${res.outcome.error}`);
+          } finally {
+            if (prevRoster) {
+              prevRoster.fill(0);
             }
-            throw new Error(`unexpected pairing outcome: ${JSON.stringify(res.outcome)}`);
           }
         }
       } finally {
@@ -840,20 +916,27 @@ export class TendrilWebClient {
       } else if (pinnedHost) {
         pinnedJson = typeof pinnedHost === "string" ? pinnedHost : JSON.stringify(pinnedHost);
       }
-      if (!pairCode) {
+      if (!pairCode || (pairCode instanceof Uint8Array && pairCode.length === 0)) {
         throw new Error("pairing code or pairingUri is required");
       }
 
       await warmTargetTransport(endpoint, relayUrl);
       this.#ensureOpen();
       const deadlineMs = performance.now() + timeoutMs;
-      const initiator = new WasmV2PakePairInitiator(
-        this.#identity,
-        deviceName,
-        deviceKind,
-        pairCode,
-        pinnedJson
-      );
+      const codeBytes =
+        pairCode instanceof Uint8Array ? pairCode : encoder.encode(String(pairCode));
+      let initiator;
+      try {
+        initiator = WasmV2PakePairInitiator.new_bytes(
+          this.#identity,
+          deviceName,
+          deviceKind,
+          codeBytes,
+          pinnedJson
+        );
+      } finally {
+        codeBytes.fill(0);
+      }
       let stream = null;
       try {
         stream = await dialWebStream({
@@ -886,34 +969,36 @@ export class TendrilWebClient {
           if (frame.status === "eof") {
             throw new Error("v2 pairing stream closed before completion");
           }
-          const prevRoster = this.#roster.to_json();
-          const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
-          if (res.write_b64) {
-            await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
-          }
-          if (res.outcome) {
-            if (res.outcome.status === "pending") {
-              try {
-                await this.#persistRoster();
-              } catch (err) {
-                if (!this.#wasmFreed) {
-                  try {
-                    this.#roster.replace_from_json(prevRoster);
-                  } catch {}
+          const prevRoster = this.#snapshotRosterBytes();
+          try {
+            const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
+            if (res.write_b64) {
+              await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+            }
+            if (res.outcome) {
+              if (res.outcome.status === "pending") {
+                try {
+                  await this.#persistRoster();
+                } catch (err) {
+                  this.#restoreRosterBytes(prevRoster);
+                  throw err;
                 }
-                throw err;
+                return {
+                  device_id: res.outcome.device_id,
+                  host_id: res.outcome.host_id,
+                  sas: res.outcome.sas,
+                  host_confirmed: Boolean(res.outcome.host_confirmed),
+                };
               }
-              return {
-                device_id: res.outcome.device_id,
-                host_id: res.outcome.host_id,
-                sas: res.outcome.sas,
-                host_confirmed: Boolean(res.outcome.host_confirmed),
-              };
+              if (res.outcome.status === "rejected") {
+                throw new Error(`v2 pairing rejected: ${res.outcome.error}`);
+              }
+              throw new Error(`unexpected v2 pairing outcome: ${JSON.stringify(res.outcome)}`);
             }
-            if (res.outcome.status === "rejected") {
-              throw new Error(`v2 pairing rejected: ${res.outcome.error}`);
+          } finally {
+            if (prevRoster) {
+              prevRoster.fill(0);
             }
-            throw new Error(`unexpected v2 pairing outcome: ${JSON.stringify(res.outcome)}`);
           }
         }
       } finally {
@@ -952,9 +1037,10 @@ export class TendrilWebClient {
       this.#ensureOpen();
       const deadlineMs = performance.now() + timeoutMs;
       const seq = crlSeq ?? this.#roster.crl_seq(targetHostId);
-      const session = new WasmSessionClient(
+      const session = WasmSessionClient.new_with_roster(
         this.#identity,
         targetHostId,
+        this.#roster,
         grantJson,
         seq ?? null
       );
@@ -1334,9 +1420,6 @@ export class TendrilWebSession {
 
   ping(cookie = 1) {
     this.#ensureOpen();
-    if (this.#isV2) {
-      throw new Error("ping is not exposed directly on v2 session");
-    }
     return this.#enqueueSend(async () => {
       this.#ensureOpen();
       const out = this.#session.send_ping(cookie, this.#elapsedMs());

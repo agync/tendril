@@ -293,15 +293,45 @@ async function main() {
         hash: window.location.hash,
         codeValue: document.getElementById('pair-code')?.value || '',
         pubValue: document.getElementById('target-pub')?.value || '',
+        warningHidden: Boolean(document.getElementById('url-warning')?.hidden),
+        warningText: document.getElementById('url-warning')?.textContent || '',
+        redactChecked: Boolean(document.getElementById('redact-log-toggle')?.checked),
         localStorageKeys: Object.keys(localStorage),
       };
     `);
     assert.ok(demoSecurityState.status.includes("WASM core ready"));
     assert.equal(demoSecurityState.search, "");
     assert.equal(demoSecurityState.hash, "");
-    assert.equal(demoSecurityState.codeValue, "1111-2222-3333");
+    // PRIV-08: query string secrets must NEVER populate pair-code; warning must be shown.
+    assert.equal(demoSecurityState.codeValue, "");
     assert.equal(demoSecurityState.pubValue, "testpub");
+    assert.equal(demoSecurityState.warningHidden, false);
+    assert.ok(demoSecurityState.warningText.includes("query string"));
+    assert.equal(demoSecurityState.redactChecked, true);
     assert.deepEqual(demoSecurityState.localStorageKeys, []);
+
+    // Verify fragment (#code=...) IS accepted and immediately scrubbed.
+    const loadedHash = cdp.waitForEvent("Page.loadEventFired");
+    await cdp.send("Page.navigate", { url: `${server.baseUrl}/index.html#code=1111-2222-3333&pub=hashpub` });
+    await loadedHash;
+    const hashState = await cdp.evalAsync(`
+      for (let i = 0; i < 100; i += 1) {
+        if ((document.getElementById('status')?.textContent || '').includes('WASM core ready')) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return {
+        hash: window.location.hash,
+        codeValue: document.getElementById('pair-code')?.value || '',
+        pubValue: document.getElementById('target-pub')?.value || '',
+        warningHidden: Boolean(document.getElementById('url-warning')?.hidden),
+      };
+    `);
+    assert.equal(hashState.hash, "");
+    assert.equal(hashState.codeValue, "1111-2222-3333");
+    assert.equal(hashState.pubValue, "hashpub");
+    assert.equal(hashState.warningHidden, true);
 
     // 1. Offline conformance vectors & Gate #8 Chrome WASM Argon2 benchmark.
     const offline = await cdp.evalAsync(`

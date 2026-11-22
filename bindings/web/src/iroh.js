@@ -266,13 +266,18 @@ export async function dialIrohStream({
     }
   }
   let relayUrlsJson = null;
+  if (relayUrlOverride !== null && relayUrlOverride !== undefined && typeof relayUrlOverride !== "string") {
+    throw new TypeError("relayUrlOverride must be a string");
+  }
+  const trimmedRelayOverride =
+    typeof relayUrlOverride === "string" ? relayUrlOverride.trim() : "";
   if (p2pRelayUrls !== null && p2pRelayUrls !== undefined) {
     if (!Array.isArray(p2pRelayUrls)) {
       throw new TypeError("p2pRelayUrls must be an array of relay URLs");
     }
     relayUrlsJson = JSON.stringify(p2pRelayUrls);
-  } else if (relayUrlOverride && authTokenStr !== null) {
-    relayUrlsJson = JSON.stringify([relayUrlOverride]);
+  } else if (trimmedRelayOverride && authTokenStr !== null) {
+    relayUrlsJson = JSON.stringify([trimmedRelayOverride]);
   }
   const mod = await ensureP2pReady();
   let timer = null;
@@ -280,7 +285,7 @@ export async function dialIrohStream({
   const useOptions = relayUrlsJson !== null || authTokenStr !== null;
   const dialPromise = (useOptions
     ? mod.WasmIrohStream.dial_with_options(endpoint, relayUrlsJson, authTokenStr, timeoutMs)
-    : mod.WasmIrohStream.dial(endpoint, relayUrlOverride || null, timeoutMs)
+    : mod.WasmIrohStream.dial(endpoint, trimmedRelayOverride || null, timeoutMs)
   )
     .then(async (stream) => {
       if (timedOut) {

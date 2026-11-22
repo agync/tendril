@@ -99,6 +99,17 @@
       border-radius: 6px;
       color: #b45309;
     }
+    .inline-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 10px;
+      cursor: pointer;
+    }
+    .inline-toggle input[type="checkbox"] {
+      width: auto;
+      margin: 0;
+    }
     @media (prefers-color-scheme: dark) {
       .warn {
         color: #fbbf24;
@@ -172,6 +183,10 @@
       <div class="row">
         <button id="send-btn" type="button">Send Data</button>
       </div>
+      <label class="inline-toggle">
+        <input id="redact-log-toggle" type="checkbox" checked />
+        Redact sensitive payloads and SAS in log
+      </label>
       <pre id="log"></pre>
     </section>
   </main>
