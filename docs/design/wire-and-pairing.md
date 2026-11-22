@@ -48,4 +48,8 @@ Inside `intent = session`, decrypted Noise transport frames (`<= 65503` bytes) c
 
 Key rotations carry a strictly monotonic `seq` counter and a `3373`-byte hybrid `Ed25519 || ML-DSA-65` signature (`ctx = "tendril-hybrid-v1"`) over the `4031`-byte payload (`"tendril-rot-v1\0" || seq_be8 || prev_signing_pub (1984 B) || new_signing_pub (1984 B) || new_static_pub (32 B) || ts_be8`). Any conflicting valid record at the same `seq` moves the peer entry immediately to `revoked`.
 
-Normative byte rules live in `spec/wire-v1.md` and `spec/pairing-v1.md`.
+## Group frames
+
+Two further inner frame types serve small peer mesh groups: `0x0A GROUP_MANIFEST` (a compact signed manifest, at most `32768` bytes) and `0x0B GROUP_RENDEZVOUS` (exactly `60` bytes: `group_id`, `seq`, and the 32-byte rendezvous key). A receiver closes the session on a `0x0A` above `32768` bytes or a `0x0B` of any other length. The initiator's optional `SessionHello.groups` lists `{group_id, seq}` gossip for the one group it is dialing (at most `16` entries, omitted when empty), which lets a responder holding a newer manifest queue it as `0x0A`. Core never ingests these frames on its own: the runtime hands them to `GroupBook`, which verifies and authorizes them. See [Small peer mesh groups](groups.md) and `spec/groups-v1.md`.
+
+Normative byte rules live in `spec/wire-v1.md`, `spec/pairing-v1.md`, and `spec/groups-v1.md`.

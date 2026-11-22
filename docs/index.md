@@ -9,7 +9,7 @@ Documentation for Tendril, an Apache-2.0 SDK for private device-to-device links 
 ## Sections
 
 - [Overview](overview.md) - Purpose, scope, non-goals, and explicit design limits.
-- [Design](design/index.md) - Pairing ceremony, wire profile, capability grants, and threat model.
+- [Design](design/index.md) - Pairing ceremony, wire profile, capability grants, small peer mesh groups, and threat model.
 - [Architecture](architecture/index.md) - Module boundaries, trust posture, and provider layers.
 - [Decisions](adr/index.md) - Architecture decision records, one decision per page.
 - [Usage](usage/index.md) - Integration guides and binding setup for supported languages.

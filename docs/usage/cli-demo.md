@@ -116,6 +116,26 @@ tendril --state-dir ./host-state rotate
 
 Once revoked, subsequent `dial` attempts fail closed on the host listener during session establishment, and active `tendril serve` sessions reload `roster.json` updates (under `.roster.lock` advisory locking) to terminate revoked peers immediately across ticks or incoming frames (`0x04 REKEY`, `0x01 DATA`). `tendril rotate` re-signs any persisted self-issued CRL automatically under the new key so revoked tokens stay blocked across key rotation.
 
+## Peer groups
+
+`tendril group` manages a small signed mesh rooted at the local identity. The CLI only builds and persists manifests and drives `GroupPool`; verification and authorization stay in `tendril-core`. Members must already be in the roster as `Active` peers with a known signing key (for example through M2M enrollment); code-paired clients whose signing key the host has not learned fail closed. Group commands require `host_id` to equal `device_id`, and a root identity roots exactly one group because the id derives from its signing key. Endpoint hints may be bare `host:port` (treated as `direct:`) or any other provider hint.
+
+```bash
+tendril --state-dir ./a-state group create --name team --endpoint 127.0.0.1:7000
+tendril --state-dir ./a-state group add <group_id> --peer <b_device_id> --endpoint 127.0.0.1:7001
+tendril --state-dir ./a-state group sync <group_id> --timeout 10
+tendril --state-dir ./b-state group broadcast <group_id> --message "hello"
+tendril --state-dir ./a-state group remove <group_id> --peer <b_device_id>
+tendril --state-dir ./a-state group list
+tendril --state-dir ./a-state group show <group_id>
+```
+
+- `add` defaults member caps to `group.send:<group_id>` and `group.recv:<group_id>`; repeat `--cap` to override.
+- `remove` revokes the member and rotates the rendezvous key. Run `sync` afterwards so reachable members ingest the new manifest and drop the revoked peer.
+- `sync` pushes the manifest (and the rendezvous key from the root) and prints `{group_id, seq, delivered, offline, failed}`; `broadcast` prints the `BroadcastReport`. `list` and `show` never print the rendezvous key.
+- `sync` and `broadcast` dial siblings over direct, local, relay (`--relay-auth-secret-file` or `--relay-ticket-file`), overlay, and broker endpoints, and over p2p (`iroh://`) when `--p2p` or any other `--p2p-*` option is given; `serve` adds p2p to its group dialers under the same rule as it enables its own p2p listener. `/v2/relay` sibling endpoints are not dialed.
+- `tendril serve` ingests pushed `0x0A` and `0x0B` frames from confirmed peers. An unknown group is pinned only when the sender is the manifest signer, an `Active` paired peer whose pinned signing key signed the manifest, and the manifest lists the local device. Once stored groups include the local device, every inbound session passes the pre-auth limiter and is routed after the handshake: a session advertising one local group goes to that group's pool, any other session must come from an `Active` paired peer. Group siblings never enter the roster, so they cannot open ordinary sessions or receive grants without pairing. It prints `group_session_established`, `group_data`, `group_manifest_updated`, `group_member_joined`, `group_member_revoked`, and `group_audit` JSON events.
+
 ## JSON stdio conformance peer (`tendril-conformance-peer`)
 
 Cross-language SDK bindings spawn `tendril-conformance-peer` and exchange single-line JSON commands over `stdin`/`stdout` (`stdout` is flushed after every response):

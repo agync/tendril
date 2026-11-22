@@ -64,6 +64,10 @@ For human-mediated pairing over untrusted paths, `intent = 0x02, flags = 0x01` d
 - **Atomic `incoming` verification and active-only jittered listeners:** `tendril serve` (`sync_v2_relay_listeners` in `tendril-cli`) binds `/v2/relay` mailboxes only for `PeerState::Active` peers with staggered multi-peer bind jitter, while `RelayV2Listener` handles single-mailbox control sockets with CSPRNG-jittered reconnect backoffs and control pings (`22.5s..=37.5s`), verifying `dial_token` across the active `RelayEpochWindow` (`+-1` hour skew) before recording `(epoch, dial_nonce, conn_id)` in `RelayDialReplayCache` and ignoring invalid or replayed notifications silently.
 - **Per-epoch socket isolation:** Clients requiring cross-epoch unlinkability MUST open a separate control WebSocket per epoch `mailbox_id` rather than registering `(epoch - 1, epoch, epoch + 1)` on one persistent control socket.
 
+## Group frames and bootstrap on Wire v2
+
+Group frames `0x0A` and `0x0B` travel inside `0x09 PADDED` on Wire v2. The legacy unpadded receive path accepts only `0x01..=0x07`, so a v2 session with padding disabled cannot send or receive them. A first sibling link in a group with `min_wire_version >= 2` cannot use a stored pairwise reconnect secret, so it is admitted under a `pair_bootstrap` derived by HKDF-SHA256 from the group rendezvous key, the manifest `seq`, and both device ids. After `Established` both ends overwrite the stored pairwise secret with the session's exported secrets (the pairwise upgrade), and later dials use it; the bootstrap rotates on every revocation. A member that holds the manifest but not the current-`seq` key cannot derive the bootstrap, so an admin delivers `0x0A` and `0x0B` over its ordinary paired session first. See [Small peer mesh groups](groups.md) and `spec/groups-v1.md`.
+
 ## Bucketed inner frames and jittered scheduling
 
 | Mechanism | Specification (`spec/wire-v2.md`) | Privacy effect |

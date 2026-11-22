@@ -20,6 +20,7 @@ flowchart TB
     PR["pairing"]
     SE["session"]
     GR["grants"]
+    GP["groups"]
     PO["path policy"]
   end
   subgraph PROV["Untrusted path providers"]
@@ -43,6 +44,7 @@ flowchart TB
 | `pairing` | Pairing code proof, handshake binding, confirmation state, minting split | Socket dialing, UI rendering |
 | `session` | Noise XXhfs handshake, length-prefixed framing, rekeying, close on fault | Path ranking, retries |
 | `grants` | Capability grammar, signature verification, subset delegation, revocation lists | App authorization prompts |
+| `group` | Signed membership manifest, first-contact pin, group-scoped capabilities, rendezvous key and sibling pins, `GroupBook` ingest rules | Dialing siblings, frame I/O (`tendril-runtime` `GroupPool` and `GroupHub` do that); see [Small peer mesh groups](../design/groups.md) |
 | `path policy` | Provider registry, locality ranking, probing, fall-up triggers, rebuild on failure | Provider transport internals |
 
 ## Provider boundary
