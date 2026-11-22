@@ -17,7 +17,9 @@ use tendril_core::policy::{
     CandidateEndpoint, PathPlanner, PathPolicyConfig, PlannerAction, ProviderId,
 };
 use tendril_core::roster::Roster;
-use tendril_core::session::{RekeyDirection, SessionAction, SessionMachine};
+use tendril_core::session::{
+    RekeyDirection, SessionAction, SessionMachine, check_peer_allows_wire_v1,
+};
 use tendril_core::wire::{Intent, Preamble};
 use tendril_core::{MAX_FRAME_LEN, PREAMBLE_LEN};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -814,6 +816,7 @@ impl SessionDriver {
         roster: &mut Roster,
         now_unix: u64,
     ) -> Result<(CandidateEndpoint, Self), RuntimeError> {
+        check_peer_allows_wire_v1(roster, target_host_id)?;
         struct RosterSyncGuard<'a> {
             dst: &'a mut Roster,
             shared: Arc<Mutex<Roster>>,
@@ -851,6 +854,13 @@ impl SessionDriver {
         mut roster: RosterRef<'_>,
         now_unix: u64,
     ) -> Result<Self, RuntimeError> {
+        match &roster {
+            RosterRef::Direct(r) => check_peer_allows_wire_v1(r, target_host_id)?,
+            RosterRef::Locked(m) => check_peer_allows_wire_v1(
+                &m.lock().expect("roster mutex poisoned"),
+                target_host_id,
+            )?,
+        }
         let mut machine = SessionMachine::new_initiator(
             local_identity,
             target_host_id,
