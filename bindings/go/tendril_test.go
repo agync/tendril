@@ -1397,3 +1397,168 @@ func TestWireV2ConformancePeerInterop(t *testing.T) {
 	_ = hostSess.CloseSession(1000, "done")
 	peer2.call(t, map[string]any{"op": "shutdown"})
 }
+
+type rosterDoc struct {
+	Entries map[string]struct {
+		State  string            `json:"state"`
+		Grants []json.RawMessage `json:"grants"`
+	} `json:"entries"`
+}
+
+func parseRoster(t *testing.T, raw []byte) rosterDoc {
+	t.Helper()
+	var doc rosterDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse roster: %v", err)
+	}
+	return doc
+}
+
+func TestRevokePeerRacesPollEventAndAuthorize(t *testing.T) {
+	hostDir := t.TempDir()
+	cliDir := t.TempDir()
+	hostEp, err := tendril.NewEndpoint(hostDir, "go-sec04-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint host: %v", err)
+	}
+	defer hostEp.Close()
+	cliEp, err := tendril.NewEndpoint(cliDir, "")
+	if err != nil {
+		t.Fatalf("NewEndpoint cli: %v", err)
+	}
+	defer cliEp.Close()
+
+	addr, err := hostEp.ServeDirect("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	code, err := hostEp.IssueCode("lan")
+	if err != nil {
+		t.Fatalf("IssueCode: %v", err)
+	}
+	pairCh := make(chan tendril.PairAcceptResult, 1)
+	pairErr := make(chan error, 1)
+	go func() {
+		res, err := hostEp.PairAccept(5000)
+		if err != nil {
+			pairErr <- err
+			return
+		}
+		pairCh <- res
+	}()
+	cliPair, err := cliEp.PairInitiate(addr, "", code, "go-dev", "go")
+	if err != nil {
+		t.Fatalf("PairInitiate: %v", err)
+	}
+	var acc tendril.PairAcceptResult
+	select {
+	case err := <-pairErr:
+		t.Fatalf("PairAccept: %v", err)
+	case acc = <-pairCh:
+	}
+	if err := hostEp.ConfirmPeer(acc.DeviceID, acc.SAS); err != nil {
+		t.Fatalf("host ConfirmPeer: %v", err)
+	}
+	if err := cliEp.ConfirmPeer("go-sec04-host", cliPair.SAS); err != nil {
+		t.Fatalf("cli ConfirmPeer: %v", err)
+	}
+	grant, err := hostEp.MintGrant(acc.DeviceID, []string{"fs.read"}, 3600)
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+
+	sessCh := make(chan *tendril.Session, 1)
+	sessErr := make(chan error, 1)
+	go func() {
+		s, err := hostEp.AcceptSession(5000)
+		if err != nil {
+			sessErr <- err
+			return
+		}
+		sessCh <- s
+	}()
+	cliSess, err := cliEp.Connect(addr, "", "go-sec04-host", grant)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cliSess.Close()
+	var hostSess *tendril.Session
+	select {
+	case err := <-sessErr:
+		t.Fatalf("AcceptSession: %v", err)
+	case hostSess = <-sessCh:
+	}
+	defer hostSess.Close()
+
+	if ok, err := hostSess.Authorize("fs.read"); err != nil || !ok {
+		t.Fatalf("authorize before revoke: ok=%v err=%v", ok, err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	run := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					fn()
+				}
+			}
+		}()
+	}
+	run(func() { _, _ = hostSess.PollEvent(5) })
+	run(func() { _, _ = hostSess.Authorize("fs.read") })
+	run(func() {
+		_ = cliSess.SendData([]byte("x"))
+		_ = cliSess.Rekey()
+		time.Sleep(time.Millisecond)
+	})
+	run(func() {
+		if s, err := hostEp.Connect("127.0.0.1:1", "", "nobody", ""); err == nil {
+			_ = s.Close()
+			t.Errorf("connect to a dead endpoint must fail")
+		}
+	})
+
+	time.Sleep(30 * time.Millisecond)
+	if err := hostEp.RevokePeer(acc.DeviceID); err != nil {
+		t.Fatalf("RevokePeer: %v", err)
+	}
+	for range 200 {
+		ok, err := hostSess.Authorize("fs.read")
+		if err != nil {
+			t.Fatalf("Authorize after revoke: %v", err)
+		}
+		if ok {
+			t.Fatalf("authorize must deny immediately after RevokePeer")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+
+	for name, export := range map[string]func() ([]byte, error){
+		"endpoint": hostEp.ExportRosterJSON,
+		"session":  hostSess.ExportRosterJSON,
+	} {
+		raw, err := export()
+		if err != nil {
+			t.Fatalf("%s ExportRosterJSON: %v", name, err)
+		}
+		entry, ok := parseRoster(t, raw).Entries[acc.DeviceID]
+		if !ok || entry.State != "revoked" || len(entry.Grants) != 0 {
+			t.Fatalf("%s roster resurrected revoked peer: %+v", name, entry)
+		}
+	}
+	disk, err := os.ReadFile(filepath.Join(hostDir, "roster.json"))
+	if err != nil {
+		t.Fatalf("read roster.json: %v", err)
+	}
+	if entry := parseRoster(t, disk).Entries[acc.DeviceID]; entry.State != "revoked" {
+		t.Fatalf("disk roster resurrected revoked peer: %+v", entry)
+	}
+}

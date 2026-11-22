@@ -1061,3 +1061,33 @@ func (s *Session) CloseSession(code uint16, reason string) error {
 		return nil
 	})
 }
+
+// ExportRosterJSON returns the endpoint's current roster JSON. The result is secret material;
+// callers should zero the returned slice once persisted.
+func (ep *Endpoint) ExportRosterJSON() ([]byte, error) {
+	var out []byte
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		var raw *C.char
+		if rc := C.tendril_endpoint_export_roster_json(h, &raw); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		out = []byte(takeOutCStr(raw))
+		return nil
+	})
+	return out, err
+}
+
+// ExportRosterJSON returns the session's shared roster JSON. The result is secret material;
+// callers should zero the returned slice once persisted.
+func (s *Session) ExportRosterJSON() ([]byte, error) {
+	var out []byte
+	err := s.withHandle(func(h *C.TendrilSession) error {
+		var raw *C.char
+		if rc := C.tendril_session_export_roster_json(h, &raw); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		out = []byte(takeOutCStr(raw))
+		return nil
+	})
+	return out, err
+}
