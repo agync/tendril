@@ -92,7 +92,32 @@ export class Endpoint {
     relayHost?: string | null
   ): Promise<Session>;
   acceptV2(timeoutMs?: number | null): Promise<Session>;
+  groupCreate(
+    name: string,
+    minWireVersion: number,
+    endpoints?: string[] | null
+  ): Promise<string>;
+  groupAddMember(
+    groupId: string,
+    peerId: string,
+    caps?: string[] | null,
+    endpoints?: string[] | null
+  ): Promise<string>;
+  groupRemoveMember(groupId: string, peerId: string): Promise<string>;
+  groupIngestManifest(manifestJson: string, senderPeerId: string): Promise<string>;
+  groupOpen(groupId: string, listenAddr?: string | null): Promise<Group>;
   close(): void;
+}
+
+export class Group {
+  private constructor();
+  readonly groupId: string;
+  readonly localEndpoint: string | null;
+  broadcast(data: Buffer, requiredCap?: string | null): Promise<string>;
+  sync(): Promise<string>;
+  pollEvent(timeoutMs?: number | null): Promise<string | null>;
+  authorizePeer(peerId: string, cap: string): boolean;
+  close(): Promise<void>;
 }
 
 export class Session {

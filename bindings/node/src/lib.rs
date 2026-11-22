@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use napi::bindgen_prelude::*;
@@ -18,6 +18,7 @@ use tendril_core::crypto::{
 };
 use tendril_core::error::CoreError;
 use tendril_core::grants::{Grant, RevocationList, authorize_grant, canonical_json};
+use tendril_core::group::GroupManifest;
 use tendril_core::identity::{
     EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
 };
@@ -32,8 +33,9 @@ use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
 use tendril_runtime::{
-    BrokerDialer, ConcurrentSession, ConcurrentV2Session, DEFAULT_PRE_AUTH_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, HttpWakeProvider, InboundRouter,
+    BroadcastReport, BrokerDialer, ConcurrentSession, ConcurrentV2Session,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, GroupEvent,
+    GroupFrameKind, GroupFrameOutcome, GroupPool, GroupPoolConfig, HttpWakeProvider, InboundRouter,
     LocalDialer, MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pListener, P2pOptions,
     P2pRelayAuth, P2pRelayMode, PathDialer, PathListener, PathStream, RelayClientAuth, RelayDialer,
     RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError,
@@ -43,8 +45,11 @@ use tendril_runtime::{
     drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
     drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_store,
     drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
-    drive_v2_pake_pair_responder_with_store, pairing_path_kind_for_provider, parse_p2p_relay_mode,
-    parse_p2p_relay_modes, pinned_pairing_floor, wake_and_dial_v2,
+    drive_v2_pake_pair_responder_with_store, group_add_member as rt_group_add_member,
+    group_create as rt_group_create, group_ingest_manifest as rt_group_ingest_manifest,
+    group_remove_member as rt_group_remove_member, handle_session_group_frame,
+    pairing_path_kind_for_provider, parse_p2p_relay_mode, parse_p2p_relay_modes,
+    pinned_pairing_floor, wake_and_dial_v2,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
@@ -84,6 +89,12 @@ fn f64_to_u16(v: Option<f64>, default_val: u16, name: &str) -> Result<u16> {
     let n = f64_to_u64(raw, name)?;
     u16::try_from(n)
         .map_err(|_| Error::new(Status::InvalidArg, format!("{name} must be in 0..=65535")))
+}
+
+fn f64_to_u8(v: f64, name: &str) -> Result<u8> {
+    let n = f64_to_u64(v, name)?;
+    u8::try_from(n)
+        .map_err(|_| Error::new(Status::InvalidArg, format!("{name} must be in 0..=255")))
 }
 
 fn u64_to_f64(v: u64) -> Result<f64> {
@@ -611,6 +622,18 @@ impl EndpointTransportConfig {
         }
         Ok(opts.with_relay_auth(self.p2p_relay_auth.clone()))
     }
+
+    /// Options for the shared group `P2pDialer`, present only when a relay mode is configured
+    /// explicitly (or `TENDRIL_P2P_LOCAL=1`). Other p2p settings never imply public relays.
+    fn build_p2p_group_options(&self) -> Option<P2pOptions> {
+        P2pOptions::for_group_dialer(
+            self.p2p_relay_mode.clone(),
+            std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"),
+            self.p2p_pkarr,
+            self.p2p_allow_private_addrs,
+            self.p2p_relay_auth.clone(),
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -992,6 +1015,7 @@ pub struct Endpoint {
     transport_cfg: StdMutex<EndpointTransportConfig>,
     self_m2m_enabled: AtomicBool,
     m2m_enabled: AtomicBool,
+    groups: StdMutex<Vec<Weak<GroupPool>>>,
 }
 
 impl Endpoint {
@@ -1037,6 +1061,15 @@ impl Endpoint {
             roster: Arc::clone(&self.roster),
             session: Arc::new(backend),
         }
+    }
+
+    fn group_store(&self) -> Result<Arc<StateStore>> {
+        self.store.clone().ok_or_else(|| {
+            Error::new(
+                Status::GenericFailure,
+                "group operations require a state_dir",
+            )
+        })
     }
 
     fn snapshot_transport_cfg(&self) -> EndpointTransportConfig {
@@ -1096,6 +1129,129 @@ impl Endpoint {
             transport_cfg: StdMutex::new(EndpointTransportConfig::default()),
             self_m2m_enabled: AtomicBool::new(false),
             m2m_enabled: AtomicBool::new(has_active_anchor),
+            groups: StdMutex::new(Vec::new()),
+        })
+    }
+
+    #[napi]
+    pub async fn group_create(
+        &self,
+        name: String,
+        min_wire_version: f64,
+        endpoints: Option<Vec<String>>,
+    ) -> Result<String> {
+        let store = self.group_store()?;
+        let wire = f64_to_u8(min_wire_version, "min_wire_version")?;
+        let manifest = rt_group_create(
+            &store,
+            &self.identity,
+            &name,
+            wire,
+            endpoints.unwrap_or_default(),
+        )
+        .map_err(to_generic_err)?;
+        manifest_json(&manifest)
+    }
+
+    #[napi]
+    pub async fn group_add_member(
+        &self,
+        group_id: String,
+        peer_id: String,
+        caps: Option<Vec<String>>,
+        endpoints: Option<Vec<String>>,
+    ) -> Result<String> {
+        let store = self.group_store()?;
+        let manifest = rt_group_add_member(
+            &store,
+            &self.identity,
+            &group_id,
+            &peer_id,
+            caps.unwrap_or_default(),
+            endpoints.unwrap_or_default(),
+        )
+        .map_err(to_generic_err)?;
+        manifest_json(&manifest)
+    }
+
+    #[napi]
+    pub async fn group_remove_member(&self, group_id: String, peer_id: String) -> Result<String> {
+        let store = self.group_store()?;
+        let manifest = rt_group_remove_member(&store, &self.identity, &group_id, &peer_id)
+            .map_err(to_generic_err)?;
+        manifest_json(&manifest)
+    }
+
+    #[napi]
+    pub async fn group_ingest_manifest(
+        &self,
+        manifest_json: String,
+        sender_peer_id: String,
+    ) -> Result<String> {
+        let store = self.group_store()?;
+        rt_group_ingest_manifest(
+            &store,
+            &self.identity.device_id(),
+            &sender_peer_id,
+            &manifest_json,
+        )
+        .map(|outcome| outcome.group_id)
+        .map_err(to_generic_err)
+    }
+
+    #[napi]
+    pub async fn group_open(&self, group_id: String, listen_addr: Option<String>) -> Result<Group> {
+        let store = self.group_store()?;
+        let addr: Option<SocketAddr> = listen_addr
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| Error::new(Status::InvalidArg, format!("invalid address: {e}")))
+            })
+            .transpose()?;
+        let transport_cfg = self.snapshot_transport_cfg();
+        let mut dialers: Vec<Arc<dyn PathDialer>> = vec![
+            Arc::new(DirectDialer::new()),
+            Arc::new(LocalDialer::new()),
+            Arc::new(RelayDialer::new().with_auth(transport_cfg.relay_auth.clone())),
+            Arc::new(OverlayDialer::new()),
+            Arc::new(BrokerDialer::new()),
+        ];
+        if let Some(opts) = transport_cfg.build_p2p_group_options() {
+            let dialer = P2pDialer::bind_with_options(opts)
+                .await
+                .map_err(to_generic_err)?;
+            dialers.push(Arc::new(dialer));
+        }
+        let pool = GroupPool::open(
+            (*store).clone(),
+            Arc::clone(&self.identity),
+            &group_id,
+            GroupPoolConfig::new(dialers),
+            None,
+        )
+        .map_err(to_generic_err)?;
+        let mut local_endpoint = None;
+        if let Some(addr) = addr {
+            let listener = match DirectListener::bind(addr, None).await {
+                Ok(l) => l,
+                Err(e) => {
+                    pool.close();
+                    return Err(to_generic_err(e));
+                }
+            };
+            local_endpoint = Some(listener.local_endpoint());
+            pool.serve(Box::new(listener));
+        }
+        let pool = Arc::new(pool);
+        {
+            let mut groups = self.groups.lock().unwrap_or_else(|e| e.into_inner());
+            groups.retain(|w| w.upgrade().is_some_and(|p| !p.is_closed()));
+            groups.push(Arc::downgrade(&pool));
+        }
+        Ok(Group {
+            pool,
+            local_endpoint,
         })
     }
 
@@ -2142,6 +2298,18 @@ impl Endpoint {
     #[napi]
     pub fn close(&self) {
         self.router.close();
+        let pools: Vec<Arc<GroupPool>> = self
+            .groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .filter_map(|w| w.upgrade())
+            .collect();
+        within_runtime_if_available(|| {
+            for pool in pools {
+                pool.close();
+            }
+        });
     }
 }
 
@@ -2151,6 +2319,13 @@ enum SessionBackend {
 }
 
 impl SessionBackend {
+    fn peer_device_id(&self) -> Option<String> {
+        match self {
+            Self::V1(s) => s.peer_device_id(),
+            Self::V2(s) => Some(s.peer_device_id().to_owned()),
+        }
+    }
+
     async fn send_data(&self, payload: &[u8]) -> std::result::Result<(), RuntimeError> {
         match self {
             Self::V1(s) => s.send_data(payload).await,
@@ -2205,6 +2380,71 @@ pub struct Session {
     identity: Arc<EndpointIdentity>,
     roster: Arc<StdMutex<Roster>>,
     session: Arc<SessionBackend>,
+}
+
+impl Session {
+    /// Hands an ordinary-session `0x0A`/`0x0B` to the runtime when the endpoint has a state
+    /// store and reports the redacted outcome. Store-less endpoints surface the unverified
+    /// event instead.
+    async fn group_frame_json(&self, ev: SessionEvent) -> Result<serde_json::Value> {
+        if let Some(store) = self.store.as_ref() {
+            let peer = self.session.peer_device_id().ok_or_else(|| {
+                Error::new(Status::GenericFailure, "session peer is not authenticated")
+            })?;
+            let store = Arc::clone(store);
+            let local_id = self.identity.device_id();
+            let probe = ev.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                handle_session_group_frame(&store, &local_id, &peer, &probe)
+            })
+            .await
+            .map_err(to_generic_err)?;
+            if let Some(outcome) = outcome {
+                return Ok(group_frame_outcome_json(&outcome));
+            }
+        }
+        match &ev {
+            SessionEvent::GroupManifestReceived(manifest) => Ok(serde_json::json!({
+                "status": "event",
+                "event": "group_manifest_unverified",
+                "group_id": manifest.group_id,
+                "seq": manifest.seq,
+                "manifest_json": manifest_json(manifest)?,
+            })),
+            SessionEvent::GroupRendezvousReceived(frame) => Ok(serde_json::json!({
+                "status": "event",
+                "event": "group_rendezvous_unverified",
+                "group_id": frame.group_id,
+                "seq": frame.seq,
+            })),
+            _ => Err(Error::new(
+                Status::GenericFailure,
+                "not a group frame event",
+            )),
+        }
+    }
+}
+
+fn group_frame_outcome_json(outcome: &GroupFrameOutcome) -> serde_json::Value {
+    let kind = match outcome.kind {
+        GroupFrameKind::Manifest => "manifest",
+        GroupFrameKind::Rendezvous => "rendezvous",
+    };
+    let verdict = if outcome.ingested {
+        "ingested"
+    } else {
+        "rejected"
+    };
+    let mut val = serde_json::json!({
+        "status": "event",
+        "event": format!("group_{kind}_{verdict}"),
+        "group_id": outcome.group_id,
+        "seq": outcome.seq,
+    });
+    if let Some(error) = &outcome.error {
+        val["error"] = serde_json::Value::String(error.clone());
+    }
+    val
 }
 
 #[napi]
@@ -2273,6 +2513,10 @@ impl Session {
                         "event": "audit",
                         "audit": audit,
                     }),
+                    ev @ (SessionEvent::GroupManifestReceived(_)
+                    | SessionEvent::GroupRendezvousReceived(_)) => {
+                        self.group_frame_json(ev).await?
+                    }
                     SessionEvent::Closed { code, reason } => serde_json::json!({
                         "status": "event",
                         "event": "closed",
@@ -2333,6 +2577,117 @@ impl Session {
     }
 }
 
+fn manifest_json(manifest: &GroupManifest) -> Result<String> {
+    let bytes = manifest.to_wire_bytes().map_err(to_generic_err)?;
+    String::from_utf8(bytes).map_err(to_generic_err)
+}
+
+fn report_json(report: &BroadcastReport) -> Result<String> {
+    serde_json::to_string(report).map_err(to_generic_err)
+}
+
+fn group_event_json(event: &GroupEvent) -> String {
+    match event {
+        GroupEvent::AppData {
+            sender_device_id,
+            payload,
+        } => serde_json::json!({
+            "event": "app_data",
+            "sender_device_id": sender_device_id,
+            "payload_b64": b64url_encode(payload),
+        }),
+        GroupEvent::ManifestUpdated { seq } => serde_json::json!({
+            "event": "manifest_updated",
+            "seq": seq,
+        }),
+        GroupEvent::MemberJoined { device_id } => serde_json::json!({
+            "event": "member_joined",
+            "device_id": device_id,
+        }),
+        GroupEvent::MemberRevoked { device_id } => serde_json::json!({
+            "event": "member_revoked",
+            "device_id": device_id,
+        }),
+        GroupEvent::Audit(audit) => serde_json::json!({
+            "event": "audit",
+            "audit": audit,
+        }),
+    }
+    .to_string()
+}
+
+#[napi]
+pub struct Group {
+    pool: Arc<GroupPool>,
+    local_endpoint: Option<String>,
+}
+
+impl Group {
+    fn ensure_open(&self) -> Result<()> {
+        if self.pool.is_closed() {
+            return Err(Error::new(Status::GenericFailure, "group is closed"));
+        }
+        Ok(())
+    }
+}
+
+#[napi]
+impl Group {
+    #[napi(getter)]
+    pub fn group_id(&self) -> String {
+        self.pool.group_id().to_owned()
+    }
+
+    #[napi(getter)]
+    pub fn local_endpoint(&self) -> Option<String> {
+        self.local_endpoint.clone()
+    }
+
+    #[napi]
+    pub async fn broadcast(&self, data: Buffer, required_cap: Option<String>) -> Result<String> {
+        self.ensure_open()?;
+        let cap = required_cap.filter(|s| !s.is_empty());
+        let report = self
+            .pool
+            .broadcast(cap.as_deref(), data.as_ref())
+            .await
+            .map_err(to_generic_err)?;
+        report_json(&report)
+    }
+
+    #[napi]
+    pub async fn sync(&self) -> Result<String> {
+        self.ensure_open()?;
+        let report = self.pool.sync().await.map_err(to_generic_err)?;
+        report_json(&report)
+    }
+
+    #[napi]
+    pub async fn poll_event(&self, timeout_ms: Option<f64>) -> Result<Option<String>> {
+        self.ensure_open()?;
+        let wait = Duration::from_millis(f64_to_timeout_ms(timeout_ms, 5000)?);
+        Ok(self
+            .pool
+            .poll_event(wait)
+            .await
+            .map(|ev| group_event_json(&ev)))
+    }
+
+    #[napi]
+    pub fn authorize_peer(&self, peer_id: String, cap: String) -> Result<bool> {
+        self.ensure_open()?;
+        self.pool
+            .authorize_peer(&peer_id, &cap)
+            .map(|()| true)
+            .map_err(to_generic_err)
+    }
+
+    #[napi]
+    pub async fn close(&self) {
+        self.pool.close();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2360,6 +2715,21 @@ mod tests {
         pinned.p2p_relay_mode = Some(P2pRelayMode::Disabled);
         let opts = pinned.build_p2p_dialer_options(uri, None).unwrap();
         assert!(matches!(opts.relay_mode, P2pRelayMode::Disabled));
+    }
+
+    #[test]
+    fn group_dialer_needs_an_explicit_relay_mode() {
+        let mut cfg = EndpointTransportConfig::default();
+        cfg.p2p_pkarr = Some(true);
+        cfg.p2p_advertise_direct_addrs = Some(true);
+        cfg.p2p_allow_private_addrs = Some(true);
+        cfg.p2p_relay_auth = Some(P2pRelayAuth::BearerToken("tok".to_owned().into()));
+        assert!(cfg.build_p2p_group_options().is_none());
+
+        cfg.p2p_relay_mode = Some(P2pRelayMode::Custom("https://relay.example/".to_owned()));
+        let opts = cfg.build_p2p_group_options().expect("explicit mode");
+        assert!(matches!(opts.relay_mode, P2pRelayMode::Custom(_)));
+        assert!(opts.relay_auth.is_some());
     }
 
     #[test]
