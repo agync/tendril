@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -19,6 +19,7 @@ use tendril_core::crypto::{
 };
 use tendril_core::error::CoreError;
 use tendril_core::grants::{AuditEvent, Grant, RevocationList, authorize_grant, canonical_json};
+use tendril_core::group::GroupManifest;
 use tendril_core::identity::{
     EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
 };
@@ -33,8 +34,9 @@ use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
 use tendril_runtime::{
-    BrokerDialer, ConcurrentSession, ConcurrentV2Session, DEFAULT_PRE_AUTH_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, HttpWakeProvider, InboundRouter,
+    BroadcastReport, BrokerDialer, ConcurrentSession, ConcurrentV2Session,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, GroupEvent,
+    GroupFrameKind, GroupFrameOutcome, GroupPool, GroupPoolConfig, HttpWakeProvider, InboundRouter,
     LocalDialer, MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pListener, P2pOptions,
     P2pRelayAuth, P2pRelayMode, PathDialer, PathListener, PathStream, RelayClientAuth, RelayDialer,
     RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError,
@@ -44,8 +46,11 @@ use tendril_runtime::{
     drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
     drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_store,
     drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
-    drive_v2_pake_pair_responder_with_store, pairing_path_kind_for_provider, parse_p2p_relay_mode,
-    parse_p2p_relay_modes, pinned_pairing_floor, wake_and_dial_v2,
+    drive_v2_pake_pair_responder_with_store, group_add_member as rt_group_add_member,
+    group_create as rt_group_create, group_ingest_manifest as rt_group_ingest_manifest,
+    group_remove_member as rt_group_remove_member, handle_session_group_frame,
+    pairing_path_kind_for_provider, parse_p2p_relay_mode, parse_p2p_relay_modes,
+    pinned_pairing_floor, wake_and_dial_v2,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -572,6 +577,18 @@ impl EndpointTransportConfig {
         }
         Ok(opts.with_relay_auth(self.p2p_relay_auth.clone()))
     }
+
+    /// Options for the shared group `P2pDialer`, present only when a relay mode is configured
+    /// explicitly (or `TENDRIL_P2P_LOCAL=1`). Other p2p settings never imply public relays.
+    fn build_p2p_group_options(&self) -> Option<P2pOptions> {
+        P2pOptions::for_group_dialer(
+            self.p2p_relay_mode.clone(),
+            std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"),
+            self.p2p_pkarr,
+            self.p2p_allow_private_addrs,
+            self.p2p_relay_auth.clone(),
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -926,6 +943,7 @@ struct Endpoint {
     transport_cfg: Arc<StdMutex<EndpointTransportConfig>>,
     self_m2m_enabled: Arc<AtomicBool>,
     m2m_enabled: Arc<AtomicBool>,
+    groups: StdMutex<Vec<Weak<GroupPool>>>,
 }
 
 impl Endpoint {
@@ -938,6 +956,12 @@ impl Endpoint {
             roster: Arc::clone(&self.roster),
             session: Arc::new(backend),
         }
+    }
+
+    fn group_store(&self) -> PyResult<Arc<StateStore>> {
+        self.store
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("group operations require a state_dir"))
     }
 
     fn snapshot_transport_cfg(&self) -> EndpointTransportConfig {
@@ -1000,7 +1024,149 @@ impl Endpoint {
                 transport_cfg: Arc::new(StdMutex::new(EndpointTransportConfig::default())),
                 self_m2m_enabled: Arc::new(AtomicBool::new(false)),
                 m2m_enabled: Arc::new(AtomicBool::new(has_active_anchor)),
+                groups: StdMutex::new(Vec::new()),
             })
+        })
+    }
+
+    #[pyo3(signature = (name, min_wire_version, endpoints=None))]
+    fn group_create(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        min_wire_version: u8,
+        endpoints: Option<Vec<String>>,
+    ) -> PyResult<String> {
+        let store = self.group_store()?;
+        let identity = Arc::clone(&self.identity);
+        let name = name.to_owned();
+        let endpoints = endpoints.unwrap_or_default();
+        py.detach(move || {
+            let manifest = rt_group_create(&store, &identity, &name, min_wire_version, endpoints)
+                .map_err(py_err)?;
+            manifest_json(&manifest)
+        })
+    }
+
+    #[pyo3(signature = (group_id, peer_id, caps=None, endpoints=None))]
+    fn group_add_member(
+        &self,
+        py: Python<'_>,
+        group_id: &str,
+        peer_id: &str,
+        caps: Option<Vec<String>>,
+        endpoints: Option<Vec<String>>,
+    ) -> PyResult<String> {
+        let store = self.group_store()?;
+        let identity = Arc::clone(&self.identity);
+        let group_id = group_id.to_owned();
+        let peer_id = peer_id.to_owned();
+        let caps = caps.unwrap_or_default();
+        let endpoints = endpoints.unwrap_or_default();
+        py.detach(move || {
+            let manifest =
+                rt_group_add_member(&store, &identity, &group_id, &peer_id, caps, endpoints)
+                    .map_err(py_err)?;
+            manifest_json(&manifest)
+        })
+    }
+
+    fn group_remove_member(
+        &self,
+        py: Python<'_>,
+        group_id: &str,
+        peer_id: &str,
+    ) -> PyResult<String> {
+        let store = self.group_store()?;
+        let identity = Arc::clone(&self.identity);
+        let group_id = group_id.to_owned();
+        let peer_id = peer_id.to_owned();
+        py.detach(move || {
+            let manifest =
+                rt_group_remove_member(&store, &identity, &group_id, &peer_id).map_err(py_err)?;
+            manifest_json(&manifest)
+        })
+    }
+
+    fn group_ingest_manifest(
+        &self,
+        py: Python<'_>,
+        manifest_json: &str,
+        sender_peer_id: &str,
+    ) -> PyResult<String> {
+        let store = self.group_store()?;
+        let local_id = self.identity.device_id();
+        let manifest_json = manifest_json.to_owned();
+        let sender = sender_peer_id.to_owned();
+        py.detach(move || {
+            rt_group_ingest_manifest(&store, &local_id, &sender, &manifest_json)
+                .map(|outcome| outcome.group_id)
+                .map_err(py_err)
+        })
+    }
+
+    #[pyo3(signature = (group_id, listen_addr=None))]
+    fn group_open(
+        &self,
+        py: Python<'_>,
+        group_id: &str,
+        listen_addr: Option<&str>,
+    ) -> PyResult<Group> {
+        let store = self.group_store()?;
+        let identity = Arc::clone(&self.identity);
+        let rt = Arc::clone(&self.rt);
+        let transport_cfg = self.snapshot_transport_cfg();
+        let relay_auth = transport_cfg.relay_auth.clone();
+        let p2p_opts = transport_cfg.build_p2p_group_options();
+        let group_id = group_id.to_owned();
+        let addr: Option<SocketAddr> = listen_addr
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| PyValueError::new_err(format!("invalid address: {e}")))
+            })
+            .transpose()?;
+        py.detach(move || {
+            let rt_for_pool = Arc::clone(&rt);
+            rt_for_pool.block_on(async move {
+                let mut dialers: Vec<Arc<dyn PathDialer>> = vec![
+                    Arc::new(DirectDialer::new()),
+                    Arc::new(LocalDialer::new()),
+                    Arc::new(RelayDialer::new().with_auth(relay_auth)),
+                    Arc::new(OverlayDialer::new()),
+                    Arc::new(BrokerDialer::new()),
+                ];
+                if let Some(opts) = p2p_opts {
+                    dialers.push(Arc::new(
+                        P2pDialer::bind_with_options(opts).await.map_err(py_err)?,
+                    ));
+                }
+                let config = GroupPoolConfig::new(dialers);
+                let pool = GroupPool::open((*store).clone(), identity, &group_id, config, None)
+                    .map_err(py_err)?;
+                let mut local_endpoint = None;
+                if let Some(addr) = addr {
+                    let listener = match DirectListener::bind(addr, None).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            pool.close();
+                            return Err(py_err(e));
+                        }
+                    };
+                    local_endpoint = Some(listener.local_endpoint());
+                    pool.serve(Box::new(listener));
+                }
+                Ok(Group {
+                    rt,
+                    pool: Arc::new(pool),
+                    local_endpoint,
+                })
+            })
+        })
+        .inspect(|group| {
+            let mut groups = self.groups.lock().unwrap_or_else(|e| e.into_inner());
+            groups.retain(|w| w.upgrade().is_some_and(|p| !p.is_closed()));
+            groups.push(Arc::downgrade(&group.pool));
         })
     }
 
@@ -2312,7 +2478,21 @@ impl Endpoint {
 
     fn close(&self, py: Python<'_>) {
         let router = Arc::clone(&self.router);
-        py.detach(move || router.close());
+        let rt = Arc::clone(&self.rt);
+        let pools: Vec<Arc<GroupPool>> = self
+            .groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .filter_map(|w| w.upgrade())
+            .collect();
+        py.detach(move || {
+            router.close();
+            let _guard = rt.enter();
+            for pool in pools {
+                pool.close();
+            }
+        });
     }
 }
 
@@ -2322,6 +2502,13 @@ enum SessionBackend {
 }
 
 impl SessionBackend {
+    fn peer_device_id(&self) -> Option<String> {
+        match self {
+            Self::V1(s) => s.peer_device_id(),
+            Self::V2(s) => Some(s.peer_device_id().to_owned()),
+        }
+    }
+
     fn is_v2(&self) -> bool {
         matches!(self, Self::V2(_))
     }
@@ -2462,6 +2649,10 @@ impl Session {
                                 "event": "audit",
                                 "audit": audit,
                             }),
+                            ev @ (SessionEvent::GroupManifestReceived(_)
+                            | SessionEvent::GroupRendezvousReceived(_)) => {
+                                group_frame_json(store.as_ref(), &identity, &sess, ev).await?
+                            }
                             SessionEvent::Closed { code, reason } => serde_json::json!({
                                 "status": "event",
                                 "event": "closed",
@@ -2527,6 +2718,221 @@ impl Session {
     }
 }
 
+/// Hands an ordinary-session `0x0A`/`0x0B` to the runtime when the endpoint has a state store
+/// and reports the redacted outcome. Store-less endpoints surface the unverified event instead.
+async fn group_frame_json(
+    store: Option<&Arc<StateStore>>,
+    identity: &EndpointIdentity,
+    session: &SessionBackend,
+    ev: SessionEvent,
+) -> PyResult<serde_json::Value> {
+    if let Some(store) = store {
+        let peer = session
+            .peer_device_id()
+            .ok_or_else(|| PyRuntimeError::new_err("session peer is not authenticated"))?;
+        let store = Arc::clone(store);
+        let local_id = identity.device_id();
+        let probe = ev.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            handle_session_group_frame(&store, &local_id, &peer, &probe)
+        })
+        .await
+        .map_err(py_err)?;
+        if let Some(outcome) = outcome {
+            return Ok(group_frame_outcome_json(&outcome));
+        }
+    }
+    match &ev {
+        SessionEvent::GroupManifestReceived(manifest) => Ok(serde_json::json!({
+            "status": "event",
+            "event": "group_manifest_unverified",
+            "group_id": manifest.group_id,
+            "seq": manifest.seq,
+            "manifest_json": manifest_json(manifest)?,
+        })),
+        SessionEvent::GroupRendezvousReceived(frame) => Ok(serde_json::json!({
+            "status": "event",
+            "event": "group_rendezvous_unverified",
+            "group_id": frame.group_id,
+            "seq": frame.seq,
+        })),
+        _ => Err(PyRuntimeError::new_err("not a group frame event")),
+    }
+}
+
+fn group_frame_outcome_json(outcome: &GroupFrameOutcome) -> serde_json::Value {
+    let kind = match outcome.kind {
+        GroupFrameKind::Manifest => "manifest",
+        GroupFrameKind::Rendezvous => "rendezvous",
+    };
+    let verdict = if outcome.ingested {
+        "ingested"
+    } else {
+        "rejected"
+    };
+    let mut val = serde_json::json!({
+        "status": "event",
+        "event": format!("group_{kind}_{verdict}"),
+        "group_id": outcome.group_id,
+        "seq": outcome.seq,
+    });
+    if let Some(error) = &outcome.error {
+        val["error"] = serde_json::Value::String(error.clone());
+    }
+    val
+}
+
+fn manifest_json(manifest: &GroupManifest) -> PyResult<String> {
+    let bytes = manifest.to_wire_bytes().map_err(py_err)?;
+    String::from_utf8(bytes).map_err(py_err)
+}
+
+fn report_json(report: &BroadcastReport) -> PyResult<String> {
+    serde_json::to_string(report).map_err(py_err)
+}
+
+fn group_event_json(event: &GroupEvent) -> String {
+    match event {
+        GroupEvent::AppData {
+            sender_device_id,
+            payload,
+        } => serde_json::json!({
+            "event": "app_data",
+            "sender_device_id": sender_device_id,
+            "payload_b64": b64url_encode(payload),
+        }),
+        GroupEvent::ManifestUpdated { seq } => serde_json::json!({
+            "event": "manifest_updated",
+            "seq": seq,
+        }),
+        GroupEvent::MemberJoined { device_id } => serde_json::json!({
+            "event": "member_joined",
+            "device_id": device_id,
+        }),
+        GroupEvent::MemberRevoked { device_id } => serde_json::json!({
+            "event": "member_revoked",
+            "device_id": device_id,
+        }),
+        GroupEvent::Audit(audit) => serde_json::json!({
+            "event": "audit",
+            "audit": audit,
+        }),
+    }
+    .to_string()
+}
+
+#[pyclass(frozen)]
+struct Group {
+    rt: Arc<Runtime>,
+    pool: Arc<GroupPool>,
+    local_endpoint: Option<String>,
+}
+
+impl Group {
+    fn ensure_open(&self) -> PyResult<()> {
+        if self.pool.is_closed() {
+            return Err(PyRuntimeError::new_err("group is closed"));
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl Group {
+    #[getter]
+    fn group_id(&self) -> String {
+        self.pool.group_id().to_owned()
+    }
+
+    #[getter]
+    fn local_endpoint(&self) -> Option<String> {
+        self.local_endpoint.clone()
+    }
+
+    #[pyo3(signature = (data, required_cap=None))]
+    fn broadcast(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        required_cap: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_open()?;
+        let payload = data.to_vec();
+        let cap = required_cap
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let rt = Arc::clone(&self.rt);
+        let pool = Arc::clone(&self.pool);
+        py.detach(move || {
+            let report = rt
+                .block_on(async move { pool.broadcast(cap.as_deref(), &payload).await })
+                .map_err(py_err)?;
+            report_json(&report)
+        })
+    }
+
+    fn sync(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_open()?;
+        let rt = Arc::clone(&self.rt);
+        let pool = self.pool.clone();
+        py.detach(move || {
+            let report = rt
+                .block_on(async move { pool.sync().await })
+                .map_err(py_err)?;
+            report_json(&report)
+        })
+    }
+
+    #[pyo3(signature = (timeout_ms=5000))]
+    fn poll_event(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Option<String>> {
+        self.ensure_open()?;
+        let rt = Arc::clone(&self.rt);
+        let pool = self.pool.clone();
+        let wait = Duration::from_millis(timeout_ms);
+        py.detach(move || {
+            Ok(rt
+                .block_on(async move { pool.poll_event(wait).await })
+                .map(|ev| group_event_json(&ev)))
+        })
+    }
+
+    fn authorize_peer(&self, py: Python<'_>, peer_id: &str, cap: &str) -> PyResult<bool> {
+        self.ensure_open()?;
+        let pool = self.pool.clone();
+        let peer_id = peer_id.to_owned();
+        let cap = cap.to_owned();
+        py.detach(move || {
+            pool.authorize_peer(&peer_id, &cap)
+                .map(|()| true)
+                .map_err(py_err)
+        })
+    }
+
+    fn close(&self, py: Python<'_>) {
+        let pool = self.pool.clone();
+        let rt = Arc::clone(&self.rt);
+        py.detach(move || {
+            let _guard = rt.enter();
+            pool.close();
+        });
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_value: Option<Py<PyAny>>,
+        _traceback: Option<Py<PyAny>>,
+    ) {
+        self.close(py);
+    }
+}
+
 #[pymodule]
 fn _tendril(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(device_id, m)?)?;
@@ -2538,5 +2944,6 @@ fn _tendril(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(verify_grant_json, m)?)?;
     m.add_class::<Endpoint>()?;
     m.add_class::<Session>()?;
+    m.add_class::<Group>()?;
     Ok(())
 }

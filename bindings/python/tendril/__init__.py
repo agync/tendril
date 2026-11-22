@@ -2,6 +2,7 @@
 
 from tendril._tendril import (
     Endpoint,
+    Group,
     Session,
     compute_code_mac,
     device_id,
@@ -14,6 +15,7 @@ from tendril._tendril import (
 
 __all__ = [
     "Endpoint",
+    "Group",
     "Session",
     "compute_code_mac",
     "device_id",
