@@ -8,6 +8,7 @@ use poly1305 as _;
 pub mod crypto;
 pub mod error;
 pub mod grants;
+pub mod group;
 pub mod identity;
 pub mod noise;
 pub mod pairing;

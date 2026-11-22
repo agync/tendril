@@ -15,6 +15,7 @@ extern "C" {
 
 typedef struct TendrilEndpoint TendrilEndpoint;
 typedef struct TendrilSession TendrilSession;
+typedef struct TendrilGroup TendrilGroup;
 
 enum TendrilResult {
     TENDRIL_OK = 0,
@@ -178,6 +179,76 @@ int32_t tendril_endpoint_pair_v2_initiate(TendrilEndpoint *ep, const char *endpo
 int32_t tendril_endpoint_pair_v2_accept(TendrilEndpoint *ep, uint64_t timeout_ms, char **out_json);
 TendrilSession *tendril_session_connect_v2(TendrilEndpoint *ep, const char *endpoint, const char *relay_host_opt, const char *target_host_id, const char *grant_json_opt);
 TendrilSession *tendril_session_accept_v2(TendrilEndpoint *ep, uint64_t timeout_ms);
+
+/*
+ * Group mesh. Admin calls need an endpoint with a state directory and return manifest JSON (public;
+ * rendezvous keys and pairwise secrets never cross this boundary). Free every out string with
+ * tendril_string_free. caps_json and endpoints_json are null or a JSON array of strings.
+ *
+ * Ordinary-session 0x0A/0x0B frames: tendril_session_poll_event hands them to the runtime on
+ * endpoints with a state directory and reports group_manifest_ingested, group_manifest_rejected,
+ * group_rendezvous_ingested or group_rendezvous_rejected ({group_id, seq, error?}). Store-less
+ * endpoints keep reporting group_manifest_unverified and group_rendezvous_unverified.
+ */
+int32_t tendril_group_create(
+    TendrilEndpoint *ep,
+    const char *name,
+    uint8_t min_wire_version,
+    const char *endpoints_json,
+    char **out_manifest_json
+);
+int32_t tendril_group_add_member(
+    TendrilEndpoint *ep,
+    const char *group_id,
+    const char *peer_id,
+    const char *caps_json,
+    const char *endpoints_json,
+    char **out_manifest_json
+);
+int32_t tendril_group_remove_member(
+    TendrilEndpoint *ep,
+    const char *group_id,
+    const char *peer_id,
+    char **out_manifest_json
+);
+/* sender_peer_id must be the authenticated peer that delivered the manifest. */
+int32_t tendril_group_ingest_manifest(
+    TendrilEndpoint *ep,
+    const char *manifest_json,
+    const char *sender_peer_id,
+    char **out_group_id
+);
+
+/*
+ * Opens a group handle (listen_addr may be NULL). The first open on an endpoint routes its inbound session streams through
+ * the group hub; configure transports before it. Ordinary sessions still arrive via
+ * tendril_session_accept and tendril_session_accept_v2.
+ */
+int32_t tendril_group_open(
+    TendrilEndpoint *ep,
+    const char *group_id,
+    const char *listen_addr,
+    TendrilGroup **out_group
+);
+/* Endpoint bound by listen_addr at open time; *out_endpoint is NULL when none (free otherwise). */
+int32_t tendril_group_local_endpoint(const TendrilGroup *group, char **out_endpoint);
+/* Pushes the manifest (and, for an admin, the rendezvous key) to members. Needed for wire v2 groups. */
+int32_t tendril_group_sync(TendrilGroup *group, char **out_report_json);
+/* required_cap may be null (default send capability). Report JSON: {delivered, offline, failed}. */
+int32_t tendril_group_broadcast(
+    TendrilGroup *group,
+    const char *required_cap,
+    const uint8_t *data_ptr,
+    size_t data_len,
+    char **out_report_json
+);
+/* Returns TENDRIL_OK with an event, TENDRIL_WOULD_BLOCK on timeout, TENDRIL_EOF when the pool is closed. */
+int32_t tendril_group_poll_event(TendrilGroup *group, uint64_t timeout_ms, char **out_event_json);
+/* TENDRIL_OK when peer_id holds cap; any refusal sets the last error. */
+int32_t tendril_group_authorize_peer(const TendrilGroup *group, const char *peer_id, const char *cap);
+/* Idempotent. Later calls on the handle return TENDRIL_ERR_CLOSED; tendril_group_free is safe after close. */
+int32_t tendril_group_close(TendrilGroup *group);
+void tendril_group_free(TendrilGroup *group);
 
 #ifdef __cplusplus
 }

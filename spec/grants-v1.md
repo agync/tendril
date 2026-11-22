@@ -30,6 +30,13 @@ namespace.verb:resource
 | `pair.mint` | Issue or delegate a narrower capability grant |
 | `roster.read` | Inspect known peers and grant status |
 | `roster.revoke` | Revoke a peer or grant nonce |
+| `group.admin:<group_id>/<hex_lower(SHA-256(signer_signing_pub))>` | Co-sign group manifests and deliver `0x0B` rendezvous keys, bound to one signing key; issued only as a root-signed grant, never inside a manifest (`spec/groups-v1.md`) |
+| `group.send:<group_id>` | Send application data to the peers of one group |
+| `group.recv:<group_id>` | Receive application data from the peers of one group |
+
+### 1.1.1 Group-Scoped Capabilities
+
+Capabilities carried in a `GroupManifest` member entry MUST have a `resource` equal to the `group_id` or beginning with `group_id + "/"` (`spec/groups-v1.md` rulings R5). A group root can therefore never grant `fs.*`, `shell.*`, or another group's resources through a manifest.
 
 ### 1.2 Capability Coverage Rules
 

@@ -2,6 +2,7 @@
 
 pub mod driver;
 pub mod error;
+pub mod group;
 pub mod provider;
 pub mod providers;
 pub mod rate_limit;
@@ -24,6 +25,14 @@ pub use driver::{
     drive_pair_initiator_with_timeout,
 };
 pub use error::RuntimeError;
+pub use group::{
+    ADMIN_SESSION_IDLE_TIMEOUT, BroadcastReport, DEFAULT_GROUP_DIAL_BUDGET, GroupEvent,
+    GroupFrameKind, GroupFrameOutcome, GroupHub, GroupPool, GroupPoolConfig, InboundSession,
+    MAX_ADMIN_SESSIONS, MAX_CONCURRENT_GROUP_DIALS, MAX_LOCAL_GROUPS, MAX_STORED_GROUPS,
+    check_group_capacity, default_group_caps, group_add_member, group_create, group_forget,
+    group_ingest_manifest, group_remove_member, handle_session_group_frame, ingest_pushed_manifest,
+    ingest_pushed_rendezvous, normalize_endpoint_hint,
+};
 pub use provider::{
     DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathReader, PathStream,
     PathWriter, PrefixedPathStream, peek_exact, recv_tendril_frame, send_tendril_frame,

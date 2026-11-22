@@ -1817,6 +1817,22 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                     }),
                     false,
                 ),
+                Ok(Ok(Some(SessionEvent::GroupManifestReceived(manifest)))) => (
+                    serde_json::json!({
+                        "ok": true,
+                        "event": "group_manifest_unverified",
+                        "group_id": manifest.group_id,
+                        "seq": manifest.seq,
+                    }),
+                    false,
+                ),
+                Ok(Ok(Some(SessionEvent::GroupRendezvousReceived(_)))) => (
+                    serde_json::json!({
+                        "ok": true,
+                        "event": "group_rendezvous_unverified",
+                    }),
+                    false,
+                ),
                 Ok(Ok(Some(SessionEvent::Closed { code, reason }))) => (
                     serde_json::json!({
                         "ok": true,

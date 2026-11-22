@@ -1688,3 +1688,221 @@ fn wire_v2_vectors_match_byte_for_byte() {
             .signing_pub
     );
 }
+
+mod group_vectors {
+    use super::{decode_hex_array, vectors_dir};
+    use std::fs;
+
+    use serde_json::Value;
+    use tendril_core::crypto::{HybridSigningPublicKey, SigningKeypair};
+    use tendril_core::error::CoreError;
+    use tendril_core::grants::{Grant, grant_signed_bytes, verify_grant_signature};
+    use tendril_core::group::{
+        GroupBook, GroupIngestStatus, GroupManifest, GroupSeq, derive_group_mailbox_secret,
+        derive_pair_bootstrap, encode_group_rendezvous_frame, group_id_from_root,
+        group_manifest_signed_bytes, verify_group_manifest,
+    };
+    use tendril_core::wire::{InnerFrameType, SessionHello, encode_inner_frame};
+
+    fn error_name(err: &CoreError) -> &'static str {
+        match err {
+            CoreError::InvalidGroupManifest(_) => "InvalidGroupManifest",
+            CoreError::InvalidGroupCapabilityScope(_) => "InvalidGroupCapabilityScope",
+            CoreError::GroupSeqRollback { .. } => "GroupSeqRollback",
+            CoreError::GroupManifestFork { .. } => "GroupManifestFork",
+            CoreError::GroupMemberRevoked(_) => "GroupMemberRevoked",
+            CoreError::GroupNotFound(_) => "GroupNotFound",
+            CoreError::GroupUnauthorized(_) => "GroupUnauthorized",
+            CoreError::GroupManifestTooLarge { .. } => "GroupManifestTooLarge",
+            CoreError::GroupWireDowngrade { .. } => "GroupWireDowngrade",
+            CoreError::InvalidSignature => "InvalidSignature",
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
+        v[key].as_str().unwrap_or_else(|| panic!("missing {key}"))
+    }
+
+    #[test]
+    fn groups_vectors_match_core() {
+        let text = fs::read_to_string(vectors_dir().join("groups.json")).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let now = v["now_unix"].as_u64().unwrap();
+
+        assert_eq!(
+            hex::decode(str_of(&v, "manifest_domain_hex")).unwrap(),
+            b"tendril-group-v1\0"
+        );
+
+        for (name, entry) in v["keys"].as_object().unwrap() {
+            let seed: [u8; 32] = decode_hex_array(str_of(entry, "signing_seed_hex"));
+            let sk = SigningKeypair::from_seed(seed);
+            assert_eq!(
+                hex::encode(sk.public_bytes()),
+                str_of(entry, "signing_pub_hex"),
+                "{name}"
+            );
+            let scalar: [u8; 32] = decode_hex_array(str_of(entry, "static_scalar_hex"));
+            let st = tendril_core::crypto::StaticKeypair::from_scalar(scalar);
+            assert_eq!(
+                hex::encode(st.public_bytes()),
+                str_of(entry, "static_pub_hex")
+            );
+            assert_eq!(st.device_id(), str_of(entry, "device_id"));
+        }
+
+        let gid = &v["group_id"];
+        let root_pub = HybridSigningPublicKey::from_bytes(
+            &hex::decode(str_of(gid, "root_signing_pub_hex")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(group_id_from_root(&root_pub), str_of(gid, "group_id"));
+
+        let chain = v["chain"].as_array().unwrap();
+        let mut book = GroupBook::new();
+        let mut parsed = Vec::new();
+        for entry in chain {
+            let manifest: GroupManifest =
+                serde_json::from_value(entry["manifest"].clone()).unwrap();
+            let signed = group_manifest_signed_bytes(&manifest.unsigned()).unwrap();
+            assert_eq!(hex::encode(&signed), str_of(entry, "signed_bytes_hex"));
+            assert_eq!(
+                manifest.to_wire_bytes().unwrap().len() as u64,
+                entry["wire_len"].as_u64().unwrap()
+            );
+            let verified = verify_group_manifest(&manifest, now, None).unwrap();
+            assert_eq!(verified.signed_bytes(), signed.as_slice());
+            book.ingest_group_manifest(&manifest, now, None).unwrap();
+            parsed.push(manifest);
+        }
+        assert!(!parsed[0].signer_signing_pub.is_some());
+        assert!(parsed[4].admin_grant.is_some() && parsed[4].signer_signing_pub.is_some());
+
+        let grant: Grant = serde_json::from_value(v["admin_grant"]["grant"].clone()).unwrap();
+        assert_eq!(
+            hex::encode(grant_signed_bytes(&grant.unsigned()).unwrap()),
+            str_of(&v["admin_grant"], "signed_bytes_hex")
+        );
+        verify_grant_signature(&grant, &root_pub).unwrap();
+        assert_eq!(parsed[4].admin_grant.as_ref(), Some(&grant));
+        let co_pub =
+            HybridSigningPublicKey::from_b64url(parsed[4].signer_signing_pub.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(
+            grant.caps,
+            vec![format!(
+                "group.admin:{}/{}",
+                str_of(gid, "group_id"),
+                hex::encode(co_pub.sha256_hash())
+            )]
+        );
+
+        for case in v["rejections"].as_array().unwrap() {
+            let name = str_of(case, "name");
+            let manifest: GroupManifest = serde_json::from_value(case["manifest"].clone()).unwrap();
+            let mut book = GroupBook::new();
+            if let Some(idx) = case["prior_index"].as_u64() {
+                for prior in &parsed[..=usize::try_from(idx).unwrap()] {
+                    book.ingest_group_manifest(prior, now, None).unwrap();
+                }
+            }
+            let err = book
+                .ingest_group_manifest(&manifest, now, None)
+                .expect_err(name);
+            assert_eq!(
+                error_name(&err),
+                str_of(case, "expected_error"),
+                "{name}: {err:?}"
+            );
+        }
+
+        for case in v["same_seq_replays"].as_array().unwrap() {
+            let name = str_of(case, "name");
+            let manifest: GroupManifest = serde_json::from_value(case["manifest"].clone()).unwrap();
+            let idx = usize::try_from(case["prior_index"].as_u64().unwrap()).unwrap();
+            let mut book = GroupBook::new();
+            for prior in &parsed[..=idx] {
+                book.ingest_group_manifest(prior, now, None).unwrap();
+            }
+            let outcome = book
+                .ingest_group_manifest(&manifest, now, None)
+                .expect(name);
+            assert_eq!(outcome.status, GroupIngestStatus::Unchanged, "{name}");
+        }
+
+        for case in v["parse_rejections"].as_array().unwrap() {
+            let bytes = serde_json::to_vec(&case["manifest"]).unwrap();
+            assert!(
+                matches!(
+                    GroupManifest::from_wire_bytes(&bytes),
+                    Err(CoreError::Json(_))
+                ),
+                "{}",
+                str_of(case, "name")
+            );
+        }
+        assert_eq!(v["limits"]["max_seq"].as_u64(), Some((1 << 53) - 1));
+        assert_eq!(v["limits"]["max_seq_jump"].as_u64(), Some(1024));
+
+        let pb = &v["pair_bootstrap"];
+        let key: [u8; 32] = decode_hex_array(str_of(pb, "group_rendezvous_key_hex"));
+        let out = derive_pair_bootstrap(
+            &key,
+            pb["seq"].as_u64().unwrap(),
+            str_of(pb, "id_a"),
+            str_of(pb, "id_b"),
+        );
+        assert_eq!(hex::encode(*out), str_of(pb, "output_hex"));
+        let swapped = derive_pair_bootstrap(
+            &key,
+            pb["seq"].as_u64().unwrap(),
+            str_of(pb, "id_b"),
+            str_of(pb, "id_a"),
+        );
+        assert_eq!(*out, *swapped);
+
+        let gm = &v["group_mailbox"];
+        let key: [u8; 32] = decode_hex_array(str_of(gm, "group_rendezvous_key_hex"));
+        let out = derive_group_mailbox_secret(
+            &key,
+            gm["seq"].as_u64().unwrap(),
+            str_of(gm, "member_device_id"),
+        );
+        assert_eq!(hex::encode(*out), str_of(gm, "output_hex"));
+
+        let rf = &v["rendezvous_frame"];
+        let key: [u8; 32] = decode_hex_array(str_of(rf, "group_rendezvous_key_hex"));
+        let frame = encode_group_rendezvous_frame(
+            str_of(rf, "group_id"),
+            rf["seq"].as_u64().unwrap(),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(hex::encode(&frame[..]), str_of(rf, "frame_hex"));
+        assert_eq!(
+            hex::encode(encode_inner_frame(InnerFrameType::GroupRendezvous, &frame[..]).unwrap()),
+            str_of(rf, "inner_frame_hex")
+        );
+
+        let hello: SessionHello =
+            serde_json::from_str(str_of(&v["session_hello_groups"], "json")).unwrap();
+        assert_eq!(
+            hello.groups,
+            Some(vec![
+                GroupSeq {
+                    group_id: str_of(gid, "group_id").to_string(),
+                    seq: 6
+                },
+                GroupSeq {
+                    group_id: "grp_0123456789abcdef".to_string(),
+                    seq: 1
+                },
+            ])
+        );
+        assert_eq!(
+            serde_json::to_string(&hello).unwrap(),
+            str_of(&v["session_hello_groups"], "json")
+        );
+    }
+}

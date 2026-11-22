@@ -206,6 +206,10 @@ pub struct Roster {
     trust_anchors: BTreeMap<String, TrustAnchor>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     burned_enrollment_nonces: BTreeMap<String, u64>,
+    #[serde(skip)]
+    signing_hash_pins: BTreeMap<String, [u8; 32]>,
+    #[serde(skip)]
+    rendezvous_alternates: BTreeMap<String, Vec<V2PeerSecrets>>,
 }
 
 impl Roster {
@@ -213,6 +217,100 @@ impl Roster {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pins `peer_id` to the SHA-256 hash of its hybrid signing key for this in-memory roster only.
+    ///
+    /// Initiator handshakes resolve the full key from `HostHello` through
+    /// [`Self::resolve_signing_pin`]. The pin is never serialized.
+    pub fn pin_signing_hash(&mut self, peer_id: &str, hash: [u8; 32]) -> Result<(), CoreError> {
+        let entry = self
+            .entries
+            .get(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+        if let Some(signing) = &entry.signing_pub
+            && !bool::from(signing.sha256_hash().ct_eq(&hash))
+        {
+            return Err(CoreError::HostKeyUnverified);
+        }
+        self.signing_hash_pins.insert(peer_id.to_string(), hash);
+        Ok(())
+    }
+
+    /// Reports whether `peer_id` carries an in-memory signing hash pin (a manifest-pinned sibling).
+    ///
+    /// Handshakes to such a peer accept exactly the pinned Noise static and signing key: a
+    /// `HostHello` rotation chain never advances the pin.
+    #[must_use]
+    pub fn is_manifest_pinned(&self, peer_id: &str) -> bool {
+        self.signing_hash_pins.contains_key(peer_id)
+    }
+
+    /// Registers an extra in-memory Wire v2 rendezvous secret under which a responder accepts
+    /// `msg1` from `peer_id`, in addition to the entry's own `v2_secrets`. Never serialized.
+    pub fn add_rendezvous_alternate(
+        &mut self,
+        peer_id: &str,
+        secrets: V2PeerSecrets,
+    ) -> Result<(), CoreError> {
+        if !self.entries.contains_key(peer_id) {
+            return Err(CoreError::PeerNotFound(peer_id.to_string()));
+        }
+        self.rendezvous_alternates
+            .entry(peer_id.to_string())
+            .or_default()
+            .push(secrets);
+        Ok(())
+    }
+
+    /// Drops every `Active` entry for which `keep(key, entry)` returns `false`, with its
+    /// in-memory signing hash pin and rendezvous alternates. `Pending` and `Revoked` entries are
+    /// always kept, so this only narrows trust and never undoes a revocation.
+    pub fn retain_active(&mut self, mut keep: impl FnMut(&str, &RosterEntry) -> bool) {
+        let dropped: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(k, e)| e.state == PeerState::Active && !keep(k, e))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in dropped {
+            self.entries.remove(&key);
+            self.signing_hash_pins.remove(&key);
+            self.rendezvous_alternates.remove(&key);
+        }
+    }
+
+    /// Returns the in-memory alternate rendezvous secrets registered for `peer_id`.
+    #[must_use]
+    pub fn rendezvous_alternates(&self, peer_id: &str) -> &[V2PeerSecrets] {
+        self.rendezvous_alternates
+            .get(peer_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Completes a hash-only signing pin for `peer_id` from the key presented in `HostHello`.
+    ///
+    /// A no-op when the entry already carries a full signing key or has no hash pin. A presented
+    /// key that does not hash to the pin is [`CoreError::HostKeyUnverified`].
+    pub fn resolve_signing_pin(
+        &mut self,
+        peer_id: &str,
+        presented: &HybridSigningPublicKey,
+    ) -> Result<(), CoreError> {
+        let Some(entry) = self.entries.get_mut(peer_id) else {
+            return Ok(());
+        };
+        if entry.signing_pub.is_some() {
+            return Ok(());
+        }
+        let Some(hash) = self.signing_hash_pins.get(peer_id) else {
+            return Ok(());
+        };
+        if !bool::from(presented.sha256_hash().ct_eq(hash)) {
+            return Err(CoreError::HostKeyUnverified);
+        }
+        entry.signing_pub = Some(presented.clone());
+        Ok(())
     }
 
     /// Looks up an entry by roster key (`host_id` or `device_id`).
@@ -1345,6 +1443,42 @@ mod tests {
             Err(CoreError::PeerRevoked(_))
         ));
         assert_eq!(tampered.lookup_active_signing_key("zz_active_host"), None);
+    }
+
+    #[test]
+    fn retain_active_drops_only_active_entries_and_their_pins() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+
+        let mut roster = Roster::new();
+        for (key, n) in [("active", 0x41), ("revoked", 0x42)] {
+            roster
+                .insert_pinned_host(
+                    key.to_string(),
+                    key.to_string(),
+                    *StaticKeypair::from_scalar([n; 32]).public_bytes(),
+                    None,
+                    0,
+                    vec![],
+                )
+                .unwrap();
+            roster
+                .pin_signing_hash(
+                    key,
+                    SigningKeypair::from_seed([n; 32])
+                        .public_key()
+                        .sha256_hash(),
+                )
+                .unwrap();
+            roster
+                .add_rendezvous_alternate(key, V2PeerSecrets::new([n; 32], [n; 32]))
+                .unwrap();
+        }
+        roster.revoke_peer("revoked").unwrap();
+        roster.retain_active(|_, _| false);
+        assert!(roster.get("active").is_none());
+        assert!(!roster.is_manifest_pinned("active"));
+        assert!(roster.rendezvous_alternates("active").is_empty());
+        assert_eq!(roster.get("revoked").unwrap().state, PeerState::Revoked);
     }
 
     #[test]

@@ -31,6 +31,10 @@ use crate::grants::{
     AuditEvent, Grant, RevocationList, authorize_grant, authorize_path_capability,
     verify_grant_with_chain,
 };
+use crate::group::{
+    GroupManifest, GroupRendezvousFrame, GroupSeq, decode_group_rendezvous_frame,
+    validate_group_seqs,
+};
 use crate::identity::{EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain_pin};
 use crate::noise::{MSG1_LEN, NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::pairing::{PairingManager, PairingPathKind, PinnedHost};
@@ -953,15 +957,44 @@ pub fn encode_dummy_cover_frame(bucket_size: usize) -> Result<Vec<u8>, CoreError
 }
 
 /// Decoded inner frame from a v2 transport plaintext.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum V2InnerFrame {
+    /// A decoded frame. The payload is wiped on drop because `0x0B` carries a group key.
     Frame {
         kind: InnerFrameType,
-        payload: Vec<u8>,
+        payload: Zeroizing<Vec<u8>>,
     },
     DummyCover {
         plaintext_len: usize,
     },
+}
+
+impl fmt::Debug for V2InnerFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Frame { kind, .. } if *kind == InnerFrameType::GroupRendezvous => f
+                .debug_struct("Frame")
+                .field("kind", kind)
+                .field("payload", &"<redacted>")
+                .finish(),
+            Self::Frame { kind, payload } => f
+                .debug_struct("Frame")
+                .field("kind", kind)
+                .field("payload", payload)
+                .finish(),
+            Self::DummyCover { plaintext_len } => f
+                .debug_struct("DummyCover")
+                .field("plaintext_len", plaintext_len)
+                .finish(),
+        }
+    }
+}
+
+const fn is_group_frame(kind: InnerFrameType) -> bool {
+    matches!(
+        kind,
+        InnerFrameType::GroupManifest | InnerFrameType::GroupRendezvous
+    )
 }
 
 /// Decodes a decrypted transport plaintext supporting `0x08` cover frames, `0x09` padded envelopes,
@@ -996,16 +1029,19 @@ pub fn decode_v2_inner_frame(
         }
         x if x == InnerFrameType::Padded as u8 => {
             let (kind, payload) = unpad_inner_frame(plaintext)?;
-            Ok(V2InnerFrame::Frame { kind, payload })
+            Ok(V2InnerFrame::Frame {
+                kind,
+                payload: Zeroizing::new(payload),
+            })
         }
         other => {
-            if !allow_unpadded_v1 {
+            if !allow_unpadded_v1 || !(0x01..=0x07).contains(&other) {
                 return Err(CoreError::UnknownInnerFrameType(other));
             }
             let (kind, payload) = decode_inner_frame(plaintext)?;
             Ok(V2InnerFrame::Frame {
                 kind,
-                payload: payload.to_vec(),
+                payload: Zeroizing::new(payload.to_vec()),
             })
         }
     }
@@ -1346,6 +1382,8 @@ impl SealedSession {
                 payload,
                 &self.padding,
             )?))
+        } else if is_group_frame(kind) {
+            Err(CoreError::UnknownInnerFrameType(kind as u8))
         } else {
             Ok(Zeroizing::new(encode_inner_frame(kind, payload)?))
         }
@@ -1475,19 +1513,25 @@ impl SealedSession {
 
     /// Decrypts and decodes an incoming transport frame.
     ///
-    /// In v1 mode (`!padding.is_enabled()`), rejects `0x08` and `0x09` (`UnknownInnerFrameType`).
+    /// In v1 mode (`!padding.is_enabled()`), rejects `0x08`, `0x09`, and the group frames
+    /// `0x0A`/`0x0B` (`UnknownInnerFrameType`); group frames travel only inside `0x09 PADDED`.
+    ///
+    /// A returned `0x0B GROUP_RENDEZVOUS` payload carries the group rendezvous key. Callers MUST
+    /// treat it as secret and wipe it (for example by moving it into `Zeroizing`) after decoding.
     /// In v2 mode, handles `0x08` cover and `0x09` padded frames, and automatically calls
     /// `rekey_incoming()` on `0x04 REKEY`.
     pub fn unseal(&mut self, ciphertext: &[u8]) -> Result<V2InnerFrame, CoreError> {
         let plaintext = self.transport.read_message_vec(ciphertext)?;
         let decoded = if !self.padding.enabled {
             let (kind, payload) = decode_inner_frame(&plaintext)?;
-            if matches!(kind, InnerFrameType::Padding | InnerFrameType::Padded) {
+            if matches!(kind, InnerFrameType::Padding | InnerFrameType::Padded)
+                || is_group_frame(kind)
+            {
                 return Err(CoreError::UnknownInnerFrameType(kind as u8));
             }
             V2InnerFrame::Frame {
                 kind,
-                payload: payload.to_vec(),
+                payload: Zeroizing::new(payload.to_vec()),
             }
         } else {
             decode_v2_inner_frame(&plaintext, !self.padding.require_padded_rx)?
@@ -1826,6 +1870,10 @@ pub enum V2SessionAction {
         issuer: String,
         seq: u64,
     },
+    /// Received `0x0A` manifest, parsed but not verified or ingested.
+    GroupManifestReceived(Box<GroupManifest>),
+    /// Received `0x0B` rendezvous frame, not yet authorized or ingested.
+    GroupRendezvousReceived(GroupRendezvousFrame),
     Rekeyed {
         direction: RekeyDirection,
     },
@@ -1858,6 +1906,7 @@ pub struct V2SessionInitiator {
     reconnect_secret: Zeroizing<[u8; 32]>,
     initial_grant: Option<Grant>,
     initial_crl_seq: Option<u64>,
+    initial_groups: Option<Vec<GroupSeq>>,
     active_grant: Option<Grant>,
     padding: PaddingPolicy,
     jitter: ScheduleJitterPolicy,
@@ -1902,6 +1951,7 @@ impl V2SessionInitiator {
             reconnect_secret: Zeroizing::new(reconnect_secret),
             initial_grant: initial_grant.clone(),
             initial_crl_seq: crl_seq,
+            initial_groups: None,
             active_grant: initial_grant,
             padding: PaddingPolicy::v2_default(),
             jitter: ScheduleJitterPolicy::default(),
@@ -1911,6 +1961,13 @@ impl V2SessionInitiator {
             #[cfg(any(test, feature = "test-utils"))]
             fixed_rendezvous_nonce: None,
         })
+    }
+
+    /// Sets the gossip summary advertised in the initiator `SessionHello` (before `msg3`).
+    pub fn set_local_groups(&mut self, groups: Vec<GroupSeq>) -> Result<(), CoreError> {
+        validate_group_seqs(&groups)?;
+        self.initial_groups = (!groups.is_empty()).then_some(groups);
+        Ok(())
     }
 
     /// Overrides ephemeral Noise randomness strictly in tests.
@@ -2094,6 +2151,7 @@ impl V2SessionInitiator {
                     return Err(CoreError::HostKeyUnverified);
                 }
 
+                roster.resolve_signing_pin(&self.target_host_id, &host_signing_pub)?;
                 let (pinned_static, pinned_signing) = match roster.get(&self.target_host_id) {
                     Some(entry) => {
                         check_wire_version(entry.min_wire_version, WIRE_VERSION_V2)?;
@@ -2116,30 +2174,36 @@ impl V2SessionInitiator {
                     }
                     None => return Err(CoreError::HostKeyUnverified),
                 };
-                if host_hello.rotation.is_empty()
-                    && peer_static == pinned_static
-                    && host_signing_pub != pinned_signing
-                {
-                    return Err(CoreError::HostKeyUnverified);
-                }
-                match roster.apply_verified_rotation(
-                    &self.target_host_id,
-                    &host_hello.rotation,
-                    &peer_static,
-                    &host_signing_pub,
-                ) {
-                    Ok(_) => {
-                        if !host_hello.rotation.is_empty() {
-                            self.applied_rotation = host_hello.rotation;
-                        }
+                if roster.is_manifest_pinned(&self.target_host_id) {
+                    if peer_static != pinned_static || host_signing_pub != pinned_signing {
+                        return Err(CoreError::HostKeyUnverified);
                     }
-                    Err(
-                        err @ (CoreError::RotationForkDetected { .. }
-                        | CoreError::IncompletePin(_)
-                        | CoreError::PeerPending(_)
-                        | CoreError::PeerRevoked(_)),
-                    ) => return Err(err),
-                    Err(_) => return Err(CoreError::HostKeyUnverified),
+                } else {
+                    if host_hello.rotation.is_empty()
+                        && peer_static == pinned_static
+                        && host_signing_pub != pinned_signing
+                    {
+                        return Err(CoreError::HostKeyUnverified);
+                    }
+                    match roster.apply_verified_rotation(
+                        &self.target_host_id,
+                        &host_hello.rotation,
+                        &peer_static,
+                        &host_signing_pub,
+                    ) {
+                        Ok(_) => {
+                            if !host_hello.rotation.is_empty() {
+                                self.applied_rotation = host_hello.rotation;
+                            }
+                        }
+                        Err(
+                            err @ (CoreError::RotationForkDetected { .. }
+                            | CoreError::IncompletePin(_)
+                            | CoreError::PeerPending(_)
+                            | CoreError::PeerRevoked(_)),
+                        ) => return Err(err),
+                        Err(_) => return Err(CoreError::HostKeyUnverified),
+                    }
                 }
                 roster.set_peer_min_wire_version(&self.target_host_id, WIRE_VERSION_V2)?;
 
@@ -2147,6 +2211,7 @@ impl V2SessionInitiator {
                     device_id: self.local_device_id.clone(),
                     grant: self.initial_grant.clone(),
                     crl_seq: self.initial_crl_seq,
+                    groups: self.initial_groups.clone(),
                 };
                 let hello_bytes = Zeroizing::new(
                     serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -2199,74 +2264,86 @@ impl V2SessionInitiator {
     ) -> Result<(), CoreError> {
         match decoded {
             V2InnerFrame::DummyCover { .. } => {}
-            V2InnerFrame::Frame { kind, payload } => match kind {
-                InnerFrameType::Data => actions.push(V2SessionAction::AppData(payload)),
-                InnerFrameType::Grant => {
-                    let grant: Grant = serde_json::from_slice(&payload)
-                        .map_err(|err| CoreError::Json(err.to_string()))?;
-                    let root_id = self.target_host_id.clone();
-                    let subject = self.local_device_id.clone();
-                    verify_grant_with_chain(
-                        &grant,
-                        &subject,
-                        &root_id,
-                        now_unix,
-                        roster.crl(&root_id),
-                        |issuer| roster.lookup_active_signing_key(issuer),
-                    )?;
-                    self.active_grant = Some(grant.clone());
-                    actions.push(V2SessionAction::GrantUpdated(grant));
+            V2InnerFrame::Frame { kind, mut payload } => {
+                match kind {
+                    InnerFrameType::Data => {
+                        actions.push(V2SessionAction::AppData(std::mem::take(&mut *payload)));
+                    }
+                    InnerFrameType::Grant => {
+                        let grant: Grant = serde_json::from_slice(&payload)
+                            .map_err(|err| CoreError::Json(err.to_string()))?;
+                        let root_id = self.target_host_id.clone();
+                        let subject = self.local_device_id.clone();
+                        verify_grant_with_chain(
+                            &grant,
+                            &subject,
+                            &root_id,
+                            now_unix,
+                            roster.crl(&root_id),
+                            |issuer| roster.lookup_active_signing_key(issuer),
+                        )?;
+                        self.active_grant = Some(grant.clone());
+                        actions.push(V2SessionAction::GrantUpdated(grant));
+                    }
+                    InnerFrameType::Revocation => {
+                        let crl: RevocationList = serde_json::from_slice(&payload)
+                            .map_err(|err| CoreError::Json(err.to_string()))?;
+                        let root_id = self.target_host_id.clone();
+                        let root_pub = roster
+                            .lookup_active_signing_key(&root_id)
+                            .ok_or_else(|| CoreError::IncompletePin(root_id.clone()))?;
+                        let seq = crl.seq;
+                        roster.ingest_crl(crl, &root_id, &root_pub)?;
+                        actions.push(V2SessionAction::RevocationUpdated {
+                            issuer: root_id,
+                            seq,
+                        });
+                        self.verify_peer_and_active_grant(now_unix, roster)?;
+                    }
+                    InnerFrameType::GroupManifest => {
+                        let manifest = GroupManifest::from_wire_bytes(&payload)?;
+                        actions.push(V2SessionAction::GroupManifestReceived(Box::new(manifest)));
+                    }
+                    InnerFrameType::GroupRendezvous => {
+                        let frame = decode_group_rendezvous_frame(&payload)?;
+                        actions.push(V2SessionAction::GroupRendezvousReceived(frame));
+                    }
+                    InnerFrameType::Rekey => {
+                        self.verify_peer_and_active_grant(now_unix, roster)?;
+                        actions.push(V2SessionAction::Rekeyed {
+                            direction: RekeyDirection::Incoming,
+                        });
+                    }
+                    InnerFrameType::Ping => {
+                        let cookie: [u8; 8] = payload.as_slice().try_into().map_err(|_| {
+                            CoreError::InvalidInnerFramePayload("PING must be 8 bytes")
+                        })?;
+                        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
+                            return Err(CoreError::NotReady("v2 session not established"));
+                        };
+                        let mut reply =
+                            seal_transport_action(sealed, InnerFrameType::Pong, &cookie, now_ms)?;
+                        actions.append(&mut reply);
+                    }
+                    InnerFrameType::Pong => {
+                        let cookie: [u8; 8] = payload.as_slice().try_into().map_err(|_| {
+                            CoreError::InvalidInnerFramePayload("PONG must be 8 bytes")
+                        })?;
+                        actions.push(V2SessionAction::PongReceived(u64::from_be_bytes(cookie)));
+                    }
+                    InnerFrameType::Close => {
+                        let code = u16::from_be_bytes([payload[0], payload[1]]);
+                        let reason = String::from_utf8(payload[2..].to_vec()).map_err(|_| {
+                            CoreError::InvalidInnerFramePayload("CLOSE reason must be UTF-8")
+                        })?;
+                        self.phase = V2InitPhase::Closed;
+                        actions.push(V2SessionAction::CloseTransport { code, reason });
+                    }
+                    InnerFrameType::Padding | InnerFrameType::Padded => {
+                        return Err(CoreError::UnknownInnerFrameType(kind as u8));
+                    }
                 }
-                InnerFrameType::Revocation => {
-                    let crl: RevocationList = serde_json::from_slice(&payload)
-                        .map_err(|err| CoreError::Json(err.to_string()))?;
-                    let root_id = self.target_host_id.clone();
-                    let root_pub = roster
-                        .lookup_active_signing_key(&root_id)
-                        .ok_or_else(|| CoreError::IncompletePin(root_id.clone()))?;
-                    let seq = crl.seq;
-                    roster.ingest_crl(crl, &root_id, &root_pub)?;
-                    actions.push(V2SessionAction::RevocationUpdated {
-                        issuer: root_id,
-                        seq,
-                    });
-                    self.verify_peer_and_active_grant(now_unix, roster)?;
-                }
-                InnerFrameType::Rekey => {
-                    self.verify_peer_and_active_grant(now_unix, roster)?;
-                    actions.push(V2SessionAction::Rekeyed {
-                        direction: RekeyDirection::Incoming,
-                    });
-                }
-                InnerFrameType::Ping => {
-                    let cookie: [u8; 8] = payload
-                        .try_into()
-                        .map_err(|_| CoreError::InvalidInnerFramePayload("PING must be 8 bytes"))?;
-                    let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-                        return Err(CoreError::NotReady("v2 session not established"));
-                    };
-                    let mut reply =
-                        seal_transport_action(sealed, InnerFrameType::Pong, &cookie, now_ms)?;
-                    actions.append(&mut reply);
-                }
-                InnerFrameType::Pong => {
-                    let cookie: [u8; 8] = payload
-                        .try_into()
-                        .map_err(|_| CoreError::InvalidInnerFramePayload("PONG must be 8 bytes"))?;
-                    actions.push(V2SessionAction::PongReceived(u64::from_be_bytes(cookie)));
-                }
-                InnerFrameType::Close => {
-                    let code = u16::from_be_bytes([payload[0], payload[1]]);
-                    let reason = String::from_utf8(payload[2..].to_vec()).map_err(|_| {
-                        CoreError::InvalidInnerFramePayload("CLOSE reason must be UTF-8")
-                    })?;
-                    self.phase = V2InitPhase::Closed;
-                    actions.push(V2SessionAction::CloseTransport { code, reason });
-                }
-                InnerFrameType::Padding | InnerFrameType::Padded => {
-                    return Err(CoreError::UnknownInnerFrameType(kind as u8));
-                }
-            },
+            }
         }
         Ok(())
     }
@@ -2425,6 +2502,31 @@ impl V2SessionInitiator {
         seal_transport_action(sealed, InnerFrameType::Revocation, &json, now_ms)
     }
 
+    /// Seals a `0x0A GROUP_MANIFEST` frame.
+    pub fn seal_group_manifest(
+        &mut self,
+        manifest: &GroupManifest,
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        let json = manifest.to_wire_bytes()?;
+        seal_transport_action(sealed, InnerFrameType::GroupManifest, &json, now_ms)
+    }
+
+    /// Seals a `0x0B GROUP_RENDEZVOUS` frame carrying exactly 60 bytes.
+    pub fn seal_group_rendezvous(
+        &mut self,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        seal_transport_action(sealed, InnerFrameType::GroupRendezvous, payload, now_ms)
+    }
+
     /// Seals a `0x08 PADDING` cover frame sized to `bucket`.
     pub fn seal_dummy_cover(
         &mut self,
@@ -2539,8 +2641,10 @@ pub struct V2SessionResponder {
     peer_device_id: Option<String>,
     peer_static_pub: Option<[u8; 32]>,
     peer_crl_seq: Option<u64>,
+    peer_groups: Option<Vec<GroupSeq>>,
     active_grant: Option<Grant>,
     exported_secrets: Option<V2PeerSecrets>,
+    matched_rendezvous_secret: Option<Zeroizing<[u8; 32]>>,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_ephemeral: Option<[u8; 32]>,
 }
@@ -2572,8 +2676,10 @@ impl V2SessionResponder {
             peer_device_id: None,
             peer_static_pub: None,
             peer_crl_seq: None,
+            peer_groups: None,
             active_grant: None,
             exported_secrets: None,
+            matched_rendezvous_secret: None,
             #[cfg(any(test, feature = "test-utils"))]
             fixed_ephemeral: None,
         })
@@ -2585,6 +2691,15 @@ impl V2SessionResponder {
     pub fn with_fixed_ephemeral_for_testing_only(mut self, eph_seed: [u8; 32]) -> Self {
         self.fixed_ephemeral = Some(eph_seed);
         self
+    }
+
+    /// Returns the reconnect secret under which the initiator's `msg1` rendezvous MAC verified.
+    ///
+    /// Lets a caller tell which of a peer's candidate secrets (its own `v2_secrets` or a
+    /// registered alternate) admitted the session. The value is secret.
+    #[must_use]
+    pub fn matched_rendezvous_secret(&self) -> Option<&[u8; 32]> {
+        self.matched_rendezvous_secret.as_deref()
     }
 
     /// Overrides the v2 padding policy used once established.
@@ -2616,6 +2731,12 @@ impl V2SessionResponder {
     #[must_use]
     pub const fn peer_crl_seq(&self) -> Option<u64> {
         self.peer_crl_seq
+    }
+
+    /// Returns the group gossip summary advertised by the initiator in `SessionHello`, if any.
+    #[must_use]
+    pub fn peer_groups(&self) -> Option<&[GroupSeq]> {
+        self.peer_groups.as_deref()
     }
 
     /// Returns the currently verified capability grant associated with this session, if any.
@@ -2757,33 +2878,31 @@ impl V2SessionResponder {
                 let cache_accepts =
                     payload_valid_len && replay_cache.can_accept(&r_nonce, now_unix);
 
-                for (_, entry) in roster.entries() {
-                    let active_secret = if entry.state == PeerState::Active {
-                        entry.v2_secrets.as_ref().map(|s| s.reconnect_secret())
-                    } else {
-                        None
-                    };
-                    let key_ref = active_secret.unwrap_or(&dummy_key);
-                    let mac_ok = verify_rendezvous_mac(
-                        key_ref,
-                        &preamble,
-                        &re_i,
-                        &ek_hash,
-                        &r_nonce,
-                        ts_unix,
-                        &candidate_mac,
-                    );
-                    if payload_valid_len
-                        && active_secret.is_some()
-                        && ts_fresh
-                        && cache_accepts
-                        && mac_ok
-                    {
-                        matched = Some((
-                            entry.device_id.clone(),
-                            entry.static_pub,
-                            Zeroizing::new(*key_ref),
-                        ));
+                for (key, entry) in roster.entries() {
+                    let active = entry.state == PeerState::Active;
+                    let candidates = entry
+                        .v2_secrets
+                        .iter()
+                        .chain(roster.rendezvous_alternates(key))
+                        .map(|s| s.reconnect_secret());
+                    for candidate in candidates {
+                        let key_ref = if active { candidate } else { &dummy_key };
+                        let mac_ok = verify_rendezvous_mac(
+                            key_ref,
+                            &preamble,
+                            &re_i,
+                            &ek_hash,
+                            &r_nonce,
+                            ts_unix,
+                            &candidate_mac,
+                        );
+                        if payload_valid_len && active && ts_fresh && cache_accepts && mac_ok {
+                            matched = Some((
+                                entry.device_id.clone(),
+                                entry.static_pub,
+                                Zeroizing::new(*key_ref),
+                            ));
+                        }
                     }
                 }
 
@@ -2823,6 +2942,7 @@ impl V2SessionResponder {
                     let msg2 = hs.write_msg2_with_hash(|h_pre| {
                         seal_v2_hello_envelope(&secret, &r_nonce, h_pre, &hello_json)
                     })?;
+                    self.matched_rendezvous_secret = Some(secret);
                     (msg2, Some((peer_id, peer_static)))
                 } else {
                     let mut decoy = vec![0u8; decoy_bucket];
@@ -2902,6 +3022,7 @@ impl V2SessionResponder {
                     now_ms,
                 );
                 self.peer_crl_seq = hello.crl_seq;
+                self.peer_groups = hello.groups;
                 self.peer_device_id = Some(canonical_peer_id.clone());
                 self.peer_static_pub = Some(peer_static);
                 self.phase = V2RespPhase::Transport(Box::new(sealed));
@@ -2936,76 +3057,88 @@ impl V2SessionResponder {
     ) -> Result<(), CoreError> {
         match decoded {
             V2InnerFrame::DummyCover { .. } => {}
-            V2InnerFrame::Frame { kind, payload } => match kind {
-                InnerFrameType::Data => actions.push(V2SessionAction::AppData(payload)),
-                InnerFrameType::Grant => {
-                    let grant: Grant = serde_json::from_slice(&payload)
-                        .map_err(|err| CoreError::Json(err.to_string()))?;
-                    let root_id = self.local_host_id.clone();
-                    let subject = self
-                        .peer_device_id
-                        .as_deref()
-                        .ok_or(CoreError::NotReady("missing peer device_id"))?
-                        .to_string();
-                    verify_grant_with_chain(
-                        &grant,
-                        &subject,
-                        &root_id,
-                        now_unix,
-                        roster.crl(&root_id),
-                        |issuer| self.lookup_issuer_key(roster, issuer),
-                    )?;
-                    self.active_grant = Some(grant.clone());
-                    actions.push(V2SessionAction::GrantUpdated(grant));
+            V2InnerFrame::Frame { kind, mut payload } => {
+                match kind {
+                    InnerFrameType::Data => {
+                        actions.push(V2SessionAction::AppData(std::mem::take(&mut *payload)));
+                    }
+                    InnerFrameType::Grant => {
+                        let grant: Grant = serde_json::from_slice(&payload)
+                            .map_err(|err| CoreError::Json(err.to_string()))?;
+                        let root_id = self.local_host_id.clone();
+                        let subject = self
+                            .peer_device_id
+                            .as_deref()
+                            .ok_or(CoreError::NotReady("missing peer device_id"))?
+                            .to_string();
+                        verify_grant_with_chain(
+                            &grant,
+                            &subject,
+                            &root_id,
+                            now_unix,
+                            roster.crl(&root_id),
+                            |issuer| self.lookup_issuer_key(roster, issuer),
+                        )?;
+                        self.active_grant = Some(grant.clone());
+                        actions.push(V2SessionAction::GrantUpdated(grant));
+                    }
+                    InnerFrameType::Revocation => {
+                        let crl: RevocationList = serde_json::from_slice(&payload)
+                            .map_err(|err| CoreError::Json(err.to_string()))?;
+                        let root_id = self.local_host_id.clone();
+                        let root_pub = self.local_signing_pub.clone();
+                        let seq = crl.seq;
+                        roster.ingest_crl(crl, &root_id, &root_pub)?;
+                        actions.push(V2SessionAction::RevocationUpdated {
+                            issuer: root_id,
+                            seq,
+                        });
+                        self.verify_peer_and_active_grant(now_unix, roster)?;
+                    }
+                    InnerFrameType::GroupManifest => {
+                        let manifest = GroupManifest::from_wire_bytes(&payload)?;
+                        actions.push(V2SessionAction::GroupManifestReceived(Box::new(manifest)));
+                    }
+                    InnerFrameType::GroupRendezvous => {
+                        let frame = decode_group_rendezvous_frame(&payload)?;
+                        actions.push(V2SessionAction::GroupRendezvousReceived(frame));
+                    }
+                    InnerFrameType::Rekey => {
+                        self.verify_peer_and_active_grant(now_unix, roster)?;
+                        actions.push(V2SessionAction::Rekeyed {
+                            direction: RekeyDirection::Incoming,
+                        });
+                    }
+                    InnerFrameType::Ping => {
+                        let cookie: [u8; 8] = payload.as_slice().try_into().map_err(|_| {
+                            CoreError::InvalidInnerFramePayload("PING must be 8 bytes")
+                        })?;
+                        let V2RespPhase::Transport(ref mut sealed) = self.phase else {
+                            return Err(CoreError::NotReady("v2 session not established"));
+                        };
+                        let mut reply =
+                            seal_transport_action(sealed, InnerFrameType::Pong, &cookie, now_ms)?;
+                        actions.append(&mut reply);
+                    }
+                    InnerFrameType::Pong => {
+                        let cookie: [u8; 8] = payload.as_slice().try_into().map_err(|_| {
+                            CoreError::InvalidInnerFramePayload("PONG must be 8 bytes")
+                        })?;
+                        actions.push(V2SessionAction::PongReceived(u64::from_be_bytes(cookie)));
+                    }
+                    InnerFrameType::Close => {
+                        let code = u16::from_be_bytes([payload[0], payload[1]]);
+                        let reason = String::from_utf8(payload[2..].to_vec()).map_err(|_| {
+                            CoreError::InvalidInnerFramePayload("CLOSE reason must be UTF-8")
+                        })?;
+                        self.phase = V2RespPhase::Closed;
+                        actions.push(V2SessionAction::CloseTransport { code, reason });
+                    }
+                    InnerFrameType::Padding | InnerFrameType::Padded => {
+                        return Err(CoreError::UnknownInnerFrameType(kind as u8));
+                    }
                 }
-                InnerFrameType::Revocation => {
-                    let crl: RevocationList = serde_json::from_slice(&payload)
-                        .map_err(|err| CoreError::Json(err.to_string()))?;
-                    let root_id = self.local_host_id.clone();
-                    let root_pub = self.local_signing_pub.clone();
-                    let seq = crl.seq;
-                    roster.ingest_crl(crl, &root_id, &root_pub)?;
-                    actions.push(V2SessionAction::RevocationUpdated {
-                        issuer: root_id,
-                        seq,
-                    });
-                    self.verify_peer_and_active_grant(now_unix, roster)?;
-                }
-                InnerFrameType::Rekey => {
-                    self.verify_peer_and_active_grant(now_unix, roster)?;
-                    actions.push(V2SessionAction::Rekeyed {
-                        direction: RekeyDirection::Incoming,
-                    });
-                }
-                InnerFrameType::Ping => {
-                    let cookie: [u8; 8] = payload
-                        .try_into()
-                        .map_err(|_| CoreError::InvalidInnerFramePayload("PING must be 8 bytes"))?;
-                    let V2RespPhase::Transport(ref mut sealed) = self.phase else {
-                        return Err(CoreError::NotReady("v2 session not established"));
-                    };
-                    let mut reply =
-                        seal_transport_action(sealed, InnerFrameType::Pong, &cookie, now_ms)?;
-                    actions.append(&mut reply);
-                }
-                InnerFrameType::Pong => {
-                    let cookie: [u8; 8] = payload
-                        .try_into()
-                        .map_err(|_| CoreError::InvalidInnerFramePayload("PONG must be 8 bytes"))?;
-                    actions.push(V2SessionAction::PongReceived(u64::from_be_bytes(cookie)));
-                }
-                InnerFrameType::Close => {
-                    let code = u16::from_be_bytes([payload[0], payload[1]]);
-                    let reason = String::from_utf8(payload[2..].to_vec()).map_err(|_| {
-                        CoreError::InvalidInnerFramePayload("CLOSE reason must be UTF-8")
-                    })?;
-                    self.phase = V2RespPhase::Closed;
-                    actions.push(V2SessionAction::CloseTransport { code, reason });
-                }
-                InnerFrameType::Padding | InnerFrameType::Padded => {
-                    return Err(CoreError::UnknownInnerFrameType(kind as u8));
-                }
-            },
+            }
         }
         Ok(())
     }
@@ -3168,6 +3301,31 @@ impl V2SessionResponder {
             serde_json::to_vec(crl).map_err(|err| CoreError::Json(err.to_string()))?,
         );
         seal_transport_action(sealed, InnerFrameType::Revocation, &json, now_ms)
+    }
+
+    /// Seals a `0x0A GROUP_MANIFEST` frame.
+    pub fn seal_group_manifest(
+        &mut self,
+        manifest: &GroupManifest,
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2RespPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        let json = manifest.to_wire_bytes()?;
+        seal_transport_action(sealed, InnerFrameType::GroupManifest, &json, now_ms)
+    }
+
+    /// Seals a `0x0B GROUP_RENDEZVOUS` frame carrying exactly 60 bytes.
+    pub fn seal_group_rendezvous(
+        &mut self,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2RespPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        seal_transport_action(sealed, InnerFrameType::GroupRendezvous, payload, now_ms)
     }
 
     /// Seals a `0x08 PADDING` cover frame sized to `bucket`.

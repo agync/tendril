@@ -167,6 +167,33 @@ pub enum CoreError {
 
     #[error("read buffer limit exceeded: {len} > {max}")]
     BufferOverflow { len: usize, max: usize },
+
+    #[error("invalid group manifest: {0}")]
+    InvalidGroupManifest(String),
+
+    #[error("group capability outside group scope: {0}")]
+    InvalidGroupCapabilityScope(String),
+
+    #[error("group manifest sequence rollback: current {current}, got {got}")]
+    GroupSeqRollback { current: u64, got: u64 },
+
+    #[error("group manifest fork detected at sequence {seq}")]
+    GroupManifestFork { seq: u64 },
+
+    #[error("group member is revoked: {0}")]
+    GroupMemberRevoked(String),
+
+    #[error("group not found: {0}")]
+    GroupNotFound(String),
+
+    #[error("group authorization denied: {0}")]
+    GroupUnauthorized(String),
+
+    #[error("group manifest too large: {len} > {max}")]
+    GroupManifestTooLarge { len: usize, max: usize },
+
+    #[error("group wire version downgrade rejected: stored floor v{current}, got v{got}")]
+    GroupWireDowngrade { current: u8, got: u8 },
 }
 
 impl CoreError {

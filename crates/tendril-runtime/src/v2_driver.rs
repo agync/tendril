@@ -11,6 +11,7 @@ use tendril_core::grants::{
     AuditEvent, Grant, RevocationList, authorize_grant, authorize_path_capability,
     verify_grant_with_chain,
 };
+use tendril_core::group::{GroupManifest, GroupSeq, V2GroupSecrets, decode_group_rendezvous_frame};
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
 use tendril_core::pairing::{PairingManager, PairingPathKind};
 use tendril_core::policy::{CandidateEndpoint, PathPolicyConfig, ProviderId};
@@ -926,8 +927,10 @@ impl V2TransportCore {
         let mut should_close = false;
         match decoded {
             V2InnerFrame::DummyCover { .. } => {}
-            V2InnerFrame::Frame { kind, payload } => match kind {
-                InnerFrameType::Data => events.push(SessionEvent::AppData(payload)),
+            V2InnerFrame::Frame { kind, mut payload } => match kind {
+                InnerFrameType::Data => {
+                    events.push(SessionEvent::AppData(std::mem::take(&mut *payload)));
+                }
                 InnerFrameType::Grant => {
                     let grant: Grant = serde_json::from_slice(&payload)
                         .map_err(|err| CoreError::Json(err.to_string()))?;
@@ -1006,6 +1009,7 @@ impl V2TransportCore {
                 }
                 InnerFrameType::Pong => {
                     let cookie: [u8; 8] = payload
+                        .as_slice()
                         .try_into()
                         .map_err(|_| CoreError::InvalidInnerFramePayload("PONG must be 8 bytes"))?;
                     events.push(SessionEvent::PongReceived(u64::from_be_bytes(cookie)));
@@ -1018,6 +1022,14 @@ impl V2TransportCore {
                     self.closed = true;
                     should_close = true;
                     events.push(SessionEvent::Closed { code, reason });
+                }
+                InnerFrameType::GroupManifest => {
+                    let manifest = GroupManifest::from_wire_bytes(&payload)?;
+                    events.push(SessionEvent::GroupManifestReceived(Box::new(manifest)));
+                }
+                InnerFrameType::GroupRendezvous => {
+                    let frame = decode_group_rendezvous_frame(&payload)?;
+                    events.push(SessionEvent::GroupRendezvousReceived(frame));
                 }
                 InnerFrameType::Padding | InnerFrameType::Padded => {
                     return Err(CoreError::UnknownInnerFrameType(kind as u8));
@@ -1171,8 +1183,10 @@ pub struct V2SessionDriver {
     started_at: Instant,
     peer_static_pub: [u8; 32],
     peer_crl_seq: Option<u64>,
+    peer_groups: Option<Vec<GroupSeq>>,
     applied_rotation: Vec<RotationRecord>,
     exported_secrets: Option<V2PeerSecrets>,
+    matched_rendezvous: Option<Zeroizing<[u8; 32]>>,
     jitter: ScheduleJitterPolicy,
     store: Option<StateStore>,
     _half_open: Option<HalfOpenGuard>,
@@ -1244,6 +1258,7 @@ impl V2SessionDriver {
             PaddingPolicy::v2_default(),
             V2RosterRef::Direct(roster),
             now_unix,
+            Vec::new(),
         )
         .await
     }
@@ -1272,6 +1287,7 @@ impl V2SessionDriver {
             padding,
             V2RosterRef::Direct(roster),
             now_unix,
+            Vec::new(),
         )
         .await
     }
@@ -1305,6 +1321,36 @@ impl V2SessionDriver {
             PaddingPolicy::v2_default(),
             V2RosterRef::Locked(roster),
             now_unix,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Initiates a Wire v2 session to a group sibling using `reconnect_secret` (the persisted
+    /// pairwise secret or the group `pair_bootstrap`) and a mutex-guarded roster, advertising
+    /// `groups` in the initiator `SessionHello`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_group_member(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        reconnect_secret: [u8; 32],
+        padding: PaddingPolicy,
+        roster: &Mutex<Roster>,
+        groups: Vec<GroupSeq>,
+        now_unix: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::connect_with_roster_ref(
+            stream,
+            local_identity,
+            target_host_id,
+            Zeroizing::new(reconnect_secret),
+            None,
+            None,
+            padding,
+            V2RosterRef::Locked(roster),
+            now_unix,
+            groups,
         )
         .await
     }
@@ -1444,6 +1490,7 @@ impl V2SessionDriver {
         padding: PaddingPolicy,
         mut roster: V2RosterRef<'_>,
         now_unix: u64,
+        groups: Vec<GroupSeq>,
     ) -> Result<Self, RuntimeError> {
         let started_at = Instant::now();
         let mut machine = V2SessionInitiator::new(
@@ -1454,6 +1501,7 @@ impl V2SessionDriver {
             crl_seq,
         )?
         .with_padding_policy(padding);
+        machine.set_local_groups(groups)?;
         let deadline = TokioInstant::now() + DEFAULT_PRE_AUTH_TIMEOUT;
         let start_actions = machine.start(now_unix)?;
         for action in start_actions {
@@ -1534,8 +1582,10 @@ impl V2SessionDriver {
             started_at,
             peer_static_pub: peer_static,
             peer_crl_seq: None,
+            peer_groups: None,
             applied_rotation,
             exported_secrets,
+            matched_rendezvous: None,
             jitter: ScheduleJitterPolicy::default(),
             store: None,
             _half_open: None,
@@ -1877,8 +1927,12 @@ impl V2SessionDriver {
             RuntimeError::Protocol("missing peer static key after v2 establish".to_owned())
         })?;
         let peer_crl_seq = machine.peer_crl_seq();
+        let peer_groups = machine.peer_groups().map(<[GroupSeq]>::to_vec);
         let active_grant = machine.active_grant().cloned();
         let exported_secrets = machine.exported_v2_secrets().cloned();
+        let matched_rendezvous = machine
+            .matched_rendezvous_secret()
+            .map(|s| Zeroizing::new(*s));
         let sealed = machine.into_sealed_session()?;
 
         Ok(Self {
@@ -1899,8 +1953,10 @@ impl V2SessionDriver {
             started_at,
             peer_static_pub: peer_static,
             peer_crl_seq,
+            peer_groups,
             applied_rotation: Vec::new(),
             exported_secrets,
+            matched_rendezvous,
             jitter: state.config.jitter,
             store: disk_store,
             _half_open: half_open,
@@ -1931,6 +1987,51 @@ impl V2SessionDriver {
             });
         }
         Ok(())
+    }
+
+    /// Sends encrypted, bucket-padded `0x0A GROUP_MANIFEST`.
+    pub async fn send_group_manifest(
+        &mut self,
+        manifest: &GroupManifest,
+    ) -> Result<(), RuntimeError> {
+        let json = manifest.to_wire_bytes()?;
+        let now_ms = self.elapsed_ms();
+        let (writes, rekeyed) =
+            self.core
+                .seal_frame(InnerFrameType::GroupManifest, &json, now_ms)?;
+        self.write_wire_frames(&writes).await?;
+        if rekeyed {
+            self.pending_events.push_back(SessionEvent::Rekeyed {
+                direction: RekeyDirection::Outgoing,
+            });
+        }
+        Ok(())
+    }
+
+    /// Sends encrypted, bucket-padded `0x0B GROUP_RENDEZVOUS` carrying `secrets` for `group_id`.
+    pub async fn send_group_rendezvous(
+        &mut self,
+        secrets: &V2GroupSecrets,
+        group_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let frame = secrets.to_rendezvous_frame(group_id)?;
+        let now_ms = self.elapsed_ms();
+        let (writes, rekeyed) =
+            self.core
+                .seal_frame(InnerFrameType::GroupRendezvous, &frame[..], now_ms)?;
+        self.write_wire_frames(&writes).await?;
+        if rekeyed {
+            self.pending_events.push_back(SessionEvent::Rekeyed {
+                direction: RekeyDirection::Outgoing,
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the group gossip summary the initiator advertised in `SessionHello`, if any.
+    #[must_use]
+    pub fn peer_groups(&self) -> Option<&[GroupSeq]> {
+        self.peer_groups.as_deref()
     }
 
     /// Sends encrypted, bucket-padded `0x02 GRANT`.
@@ -2099,6 +2200,17 @@ impl V2SessionDriver {
         self.exported_secrets.as_ref()
     }
 
+    /// Returns the reconnect secret that admitted an accepted session's `msg1` (responder only).
+    #[must_use]
+    pub fn matched_rendezvous_secret(&self) -> Option<&[u8; 32]> {
+        self.matched_rendezvous.as_deref()
+    }
+
+    /// Persists CRLs ingested during this session to `store`, as a store-backed accept does.
+    pub fn attach_store(&mut self, store: StateStore) {
+        self.store = Some(store);
+    }
+
     /// Returns the active jittered [`RekeyThresholds`] for the current cipher epoch.
     #[must_use]
     pub const fn rekey_thresholds(&self) -> RekeyThresholds {
@@ -2265,6 +2377,7 @@ impl V2SessionDriver {
             started_at: self.started_at,
             provider_id,
             peer_device_id,
+            peer_groups: self.peer_groups,
             exported_secrets: self.exported_secrets,
             jitter: self.jitter,
             store: self.store,
@@ -2305,6 +2418,7 @@ pub struct ConcurrentV2Session {
     started_at: Instant,
     provider_id: ProviderId,
     peer_device_id: String,
+    peer_groups: Option<Vec<GroupSeq>>,
     exported_secrets: Option<V2PeerSecrets>,
     jitter: ScheduleJitterPolicy,
     store: Option<StateStore>,
@@ -2368,16 +2482,86 @@ impl ConcurrentV2Session {
         self.exported_secrets.as_ref()
     }
 
+    /// Returns the group gossip summary the initiator advertised in `SessionHello`, if any.
+    #[must_use]
+    pub fn peer_groups(&self) -> Option<&[GroupSeq]> {
+        self.peer_groups.as_deref()
+    }
+
     /// Samples the next CSPRNG-jittered keepalive delay from [`ScheduleJitterPolicy`].
     pub fn next_keepalive_delay(&self) -> Result<Duration, RuntimeError> {
         let ms = self.jitter.next_ping_delay_ms()?;
         Ok(Duration::from_millis(ms))
     }
 
+    /// Sends encrypted, bucket-padded `0x0A GROUP_MANIFEST` concurrently with inbound polling.
+    pub async fn send_group_manifest(&self, manifest: &GroupManifest) -> Result<(), RuntimeError> {
+        let json = manifest.to_wire_bytes()?;
+        self.run_write_op(|core, now_ms| {
+            core.seal_frame(InnerFrameType::GroupManifest, &json, now_ms)
+        })
+        .await
+    }
+
+    /// Sends encrypted, bucket-padded `0x0B GROUP_RENDEZVOUS` carrying `secrets` for `group_id`.
+    pub async fn send_group_rendezvous(
+        &self,
+        secrets: &V2GroupSecrets,
+        group_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let frame = secrets.to_rendezvous_frame(group_id)?;
+        self.run_write_op(|core, now_ms| {
+            core.seal_frame(InnerFrameType::GroupRendezvous, &frame[..], now_ms)
+        })
+        .await
+    }
+
     /// Sends encrypted, bucket-padded `0x01 DATA` concurrently with inbound polling.
     pub async fn send_data(&self, payload: &[u8]) -> Result<(), RuntimeError> {
         self.run_write_op(|core, now_ms| core.seal_frame(InnerFrameType::Data, payload, now_ms))
             .await
+    }
+
+    /// Like [`Self::send_data`], but evaluates `authority` while holding the writer lock and
+    /// before sealing; an `Err` aborts the write and leaves the session untouched.
+    pub async fn send_data_authorized(
+        &self,
+        payload: &[u8],
+        authority: impl FnOnce() -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        self.run_authorized_write_op(authority, |core, now_ms| {
+            core.seal_frame(InnerFrameType::Data, payload, now_ms)
+        })
+        .await
+    }
+
+    /// Like [`Self::send_group_manifest`], with `authority` evaluated as in
+    /// [`Self::send_data_authorized`].
+    pub async fn send_group_manifest_authorized(
+        &self,
+        manifest: &GroupManifest,
+        authority: impl FnOnce() -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let json = manifest.to_wire_bytes()?;
+        self.run_authorized_write_op(authority, |core, now_ms| {
+            core.seal_frame(InnerFrameType::GroupManifest, &json, now_ms)
+        })
+        .await
+    }
+
+    /// Like [`Self::send_group_rendezvous`], with `authority` evaluated as in
+    /// [`Self::send_data_authorized`].
+    pub async fn send_group_rendezvous_authorized(
+        &self,
+        secrets: &V2GroupSecrets,
+        group_id: &str,
+        authority: impl FnOnce() -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let frame = secrets.to_rendezvous_frame(group_id)?;
+        self.run_authorized_write_op(authority, |core, now_ms| {
+            core.seal_frame(InnerFrameType::GroupRendezvous, &frame[..], now_ms)
+        })
+        .await
     }
 
     /// Sends encrypted, bucket-padded `0x02 GRANT`.
@@ -2618,7 +2802,16 @@ impl ConcurrentV2Session {
     where
         F: FnOnce(&mut V2TransportCore, u64) -> Result<(Vec<Vec<u8>>, bool), CoreError>,
     {
+        self.run_authorized_write_op(|| Ok(()), op).await
+    }
+
+    async fn run_authorized_write_op<A, F>(&self, authority: A, op: F) -> Result<(), RuntimeError>
+    where
+        A: FnOnce() -> Result<(), RuntimeError>,
+        F: FnOnce(&mut V2TransportCore, u64) -> Result<(Vec<Vec<u8>>, bool), CoreError>,
+    {
         let mut writer = self.writer.lock().await;
+        authority()?;
         let (writes, rekeyed) = {
             let now_ms = self.elapsed_ms();
             let mut core = self

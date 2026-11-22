@@ -34,15 +34,18 @@ use tendril_core::v2::{
 };
 use tendril_runtime::{
     BrokerDialer, ConcurrentSession, ConcurrentV2Session, DEFAULT_PRE_AUTH_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, HttpWakeProvider, InboundRouter,
-    LocalDialer, MAX_OUTER_FRAME_LEN, OverlayDialer, PathDialer, PathListener, PathStream,
-    RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer, RelayV2Listener,
-    RelayV2ListenerConfig, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
-    V2SessionDriver, WakeAdapterKind, WakeDialOptions, WakeSecret, WakeTarget,
-    deserialize_identity_json, dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
-    drive_pair_responder_with_policy, drive_pair_responder_with_store,
-    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
-    drive_v2_pake_pair_responder_with_store, pairing_path_kind_for_provider, pinned_pairing_floor,
+    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, GroupEvent, GroupFrameKind,
+    GroupFrameOutcome, GroupHub, GroupPool, GroupPoolConfig, HttpWakeProvider, InboundQueue,
+    InboundRouter, InboundSession, LocalDialer, MAX_OUTER_FRAME_LEN, OverlayDialer, PathDialer,
+    PathListener, PathStream, PreAuthRateLimiter, RelayClientAuth, RelayDialer, RelayListener,
+    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError, SessionDriver,
+    SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeDialOptions,
+    WakeSecret, WakeTarget, deserialize_identity_json, dial_endpoint_with_auth,
+    drive_m2m_enroll_initiator_with_floor, drive_pair_responder_with_policy,
+    drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_timeout,
+    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
+    group_add_member, group_create, group_ingest_manifest, group_remove_member,
+    handle_session_group_frame, pairing_path_kind_for_provider, pinned_pairing_floor, recv_routed,
     serialize_identity_json, wake_and_dial_v2,
 };
 #[cfg(feature = "p2p-iroh")]
@@ -52,6 +55,7 @@ use tendril_runtime::{
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -576,6 +580,20 @@ impl EndpointTransportConfig {
         Ok(opts)
     }
 
+    /// Options for the shared group `P2pDialer`, present only when a relay mode is configured
+    /// explicitly (or `TENDRIL_P2P_LOCAL=1`). A shared dialer cannot derive per-peer `?relay=`
+    /// URLs, so an unconfigured endpoint never builds one and never falls back to public relays.
+    #[cfg(feature = "p2p-iroh")]
+    fn build_p2p_group_options(&self) -> Option<P2pOptions> {
+        P2pOptions::for_group_dialer(
+            self.p2p_relay_mode.clone(),
+            std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"),
+            self.p2p_pkarr,
+            self.p2p_allow_private_addrs,
+            self.p2p_relay_auth.clone(),
+        )
+    }
+
     #[cfg(feature = "p2p-iroh")]
     fn build_p2p_dialer_options(
         &self,
@@ -897,6 +915,9 @@ pub struct TendrilEndpoint {
     transport_cfg: StdMutex<EndpointTransportConfig>,
     self_m2m_enabled: AtomicBool,
     m2m_enabled: AtomicBool,
+    group_rt: StdMutex<Option<Arc<GroupRuntime>>>,
+    /// Fired once when the group runtime is installed, so parked accepts switch to its channels.
+    group_ready: tokio::sync::Notify,
 }
 
 impl TendrilEndpoint {
@@ -938,6 +959,168 @@ impl TendrilEndpoint {
     fn spawn_listener(&self, listener: Box<dyn PathListener>) {
         self.router.spawn_listener(self.rt.handle(), listener);
     }
+
+    fn group_runtime(&self) -> Option<Arc<GroupRuntime>> {
+        self.group_rt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Returns the endpoint's group runtime, creating it (hub plus inbound pumps) on first use.
+    fn ensure_group_runtime(&self) -> Result<Arc<GroupRuntime>, (i32, String)> {
+        let Some(store) = self.store.as_ref() else {
+            return Err((
+                TENDRIL_ERR_INVALID_ARG,
+                "groups require a state directory endpoint".to_owned(),
+            ));
+        };
+        let mut slot = self
+            .group_rt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = slot.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        let cfg = self.snapshot_transport_cfg();
+        #[allow(unused_mut)]
+        let mut dialers: Vec<Arc<dyn PathDialer>> = vec![
+            Arc::new(DirectDialer::new()),
+            Arc::new(LocalDialer::new()),
+            Arc::new(RelayDialer::new().with_auth(cfg.relay_auth.clone())),
+            Arc::new(OverlayDialer::new()),
+            Arc::new(BrokerDialer::new()),
+        ];
+        #[cfg(feature = "p2p-iroh")]
+        if let Some(opts) = cfg.build_p2p_group_options() {
+            let dialer = self
+                .rt
+                .block_on(P2pDialer::bind_with_options(opts))
+                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
+            dialers.push(Arc::new(dialer));
+        }
+        let hub = Arc::new(GroupHub::new(
+            store.as_ref().clone(),
+            Arc::new(self.identity.clone()),
+            GroupPoolConfig::new(dialers),
+            None,
+        ));
+        {
+            // Register every stored group before the pumps run, so a sibling stream that is
+            // already queued is never handled by a hub with no pools.
+            let _guard = self.rt.enter();
+            let _ = hub.sync();
+        }
+        let (v1_tx, v1_rx) = mpsc::channel(GROUP_ORDINARY_QUEUE_CAP);
+        let (v2_tx, v2_rx) = mpsc::channel(GROUP_ORDINARY_QUEUE_CAP);
+        let (_, v1_queue) = self.router.split_queues();
+        let (_, v2_queue) = self.router.split_v2_queues();
+        let handle = self.rt.handle();
+        let pumps = vec![
+            handle
+                .spawn(group_inbound_pump(
+                    v1_queue,
+                    self.router.session_rate_limiter().clone(),
+                    Arc::clone(&hub),
+                    Arc::clone(&self.v2_state),
+                    v1_tx.clone(),
+                    v2_tx.clone(),
+                ))
+                .abort_handle(),
+            handle
+                .spawn(group_inbound_pump(
+                    v2_queue,
+                    self.router.v2_session_rate_limiter().clone(),
+                    Arc::clone(&hub),
+                    Arc::clone(&self.v2_state),
+                    v1_tx,
+                    v2_tx,
+                ))
+                .abort_handle(),
+        ];
+        let runtime = Arc::new(GroupRuntime {
+            rt: Arc::clone(&self.rt),
+            hub,
+            v1_rx: AsyncMutex::new(v1_rx),
+            v2_rx: AsyncMutex::new(v2_rx),
+            pumps,
+        });
+        *slot = Some(Arc::clone(&runtime));
+        self.group_ready.notify_waiters();
+        Ok(runtime)
+    }
+}
+
+const GROUP_ORDINARY_QUEUE_CAP: usize = 16;
+const GROUP_PUMP_WAIT: Duration = Duration::from_secs(3600);
+
+/// Group dispatch state shared by an endpoint once the first group is opened.
+///
+/// From then on the pumps own the endpoint's inbound session queues: sibling sessions are
+/// installed in their pool by the hub and ordinary paired sessions are handed to
+/// `tendril_session_accept` and `tendril_session_accept_v2` through the channels.
+struct GroupRuntime {
+    rt: Arc<Runtime>,
+    hub: Arc<GroupHub>,
+    v1_rx: AsyncMutex<mpsc::Receiver<SessionDriver>>,
+    v2_rx: AsyncMutex<mpsc::Receiver<V2SessionDriver>>,
+    pumps: Vec<tokio::task::AbortHandle>,
+}
+
+impl GroupRuntime {
+    /// Closes the hub and aborts the pumps; dropping a pump aborts its in-flight handshakes.
+    fn shutdown(&self) {
+        let _guard = self.rt.enter();
+        self.hub.close();
+        for pump in &self.pumps {
+            pump.abort();
+        }
+    }
+}
+
+impl Drop for GroupRuntime {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+async fn group_inbound_pump(
+    queue: InboundQueue,
+    limiter: PreAuthRateLimiter,
+    hub: Arc<GroupHub>,
+    v2_state: Arc<V2ResponderState>,
+    v1_tx: mpsc::Sender<SessionDriver>,
+    v2_tx: mpsc::Sender<V2SessionDriver>,
+) {
+    let mut handshakes = tokio::task::JoinSet::new();
+    loop {
+        while handshakes.try_join_next().is_some() {}
+        match recv_routed(&queue, GROUP_PUMP_WAIT).await {
+            Ok(Some((stream, guard))) => {
+                let hub = Arc::clone(&hub);
+                let v2_state = Arc::clone(&v2_state);
+                let limiter = limiter.clone();
+                let v1_tx = v1_tx.clone();
+                let v2_tx = v2_tx.clone();
+                handshakes.spawn(async move {
+                    match hub
+                        .accept(stream, &v2_state, Some(&limiter), Some(guard))
+                        .await
+                    {
+                        Ok(InboundSession::OrdinaryV1 { session, .. }) => {
+                            let _ = v1_tx.try_send(session);
+                        }
+                        Ok(InboundSession::OrdinaryV2 { session }) => {
+                            let _ = v2_tx.try_send(session);
+                        }
+                        Ok(InboundSession::Group { .. }) | Err(_) => {}
+                    }
+                });
+            }
+            Ok(None) => return,
+            Err(()) => {}
+        }
+    }
 }
 
 fn build_endpoint_handle(
@@ -970,6 +1153,8 @@ fn build_endpoint_handle(
         transport_cfg: StdMutex::new(EndpointTransportConfig::default()),
         self_m2m_enabled: AtomicBool::new(false),
         m2m_enabled: AtomicBool::new(has_active_anchor),
+        group_rt: StdMutex::new(None),
+        group_ready: tokio::sync::Notify::new(),
     }))
 }
 
@@ -985,6 +1170,27 @@ unsafe fn write_roster_json_out(roster_arc: &StdMutex<Roster>, out_json: *mut *m
         }
     };
     unsafe { write_out_cstring(out_json, &json) }
+}
+
+fn group_frame_outcome_json(outcome: &GroupFrameOutcome) -> serde_json::Value {
+    let kind = match outcome.kind {
+        GroupFrameKind::Manifest => "manifest",
+        GroupFrameKind::Rendezvous => "rendezvous",
+    };
+    let verdict = if outcome.ingested {
+        "ingested"
+    } else {
+        "rejected"
+    };
+    let mut val = serde_json::json!({
+        "event": format!("group_{kind}_{verdict}"),
+        "group_id": outcome.group_id,
+        "seq": outcome.seq,
+    });
+    if let Some(error) = &outcome.error {
+        val["error"] = serde_json::Value::String(error.clone());
+    }
+    val
 }
 
 enum SessionBackend {
@@ -1029,6 +1235,13 @@ impl SessionBackend {
         }
     }
 
+    fn peer_device_id(&self) -> Option<String> {
+        match self {
+            Self::V1(s) => s.peer_device_id(),
+            Self::V2(s) => Some(s.peer_device_id().to_owned()),
+        }
+    }
+
     async fn send_rekey(&self) -> Result<(), RuntimeError> {
         match self {
             Self::V1(s) => s.send_rekey().await,
@@ -1052,10 +1265,45 @@ pub struct TendrilSession {
     roster: Arc<StdMutex<Roster>>,
     v1_root_id: Option<String>,
     v1_local_signing: Option<(String, HybridSigningPublicKey)>,
+    local_device_id: String,
     session: SessionBackend,
 }
 
 impl TendrilSession {
+    /// Hands an ordinary-session `0x0A`/`0x0B` to the runtime when the endpoint has a state
+    /// store and reports the redacted outcome. Store-less endpoints surface the unverified
+    /// event instead.
+    fn group_frame_json(&self, ev: &SessionEvent) -> Result<serde_json::Value, String> {
+        if let Some(store) = self.store.as_ref() {
+            let peer = self
+                .session
+                .peer_device_id()
+                .ok_or_else(|| "session peer is not authenticated".to_owned())?;
+            if let Some(outcome) =
+                handle_session_group_frame(store, &self.local_device_id, &peer, ev)
+            {
+                return Ok(group_frame_outcome_json(&outcome));
+            }
+        }
+        match ev {
+            SessionEvent::GroupManifestReceived(manifest) => {
+                let bytes = manifest.to_wire_bytes().map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({
+                    "event": "group_manifest_unverified",
+                    "group_id": manifest.group_id,
+                    "seq": manifest.seq,
+                    "manifest_json": String::from_utf8_lossy(&bytes),
+                }))
+            }
+            SessionEvent::GroupRendezvousReceived(frame) => Ok(serde_json::json!({
+                "event": "group_rendezvous_unverified",
+                "group_id": frame.group_id,
+                "seq": frame.seq,
+            })),
+            _ => Err("not a group frame event".to_owned()),
+        }
+    }
+
     fn load_roster_from_store(&self) -> Result<(), String> {
         load_roster_from_store_locked(
             self.store.as_ref(),
@@ -1569,6 +1817,9 @@ pub unsafe extern "C" fn tendril_endpoint_close(ep: *mut TendrilEndpoint) -> i32
         }
         let ep = unsafe { &*ep };
         ep.router.close();
+        if let Some(groups) = ep.group_runtime() {
+            groups.shutdown();
+        }
         TENDRIL_OK
     })
 }
@@ -2650,6 +2901,7 @@ pub unsafe extern "C" fn tendril_session_connect(
                     roster: Arc::clone(&ep.roster),
                     v1_root_id: Some(target_s.to_owned()),
                     v1_local_signing: None,
+                    local_device_id: ep.identity.device_id(),
                     session: SessionBackend::V1(driver.into_concurrent()),
                 }))
             }
@@ -2700,10 +2952,58 @@ pub unsafe extern "C" fn tendril_session_accept(
         let wait = Duration::from_millis(timeout_ms);
         let accepted = std::cell::Cell::new(false);
         let res = ep.rt.block_on(async {
-            let (stream, guard) = match ep.router.recv_session(wait).await {
-                Ok(Some(pair)) => pair,
-                Ok(None) => return Err("listener closed".to_owned()),
-                Err(()) => return Err("timed out accepting session".to_owned()),
+            let deadline = tokio::time::Instant::now() + wait;
+            let mut groups = ep.group_runtime();
+            let (stream, guard) = loop {
+                if let Some(groups) = groups.as_ref() {
+                    // The group pumps own the router queue from here on.
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let mut rx = groups.v1_rx.lock().await;
+                    return match timeout(left, rx.recv()).await {
+                        Ok(Some(driver)) => {
+                            accepted.set(true);
+                            Ok(driver)
+                        }
+                        Ok(None) => Err("listener closed".to_owned()),
+                        Err(_) => Err("timed out accepting session".to_owned()),
+                    };
+                }
+                let ready = ep.group_ready.notified();
+                tokio::pin!(ready);
+                ready.as_mut().enable();
+                groups = ep.group_runtime();
+                if groups.is_some() {
+                    continue;
+                }
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let (stream, guard) = tokio::select! {
+                    () = &mut ready => continue,
+                    recv = ep.router.recv_session(left) => match recv {
+                        Ok(Some(pair)) => pair,
+                        Ok(None) => return Err("listener closed".to_owned()),
+                        Err(()) => return Err("timed out accepting session".to_owned()),
+                    },
+                };
+                // A group runtime created while this call was parked now owns group streams.
+                let Some(rt_groups) = ep.group_runtime() else {
+                    break (stream, guard);
+                };
+                match rt_groups
+                    .hub
+                    .accept(
+                        stream,
+                        &ep.v2_state,
+                        Some(ep.router.session_rate_limiter()),
+                        Some(guard),
+                    )
+                    .await
+                {
+                    Ok(InboundSession::OrdinaryV1 { session, .. }) => {
+                        accepted.set(true);
+                        return Ok(session);
+                    }
+                    Ok(_) | Err(_) => groups = Some(rt_groups),
+                }
             };
             accepted.set(true);
 
@@ -2763,6 +3063,7 @@ pub unsafe extern "C" fn tendril_session_accept(
                     roster: Arc::clone(&ep.roster),
                     v1_root_id: Some(local_id.clone()),
                     v1_local_signing: Some((local_id, local_sig)),
+                    local_device_id: ep.identity.device_id(),
                     session: SessionBackend::V1(driver.into_concurrent()),
                 }))
             }
@@ -2934,6 +3235,16 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                         "event": "audit",
                         "audit": audit,
                     }),
+                    ev @ (SessionEvent::GroupManifestReceived(_)
+                    | SessionEvent::GroupRendezvousReceived(_)) => {
+                        match sess.group_frame_json(&ev) {
+                            Ok(val) => val,
+                            Err(msg) => {
+                                set_last_error(msg);
+                                return TENDRIL_ERR_PROTOCOL;
+                            }
+                        }
+                    }
                     SessionEvent::Closed { code, reason } => serde_json::json!({
                         "event": "closed",
                         "code": code,
@@ -3674,6 +3985,7 @@ pub unsafe extern "C" fn tendril_session_connect_v2(
                     roster: Arc::clone(&ep.roster),
                     v1_root_id: None,
                     v1_local_signing: None,
+                    local_device_id: ep.identity.device_id(),
                     session: SessionBackend::V2(driver.into_concurrent()),
                 }))
             }
@@ -3706,10 +4018,58 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
         let wait = Duration::from_millis(timeout_ms);
         let accepted = std::cell::Cell::new(false);
         let res = ep.rt.block_on(async {
-            let (stream, guard) = match ep.router.recv_v2_session(wait).await {
-                Ok(Some(pair)) => pair,
-                Ok(None) => return Err("listener closed".to_owned()),
-                Err(()) => return Err("timed out accepting v2 session".to_owned()),
+            let deadline = tokio::time::Instant::now() + wait;
+            let mut groups = ep.group_runtime();
+            let (stream, guard) = loop {
+                if let Some(groups) = groups.as_ref() {
+                    // The group pumps own the router queue from here on.
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let mut rx = groups.v2_rx.lock().await;
+                    return match timeout(left, rx.recv()).await {
+                        Ok(Some(driver)) => {
+                            accepted.set(true);
+                            Ok(driver)
+                        }
+                        Ok(None) => Err("listener closed".to_owned()),
+                        Err(_) => Err("timed out accepting v2 session".to_owned()),
+                    };
+                }
+                let ready = ep.group_ready.notified();
+                tokio::pin!(ready);
+                ready.as_mut().enable();
+                groups = ep.group_runtime();
+                if groups.is_some() {
+                    continue;
+                }
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let (stream, guard) = tokio::select! {
+                    () = &mut ready => continue,
+                    recv = ep.router.recv_v2_session(left) => match recv {
+                        Ok(Some(pair)) => pair,
+                        Ok(None) => return Err("listener closed".to_owned()),
+                        Err(()) => return Err("timed out accepting v2 session".to_owned()),
+                    },
+                };
+                // A group runtime created while this call was parked now owns group streams.
+                let Some(rt_groups) = ep.group_runtime() else {
+                    break (stream, guard);
+                };
+                match rt_groups
+                    .hub
+                    .accept(
+                        stream,
+                        &ep.v2_state,
+                        Some(ep.router.v2_session_rate_limiter()),
+                        Some(guard),
+                    )
+                    .await
+                {
+                    Ok(InboundSession::OrdinaryV2 { session }) => {
+                        accepted.set(true);
+                        return Ok(session);
+                    }
+                    Ok(_) | Err(_) => groups = Some(rt_groups),
+                }
             };
             accepted.set(true);
             if let Some(ref store) = ep.store {
@@ -3759,6 +4119,7 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
                     roster: Arc::clone(&ep.roster),
                     v1_root_id: None,
                     v1_local_signing: None,
+                    local_device_id: ep.identity.device_id(),
                     session: SessionBackend::V2(driver.into_concurrent()),
                 }))
             }
@@ -3771,6 +4132,694 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
             }
         }
     })
+}
+
+/// Opaque group handle over one endpoint-scoped [`GroupPool`], sharing the endpoint's runtime.
+pub struct TendrilGroup {
+    rt: Arc<Runtime>,
+    pool: GroupPool,
+    local_endpoint: Option<String>,
+    listener: Option<HandleListener>,
+    closed: AtomicBool,
+    close_notify: tokio::sync::Notify,
+}
+
+/// A direct listener bound by one group handle and served by the shared pool. Closing the handle
+/// stops it accepting and drops the socket, so the port can be bound again straight away.
+struct HandleListener {
+    slot: Arc<AsyncMutex<Option<Box<dyn PathListener>>>>,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+/// Pool-facing half of a [`HandleListener`].
+struct CancellableListener {
+    slot: Arc<AsyncMutex<Option<Box<dyn PathListener>>>>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    endpoint: String,
+}
+
+#[async_trait::async_trait]
+impl PathListener for CancellableListener {
+    async fn accept(&mut self) -> Result<Box<dyn PathStream>, RuntimeError> {
+        let mut slot = self.slot.lock().await;
+        let Some(inner) = slot.as_mut() else {
+            return std::future::pending().await;
+        };
+        let accepted = tokio::select! {
+            res = inner.accept() => Some(res),
+            _ = self.cancel.wait_for(|stopped| *stopped) => None,
+        };
+        if let Some(res) = accepted {
+            return res;
+        }
+        *slot = None;
+        drop(slot);
+        std::future::pending().await
+    }
+
+    fn local_endpoint(&self) -> String {
+        self.endpoint.clone()
+    }
+}
+
+impl HandleListener {
+    fn new(listener: Box<dyn PathListener>) -> (Self, CancellableListener) {
+        let endpoint = listener.local_endpoint();
+        let slot = Arc::new(AsyncMutex::new(Some(listener)));
+        let (cancel, rx) = tokio::sync::watch::channel(false);
+        (
+            Self {
+                slot: Arc::clone(&slot),
+                cancel,
+            },
+            CancellableListener {
+                slot,
+                cancel: rx,
+                endpoint,
+            },
+        )
+    }
+
+    /// Stops the listener and waits until its socket is released.
+    async fn stop(&self) {
+        let _ = self.cancel.send(true);
+        *self.slot.lock().await = None;
+    }
+}
+
+impl TendrilGroup {
+    fn close_once(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.close_notify.notify_waiters();
+            let _guard = self.rt.enter();
+            self.pool.disconnect_all();
+            if let Some(listener) = &self.listener {
+                self.rt.block_on(listener.stop());
+            }
+        }
+    }
+
+    fn live(&self) -> Result<(), i32> {
+        if self.closed.load(Ordering::Acquire) {
+            set_last_error("group handle is closed");
+            return Err(TENDRIL_ERR_CLOSED);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TendrilGroup {
+    fn drop(&mut self) {
+        self.close_once();
+    }
+}
+
+fn group_error_code(err: &RuntimeError) -> i32 {
+    match err {
+        RuntimeError::Core(CoreError::GroupNotFound(_) | CoreError::PeerNotFound(_)) => {
+            TENDRIL_ERR_NOT_FOUND
+        }
+        RuntimeError::Closed => TENDRIL_ERR_CLOSED,
+        RuntimeError::Io(_) | RuntimeError::Storage(_) => TENDRIL_ERR_INTERNAL,
+        _ => TENDRIL_ERR_PROTOCOL,
+    }
+}
+
+fn fail_group(err: &RuntimeError) -> i32 {
+    set_last_error(err.to_string());
+    group_error_code(err)
+}
+
+unsafe fn json_string_list(ptr: *const c_char, name: &str) -> Result<Vec<String>, i32> {
+    let Some(raw) = (unsafe { opt_cstr_to_str(ptr, name) })? else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str::<Vec<String>>(raw).map_err(|e| {
+        set_last_error(format!(
+            "invalid {name}: expected a JSON array of strings: {e}"
+        ));
+        TENDRIL_ERR_INVALID_ARG
+    })
+}
+
+unsafe fn group_admin_ep<'a>(
+    ep: *mut TendrilEndpoint,
+) -> Result<(&'a TendrilEndpoint, &'a StateStore), i32> {
+    if ep.is_null() {
+        set_last_error("null endpoint");
+        return Err(TENDRIL_ERR_INVALID_ARG);
+    }
+    let ep = unsafe { &*ep };
+    let Some(store) = ep.store.as_deref() else {
+        set_last_error("groups require a state directory endpoint");
+        return Err(TENDRIL_ERR_INVALID_ARG);
+    };
+    Ok((ep, store))
+}
+
+unsafe fn write_manifest_out(
+    manifest: &tendril_core::group::GroupManifest,
+    out: *mut *mut c_char,
+) -> i32 {
+    let json = match manifest.to_wire_bytes() {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) => {
+            set_last_error(e.to_string());
+            return TENDRIL_ERR_INTERNAL;
+        }
+    };
+    unsafe { write_out_cstring(out, &json) }
+}
+
+/// Creates a group rooted at this endpoint's identity and returns the signed manifest JSON.
+///
+/// `endpoints_json` is null or a JSON array of endpoint hint strings.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer; `name` a NUL-terminated string; `endpoints_json` null or
+/// a NUL-terminated JSON string; `out_manifest_json` non-null (free with [`tendril_string_free`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_create(
+    ep: *mut TendrilEndpoint,
+    name: *const c_char,
+    min_wire_version: u8,
+    endpoints_json: *const c_char,
+    out_manifest_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if out_manifest_json.is_null() {
+            set_last_error("null out_manifest_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let (ep, store) = match unsafe { group_admin_ep(ep) } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let name = match unsafe { cstr_to_str(name, "name") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let endpoints = match unsafe { json_string_list(endpoints_json, "endpoints_json") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        match group_create(store, &ep.identity, name, min_wire_version, endpoints) {
+            Ok(manifest) => unsafe { write_manifest_out(&manifest, out_manifest_json) },
+            Err(e) => fail_group(&e),
+        }
+    })
+}
+
+/// Adds the paired peer `peer_id` to a group this endpoint roots and returns the new manifest.
+///
+/// `caps_json` and `endpoints_json` are null or JSON arrays of strings; empty caps grant the
+/// default send and receive capabilities.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer; string arguments NUL-terminated (the JSON ones may be
+/// null); `out_manifest_json` non-null (free with [`tendril_string_free`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_add_member(
+    ep: *mut TendrilEndpoint,
+    group_id: *const c_char,
+    peer_id: *const c_char,
+    caps_json: *const c_char,
+    endpoints_json: *const c_char,
+    out_manifest_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if out_manifest_json.is_null() {
+            set_last_error("null out_manifest_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let (ep, store) = match unsafe { group_admin_ep(ep) } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let group_id = match unsafe { cstr_to_str(group_id, "group_id") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let peer_id = match unsafe { cstr_to_str(peer_id, "peer_id") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let caps = match unsafe { json_string_list(caps_json, "caps_json") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let endpoints = match unsafe { json_string_list(endpoints_json, "endpoints_json") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        match group_add_member(store, &ep.identity, group_id, peer_id, caps, endpoints) {
+            Ok(manifest) => unsafe { write_manifest_out(&manifest, out_manifest_json) },
+            Err(e) => fail_group(&e),
+        }
+    })
+}
+
+/// Revokes `peer_id` from a group this endpoint roots, rotates its keys, and returns the manifest.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer; string arguments NUL-terminated; `out_manifest_json`
+/// non-null (free with [`tendril_string_free`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_remove_member(
+    ep: *mut TendrilEndpoint,
+    group_id: *const c_char,
+    peer_id: *const c_char,
+    out_manifest_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if out_manifest_json.is_null() {
+            set_last_error("null out_manifest_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let (ep, store) = match unsafe { group_admin_ep(ep) } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let group_id = match unsafe { cstr_to_str(group_id, "group_id") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let peer_id = match unsafe { cstr_to_str(peer_id, "peer_id") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        match group_remove_member(store, &ep.identity, group_id, peer_id) {
+            Ok(manifest) => unsafe { write_manifest_out(&manifest, out_manifest_json) },
+            Err(e) => fail_group(&e),
+        }
+    })
+}
+
+/// Ingests a group manifest received from the authenticated peer `sender_peer_id` and returns its
+/// group id. First-contact and capacity rules are enforced by the runtime.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer; string arguments NUL-terminated; `out_group_id` non-null
+/// (free with [`tendril_string_free`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_ingest_manifest(
+    ep: *mut TendrilEndpoint,
+    manifest_json: *const c_char,
+    sender_peer_id: *const c_char,
+    out_group_id: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if out_group_id.is_null() {
+            set_last_error("null out_group_id");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let (ep, store) = match unsafe { group_admin_ep(ep) } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let manifest = match unsafe { cstr_to_str(manifest_json, "manifest_json") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let sender = match unsafe { cstr_to_str(sender_peer_id, "sender_peer_id") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        match group_ingest_manifest(store, &ep.identity.device_id(), sender, manifest) {
+            Ok(outcome) => unsafe { write_out_cstring(out_group_id, &outcome.group_id) },
+            Err(e) => fail_group(&e),
+        }
+    })
+}
+
+/// Opens the lazy full-mesh pool for `group_id` and returns an opaque handle.
+///
+/// The first open on an endpoint starts group dispatch: the endpoint's inbound session streams are
+/// then routed through the group hub, and ordinary sessions still reach `tendril_session_accept`
+/// and `tendril_session_accept_v2`. Configure transports before the first open.
+///
+/// `listen_addr` may be null. When set, a direct listener is bound there and served by this
+/// group's pool, and [`tendril_group_local_endpoint`] reports the bound endpoint.
+///
+/// # Safety
+/// `ep` must be a valid endpoint pointer; `group_id` NUL-terminated; `listen_addr` null or
+/// NUL-terminated; `out_group` non-null. Release the handle with [`tendril_group_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_open(
+    ep: *mut TendrilEndpoint,
+    group_id: *const c_char,
+    listen_addr: *const c_char,
+    out_group: *mut *mut TendrilGroup,
+) -> i32 {
+    ffi_i32(|| {
+        if out_group.is_null() {
+            set_last_error("null out_group");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let (ep, store) = match unsafe { group_admin_ep(ep) } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let group_id = match unsafe { cstr_to_str(group_id, "group_id") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let listen = match unsafe { opt_cstr_to_str(listen_addr, "listen_addr") } {
+            Ok(v) => v.filter(|a| !a.is_empty()),
+            Err(rc) => return rc,
+        };
+        let listen: Option<SocketAddr> = match listen.map(str::parse).transpose() {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(format!("invalid listen_addr: {e}"));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let groups = match ep.ensure_group_runtime() {
+            Ok(g) => g,
+            Err((rc, msg)) => {
+                set_last_error(msg);
+                return rc;
+            }
+        };
+        let _guard = ep.rt.enter();
+        let _ = groups.hub.sync();
+        let pool = match groups.hub.pool(group_id) {
+            Some(pool) if !pool.is_closed() => pool,
+            _ => {
+                return match GroupPool::open(
+                    store.clone(),
+                    Arc::new(ep.identity.clone()),
+                    group_id,
+                    GroupPoolConfig::new(Vec::new()),
+                    None,
+                ) {
+                    Ok(unregistered) => {
+                        unregistered.close();
+                        set_last_error("group pool is not available on this endpoint");
+                        TENDRIL_ERR_CLOSED
+                    }
+                    Err(e) => fail_group(&e),
+                };
+            }
+        };
+        let mut local_endpoint = None;
+        let mut handle_listener = None;
+        if let Some(addr) = listen {
+            match ep.rt.block_on(DirectListener::bind(addr, None)) {
+                Ok(listener) => {
+                    local_endpoint = Some(listener.local_endpoint());
+                    let (handle, served) = HandleListener::new(Box::new(listener));
+                    handle_listener = Some(handle);
+                    pool.serve(Box::new(served));
+                }
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return TENDRIL_ERR_PROTOCOL;
+                }
+            }
+        }
+        let handle = Box::new(TendrilGroup {
+            rt: Arc::clone(&ep.rt),
+            pool,
+            local_endpoint,
+            listener: handle_listener,
+            closed: AtomicBool::new(false),
+            close_notify: tokio::sync::Notify::new(),
+        });
+        unsafe {
+            *out_group = Box::into_raw(handle);
+        }
+        TENDRIL_OK
+    })
+}
+
+unsafe fn group_ref<'a>(group: *const TendrilGroup) -> Result<&'a TendrilGroup, i32> {
+    if group.is_null() {
+        set_last_error("null group");
+        return Err(TENDRIL_ERR_INVALID_ARG);
+    }
+    let group = unsafe { &*group };
+    group.live()?;
+    Ok(group)
+}
+
+/// Sends `data` to every reachable member holding the receive capability and writes the
+/// `BroadcastReport` JSON (`delivered`, `offline`, `failed`).
+///
+/// `required_cap` may be null for the group's default send capability.
+///
+/// # Safety
+/// `group` must be a valid group pointer; `required_cap` null or NUL-terminated; if `data_len > 0`
+/// `data_ptr` must point to `data_len` readable bytes; `out_report_json` non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_broadcast(
+    group: *mut TendrilGroup,
+    required_cap: *const c_char,
+    data_ptr: *const u8,
+    data_len: usize,
+    out_report_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if out_report_json.is_null() || (data_ptr.is_null() && data_len > 0) {
+            set_last_error("invalid data or out_report_json pointer");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let group = match unsafe { group_ref(group) } {
+            Ok(g) => g,
+            Err(rc) => return rc,
+        };
+        let cap = match unsafe { opt_cstr_to_str(required_cap, "required_cap") } {
+            Ok(v) => v.filter(|c| !c.is_empty()),
+            Err(rc) => return rc,
+        };
+        let data: &[u8] = if data_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(data_ptr, data_len) }
+        };
+        match group.rt.block_on(group.pool.broadcast(cap, data)) {
+            Ok(report) => match serde_json::to_string(&report) {
+                Ok(json) => unsafe { write_out_cstring(out_report_json, &json) },
+                Err(e) => {
+                    set_last_error(format!("failed to serialize report: {e}"));
+                    TENDRIL_ERR_INTERNAL
+                }
+            },
+            Err(e) => fail_group(&e),
+        }
+    })
+}
+
+/// Pushes the stored manifest (and, for an admin, the rendezvous key) to every member and writes
+/// the `BroadcastReport` JSON. Wire v2 groups need this so members learn the rendezvous key; the
+/// runtime enforces who may push.
+///
+/// # Safety
+/// `group` must be a valid group pointer and `out_report_json` non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_sync(
+    group: *mut TendrilGroup,
+    out_report_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if out_report_json.is_null() {
+            set_last_error("null out_report_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let group = match unsafe { group_ref(group) } {
+            Ok(g) => g,
+            Err(rc) => return rc,
+        };
+        match group.rt.block_on(group.pool.sync()) {
+            Ok(report) => match serde_json::to_string(&report) {
+                Ok(json) => unsafe { write_out_cstring(out_report_json, &json) },
+                Err(e) => {
+                    set_last_error(format!("failed to serialize report: {e}"));
+                    TENDRIL_ERR_INTERNAL
+                }
+            },
+            Err(e) => fail_group(&e),
+        }
+    })
+}
+
+/// Writes the endpoint bound by `listen_addr` at open time, or sets `*out_endpoint` to null when
+/// the group was opened without a listener.
+///
+/// # Safety
+/// `group` must be a valid group pointer and `out_endpoint` non-null (free a non-null result with
+/// [`tendril_string_free`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_local_endpoint(
+    group: *const TendrilGroup,
+    out_endpoint: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if out_endpoint.is_null() {
+            set_last_error("null out_endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let group = match unsafe { group_ref(group) } {
+            Ok(g) => g,
+            Err(rc) => return rc,
+        };
+        match group.local_endpoint.as_deref() {
+            Some(endpoint) => unsafe { write_out_cstring(out_endpoint, endpoint) },
+            None => {
+                unsafe { *out_endpoint = ptr::null_mut() };
+                TENDRIL_OK
+            }
+        }
+    })
+}
+
+fn group_event_json(event: GroupEvent) -> serde_json::Value {
+    match event {
+        GroupEvent::AppData {
+            sender_device_id,
+            mut payload,
+        } => {
+            let encoded = Zeroizing::new(b64url_encode(&payload));
+            payload.zeroize();
+            serde_json::json!({
+                "event": "app_data",
+                "sender_device_id": sender_device_id,
+                "payload_b64": &*encoded,
+            })
+        }
+        GroupEvent::ManifestUpdated { seq } => serde_json::json!({
+            "event": "manifest_updated",
+            "seq": seq,
+        }),
+        GroupEvent::MemberJoined { device_id } => serde_json::json!({
+            "event": "member_joined",
+            "device_id": device_id,
+        }),
+        GroupEvent::MemberRevoked { device_id } => serde_json::json!({
+            "event": "member_revoked",
+            "device_id": device_id,
+        }),
+        GroupEvent::Audit(audit) => serde_json::json!({
+            "event": "audit",
+            "audit": audit,
+        }),
+    }
+}
+
+/// Waits up to `timeout_ms` for the next group event and writes it as JSON.
+///
+/// Returns `TENDRIL_OK` with an event, `TENDRIL_WOULD_BLOCK` on timeout, and `TENDRIL_EOF` once the
+/// pool is closed or the handle is closed (a parked call returns promptly on
+/// [`tendril_group_close`]). Events are `app_data` (`payload_b64`), `manifest_updated`, `member_joined`,
+/// `member_revoked`, and `audit`.
+///
+/// # Safety
+/// `group` must be a valid group pointer and `out_event_json` non-null (free with
+/// [`tendril_string_free`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_poll_event(
+    group: *mut TendrilGroup,
+    timeout_ms: u64,
+    out_event_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if out_event_json.is_null() {
+            set_last_error("null out_event_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let group = match unsafe { group_ref(group) } {
+            Ok(g) => g,
+            Err(rc) => return rc,
+        };
+        let wait = Duration::from_millis(timeout_ms);
+        let polled = group.rt.block_on(async {
+            let closed = group.close_notify.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            if group.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                event = group.pool.poll_event(wait) => Some(event),
+                () = &mut closed => None,
+            }
+        });
+        match polled {
+            Some(Some(event)) => {
+                let json = Zeroizing::new(group_event_json(event).to_string());
+                unsafe { write_out_cstring(out_event_json, &json) }
+            }
+            Some(None) if group.pool.is_closed() => TENDRIL_EOF,
+            Some(None) => TENDRIL_WOULD_BLOCK,
+            None => TENDRIL_EOF,
+        }
+    })
+}
+
+/// Checks whether `peer_id` currently holds `cap` in the group. Returns `TENDRIL_OK` when allowed;
+/// any refusal sets the last error to the core error text.
+///
+/// # Safety
+/// `group` must be a valid group pointer; `peer_id` and `cap` NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_authorize_peer(
+    group: *const TendrilGroup,
+    peer_id: *const c_char,
+    cap: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        let group = match unsafe { group_ref(group) } {
+            Ok(g) => g,
+            Err(rc) => return rc,
+        };
+        let peer_id = match unsafe { cstr_to_str(peer_id, "peer_id") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let cap = match unsafe { cstr_to_str(cap, "cap") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        match group.pool.authorize_peer(peer_id, cap) {
+            Ok(()) => TENDRIL_OK,
+            Err(e) => fail_group(&e),
+        }
+    })
+}
+
+/// Closes the group handle's sessions. Idempotent; later calls on the handle return
+/// `TENDRIL_ERR_CLOSED` until [`tendril_group_free`] releases it.
+///
+/// # Safety
+/// `group` must be a valid group pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_close(group: *mut TendrilGroup) -> i32 {
+    ffi_i32(|| {
+        if group.is_null() {
+            set_last_error("null group");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        unsafe { &*group }.close_once();
+        TENDRIL_OK
+    })
+}
+
+/// Frees a group handle returned by [`tendril_group_open`]; safe after [`tendril_group_close`].
+///
+/// # Safety
+/// `group` must be null or an unfreed pointer from [`tendril_group_open`], with no concurrent calls.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_group_free(group: *mut TendrilGroup) {
+    if !group.is_null() {
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            drop(Box::from_raw(group));
+        }));
+    }
 }
 
 #[cfg(all(test, feature = "p2p-iroh"))]
@@ -3800,6 +4849,22 @@ mod p2p_dialer_option_tests {
         let opts = cfg.build_p2p_dialer_options(&plain, None).expect("options");
         assert!(matches!(opts.relay_mode, P2pRelayMode::Default));
         assert!(opts.resolve_pkarr);
+    }
+
+    #[test]
+    fn group_dialer_options_require_an_explicit_relay_mode() {
+        if std::env::var("TENDRIL_P2P_LOCAL").as_deref() != Ok("1") {
+            assert!(
+                EndpointTransportConfig::default()
+                    .build_p2p_group_options()
+                    .is_none()
+            );
+        }
+        let mut cfg = EndpointTransportConfig::default();
+        cfg.p2p_relay_mode = Some(P2pRelayMode::Disabled);
+        let opts = cfg.build_p2p_group_options().expect("options");
+        assert!(matches!(opts.relay_mode, P2pRelayMode::Disabled));
+        assert!(!opts.publish_pkarr);
     }
 
     #[test]

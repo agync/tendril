@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use tendril_core::crypto::{SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode};
+use tendril_core::group::GroupBook;
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
 use tendril_core::roster::{PeerState, Roster};
 use zeroize::{Zeroize, Zeroizing};
@@ -17,6 +18,8 @@ const IDENTITY_FILE: &str = "identity.json";
 const IDENTITY_LOCK_FILE: &str = ".identity.lock";
 const ROSTER_FILE: &str = "roster.json";
 const ROSTER_LOCK_FILE: &str = ".roster.lock";
+const GROUPS_FILE: &str = "groups.json";
+const GROUPS_LOCK_FILE: &str = ".groups.lock";
 
 /// Snapshot metadata identifying the on-disk state of `roster.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +136,18 @@ impl StateStore {
     #[must_use]
     pub fn roster_lock_path(&self) -> PathBuf {
         self.dir.join(ROSTER_LOCK_FILE)
+    }
+
+    /// Returns the path to `groups.json`.
+    #[must_use]
+    pub fn groups_path(&self) -> PathBuf {
+        self.dir.join(GROUPS_FILE)
+    }
+
+    /// Returns the path to the advisory lock file guarding `groups.json`.
+    #[must_use]
+    pub fn groups_lock_path(&self) -> PathBuf {
+        self.dir.join(GROUPS_LOCK_FILE)
     }
 
     /// Loads [`EndpointIdentity`] from `identity.json`.
@@ -272,6 +287,78 @@ impl StateStore {
                 Err(err)
             }
         }
+    }
+
+    /// Returns lightweight filesystem metadata identifying the current `groups.json` generation.
+    pub fn groups_stamp(&self) -> Result<Option<RosterStamp>, RuntimeError> {
+        match fs::metadata(self.groups_path()) {
+            Ok(meta) => Ok(Some(RosterStamp {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+                #[cfg(unix)]
+                ino: std::os::unix::fs::MetadataExt::ino(&meta),
+            })),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(RuntimeError::Io(err)),
+        }
+    }
+
+    /// Loads the [`GroupBook`] from `groups.json` under a shared advisory lock, or returns an empty
+    /// book if absent. The file holds group rendezvous keys and carries the same `0o600`
+    /// protection as the roster.
+    pub fn load_group_book(&self) -> Result<GroupBook, RuntimeError> {
+        let _lock = self.lock_groups_file(false)?;
+        self.load_group_book_unlocked()
+    }
+
+    /// Atomically persists `book` under an exclusive advisory lock with `0o600` file mode on Unix.
+    pub fn save_group_book(&self, book: &GroupBook) -> Result<(), RuntimeError> {
+        let _lock = self.lock_groups_file(true)?;
+        self.save_group_book_unlocked(book)
+    }
+
+    /// Executes `f` transactionally against the latest on-disk [`GroupBook`] under an exclusive
+    /// advisory lock, persisting atomically only when `f` returns `Ok`.
+    pub fn update_group_book<T, F>(&self, f: F) -> Result<T, RuntimeError>
+    where
+        F: FnOnce(&mut GroupBook) -> Result<T, RuntimeError>,
+    {
+        let _lock = self.lock_groups_file(true)?;
+        let mut book = self.load_group_book_unlocked()?;
+        let out = f(&mut book)?;
+        self.save_group_book_unlocked(&book)?;
+        Ok(out)
+    }
+
+    fn lock_groups_file(&self, exclusive: bool) -> Result<File, RuntimeError> {
+        let file = open_lock_0600(&self.groups_lock_path())?;
+        if exclusive {
+            file.lock()?;
+        } else {
+            file.lock_shared()?;
+        }
+        Ok(file)
+    }
+
+    fn load_group_book_unlocked(&self) -> Result<GroupBook, RuntimeError> {
+        let path = self.groups_path();
+        match fs::symlink_metadata(&path) {
+            Ok(_) => verify_private_file_0600(&path)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(GroupBook::new());
+            }
+            Err(err) => return Err(RuntimeError::Io(err)),
+        }
+        let raw = Zeroizing::new(fs::read_to_string(&path)?);
+        serde_json::from_str(&raw)
+            .map_err(|err| RuntimeError::Storage(format!("invalid groups json: {err}")))
+    }
+
+    fn save_group_book_unlocked(&self, book: &GroupBook) -> Result<(), RuntimeError> {
+        let mut json = Zeroizing::new(Vec::new());
+        serde_json::to_writer_pretty(&mut *json, book)
+            .map_err(|err| RuntimeError::Storage(format!("serialize groups failed: {err}")))?;
+        self.atomic_write_0600(&self.groups_path(), &json)
     }
 
     fn lock_roster_file(&self, exclusive: bool) -> Result<File, RuntimeError> {

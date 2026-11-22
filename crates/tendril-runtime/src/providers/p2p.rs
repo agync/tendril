@@ -204,6 +204,35 @@ impl P2pOptions {
         }
     }
 
+    /// Options for the shared dialer of a group pool, or `None` when none may be built.
+    ///
+    /// A shared dialer cannot derive per-peer `?relay=` URLs, so it exists only when `relay_mode`
+    /// is set explicitly or `local` (`TENDRIL_P2P_LOCAL=1`) selects [`P2pRelayMode::Disabled`].
+    /// Other p2p settings never imply a relay mode, so an endpoint that configured only Pkarr,
+    /// private-address, or relay-auth settings never falls back to the public `n0` relays.
+    #[must_use]
+    pub fn for_group_dialer(
+        relay_mode: Option<P2pRelayMode>,
+        local: bool,
+        resolve_pkarr: Option<bool>,
+        allow_private_addrs: Option<bool>,
+        relay_auth: Option<P2pRelayAuth>,
+    ) -> Option<Self> {
+        let mode = match relay_mode {
+            Some(mode) => mode,
+            None if local => P2pRelayMode::Disabled,
+            None => return None,
+        };
+        let mut opts = Self::for_dialer(mode);
+        if let Some(resolve) = resolve_pkarr {
+            opts = opts.with_resolve_pkarr(resolve);
+        }
+        if allow_private_addrs == Some(true) {
+            opts = opts.with_allow_private_addrs(true);
+        }
+        Some(opts.with_relay_auth(relay_auth))
+    }
+
     /// Derives dialer options for dialing `endpoint`.
     ///
     /// When `explicit_mode` is `None` or [`P2pRelayMode::Default`] and the URI carries validated
@@ -1381,6 +1410,29 @@ mod tests {
             P2pDialer::bind_with_options(forged).await,
             Err(RuntimeError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn for_group_dialer_requires_an_explicit_relay_mode() {
+        let auth = Some(P2pRelayAuth::BearerToken("tok".to_owned().into()));
+        assert!(
+            P2pOptions::for_group_dialer(None, false, Some(true), Some(true), auth.clone())
+                .is_none()
+        );
+        let local = P2pOptions::for_group_dialer(None, true, None, None, None).expect("local");
+        assert!(matches!(local.relay_mode, P2pRelayMode::Disabled));
+        assert!(local.allow_private_addrs && !local.resolve_pkarr);
+        let custom = P2pOptions::for_group_dialer(
+            Some(P2pRelayMode::Custom("https://relay.example/".to_owned())),
+            false,
+            Some(true),
+            None,
+            auth,
+        )
+        .expect("custom");
+        assert!(matches!(custom.relay_mode, P2pRelayMode::Custom(_)));
+        assert!(custom.resolve_pkarr && custom.relay_auth.is_some());
+        assert!(!custom.publish_pkarr && !custom.allow_private_addrs);
     }
 
     #[test]

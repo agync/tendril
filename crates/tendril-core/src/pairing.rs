@@ -743,7 +743,7 @@ fn is_valid_host_port_hint(target: &str) -> bool {
     port_str.parse::<u16>().ok().filter(|&n| n > 0).is_some()
 }
 
-fn is_valid_pairing_endpoint_hint(ep: &str) -> bool {
+pub(crate) fn is_valid_pairing_endpoint_hint(ep: &str) -> bool {
     if ep.is_empty()
         || ep
             .bytes()

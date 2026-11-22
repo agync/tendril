@@ -1,6 +1,7 @@
 //! Sans-I/O WebAssembly bindings exposing `tendril-core` primitives and state machines,
 //! plus opt-in `p2p-iroh` browser WebSocket relay transport.
 
+pub mod group;
 #[cfg(feature = "p2p-iroh")]
 pub mod p2p;
 
@@ -39,6 +40,9 @@ use tendril_core::v2::{
 use tendril_core::wire::WIRE_VERSION_V2;
 use wasm_bindgen::prelude::*;
 use zeroize::{Zeroize as _, Zeroizing};
+
+use group::{MAX_PENDING_RENDEZVOUS, WasmGroupBook};
+use tendril_core::group::GroupRendezvousFrame;
 
 fn to_js_err(err: impl fmt::Display) -> JsValue {
     JsValue::from_str(&err.to_string())
@@ -107,6 +111,11 @@ fn u64_to_f64(v: u64) -> Result<f64, String> {
         return Err("sequence exceeds JavaScript safe integer range".to_owned());
     }
     Ok(v as f64)
+}
+
+fn manifest_wire_json(manifest: &tendril_core::group::GroupManifest) -> Result<String, String> {
+    let bytes = manifest.to_wire_bytes().map_err(|e| e.to_string())?;
+    String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
 fn collect_session_writes(actions: Vec<SessionAction>) -> Vec<u8> {
@@ -1050,6 +1059,8 @@ impl WasmPairInitiator {
 #[wasm_bindgen]
 pub struct WasmSessionClient {
     inner: SessionMachine,
+    peer_device_id: Option<String>,
+    pending_rendezvous: Vec<GroupRendezvousFrame>,
 }
 
 impl WasmSessionClient {
@@ -1075,7 +1086,11 @@ impl WasmSessionClient {
             None,
         )
         .map_err(|e| e.to_string())?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            peer_device_id: None,
+            pending_rendezvous: Vec::new(),
+        })
     }
 
     fn step_bytes(
@@ -1097,7 +1112,11 @@ impl WasmSessionClient {
         for action in actions {
             match action {
                 SessionAction::WriteBytes(chunk) => writes.extend_from_slice(&chunk),
-                SessionAction::Established { .. } => {}
+                SessionAction::Established {
+                    peer_static_pub, ..
+                } => {
+                    self.peer_device_id = Some(core_device_id(&peer_static_pub));
+                }
                 SessionAction::AppData(data) => events.push(json!({
                     "event": "data",
                     "data_b64": b64url_encode(&data),
@@ -1115,6 +1134,23 @@ impl WasmSessionClient {
                     "issuer": issuer,
                     "seq": seq,
                 })),
+                SessionAction::GroupManifestReceived(manifest) => events.push(json!({
+                    "event": "group_manifest_unverified",
+                    "group_id": manifest.group_id,
+                    "seq": manifest.seq,
+                    "manifest_json": manifest_wire_json(&manifest)?,
+                })),
+                SessionAction::GroupRendezvousReceived(frame) => {
+                    events.push(json!({
+                        "event": "group_rendezvous_unverified",
+                        "group_id": frame.group_id,
+                        "seq": frame.seq,
+                    }));
+                    if self.pending_rendezvous.len() >= MAX_PENDING_RENDEZVOUS {
+                        self.pending_rendezvous.remove(0);
+                    }
+                    self.pending_rendezvous.push(frame);
+                }
                 SessionAction::PongReceived(cookie) => events.push(json!({
                     "event": "pong",
                     "cookie": cookie,
@@ -1241,6 +1277,30 @@ impl WasmSessionClient {
             .authorize(requested_cap, now_u, &roster.inner)
             .0
             .is_ok()
+    }
+
+    /// Device id derived from the static key authenticated by the handshake, once established.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn peer_device_id(&self) -> Option<String> {
+        self.peer_device_id.clone()
+    }
+
+    /// Applies buffered `0x0B` frames to `book` as delivered by this authenticated peer.
+    ///
+    /// Frames stay inside WASM memory; the returned JSON carries group ids and errors only.
+    #[wasm_bindgen]
+    pub fn apply_group_rendezvous(
+        &mut self,
+        book: &mut WasmGroupBook,
+        roster: &WasmRoster,
+        now_unix: f64,
+    ) -> Result<String, JsValue> {
+        let now = f64_to_u64(now_unix, "now_unix").map_err(to_js_err)?;
+        let frames = std::mem::take(&mut self.pending_rendezvous);
+        Ok(book
+            .apply_rendezvous_inner(&roster.inner, self.peer_device_id.as_deref(), &frames, now)
+            .to_string())
     }
 
     #[wasm_bindgen]
@@ -1485,6 +1545,8 @@ fn collect_v2_writes(actions: Vec<V2SessionAction>) -> Vec<u8> {
 pub struct WasmV2SessionInitiator {
     phase: V2WasmSessionPhase,
     target_host_id: String,
+    peer_device_id: Option<String>,
+    pending_rendezvous: Vec<GroupRendezvousFrame>,
     pending_writes: Vec<u8>,
     pending_events: Vec<serde_json::Value>,
 }
@@ -1527,6 +1589,8 @@ impl WasmV2SessionInitiator {
         Ok(Self {
             phase: V2WasmSessionPhase::Active(Box::new(machine)),
             target_host_id: target_host_id.to_owned(),
+            peer_device_id: None,
+            pending_rendezvous: Vec::new(),
             pending_writes: Vec::new(),
             pending_events: Vec::new(),
         })
@@ -1541,10 +1605,15 @@ impl WasmV2SessionInitiator {
             V2SessionAction::WriteBytes(chunk) => {
                 self.pending_writes.extend_from_slice(&chunk);
             }
-            V2SessionAction::Established { peer_device_id, .. } => {
+            V2SessionAction::Established {
+                peer_device_id,
+                peer_static_pub,
+                ..
+            } => {
                 roster
                     .set_peer_min_wire_version(&self.target_host_id, WIRE_VERSION_V2)
                     .map_err(|e| e.to_string())?;
+                self.peer_device_id = Some(core_device_id(&peer_static_pub));
                 self.pending_events.push(json!({
                     "event": "established",
                     "peer_device_id": peer_device_id,
@@ -1575,6 +1644,27 @@ impl WasmV2SessionInitiator {
                     "event": "rekeyed",
                     "direction": format!("{direction:?}"),
                 }));
+            }
+            V2SessionAction::GroupManifestReceived(manifest) => {
+                self.pending_events.push(json!({
+                    "event": "group_manifest_unverified",
+                    "group_id": manifest.group_id,
+                    "seq": manifest.seq,
+                    "manifest_json": manifest_wire_json(&manifest)?,
+                }));
+            }
+            V2SessionAction::GroupRendezvousReceived(frame) => {
+                #[allow(clippy::cast_precision_loss)]
+                let seq_f64 = frame.seq as f64;
+                self.pending_events.push(json!({
+                    "event": "group_rendezvous_unverified",
+                    "group_id": frame.group_id,
+                    "seq": seq_f64,
+                }));
+                if self.pending_rendezvous.len() >= MAX_PENDING_RENDEZVOUS {
+                    self.pending_rendezvous.remove(0);
+                }
+                self.pending_rendezvous.push(frame);
             }
             V2SessionAction::PongReceived(cookie) => {
                 let cookie_f64 = u64_to_f64(cookie).unwrap_or(0.0);
@@ -1810,6 +1900,30 @@ impl WasmV2SessionInitiator {
         Ok(collect_v2_writes(actions))
     }
 
+    /// Device id derived from the static key authenticated by the handshake, once established.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn peer_device_id(&self) -> Option<String> {
+        self.peer_device_id.clone()
+    }
+
+    /// Applies buffered `0x0B` frames to `book` as delivered by this authenticated peer.
+    ///
+    /// Frames stay inside WASM memory; the returned JSON carries group ids and errors only.
+    #[wasm_bindgen]
+    pub fn apply_group_rendezvous(
+        &mut self,
+        book: &mut WasmGroupBook,
+        roster: &WasmRoster,
+        now_unix: f64,
+    ) -> Result<String, JsValue> {
+        let now = f64_to_u64(now_unix, "now_unix").map_err(to_js_err)?;
+        let frames = std::mem::take(&mut self.pending_rendezvous);
+        Ok(book
+            .apply_rendezvous_inner(&roster.inner, self.peer_device_id.as_deref(), &frames, now)
+            .to_string())
+    }
+
     #[wasm_bindgen]
     #[must_use]
     pub fn is_established(&self) -> bool {
@@ -1960,6 +2074,204 @@ mod tests {
             .feed_bytes(&sm3, now, 25, &mut host_roster)
             .unwrap();
         assert!(host_sess.is_established());
+    }
+
+    #[test]
+    fn wasm_v1_session_feeds_group_book_from_authenticated_peer() {
+        use tendril_core::group::{
+            GroupBuildParams, GroupIngestStatus, GroupMember, GroupSigner, add_member,
+            create_group, encode_group_rendezvous_frame,
+        };
+
+        let host_id = EndpointIdentity::generate()
+            .unwrap()
+            .with_host_id("wasm-grp-host");
+        let mut host_roster = Roster::new();
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let now = 1_795_564_800u64;
+        let code = mgr.issue_code(PairingCodeKind::Remote3Group, now).unwrap();
+
+        let cli_id = WasmIdentity::generate_inner(Some("wasm-grp-cli")).unwrap();
+        let mut cli_roster = WasmRoster::new();
+        let mut pair_init = WasmPairInitiator::new_inner(
+            &cli_id, "web", "browser", &code, None, None, None, None, None,
+        )
+        .unwrap();
+        let mut pair_resp = PairingResponder::new(&host_id, PairingPathKind::Remote, None).unwrap();
+        let m1: Vec<u8> = match pair_init.inner.start().unwrap().pop().unwrap() {
+            PairAction::WriteBytes(b) => b,
+            other => panic!("unexpected start action: {other:?}"),
+        };
+        let writes = |acts: Vec<PairAction>| -> Vec<u8> {
+            acts.into_iter()
+                .filter_map(|a| match a {
+                    PairAction::WriteBytes(b) => Some(b),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+        let m2 = writes(
+            pair_resp
+                .feed_bytes(&m1, now, &mut mgr, &mut host_roster)
+                .unwrap(),
+        );
+        let step1: serde_json::Value =
+            serde_json::from_str(&pair_init.step_bytes(&m2, &mut cli_roster).unwrap()).unwrap();
+        let m3 = b64url_decode(step1["write_b64"].as_str().unwrap()).unwrap();
+        let mut cli_dev_id = String::new();
+        let mut host_sas = String::new();
+        let mut resp_bytes = Vec::new();
+        for a in pair_resp
+            .feed_bytes(&m3, now, &mut mgr, &mut host_roster)
+            .unwrap()
+        {
+            match a {
+                PairAction::WriteBytes(b) => resp_bytes.extend_from_slice(&b),
+                PairAction::Completed(PairOutcome::ResponderPending {
+                    device_id,
+                    pairing_sas,
+                    ..
+                }) => {
+                    cli_dev_id = device_id;
+                    host_sas = pairing_sas;
+                }
+                _ => {}
+            }
+        }
+        pair_init.step_bytes(&resp_bytes, &mut cli_roster).unwrap();
+        host_roster
+            .confirm_peer(&cli_dev_id, Some(&host_sas))
+            .unwrap();
+        cli_roster
+            .inner
+            .confirm_peer("wasm-grp-host", Some(&host_sas))
+            .unwrap();
+
+        let grant = host_roster
+            .mint_grant(
+                &host_id,
+                &cli_dev_id,
+                vec!["fs.read".to_owned()],
+                now,
+                now + 3600,
+                [0x55; 16],
+            )
+            .unwrap();
+        let grant_json = serde_json::to_string(&grant).unwrap();
+        let mut cli_sess =
+            WasmSessionClient::new_inner(&cli_id, "wasm-grp-host", Some(&grant_json), None)
+                .unwrap();
+        let mut host_sess = SessionMachine::new_responder(&host_id, None).unwrap();
+        let sm1 = collect_session_writes(cli_sess.inner.start().unwrap());
+        let sm2 = collect_session_writes(
+            host_sess
+                .feed_bytes(&sm1, now, 10, &mut host_roster)
+                .unwrap(),
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let est: serde_json::Value = serde_json::from_str(
+            &cli_sess
+                .step_bytes(&sm2, now as f64, 20.0, &mut cli_roster)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(est["established"], true);
+        host_sess
+            .feed_bytes(
+                &b64url_decode(est["write_b64"].as_str().unwrap()).unwrap(),
+                now,
+                25,
+                &mut host_roster,
+            )
+            .unwrap();
+        assert_eq!(
+            cli_sess.peer_device_id().as_deref(),
+            Some(host_id.device_id().as_str())
+        );
+
+        let host_member = GroupMember::new(
+            host_id.static_key().public_bytes(),
+            "host",
+            host_id.signing_key().public_key(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let params = GroupBuildParams::new(now);
+        let (g1, s1) = create_group(host_id.signing_key(), "mesh", 1, host_member, params).unwrap();
+        let gid = g1.group_id.clone();
+        let cli_member = GroupMember::new(
+            cli_id.inner.static_key().public_bytes(),
+            "web",
+            cli_id.inner.signing_key().public_key(),
+            Vec::new(),
+            vec![format!("group.send:{gid}"), format!("group.recv:{gid}")],
+        );
+        let (g2, s2) = add_member(
+            &g1,
+            &GroupSigner::root(host_id.signing_key()),
+            cli_member,
+            &s1,
+            params,
+        )
+        .unwrap();
+
+        let mut book = WasmGroupBook::new(&cli_id);
+        fn relay(
+            cli_sess: &mut WasmSessionClient,
+            roster: &mut WasmRoster,
+            actions: Vec<SessionAction>,
+            now: u64,
+        ) -> serde_json::Value {
+            let bytes = collect_session_writes(actions);
+            #[allow(clippy::cast_precision_loss)]
+            serde_json::from_str(
+                &cli_sess
+                    .step_bytes(&bytes, now as f64, 30.0, roster)
+                    .unwrap(),
+            )
+            .unwrap()
+        }
+
+        let actions = host_sess.send_group_manifest(&g2, 30).unwrap();
+        let step = relay(&mut cli_sess, &mut cli_roster, actions, now);
+        let event = step["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["event"] == "group_manifest_unverified")
+            .unwrap()
+            .to_string();
+        let sender = cli_sess.peer_device_id().unwrap();
+        let out = book
+            .ingest_event_inner(&cli_roster.inner, &sender, &event, now)
+            .unwrap();
+        assert_eq!(out.group_id, gid);
+        assert_eq!(out.status, GroupIngestStatus::Created);
+
+        let payload = encode_group_rendezvous_frame(&gid, 2, &[0x42; 32]).unwrap();
+        let actions = host_sess
+            .send_group_rendezvous(payload.as_ref(), 40)
+            .unwrap();
+        let step = relay(&mut cli_sess, &mut cli_roster, actions, now);
+        let rv = step["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["event"] == "group_rendezvous_unverified")
+            .unwrap();
+        assert!(!rv.to_string().contains(&b64url_encode(&[0x42; 32])));
+        assert_eq!(cli_sess.pending_rendezvous.len(), 1);
+        let frames = std::mem::take(&mut cli_sess.pending_rendezvous);
+        let applied = book.apply_rendezvous_inner(
+            &cli_roster.inner,
+            cli_sess.peer_device_id().as_deref(),
+            &frames,
+            now,
+        );
+        assert_eq!(applied["applied"].as_array().unwrap().len(), 1, "{applied}");
+        assert!(book.inner.secrets(&gid).is_some());
+        let _ = s2;
     }
 
     #[test]
