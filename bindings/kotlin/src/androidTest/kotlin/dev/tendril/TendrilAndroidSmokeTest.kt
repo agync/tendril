@@ -147,4 +147,39 @@ class TendrilAndroidSmokeTest {
       deleteKeystoreAlias(alias)
     }
   }
+
+  @Test
+  fun groupApiRefusesOnSealedEndpoint() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val stateDir = File(context.noBackupFilesDir, "tendril-smoke-grp-${UUID.randomUUID()}")
+    val alias = "tendril.smoke.grp.${UUID.randomUUID()}"
+    val cipher = KeystoreStateCipher(alias)
+
+    try {
+      TendrilEndpoint.create(
+          stateDir = stateDir.absolutePath,
+          hostId = "android-smoke-grp-host",
+          stateCipher = cipher,
+        )
+        .use { ep ->
+          val createResult = runCatching { ep.groupCreate("smoke-group") }
+          assertTrue(createResult.isFailure)
+          assertTrue(
+            createResult.exceptionOrNull()?.message.orEmpty().contains("groups require a state directory endpoint")
+          )
+
+          val openResult = runCatching { ep.openGroup("no-such-group") }
+          assertTrue(openResult.isFailure)
+          assertTrue(
+            openResult.exceptionOrNull()?.message.orEmpty().contains("groups require a state directory endpoint")
+          )
+
+          val ingestResult = runCatching { ep.groupIngestManifest("{}", "peer") }
+          assertTrue(ingestResult.isFailure)
+        }
+    } finally {
+      stateDir.deleteRecursively()
+      deleteKeystoreAlias(alias)
+    }
+  }
 }
