@@ -38,25 +38,15 @@ public final class TendrilKeychainStore {
     }
     lock.lock()
     defer { lock.unlock() }
-    if var existing = try readKeyData() {
-      defer { existing.resetBytes(in: 0..<existing.count) }
-      guard existing.count == 32 else {
-        throw TendrilKeychainError.invalidData
-      }
-      return SymmetricKey(data: existing)
+    if let existing = try readKey() {
+      return existing
     }
     let fresh = SymmetricKey(size: .bits256)
-    var raw = fresh.withUnsafeBytes { Data($0) }
-    defer { raw.resetBytes(in: 0..<raw.count) }
-    if try storeKeyData(raw) {
+    if try storeKey(fresh) {
       return fresh
     }
-    if var raced = try readKeyData() {
-      defer { raced.resetBytes(in: 0..<raced.count) }
-      guard raced.count == 32 else {
-        throw TendrilKeychainError.invalidData
-      }
-      return SymmetricKey(data: raced)
+    if let raced = try readKey() {
+      return raced
     }
     throw TendrilKeychainError.osStatus(errSecDuplicateItem)
   }
@@ -90,41 +80,87 @@ public final class TendrilKeychainStore {
     return try AES.GCM.open(box, using: key, authenticating: combinedAad(authenticating))
   }
 
-  private func readKeyData() throws -> Data? {
-    let query: [String: Any] = [
-      kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: service,
-      kSecAttrAccount as String: account,
-      kSecReturnData as String: true,
-      kSecMatchLimit as String: kSecMatchLimitOne,
-    ]
-    var item: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &item)
-    if status == errSecItemNotFound {
-      return nil
+  private static func zeroize(_ buffer: UnsafeMutableRawBufferPointer) {
+    guard let base = buffer.baseAddress, buffer.count > 0 else { return }
+    #if canImport(Darwin)
+    _ = memset_s(base, buffer.count, 0, buffer.count)
+    #else
+    let bytes = base.assumingMemoryBound(to: UInt8.self)
+    for i in 0..<buffer.count {
+      bytes[i] = 0
     }
-    guard status == errSecSuccess, let data = item as? Data else {
-      throw TendrilKeychainError.osStatus(status)
-    }
-    return data
+    #endif
   }
 
-  private func storeKeyData(_ data: Data) throws -> Bool {
-    let query: [String: Any] = [
-      kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: service,
-      kSecAttrAccount as String: account,
-      kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-      kSecValueData as String: data,
-    ]
-    let status = SecItemAdd(query as CFDictionary, nil)
-    if status == errSecDuplicateItem {
-      return false
+  private func readKey() throws -> SymmetricKey? {
+    try autoreleasepool {
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+      ]
+      var item: CFTypeRef?
+      let status = SecItemCopyMatching(query as CFDictionary, &item)
+      if status == errSecItemNotFound {
+        return nil
+      }
+      guard status == errSecSuccess else {
+        throw TendrilKeychainError.osStatus(status)
+      }
+      // Note: CFData returned by SecItemCopyMatching is owned and freed by CoreFoundation
+      // when the enclosing autoreleasepool drains.
+      guard let cfItem = item, CFGetTypeID(cfItem) == CFDataGetTypeID() else {
+        throw TendrilKeychainError.invalidData
+      }
+      let cfData = cfItem as! CFData
+      let length = CFDataGetLength(cfData)
+      guard length == 32, let ptr = CFDataGetBytePtr(cfData) else {
+        throw TendrilKeychainError.invalidData
+      }
+      let scratch = UnsafeMutableRawBufferPointer.allocate(byteCount: 32, alignment: 1)
+      defer {
+        Self.zeroize(scratch)
+        scratch.deallocate()
+      }
+      scratch.baseAddress?.copyMemory(from: ptr, byteCount: 32)
+      return SymmetricKey(data: scratch)
     }
-    guard status == errSecSuccess else {
-      throw TendrilKeychainError.osStatus(status)
+  }
+
+  private func storeKey(_ key: SymmetricKey) throws -> Bool {
+    try autoreleasepool {
+      try key.withUnsafeBytes { rawBytes in
+        guard rawBytes.count == 32, let base = rawBytes.baseAddress else {
+          throw TendrilKeychainError.invalidData
+        }
+        // Note: CFData passed to SecItemAdd is owned and freed by CoreFoundation
+        // inside this autoreleasepool; rawBytes itself is backed by CryptoKit SecureBytes.
+        guard let cfData = CFDataCreate(
+          kCFAllocatorDefault,
+          base.assumingMemoryBound(to: UInt8.self),
+          32
+        ) else {
+          throw TendrilKeychainError.invalidData
+        }
+        let query: [String: Any] = [
+          kSecClass as String: kSecClassGenericPassword,
+          kSecAttrService as String: service,
+          kSecAttrAccount as String: account,
+          kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+          kSecValueData as String: cfData,
+        ]
+        let status = SecItemAdd(query as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+          return false
+        }
+        guard status == errSecSuccess else {
+          throw TendrilKeychainError.osStatus(status)
+        }
+        return true
+      }
     }
-    return true
   }
 }
 #endif

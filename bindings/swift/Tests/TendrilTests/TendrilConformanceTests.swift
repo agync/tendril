@@ -715,4 +715,66 @@ struct TendrilConformanceTests {
     _ = try call(["op": "shutdown"])
   }
   #endif
+
+  #if canImport(CryptoKit) && canImport(Security)
+  @Test
+  func keychainStoreCustomProviderRoundTripAndVersionGuard() throws {
+    let key = SymmetricKey(size: .bits256)
+    let store = TendrilKeychainStore(
+      service: "dev.tendril.state.test",
+      account: "custom-provider-\(UUID().uuidString)"
+    ) {
+      key
+    }
+    let payload = Data("sec22-keychain-roundtrip-state".utf8)
+    let aad = Data("sec22-aad".utf8)
+
+    let sealedWithAad = try store.sealState(payload, authenticating: aad)
+    #expect(try store.openState(sealedWithAad, authenticating: aad) == payload)
+
+    let sealedEmptyAad = try store.sealState(payload)
+    #expect(try store.openState(sealedEmptyAad) == payload)
+    #expect(throws: Error.self) {
+      _ = try store.openState(sealedWithAad)
+    }
+
+    var wrongVersion = sealedWithAad
+    wrongVersion[0] = 0x02
+    #expect(throws: Error.self) {
+      _ = try store.openState(wrongVersion, authenticating: aad)
+    }
+    #expect(throws: Error.self) {
+      _ = try store.openState(Data([0x01]), authenticating: aad)
+    }
+  }
+
+  #if os(macOS)
+  @Test
+  func keychainStoreRealKeychainRoundTrip() throws {
+    let service = "dev.tendril.state.test"
+    let account = "real-kc-\(UUID().uuidString)"
+    let store = TendrilKeychainStore(service: service, account: account)
+    defer {
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+      ]
+      SecItemDelete(query as CFDictionary)
+    }
+    do {
+      let key1 = try store.loadOrCreateMasterKey()
+      let key2 = try store.loadOrCreateMasterKey()
+      #expect(key1.withUnsafeBytes { Data($0) } == key2.withUnsafeBytes { Data($0) })
+      let payload = Data("sec22-real-keychain-state".utf8)
+      let sealed = try store.sealState(payload)
+      #expect(try store.openState(sealed) == payload)
+    } catch TendrilKeychainError.osStatus(let status)
+      where status == errSecWrPerm || status == errSecInteractionNotAllowed || status == -34018
+    {
+      print("[TendrilTests] NOTICE: live Keychain unavailable in headless CLI (OSStatus \(status))")
+    }
+  }
+  #endif
+  #endif
 }

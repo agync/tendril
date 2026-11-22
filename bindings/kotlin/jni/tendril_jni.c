@@ -17,6 +17,24 @@ static void zeroize_cstr_free(char *p) {
   free(p);
 }
 
+static void zeroize_bytes(void *p, size_t len) {
+  if (p == NULL || len == 0) {
+    return;
+  }
+  volatile unsigned char *vp = (volatile unsigned char *)p;
+  for (size_t i = 0; i < len; i++) {
+    vp[i] = 0;
+  }
+}
+
+static void zeroize_bytes_free(void *p, size_t len) {
+  if (p == NULL) {
+    return;
+  }
+  zeroize_bytes(p, len);
+  free(p);
+}
+
 static jstring utf8_to_jstring(JNIEnv *env, const char *s);
 
 static void throw_ex(JNIEnv *env, const char *class_name, const char *msg) {
@@ -190,7 +208,8 @@ static jstring utf8_to_jstring(JNIEnv *env, const char *s) {
       len16 += 1;
     }
   }
-  jchar *u16 = (jchar *)malloc((len16 > 0 ? len16 : 1) * sizeof(jchar));
+  size_t u16_bytes = (len16 > 0 ? len16 : 1) * sizeof(jchar);
+  jchar *u16 = (jchar *)malloc(u16_bytes);
   if (u16 == NULL) {
     throw_ex(env, "java/lang/OutOfMemoryError", "malloc failed decoding UTF-8");
     return NULL;
@@ -226,7 +245,7 @@ static jstring utf8_to_jstring(JNIEnv *env, const char *s) {
     }
   }
   jstring out = (*env)->NewString(env, u16, (jsize)idx);
-  free(u16);
+  zeroize_bytes_free(u16, u16_bytes);
   return out;
 }
 
@@ -456,7 +475,7 @@ JNIEXPORT jboolean JNICALL Java_dev_tendril_TendrilNative_verifyGrantJson(
     rc = tendril_verify_grant_json(
         c_grant, c_keys, c_subj, c_root, c_cap, (uint64_t)now_unix, c_crl, &allowed);
   }
-  free(c_grant);
+  zeroize_cstr_free(c_grant);
   free(c_keys);
   free(c_subj);
   free(c_root);
@@ -515,7 +534,7 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_endpointNewFromState(
     ep = tendril_endpoint_new_from_state(c_id, c_roster, c_host);
   }
   zeroize_cstr_free(c_id);
-  free(c_roster);
+  zeroize_cstr_free(c_roster);
   free(c_host);
   if ((*env)->ExceptionCheck(env)) {
     return 0;
@@ -898,7 +917,7 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointConfirmPeer(
     rc = tendril_endpoint_confirm_peer((TendrilEndpoint *)(uintptr_t)ptr, c_peer, c_sas);
   }
   free(c_peer);
-  free(c_sas);
+  zeroize_cstr_free(c_sas);
   if ((*env)->ExceptionCheck(env)) {
     return;
   }
@@ -926,7 +945,7 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointMintGrant(
         (TendrilEndpoint *)(uintptr_t)ptr, c_peer, c_caps, (uint64_t)ttl_secs, &out);
   }
   free(c_peer);
-  free(c_caps);
+  zeroize_cstr_free(c_caps);
   if ((*env)->ExceptionCheck(env)) {
     return NULL;
   }
@@ -1114,7 +1133,7 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionConnect(
   free(c_ep);
   free(c_rh);
   free(c_target);
-  free(c_grant);
+  zeroize_cstr_free(c_grant);
   if ((*env)->ExceptionCheck(env)) {
     return 0;
   }
@@ -1167,7 +1186,7 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionConnectV2(
   free(c_ep);
   free(c_rh);
   free(c_target);
-  free(c_grant);
+  zeroize_cstr_free(c_grant);
   if ((*env)->ExceptionCheck(env)) {
     return 0;
   }
@@ -1239,16 +1258,35 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_sessionSendData(
     return;
   }
   jsize len = (*env)->GetArrayLength(env, data);
-  jbyte *bytes = len > 0 ? (*env)->GetByteArrayElements(env, data, NULL) : NULL;
-  if (len > 0 && bytes == NULL) {
-    throw_ex(env, "java/lang/OutOfMemoryError", "GetByteArrayElements failed");
+  if (len < 0) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid data length");
     return;
   }
-  int32_t rc = tendril_session_send_data(
-      (TendrilSession *)(uintptr_t)ptr, (const uint8_t *)bytes, (size_t)len);
-  if (bytes != NULL) {
-    (*env)->ReleaseByteArrayElements(env, data, bytes, JNI_ABORT);
+  uint8_t stack_buf[4096];
+  uint8_t *heap_buf = NULL;
+  uint8_t *buf = stack_buf;
+  if (len > (jsize)sizeof(stack_buf)) {
+    heap_buf = (uint8_t *)malloc((size_t)len);
+    if (heap_buf == NULL) {
+      throw_ex(env, "java/lang/OutOfMemoryError", "malloc failed");
+      return;
+    }
+    buf = heap_buf;
   }
+  if (len > 0) {
+    (*env)->GetByteArrayRegion(env, data, 0, len, (jbyte *)buf);
+    if ((*env)->ExceptionCheck(env)) {
+      zeroize_bytes(buf, (size_t)len);
+      free(heap_buf);
+      return;
+    }
+  }
+  int32_t rc = tendril_session_send_data(
+      (TendrilSession *)(uintptr_t)ptr, len > 0 ? buf : NULL, (size_t)len);
+  if (len > 0) {
+    zeroize_bytes(buf, (size_t)len);
+  }
+  free(heap_buf);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_session_send_data failed");
   }

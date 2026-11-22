@@ -1279,6 +1279,49 @@ public final class TendrilJniConformanceTest {
           check("rust-v2-reply".equals(got), "unexpected rust v2 reply: " + got);
           check(TendrilNative.sessionAuthorize(sess, "fs.read"), "fs.read should be allowed");
           check(!TendrilNative.sessionAuthorize(sess, "shell.exec"), "shell.exec should be denied");
+
+          // SEC-21 regression: exercise sessionSendData large-frame heap path (>4096 bytes)
+          // and utf8_to_jstring decoding on pollEvent.
+          byte[] largePayload = new byte[8192];
+          byte[] marker = "SEC21_LARGE_FRAME_SECRET_".getBytes(StandardCharsets.UTF_8);
+          for (int i = 0; i < largePayload.length; i++) {
+            largePayload[i] = marker[i % marker.length];
+          }
+          TendrilNative.sessionSendData(sess, largePayload);
+          String largeGot = null;
+          for (int i = 0; i < 4; i++) {
+            Map<String, Object> largeEv = peer.call(Map.of("op", "recv", "timeout_ms", 2000));
+            if ("data".equals(largeEv.get("event"))) {
+              largeGot = asStr(largeEv.get("data_utf8"));
+              break;
+            }
+          }
+          check(
+              new String(largePayload, StandardCharsets.UTF_8).equals(largeGot),
+              "unexpected large-frame recv");
+
+          peer.call(Map.of("op", "send", "data_utf8", "SEC21_POLL_SECRET_UTF8"));
+          String pollGot = null;
+          for (int i = 0; i < 4; i++) {
+            Map<String, Object> jev =
+                asObj(Json.parse(TendrilNative.sessionPollEvent(sess, 2000)));
+            if ("data".equals(jev.get("event"))) {
+              pollGot =
+                  new String(b64UrlDecode(asStr(jev.get("data_b64"))), StandardCharsets.UTF_8);
+              break;
+            }
+          }
+          check("SEC21_POLL_SECRET_UTF8".equals(pollGot), "unexpected poll secret: " + pollGot);
+
+          // SEC-21 regression: exercise endpointNewFromState roster zeroization path.
+          String idJson = TendrilNative.endpointExportIdentityJson(cliEp);
+          try {
+            TendrilNative.endpointNewFromState(idJson, "{\"SEC21_ROSTER_SECRET\":true}", "h");
+            throw new AssertionError("expected invalid roster json to fail");
+          } catch (IllegalStateException expected) {
+            // Expected: c_roster is zeroized before free on return.
+          }
+
           TendrilNative.sessionClose(sess, 1000, "done");
         } finally {
           TendrilNative.sessionFree(sess);
