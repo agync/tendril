@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -28,7 +29,7 @@ use tendril_core::v2::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout};
 use tokio_rustls::TlsAcceptor;
@@ -181,6 +182,102 @@ impl FromStr for IpCidr {
     }
 }
 
+/// Maximum byte size accepted for `--auth-secret-file`.
+pub const MAX_AUTH_SECRET_FILE_BYTES: usize = 16 * 1024;
+/// Maximum byte size accepted for `--tls-key`.
+pub const MAX_TLS_KEY_FILE_BYTES: usize = 256 * 1024;
+
+/// Reads a private key or secret file after verifying it is a regular non-symlink file
+/// within `max_bytes` and, on Unix, has owner-only permissions (`mode & 0o077 == 0`).
+pub fn read_private_file(
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    let sym_meta = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to stat {label} '{}': {err}", path.display()))?;
+    if sym_meta.file_type().is_symlink() {
+        return Err(format!(
+            "{label} '{}' must not be a symlink",
+            path.display()
+        ));
+    }
+    if !sym_meta.file_type().is_file() {
+        return Err(format!(
+            "{label} '{}' must be a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (sym_meta.mode() & 0o077) != 0 {
+            return Err(format!(
+                "{label} '{}' must have owner-only permissions (0600 or stricter)",
+                path.display()
+            ));
+        }
+    }
+    if sym_meta.len() > max_bytes as u64 {
+        return Err(format!(
+            "{label} '{}' exceeds maximum size of {max_bytes} bytes",
+            path.display()
+        ));
+    }
+
+    let file = std::fs::File::open(path)
+        .map_err(|err| format!("failed to open {label} '{}': {err}", path.display()))?;
+    let fd_meta = file
+        .metadata()
+        .map_err(|err| format!("failed to stat open {label} '{}': {err}", path.display()))?;
+    if !fd_meta.file_type().is_file() {
+        return Err(format!(
+            "{label} '{}' must be a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (fd_meta.mode() & 0o077) != 0 {
+            return Err(format!(
+                "{label} '{}' must have owner-only permissions (0600 or stricter)",
+                path.display()
+            ));
+        }
+        if fd_meta.dev() != sym_meta.dev() || fd_meta.ino() != sym_meta.ino() {
+            return Err(format!("{label} '{}' changed during open", path.display()));
+        }
+    }
+    if fd_meta.len() > max_bytes as u64 {
+        return Err(format!(
+            "{label} '{}' exceeds maximum size of {max_bytes} bytes",
+            path.display()
+        ));
+    }
+
+    let mut buf = Zeroizing::new(Vec::new());
+    let limit = (max_bytes as u64).saturating_add(1);
+    file.take(limit)
+        .read_to_end(&mut buf)
+        .map_err(|err| format!("failed to read {label} '{}': {err}", path.display()))?;
+    if buf.len() > max_bytes {
+        return Err(format!(
+            "{label} '{}' exceeds maximum size of {max_bytes} bytes",
+            path.display()
+        ));
+    }
+    Ok(buf)
+}
+
+/// Header inspected when extracting the client IP from a trusted reverse proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrustedProxyHeader {
+    #[default]
+    Xff,
+    Forwarded,
+}
+
 /// Configuration for [`RelayServer`].
 #[derive(Clone)]
 pub struct RelayConfig {
@@ -201,6 +298,7 @@ pub struct RelayConfig {
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
     pub trusted_proxies: Vec<IpCidr>,
+    pub trusted_proxy_header: TrustedProxyHeader,
     pub allowed_mailboxes: Vec<[u8; 32]>,
     pub auth_secret: Option<Zeroizing<Vec<u8>>>,
     pub trusted_issuers: Vec<[u8; 32]>,
@@ -229,6 +327,7 @@ impl fmt::Debug for RelayConfig {
             .field("tls_cert_path", &self.tls_cert_path)
             .field("tls_key_path", &self.tls_key_path)
             .field("trusted_proxies", &self.trusted_proxies)
+            .field("trusted_proxy_header", &self.trusted_proxy_header)
             .field("allowed_mailboxes", &self.allowed_mailboxes.len())
             .field(
                 "auth_secret",
@@ -261,6 +360,7 @@ impl Default for RelayConfig {
             tls_cert_path: None,
             tls_key_path: None,
             trusted_proxies: Vec::new(),
+            trusted_proxy_header: TrustedProxyHeader::default(),
             allowed_mailboxes: Vec::new(),
             auth_secret: None,
             trusted_issuers: Vec::new(),
@@ -504,6 +604,7 @@ struct RelayState {
     config: RelayConfig,
     limiter: Mutex<IpTokenLimiter>,
     active_connections: AtomicUsize,
+    pre_upgrade_semaphore: Arc<Semaphore>,
     active_per_ip: Mutex<HashMap<IpAddr, usize>>,
     tables: Mutex<RelayTables>,
 }
@@ -515,10 +616,12 @@ impl RelayState {
             config.ip_burst_capacity,
             config.ip_refill_per_sec,
         );
+        let pre_upgrade_cap = (config.max_total_connections / 4).max(1);
         Self {
             config,
             limiter: Mutex::new(limiter),
             active_connections: AtomicUsize::new(0),
+            pre_upgrade_semaphore: Arc::new(Semaphore::new(pre_upgrade_cap)),
             active_per_ip: Mutex::new(HashMap::new()),
             tables: Mutex::new(RelayTables::new()),
         }
@@ -767,8 +870,10 @@ impl RelayServer {
                         cert_path.display()
                     )));
                 }
-                let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| {
-                    RelayError::Tls(format!("read private key '{}': {e}", key_path.display()))
+                let key_bytes = read_private_file(key_path, MAX_TLS_KEY_FILE_BYTES, "tls-key")
+                    .map_err(RelayError::Tls)?;
+                let key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
+                    RelayError::Tls(format!("parse private key '{}': {e}", key_path.display()))
                 })?;
                 let server_cfg = rustls::ServerConfig::builder()
                     .with_no_client_auth()
@@ -839,20 +944,39 @@ impl RelayServer {
                                 .trusted_proxies
                                 .iter()
                                 .any(|cidr| cidr.contains(peer_ip));
-                            let ip_guard = if from_trusted_proxy {
-                                None
+                            let (ip_guard, pre_upgrade_permit) = if from_trusted_proxy {
+                                let Ok(permit) =
+                                    self.state.pre_upgrade_semaphore.clone().try_acquire_owned()
+                                else {
+                                    tracing::debug!(
+                                        ip = %peer_ip,
+                                        "rejected trusted-proxy connection at pre-upgrade cap"
+                                    );
+                                    drop(stream);
+                                    continue;
+                                };
+                                (None, Some(permit))
                             } else {
                                 let Some(guard) = self.state.try_acquire_ip(peer_ip) else {
                                     tracing::debug!(ip = %peer_ip, "rejected relay connection by rate/ip cap");
                                     drop(stream);
                                     continue;
                                 };
-                                Some(guard)
+                                (Some(guard), None)
                             };
                             let state = Arc::clone(&self.state);
                             let tls = self.tls_acceptor.clone();
                             tokio::spawn(async move {
-                                handle_connection(stream, peer_ip, global_guard, ip_guard, tls, state).await;
+                                handle_connection(
+                                    stream,
+                                    peer_ip,
+                                    global_guard,
+                                    ip_guard,
+                                    pre_upgrade_permit,
+                                    tls,
+                                    state,
+                                )
+                                .await;
                             });
                         }
                         Err(err) => {
@@ -1039,30 +1163,35 @@ fn parse_forwarded_ip_token(raw: &str) -> Option<IpAddr> {
 fn extract_trusted_client_ip(
     headers: &HeaderMap,
     trusted_proxies: &[IpCidr],
+    trusted_header: TrustedProxyHeader,
     peer_ip: IpAddr,
 ) -> IpAddr {
     let mut candidates = Vec::new();
-    for val in headers.get_all("forwarded") {
-        if let Ok(s) = val.to_str() {
-            for entry in s.split(',') {
-                for param in entry.split(';') {
-                    let trimmed = param.trim();
-                    if trimmed.len() > 4
-                        && trimmed[..4].eq_ignore_ascii_case("for=")
-                        && let Some(ip) = parse_forwarded_ip_token(&trimmed[4..])
-                    {
-                        candidates.push(ip);
+    match trusted_header {
+        TrustedProxyHeader::Forwarded => {
+            for val in headers.get_all("forwarded") {
+                if let Ok(s) = val.to_str() {
+                    for entry in s.split(',') {
+                        for param in entry.split(';') {
+                            let trimmed = param.trim();
+                            if trimmed.len() > 4
+                                && trimmed[..4].eq_ignore_ascii_case("for=")
+                                && let Some(ip) = parse_forwarded_ip_token(&trimmed[4..])
+                            {
+                                candidates.push(ip);
+                            }
+                        }
                     }
                 }
             }
         }
-    }
-    if candidates.is_empty() {
-        for val in headers.get_all("x-forwarded-for") {
-            if let Ok(s) = val.to_str() {
-                for part in s.split(',') {
-                    if let Some(ip) = parse_forwarded_ip_token(part) {
-                        candidates.push(ip);
+        TrustedProxyHeader::Xff => {
+            for val in headers.get_all("x-forwarded-for") {
+                if let Ok(s) = val.to_str() {
+                    for part in s.split(',') {
+                        if let Some(ip) = parse_forwarded_ip_token(part) {
+                            candidates.push(ip);
+                        }
                     }
                 }
             }
@@ -1081,13 +1210,14 @@ async fn handle_connection(
     peer_ip: IpAddr,
     global_guard: GlobalConnGuard,
     pre_acquired_ip: Option<IpConnGuard>,
+    pre_upgrade_permit: Option<OwnedSemaphorePermit>,
     tls_acceptor: Option<TlsAcceptor>,
     state: Arc<RelayState>,
 ) {
     let _ = stream.set_nodelay(true);
+    let upgrade_timeout = Duration::from_secs(5).min(state.config.accept_timeout);
     let io_stream = match tls_acceptor {
-        Some(acceptor) => match timeout(state.config.accept_timeout, acceptor.accept(stream)).await
-        {
+        Some(acceptor) => match timeout(upgrade_timeout, acceptor.accept(stream)).await {
             Ok(Ok(tls_stream)) => RelayTcpStream::Tls(Box::new(tls_stream)),
             Ok(Err(_)) | Err(_) => return,
         },
@@ -1104,6 +1234,7 @@ async fn handle_connection(
     let matched_version = Arc::new(Mutex::new(None::<RelayProtocolVersion>));
     let extract_trusted = pre_acquired_ip.is_none();
     let trusted_proxies = state.config.trusted_proxies.clone();
+    let trusted_header = state.config.trusted_proxy_header;
     let extracted_slot = Arc::clone(&extracted_ip);
     let version_slot = Arc::clone(&matched_version);
 
@@ -1122,20 +1253,22 @@ async fn handle_connection(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(version);
         if extract_trusted {
-            let resolved = extract_trusted_client_ip(req.headers(), &trusted_proxies, peer_ip);
+            let resolved =
+                extract_trusted_client_ip(req.headers(), &trusted_proxies, trusted_header, peer_ip);
             *extracted_slot.lock().expect("extracted_ip mutex poisoned") = Some(resolved);
         }
         Ok(resp)
     };
 
     let Ok(Ok(mut ws)) = timeout(
-        state.config.accept_timeout,
+        upgrade_timeout,
         accept_hdr_async_with_config(io_stream, validate_req, Some(ws_config)),
     )
     .await
     else {
         return;
     };
+    drop(pre_upgrade_permit);
 
     let version = matched_version
         .lock()
@@ -1314,7 +1447,7 @@ async fn handle_register(
         send_error_and_close(&mut ws, "capacity_exceeded", state.config.write_timeout).await;
         return;
     };
-    let _reg_guard = MailboxRegGuard {
+    let reg_guard = MailboxRegGuard {
         state: Arc::clone(&state),
         mailbox_pub,
         reg_id,
@@ -1332,8 +1465,30 @@ async fn handle_register(
         return;
     }
 
+    let idle_sleep = tokio::time::sleep(state.config.idle_timeout.max(Duration::from_millis(1)));
+    tokio::pin!(idle_sleep);
+    let mut awaiting_pong = false;
+
     loop {
         tokio::select! {
+            () = &mut idle_sleep => {
+                if awaiting_pong {
+                    break;
+                }
+                if !timeout(
+                    state.config.write_timeout,
+                    ws.send(Message::Ping(Vec::new().into())),
+                )
+                .await
+                .is_ok_and(|res| res.is_ok())
+                {
+                    break;
+                }
+                awaiting_pong = true;
+                idle_sleep
+                    .as_mut()
+                    .reset(TokioInstant::now() + state.config.pong_timeout.max(Duration::from_millis(1)));
+            }
             maybe_conn = incoming_rx.recv() => {
                 let Some(conn_id) = maybe_conn else {
                     break;
@@ -1344,12 +1499,18 @@ async fn handle_register(
             }
             maybe_ws = ws.next() => {
                 match maybe_ws {
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                        awaiting_pong = false;
+                        idle_sleep
+                            .as_mut()
+                            .reset(TokioInstant::now() + state.config.idle_timeout.max(Duration::from_millis(1)));
+                    }
                     _ => break,
                 }
             }
         }
     }
+    drop(reg_guard);
     let _ = timeout(state.config.write_timeout, ws.close(None)).await;
 }
 
@@ -1376,7 +1537,7 @@ async fn handle_dial(
         return;
     }
 
-    let (match_tx, match_rx) = oneshot::channel::<AcceptorTransfer>();
+    let (match_tx, mut match_rx) = oneshot::channel::<AcceptorTransfer>();
     let enqueue_res: Result<(mpsc::Sender<String>, u64), &'static str> = {
         let mut tables = state.tables.lock().expect("tables mutex poisoned");
         if let Some(mailbox) = tables.mailboxes.get(&target_pub).cloned() {
@@ -1436,15 +1597,27 @@ async fn handle_dial(
         }
     }
 
-    let acceptor = match timeout(state.config.accept_timeout, match_rx).await {
-        Ok(Ok(transfer)) => transfer,
-        Ok(Err(_)) => {
-            send_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
-            return;
-        }
-        Err(_) => {
-            send_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
-            return;
+    let accept_deadline = tokio::time::sleep(state.config.accept_timeout);
+    tokio::pin!(accept_deadline);
+    let acceptor = loop {
+        tokio::select! {
+            res = &mut match_rx => match res {
+                Ok(transfer) => break transfer,
+                Err(_) => {
+                    send_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
+                    return;
+                }
+            },
+            () = &mut accept_deadline => {
+                send_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
+                return;
+            }
+            maybe_ws = ws.next() => {
+                match maybe_ws {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    _ => return,
+                }
+            }
         }
     };
 

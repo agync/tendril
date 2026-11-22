@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use tendril_core::crypto::SigningKeypair;
 use tendril_relay::protocol::{RelayClientMsg, RelayServerMsg, sign_relay_register};
 use tendril_relay::rate_limit::{IpTokenLimiter, normalize_rate_limit_ip};
-use tendril_relay::server::{IpCidr, RelayConfig, RelayError, RelayServer};
+use tendril_relay::server::{IpCidr, RelayConfig, RelayError, RelayServer, TrustedProxyHeader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -99,6 +99,13 @@ fn generate_ephemeral_cert(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
         .expect("run openssl x509 sign");
     assert!(sign_status.success(), "openssl leaf sign failed");
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&leaf_key, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 600 leaf_key");
+    }
+
     (ca_cert, leaf_cert, leaf_key)
 }
 
@@ -178,7 +185,7 @@ async fn sec15_trusted_proxy_right_to_left_xff_and_spoof_rejection() {
     let trusted_server = RelayServer::bind(RelayConfig {
         trusted_proxies: vec![
             "127.0.0.1/32".parse::<IpCidr>().expect("loopback cidr"),
-            mapped_cidr,
+            mapped_cidr.clone(),
         ],
         ip_burst_capacity: 1,
         ip_refill_per_sec: 1,
@@ -230,8 +237,26 @@ async fn sec15_trusted_proxy_right_to_left_xff_and_spoof_rejection() {
         RelayServerMsg::Error { code } if code == "rate_limited"
     ));
 
-    // RFC 7239 Forwarded takes precedence even if an untrusted client injected X-Forwarded-For.
-    let mut req3 = ws_url.clone().into_client_request().expect("req3");
+    drop((ws1, ws2));
+    trusted_handle.stop().await.expect("stop trusted");
+
+    // When explicitly configured for RFC 7239 Forwarded, X-Forwarded-For is ignored.
+    let fwd_server = RelayServer::bind(RelayConfig {
+        trusted_proxies: vec![
+            "127.0.0.1/32".parse::<IpCidr>().expect("loopback cidr"),
+            mapped_cidr.clone(),
+        ],
+        trusted_proxy_header: TrustedProxyHeader::Forwarded,
+        ip_burst_capacity: 1,
+        ip_refill_per_sec: 1,
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind forwarded relay");
+    let fwd_handle = fwd_server.spawn();
+    let fwd_url = fwd_handle.ws_url();
+
+    let mut req3 = fwd_url.clone().into_client_request().expect("req3");
     req3.headers_mut()
         .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
     req3.headers_mut().insert(
@@ -254,7 +279,7 @@ async fn sec15_trusted_proxy_right_to_left_xff_and_spoof_rejection() {
     ));
 
     // A second request with the same Forwarded client IP shares that bucket despite changing XFF.
-    let mut req4 = ws_url.into_client_request().expect("req4");
+    let mut req4 = fwd_url.into_client_request().expect("req4");
     req4.headers_mut()
         .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.77"));
     req4.headers_mut().insert(
@@ -276,8 +301,8 @@ async fn sec15_trusted_proxy_right_to_left_xff_and_spoof_rejection() {
         RelayServerMsg::Error { code } if code == "rate_limited"
     ));
 
-    drop((ws1, ws2, ws3, ws4));
-    trusted_handle.stop().await.expect("stop trusted");
+    drop((ws3, ws4));
+    fwd_handle.stop().await.expect("stop forwarded");
 
     // Untrusted proxy configuration must ignore X-Forwarded-For completely.
     let untrusted_server = RelayServer::bind(RelayConfig {
@@ -1354,4 +1379,438 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
 
         srv.stop().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn sec08_forged_forwarded_header_does_not_bypass_default_xff() {
+    let server = RelayServer::bind(RelayConfig {
+        trusted_proxies: vec!["127.0.0.1/32".parse::<IpCidr>().expect("loopback cidr")],
+        ip_burst_capacity: 1,
+        ip_refill_per_sec: 1,
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind trusted relay");
+    let handle = server.spawn();
+    let ws_url = handle.ws_url();
+
+    // First connection from 203.0.113.7 consumes its single token.
+    let mut req1 = ws_url.clone().into_client_request().expect("req1");
+    req1.headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+    let (mut ws1, _) = connect_async_with_config(req1, None, false)
+        .await
+        .expect("ws1 connect");
+    let msg1 = ws1
+        .next()
+        .await
+        .expect("ws1 item")
+        .expect("ws1 ok")
+        .into_text()
+        .expect("ws1 text");
+    assert!(matches!(
+        serde_json::from_str::<RelayServerMsg>(&msg1).expect("msg1"),
+        RelayServerMsg::Challenge { .. }
+    ));
+
+    // Attacker appends a forged Forwarded header while X-Forwarded-For stays 203.0.113.7.
+    // Under default Xff mode, Forwarded must be ignored so the bucket is still rate_limited.
+    let mut req2 = ws_url.clone().into_client_request().expect("req2");
+    req2.headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+    req2.headers_mut().insert(
+        "forwarded",
+        HeaderValue::from_static("for=198.51.100.55;proto=https"),
+    );
+    let (mut ws2, _) = connect_async_with_config(req2, None, false)
+        .await
+        .expect("ws2 connect");
+    let msg2 = ws2
+        .next()
+        .await
+        .expect("ws2 item")
+        .expect("ws2 ok")
+        .into_text()
+        .expect("ws2 text");
+    assert!(
+        matches!(
+            serde_json::from_str::<RelayServerMsg>(&msg2).expect("msg2"),
+            RelayServerMsg::Error { code } if code == "rate_limited"
+        ),
+        "forged Forwarded header must not bypass default XFF rate limit, got {msg2}"
+    );
+
+    // Forged Forwarded containing a trusted proxy IP must not collapse distinct XFF clients
+    // into the loopback proxy bucket.
+    let mut req3 = ws_url.clone().into_client_request().expect("req3");
+    req3.headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.8"));
+    req3.headers_mut()
+        .insert("forwarded", HeaderValue::from_static("for=127.0.0.1"));
+    let (mut ws3, _) = connect_async_with_config(req3, None, false)
+        .await
+        .expect("ws3 connect");
+    let msg3 = ws3
+        .next()
+        .await
+        .expect("ws3 item")
+        .expect("ws3 ok")
+        .into_text()
+        .expect("ws3 text");
+    assert!(matches!(
+        serde_json::from_str::<RelayServerMsg>(&msg3).expect("msg3"),
+        RelayServerMsg::Challenge { .. }
+    ));
+
+    let mut req4 = ws_url.into_client_request().expect("req4");
+    req4.headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+    req4.headers_mut()
+        .insert("forwarded", HeaderValue::from_static("for=127.0.0.1"));
+    let (mut ws4, _) = connect_async_with_config(req4, None, false)
+        .await
+        .expect("ws4 connect");
+    let msg4 = ws4
+        .next()
+        .await
+        .expect("ws4 item")
+        .expect("ws4 ok")
+        .into_text()
+        .expect("ws4 text");
+    assert!(
+        matches!(
+            serde_json::from_str::<RelayServerMsg>(&msg4).expect("msg4"),
+            RelayServerMsg::Challenge { .. }
+        ),
+        "forged Forwarded must not collapse distinct XFF buckets into proxy IP, got {msg4}"
+    );
+
+    drop((ws1, ws2, ws3, ws4));
+    handle.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn sec09_v1_early_dialer_disconnect_frees_pending_slot_immediately() {
+    use tendril_core::crypto::{b64url_decode_array, b64url_encode};
+
+    let server = RelayServer::bind(RelayConfig {
+        max_pending_per_mailbox: 2,
+        accept_timeout: Duration::from_secs(15),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind relay");
+    let handle = server.spawn();
+    let ws_url = handle.ws_url();
+
+    let kp = SigningKeypair::generate().expect("kp");
+    let (mut reg_ws, _) = connect_async_with_config(&ws_url, None, false)
+        .await
+        .expect("connect reg");
+    let ch_txt = reg_ws
+        .next()
+        .await
+        .expect("ch")
+        .expect("ok")
+        .into_text()
+        .expect("txt");
+    let RelayServerMsg::Challenge { nonce, host, .. } =
+        serde_json::from_str(&ch_txt).expect("parse")
+    else {
+        panic!("expected challenge");
+    };
+    let nonce_bytes: [u8; 32] = b64url_decode_array(&nonce).expect("nonce");
+    let (pub_b64, sig_b64) = sign_relay_register(&kp.ed25519_signing_key(), &host, &nonce_bytes);
+    reg_ws
+        .send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Register {
+                pub_key: pub_b64.clone(),
+                sig: sig_b64,
+                auth: None,
+            })
+            .expect("ser")
+            .into(),
+        ))
+        .await
+        .expect("send reg");
+    let reg_resp = reg_ws
+        .next()
+        .await
+        .expect("resp")
+        .expect("ok")
+        .into_text()
+        .expect("txt");
+    assert!(matches!(
+        serde_json::from_str::<RelayServerMsg>(&reg_resp).expect("parse"),
+        RelayServerMsg::Registered { .. }
+    ));
+
+    let started = Instant::now();
+    for i in 0..4u8 {
+        let (mut d_ws, _) = connect_async_with_config(&ws_url, None, false)
+            .await
+            .expect("connect dialer");
+        let _ = d_ws.next().await;
+        d_ws.send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Dial {
+                target_pub: pub_b64.clone(),
+                conn_id: b64url_encode(&[0x90 + i; 16]),
+                auth: None,
+            })
+            .expect("ser")
+            .into(),
+        ))
+        .await
+        .expect("send dial");
+
+        let inc = timeout(Duration::from_secs(2), reg_ws.next())
+            .await
+            .expect("incoming before timeout")
+            .expect("incoming item")
+            .expect("incoming ok")
+            .into_text()
+            .expect("incoming txt");
+        assert!(
+            matches!(
+                serde_json::from_str::<RelayServerMsg>(&inc).expect("parse inc"),
+                RelayServerMsg::Incoming { .. }
+            ),
+            "dial #{i} should reach mailbox without hitting rate_limited"
+        );
+        drop(d_ws);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "early dialer disconnects must free slots immediately"
+    );
+
+    drop(reg_ws);
+    handle.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn sec09_v1_idle_ping_pong_watchdog_reaps_silent_client_and_keeps_live_client() {
+    use tendril_core::crypto::{b64url_decode_array, b64url_encode};
+
+    let server = RelayServer::bind(RelayConfig {
+        idle_timeout: Duration::from_millis(120),
+        pong_timeout: Duration::from_millis(120),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind relay");
+    let handle = server.spawn();
+    let ws_url = handle.ws_url();
+
+    async fn reg_v1(
+        ws_url: &str,
+        kp: &SigningKeypair,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+        String,
+    ) {
+        let (mut ws, _) = connect_async_with_config(ws_url, None, false)
+            .await
+            .expect("connect");
+        let ch_txt = ws
+            .next()
+            .await
+            .expect("ch")
+            .expect("ok")
+            .into_text()
+            .expect("txt");
+        let RelayServerMsg::Challenge { nonce, host, .. } =
+            serde_json::from_str(&ch_txt).expect("parse")
+        else {
+            panic!("expected challenge");
+        };
+        let nonce_bytes: [u8; 32] = b64url_decode_array(&nonce).expect("nonce");
+        let (pub_b64, sig_b64) =
+            sign_relay_register(&kp.ed25519_signing_key(), &host, &nonce_bytes);
+        ws.send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Register {
+                pub_key: pub_b64.clone(),
+                sig: sig_b64,
+                auth: None,
+            })
+            .expect("ser")
+            .into(),
+        ))
+        .await
+        .expect("send reg");
+        let resp = ws
+            .next()
+            .await
+            .expect("resp")
+            .expect("ok")
+            .into_text()
+            .expect("txt");
+        assert!(matches!(
+            serde_json::from_str::<RelayServerMsg>(&resp).expect("parse"),
+            RelayServerMsg::Registered { .. }
+        ));
+        (ws, pub_b64)
+    }
+
+    let live_kp = SigningKeypair::generate().expect("live kp");
+    let dead_kp = SigningKeypair::generate().expect("dead kp");
+    let (mut live_ws, _live_pub) = reg_v1(&ws_url, &live_kp).await;
+    let (dead_ws, dead_pub) = reg_v1(&ws_url, &dead_kp).await;
+
+    let live_task = tokio::spawn(async move {
+        let mut saw_ping = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(450);
+        while tokio::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(60), live_ws.next()).await {
+                Ok(Some(Ok(Message::Ping(_)))) => {
+                    saw_ping = true;
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(None | Some(Err(_))) => panic!("live v1 client must not be closed by watchdog"),
+                Err(_) => {}
+            }
+        }
+        (live_ws, saw_ping)
+    });
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let (_live_ws, saw_ping) = live_task.await.expect("live task");
+    assert!(saw_ping, "expected v1 watchdog to send Ping to live client");
+
+    let (mut dial_dead, _) = connect_async_with_config(&ws_url, None, false)
+        .await
+        .expect("dial dead");
+    let _ = dial_dead.next().await;
+    dial_dead
+        .send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Dial {
+                target_pub: dead_pub,
+                conn_id: b64url_encode(&[0x42; 16]),
+                auth: None,
+            })
+            .expect("ser")
+            .into(),
+        ))
+        .await
+        .expect("send dial");
+    let resp = timeout(Duration::from_secs(2), dial_dead.next())
+        .await
+        .expect("dial resp before timeout")
+        .expect("item")
+        .expect("ok")
+        .into_text()
+        .expect("txt");
+    assert_eq!(
+        serde_json::from_str::<RelayServerMsg>(&resp).expect("parse"),
+        RelayServerMsg::Error {
+            code: "offline".to_owned()
+        }
+    );
+
+    drop(dead_ws);
+    handle.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn sec16_pre_upgrade_trusted_proxy_stall_is_bounded() {
+    let server = RelayServer::bind(RelayConfig {
+        max_total_connections: 8,
+        trusted_proxies: vec!["127.0.0.1/32".parse::<IpCidr>().expect("loopback cidr")],
+        accept_timeout: Duration::from_millis(300),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind relay");
+    let handle = server.spawn();
+    let addr = handle.local_addr();
+    let ws_url = handle.ws_url();
+
+    // First establish 2 upgraded WS connections; they must release their pre-upgrade permits.
+    let mut req_a = ws_url.clone().into_client_request().expect("req_a");
+    req_a
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+    let (ws_a, _) = connect_async_with_config(req_a, None, false)
+        .await
+        .expect("ws_a");
+
+    let mut req_b = ws_url.clone().into_client_request().expect("req_b");
+    req_b
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.11"));
+    let (ws_b, _) = connect_async_with_config(req_b, None, false)
+        .await
+        .expect("ws_b");
+
+    // Open 2 stalled raw TCP connections from the trusted proxy; this saturates
+    // pre_upgrade_cap = (8 / 4).max(1) = 2 while max_total_connections=8 still has 4 free slots.
+    let stall1 = TcpStream::connect(addr).await.expect("stall1");
+    let stall2 = TcpStream::connect(addr).await.expect("stall2");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let mut req_c = ws_url.clone().into_client_request().expect("req_c");
+    req_c
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.12"));
+    let rejected = timeout(
+        Duration::from_millis(200),
+        connect_async_with_config(req_c, None, false),
+    )
+    .await;
+    assert!(
+        !matches!(rejected, Ok(Ok(_))),
+        "3rd concurrent pre-upgrade trusted-proxy connection must be rejected at pre-upgrade cap"
+    );
+
+    // Wait for upgrade timeout (300ms) to evict stalled pre-upgrade sockets, then upgrade succeeds.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut req_d = ws_url.into_client_request().expect("req_d");
+    req_d
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.13"));
+    let (ws_d, _) = connect_async_with_config(req_d, None, false)
+        .await
+        .expect("ws_d after stall timeout");
+
+    drop((stall1, stall2, ws_a, ws_b, ws_d));
+    handle.stop().await.expect("stop");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sec18_tls_key_rejects_symlink_and_world_readable() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let tmp = TempDir::new().expect("tempdir");
+    let (_ca_cert_path, cert_path, key_path) = generate_ephemeral_cert(tmp.path());
+
+    // World-readable (0o644) TLS key must be rejected.
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    let res_644 = RelayServer::bind(RelayConfig {
+        tls_cert_path: Some(cert_path.clone()),
+        tls_key_path: Some(key_path.clone()),
+        ..RelayConfig::default()
+    })
+    .await;
+    assert!(
+        matches!(res_644, Err(RelayError::Tls(_))),
+        "0o644 TLS key must be rejected"
+    );
+
+    // Fix key permissions to 0o600, then verify symlink to it is rejected.
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    let link_path = tmp.path().join("relay-key-link.pem");
+    symlink(&key_path, &link_path).expect("symlink");
+    let res_link = RelayServer::bind(RelayConfig {
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(link_path),
+        ..RelayConfig::default()
+    })
+    .await;
+    assert!(
+        matches!(res_link, Err(RelayError::Tls(_))),
+        "symlink TLS key must be rejected"
+    );
 }

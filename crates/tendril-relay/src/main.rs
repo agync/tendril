@@ -1,5 +1,6 @@
 //! Standalone Tendril v1 and v2 WebSocket ciphertext relay binary.
 
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -7,8 +8,11 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use tendril_core::crypto::{b64url_decode_array, is_valid_ed25519_public_key};
 use tendril_core::relay_auth::validate_relay_auth_secret;
-use tendril_relay::{IpCidr, RelayAuthScope, RelayConfig, RelayServer};
+use tendril_relay::server::{MAX_AUTH_SECRET_FILE_BYTES, read_private_file};
+use tendril_relay::{IpCidr, RelayAuthScope, RelayConfig, RelayServer, TrustedProxyHeader};
 use zeroize::Zeroizing;
+
+const MAX_ALLOW_MAILBOXES_FILE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliAuthScope {
@@ -21,6 +25,21 @@ impl From<CliAuthScope> for RelayAuthScope {
         match value {
             CliAuthScope::All => Self::All,
             CliAuthScope::RegisterOnly => Self::RegisterOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliTrustedProxyHeader {
+    Xff,
+    Forwarded,
+}
+
+impl From<CliTrustedProxyHeader> for TrustedProxyHeader {
+    fn from(value: CliTrustedProxyHeader) -> Self {
+        match value {
+            CliTrustedProxyHeader::Xff => Self::Xff,
+            CliTrustedProxyHeader::Forwarded => Self::Forwarded,
         }
     }
 }
@@ -51,6 +70,8 @@ struct Args {
     tls_key: Option<PathBuf>,
     #[arg(long = "trusted-proxy")]
     trusted_proxies: Vec<IpCidr>,
+    #[arg(long = "trusted-proxy-header", value_enum, default_value_t = CliTrustedProxyHeader::Xff)]
+    trusted_proxy_header: CliTrustedProxyHeader,
     #[arg(long = "allow-mailbox", allow_hyphen_values = true)]
     allow_mailboxes: Vec<String>,
     #[arg(long = "allow-mailboxes-file")]
@@ -74,8 +95,32 @@ fn decode_32b_key(raw: &str, label: &str, require_ed25519: bool) -> Result<[u8; 
 }
 
 fn parse_allow_mailboxes_file(path: &Path) -> Result<Vec<[u8; 32]>, String> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|err| format!("failed to read allow-mailboxes file: {err}"))?;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to stat allow-mailboxes-file: {err}"))?;
+    if meta.file_type().is_symlink() {
+        return Err("allow-mailboxes-file must not be a symlink".to_owned());
+    }
+    if !meta.file_type().is_file() {
+        return Err("allow-mailboxes-file must be a regular file".to_owned());
+    }
+    if meta.len() > MAX_ALLOW_MAILBOXES_FILE_BYTES as u64 {
+        return Err(format!(
+            "allow-mailboxes-file exceeds maximum size of {MAX_ALLOW_MAILBOXES_FILE_BYTES} bytes"
+        ));
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|err| format!("failed to open allow-mailboxes-file: {err}"))?;
+    let mut raw = Vec::new();
+    file.take((MAX_ALLOW_MAILBOXES_FILE_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut raw)
+        .map_err(|err| format!("failed to read allow-mailboxes-file: {err}"))?;
+    if raw.len() > MAX_ALLOW_MAILBOXES_FILE_BYTES {
+        return Err(format!(
+            "allow-mailboxes-file exceeds maximum size of {MAX_ALLOW_MAILBOXES_FILE_BYTES} bytes"
+        ));
+    }
+    let contents = String::from_utf8(raw)
+        .map_err(|err| format!("allow-mailboxes-file must be valid UTF-8: {err}"))?;
     let mut keys = Vec::new();
     for (idx, line) in contents.lines().enumerate() {
         let trimmed = line.trim();
@@ -111,9 +156,7 @@ fn validate_secret_bytes(
 
 fn load_auth_secret(file: Option<&Path>) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
     if let Some(path) = file {
-        let bytes = Zeroizing::new(
-            std::fs::read(path).map_err(|err| format!("failed to read auth-secret-file: {err}"))?,
-        );
+        let bytes = read_private_file(path, MAX_AUTH_SECRET_FILE_BYTES, "auth-secret-file")?;
         return validate_secret_bytes(bytes, "auth-secret-file").map(Some);
     }
     match std::env::var("TENDRIL_RELAY_AUTH_SECRET") {
@@ -166,6 +209,7 @@ fn build_relay_config(
         tls_cert_path: args.tls_cert,
         tls_key_path: args.tls_key,
         trusted_proxies: args.trusted_proxies,
+        trusted_proxy_header: args.trusted_proxy_header.into(),
         allowed_mailboxes,
         auth_secret,
         trusted_issuers,
@@ -277,5 +321,38 @@ mod tests {
         .unwrap();
         let built = build_relay_config(valid_scoped, None).unwrap();
         assert_eq!(built.auth_scope, RelayAuthScope::RegisterOnly);
+        assert_eq!(built.trusted_proxy_header, TrustedProxyHeader::Xff);
+
+        let fwd_args =
+            Args::try_parse_from(["tendril-relay", "--trusted-proxy-header", "forwarded"])
+                .expect("parse forwarded header selector");
+        let fwd_cfg = build_relay_config(fwd_args, None).unwrap();
+        assert_eq!(fwd_cfg.trusted_proxy_header, TrustedProxyHeader::Forwarded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sec18_auth_secret_file_rejects_symlink_and_world_readable() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let secret_path = dir.path().join("secret.bin");
+        std::fs::write(&secret_path, b"valid-shared-secret").unwrap();
+
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            load_auth_secret(Some(&secret_path)).is_err(),
+            "0o644 auth-secret-file must be rejected"
+        );
+
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_auth_secret(Some(&secret_path)).is_ok());
+
+        let link_path = dir.path().join("secret-link.bin");
+        symlink(&secret_path, &link_path).unwrap();
+        assert!(
+            load_auth_secret(Some(&link_path)).is_err(),
+            "symlink auth-secret-file must be rejected"
+        );
     }
 }
