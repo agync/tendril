@@ -124,10 +124,16 @@ export interface TendrilIndexedDbVault {
 export function createIndexedDbVault(options?: IndexedDbVaultOptions): TendrilIndexedDbVault;
 export const openTendrilVault: typeof createIndexedDbVault;
 
-export function initTendril(wasmUrl?: string | URL | RequestInfo | BufferSource): Promise<void>;
-export function initTendrilP2p(
-  wasmUrl?: string | URL | RequestInfo | BufferSource
-): Promise<void>;
+export type WasmInitInput =
+  | string
+  | URL
+  | RequestInfo
+  | BufferSource
+  | WebAssembly.Module
+  | { module_or_path: string | URL | RequestInfo | BufferSource | WebAssembly.Module };
+
+export function initTendril(wasmUrl?: WasmInitInput): Promise<void>;
+export function initTendrilP2p(wasmUrl?: WasmInitInput): Promise<void>;
 export function parseP2pEndpoint(endpoint: string): Promise<ParsedP2pEndpoint>;
 export const MAX_RELAY_FRAME_LEN: number;
 export const MAX_QUEUED_BYTES: number;
@@ -281,6 +287,7 @@ export interface TendrilWebClientOptions {
   rosterJson?: string | null;
   rosterBytes?: Uint8Array | null;
   onPersistRoster?: ((rosterJson: string) => void | Promise<void>) | null;
+  onPersistRosterBytes?: ((rosterBytes: Uint8Array) => void | Promise<void>) | null;
 }
 
 export interface WebTransportDialOptions {

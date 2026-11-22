@@ -16,6 +16,21 @@ function stripHostBrackets(host) {
   return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
 }
 
+function normalizeRelayHostInput(host) {
+  if (typeof host !== "string") {
+    throw new Error("relay host must be a string");
+  }
+  const trimmed = host.trim();
+  if (trimmed.includes(":") && !trimmed.startsWith("[") && !trimmed.endsWith("]")) {
+    return `[${trimmed}]`;
+  }
+  return trimmed;
+}
+
+function canonicalizeHostForCompare(host) {
+  return canonical_relay_host(normalizeRelayHostInput(host));
+}
+
 function parseIpv4Octets(host) {
   const parts = host.split(".");
   if (parts.length !== 4) return null;
@@ -473,7 +488,7 @@ async function openRelayHandshake({
   buildDialMsg,
 }) {
   const { url: canonicalUrl, host: urlHost } = validateRelayWsUrl(relayUrl, allowInsecureWs);
-  const expHost = canonical_relay_host(expectedHost || urlHost);
+  const expHost = canonicalizeHostForCompare(expectedHost || urlHost);
 
   const ws = new WebSocket(canonicalUrl);
   ws.binaryType = "arraybuffer";
@@ -626,7 +641,7 @@ async function openRelayHandshake({
     }
     let challengeHost;
     try {
-      challengeHost = canonical_relay_host(challenge.host);
+      challengeHost = canonicalizeHostForCompare(challenge.host);
     } catch (err) {
       throw new Error(`invalid relay challenge host '${challenge.host}': ${err.message || err}`);
     }
@@ -635,7 +650,6 @@ async function openRelayHandshake({
         `relay challenge host mismatch: expected '${expHost}', got '${challengeHost}'`
       );
     }
-    challenge.host = challengeHost;
     if (challenge.max_frame !== undefined) {
       stream._setMaxFrame(challenge.max_frame);
     }

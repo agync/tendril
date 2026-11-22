@@ -44,6 +44,26 @@ fn to_js_err(err: impl fmt::Display) -> JsValue {
     JsValue::from_str(&err.to_string())
 }
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = Uint8Array)]
+    type JsUint8Array;
+
+    #[wasm_bindgen(constructor, js_class = "Uint8Array")]
+    fn new_with_length(len: u32) -> JsUint8Array;
+
+    #[wasm_bindgen(method, js_class = "Uint8Array", js_name = set)]
+    fn set_bytes(this: &JsUint8Array, src: &[u8]);
+}
+
+fn copy_zeroizing_bytes_to_js(bytes: Zeroizing<Vec<u8>>) -> Result<JsValue, JsValue> {
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| to_js_err("serialized payload exceeds u32 length"))?;
+    let arr = JsUint8Array::new_with_length(len);
+    arr.set_bytes(&bytes);
+    Ok(arr.into())
+}
+
 fn as_32(bytes: &[u8], name: &str) -> Result<[u8; 32], String> {
     bytes
         .try_into()
@@ -416,16 +436,16 @@ impl WasmIdentity {
         res
     }
 
-    #[wasm_bindgen]
-    pub fn to_json(&self) -> Result<String, JsValue> {
+    #[wasm_bindgen(unchecked_return_type = "string")]
+    pub fn to_json(&self) -> Result<JsValue, JsValue> {
         let serialized = self.serialize_json().map_err(to_js_err)?;
-        Ok((*serialized).clone())
+        Ok(JsValue::from_str(&serialized))
     }
 
-    #[wasm_bindgen]
-    pub fn to_json_bytes(&self) -> Result<Vec<u8>, JsValue> {
+    #[wasm_bindgen(unchecked_return_type = "Uint8Array")]
+    pub fn to_json_bytes(&self) -> Result<JsValue, JsValue> {
         let serialized = self.serialize_json_bytes().map_err(to_js_err)?;
-        Ok(serialized.to_vec())
+        copy_zeroizing_bytes_to_js(serialized)
     }
 
     #[wasm_bindgen]
@@ -522,16 +542,16 @@ impl WasmRoster {
         res
     }
 
-    #[wasm_bindgen]
-    pub fn to_json(&self) -> Result<String, JsValue> {
+    #[wasm_bindgen(unchecked_return_type = "string")]
+    pub fn to_json(&self) -> Result<JsValue, JsValue> {
         let serialized = Zeroizing::new(serde_json::to_string(&self.inner).map_err(to_js_err)?);
-        Ok((*serialized).clone())
+        Ok(JsValue::from_str(&serialized))
     }
 
-    #[wasm_bindgen]
-    pub fn to_json_bytes(&self) -> Result<Vec<u8>, JsValue> {
+    #[wasm_bindgen(unchecked_return_type = "Uint8Array")]
+    pub fn to_json_bytes(&self) -> Result<JsValue, JsValue> {
         let serialized = Zeroizing::new(serde_json::to_vec(&self.inner).map_err(to_js_err)?);
-        Ok(serialized.to_vec())
+        copy_zeroizing_bytes_to_js(serialized)
     }
 
     #[wasm_bindgen]

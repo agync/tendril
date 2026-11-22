@@ -361,19 +361,21 @@ export class TendrilWebClient {
   #identity;
   #roster;
   #onPersistRoster;
+  #onPersistRosterBytes;
   #freed = false;
   #wasmFreed = false;
   #holders = 0;
   #activeSessions = new Set();
   #persistChain = Promise.resolve();
 
-  constructor(token, identity, roster, onPersistRoster) {
+  constructor(token, identity, roster, onPersistRoster, onPersistRosterBytes = null) {
     if (token !== CLIENT_TOKEN) {
       throw new Error("Use TendrilWebClient.create()");
     }
     this.#identity = identity;
     this.#roster = roster;
     this.#onPersistRoster = onPersistRoster;
+    this.#onPersistRosterBytes = onPersistRosterBytes;
   }
 
   static async create({
@@ -383,44 +385,52 @@ export class TendrilWebClient {
     rosterJson = null,
     rosterBytes = null,
     onPersistRoster = null,
+    onPersistRosterBytes = null,
   } = {}) {
-    await initTendril();
-    let identity;
-    if (identityBytes !== null && identityBytes !== undefined) {
-      if (!(identityBytes instanceof Uint8Array)) {
-        throw new TypeError("identityBytes must be a Uint8Array");
-      }
-      try {
+    try {
+      await initTendril();
+      let identity;
+      if (identityBytes !== null && identityBytes !== undefined) {
+        if (!(identityBytes instanceof Uint8Array)) {
+          throw new TypeError("identityBytes must be a Uint8Array");
+        }
         identity = WasmIdentity.from_json_bytes(identityBytes);
-      } finally {
+      } else if (identityJson) {
+        identity = WasmIdentity.from_json(identityJson);
+      } else {
+        identity = WasmIdentity.generate(hostId);
+      }
+      let roster;
+      try {
+        if (rosterBytes !== null && rosterBytes !== undefined) {
+          if (!(rosterBytes instanceof Uint8Array)) {
+            throw new TypeError("rosterBytes must be a Uint8Array");
+          }
+          roster = WasmRoster.from_json_bytes(rosterBytes);
+        } else if (rosterJson) {
+          roster = WasmRoster.from_json(rosterJson);
+        } else {
+          roster = new WasmRoster();
+        }
+      } catch (err) {
+        identity.free();
+        throw err;
+      }
+      return new TendrilWebClient(
+        CLIENT_TOKEN,
+        identity,
+        roster,
+        onPersistRoster,
+        onPersistRosterBytes
+      );
+    } finally {
+      if (identityBytes instanceof Uint8Array) {
         identityBytes.fill(0);
       }
-    } else if (identityJson) {
-      identity = WasmIdentity.from_json(identityJson);
-    } else {
-      identity = WasmIdentity.generate(hostId);
-    }
-    let roster;
-    try {
-      if (rosterBytes !== null && rosterBytes !== undefined) {
-        if (!(rosterBytes instanceof Uint8Array)) {
-          throw new TypeError("rosterBytes must be a Uint8Array");
-        }
-        try {
-          roster = WasmRoster.from_json_bytes(rosterBytes);
-        } finally {
-          rosterBytes.fill(0);
-        }
-      } else if (rosterJson) {
-        roster = WasmRoster.from_json(rosterJson);
-      } else {
-        roster = new WasmRoster();
+      if (rosterBytes instanceof Uint8Array) {
+        rosterBytes.fill(0);
       }
-    } catch (err) {
-      identity.free();
-      throw err;
     }
-    return new TendrilWebClient(CLIENT_TOKEN, identity, roster, onPersistRoster);
   }
 
   #ensureOpen() {
@@ -493,8 +503,15 @@ export class TendrilWebClient {
     return this.#roster.to_json_bytes();
   }
 
+  #hasPersistCallback() {
+    return (
+      typeof this.#onPersistRosterBytes === "function" ||
+      typeof this.#onPersistRoster === "function"
+    );
+  }
+
   #snapshotRosterBytes() {
-    return typeof this.#onPersistRoster === "function" ? this.#roster.to_json_bytes() : null;
+    return this.#hasPersistCallback() ? this.#roster.to_json_bytes() : null;
   }
 
   #restoreRosterBytes(prevBytes) {
@@ -734,15 +751,25 @@ export class TendrilWebClient {
   }
 
   #persistRoster() {
-    const fn = this.#onPersistRoster;
-    if (typeof fn !== "function") {
+    const fnBytes = this.#onPersistRosterBytes;
+    const fnStr = this.#onPersistRoster;
+    if (typeof fnBytes !== "function" && typeof fnStr !== "function") {
       return Promise.resolve();
     }
     const run = this.#persistChain.then(async () => {
       if (this.#wasmFreed) {
         throw new Error("TendrilWebClient has been freed");
       }
-      await fn(this.#roster.to_json());
+      if (typeof fnBytes === "function") {
+        const bytes = this.#roster.to_json_bytes();
+        try {
+          await fnBytes(bytes);
+        } finally {
+          bytes.fill(0);
+        }
+        return;
+      }
+      await fnStr(this.#roster.to_json());
     });
     this.#persistChain = run.catch(() => {});
     return run;

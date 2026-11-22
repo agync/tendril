@@ -1314,33 +1314,43 @@ test("TendrilWebSession v2 tick() self-terminates when grant expires", async () 
   }
 });
 
-test("SEC-12 relay challenge host canonicalization accepts [::1], trailing dot, and mixed case", async () => {
+test("SEC-12 relay challenge host canonicalization accepts [::1], bare ::1, trailing dot, mixed case, and preserves raw HMAC host", async (t) => {
   await ensureWasm();
-  const nonceB64 = Buffer.from(new Uint8Array(32).fill(0x42)).toString("base64url");
-  const targetPub = Buffer.from(new Uint8Array(32).fill(0x77)).toString("base64url");
+  const nonceBytes = new Uint8Array(32).fill(0x42);
+  const nonceB64 = Buffer.from(nonceBytes).toString("base64url");
+  const targetBytes = new Uint8Array(32).fill(0x77);
+  const targetPub = Buffer.from(targetBytes).toString("base64url");
   const serverEpoch = Math.floor(Date.now() / 1000 / 3600);
   const mbSecret = new Uint8Array(32).fill(0x21);
 
-  // 1. Mock server returning canonical IPv6 "[::1]" host over IPv6 loopback (or expectedHost)
   let challengeHostToSend = "[::1]";
+  let authRequiredToSend = undefined;
+  const capturedDials = [];
   const mock = await startMockRelayWsServer((reqUrl) => {
     const isV2 = reqUrl.startsWith("/v2/relay");
+    const challenge = isV2
+      ? {
+          op: "challenge",
+          host: challengeHostToSend,
+          nonce: nonceB64,
+          epoch: serverEpoch,
+          max_frame: MAX_RELAY_FRAME_LEN,
+        }
+      : {
+          op: "challenge",
+          host: challengeHostToSend,
+          nonce: nonceB64,
+          max_frame: MAX_RELAY_FRAME_LEN,
+        };
+    if (authRequiredToSend) {
+      challenge.auth_required = authRequiredToSend;
+    }
     return {
-      challenge: isV2
-        ? {
-            op: "challenge",
-            host: challengeHostToSend,
-            nonce: nonceB64,
-            epoch: serverEpoch,
-            max_frame: MAX_RELAY_FRAME_LEN,
-          }
-        : {
-            op: "challenge",
-            host: challengeHostToSend,
-            nonce: nonceB64,
-            max_frame: MAX_RELAY_FRAME_LEN,
-          },
-      handleDial: (msg) => ({ op: "ready", conn_id: msg.conn_id }),
+      challenge,
+      handleDial: (msg) => {
+        capturedDials.push(msg);
+        return { op: "ready", conn_id: msg.conn_id };
+      },
     };
   });
 
@@ -1399,15 +1409,42 @@ test("SEC-12 relay challenge host canonicalization accepts [::1], trailing dot, 
   }
 
   try {
-    // Trailing dot and mixed case must canonicalize to equal host
+    // Trailing dot and mixed case must canonicalize to equal host AND preserve raw challenge.host for v1 HMAC
     challengeHostToSend = "Relay.Example.";
+    authRequiredToSend = ["dial"];
+    const hmacSecretRaw = new TextEncoder().encode("sec12-raw-host-hmac-secret");
+    const expectedRawMac = computeRelayAuthHmacB64(
+      new Uint8Array(hmacSecretRaw),
+      "dial",
+      "Relay.Example.",
+      nonceBytes,
+      targetBytes
+    );
     const sCase = await dialRelayStream({
       relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
       targetPub,
       expectedHost: "RELAY.EXAMPLE",
       allowInsecureWs: true,
+      relayAuthSecret: hmacSecretRaw,
     });
     sCase.close();
+    assert.equal(capturedDials.at(-1).auth.kind, "hmac");
+    assert.equal(
+      capturedDials.at(-1).auth.mac,
+      expectedRawMac,
+      "v1 dial HMAC must use raw challenge.host without mutating it"
+    );
+    authRequiredToSend = undefined;
+
+    // Bare IPv6 "::1" from relay matches bracketed expectedHost "[::1]"
+    challengeHostToSend = "::1";
+    const sBareV6 = await dialRelayStream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+      targetPub,
+      expectedHost: "[::1]",
+      allowInsecureWs: true,
+    });
+    sBareV6.close();
 
     // [::1] via expectedHost
     challengeHostToSend = "[::1]";
@@ -1415,8 +1452,8 @@ test("SEC-12 relay challenge host canonicalization accepts [::1], trailing dot, 
       relayUrl: `ws://127.0.0.1:${mock.port}/v2/relay`,
       expectedHost: "[0:0:0:0:0:0:0:1]",
       allowInsecureWs: true,
-      deriveV2Dial: ({ relayHost, nonceBytes, connIdBytes }) =>
-        deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, nonceBytes, connIdBytes),
+      deriveV2Dial: ({ relayHost, nonceBytes: n, connIdBytes }) =>
+        deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, n, connIdBytes),
     });
     sV6Exp.close();
 
@@ -1426,10 +1463,12 @@ test("SEC-12 relay challenge host canonicalization accepts [::1], trailing dot, 
       const sV6Url = await dialRelayV2Stream({
         relayUrl: `ws://[::1]:${v6Port}/v2/relay`,
         allowInsecureWs: true,
-        deriveV2Dial: ({ relayHost, nonceBytes, connIdBytes }) =>
-          deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, nonceBytes, connIdBytes),
+        deriveV2Dial: ({ relayHost, nonceBytes: n, connIdBytes }) =>
+          deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, n, connIdBytes),
       });
       sV6Url.close();
+    } else {
+      t.diagnostic("skipping live ws://[::1] leg: ::1 loopback bind unavailable in sandbox");
     }
   } finally {
     if (ipv6Server) {
@@ -1640,6 +1679,65 @@ test("PRIV-07 byte-slice identity, roster, and PAKE code APIs zeroize caller buf
     } finally {
       pake.free();
       wid.free();
+    }
+
+    // Nit #4: throwing on invalid identityBytes must still zeroize rosterBytes
+    const badIdBytes = new TextEncoder().encode("not-json");
+    const untouchedRosterBytes = c2.exportRosterBytes();
+    await assert.rejects(() =>
+      TendrilWebClient.create({
+        identityBytes: badIdBytes,
+        rosterBytes: untouchedRosterBytes,
+      })
+    );
+    assert.equal(badIdBytes.every((b) => b === 0), true, "bad identityBytes must be zeroized");
+    assert.equal(
+      untouchedRosterBytes.every((b) => b === 0),
+      true,
+      "rosterBytes must be zeroized even when identityBytes fails"
+    );
+
+    // Major #3: onPersistRosterBytes receives Uint8Array and zeroes it after await
+    let capturedPersistBuf = null;
+    let persistedLen = 0;
+    const cBytesPersist = await TendrilWebClient.create({
+      hostId: "priv07-persist-bytes",
+      onPersistRosterBytes: async (bytes) => {
+        assert.ok(bytes instanceof Uint8Array);
+        assert.ok(bytes.length > 0);
+        persistedLen = bytes.length;
+        capturedPersistBuf = bytes;
+      },
+    });
+    try {
+      const anchorInfo = c2.info();
+      await cBytesPersist.addTrustAnchor("priv07-anchor", anchorInfo.signing_pub);
+      assert.ok(persistedLen > 0);
+      assert.equal(
+        capturedPersistBuf.every((b) => b === 0),
+        true,
+        "onPersistRosterBytes buffer must be zeroized after callback completes"
+      );
+    } finally {
+      cBytesPersist.free();
+    }
+
+    // Major #1: verify generated wasm-bindgen glue for to_json/to_json_bytes does NOT free un-zeroed copies
+    const glueJs = fs.readFileSync(path.join(WEB_ROOT, "pkg", "tendril_wasm.js"), "utf8");
+    for (const className of ["WasmIdentity", "WasmRoster"]) {
+      const clsMatch = glueJs.match(new RegExp(`export class ${className} \\{[\\s\\S]*?\\n\\}`));
+      assert.ok(clsMatch, `missing ${className} in generated tendril_wasm.js`);
+      for (const method of ["to_json", "to_json_bytes"]) {
+        const mMatch = clsMatch[0].match(new RegExp(`${method}\\(\\) \\{[\\s\\S]*?\\n    \\}`));
+        assert.ok(mMatch, `missing ${className}.${method} in generated tendril_wasm.js`);
+        assert.equal(
+          /getStringFromWasm0|getArrayU8FromWasm0|__wbindgen_free|__wbindgen_export/.test(
+            mMatch[0]
+          ),
+          false,
+          `${className}.${method} must return JsValue directly without un-zeroed wasm-bindgen linear memory copy:\n${mMatch[0]}`
+        );
+      }
     }
   } finally {
     c2.free();

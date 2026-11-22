@@ -79,8 +79,8 @@ async function initClient() {
   client = await TendrilWebClient.create({
     identityBytes,
     rosterBytes,
-    onPersistRoster: async (rj) => {
-      await vault.writeString(ROSTER_VAULT_ID, rj);
+    onPersistRosterBytes: async (bytes) => {
+      await vault.writeBytes(ROSTER_VAULT_ID, bytes);
     },
   });
   const exportedId = client.exportIdentityBytes();
