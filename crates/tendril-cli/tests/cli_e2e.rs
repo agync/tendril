@@ -3252,27 +3252,22 @@ async fn sec17_v2_peer_revoked_after_establish_rejected_immediately_on_next_data
     );
 }
 
-#[test]
-fn sec03_v2_dial_persists_revoked_state_on_key_mismatch() {
+#[tokio::test]
+async fn sec03_v2_dial_persists_revoked_state_on_key_mismatch() {
+    use tendril_core::crypto::{SigningKeypair, StaticKeypair};
+    use tendril_core::noise::NoiseHfsHandshakeBuilder;
     use tendril_core::roster::PeerState;
-    use tendril_runtime::StateStore;
+    use tendril_core::v2::seal_v2_hello_envelope;
+    use tendril_core::wire::{HostHello, WIRE_VERSION_V2, encode_frame};
+    use tendril_runtime::{DirectListener, PathListener, StateStore};
 
     let host_dir = TempDir::new().expect("host dir");
-    let spoof_host_dir = TempDir::new().expect("spoof host dir");
     let client_dir = TempDir::new().expect("client dir");
 
     assert!(
         run_tendril(host_dir.path(), &["init", "--host-id", "sec03-v2-host"])
             .status
             .success()
-    );
-    assert!(
-        run_tendril(
-            spoof_host_dir.path(),
-            &["init", "--host-id", "sec03-v2-host"]
-        )
-        .status
-        .success()
     );
     let cli_init = run_tendril(client_dir.path(), &["init"]);
     assert!(cli_init.status.success());
@@ -3329,57 +3324,172 @@ fn sec03_v2_dial_persists_revoked_state_on_key_mismatch() {
     );
     drop(serve);
 
-    // SEC-03 E2E verify: once PeerState::Revoked is persisted on disk, `tendril dial --wire-v2`
-    // fails closed via `V2SessionDriver::connect_with_store` and never clobbers disk state on exit.
-    let _ = spoof_host_dir;
     let client_store = StateStore::open_or_create(client_dir.path()).unwrap();
-    client_store
-        .update_roster(|roster| {
-            roster.revoke_peer("sec03-v2-host")?;
-            Ok(())
-        })
-        .unwrap();
-
-    let mut serve2 = KillOnDrop(
-        Command::new(tendril_bin())
-            .arg("--state-dir")
-            .arg(host_dir.path())
-            .args(["serve", "--listen", "127.0.0.1:0", "--wire-v2"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn v2 serve"),
-    );
-    let mut stdout2 = BufReader::new(serve2.0.stdout.take().unwrap());
-    let ep2 = read_json_line(&mut stdout2)["direct_endpoint"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-
-    let dial_out = run_tendril(
-        client_dir.path(),
-        &[
-            "dial",
-            "--wire-v2",
-            "--target",
-            "sec03-v2-host",
-            "--endpoint",
-            &ep2,
-        ],
-    );
-    assert!(
-        !dial_out.status.success(),
-        "dial to revoked v2 host must fail closed"
-    );
-
-    // Verify client disk roster still has PeerState::Revoked without clobbering.
-    let client_roster = client_store.load_roster().unwrap();
-    let entry = client_roster
+    let initial_roster = client_store.load_roster().unwrap();
+    let initial_entry = initial_roster
         .get("sec03-v2-host")
         .expect("host entry in client roster");
+    assert_eq!(initial_entry.state, PeerState::Active);
+    let reconnect_secret = *initial_entry
+        .v2_secrets
+        .as_ref()
+        .expect("v2 secrets")
+        .reconnect_secret();
+
+    // Generate two conflicting seq=1 RotationRecords signed by the host's pinned signing key.
+    let host_store = StateStore::open_or_create(host_dir.path()).unwrap();
+    let host_identity = host_store.load_identity().unwrap();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut fork_a = host_store.load_identity().unwrap();
+    fork_a
+        .rotate(
+            StaticKeypair::generate().unwrap(),
+            SigningKeypair::generate().unwrap(),
+            now_unix,
+        )
+        .unwrap();
+    let mut fork_b = host_store.load_identity().unwrap();
+    fork_b
+        .rotate(
+            StaticKeypair::generate().unwrap(),
+            SigningKeypair::generate().unwrap(),
+            now_unix + 1,
+        )
+        .unwrap();
+    let rec_a = fork_a.rotation_chain()[0].clone();
+    let rec_b = fork_b.rotation_chain()[0].clone();
+
+    let hello = HostHello {
+        host_id: "sec03-v2-host".to_owned(),
+        proto_version: WIRE_VERSION_V2,
+        signing_pub: host_identity.signing_key().public_key().to_b64url(),
+        rotation: vec![rec_a, rec_b],
+    };
+    let hello_json = serde_json::to_vec(&hello).expect("serialize HostHello");
+    let host_static_priv = *host_identity.static_key().secret_bytes();
+
+    // Spawn a local Wire v2 responder that delivers the forked RotationRecord chain in msg2.
+    let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .expect("bind fork responder");
+    let fork_ep = listener.local_endpoint();
+    let responder = tokio::spawn(async move {
+        let mut stream = listener.accept().await.expect("accept fork dial");
+        let mut raw = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        while raw.len() < 8 {
+            let n = stream.recv_chunk(&mut buf).await.expect("recv msg1");
+            assert!(n > 0, "EOF before v2 preamble and msg1 header");
+            raw.extend_from_slice(&buf[..n]);
+        }
+        let msg1_len = usize::from(u16::from_be_bytes([raw[6], raw[7]]));
+        while raw.len() < 8 + msg1_len {
+            let n = stream.recv_chunk(&mut buf).await.expect("recv msg1 body");
+            assert!(n > 0, "EOF before v2 msg1 body");
+            raw.extend_from_slice(&buf[..n]);
+        }
+        let preamble = &raw[..6];
+        let msg1_body = &raw[8..8 + msg1_len];
+        let mut hs = NoiseHfsHandshakeBuilder::new()
+            .local_private_key(&host_static_priv)
+            .prologue(preamble)
+            .build_responder()
+            .expect("build v2 responder");
+        let payload = hs.read_message_vec(msg1_body).expect("read msg1");
+        let mut r_nonce = [0u8; 16];
+        r_nonce.copy_from_slice(&payload[..16]);
+        let msg2 = hs
+            .write_msg2_with_hash(|h_pre| {
+                seal_v2_hello_envelope(&reconnect_secret, &r_nonce, h_pre, &hello_json)
+            })
+            .expect("seal msg2");
+        let wire = encode_frame(&msg2).expect("encode msg2");
+        stream.send_chunk(&wire).await.expect("write msg2");
+        // Wait for client to close after detecting RotationForkDetected.
+        let _ = stream.recv_chunk(&mut buf).await;
+    });
+
+    // Dial while sec03-v2-host is PeerState::Active; RotationForkDetected must persist Revoked.
+    let client_path = client_dir.path().to_path_buf();
+    let fork_ep_c = fork_ep.clone();
+    let fork_dial = tokio::task::spawn_blocking(move || {
+        run_tendril(
+            &client_path,
+            &[
+                "dial",
+                "--wire-v2",
+                "--target",
+                "sec03-v2-host",
+                "--endpoint",
+                &fork_ep_c,
+            ],
+        )
+    })
+    .await
+    .expect("join fork dial");
+    responder.await.expect("join fork responder");
+    assert!(
+        !fork_dial.status.success(),
+        "v2 dial receiving forked rotation chain must fail closed"
+    );
+
+    let after_fork = client_store.load_roster().unwrap();
     assert_eq!(
-        entry.state,
+        after_fork
+            .get("sec03-v2-host")
+            .expect("host entry in client roster")
+            .state,
         PeerState::Revoked,
-        "SEC-03: v2 dial must preserve PeerState::Revoked on disk without clobbering"
+        "SEC-03: v2 dial RotationForkDetected must transition Active -> Revoked on disk"
+    );
+
+    // Follow-up dial to an honest serve must still fail closed and preserve PeerState::Revoked.
+    let host_path = host_dir.path().to_path_buf();
+    let client_path = client_dir.path().to_path_buf();
+    let post_revoke_dial = tokio::task::spawn_blocking(move || {
+        let mut serve2 = KillOnDrop(
+            Command::new(tendril_bin())
+                .arg("--state-dir")
+                .arg(&host_path)
+                .args(["serve", "--listen", "127.0.0.1:0", "--wire-v2"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn honest v2 serve"),
+        );
+        let mut stdout2 = BufReader::new(serve2.0.stdout.take().unwrap());
+        let ep2 = read_json_line(&mut stdout2)["direct_endpoint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        run_tendril(
+            &client_path,
+            &[
+                "dial",
+                "--wire-v2",
+                "--target",
+                "sec03-v2-host",
+                "--endpoint",
+                &ep2,
+            ],
+        )
+    })
+    .await
+    .expect("join post-revoke dial");
+    assert!(
+        !post_revoke_dial.status.success(),
+        "subsequent dial to honest host after fork revocation must fail closed"
+    );
+    let after_honest = client_store.load_roster().unwrap();
+    assert_eq!(
+        after_honest
+            .get("sec03-v2-host")
+            .expect("host entry in client roster")
+            .state,
+        PeerState::Revoked,
+        "SEC-03: subsequent v2 dial must preserve PeerState::Revoked on disk without clobbering"
     );
 }
