@@ -12,22 +12,25 @@ tags: [usage, cli, relay, conformance]
 
 ## Running a standalone relay
 
-Launch `tendril-relay` locally or build the rootless container defined in `crates/tendril-relay/Containerfile`:
+Launch `tendril-relay` locally or build the rootless container defined in the root `Containerfile`:
 
 ```bash
 cargo run -p tendril-relay -- --listen 127.0.0.1:8443 --host localhost
 ```
 
-In production deployments, terminate TLS directly on `tendril-relay` (`--tls-cert` and `--tls-key`, serving `wss://<host>/v1/relay` and `wss://<host>/v2/relay`) or behind a trusted reverse proxy configured with `--trusted-proxy <CIDR>`. Right-to-left RFC 7239 `Forwarded` (falling back to `X-Forwarded-For` if absent) extraction runs only when the TCP peer matches `--trusted-proxy`, so reverse proxies should strip or overwrite untrusted client forwarding headers. Rate limits normalize IPv4-mapped addresses and group IPv6 addresses by `/64` prefix alongside global `--max-connections` and `--max-mailboxes` caps.
+In production deployments, terminate TLS directly on `tendril-relay` (`--tls-cert` and `--tls-key`, where `--tls-key` enforces `0600` regular non-symlink file permissions, serving `wss://<host>/v1/relay` and `wss://<host>/v2/relay`) or behind a trusted reverse proxy configured with `--trusted-proxy <CIDR>`. Right-to-left header extraction runs only when the TCP peer matches `--trusted-proxy`, using `--trusted-proxy-header <x-forwarded-for|forwarded>` (default `x-forwarded-for`, explicitly selected rather than allowing `Forwarded` to bypass `X-Forwarded-For`). Trusted-proxy peers take a pre-upgrade semaphore permit (`(max_total_connections / 4).max(1)`) and run handshake upgrade under a `min(5s, accept_timeout)` timeout; per-IP `ip_guard` limits apply to the extracted client IP after upgrade. Reverse proxies should strip or overwrite untrusted client forwarding headers. Rate limits normalize IPv4-mapped addresses and group IPv6 addresses by `/64` prefix alongside global `--max-connections` and `--max-mailboxes` caps.
 
 ### Managed relay admission (Tiers 1-3 and `--auth-scope`)
 
 Both `/v1/relay` and `/v2/relay` support stateless admission control (`allowlist OR proof`, not additive):
 
 - **Tier 1 (Allowlist):** `--allow-mailbox <b64url_pub>` or `--allow-mailboxes-file <path>` admits listed mailbox keys on `register` and `accept` without an additional HMAC or ticket proof. An empty or comment-only file (`0` valid keys) fails closed at startup.
-- **Tier 2 (Shared HMAC):** `--auth-secret-file <path>` (`0600` file permissions recommended) or `TENDRIL_RELAY_AUTH_SECRET` verifies `tendril-relay-auth-v1\0` HMAC-SHA256 proofs. `tendril-relay` reads `TENDRIL_RELAY_AUTH_SECRET` once at startup rather than stripping the process environment.
+- **Tier 2 (Shared HMAC):** `--auth-secret-file <path>` (enforces `0600` regular non-symlink file permissions) or `TENDRIL_RELAY_AUTH_SECRET` verifies `tendril-relay-auth-v1\0` HMAC-SHA256 proofs. `tendril-relay` reads `TENDRIL_RELAY_AUTH_SECRET` once at startup rather than stripping the process environment.
 - **Tier 3 (`RelayTicket`):** `--issuer-pub <b64url_pub>` verifies JCS-canonical Ed25519 `RelayTicket` proofs (`tendril-relay-ticket-v1\0`, `role: register | dial | any`, `1..=86400s` TTL, `+-30s` skew). Treat a `RelayTicket` as a **bearer credential** when shared over untrusted channels or logs unless scoped to `target_pub` and a short TTL.
 - **`--auth-scope <all|register-only>`:** Defaults to `all` whenever any admission mechanism is active (requiring admission on both `register` and `dial`, checking `auth` right after decode before mailbox lookup or epoch skew checks). Passing `--auth-scope` with no allowlist, secret, or issuer fails closed; `--auth-scope register-only` with Tier 1 alone leaves `dial` open because Tier 1 is peer-mailbox allowlisting.
+
+> [!NOTE]
+> For container and Kubernetes deployments, mount projected secrets as `0600` regular non-symlink files (for example, by copying or mounting without symlink indirection or group/world read bits): `tendril-relay` enforces `0600` regular non-symlink checks on `--auth-secret-file` and `--tls-key` (and regular non-symlink checks on `--allow-mailboxes-file`), while `tendril` CLI enforces `0600` regular non-symlink checks on `--code-file`, `--token-file`, `--grant @path`, `--relay-auth-secret-file`, `--relay-ticket-file`, `--p2p-relay-token-file`, `--p2p-api-secret-file`, `--wake-secret-file`, and `--wake-auth-header-file`.
 
 ```bash
 # Mint a Tier 3 RelayTicket using tendril relay-ticket

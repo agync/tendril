@@ -116,6 +116,7 @@ code_mac = HMAC-SHA256(key = K, msg = "tendril-pair-v1" || h)
 ```
 
 - **Default TTL:** 15 minutes (`900 s`), configurable by the host.
+- **Live code cap:** At most `MAX_LIVE_PAIRING_CODES = 4` unexpired pairing codes may be live concurrently. Issuing a new code when `>= 4` unexpired codes exist fails closed (`CoreError::ProtocolViolation`), keeping Wire v2 PAKE responders inside the constant-time 4-pass Argon2id padding envelope.
 - **Retry budget:** At most **5** failed `pair` claim attempts per code lifetime. Because a wrong-code or MITM-relayed claim cannot be attributed to a single live code in constant time without leaking existence, every failed `pair` claim increments the failure counter on all currently live codes and burns any code reaching 5 failures. To prevent pairing-window status oracles, responders run a uniform dummy KDF pass when zero live codes exist and return the uniform `"unauthorized"` error code across invalid, expired, or burned pairing codes.
 - **Single-use burn:** A successful `pair` claim immediately burns the matched code.
 - **Re-pairing rules:**
