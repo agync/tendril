@@ -20,10 +20,12 @@ android {
     }
   }
 
-  externalNativeBuild {
-    cmake {
-      path = file("jni/CMakeLists.txt")
-      version = "3.22.1"
+  if (!hasProperty("prebuiltAar")) {
+    externalNativeBuild {
+      cmake {
+        path = file("jni/CMakeLists.txt")
+        version = "3.22.1"
+      }
     }
   }
 
