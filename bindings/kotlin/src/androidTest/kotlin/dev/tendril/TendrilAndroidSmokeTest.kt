@@ -73,7 +73,15 @@ class TendrilAndroidSmokeTest {
               ttlSecs = 300,
             )
           val tokenObj = JSONObject(tokenJson)
-          assertEquals("android-smoke-host", tokenObj.getString("target_host_id"))
+          assertEquals(1, tokenObj.getInt("v"))
+          assertEquals("android-smoke-host", tokenObj.getString("issuer"))
+          assertEquals("smoke-peer", tokenObj.getString("subject"))
+          val caps = tokenObj.getJSONArray("caps")
+          assertEquals(1, caps.length())
+          assertEquals("pair.enroll:android-smoke-host", caps.getString(0))
+          assertEquals(1, tokenObj.getInt("uses"))
+          assertTrue(tokenObj.getBoolean("machine"))
+          assertFalse(tokenObj.getString("sig").isEmpty())
         }
 
       TendrilEndpoint.create(
@@ -84,8 +92,8 @@ class TendrilAndroidSmokeTest {
         .use { ep2 ->
           val info2 = JSONObject(ep2.infoJson())
           assertEquals(info1.getString("device_id"), info2.getString("device_id"))
-          assertEquals(info1.getString("static_pub_b64"), info2.getString("static_pub_b64"))
-          assertEquals(info1.getString("signing_pub_b64"), info2.getString("signing_pub_b64"))
+          assertEquals(info1.getString("static_pub"), info2.getString("static_pub"))
+          assertEquals(info1.getString("signing_pub"), info2.getString("signing_pub"))
           assertNotEquals("", info2.getString("device_id"))
         }
     } finally {
