@@ -28,6 +28,7 @@ use tendril_core::pairing::{
 };
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket};
 use tendril_core::roster::{AnchorState, PeerState, Roster};
+use tendril_core::session::check_peer_allows_wire_v1;
 use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
@@ -41,49 +42,207 @@ use tendril_runtime::{
     WakeDialOptions, WakeSecret, WakeTarget, dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_store,
     drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
-    drive_v2_pake_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_timeout,
-    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
-    pairing_path_kind_for_provider, parse_p2p_relay_mode, parse_p2p_relay_modes,
-    pinned_pairing_floor, wake_and_dial_v2,
+    drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_store,
+    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
+    drive_v2_pake_pair_responder_with_store, pairing_path_kind_for_provider, parse_p2p_relay_mode,
+    parse_p2p_relay_modes, pinned_pairing_floor, wake_and_dial_v2,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-fn persist_roster_guard(store: Option<&Arc<StateStore>>, roster: &Roster) -> PyResult<()> {
-    if let Some(s) = store {
-        s.save_roster(roster)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+fn py_err(err: impl fmt::Display) -> PyErr {
+    PyRuntimeError::new_err(err.to_string())
+}
+
+fn lock_roster(roster: &StdMutex<Roster>) -> std::sync::MutexGuard<'_, Roster> {
+    roster
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Applies `f` to the latest on-disk roster and publishes the committed result to memory.
+///
+/// Callers must hold `store_lock`; the in-memory roster lock is taken second and is never held
+/// across an `.await`.
+fn commit_roster<T>(
+    store: &StateStore,
+    roster: &StdMutex<Roster>,
+    identity: &EndpointIdentity,
+    f: impl FnOnce(&mut Roster, &Roster) -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    let mut mem = lock_roster(roster);
+    let (out, disk, _) = store.update_roster_with_state(|disk| f(disk, &mem))?;
+    publish_roster(&mut mem, disk, identity);
+    Ok(out)
+}
+
+fn reload_roster(
+    store: &StateStore,
+    roster: &StdMutex<Roster>,
+    identity: &EndpointIdentity,
+) -> Result<(), RuntimeError> {
+    let mut mem = lock_roster(roster);
+    let disk = store.load_roster()?;
+    publish_roster(&mut mem, disk, identity);
+    Ok(())
+}
+
+/// Replaces the in-memory roster with the committed disk roster while keeping any revocation
+/// or CRL a live session learned in memory but has not committed yet.
+fn publish_roster(mem: &mut Roster, disk: Roster, identity: &EndpointIdentity) {
+    let mut next = disk;
+    merge_session_state(&mut next, mem, identity);
+    *mem = next;
+}
+
+/// Applies the rotation chain verified during a v1 connect to the disk roster.
+fn apply_learned_rotation(
+    disk: &mut Roster,
+    learned: &Roster,
+    target: &str,
+    chain: &[RotationRecord],
+) {
+    if chain.is_empty() {
+        return;
+    }
+    if let Some(entry) = learned.get(target)
+        && let Some(signing) = entry.signing_pub.as_ref()
+    {
+        let _ = disk.apply_verified_rotation(target, chain, &entry.static_pub, signing);
+    }
+}
+
+/// Folds revocations and CRLs learned in memory by a live session into the on-disk roster
+/// without overwriting any other committed state.
+fn merge_session_state(disk: &mut Roster, mem: &Roster, identity: &EndpointIdentity) {
+    let newly_revoked: Vec<String> = mem
+        .entries()
+        .filter(|(id, entry)| {
+            entry.state == PeerState::Revoked
+                && disk
+                    .get(id)
+                    .is_some_and(|prev| prev.state != PeerState::Revoked)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &newly_revoked {
+        let _ = disk.revoke_peer(id);
+    }
+    let mut issuers = vec![identity.host_id().to_owned()];
+    issuers.extend(mem.entries().map(|(id, _)| id.clone()));
+    issuers.extend(mem.trust_anchors().map(|(id, _)| id.clone()));
+    for issuer in issuers {
+        let Some(crl) = mem.crl(&issuer).cloned() else {
+            continue;
+        };
+        let issuer_pub = if issuer == identity.host_id() {
+            Some(identity.signing_key().public_key().clone())
+        } else {
+            disk.lookup_active_signing_key(&issuer).or_else(|| {
+                disk.get(&issuer)
+                    .filter(|e| e.state != PeerState::Pending)
+                    .and_then(|e| e.signing_pub.clone())
+            })
+        };
+        if let Some(pk) = issuer_pub {
+            let _ = disk.ingest_crl(crl, &issuer, &pk);
+        }
+    }
+}
+
+/// Mutates the roster under the `store_lock` -> roster lock order. Must run outside any Tokio
+/// runtime thread.
+fn update_roster_blocking<T>(
+    store: Option<&Arc<StateStore>>,
+    store_lock: &AsyncMutex<()>,
+    roster: &StdMutex<Roster>,
+    identity: &EndpointIdentity,
+    f: impl FnOnce(&mut Roster) -> Result<T, RuntimeError>,
+) -> PyResult<T> {
+    if let Some(store) = store {
+        let _guard = store_lock.blocking_lock();
+        commit_roster(store, roster, identity, |disk, _| f(disk)).map_err(py_err)
+    } else {
+        let mut guard = lock_roster(roster);
+        f(&mut guard).map_err(py_err)
+    }
+}
+
+fn sync_roster_blocking(
+    store: Option<&Arc<StateStore>>,
+    store_lock: &AsyncMutex<()>,
+    roster: &StdMutex<Roster>,
+    identity: &EndpointIdentity,
+) -> PyResult<()> {
+    if let Some(store) = store {
+        let _guard = store_lock.blocking_lock();
+        reload_roster(store, roster, identity).map_err(py_err)?;
     }
     Ok(())
 }
 
-fn persist_store_roster(
+/// Commits what a v1 connect learned in its private working roster: revocations, CRLs, and the
+/// verified rotation chain.
+fn commit_connect_blocking(
     store: Option<&Arc<StateStore>>,
-    roster: &Arc<StdMutex<Roster>>,
+    store_lock: &AsyncMutex<()>,
+    roster: &StdMutex<Roster>,
+    identity: &EndpointIdentity,
+    learned: &Roster,
+    target: &str,
+    chain: &[RotationRecord],
 ) -> PyResult<()> {
-    if store.is_some() {
-        let guard = roster
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        persist_roster_guard(store, &guard)?;
+    if let Some(store) = store {
+        let _guard = store_lock.blocking_lock();
+        commit_roster(store, roster, identity, |disk, _| {
+            apply_learned_rotation(disk, learned, target, chain);
+            merge_session_state(disk, learned, identity);
+            Ok(())
+        })
+        .map_err(py_err)?;
     }
     Ok(())
 }
 
-fn sync_roster_from_store_opt(
+async fn sync_roster_async(
     store: Option<&Arc<StateStore>>,
+    store_lock: &AsyncMutex<()>,
     roster: &Arc<StdMutex<Roster>>,
-) -> PyResult<()> {
-    if let Some(s) = store {
-        let disk = s
-            .load_roster()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mut guard = roster
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = disk;
+    identity: &Arc<EndpointIdentity>,
+) -> Result<(), RuntimeError> {
+    if let Some(store) = store {
+        let _guard = store_lock.lock().await;
+        let store = Arc::clone(store);
+        let roster = Arc::clone(roster);
+        let identity = Arc::clone(identity);
+        tokio::task::spawn_blocking(move || reload_roster(&store, &roster, &identity))
+            .await
+            .map_err(|e| RuntimeError::Protocol(e.to_string()))??;
+    }
+    Ok(())
+}
+
+async fn commit_session_async(
+    store: Option<&Arc<StateStore>>,
+    store_lock: &AsyncMutex<()>,
+    roster: &Arc<StdMutex<Roster>>,
+    identity: &Arc<EndpointIdentity>,
+) -> Result<(), RuntimeError> {
+    if let Some(store) = store {
+        let _guard = store_lock.lock().await;
+        let store = Arc::clone(store);
+        let roster = Arc::clone(roster);
+        let identity = Arc::clone(identity);
+        tokio::task::spawn_blocking(move || {
+            commit_roster(&store, &roster, &identity, |disk, mem| {
+                merge_session_state(disk, mem, &identity);
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| RuntimeError::Protocol(e.to_string()))??;
     }
     Ok(())
 }
@@ -394,28 +553,24 @@ impl EndpointTransportConfig {
 
     fn build_p2p_dialer_options(
         &self,
+        endpoint: &str,
         relay_host: Option<&str>,
     ) -> Result<P2pOptions, RuntimeError> {
-        let mode = if let Some(ref m) = self.p2p_relay_mode {
-            m.clone()
+        let explicit_mode = if let Some(ref m) = self.p2p_relay_mode {
+            Some(m.clone())
         } else if let Some(spec) = relay_host.map(str::trim).filter(|s| !s.is_empty()) {
-            parse_p2p_relay_mode(Some(spec))?
+            Some(parse_p2p_relay_mode(Some(spec))?)
         } else if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") {
-            P2pRelayMode::Disabled
+            Some(P2pRelayMode::Disabled)
         } else {
-            P2pRelayMode::Default
+            None
         };
-        let mut opts = P2pOptions::for_dialer(mode);
+        let allow_private = self.p2p_allow_private_addrs.unwrap_or(false);
+        let mut opts = P2pOptions::for_endpoint(endpoint, explicit_mode, allow_private)?;
         if let Some(pkarr) = self.p2p_pkarr {
             opts = opts.with_resolve_pkarr(pkarr);
         }
-        if let Some(allow_priv) = self.p2p_allow_private_addrs {
-            opts = opts.with_allow_private_addrs(allow_priv);
-        } else if matches!(opts.relay_mode, P2pRelayMode::Disabled) {
-            opts = opts.with_allow_private_addrs(true);
-        }
-        opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
-        Ok(opts)
+        Ok(opts.with_relay_auth(self.p2p_relay_auth.clone()))
     }
 }
 
@@ -530,7 +685,7 @@ async fn dial_endpoint_v2_with_options(
 ) -> Result<Box<dyn PathStream>, RuntimeError> {
     let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
-        let opts = cfg.build_p2p_dialer_options(normalized_host)?;
+        let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host)?;
         let dialer = P2pDialer::bind_with_options(opts).await?;
         return match dialer.dial(endpoint).await {
             Ok(stream) => Ok(stream),
@@ -558,7 +713,7 @@ async fn build_dialer_with_options(
 ) -> Result<Box<dyn PathDialer>, RuntimeError> {
     let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
-        let opts = cfg.build_p2p_dialer_options(normalized_host)?;
+        let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host)?;
         return Ok(Box::new(P2pDialer::bind_with_options(opts).await?));
     }
     if endpoint.starts_with("overlay://") {
@@ -774,6 +929,17 @@ struct Endpoint {
 }
 
 impl Endpoint {
+    fn new_session(&self, backend: SessionBackend) -> Session {
+        Session {
+            rt: Arc::clone(&self.rt),
+            store: self.store.clone(),
+            store_lock: Arc::clone(&self.store_lock),
+            identity: Arc::clone(&self.identity),
+            roster: Arc::clone(&self.roster),
+            session: Arc::new(backend),
+        }
+    }
+
     fn snapshot_transport_cfg(&self) -> EndpointTransportConfig {
         self.transport_cfg
             .lock()
@@ -961,11 +1127,17 @@ impl Endpoint {
         peer_id: Option<&str>,
     ) -> PyResult<String> {
         let cfg = self.snapshot_transport_cfg();
+        {
+            let store = self.store.clone();
+            let store_lock = Arc::clone(&self.store_lock);
+            let roster = Arc::clone(&self.roster);
+            let identity = Arc::clone(&self.identity);
+            py.detach(move || {
+                sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)
+            })?;
+        }
         let secrets: Vec<[u8; 32]> = {
-            let roster = self
-                .roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let roster = lock_roster(&self.roster);
             if let Some(pid) = peer_id.filter(|s| !s.is_empty()) {
                 vec![lookup_v2_mailbox_secret_for_target(&roster, pid)?]
             } else {
@@ -1064,10 +1236,12 @@ impl Endpoint {
         name: &str,
         kind: &str,
     ) -> PyResult<String> {
+        let identity_sync = Arc::clone(&self.identity);
         let rt = Arc::clone(&self.rt);
         let identity = Arc::clone(&self.identity);
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let cfg = self.snapshot_transport_cfg();
         let ep_s = endpoint.to_owned();
         let rh_s = relay_host.map(ToOwned::to_owned);
@@ -1076,10 +1250,8 @@ impl Endpoint {
         let kind_s = kind.to_owned();
 
         py.detach(move || {
-            let roster_snapshot = roster_arc
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity)?;
+            let roster_snapshot = lock_roster(&roster_arc).clone();
             let v2_secret = if is_v2_relay_endpoint(&ep_s) {
                 Some(
                     lookup_v2_mailbox_secret_for_pair(&roster_snapshot, None, &ep_s, now_unix())
@@ -1133,31 +1305,39 @@ impl Endpoint {
                     pairing_sas,
                     host_pin_verified,
                 } => {
-                    {
-                        let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-                        let pin_res = if host_pin_verified {
-                            roster.insert_pinned_host(
-                                host_id.clone(),
-                                host_id.clone(),
-                                host_static_pub,
-                                Some(host_signing_pub),
-                                host_rotation_seq,
-                                Vec::new(),
-                            )
-                        } else {
-                            roster.record_pending_host(
-                                host_id.clone(),
-                                host_id.clone(),
-                                host_static_pub,
-                                host_signing_pub,
-                                host_rotation_seq,
-                                pairing_sas.clone(),
-                                Vec::new(),
-                            )
-                        };
-                        pin_res.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    }
-                    persist_store_roster(store.as_ref(), &roster_arc)?;
+                    update_roster_blocking(
+                        store.as_ref(),
+                        &store_lock,
+                        &roster_arc,
+                        &identity_sync,
+                        |roster| {
+                            if host_pin_verified {
+                                roster
+                                    .insert_pinned_host(
+                                        host_id.clone(),
+                                        host_id.clone(),
+                                        host_static_pub,
+                                        Some(host_signing_pub),
+                                        host_rotation_seq,
+                                        Vec::new(),
+                                    )
+                                    .map(|_| ())
+                            } else {
+                                roster
+                                    .record_pending_host(
+                                        host_id.clone(),
+                                        host_id.clone(),
+                                        host_static_pub,
+                                        host_signing_pub,
+                                        host_rotation_seq,
+                                        pairing_sas.clone(),
+                                        Vec::new(),
+                                    )
+                                    .map(|_| ())
+                            }
+                            .map_err(RuntimeError::from)
+                        },
+                    )?;
                     Ok(serde_json::json!({
                         "device_id": device_id,
                         "host_id": host_id,
@@ -1186,14 +1366,19 @@ impl Endpoint {
         let pair_mgr = Arc::clone(&self.pair_mgr);
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let self_m2m = Arc::clone(&self.self_m2m_enabled);
+        let m2m = Arc::clone(&self.m2m_enabled);
         let wait = Duration::from_millis(timeout_ms);
-        let policy = if self.m2m_enabled.load(Ordering::Acquire) {
-            EnrollmentPolicy::enabled_default()
-        } else {
-            EnrollmentPolicy::default()
-        };
 
         py.detach(move || {
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity)?;
+            refresh_m2m_flags(&self_m2m, &m2m, &lock_roster(&roster_arc));
+            let policy = if m2m.load(Ordering::Acquire) {
+                EnrollmentPolicy::enabled_default()
+            } else {
+                EnrollmentPolicy::default()
+            };
             let roster_in = Arc::clone(&roster_arc);
             let res = rt.block_on(async move {
                 let (mut stream, guard) = match router.recv_pair(wait).await {
@@ -1203,21 +1388,42 @@ impl Endpoint {
                 };
 
                 let path_kind = pairing_path_kind_for_provider(stream.provider_id());
-                drive_pair_responder_with_policy_and_store(
-                    stream.as_mut(),
-                    &identity,
-                    &pair_mgr,
-                    &roster_in,
-                    store.as_deref(),
-                    path_kind,
-                    now_unix(),
-                    policy,
-                    Some(router.rate_limiter()),
-                    Some(guard),
-                    DEFAULT_PRE_AUTH_TIMEOUT,
-                )
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                let driven = if let Some(ref s) = store {
+                    drive_pair_responder_with_store(
+                        stream.as_mut(),
+                        &identity,
+                        &pair_mgr,
+                        s,
+                        &store_lock,
+                        path_kind,
+                        now_unix(),
+                        policy,
+                        Some(router.rate_limiter()),
+                        Some(guard),
+                        DEFAULT_PRE_AUTH_TIMEOUT,
+                    )
+                    .await
+                } else {
+                    drive_pair_responder_with_policy_and_store(
+                        stream.as_mut(),
+                        &identity,
+                        &pair_mgr,
+                        &roster_in,
+                        None,
+                        path_kind,
+                        now_unix(),
+                        policy,
+                        Some(router.rate_limiter()),
+                        Some(guard),
+                        DEFAULT_PRE_AUTH_TIMEOUT,
+                    )
+                    .await
+                };
+                let synced =
+                    sync_roster_async(store.as_ref(), &store_lock, &roster_in, &identity).await;
+                let driven = driven.map_err(py_err)?;
+                synced.map_err(py_err)?;
+                Ok(driven)
             })?;
 
             match res.outcome {
@@ -1258,18 +1464,25 @@ impl Endpoint {
 
     #[pyo3(signature = (peer_id, sas=None))]
     fn confirm_peer(&self, py: Python<'_>, peer_id: &str, sas: Option<&str>) -> PyResult<()> {
+        let identity = Arc::clone(&self.identity);
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let pid = peer_id.to_owned();
         let sas_owned = sas.map(ToOwned::to_owned);
         py.detach(move || {
-            {
-                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-                roster
-                    .confirm_peer(&pid, sas_owned.as_deref())
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            }
-            persist_store_roster(store.as_ref(), &roster_arc)
+            update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster_arc,
+                &identity,
+                |roster| {
+                    roster
+                        .confirm_peer(&pid, sas_owned.as_deref())
+                        .map(|_| ())
+                        .map_err(RuntimeError::from)
+                },
+            )
         })
     }
 
@@ -1284,41 +1497,50 @@ impl Endpoint {
         let roster_arc = Arc::clone(&self.roster);
         let identity = Arc::clone(&self.identity);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let pid = peer_id.to_owned();
         py.detach(move || {
             let nonce = random_bytes::<16>().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let grant = {
-                let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-                let now = now_unix();
-                roster
-                    .mint_grant(
-                        &identity,
-                        &pid,
-                        caps,
-                        now,
-                        now.saturating_add(ttl_secs),
-                        nonce,
-                    )
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-            };
-            persist_store_roster(store.as_ref(), &roster_arc)?;
+            let grant = update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster_arc,
+                &identity,
+                |roster| {
+                    let now = now_unix();
+                    roster
+                        .mint_grant(
+                            &identity,
+                            &pid,
+                            caps,
+                            now,
+                            now.saturating_add(ttl_secs),
+                            nonce,
+                        )
+                        .map_err(RuntimeError::from)
+                },
+            )?;
             serde_json::to_string(&grant).map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
     }
 
     fn revoke_peer(&self, py: Python<'_>, peer_id: &str) -> PyResult<()> {
+        let identity = Arc::clone(&self.identity);
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let pid = peer_id.to_owned();
         let self_m2m = Arc::clone(&self.self_m2m_enabled);
         let m2m = Arc::clone(&self.m2m_enabled);
         py.detach(move || {
-            let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-            roster
-                .revoke_peer(&pid)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            persist_roster_guard(store.as_ref(), &roster)?;
-            refresh_m2m_flags(&self_m2m, &m2m, &roster);
+            update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster_arc,
+                &identity,
+                |roster| roster.revoke_peer(&pid).map_err(RuntimeError::from),
+            )?;
+            refresh_m2m_flags(&self_m2m, &m2m, &lock_roster(&roster_arc));
             Ok(())
         })
     }
@@ -1329,38 +1551,51 @@ impl Endpoint {
         anchor_id: &str,
         signing_pub: &[u8],
     ) -> PyResult<()> {
+        let identity = Arc::clone(&self.identity);
         let key = parse_hybrid_signing_pub(signing_pub, "signing_pub")?;
         let aid = anchor_id.to_owned();
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let self_m2m = Arc::clone(&self.self_m2m_enabled);
         let m2m = Arc::clone(&self.m2m_enabled);
         let router = Arc::clone(&self.router);
         py.detach(move || {
-            let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-            roster
-                .add_trust_anchor(aid, key)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            persist_roster_guard(store.as_ref(), &roster)?;
-            refresh_m2m_flags(&self_m2m, &m2m, &roster);
+            update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster_arc,
+                &identity,
+                |roster| {
+                    roster
+                        .add_trust_anchor(aid, key)
+                        .map(|_| ())
+                        .map_err(RuntimeError::from)
+                },
+            )?;
+            refresh_m2m_flags(&self_m2m, &m2m, &lock_roster(&roster_arc));
             router.set_pair_enabled(true);
             Ok(())
         })
     }
 
     fn revoke_trust_anchor(&self, py: Python<'_>, anchor_id: &str) -> PyResult<()> {
+        let identity = Arc::clone(&self.identity);
         let aid = anchor_id.to_owned();
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let self_m2m = Arc::clone(&self.self_m2m_enabled);
         let m2m = Arc::clone(&self.m2m_enabled);
         py.detach(move || {
-            let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-            roster
-                .revoke_trust_anchor(&aid)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            persist_roster_guard(store.as_ref(), &roster)?;
-            refresh_m2m_flags(&self_m2m, &m2m, &roster);
+            update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster_arc,
+                &identity,
+                |roster| roster.revoke_trust_anchor(&aid).map_err(RuntimeError::from),
+            )?;
+            refresh_m2m_flags(&self_m2m, &m2m, &lock_roster(&roster_arc));
             Ok(())
         })
     }
@@ -1416,6 +1651,7 @@ impl Endpoint {
         name: &str,
         kind: &str,
     ) -> PyResult<String> {
+        let identity_sync = Arc::clone(&self.identity);
         let static_pub = as_32(host_static_pub, "host_static_pub")?;
         let signing_pin = parse_signing_pin(host_signing_pub, "host_signing_pub")?;
         let token: Grant = serde_json::from_str(token_json)
@@ -1430,19 +1666,16 @@ impl Endpoint {
         let identity = Arc::clone(&self.identity);
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let ep_s = endpoint.to_owned();
         let rh_s = relay_host.map(ToOwned::to_owned);
         let name_s = name.to_owned();
         let kind_s = kind.to_owned();
 
         let cfg = self.snapshot_transport_cfg();
-        let fallback_floor = {
-            let roster = roster_arc
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pinned_pairing_floor(&roster, &pinned_host)
-        };
         py.detach(move || {
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity_sync)?;
+            let fallback_floor = pinned_pairing_floor(&lock_roster(&roster_arc), &pinned_host);
             let store_for_enroll = store.clone();
             let res = rt.block_on(async move {
                 let mut stream = dial_endpoint_v2_with_options(&ep_s, rh_s.as_deref(), &cfg, None)
@@ -1487,20 +1720,25 @@ impl Endpoint {
                     host_rotation_seq,
                     token_nonce,
                 } => {
-                    {
-                        let mut roster = roster_arc.lock().expect("roster mutex poisoned");
-                        roster
-                            .insert_pinned_host(
-                                host_id.clone(),
-                                host_id.clone(),
-                                host_static_pub,
-                                Some(host_signing_pub),
-                                host_rotation_seq,
-                                Vec::new(),
-                            )
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    }
-                    persist_store_roster(store.as_ref(), &roster_arc)?;
+                    update_roster_blocking(
+                        store.as_ref(),
+                        &store_lock,
+                        &roster_arc,
+                        &identity_sync,
+                        |roster| {
+                            roster
+                                .insert_pinned_host(
+                                    host_id.clone(),
+                                    host_id.clone(),
+                                    host_static_pub,
+                                    Some(host_signing_pub),
+                                    host_rotation_seq,
+                                    Vec::new(),
+                                )
+                                .map(|_| ())
+                                .map_err(RuntimeError::from)
+                        },
+                    )?;
                     Ok(serde_json::json!({
                         "device_id": device_id,
                         "host_id": host_id,
@@ -1533,10 +1771,12 @@ impl Endpoint {
         kind: Option<&str>,
         pinned_host_json: Option<&str>,
     ) -> PyResult<String> {
+        let identity_sync = Arc::clone(&self.identity);
         let rt = Arc::clone(&self.rt);
         let identity = Arc::clone(&self.identity);
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let cfg = self.snapshot_transport_cfg();
         let ep_s = endpoint.to_owned();
         let rh_s = relay_host.map(ToOwned::to_owned);
@@ -1548,10 +1788,8 @@ impl Endpoint {
             .map(ToOwned::to_owned);
 
         py.detach(move || {
-            let roster_snapshot = roster_arc
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity)?;
+            let roster_snapshot = lock_roster(&roster_arc).clone();
 
             let v2_pinned = match pinned_opt {
                 Some(raw) => {
@@ -1648,7 +1886,12 @@ impl Endpoint {
                     let h_id = host_id.clone();
                     let sas = pairing_sas.clone();
                     if store.is_some() {
-                        sync_roster_from_store_opt(store.as_ref(), &roster_arc)?;
+                        sync_roster_blocking(
+                            store.as_ref(),
+                            &store_lock,
+                            &roster_arc,
+                            &identity_sync,
+                        )?;
                     } else {
                         let mut roster = roster_arc
                             .lock()
@@ -1701,7 +1944,7 @@ impl Endpoint {
                     Err(()) => return Err(PyRuntimeError::new_err("timed out accepting v2 pair")),
                 };
                 let path_kind = pairing_path_kind_for_provider(stream.provider_id());
-                if let Some(ref s) = store_in {
+                let driven = if let Some(ref s) = store_in {
                     drive_v2_pake_pair_responder_with_store(
                         stream.as_mut(),
                         &identity,
@@ -1730,8 +1973,12 @@ impl Endpoint {
                         DEFAULT_PRE_AUTH_TIMEOUT,
                     )
                     .await
-                }
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                };
+                let synced =
+                    sync_roster_async(store_in.as_ref(), &store_lock, &roster_in, &identity).await;
+                let driven = driven.map_err(py_err)?;
+                synced.map_err(py_err)?;
+                Ok(driven)
             })?;
 
             match res.outcome {
@@ -1741,17 +1988,14 @@ impl Endpoint {
                     name,
                     kind,
                     ..
-                } => {
-                    sync_roster_from_store_opt(store.as_ref(), &roster_arc)?;
-                    Ok(serde_json::json!({
-                        "device_id": device_id,
-                        "sas": pairing_sas,
-                        "name": name,
-                        "kind": kind,
-                        "wire_version": 2,
-                    })
-                    .to_string())
-                }
+                } => Ok(serde_json::json!({
+                    "device_id": device_id,
+                    "sas": pairing_sas,
+                    "name": name,
+                    "kind": kind,
+                    "wire_version": 2,
+                })
+                .to_string()),
                 V2PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
                 V2PairOutcome::InitiatorPending { .. } => {
                     Err(PyRuntimeError::new_err("unexpected initiator outcome"))
@@ -1779,21 +2023,31 @@ impl Endpoint {
         let identity = Arc::clone(&self.identity);
         let roster = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let cfg = self.snapshot_transport_cfg();
         let ep_s = endpoint.to_owned();
         let rh_s = relay_host.map(ToOwned::to_owned);
         let target_s = target_host_id.to_owned();
 
         let driver = py.detach(move || {
-            let v2_secret = if is_v2_relay_endpoint(&ep_s) {
-                let guard = roster
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                Some(lookup_v2_mailbox_secret_for_target(&guard, &target_s)?)
-            } else {
-                None
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
+            let (v2_secret, working) = {
+                let guard = lock_roster(&roster);
+                check_peer_allows_wire_v1(&guard, &target_s).map_err(py_err)?;
+                let sec = if is_v2_relay_endpoint(&ep_s) {
+                    Some(lookup_v2_mailbox_secret_for_target(&guard, &target_s)?)
+                } else {
+                    None
+                };
+                (sec, Arc::new(StdMutex::new(guard.clone())))
             };
-            let roster_in = Arc::clone(&roster);
+            let roster_in = if store.is_some() {
+                Arc::clone(&working)
+            } else {
+                Arc::clone(&roster)
+            };
+            let identity_in = Arc::clone(&identity);
+            let target_commit = target_s.clone();
             let res = rt.block_on(async move {
                 let stream = dial_endpoint_v2_with_options(&ep_s, rh_s.as_deref(), &cfg, v2_secret)
                     .await
@@ -1809,13 +2063,31 @@ impl Endpoint {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             });
+            let persisted = if store.is_some() {
+                let chain = res
+                    .as_ref()
+                    .map(|d| d.applied_rotation().to_vec())
+                    .unwrap_or_default();
+                let learned = lock_roster(&working).clone();
+                commit_connect_blocking(
+                    store.as_ref(),
+                    &store_lock,
+                    &roster,
+                    &identity_in,
+                    &learned,
+                    &target_commit,
+                    &chain,
+                )
+            } else {
+                Ok(())
+            };
             match res {
                 Ok(drv) => {
-                    persist_store_roster(store.as_ref(), &roster)?;
+                    persisted?;
                     Ok(drv)
                 }
                 Err(err) => {
-                    if let Err(pe) = persist_store_roster(store.as_ref(), &roster) {
+                    if let Err(pe) = persisted {
                         Err(PyRuntimeError::new_err(format!(
                             "{err} (roster persist error: {pe})"
                         )))
@@ -1826,12 +2098,7 @@ impl Endpoint {
             }
         })?;
 
-        Ok(Session {
-            rt: Arc::clone(&self.rt),
-            store: self.store.clone(),
-            roster: Arc::clone(&self.roster),
-            session: Arc::new(SessionBackend::V1(driver.into_concurrent())),
-        })
+        Ok(self.new_session(SessionBackend::V1(driver.into_concurrent())))
     }
 
     #[pyo3(signature = (endpoint, target_host_id, grant_json=None, relay_host=None))]
@@ -1843,6 +2110,7 @@ impl Endpoint {
         grant_json: Option<&str>,
         relay_host: Option<&str>,
     ) -> PyResult<Session> {
+        let identity_sync = Arc::clone(&self.identity);
         let grant: Option<Grant> = match grant_json {
             Some(s) if !s.is_empty() => {
                 Some(serde_json::from_str(s).map_err(|e| PyValueError::new_err(e.to_string()))?)
@@ -1860,16 +2128,16 @@ impl Endpoint {
         let target_s = target_host_id.to_owned();
 
         let driver = py.detach(move || {
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
             let v2_secret = if is_v2_relay_endpoint(&ep_s) {
-                let guard = roster
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let guard = lock_roster(&roster);
                 Some(lookup_v2_mailbox_secret_for_target(&guard, &target_s)?)
             } else {
                 None
             };
             let roster_in = Arc::clone(&roster);
             let store_in = store.clone();
+            let store_lock_in = Arc::clone(&store_lock);
             let res = rt.block_on(async move {
                 let stream = if let Some(ref wake_cfg) = cfg.wake {
                     let dialer = build_dialer_with_options(&ep_s, rh_s.as_deref(), &cfg, v2_secret)
@@ -1905,7 +2173,7 @@ impl Endpoint {
                         &target_s,
                         grant,
                         s,
-                        &store_lock,
+                        &store_lock_in,
                         now_unix(),
                     )
                     .await
@@ -1922,26 +2190,17 @@ impl Endpoint {
                 }
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             });
+            let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity_sync);
             match res {
                 Ok(drv) => {
-                    sync_roster_from_store_opt(store.as_ref(), &roster)?;
+                    synced?;
                     Ok(drv)
                 }
-                Err(err) => {
-                    if store.is_some() {
-                        let _ = sync_roster_from_store_opt(store.as_ref(), &roster);
-                    }
-                    Err(err)
-                }
+                Err(err) => Err(err),
             }
         })?;
 
-        Ok(Session {
-            rt: Arc::clone(&self.rt),
-            store: self.store.clone(),
-            roster: Arc::clone(&self.roster),
-            session: Arc::new(SessionBackend::V2(driver.into_concurrent())),
-        })
+        Ok(self.new_session(SessionBackend::V2(driver.into_concurrent())))
     }
 
     #[pyo3(signature = (timeout_ms=5000))]
@@ -1950,6 +2209,8 @@ impl Endpoint {
         let router = Arc::clone(&self.router);
         let identity = Arc::clone(&self.identity);
         let roster = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
         let wait = Duration::from_millis(timeout_ms);
 
         let driver = py.detach(move || {
@@ -1959,8 +2220,10 @@ impl Endpoint {
                     Ok(None) => return Err(PyRuntimeError::new_err("listener closed")),
                     Err(()) => return Err(PyRuntimeError::new_err("timed out accepting session")),
                 };
-
-                SessionDriver::accept_locked(
+                sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
+                    .await
+                    .map_err(py_err)?;
+                let accepted = SessionDriver::accept_locked(
                     stream,
                     &identity,
                     &roster,
@@ -1970,20 +2233,21 @@ impl Endpoint {
                     DEFAULT_PRE_AUTH_TIMEOUT,
                 )
                 .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                .map_err(py_err);
+                let persisted =
+                    commit_session_async(store.as_ref(), &store_lock, &roster, &identity).await;
+                let driver = accepted?;
+                persisted.map_err(py_err)?;
+                Ok(driver)
             })
         })?;
 
-        Ok(Session {
-            rt: Arc::clone(&self.rt),
-            store: self.store.clone(),
-            roster: Arc::clone(&self.roster),
-            session: Arc::new(SessionBackend::V1(driver.into_concurrent())),
-        })
+        Ok(self.new_session(SessionBackend::V1(driver.into_concurrent())))
     }
 
     #[pyo3(signature = (timeout_ms=5000))]
     fn accept_v2(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Session> {
+        let identity_sync = Arc::clone(&self.identity);
         let rt = Arc::clone(&self.rt);
         let router = Arc::clone(&self.router);
         let identity = Arc::clone(&self.identity);
@@ -1996,6 +2260,7 @@ impl Endpoint {
         let driver = py.detach(move || {
             let roster_in = Arc::clone(&roster);
             let store_in = store.clone();
+            let store_lock_in = Arc::clone(&store_lock);
             let res = rt.block_on(async move {
                 let (stream, guard) = match router.recv_v2_session(wait).await {
                     Ok(Some(pair)) => pair,
@@ -2009,7 +2274,7 @@ impl Endpoint {
                         stream,
                         &identity,
                         s,
-                        &store_lock,
+                        &store_lock_in,
                         now_unix(),
                         &v2_state,
                         Some(router.v2_session_rate_limiter()),
@@ -2032,26 +2297,17 @@ impl Endpoint {
                 }
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             });
+            let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity_sync);
             match res {
                 Ok(drv) => {
-                    sync_roster_from_store_opt(store.as_ref(), &roster)?;
+                    synced?;
                     Ok(drv)
                 }
-                Err(err) => {
-                    if store.is_some() {
-                        let _ = sync_roster_from_store_opt(store.as_ref(), &roster);
-                    }
-                    Err(err)
-                }
+                Err(err) => Err(err),
             }
         })?;
 
-        Ok(Session {
-            rt: Arc::clone(&self.rt),
-            store: self.store.clone(),
-            roster: Arc::clone(&self.roster),
-            session: Arc::new(SessionBackend::V2(driver.into_concurrent())),
-        })
+        Ok(self.new_session(SessionBackend::V2(driver.into_concurrent())))
     }
 
     fn close(&self, py: Python<'_>) {
@@ -2118,6 +2374,8 @@ impl SessionBackend {
 struct Session {
     rt: Arc<Runtime>,
     store: Option<Arc<StateStore>>,
+    store_lock: Arc<AsyncMutex<()>>,
+    identity: Arc<EndpointIdentity>,
     roster: Arc<StdMutex<Roster>>,
     session: Arc<SessionBackend>,
 }
@@ -2143,6 +2401,8 @@ impl Session {
         let sess = Arc::clone(&self.session);
         let roster = Arc::clone(&self.roster);
         let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let identity = Arc::clone(&self.identity);
         let wait = Duration::from_millis(timeout_ms);
 
         py.detach(move || {
@@ -2167,9 +2427,23 @@ impl Session {
                             }),
                             SessionEvent::RevocationUpdated { issuer, seq } => {
                                 if sess.is_v2() && store.is_some() {
-                                    sync_roster_from_store_opt(store.as_ref(), &roster)?;
+                                    sync_roster_async(
+                                        store.as_ref(),
+                                        &store_lock,
+                                        &roster,
+                                        &identity,
+                                    )
+                                    .await
+                                    .map_err(py_err)?;
                                 } else {
-                                    persist_store_roster(store.as_ref(), &roster)?;
+                                    commit_session_async(
+                                        store.as_ref(),
+                                        &store_lock,
+                                        &roster,
+                                        &identity,
+                                    )
+                                    .await
+                                    .map_err(py_err)?;
                                 }
                                 serde_json::json!({
                                     "status": "event",
@@ -2200,9 +2474,14 @@ impl Session {
                     Ok(Ok(None)) => Ok(serde_json::json!({ "status": "eof" }).to_string()),
                     Ok(Err(e)) => {
                         if sess.is_v2() && store.is_some() {
-                            let _ = sync_roster_from_store_opt(store.as_ref(), &roster);
+                            let _ =
+                                sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
+                                    .await;
                             Err(PyRuntimeError::new_err(e.to_string()))
-                        } else if let Err(pe) = persist_store_roster(store.as_ref(), &roster) {
+                        } else if let Err(pe) =
+                            commit_session_async(store.as_ref(), &store_lock, &roster, &identity)
+                                .await
+                        {
                             Err(PyRuntimeError::new_err(format!("{e} ({pe})")))
                         } else {
                             Err(PyRuntimeError::new_err(e.to_string()))

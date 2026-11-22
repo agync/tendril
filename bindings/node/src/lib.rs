@@ -27,6 +27,7 @@ use tendril_core::pairing::{
 };
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket};
 use tendril_core::roster::{AnchorState, PeerState, Roster};
+use tendril_core::session::check_peer_allows_wire_v1;
 use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
@@ -40,10 +41,10 @@ use tendril_runtime::{
     WakeDialOptions, WakeSecret, WakeTarget, dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_store,
     drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
-    drive_v2_pake_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_timeout,
-    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
-    pairing_path_kind_for_provider, parse_p2p_relay_mode, parse_p2p_relay_modes,
-    pinned_pairing_floor, wake_and_dial_v2,
+    drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_store,
+    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
+    drive_v2_pake_pair_responder_with_store, pairing_path_kind_for_provider, parse_p2p_relay_mode,
+    parse_p2p_relay_modes, pinned_pairing_floor, wake_and_dial_v2,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
@@ -96,15 +97,201 @@ fn u64_to_f64(v: u64) -> Result<f64> {
     Ok(v as f64)
 }
 
-fn persist_store_roster(
+fn lock_roster(roster: &StdMutex<Roster>) -> std::sync::MutexGuard<'_, Roster> {
+    roster
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Applies `f` to the latest on-disk roster and publishes the committed result to memory.
+///
+/// Callers must hold `store_lock`; the in-memory roster lock is taken second and is never held
+/// across an `.await`.
+fn commit_roster<T>(
+    store: &StateStore,
+    roster: &StdMutex<Roster>,
+    identity: &EndpointIdentity,
+    f: impl FnOnce(&mut Roster, &Roster) -> std::result::Result<T, RuntimeError>,
+) -> std::result::Result<T, RuntimeError> {
+    let mut mem = lock_roster(roster);
+    let (out, disk, _) = store.update_roster_with_state(|disk| f(disk, &mem))?;
+    publish_roster(&mut mem, disk, identity);
+    Ok(out)
+}
+
+fn reload_roster(
+    store: &StateStore,
+    roster: &StdMutex<Roster>,
+    identity: &EndpointIdentity,
+) -> std::result::Result<(), RuntimeError> {
+    let mut mem = lock_roster(roster);
+    let disk = store.load_roster()?;
+    publish_roster(&mut mem, disk, identity);
+    Ok(())
+}
+
+/// Replaces the in-memory roster with the committed disk roster while keeping any revocation
+/// or CRL a live session learned in memory but has not committed yet.
+fn publish_roster(mem: &mut Roster, disk: Roster, identity: &EndpointIdentity) {
+    let mut next = disk;
+    merge_session_state(&mut next, mem, identity);
+    *mem = next;
+}
+
+/// Applies the rotation chain verified during a v1 connect to the disk roster.
+fn apply_learned_rotation(
+    disk: &mut Roster,
+    learned: &Roster,
+    target: &str,
+    chain: &[RotationRecord],
+) {
+    if chain.is_empty() {
+        return;
+    }
+    if let Some(entry) = learned.get(target)
+        && let Some(signing) = entry.signing_pub.as_ref()
+    {
+        let _ = disk.apply_verified_rotation(target, chain, &entry.static_pub, signing);
+    }
+}
+
+/// Folds revocations and CRLs learned in memory by a live session into the on-disk roster
+/// without overwriting any other committed state.
+fn merge_session_state(disk: &mut Roster, mem: &Roster, identity: &EndpointIdentity) {
+    let newly_revoked: Vec<String> = mem
+        .entries()
+        .filter(|(id, entry)| {
+            entry.state == PeerState::Revoked
+                && disk
+                    .get(id)
+                    .is_some_and(|prev| prev.state != PeerState::Revoked)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &newly_revoked {
+        let _ = disk.revoke_peer(id);
+    }
+    let mut issuers = vec![identity.host_id().to_owned()];
+    issuers.extend(mem.entries().map(|(id, _)| id.clone()));
+    issuers.extend(mem.trust_anchors().map(|(id, _)| id.clone()));
+    for issuer in issuers {
+        let Some(crl) = mem.crl(&issuer).cloned() else {
+            continue;
+        };
+        let issuer_pub = if issuer == identity.host_id() {
+            Some(identity.signing_key().public_key().clone())
+        } else {
+            disk.lookup_active_signing_key(&issuer).or_else(|| {
+                disk.get(&issuer)
+                    .filter(|e| e.state != PeerState::Pending)
+                    .and_then(|e| e.signing_pub.clone())
+            })
+        };
+        if let Some(pk) = issuer_pub {
+            let _ = disk.ingest_crl(crl, &issuer, &pk);
+        }
+    }
+}
+
+/// Mutates the roster under the `store_lock` -> roster lock order from a Tokio worker without
+/// blocking the runtime thread on file locks.
+async fn update_roster_async<T, F>(
     store: Option<&Arc<StateStore>>,
+    store_lock: &AsyncMutex<()>,
     roster: &Arc<StdMutex<Roster>>,
+    identity: &Arc<EndpointIdentity>,
+    f: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Roster) -> std::result::Result<T, RuntimeError> + Send + 'static,
+{
+    if let Some(store) = store {
+        let _guard = store_lock.lock().await;
+        let store = Arc::clone(store);
+        let roster = Arc::clone(roster);
+        let identity = Arc::clone(identity);
+        tokio::task::spawn_blocking(move || {
+            commit_roster(&store, &roster, &identity, |disk, _| f(disk))
+        })
+        .await
+        .map_err(to_generic_err)?
+        .map_err(to_generic_err)
+    } else {
+        let mut guard = lock_roster(roster);
+        f(&mut guard).map_err(to_generic_err)
+    }
+}
+
+async fn sync_roster_async(
+    store: Option<&Arc<StateStore>>,
+    store_lock: &AsyncMutex<()>,
+    roster: &Arc<StdMutex<Roster>>,
+    identity: &Arc<EndpointIdentity>,
 ) -> Result<()> {
-    if let Some(s) = store {
-        let guard = roster
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        s.save_roster(&guard).map_err(to_generic_err)?;
+    if let Some(store) = store {
+        let _guard = store_lock.lock().await;
+        let store = Arc::clone(store);
+        let roster = Arc::clone(roster);
+        let identity = Arc::clone(identity);
+        tokio::task::spawn_blocking(move || reload_roster(&store, &roster, &identity))
+            .await
+            .map_err(to_generic_err)?
+            .map_err(to_generic_err)?;
+    }
+    Ok(())
+}
+
+async fn commit_session_async(
+    store: Option<&Arc<StateStore>>,
+    store_lock: &AsyncMutex<()>,
+    roster: &Arc<StdMutex<Roster>>,
+    identity: &Arc<EndpointIdentity>,
+) -> Result<()> {
+    if let Some(store) = store {
+        let _guard = store_lock.lock().await;
+        let store = Arc::clone(store);
+        let roster = Arc::clone(roster);
+        let identity = Arc::clone(identity);
+        tokio::task::spawn_blocking(move || {
+            commit_roster(&store, &roster, &identity, |disk, mem| {
+                merge_session_state(disk, mem, &identity);
+                Ok(())
+            })
+        })
+        .await
+        .map_err(to_generic_err)?
+        .map_err(to_generic_err)?;
+    }
+    Ok(())
+}
+
+/// Commits what a v1 connect learned in its private working roster: revocations, CRLs, and the
+/// verified rotation chain.
+async fn commit_connect_async(
+    store: Option<&Arc<StateStore>>,
+    store_lock: &AsyncMutex<()>,
+    roster: &Arc<StdMutex<Roster>>,
+    identity: &Arc<EndpointIdentity>,
+    learned: Roster,
+    target: String,
+    chain: Vec<RotationRecord>,
+) -> Result<()> {
+    if let Some(store) = store {
+        let _guard = store_lock.lock().await;
+        let store = Arc::clone(store);
+        let roster = Arc::clone(roster);
+        let identity = Arc::clone(identity);
+        tokio::task::spawn_blocking(move || {
+            commit_roster(&store, &roster, &identity, |disk, _| {
+                apply_learned_rotation(disk, &learned, &target, &chain);
+                merge_session_state(disk, &learned, &identity);
+                Ok(())
+            })
+        })
+        .await
+        .map_err(to_generic_err)?
+        .map_err(to_generic_err)?;
     }
     Ok(())
 }
@@ -405,28 +592,24 @@ impl EndpointTransportConfig {
 
     fn build_p2p_dialer_options(
         &self,
+        endpoint: &str,
         relay_host: Option<&str>,
     ) -> std::result::Result<P2pOptions, RuntimeError> {
-        let mode = if let Some(ref m) = self.p2p_relay_mode {
-            m.clone()
+        let explicit_mode = if let Some(ref m) = self.p2p_relay_mode {
+            Some(m.clone())
         } else if let Some(spec) = relay_host.map(str::trim).filter(|s| !s.is_empty()) {
-            parse_p2p_relay_mode(Some(spec))?
+            Some(parse_p2p_relay_mode(Some(spec))?)
         } else if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") {
-            P2pRelayMode::Disabled
+            Some(P2pRelayMode::Disabled)
         } else {
-            P2pRelayMode::Default
+            None
         };
-        let mut opts = P2pOptions::for_dialer(mode);
+        let allow_private = self.p2p_allow_private_addrs.unwrap_or(false);
+        let mut opts = P2pOptions::for_endpoint(endpoint, explicit_mode, allow_private)?;
         if let Some(pkarr) = self.p2p_pkarr {
             opts = opts.with_resolve_pkarr(pkarr);
         }
-        if let Some(allow_priv) = self.p2p_allow_private_addrs {
-            opts = opts.with_allow_private_addrs(allow_priv);
-        } else if matches!(opts.relay_mode, P2pRelayMode::Disabled) {
-            opts = opts.with_allow_private_addrs(true);
-        }
-        opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
-        Ok(opts)
+        Ok(opts.with_relay_auth(self.p2p_relay_auth.clone()))
     }
 }
 
@@ -543,7 +726,7 @@ async fn dial_endpoint_v2_with_options(
 ) -> std::result::Result<Box<dyn PathStream>, RuntimeError> {
     let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
-        let opts = cfg.build_p2p_dialer_options(normalized_host)?;
+        let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host)?;
         let dialer = P2pDialer::bind_with_options(opts).await?;
         return match dialer.dial(endpoint).await {
             Ok(stream) => Ok(stream),
@@ -571,7 +754,7 @@ async fn build_dialer_with_options(
 ) -> std::result::Result<Box<dyn PathDialer>, RuntimeError> {
     let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
-        let opts = cfg.build_p2p_dialer_options(normalized_host)?;
+        let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host)?;
         return Ok(Box::new(P2pDialer::bind_with_options(opts).await?));
     }
     if endpoint.starts_with("overlay://") {
@@ -812,23 +995,48 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    fn persist_roster(&self, roster: &Roster) -> Result<()> {
+    fn update_roster_sync<T>(
+        &self,
+        f: impl FnOnce(&mut Roster) -> std::result::Result<T, RuntimeError>,
+    ) -> Result<T> {
         if let Some(store) = &self.store {
-            store.save_roster(roster).map_err(to_generic_err)?;
+            let _guard = self.store_lock.blocking_lock();
+            commit_roster(store, &self.roster, &self.identity, |disk, _| f(disk))
+                .map_err(to_generic_err)
+        } else {
+            let mut guard = lock_roster(&self.roster);
+            f(&mut guard).map_err(to_generic_err)
         }
-        Ok(())
     }
 
-    fn sync_roster_from_store(&self) -> Result<()> {
-        if let Some(store) = &self.store {
-            let disk = store.load_roster().map_err(to_generic_err)?;
-            let mut guard = self
-                .roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = disk;
+    async fn sync_roster_from_store(&self) -> Result<()> {
+        sync_roster_async(
+            self.store.as_ref(),
+            &self.store_lock,
+            &self.roster,
+            &self.identity,
+        )
+        .await
+    }
+
+    async fn commit_session_roster(&self) -> Result<()> {
+        commit_session_async(
+            self.store.as_ref(),
+            &self.store_lock,
+            &self.roster,
+            &self.identity,
+        )
+        .await
+    }
+
+    fn new_session(&self, backend: SessionBackend) -> Session {
+        Session {
+            store: self.store.clone(),
+            store_lock: Arc::clone(&self.store_lock),
+            identity: Arc::clone(&self.identity),
+            roster: Arc::clone(&self.roster),
+            session: Arc::new(backend),
         }
-        Ok(())
     }
 
     fn snapshot_transport_cfg(&self) -> EndpointTransportConfig {
@@ -982,12 +1190,8 @@ impl Endpoint {
         kind: Option<String>,
     ) -> Result<String> {
         let cfg = self.snapshot_transport_cfg();
-        let roster_snapshot = {
-            self.roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        };
+        self.sync_roster_from_store().await?;
+        let roster_snapshot = lock_roster(&self.roster).clone();
         let v2_secret = if is_v2_relay_endpoint(&endpoint) {
             Some(lookup_v2_mailbox_secret_for_pair(
                 &roster_snapshot,
@@ -1041,32 +1245,42 @@ impl Endpoint {
                 pairing_sas,
                 host_pin_verified,
             } => {
-                let mut roster = self
-                    .roster
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let pin_res = if host_pin_verified {
-                    roster.insert_pinned_host(
-                        host_id.clone(),
-                        host_id.clone(),
-                        host_static_pub,
-                        Some(host_signing_pub),
-                        host_rotation_seq,
-                        Vec::new(),
-                    )
-                } else {
-                    roster.record_pending_host(
-                        host_id.clone(),
-                        host_id.clone(),
-                        host_static_pub,
-                        host_signing_pub,
-                        host_rotation_seq,
-                        pairing_sas.clone(),
-                        Vec::new(),
-                    )
-                };
-                pin_res.map_err(to_generic_err)?;
-                self.persist_roster(&roster)?;
+                let host_id_c = host_id.clone();
+                let sas_c = pairing_sas.clone();
+                update_roster_async(
+                    self.store.as_ref(),
+                    &self.store_lock,
+                    &self.roster,
+                    &self.identity,
+                    move |roster| {
+                        if host_pin_verified {
+                            roster
+                                .insert_pinned_host(
+                                    host_id_c.clone(),
+                                    host_id_c,
+                                    host_static_pub,
+                                    Some(host_signing_pub),
+                                    host_rotation_seq,
+                                    Vec::new(),
+                                )
+                                .map(|_| ())
+                        } else {
+                            roster
+                                .record_pending_host(
+                                    host_id_c.clone(),
+                                    host_id_c,
+                                    host_static_pub,
+                                    host_signing_pub,
+                                    host_rotation_seq,
+                                    sas_c,
+                                    Vec::new(),
+                                )
+                                .map(|_| ())
+                        }
+                        .map_err(RuntimeError::from)
+                    },
+                )
+                .await?;
                 Ok(serde_json::json!({
                     "device_id": device_id,
                     "host_id": host_id,
@@ -1089,6 +1303,8 @@ impl Endpoint {
     #[napi]
     pub async fn pair_accept(&self, timeout_ms: Option<f64>) -> Result<String> {
         let wait = Duration::from_millis(f64_to_timeout_ms(timeout_ms, 5000)?);
+        self.sync_roster_from_store().await?;
+        self.refresh_m2m_enabled(&lock_roster(&self.roster));
         let policy = if self.m2m_enabled.load(Ordering::Acquire) {
             EnrollmentPolicy::enabled_default()
         } else {
@@ -1101,21 +1317,40 @@ impl Endpoint {
         };
 
         let path_kind = pairing_path_kind_for_provider(stream.provider_id());
-        let res = drive_pair_responder_with_policy_and_store(
-            stream.as_mut(),
-            &self.identity,
-            &self.pair_mgr,
-            &self.roster,
-            self.store.as_deref(),
-            path_kind,
-            now_unix(),
-            policy,
-            Some(self.router.rate_limiter()),
-            Some(guard),
-            DEFAULT_PRE_AUTH_TIMEOUT,
-        )
-        .await
-        .map_err(to_generic_err)?;
+        let driven = if let Some(ref store) = self.store {
+            drive_pair_responder_with_store(
+                stream.as_mut(),
+                &self.identity,
+                &self.pair_mgr,
+                store,
+                &self.store_lock,
+                path_kind,
+                now_unix(),
+                policy,
+                Some(self.router.rate_limiter()),
+                Some(guard),
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
+        } else {
+            drive_pair_responder_with_policy_and_store(
+                stream.as_mut(),
+                &self.identity,
+                &self.pair_mgr,
+                &self.roster,
+                None,
+                path_kind,
+                now_unix(),
+                policy,
+                Some(self.router.rate_limiter()),
+                Some(guard),
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
+        };
+        let synced = self.sync_roster_from_store().await;
+        let res = driven.map_err(to_generic_err)?;
+        synced?;
 
         match res.outcome {
             PairOutcome::ResponderPending {
@@ -1154,14 +1389,12 @@ impl Endpoint {
 
     #[napi]
     pub fn confirm_peer(&self, peer_id: String, sas: Option<String>) -> Result<()> {
-        let mut roster = self
-            .roster
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        roster
-            .confirm_peer(&peer_id, sas.as_deref())
-            .map_err(to_generic_err)?;
-        self.persist_roster(&roster)
+        self.update_roster_sync(|roster| {
+            roster
+                .confirm_peer(&peer_id, sas.as_deref())
+                .map(|_| ())
+                .map_err(RuntimeError::from)
+        })
     }
 
     #[napi]
@@ -1176,64 +1409,51 @@ impl Endpoint {
             None => 3600,
         };
         let nonce = random_bytes::<16>().map_err(to_generic_err)?;
-        let mut roster = self
-            .roster
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = now_unix();
-        let grant = roster
-            .mint_grant(
-                &self.identity,
-                &peer_id,
-                caps,
-                now,
-                now.saturating_add(ttl),
-                nonce,
-            )
-            .map_err(to_generic_err)?;
-        self.persist_roster(&roster)?;
+        let grant = self.update_roster_sync(|roster| {
+            let now = now_unix();
+            roster
+                .mint_grant(
+                    &self.identity,
+                    &peer_id,
+                    caps,
+                    now,
+                    now.saturating_add(ttl),
+                    nonce,
+                )
+                .map_err(RuntimeError::from)
+        })?;
         serde_json::to_string(&grant).map_err(to_generic_err)
     }
 
     #[napi]
     pub fn revoke_peer(&self, peer_id: String) -> Result<()> {
-        let mut roster = self
-            .roster
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        roster.revoke_peer(&peer_id).map_err(to_generic_err)?;
-        self.persist_roster(&roster)?;
-        self.refresh_m2m_enabled(&roster);
+        self.update_roster_sync(|roster| roster.revoke_peer(&peer_id).map_err(RuntimeError::from))?;
+        self.refresh_m2m_enabled(&lock_roster(&self.roster));
         Ok(())
     }
 
     #[napi]
     pub fn add_trust_anchor(&self, anchor_id: String, signing_pub: Buffer) -> Result<()> {
         let key = parse_hybrid_signing_pub(signing_pub.as_ref(), "signing_pub")?;
-        let mut roster = self
-            .roster
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        roster
-            .add_trust_anchor(anchor_id, key)
-            .map_err(to_generic_err)?;
-        self.persist_roster(&roster)?;
-        self.refresh_m2m_enabled(&roster);
+        self.update_roster_sync(|roster| {
+            roster
+                .add_trust_anchor(anchor_id, key)
+                .map(|_| ())
+                .map_err(RuntimeError::from)
+        })?;
+        self.refresh_m2m_enabled(&lock_roster(&self.roster));
         self.router.set_pair_enabled(true);
         Ok(())
     }
 
     #[napi]
     pub fn revoke_trust_anchor(&self, anchor_id: String) -> Result<()> {
-        let mut roster = self
-            .roster
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        roster
-            .revoke_trust_anchor(&anchor_id)
-            .map_err(to_generic_err)?;
-        self.persist_roster(&roster)?;
-        self.refresh_m2m_enabled(&roster);
+        self.update_roster_sync(|roster| {
+            roster
+                .revoke_trust_anchor(&anchor_id)
+                .map_err(RuntimeError::from)
+        })?;
+        self.refresh_m2m_enabled(&lock_roster(&self.roster));
         Ok(())
     }
 
@@ -1300,6 +1520,7 @@ impl Endpoint {
         };
 
         let cfg = self.snapshot_transport_cfg();
+        self.sync_roster_from_store().await?;
         let (fallback_floor, v2_secret) = {
             let roster = self
                 .roster
@@ -1361,21 +1582,27 @@ impl Endpoint {
                 host_rotation_seq,
                 token_nonce,
             } => {
-                let mut roster = self
-                    .roster
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                roster
-                    .insert_pinned_host(
-                        host_id.clone(),
-                        host_id.clone(),
-                        host_static_pub,
-                        Some(host_signing_pub),
-                        host_rotation_seq,
-                        Vec::new(),
-                    )
-                    .map_err(to_generic_err)?;
-                self.persist_roster(&roster)?;
+                let host_id_c = host_id.clone();
+                update_roster_async(
+                    self.store.as_ref(),
+                    &self.store_lock,
+                    &self.roster,
+                    &self.identity,
+                    move |roster| {
+                        roster
+                            .insert_pinned_host(
+                                host_id_c.clone(),
+                                host_id_c,
+                                host_static_pub,
+                                Some(host_signing_pub),
+                                host_rotation_seq,
+                                Vec::new(),
+                            )
+                            .map(|_| ())
+                            .map_err(RuntimeError::from)
+                    },
+                )
+                .await?;
                 Ok(serde_json::json!({
                     "device_id": device_id,
                     "host_id": host_id,
@@ -1408,49 +1635,71 @@ impl Endpoint {
             _ => None,
         };
         let cfg = self.snapshot_transport_cfg();
-        let v2_secret = if is_v2_relay_endpoint(&endpoint) {
-            let roster = self
-                .roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Some(lookup_v2_mailbox_secret_for_target(
-                &roster,
-                &target_host_id,
-            )?)
-        } else {
-            None
+        self.sync_roster_from_store().await?;
+        let (v2_secret, working) = {
+            let roster = lock_roster(&self.roster);
+            check_peer_allows_wire_v1(&roster, &target_host_id).map_err(to_generic_err)?;
+            let sec = if is_v2_relay_endpoint(&endpoint) {
+                Some(lookup_v2_mailbox_secret_for_target(
+                    &roster,
+                    &target_host_id,
+                )?)
+            } else {
+                None
+            };
+            (sec, Arc::new(StdMutex::new(roster.clone())))
         };
         let stream =
             dial_endpoint_v2_with_options(&endpoint, relay_host.as_deref(), &cfg, v2_secret)
                 .await
                 .map_err(to_generic_err)?;
-        let driver = match SessionDriver::connect_locked(
+        let connect_roster = if self.store.is_some() {
+            &working
+        } else {
+            &self.roster
+        };
+        let connected = SessionDriver::connect_locked(
             stream,
             &self.identity,
             &target_host_id,
             grant,
-            &self.roster,
+            connect_roster,
             now_unix(),
         )
-        .await
-        {
+        .await;
+        let persisted = if self.store.is_some() {
+            let chain = connected
+                .as_ref()
+                .map(|d| d.applied_rotation().to_vec())
+                .unwrap_or_default();
+            let learned = lock_roster(&working).clone();
+            commit_connect_async(
+                self.store.as_ref(),
+                &self.store_lock,
+                &self.roster,
+                &self.identity,
+                learned,
+                target_host_id.clone(),
+                chain,
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        let driver = match connected {
             Ok(drv) => {
-                persist_store_roster(self.store.as_ref(), &self.roster)?;
+                persisted?;
                 drv
             }
             Err(e) => {
-                if let Err(pe) = persist_store_roster(self.store.as_ref(), &self.roster) {
+                if let Err(pe) = persisted {
                     return Err(Error::new(Status::GenericFailure, format!("{e} ({pe})")));
                 }
                 return Err(to_generic_err(e));
             }
         };
 
-        Ok(Session {
-            store: self.store.clone(),
-            roster: Arc::clone(&self.roster),
-            session: Arc::new(SessionBackend::V1(driver.into_concurrent())),
-        })
+        Ok(self.new_session(SessionBackend::V1(driver.into_concurrent())))
     }
 
     #[napi]
@@ -1462,7 +1711,8 @@ impl Endpoint {
             Err(()) => return Err(to_generic_err("timed out accepting session")),
         };
 
-        let driver = SessionDriver::accept_locked(
+        self.sync_roster_from_store().await?;
+        let accepted = SessionDriver::accept_locked(
             stream,
             &self.identity,
             &self.roster,
@@ -1471,14 +1721,12 @@ impl Endpoint {
             Some(guard),
             DEFAULT_PRE_AUTH_TIMEOUT,
         )
-        .await
-        .map_err(to_generic_err)?;
+        .await;
+        let persisted = self.commit_session_roster().await;
+        let driver = accepted.map_err(to_generic_err)?;
+        persisted?;
 
-        Ok(Session {
-            store: self.store.clone(),
-            roster: Arc::clone(&self.roster),
-            session: Arc::new(SessionBackend::V1(driver.into_concurrent())),
-        })
+        Ok(self.new_session(SessionBackend::V1(driver.into_concurrent())))
     }
 
     #[napi(js_name = "configureTransportsJson")]
@@ -1543,6 +1791,7 @@ impl Endpoint {
         peer_id: Option<String>,
     ) -> Result<String> {
         let cfg = self.snapshot_transport_cfg();
+        self.sync_roster_from_store().await?;
         let secrets: Vec<[u8; 32]> = {
             let roster = self
                 .roster
@@ -1598,12 +1847,8 @@ impl Endpoint {
         pinned_host_json: Option<String>,
     ) -> Result<String> {
         let cfg = self.snapshot_transport_cfg();
-        let roster_snapshot = {
-            self.roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        };
+        self.sync_roster_from_store().await?;
+        let roster_snapshot = lock_roster(&self.roster).clone();
 
         let v2_pinned = match pinned_host_json.as_deref().filter(|s| !s.is_empty()) {
             Some(raw) => {
@@ -1692,7 +1937,7 @@ impl Endpoint {
                 let h_id = host_id.clone();
                 let sas = pairing_sas.clone();
                 if self.store.is_some() {
-                    self.sync_roster_from_store()?;
+                    self.sync_roster_from_store().await?;
                 } else {
                     let mut roster = self
                         .roster
@@ -1761,8 +2006,10 @@ impl Endpoint {
                 DEFAULT_PRE_AUTH_TIMEOUT,
             )
             .await
-        }
-        .map_err(to_generic_err)?;
+        };
+        let synced = self.sync_roster_from_store().await;
+        let pair_res = pair_res.map_err(to_generic_err)?;
+        synced?;
 
         match pair_res.outcome {
             V2PairOutcome::ResponderPending {
@@ -1771,17 +2018,14 @@ impl Endpoint {
                 name,
                 kind,
                 ..
-            } => {
-                self.sync_roster_from_store()?;
-                Ok(serde_json::json!({
-                    "device_id": device_id,
-                    "sas": pairing_sas,
-                    "name": name,
-                    "kind": kind,
-                    "wire_version": 2,
-                })
-                .to_string())
-            }
+            } => Ok(serde_json::json!({
+                "device_id": device_id,
+                "sas": pairing_sas,
+                "name": name,
+                "kind": kind,
+                "wire_version": 2,
+            })
+            .to_string()),
             V2PairOutcome::Rejected { error } => Err(to_generic_err(error)),
             V2PairOutcome::InitiatorPending { .. } => {
                 Err(to_generic_err("unexpected initiator outcome"))
@@ -1802,11 +2046,9 @@ impl Endpoint {
             _ => None,
         };
         let cfg = self.snapshot_transport_cfg();
+        self.sync_roster_from_store().await?;
         let v2_secret = if is_v2_relay_endpoint(&endpoint) {
-            let roster = self
-                .roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let roster = lock_roster(&self.roster);
             Some(lookup_v2_mailbox_secret_for_target(
                 &roster,
                 &target_host_id,
@@ -1841,19 +2083,11 @@ impl Endpoint {
         };
         match driver_res {
             Ok(driver) => {
-                if self.store.is_some() {
-                    self.sync_roster_from_store()?;
-                }
-                Ok(Session {
-                    store: self.store.clone(),
-                    roster: Arc::clone(&self.roster),
-                    session: Arc::new(SessionBackend::V2(driver.into_concurrent())),
-                })
+                self.sync_roster_from_store().await?;
+                Ok(self.new_session(SessionBackend::V2(driver.into_concurrent())))
             }
             Err(e) => {
-                if self.store.is_some() {
-                    let _ = self.sync_roster_from_store();
-                }
+                let _ = self.sync_roster_from_store().await;
                 Err(to_generic_err(e))
             }
         }
@@ -1895,19 +2129,11 @@ impl Endpoint {
         };
         match driver_res {
             Ok(driver) => {
-                if self.store.is_some() {
-                    self.sync_roster_from_store()?;
-                }
-                Ok(Session {
-                    store: self.store.clone(),
-                    roster: Arc::clone(&self.roster),
-                    session: Arc::new(SessionBackend::V2(driver.into_concurrent())),
-                })
+                self.sync_roster_from_store().await?;
+                Ok(self.new_session(SessionBackend::V2(driver.into_concurrent())))
             }
             Err(e) => {
-                if self.store.is_some() {
-                    let _ = self.sync_roster_from_store();
-                }
+                let _ = self.sync_roster_from_store().await;
                 Err(to_generic_err(e))
             }
         }
@@ -1975,6 +2201,8 @@ impl SessionBackend {
 #[napi]
 pub struct Session {
     store: Option<Arc<StateStore>>,
+    store_lock: Arc<AsyncMutex<()>>,
+    identity: Arc<EndpointIdentity>,
     roster: Arc<StdMutex<Roster>>,
     session: Arc<SessionBackend>,
 }
@@ -2011,17 +2239,22 @@ impl Session {
                         "grant": g,
                     }),
                     SessionEvent::RevocationUpdated { issuer, seq } => {
-                        if matches!(self.session.as_ref(), SessionBackend::V2(_))
-                            && let Some(ref store) = self.store
-                        {
-                            let disk = store.load_roster().map_err(to_generic_err)?;
-                            let mut guard = self
-                                .roster
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            *guard = disk;
+                        if matches!(self.session.as_ref(), SessionBackend::V2(_)) {
+                            sync_roster_async(
+                                self.store.as_ref(),
+                                &self.store_lock,
+                                &self.roster,
+                                &self.identity,
+                            )
+                            .await?;
                         } else {
-                            persist_store_roster(self.store.as_ref(), &self.roster)?;
+                            commit_session_async(
+                                self.store.as_ref(),
+                                &self.store_lock,
+                                &self.roster,
+                                &self.identity,
+                            )
+                            .await?;
                         }
                         serde_json::json!({
                             "status": "event",
@@ -2051,18 +2284,23 @@ impl Session {
             }
             Ok(Ok(None)) => Ok(serde_json::json!({ "status": "eof" }).to_string()),
             Ok(Err(e)) => {
-                if matches!(self.session.as_ref(), SessionBackend::V2(_))
-                    && let Some(ref store) = self.store
-                {
-                    if let Ok(disk) = store.load_roster() {
-                        let mut guard = self
-                            .roster
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        *guard = disk;
-                    }
+                if matches!(self.session.as_ref(), SessionBackend::V2(_)) {
+                    let _ = sync_roster_async(
+                        self.store.as_ref(),
+                        &self.store_lock,
+                        &self.roster,
+                        &self.identity,
+                    )
+                    .await;
                     Err(to_generic_err(e))
-                } else if let Err(pe) = persist_store_roster(self.store.as_ref(), &self.roster) {
+                } else if let Err(pe) = commit_session_async(
+                    self.store.as_ref(),
+                    &self.store_lock,
+                    &self.roster,
+                    &self.identity,
+                )
+                .await
+                {
                     Err(Error::new(Status::GenericFailure, format!("{e} ({pe})")))
                 } else {
                     Err(to_generic_err(e))
@@ -2100,7 +2338,167 @@ mod tests {
     use super::*;
     use tendril_core::grants::{RevocationListUnsigned, sign_crl};
 
-    #[tokio::test]
+    #[test]
+    fn custom_relay_uri_disables_default_relays_and_pkarr() {
+        let id = "58".to_owned() + &"66".repeat(31);
+        let uri = format!("iroh://{id}?relay=http://127.0.0.1:9/");
+        let uri = uri.as_str();
+        let mut cfg = EndpointTransportConfig::default();
+        cfg.p2p_allow_private_addrs = Some(true);
+        let opts = cfg.build_p2p_dialer_options(uri, None).unwrap();
+        assert!(matches!(opts.relay_mode, P2pRelayMode::Custom(_)));
+        assert!(!opts.resolve_pkarr);
+        assert!(!opts.publish_pkarr);
+
+        let plain = cfg
+            .build_p2p_dialer_options(&format!("iroh://{id}"), None)
+            .unwrap();
+        assert!(matches!(plain.relay_mode, P2pRelayMode::Default));
+        assert!(plain.resolve_pkarr);
+
+        let mut pinned = EndpointTransportConfig::default();
+        pinned.p2p_relay_mode = Some(P2pRelayMode::Disabled);
+        let opts = pinned.build_p2p_dialer_options(uri, None).unwrap();
+        assert!(matches!(opts.relay_mode, P2pRelayMode::Disabled));
+    }
+
+    #[test]
+    fn dialer_options_reject_untrusted_relay_uri_without_private_opt_in() {
+        let cfg = EndpointTransportConfig::default();
+        assert!(
+            cfg.build_p2p_dialer_options(
+                &format!(
+                    "iroh://{}?relay=http://127.0.0.1:9/",
+                    "58".to_owned() + &"66".repeat(31)
+                ),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v1_host_rotation_persists_to_disk_and_memory() {
+        use tendril_core::crypto::{SigningKeypair, StaticKeypair};
+
+        let uniq = format!(
+            "tendril-node-rot-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let base_dir = std::env::temp_dir().join(uniq);
+        let host_dir = base_dir.join("host");
+        let cli_dir = base_dir.join("cli");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::create_dir_all(&cli_dir).unwrap();
+
+        let host_ep = Endpoint::new(
+            Some(host_dir.to_string_lossy().into_owned()),
+            Some("rot-host".to_owned()),
+        )
+        .unwrap();
+        let cli_ep = Endpoint::new(
+            Some(cli_dir.to_string_lossy().into_owned()),
+            Some("rot-cli".to_owned()),
+        )
+        .unwrap();
+
+        let addr = host_ep
+            .serve_direct(Some("127.0.0.1:0".to_owned()))
+            .await
+            .unwrap();
+        let code = host_ep.issue_code(Some("lan".to_owned())).unwrap();
+        let (cli_pair_raw, host_acc_raw) = tokio::join!(
+            cli_ep.pair_initiate(
+                addr,
+                code,
+                None,
+                Some("rot-cli".to_owned()),
+                Some("node".to_owned()),
+            ),
+            host_ep.pair_accept(Some(5000.0)),
+        );
+        let cli_pair: serde_json::Value = serde_json::from_str(&cli_pair_raw.unwrap()).unwrap();
+        let host_acc: serde_json::Value = serde_json::from_str(&host_acc_raw.unwrap()).unwrap();
+        let sas = cli_pair["sas"].as_str().unwrap().to_owned();
+        let dev_id = host_acc["device_id"].as_str().unwrap().to_owned();
+
+        tokio::task::block_in_place(|| {
+            host_ep
+                .confirm_peer(dev_id.clone(), Some(sas.clone()))
+                .unwrap();
+            cli_ep
+                .confirm_peer("rot-host".to_owned(), Some(sas))
+                .unwrap();
+        });
+        host_ep.close();
+
+        let host_store = StateStore::open_or_create(&host_dir).unwrap();
+        let mut host_id = host_store.load_or_generate_identity(None).unwrap();
+        host_id
+            .rotate(
+                StaticKeypair::generate().unwrap(),
+                SigningKeypair::generate().unwrap(),
+                now_unix(),
+            )
+            .unwrap();
+        let expected_static = *host_id.static_key().public_bytes();
+        let expected_signing = host_id.signing_key().public_key().clone();
+        let mut host_roster = host_store.load_roster().unwrap();
+        let grant = host_roster
+            .mint_grant(
+                &host_id,
+                &dev_id,
+                vec!["fs.read".to_owned()],
+                now_unix(),
+                now_unix() + 3600,
+                random_bytes::<16>().unwrap(),
+            )
+            .unwrap();
+        let grant_json = serde_json::to_string(&grant).unwrap();
+        let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let v1_ep = listener.local_endpoint();
+        let accept_task = tokio::spawn(async move {
+            let mut r = host_roster;
+            let stream = listener.accept().await.unwrap();
+            SessionDriver::accept(stream, &host_id, &mut r, now_unix(), None)
+                .await
+                .unwrap()
+        });
+
+        let sess = cli_ep
+            .connect(v1_ep, "rot-host".to_owned(), Some(grant_json), None)
+            .await
+            .unwrap();
+        let _host_drv = accept_task.await.unwrap();
+        drop(sess);
+
+        let mem_entry = lock_roster(&cli_ep.roster)
+            .get("rot-host")
+            .cloned()
+            .expect("rot-host in memory");
+        assert_eq!(mem_entry.rotation_seq, 1);
+        assert_eq!(mem_entry.static_pub, expected_static);
+        assert_eq!(mem_entry.signing_pub.as_ref(), Some(&expected_signing));
+
+        let disk_roster = StateStore::open_or_create(&cli_dir)
+            .unwrap()
+            .load_roster()
+            .unwrap();
+        let disk_entry = disk_roster.get("rot-host").expect("rot-host on disk");
+        assert_eq!(disk_entry.rotation_seq, 1);
+        assert_eq!(disk_entry.static_pub, expected_static);
+        assert_eq!(disk_entry.signing_pub.as_ref(), Some(&expected_signing));
+
+        cli_ep.close();
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn v2_mid_session_crl_revocation_closes_session() {
         let uniq = format!(
             "tendril-node-crl-test-{}",
@@ -2147,15 +2545,17 @@ mod tests {
         let sas = cli_pair["sas"].as_str().unwrap().to_owned();
         let dev_id = host_acc["device_id"].as_str().unwrap().to_owned();
 
-        host_ep
-            .confirm_peer(dev_id.clone(), Some(sas.clone()))
-            .unwrap();
-        cli_ep
-            .confirm_peer("crl-host".to_owned(), Some(sas))
-            .unwrap();
-        let grant_json = host_ep
-            .mint_grant(dev_id, vec!["fs.read".to_owned()], Some(3600.0))
-            .unwrap();
+        let grant_json = tokio::task::block_in_place(|| {
+            host_ep
+                .confirm_peer(dev_id.clone(), Some(sas.clone()))
+                .unwrap();
+            cli_ep
+                .confirm_peer("crl-host".to_owned(), Some(sas))
+                .unwrap();
+            host_ep
+                .mint_grant(dev_id, vec!["fs.read".to_owned()], Some(3600.0))
+                .unwrap()
+        });
         let grant: Grant = serde_json::from_str(&grant_json).unwrap();
         let crl_ts = grant.not_before.clone();
         let revoked_nonce = grant.nonce.clone();
