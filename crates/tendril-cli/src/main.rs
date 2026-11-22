@@ -444,6 +444,11 @@ fn resolve_relay_auth(args: &RelayAuthArgs) -> Result<RelayClientAuth, Box<dyn s
         if ticket.issuer_pub.is_empty() || ticket.target_pub.is_empty() || ticket.sig.is_empty() {
             return Err("relay ticket has empty required fields".into());
         }
+        if ticket.spans_multiple_v2_epochs() {
+            tracing::warn!(
+                "relay ticket spans multiple /v2/relay epochs, allowing cross-epoch mailbox linkability; prefer Tier 2 HMAC admission or single-epoch scoped tickets"
+            );
+        }
         return Ok(RelayClientAuth::Ticket(ticket));
     }
     if let Ok(val) = std::env::var("TENDRIL_RELAY_AUTH_SECRET") {
@@ -560,26 +565,33 @@ fn build_p2p_listener_options(
     Ok(opts)
 }
 
+fn resolve_explicit_p2p_relay_mode(
+    args: &P2pTransportArgs,
+    relay_host_fallback: Option<&str>,
+) -> Result<Option<P2pRelayMode>, Box<dyn std::error::Error>> {
+    if !args.p2p_relay.is_empty() {
+        if args.p2p_relay.len() == 1 {
+            return Ok(Some(parse_p2p_relay_mode(Some(&args.p2p_relay[0]))?));
+        }
+        return Ok(Some(parse_p2p_relay_modes(&args.p2p_relay)?));
+    }
+    if let Some(spec) = relay_host_fallback.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(Some(parse_p2p_relay_mode(Some(spec))?));
+    }
+    if args.p2p_local || std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") {
+        return Ok(Some(P2pRelayMode::Disabled));
+    }
+    Ok(None)
+}
+
 fn resolve_p2p_relay_mode(
     args: &P2pTransportArgs,
     relay_host_fallback: Option<&str>,
 ) -> Result<P2pRelayMode, Box<dyn std::error::Error>> {
-    if args.p2p_local {
-        return Ok(P2pRelayMode::Disabled);
-    }
-    if !args.p2p_relay.is_empty() {
-        if args.p2p_relay.len() == 1 {
-            return Ok(parse_p2p_relay_mode(Some(&args.p2p_relay[0]))?);
-        }
-        return Ok(parse_p2p_relay_modes(&args.p2p_relay)?);
-    }
-    if let Some(spec) = relay_host_fallback.map(str::trim).filter(|s| !s.is_empty()) {
-        return Ok(parse_p2p_relay_mode(Some(spec))?);
-    }
-    if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") {
-        return Ok(P2pRelayMode::Disabled);
-    }
-    Ok(P2pRelayMode::Default)
+    Ok(
+        resolve_explicit_p2p_relay_mode(args, relay_host_fallback)?
+            .unwrap_or(P2pRelayMode::Default),
+    )
 }
 
 fn ws_path(endpoint: &str) -> &str {
@@ -687,17 +699,21 @@ fn lookup_v2_mailbox_secret_for_pair(
 
 fn build_p2p_dialer_options(
     p2p_args: &P2pTransportArgs,
+    endpoint: &str,
     relay_host: Option<&str>,
 ) -> Result<P2pOptions, Box<dyn std::error::Error>> {
-    let mode = resolve_p2p_relay_mode(p2p_args, relay_host)?;
+    let explicit_mode = resolve_explicit_p2p_relay_mode(p2p_args, relay_host)?;
     let p2p_auth = resolve_p2p_relay_auth(p2p_args)?;
-    let pkarr = resolve_pkarr_enabled(&mode, p2p_args.p2p_pkarr, p2p_args.no_pkarr);
-    let mut opts = P2pOptions::for_dialer(mode)
-        .with_resolve_pkarr(pkarr)
-        .with_relay_auth(p2p_auth);
-    if matches!(opts.relay_mode, P2pRelayMode::Disabled) {
-        opts = opts.with_allow_private_addrs(true);
-    }
+    let allow_private_addrs = matches!(explicit_mode, Some(P2pRelayMode::Disabled));
+    let mut opts = if endpoint.starts_with("iroh://") || endpoint.starts_with("p2p:iroh://") {
+        P2pOptions::for_endpoint(endpoint, explicit_mode, allow_private_addrs)?
+    } else {
+        let mode = explicit_mode.unwrap_or(P2pRelayMode::Default);
+        let is_disabled = matches!(mode, P2pRelayMode::Disabled);
+        P2pOptions::for_dialer(mode).with_allow_private_addrs(allow_private_addrs || is_disabled)
+    };
+    let pkarr = resolve_pkarr_enabled(&opts.relay_mode, p2p_args.p2p_pkarr, p2p_args.no_pkarr);
+    opts = opts.with_resolve_pkarr(pkarr).with_relay_auth(p2p_auth);
     Ok(opts)
 }
 
@@ -710,7 +726,7 @@ async fn dial_endpoint_cli(
 ) -> Result<Box<dyn PathStream>, Box<dyn std::error::Error>> {
     let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
-        let opts = build_p2p_dialer_options(p2p_args, normalized_host)?;
+        let opts = build_p2p_dialer_options(p2p_args, endpoint, normalized_host)?;
         let dialer = P2pDialer::bind_with_options(opts).await?;
         return match dialer.dial(endpoint).await {
             Ok(stream) => Ok(stream),
@@ -739,7 +755,7 @@ async fn build_path_dialer(
 ) -> Result<Box<dyn PathDialer>, Box<dyn std::error::Error>> {
     let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
-        let opts = build_p2p_dialer_options(p2p_args, normalized_host)?;
+        let opts = build_p2p_dialer_options(p2p_args, endpoint, normalized_host)?;
         return Ok(Box::new(P2pDialer::bind_with_options(opts).await?));
     }
     if endpoint.starts_with("overlay://") {
@@ -860,8 +876,10 @@ fn resolve_pair_code(
         return Ok(out);
     }
     if let Some(path) = code_file {
-        let content = Zeroizing::new(std::fs::read_to_string(&path)?);
-        return trim_secret_code(content.as_str().to_owned());
+        let raw_bytes = read_private_secret_bytes(&path, "pairing code")?;
+        let text =
+            std::str::from_utf8(&raw_bytes).map_err(|_| "pairing code file must be valid UTF-8")?;
+        return trim_secret_code(text.to_owned());
     }
     if let Some(env_val) = env_raw {
         return trim_secret_code(env_val.as_str().to_owned());
@@ -939,7 +957,10 @@ fn resolve_enroll_token(
         );
     }
     let raw = if let Some(path) = token_file {
-        Zeroizing::new(std::fs::read_to_string(path)?)
+        let raw_bytes = read_private_secret_bytes(&path, "enrollment token")?;
+        let text = std::str::from_utf8(&raw_bytes)
+            .map_err(|_| "enrollment token file must be valid UTF-8")?;
+        Zeroizing::new(text.to_owned())
     } else if token_stdin {
         let mut buf = Zeroizing::new(String::new());
         std::io::stdin().read_to_string(&mut buf)?;
@@ -1181,12 +1202,41 @@ async fn handle_v1_session(
         return;
     };
     let peer_id = driver.peer_device_id().unwrap_or_default().to_owned();
+    let mut last_stamp = initial_stamp;
+    {
+        let _guard = store_lock.lock().await;
+        match store.roster_stamp() {
+            Ok(curr_stamp) if curr_stamp != last_stamp => match store.load_roster_with_stamp() {
+                Ok((disk, fresh_stamp)) => {
+                    roster = disk;
+                    last_stamp = fresh_stamp;
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to reload roster after v1 accept");
+                    let _ = driver.send_close(1000, "roster error").await;
+                    return;
+                }
+            },
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "failed to check roster stamp after v1 accept");
+                let _ = driver.send_close(1000, "roster error").await;
+                return;
+            }
+        }
+    }
+    if !roster
+        .get(&peer_id)
+        .is_some_and(|entry| entry.state == PeerState::Active)
+    {
+        let _ = driver.send_close(1000, "peer revoked").await;
+        return;
+    }
     print_json_line(&serde_json::json!({
         "event": "session_established",
         "peer_device_id": peer_id,
         "provider": format!("{:?}", driver.provider_id()),
     }));
-    let mut last_stamp = initial_stamp;
     loop {
         let ev_res = driver
             .next_event_with_refresh(&mut roster, Duration::from_millis(250), |mem| {
@@ -1202,6 +1252,27 @@ async fn handle_v1_session(
             .await;
         match ev_res {
             Ok(Some(SessionEvent::AppData(data))) => {
+                if let Ok(curr_stamp) = store.roster_stamp()
+                    && curr_stamp != last_stamp
+                {
+                    let _guard = store_lock.lock().await;
+                    if let Ok((disk, fresh_stamp)) = store.load_roster_with_stamp() {
+                        roster = disk;
+                        last_stamp = fresh_stamp;
+                    }
+                }
+                if !roster
+                    .get(&peer_id)
+                    .is_some_and(|entry| entry.state == PeerState::Active)
+                {
+                    let _ = driver.send_close(1000, "peer revoked").await;
+                    print_json_line(&serde_json::json!({
+                        "event": "closed",
+                        "code": 1000,
+                        "reason": "peer revoked",
+                    }));
+                    break;
+                }
                 let shown_utf8 = if redact_logs {
                     "<redacted>".to_owned()
                 } else {
@@ -1309,6 +1380,14 @@ async fn handle_v2_session(
             }
         }
     };
+    if !initial_roster
+        .get(&peer_id)
+        .is_some_and(|entry| entry.state == PeerState::Active)
+    {
+        let mut driver = driver;
+        let _ = driver.send_close(1000, "peer revoked").await;
+        return;
+    }
     print_json_line(&serde_json::json!({
         "event": "session_established",
         "peer_device_id": peer_id,
@@ -1317,10 +1396,11 @@ async fn handle_v2_session(
     }));
     let session = Arc::new(driver.into_concurrent());
     let roster_arc = Arc::new(StdMutex::new(initial_roster));
-    let mut last_stamp = initial_stamp;
+    let last_stamp_arc = Arc::new(StdMutex::new(initial_stamp));
 
     let session_tick = Arc::clone(&session);
     let roster_tick = Arc::clone(&roster_arc);
+    let last_stamp_tick = Arc::clone(&last_stamp_arc);
     let store_tick = Arc::clone(&store);
     let store_lock_tick = Arc::clone(&store_lock);
     let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -1332,8 +1412,9 @@ async fn handle_v2_session(
                 biased;
                 _ = stop_rx.changed() => break,
                 _ = interval.tick() => {
+                    let prev_stamp = last_stamp_tick.lock().expect("stamp lock").clone();
                     if let Ok(curr_stamp) = store_tick.roster_stamp()
-                        && curr_stamp != last_stamp
+                        && curr_stamp != prev_stamp
                     {
                         let loaded = {
                             let _g = store_lock_tick.lock().await;
@@ -1341,7 +1422,7 @@ async fn handle_v2_session(
                         };
                         if let Ok((disk, fresh_stamp)) = loaded {
                             *roster_tick.lock().expect("roster lock") = disk;
-                            last_stamp = fresh_stamp;
+                            *last_stamp_tick.lock().expect("stamp lock") = fresh_stamp;
                         }
                     }
                     if let Err(err) = session_tick.tick_locked(now_unix(), &roster_tick).await {
@@ -1361,6 +1442,33 @@ async fn handle_v2_session(
     loop {
         match session.next_event_locked_now(&roster_arc).await {
             Ok(Some(SessionEvent::AppData(data))) => {
+                let prev_stamp = last_stamp_arc.lock().expect("stamp lock").clone();
+                if let Ok(curr_stamp) = store.roster_stamp()
+                    && curr_stamp != prev_stamp
+                {
+                    let loaded = {
+                        let _g = store_lock.lock().await;
+                        store.load_roster_with_stamp()
+                    };
+                    if let Ok((disk, fresh_stamp)) = loaded {
+                        *roster_arc.lock().expect("roster lock") = disk;
+                        *last_stamp_arc.lock().expect("stamp lock") = fresh_stamp;
+                    }
+                }
+                let still_active = roster_arc
+                    .lock()
+                    .expect("roster lock")
+                    .get(&peer_id)
+                    .is_some_and(|entry| entry.state == PeerState::Active);
+                if !still_active {
+                    let _ = session.send_close(1000, "peer revoked").await;
+                    print_json_line(&serde_json::json!({
+                        "event": "closed",
+                        "code": 1000,
+                        "reason": "peer revoked",
+                    }));
+                    break;
+                }
                 let shown_utf8 = if redact_logs {
                     "<redacted>".to_owned()
                 } else {
@@ -1375,8 +1483,9 @@ async fn handle_v2_session(
             Ok(Some(SessionEvent::RevocationUpdated { issuer, seq })) => {
                 {
                     let _g = store_lock.lock().await;
-                    if let Ok((disk, _)) = store.load_roster_with_stamp() {
+                    if let Ok((disk, fresh_stamp)) = store.load_roster_with_stamp() {
                         *roster_arc.lock().expect("roster lock") = disk;
+                        *last_stamp_arc.lock().expect("stamp lock") = fresh_stamp;
                     }
                 }
                 print_json_line(&serde_json::json!({
@@ -1541,7 +1650,7 @@ async fn sync_v2_relay_listeners(
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut desired: HashMap<String, [u8; 32]> = HashMap::new();
     for (peer_id, entry) in roster.entries() {
-        if entry.state != PeerState::Revoked
+        if entry.state == PeerState::Active
             && let Some(ref secrets) = entry.v2_secrets
         {
             desired.insert(peer_id.clone(), *secrets.mailbox_secret());
@@ -1562,6 +1671,11 @@ async fn sync_v2_relay_listeners(
     for (pid, secret) in desired {
         if active.contains_key(&pid) {
             continue;
+        }
+        if !newly_bound.is_empty() {
+            let jitter_byte = random_bytes::<1>()?[0];
+            let delay_ms = 25 + u64::from(jitter_byte) % 126;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
         let cfg = RelayV2ListenerConfig {
             expected_host: expected_host.map(ToOwned::to_owned),
@@ -1586,8 +1700,9 @@ async fn sync_v2_relay_listeners(
 
 fn load_grant_arg(arg: &str) -> Result<Grant, Box<dyn std::error::Error>> {
     if let Some(path) = arg.strip_prefix('@') {
-        let content = std::fs::read_to_string(Path::new(path))?;
-        Ok(serde_json::from_str(&content)?)
+        let raw_bytes = read_private_secret_bytes(Path::new(path), "grant")?;
+        let text = std::str::from_utf8(&raw_bytes).map_err(|_| "grant file must be valid UTF-8")?;
+        Ok(serde_json::from_str(text.trim())?)
     } else {
         Ok(serde_json::from_str(arg)?)
     }
@@ -1672,6 +1787,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 now_unix(),
                 ttl_secs,
             )?;
+            if ticket.spans_multiple_v2_epochs() {
+                tracing::warn!(
+                    "minted relay ticket spans multiple /v2/relay epochs, allowing cross-epoch mailbox linkability; prefer Tier 2 HMAC admission or single-epoch scoped tickets"
+                );
+            }
             let json = Zeroizing::new(canonical_json(&ticket)?);
             println!("{}", *json);
         }
@@ -2554,6 +2674,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "wake_outcome": wake_str,
                 }));
             } else {
+                tendril_core::session::check_peer_allows_wire_v1(&roster, &target)?;
                 let stream = dial_endpoint_cli(
                     &endpoint,
                     relay_host.as_deref(),
@@ -2676,7 +2797,8 @@ mod tests {
             build_p2p_listener_options(&default_args, None, false).expect("default listener");
         assert!(listener_default.publish_pkarr);
         assert!(listener_default.resolve_pkarr);
-        let dialer_default = build_p2p_dialer_options(&default_args, None).expect("default dialer");
+        let dialer_default = build_p2p_dialer_options(&default_args, "direct://127.0.0.1:1", None)
+            .expect("default dialer");
         assert!(dialer_default.resolve_pkarr);
 
         let no_pkarr_args = P2pTransportArgs {
@@ -2696,7 +2818,8 @@ mod tests {
             build_p2p_listener_options(&custom_args, None, false).expect("custom listener");
         assert!(!listener_custom.publish_pkarr);
         assert!(!listener_custom.resolve_pkarr);
-        let dialer_custom = build_p2p_dialer_options(&custom_args, None).expect("custom dialer");
+        let dialer_custom = build_p2p_dialer_options(&custom_args, "direct://127.0.0.1:1", None)
+            .expect("custom dialer");
         assert!(!dialer_custom.resolve_pkarr);
 
         let custom_opt_in = P2pTransportArgs {
@@ -2708,8 +2831,46 @@ mod tests {
         assert!(listener_custom_pkarr.publish_pkarr);
         assert!(listener_custom_pkarr.resolve_pkarr);
         let dialer_custom_pkarr =
-            build_p2p_dialer_options(&custom_opt_in, None).expect("custom dialer opt-in");
+            build_p2p_dialer_options(&custom_opt_in, "direct://127.0.0.1:1", None)
+                .expect("custom dialer opt-in");
         assert!(dialer_custom_pkarr.resolve_pkarr);
+    }
+
+    #[test]
+    fn priv01_p2p_dialer_options_derives_uri_relays_and_disables_pkarr() {
+        let default_args = P2pTransportArgs {
+            p2p_local: false,
+            p2p_relay: Vec::new(),
+            p2p_relay_token_file: None,
+            p2p_api_secret_file: None,
+            p2p_pkarr: false,
+            no_pkarr: false,
+        };
+        // Valid 32-byte Ed25519 hex iroh endpoint ID.
+        let ep_id: String = SigningKeypair::generate()
+            .expect("gen signing key")
+            .ed25519_public_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let uri = format!("iroh://{ep_id}?relay=https://relay.example:8443");
+        let opts = build_p2p_dialer_options(&default_args, &uri, None).expect("uri relay opts");
+        assert_eq!(
+            opts.relay_mode,
+            P2pRelayMode::Custom("https://relay.example:8443/".to_owned())
+        );
+        assert!(!opts.resolve_pkarr);
+
+        let pkarr_opt_in = P2pTransportArgs {
+            p2p_pkarr: true,
+            ..default_args.clone()
+        };
+        let opts_pkarr = build_p2p_dialer_options(&pkarr_opt_in, &uri, None).expect("pkarr opt-in");
+        assert!(opts_pkarr.resolve_pkarr);
+
+        // Private/loopback URI relay fails closed when private addrs are not enabled.
+        let private_uri = format!("iroh://{ep_id}?relay=https://127.0.0.1:8443");
+        assert!(build_p2p_dialer_options(&default_args, &private_uri, None).is_err());
     }
 
     #[test]
@@ -2743,5 +2904,78 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn priv06_sync_v2_relay_listeners_skips_pending_and_binds_active() {
+        let relay = tendril_relay::RelayServer::bind(tendril_relay::RelayConfig::default())
+            .await
+            .expect("bind relay");
+        let relay_handle = relay.spawn();
+        let v2_relay_url = derive_v2_relay_url(&relay_handle.ws_url());
+
+        let mut roster = Roster::new();
+        let pending_id = tendril_core::identity::EndpointIdentity::generate().unwrap();
+        let pending_secrets = tendril_core::roster::V2PeerSecrets::new([0x31; 32], [0x32; 32]);
+        roster
+            .apply_v2_pair_initiator_outcome(
+                &V2PairOutcome::InitiatorPending {
+                    device_id: pending_id.device_id(),
+                    host_id: "pending-v2-peer".to_owned(),
+                    host_static_pub: *pending_id.static_key().public_bytes(),
+                    host_signing_pub: pending_id.signing_key().public_key().clone(),
+                    pairing_sas: "111111".to_owned(),
+                    host_rotation_seq: 0,
+                    v2_secrets: pending_secrets,
+                    host_pin_verified: false,
+                },
+                "pending".to_owned(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        let active_id = tendril_core::identity::EndpointIdentity::generate().unwrap();
+        let active_secrets = tendril_core::roster::V2PeerSecrets::new([0x41; 32], [0x42; 32]);
+        roster
+            .apply_v2_pair_initiator_outcome(
+                &V2PairOutcome::InitiatorPending {
+                    device_id: active_id.device_id(),
+                    host_id: "active-v2-peer".to_owned(),
+                    host_static_pub: *active_id.static_key().public_bytes(),
+                    host_signing_pub: active_id.signing_key().public_key().clone(),
+                    pairing_sas: "222222".to_owned(),
+                    host_rotation_seq: 0,
+                    v2_secrets: active_secrets,
+                    host_pin_verified: false,
+                },
+                "active".to_owned(),
+                Vec::new(),
+            )
+            .unwrap();
+        roster
+            .confirm_peer("active-v2-peer", Some("222222"))
+            .unwrap();
+
+        let router = InboundRouter::new();
+        let mut active = HashMap::new();
+        let bound = sync_v2_relay_listeners(
+            &router,
+            &v2_relay_url,
+            Some("localhost"),
+            &RelayClientAuth::None,
+            &roster,
+            &mut active,
+        )
+        .await
+        .expect("sync v2 relay listeners");
+
+        assert_eq!(bound.len(), 1, "only Active peer must bind a v2 mailbox");
+        assert!(active.contains_key("active-v2-peer"));
+        assert!(!active.contains_key("pending-v2-peer"));
+
+        for (_, (_, stop_tx)) in active.drain() {
+            let _ = stop_tx.send(true);
+        }
+        relay_handle.stop().await.expect("stop relay");
     }
 }

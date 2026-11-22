@@ -218,24 +218,33 @@ impl PeerTransportConfig {
         })
     }
 
-    fn build_p2p_dialer_options(&self, relay_host: Option<&str>) -> Result<P2pOptions, String> {
-        let mode = if let Some(ref m) = self.p2p_relay_mode {
-            m.clone()
+    fn build_p2p_dialer_options(
+        &self,
+        endpoint: &str,
+        relay_host: Option<&str>,
+    ) -> Result<P2pOptions, String> {
+        let explicit_mode = if let Some(ref m) = self.p2p_relay_mode {
+            Some(m.clone())
         } else if let Some(spec) = relay_host.map(str::trim).filter(|s| !s.is_empty()) {
-            parse_p2p_relay_mode(Some(spec)).map_err(|e| e.to_string())?
+            Some(parse_p2p_relay_mode(Some(spec)).map_err(|e| e.to_string())?)
         } else if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") {
-            P2pRelayMode::Disabled
+            Some(P2pRelayMode::Disabled)
         } else {
-            P2pRelayMode::Default
+            None
         };
-        let mut opts = P2pOptions::for_dialer(mode)
+        let allow_private = self
+            .p2p_allow_private_addrs
+            .unwrap_or(matches!(explicit_mode, Some(P2pRelayMode::Disabled)));
+        let mut opts = if endpoint.starts_with("iroh://") || endpoint.starts_with("p2p:iroh://") {
+            P2pOptions::for_endpoint(endpoint, explicit_mode, allow_private)
+                .map_err(|e| e.to_string())?
+        } else {
+            let mode = explicit_mode.unwrap_or(P2pRelayMode::Default);
+            P2pOptions::for_dialer(mode).with_allow_private_addrs(allow_private)
+        };
+        opts = opts
             .with_resolve_pkarr(self.p2p_pkarr.unwrap_or(false))
             .with_relay_auth(self.p2p_relay_auth.clone());
-        if let Some(allow_priv) = self.p2p_allow_private_addrs {
-            opts = opts.with_allow_private_addrs(allow_priv);
-        } else if matches!(opts.relay_mode, P2pRelayMode::Disabled) {
-            opts = opts.with_allow_private_addrs(true);
-        }
         Ok(opts)
     }
 }
@@ -586,7 +595,7 @@ async fn dial_endpoint_with_cfg(
 ) -> Result<Box<dyn PathStream>, String> {
     let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
-        let opts = cfg.build_p2p_dialer_options(normalized_host)?;
+        let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host)?;
         let dialer = P2pDialer::bind_with_options(opts)
             .await
             .map_err(|e| e.to_string())?;
@@ -644,7 +653,7 @@ async fn build_dialer_with_cfg(
 ) -> Result<Box<dyn PathDialer>, String> {
     let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     if endpoint.starts_with("iroh://") {
-        let opts = cfg.build_p2p_dialer_options(normalized_host)?;
+        let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host)?;
         return Ok(Box::new(
             P2pDialer::bind_with_options(opts)
                 .await
@@ -1515,6 +1524,11 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                         false,
                     );
                 };
+                if let Err(e) =
+                    tendril_core::session::check_peer_allows_wire_v1(&state.roster, &target)
+                {
+                    return (err_json(e.to_string()), false);
+                }
                 let v2_sec = if is_v2_relay_endpoint(&ep) {
                     match lookup_v2_mailbox_secret_for_target(&state.roster, &target) {
                         Ok(s) => Some(s),
@@ -1915,4 +1929,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     state.shutdown_listeners();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priv01_conformance_peer_dialer_options_derives_uri_relays() {
+        let ep_id: String = tendril_core::crypto::SigningKeypair::generate()
+            .expect("gen signing key")
+            .ed25519_public_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let private_uri = format!("iroh://{ep_id}?relay=https://127.0.0.1:8443");
+
+        let cfg = PeerTransportConfig {
+            p2p_allow_private_addrs: Some(true),
+            ..PeerTransportConfig::default()
+        };
+        let opts = cfg
+            .build_p2p_dialer_options(&private_uri, None)
+            .expect("derive uri relay with allow_private_addrs");
+        assert_eq!(
+            opts.relay_mode,
+            P2pRelayMode::Custom("https://127.0.0.1:8443/".to_owned())
+        );
+        assert!(!opts.resolve_pkarr);
+
+        let default_cfg = PeerTransportConfig::default();
+        assert!(
+            default_cfg
+                .build_p2p_dialer_options(&private_uri, None)
+                .is_err()
+        );
+    }
 }

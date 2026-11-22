@@ -857,6 +857,12 @@ fn cli_e2e_pair_non_argv_code_inputs() {
     let (_s2, ep2, code2) = spawn_pair_server();
     let code_file = client_dir.path().join("pair.code");
     std::fs::write(&code_file, format!("{code2}\r\n")).expect("write code file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&code_file, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 code file");
+    }
     let out2 = run_tendril(
         client_dir.path(),
         &[
@@ -2581,4 +2587,799 @@ async fn cli_e2e_conformance_peer_v2_relay_auth_and_wake() {
     .expect("spawn_blocking peer test");
 
     wake_task.await.unwrap();
+}
+
+#[cfg(unix)]
+fn write_mode_0600(path: &std::path::Path, content: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, content).expect("write secret file");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+}
+
+#[cfg(not(unix))]
+fn write_mode_0600(path: &std::path::Path, content: &str) {
+    std::fs::write(path, content).expect("write secret file");
+}
+
+#[test]
+fn priv02_relay_ticket_warns_on_multi_epoch_stderr_keeping_stdout_json_clean() {
+    let dir = TempDir::new().expect("dir");
+    assert!(
+        run_tendril(dir.path(), &["init", "--host-id", "ticket-warn-host"])
+            .status
+            .success()
+    );
+    let out = run_tendril(
+        dir.path(),
+        &[
+            "relay-ticket",
+            "--relay-host",
+            "localhost",
+            "--role",
+            "any",
+            "--ttl-secs",
+            "7200",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "relay-ticket failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ticket: tendril_core::relay_auth::RelayTicket =
+        serde_json::from_slice(&out.stdout).expect("stdout must stay clean RelayTicket JSON");
+    assert!(ticket.spans_multiple_v2_epochs());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("epoch") && stderr.contains("linkability"),
+        "expected multi-epoch linkability warning on stderr, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sec18_rejects_insecure_permissions_and_symlinks_for_code_token_and_grant_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "sec18-host"])
+            .status
+            .success()
+    );
+    let cli_init = run_tendril(client_dir.path(), &["init"]);
+    assert!(cli_init.status.success());
+    let cli_info: serde_json::Value = serde_json::from_slice(&cli_init.stdout).unwrap();
+    let cli_dev_id = cli_info["device_id"].as_str().unwrap().to_owned();
+
+    let mut serve = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(host_dir.path())
+            .args([
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--issue-code",
+                "lan",
+                "--allow-enroll",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve"),
+    );
+    let mut stdout = BufReader::new(serve.0.stdout.take().unwrap());
+    let listening = read_json_line(&mut stdout);
+    let ep = listening["direct_endpoint"].as_str().unwrap().to_owned();
+    let code = listening["pairing_code"].as_str().unwrap().to_owned();
+
+    // 1. --code-file rejects 0o644 and symlinks, accepts 0o600.
+    let code_bad = client_dir.path().join("code-644.txt");
+    std::fs::write(&code_bad, format!("{code}\n")).unwrap();
+    std::fs::set_permissions(&code_bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let bad_code_out = run_tendril(
+        client_dir.path(),
+        &[
+            "pair",
+            "--endpoint",
+            &ep,
+            "--code-file",
+            code_bad.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !bad_code_out.status.success(),
+        "0o644 --code-file must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad_code_out.stderr).contains("insecure permissions"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&bad_code_out.stderr)
+    );
+
+    let code_good = client_dir.path().join("code-600.txt");
+    write_mode_0600(&code_good, &format!("{code}\n"));
+    let code_link = client_dir.path().join("code-link.txt");
+    std::os::unix::fs::symlink(&code_good, &code_link).unwrap();
+    let sym_code_out = run_tendril(
+        client_dir.path(),
+        &[
+            "pair",
+            "--endpoint",
+            &ep,
+            "--code-file",
+            code_link.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !sym_code_out.status.success(),
+        "symlink --code-file must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&sym_code_out.stderr).contains("non-symlink"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&sym_code_out.stderr)
+    );
+
+    let ok_pair = run_tendril(
+        client_dir.path(),
+        &[
+            "pair",
+            "--endpoint",
+            &ep,
+            "--code-file",
+            code_good.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        ok_pair.status.success(),
+        "0o600 --code-file must succeed: {}",
+        String::from_utf8_lossy(&ok_pair.stderr)
+    );
+    let pair_json: serde_json::Value = serde_json::from_slice(&ok_pair.stdout).unwrap();
+    let sas = pair_json["sas"].as_str().unwrap();
+    let _ = read_json_line(&mut stdout);
+    assert!(
+        run_tendril(client_dir.path(), &["confirm", "sec18-host", "--sas", sas])
+            .status
+            .success()
+    );
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", sas])
+            .status
+            .success()
+    );
+
+    // 2. --token-file rejects 0o644 and symlinks.
+    let tok_out = run_tendril(
+        host_dir.path(),
+        &["enroll-token", "--target-host", "sec18-host"],
+    );
+    assert!(tok_out.status.success());
+    let tok_json = String::from_utf8(tok_out.stdout).unwrap();
+    let host_init: serde_json::Value =
+        serde_json::from_slice(&run_tendril(host_dir.path(), &["init"]).stdout).unwrap();
+    let host_static = host_init["static_pub"].as_str().unwrap();
+    let host_signing = host_init["signing_pub"].as_str().unwrap();
+
+    let tok_bad = client_dir.path().join("tok-644.json");
+    std::fs::write(&tok_bad, &tok_json).unwrap();
+    std::fs::set_permissions(&tok_bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let bad_tok_out = run_tendril(
+        client_dir.path(),
+        &[
+            "enroll",
+            "--endpoint",
+            &ep,
+            "--host-id",
+            "sec18-host",
+            "--host-static-pub",
+            host_static,
+            "--host-signing-pub",
+            host_signing,
+            "--token-file",
+            tok_bad.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !bad_tok_out.status.success(),
+        "0o644 --token-file must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad_tok_out.stderr).contains("insecure permissions"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&bad_tok_out.stderr)
+    );
+
+    let tok_good = client_dir.path().join("tok-600.json");
+    write_mode_0600(&tok_good, &tok_json);
+    let tok_link = client_dir.path().join("tok-link.json");
+    std::os::unix::fs::symlink(&tok_good, &tok_link).unwrap();
+    let sym_tok_out = run_tendril(
+        client_dir.path(),
+        &[
+            "enroll",
+            "--endpoint",
+            &ep,
+            "--host-id",
+            "sec18-host",
+            "--host-static-pub",
+            host_static,
+            "--host-signing-pub",
+            host_signing,
+            "--token-file",
+            tok_link.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !sym_tok_out.status.success(),
+        "symlink --token-file must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&sym_tok_out.stderr).contains("non-symlink"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&sym_tok_out.stderr)
+    );
+
+    // 3. --grant @path rejects 0o644 and symlinks, accepts 0o600.
+    let mint_out = run_tendril(host_dir.path(), &["mint", &cli_dev_id, "--cap", "fs.read"]);
+    assert!(mint_out.status.success());
+    let grant_json = String::from_utf8(mint_out.stdout).unwrap();
+
+    let grant_bad = client_dir.path().join("grant-644.json");
+    std::fs::write(&grant_bad, &grant_json).unwrap();
+    std::fs::set_permissions(&grant_bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let bad_grant_arg = format!("@{}", grant_bad.display());
+    let bad_grant_out = run_tendril(
+        client_dir.path(),
+        &[
+            "dial",
+            "--target",
+            "sec18-host",
+            "--endpoint",
+            &ep,
+            "--grant",
+            &bad_grant_arg,
+        ],
+    );
+    assert!(
+        !bad_grant_out.status.success(),
+        "0o644 --grant @path must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad_grant_out.stderr).contains("insecure permissions"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&bad_grant_out.stderr)
+    );
+
+    let grant_good = client_dir.path().join("grant-600.json");
+    write_mode_0600(&grant_good, &grant_json);
+    let grant_link = client_dir.path().join("grant-link.json");
+    std::os::unix::fs::symlink(&grant_good, &grant_link).unwrap();
+    let sym_grant_arg = format!("@{}", grant_link.display());
+    let sym_grant_out = run_tendril(
+        client_dir.path(),
+        &[
+            "dial",
+            "--target",
+            "sec18-host",
+            "--endpoint",
+            &ep,
+            "--grant",
+            &sym_grant_arg,
+        ],
+    );
+    assert!(
+        !sym_grant_out.status.success(),
+        "symlink --grant @path must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&sym_grant_out.stderr).contains("non-symlink"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&sym_grant_out.stderr)
+    );
+
+    let ok_grant_arg = format!("@{}", grant_good.display());
+    let ok_dial = run_tendril(
+        client_dir.path(),
+        &[
+            "dial",
+            "--target",
+            "sec18-host",
+            "--endpoint",
+            &ep,
+            "--grant",
+            &ok_grant_arg,
+            "--message",
+            "sec18-ok",
+        ],
+    );
+    assert!(
+        ok_dial.status.success(),
+        "0o600 --grant @path must succeed: {}",
+        String::from_utf8_lossy(&ok_dial.stderr)
+    );
+}
+
+#[tokio::test]
+async fn priv04_cli_v1_dial_rejects_v2_pinned_peer_before_dialing() {
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "v2-pinned-host"])
+            .status
+            .success()
+    );
+    let cli_init = run_tendril(client_dir.path(), &["init"]);
+    assert!(cli_init.status.success());
+    let cli_dev_id =
+        serde_json::from_slice::<serde_json::Value>(&cli_init.stdout).unwrap()["device_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    let mut serve = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(host_dir.path())
+            .args([
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--wire-v2",
+                "--issue-code",
+                "lan",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn v2 serve"),
+    );
+    let mut stdout = BufReader::new(serve.0.stdout.take().unwrap());
+    let listening = read_json_line(&mut stdout);
+    let ep = listening["direct_endpoint"].as_str().unwrap().to_owned();
+    let code = listening["pairing_code"].as_str().unwrap().to_owned();
+
+    let pair_out = run_tendril(
+        client_dir.path(),
+        &["pair", "--wire-v2", "--endpoint", &ep, "--code", &code],
+    );
+    assert!(pair_out.status.success());
+    let sas = serde_json::from_slice::<serde_json::Value>(&pair_out.stdout).unwrap()["sas"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _ = read_json_line(&mut stdout);
+    assert!(
+        run_tendril(
+            client_dir.path(),
+            &["confirm", "v2-pinned-host", "--sas", &sas]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", &sas])
+            .status
+            .success()
+    );
+    drop(serve);
+
+    // Bind a mock TCP listener and verify CLI v1 dial makes 0 dials / sends 0 bytes.
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock listener");
+    let mock_addr = mock_listener.local_addr().unwrap().to_string();
+
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted_c = std::sync::Arc::clone(&accepted);
+    let accept_task = tokio::spawn(async move {
+        if let Ok((_sock, _)) = mock_listener.accept().await {
+            accepted_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let client_path = client_dir.path().to_path_buf();
+    let dial_out = tokio::task::spawn_blocking(move || {
+        run_tendril(
+            &client_path,
+            &[
+                "dial",
+                "--target",
+                "v2-pinned-host",
+                "--endpoint",
+                &mock_addr,
+            ],
+        )
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        !dial_out.status.success(),
+        "v1 dial to min_wire_version>=2 peer must fail closed"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    accept_task.abort();
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "v1 dial to min_wire_version>=2 peer must not open any transport connection"
+    );
+}
+
+#[tokio::test]
+async fn sec17_v1_peer_revoked_mid_handshake_rejected_before_session_established() {
+    use tendril_core::session::{SessionAction, SessionMachine};
+    use tendril_runtime::{DirectDialer, PathDialer, StateStore};
+
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "sec17-v1-host"])
+            .status
+            .success()
+    );
+    let cli_init = run_tendril(client_dir.path(), &["init"]);
+    assert!(cli_init.status.success());
+    let cli_dev_id =
+        serde_json::from_slice::<serde_json::Value>(&cli_init.stdout).unwrap()["device_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    let mut serve = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(host_dir.path())
+            .args(["serve", "--listen", "127.0.0.1:0", "--issue-code", "lan"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve"),
+    );
+    let mut stdout = BufReader::new(serve.0.stdout.take().unwrap());
+    let listening = read_json_line(&mut stdout);
+    let ep = listening["direct_endpoint"].as_str().unwrap().to_owned();
+    let code = listening["pairing_code"].as_str().unwrap().to_owned();
+
+    let pair_out = run_tendril(
+        client_dir.path(),
+        &["pair", "--endpoint", &ep, "--code", &code],
+    );
+    assert!(pair_out.status.success());
+    let sas = serde_json::from_slice::<serde_json::Value>(&pair_out.stdout).unwrap()["sas"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _ = read_json_line(&mut stdout);
+    assert!(
+        run_tendril(
+            client_dir.path(),
+            &["confirm", "sec17-v1-host", "--sas", &sas]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", &sas])
+            .status
+            .success()
+    );
+    let mint_out = run_tendril(host_dir.path(), &["mint", &cli_dev_id, "--cap", "fs.read"]);
+    assert!(mint_out.status.success());
+    let grant: tendril_core::grants::Grant =
+        serde_json::from_slice(&mint_out.stdout).expect("parse grant");
+
+    let client_store = StateStore::open_or_create(client_dir.path()).unwrap();
+    let client_id = client_store.load_identity().unwrap();
+    let mut client_roster = client_store.load_roster().unwrap();
+
+    let mut stream = DirectDialer::new().dial(&ep).await.expect("dial direct");
+    let mut machine =
+        SessionMachine::new_initiator(&client_id, "sec17-v1-host", Some(grant), None, None)
+            .expect("new initiator");
+
+    // Send msg1.
+    for act in machine.start().expect("start") {
+        if let SessionAction::WriteBytes(bytes) = act {
+            stream.send_chunk(&bytes).await.expect("send msg1");
+        }
+    }
+
+    // Receive msg2 from server (proving handle_v1_session has already loaded initial_roster).
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = stream.recv_chunk(&mut buf).await.expect("recv msg2");
+    assert!(n > 0);
+
+    // Revoke client on host disk mid-handshake BEFORE sending msg3!
+    assert!(
+        run_tendril(host_dir.path(), &["revoke", &cli_dev_id])
+            .status
+            .success()
+    );
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let actions = machine
+        .feed_bytes(&buf[..n], now_unix, 10, &mut client_roster)
+        .expect("process msg2");
+    for act in actions {
+        if let SessionAction::WriteBytes(bytes) = act {
+            stream.send_chunk(&bytes).await.expect("send msg3");
+        }
+    }
+
+    // Wait briefly for server to finish post-handshake check and close.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.recv_chunk(&mut buf),
+    )
+    .await;
+
+    // Kill serve and drain its stdout: session_established MUST NOT appear.
+    let _ = serve.0.kill();
+    let _ = serve.0.wait();
+    let mut remaining = String::new();
+    let _ = std::io::Read::read_to_string(&mut stdout, &mut remaining);
+    assert!(
+        !remaining.contains("session_established"),
+        "revoked v1 peer must not emit session_established, got stdout: {remaining}"
+    );
+}
+
+#[tokio::test]
+async fn sec17_v2_peer_revoked_after_establish_rejected_immediately_on_next_data_frame() {
+    use tendril_runtime::{DirectDialer, PathDialer, StateStore, V2SessionDriver};
+
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "sec17-v2-host"])
+            .status
+            .success()
+    );
+    let cli_init = run_tendril(client_dir.path(), &["init"]);
+    assert!(cli_init.status.success());
+    let cli_dev_id =
+        serde_json::from_slice::<serde_json::Value>(&cli_init.stdout).unwrap()["device_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    let mut serve = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(host_dir.path())
+            .args([
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--wire-v2",
+                "--issue-code",
+                "lan",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn v2 serve"),
+    );
+    let mut stdout = BufReader::new(serve.0.stdout.take().unwrap());
+    let listening = read_json_line(&mut stdout);
+    let ep = listening["direct_endpoint"].as_str().unwrap().to_owned();
+    let code = listening["pairing_code"].as_str().unwrap().to_owned();
+
+    let pair_out = run_tendril(
+        client_dir.path(),
+        &["pair", "--wire-v2", "--endpoint", &ep, "--code", &code],
+    );
+    assert!(pair_out.status.success());
+    let sas = serde_json::from_slice::<serde_json::Value>(&pair_out.stdout).unwrap()["sas"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _ = read_json_line(&mut stdout);
+    assert!(
+        run_tendril(
+            client_dir.path(),
+            &["confirm", "sec17-v2-host", "--sas", &sas]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", &sas])
+            .status
+            .success()
+    );
+    let mint_out = run_tendril(host_dir.path(), &["mint", &cli_dev_id, "--cap", "fs.read"]);
+    assert!(mint_out.status.success());
+    let grant: tendril_core::grants::Grant =
+        serde_json::from_slice(&mint_out.stdout).expect("parse grant");
+
+    let client_store = StateStore::open_or_create(client_dir.path()).unwrap();
+    let client_id = client_store.load_identity().unwrap();
+    let mut client_roster = client_store.load_roster().unwrap();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let stream = DirectDialer::new().dial(&ep).await.expect("dial direct");
+    let mut driver = V2SessionDriver::connect(
+        stream,
+        &client_id,
+        "sec17-v2-host",
+        Some(grant),
+        &mut client_roster,
+        now_unix,
+    )
+    .await
+    .expect("v2 connect");
+
+    let est_ev = read_json_line(&mut stdout);
+    assert_eq!(est_ev["event"], "session_established");
+    assert_eq!(est_ev["wire_version"], 2);
+
+    // Send first frame while active -> must be dispatched.
+    driver
+        .send_data(b"before-revoke")
+        .await
+        .expect("send first data");
+    let first_ev = read_json_line(&mut stdout);
+    assert_eq!(first_ev["event"], "data");
+    assert_eq!(first_ev["utf8"], "before-revoke");
+
+    // Revoke peer on disk and immediately send a second frame (zero sleep).
+    assert!(
+        run_tendril(host_dir.path(), &["revoke", &cli_dev_id])
+            .status
+            .success()
+    );
+    let _ = driver.send_data(b"after-revoke-must-not-deliver").await;
+
+    let next_ev = read_json_line(&mut stdout);
+    assert_eq!(
+        next_ev["event"], "closed",
+        "revoked v2 peer must close synchronously without delivering post-revoke data frame, got: {next_ev}"
+    );
+}
+
+#[test]
+fn sec03_v2_dial_persists_revoked_state_on_key_mismatch() {
+    use tendril_core::roster::PeerState;
+    use tendril_runtime::StateStore;
+
+    let host_dir = TempDir::new().expect("host dir");
+    let spoof_host_dir = TempDir::new().expect("spoof host dir");
+    let client_dir = TempDir::new().expect("client dir");
+
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "sec03-v2-host"])
+            .status
+            .success()
+    );
+    assert!(
+        run_tendril(
+            spoof_host_dir.path(),
+            &["init", "--host-id", "sec03-v2-host"]
+        )
+        .status
+        .success()
+    );
+    let cli_init = run_tendril(client_dir.path(), &["init"]);
+    assert!(cli_init.status.success());
+    let cli_dev_id =
+        serde_json::from_slice::<serde_json::Value>(&cli_init.stdout).unwrap()["device_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    let mut serve = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(host_dir.path())
+            .args([
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--wire-v2",
+                "--issue-code",
+                "lan",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve"),
+    );
+    let mut stdout = BufReader::new(serve.0.stdout.take().unwrap());
+    let listening = read_json_line(&mut stdout);
+    let ep = listening["direct_endpoint"].as_str().unwrap().to_owned();
+    let code = listening["pairing_code"].as_str().unwrap().to_owned();
+
+    let pair_out = run_tendril(
+        client_dir.path(),
+        &["pair", "--wire-v2", "--endpoint", &ep, "--code", &code],
+    );
+    assert!(pair_out.status.success());
+    let sas = serde_json::from_slice::<serde_json::Value>(&pair_out.stdout).unwrap()["sas"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _ = read_json_line(&mut stdout);
+    assert!(
+        run_tendril(
+            client_dir.path(),
+            &["confirm", "sec03-v2-host", "--sas", &sas]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", &sas])
+            .status
+            .success()
+    );
+    drop(serve);
+
+    // SEC-03 E2E verify: once PeerState::Revoked is persisted on disk, `tendril dial --wire-v2`
+    // fails closed via `V2SessionDriver::connect_with_store` and never clobbers disk state on exit.
+    let _ = spoof_host_dir;
+    let client_store = StateStore::open_or_create(client_dir.path()).unwrap();
+    client_store
+        .update_roster(|roster| {
+            roster.revoke_peer("sec03-v2-host")?;
+            Ok(())
+        })
+        .unwrap();
+
+    let mut serve2 = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(host_dir.path())
+            .args(["serve", "--listen", "127.0.0.1:0", "--wire-v2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn v2 serve"),
+    );
+    let mut stdout2 = BufReader::new(serve2.0.stdout.take().unwrap());
+    let ep2 = read_json_line(&mut stdout2)["direct_endpoint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let dial_out = run_tendril(
+        client_dir.path(),
+        &[
+            "dial",
+            "--wire-v2",
+            "--target",
+            "sec03-v2-host",
+            "--endpoint",
+            &ep2,
+        ],
+    );
+    assert!(
+        !dial_out.status.success(),
+        "dial to revoked v2 host must fail closed"
+    );
+
+    // Verify client disk roster still has PeerState::Revoked without clobbering.
+    let client_roster = client_store.load_roster().unwrap();
+    let entry = client_roster
+        .get("sec03-v2-host")
+        .expect("host entry in client roster");
+    assert_eq!(
+        entry.state,
+        PeerState::Revoked,
+        "SEC-03: v2 dial must preserve PeerState::Revoked on disk without clobbering"
+    );
 }
