@@ -1252,13 +1252,39 @@ async fn handle_v1_session(
             .await;
         match ev_res {
             Ok(Some(SessionEvent::AppData(data))) => {
-                if let Ok(curr_stamp) = store.roster_stamp()
-                    && curr_stamp != last_stamp
-                {
-                    let _guard = store_lock.lock().await;
-                    if let Ok((disk, fresh_stamp)) = store.load_roster_with_stamp() {
-                        roster = disk;
-                        last_stamp = fresh_stamp;
+                match store.roster_stamp() {
+                    Ok(curr_stamp) if curr_stamp != last_stamp => {
+                        let loaded = {
+                            let _guard = store_lock.lock().await;
+                            store.load_roster_with_stamp()
+                        };
+                        match loaded {
+                            Ok((disk, fresh_stamp)) => {
+                                roster = disk;
+                                last_stamp = fresh_stamp;
+                            }
+                            Err(err) => {
+                                tracing::error!(error = %err, "failed to reload roster during v1 session");
+                                let _ = driver.send_close(1000, "roster error").await;
+                                print_json_line(&serde_json::json!({
+                                    "event": "closed",
+                                    "code": 1000,
+                                    "reason": "roster error",
+                                }));
+                                break;
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to check roster stamp during v1 session");
+                        let _ = driver.send_close(1000, "roster error").await;
+                        print_json_line(&serde_json::json!({
+                            "event": "closed",
+                            "code": 1000,
+                            "reason": "roster error",
+                        }));
+                        break;
                     }
                 }
                 if !roster
@@ -1341,6 +1367,33 @@ async fn handle_v1_session(
     }
 }
 
+async fn refresh_v2_roster_if_changed(
+    store: &StateStore,
+    store_lock: &AsyncMutex<()>,
+    roster_arc: &StdMutex<tendril_core::roster::Roster>,
+    last_stamp_arc: &StdMutex<Option<tendril_runtime::RosterStamp>>,
+) -> Result<(), tendril_runtime::RuntimeError> {
+    let prev_stamp = last_stamp_arc.lock().expect("stamp lock").clone();
+    let curr_stamp = match store.roster_stamp() {
+        Ok(stamp) => stamp,
+        Err(err) => return Err(err),
+    };
+    if curr_stamp != prev_stamp {
+        let loaded = {
+            let _g = store_lock.lock().await;
+            store.load_roster_with_stamp()
+        };
+        match loaded {
+            Ok((disk, fresh_stamp)) => {
+                *roster_arc.lock().expect("roster lock") = disk;
+                *last_stamp_arc.lock().expect("stamp lock") = fresh_stamp;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_v2_session(
     stream: Box<dyn PathStream>,
@@ -1412,17 +1465,25 @@ async fn handle_v2_session(
                 biased;
                 _ = stop_rx.changed() => break,
                 _ = interval.tick() => {
-                    let prev_stamp = last_stamp_tick.lock().expect("stamp lock").clone();
-                    if let Ok(curr_stamp) = store_tick.roster_stamp()
-                        && curr_stamp != prev_stamp
+                    match refresh_v2_roster_if_changed(
+                        &store_tick,
+                        &store_lock_tick,
+                        &roster_tick,
+                        &last_stamp_tick,
+                    )
+                    .await
                     {
-                        let loaded = {
-                            let _g = store_lock_tick.lock().await;
-                            store_tick.load_roster_with_stamp()
-                        };
-                        if let Ok((disk, fresh_stamp)) = loaded {
-                            *roster_tick.lock().expect("roster lock") = disk;
-                            *last_stamp_tick.lock().expect("stamp lock") = fresh_stamp;
+                        Ok(()) => {}
+                        Err(err) => {
+                            tracing::error!(error = %err, "failed to refresh roster during v2 tick");
+                            let _ = session_tick.send_close(1000, "roster error").await;
+                            print_json_line(&serde_json::json!({
+                                "event": "closed",
+                                "code": 1000,
+                                "reason": "roster error",
+                            }));
+                            session_tick.shutdown();
+                            break;
                         }
                     }
                     if let Err(err) = session_tick.tick_locked(now_unix(), &roster_tick).await {
@@ -1442,17 +1503,24 @@ async fn handle_v2_session(
     loop {
         match session.next_event_locked_now(&roster_arc).await {
             Ok(Some(SessionEvent::AppData(data))) => {
-                let prev_stamp = last_stamp_arc.lock().expect("stamp lock").clone();
-                if let Ok(curr_stamp) = store.roster_stamp()
-                    && curr_stamp != prev_stamp
+                match refresh_v2_roster_if_changed(
+                    &store,
+                    &store_lock,
+                    &roster_arc,
+                    &last_stamp_arc,
+                )
+                .await
                 {
-                    let loaded = {
-                        let _g = store_lock.lock().await;
-                        store.load_roster_with_stamp()
-                    };
-                    if let Ok((disk, fresh_stamp)) = loaded {
-                        *roster_arc.lock().expect("roster lock") = disk;
-                        *last_stamp_arc.lock().expect("stamp lock") = fresh_stamp;
+                    Ok(()) => {}
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to refresh roster during v2 app data");
+                        let _ = session.send_close(1000, "roster error").await;
+                        print_json_line(&serde_json::json!({
+                            "event": "closed",
+                            "code": 1000,
+                            "reason": "roster error",
+                        }));
+                        break;
                     }
                 }
                 let still_active = roster_arc
@@ -1481,11 +1549,24 @@ async fn handle_v2_session(
                 }));
             }
             Ok(Some(SessionEvent::RevocationUpdated { issuer, seq })) => {
-                {
+                let loaded = {
                     let _g = store_lock.lock().await;
-                    if let Ok((disk, fresh_stamp)) = store.load_roster_with_stamp() {
+                    store.load_roster_with_stamp()
+                };
+                match loaded {
+                    Ok((disk, fresh_stamp)) => {
                         *roster_arc.lock().expect("roster lock") = disk;
                         *last_stamp_arc.lock().expect("stamp lock") = fresh_stamp;
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to reload roster after v2 revocation update");
+                        let _ = session.send_close(1000, "roster error").await;
+                        print_json_line(&serde_json::json!({
+                            "event": "closed",
+                            "code": 1000,
+                            "reason": "roster error",
+                        }));
+                        break;
                     }
                 }
                 print_json_line(&serde_json::json!({
