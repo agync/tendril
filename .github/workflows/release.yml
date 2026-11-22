@@ -534,9 +534,10 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.ref }}
           persist-credentials: false
-      - uses: ./.github/actions/rust-toolchain
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          targets: aarch64-linux-android
+          name: signed-release-assets
+          path: release-assets
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
@@ -547,20 +548,16 @@ jobs:
           cache-disabled: true
       - name: Publish dev.agync:tendril-android
         env:
-          NDK_VER: "27.1.12297006"
           VERSION: ${{ needs.plan.outputs.version }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          sdkroot="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          if [ ! -d "$sdkroot/ndk/$NDK_VER" ] || [ ! -d "$sdkroot/cmake/3.22.1" ]; then
-            "$sdkroot/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VER" "cmake;3.22.1" >/dev/null
-          fi
-          export ANDROID_NDK_HOME="$sdkroot/ndk/$NDK_VER"
-          make bindings/android
+          grep "  tendril-android-${VERSION}.aar$" release-assets/SHA256SUMS | (cd release-assets && sha256sum --check --status -)
           gradle -p bindings/kotlin --no-daemon -Dorg.gradle.jvmargs="-Xmx3g" \
-            -PtendrilVersion="$VERSION" publishReleasePublicationToGitHubPackagesRepository
+            -PtendrilVersion="$VERSION" \
+            -PprebuiltAar="$(pwd)/release-assets/tendril-android-${VERSION}.aar" \
+            publishPrebuiltReleasePublicationToGitHubPackagesRepository
 
   publish-pypi:
     name: publish Python to PyPI (OIDC)

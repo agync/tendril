@@ -40,26 +40,42 @@ android {
 }
 
 afterEvaluate {
+  val prebuiltAar = (findProperty("prebuiltAar") as String?)?.takeIf { it.isNotBlank() }
+  val resolvedVersion = (findProperty("tendrilVersion") as String?) ?: "0.1.0" // x-release-please-version
+
+  fun MavenPublication.configureTendrilPublication() {
+    groupId = "dev.agync"
+    artifactId = "tendril-android"
+    version = resolvedVersion
+    pom {
+      name.set("Tendril Android SDK")
+      description.set("Android Kotlin JNI bindings for Tendril private device-to-device links.")
+      url.set("https://tendril.agync.dev")
+      licenses {
+        license {
+          name.set("Apache-2.0")
+          url.set("https://www.apache.org/licenses/LICENSE-2.0")
+        }
+      }
+      scm {
+        url.set("https://github.com/agync/tendril")
+      }
+    }
+  }
+
   publishing {
     publications {
-      register<MavenPublication>("release") {
-        groupId = "dev.agync"
-        artifactId = "tendril-android"
-        version = (findProperty("tendrilVersion") as String?) ?: "0.1.0" // x-release-please-version
-        from(components["release"])
-        pom {
-          name.set("Tendril Android SDK")
-          description.set("Android Kotlin JNI bindings for Tendril private device-to-device links.")
-          url.set("https://tendril.agync.dev")
-          licenses {
-            license {
-              name.set("Apache-2.0")
-              url.set("https://www.apache.org/licenses/LICENSE-2.0")
-            }
+      if (prebuiltAar != null) {
+        register<MavenPublication>("prebuiltRelease") {
+          configureTendrilPublication()
+          artifact(file(prebuiltAar)) {
+            extension = "aar"
           }
-          scm {
-            url.set("https://github.com/agync/tendril")
-          }
+        }
+      } else {
+        register<MavenPublication>("release") {
+          configureTendrilPublication()
+          from(components["release"])
         }
       }
     }
