@@ -470,7 +470,23 @@ async fn drive_v2_pake_pair_responder_inner(
             pending_claim_bytes.extend_from_slice(&trailing);
             let msg1_bytes = std::mem::take(&mut pre_claim_buf);
 
-            // Bound concurrent 19 MiB Argon2id derivations strictly around msg1 verification.
+            let mut m = machine
+                .take()
+                .ok_or_else(|| RuntimeError::Protocol("v2 PAKE responder state missing".into()))?;
+            let work = m
+                .parse_pake_msg1_header(&msg1_bytes)?
+                .ok_or_else(|| RuntimeError::Protocol("v2 PAKE msg1 frame incomplete".into()))?;
+            let (msg1_cache_ok, allowed_codes) = {
+                let mut mgr = manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    mgr.is_pake_msg1_allowed(work.salt(), work.candidate_mac(), now_unix),
+                    mgr.allowed_live_codes(work.path(), now_unix),
+                )
+            };
+
+            // Bound concurrent 19 MiB Argon2id derivations with no PairingManager lock held.
             let acquire_wait = state.config.argon2_acquire_timeout;
             let permit = if acquire_wait.is_zero() {
                 match Arc::clone(&state.argon2_semaphore).try_acquire_owned() {
@@ -500,25 +516,25 @@ async fn drive_v2_pake_pair_responder_inner(
                 }
             };
 
-            let mut m = machine
-                .take()
-                .ok_or_else(|| RuntimeError::Protocol("v2 PAKE responder state missing".into()))?;
-            let mgr_c = Arc::clone(manager);
-            let blocking_res = tokio::task::spawn_blocking(move || {
+            let (work, matched) = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let mut mgr = mgr_c
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut empty_roster = Roster::new();
-                let actions = m.feed_bytes(&msg1_bytes, now_unix, &mut mgr, &mut empty_roster)?;
-                Ok::<_, CoreError>((m, actions))
+                let matched =
+                    V2PakePairResponder::evaluate_pake_msg1(&work, &allowed_codes, msg1_cache_ok)?;
+                Ok::<_, CoreError>((work, matched))
             })
             .await
             .map_err(|err| {
                 RuntimeError::Protocol(format!("argon2id responder task failed: {err}"))
-            })?;
-            let (returned_m, actions) = blocking_res?;
-            machine = Some(returned_m);
+            })??;
+            let recorded = {
+                let mut mgr = manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                matched.is_some()
+                    && mgr.commit_pake_msg1(*work.salt(), *work.candidate_mac(), now_unix)
+            };
+            let actions = m.finish_pake_msg1(work, matched, recorded)?;
+            machine = Some(m);
             awaiting_msg3 = true;
             actions
         } else {
@@ -1162,6 +1178,44 @@ pub struct V2SessionDriver {
     _half_open: Option<HalfOpenGuard>,
 }
 
+/// Persists a peer revocation observed while a v2 connect failed, before the error surfaces.
+///
+/// Only a rotation fork or a fresh transition into [`PeerState::Revoked`] is written, so
+/// repeated rejected reconnects to an already revoked peer never rewrite the roster.
+async fn persist_failed_connect_revocation(
+    store: &StateStore,
+    store_lock: &AsyncMutex<()>,
+    target_host_id: &str,
+    err: &RuntimeError,
+    was_revoked: bool,
+    working_roster: &Roster,
+) {
+    let fork = matches!(
+        err,
+        RuntimeError::Core(CoreError::RotationForkDetected { .. })
+    );
+    let fresh = !was_revoked
+        && working_roster
+            .get(target_host_id)
+            .is_some_and(|entry| entry.state == PeerState::Revoked);
+    if !fork && !fresh {
+        return;
+    }
+    let target_owned = target_host_id.to_owned();
+    let store_c = store.clone();
+    let _guard = store_lock.lock().await;
+    let persisted = tokio::task::spawn_blocking(move || {
+        store_c.update_roster(|rst| match rst.revoke_peer(&target_owned) {
+            Ok(()) | Err(CoreError::PeerNotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        })
+    })
+    .await;
+    if !matches!(persisted, Ok(Ok(()))) {
+        tracing::warn!("failed to persist v2 peer revocation after connect error");
+    }
+}
+
 enum V2RosterRef<'a> {
     Direct(&'a mut Roster),
     Locked(&'a Mutex<Roster>),
@@ -1273,7 +1327,10 @@ impl V2SessionDriver {
                 .await
                 .map_err(|err| RuntimeError::Storage(format!("v2 load roster failed: {err}")))??
         };
-        let mut driver = Self::connect(
+        let was_revoked = working_roster
+            .get(target_host_id)
+            .is_some_and(|entry| entry.state == PeerState::Revoked);
+        let mut driver = match Self::connect(
             stream,
             local_identity,
             target_host_id,
@@ -1281,7 +1338,22 @@ impl V2SessionDriver {
             &mut working_roster,
             now_unix,
         )
-        .await?;
+        .await
+        {
+            Ok(driver) => driver,
+            Err(err) => {
+                persist_failed_connect_revocation(
+                    store,
+                    store_lock,
+                    target_host_id,
+                    &err,
+                    was_revoked,
+                    &working_roster,
+                )
+                .await;
+                return Err(err);
+            }
+        };
         let applied_rotation = driver.applied_rotation().to_vec();
         let peer_static = *driver.peer_static_pub();
         let has_exported = driver.exported_v2_secrets().is_some();
@@ -1290,7 +1362,7 @@ impl V2SessionDriver {
         {
             let _guard = store_lock.lock().await;
             tokio::task::spawn_blocking(move || {
-                store_c.update_roster(|rst| {
+                store_c.update_roster_persisting_revocations(|rst| {
                     if !applied_rotation.is_empty() {
                         let presented_signing = working_roster
                             .get(&target_owned)
@@ -1736,7 +1808,7 @@ impl V2SessionDriver {
                 let mut m_owned = machine;
                 let (m_back, actions) = tokio::task::spawn_blocking(move || {
                     store_c
-                        .update_roster(|rst| {
+                        .update_roster_persisting_revocations(|rst| {
                             let mut cache = cache_arc
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2730,4 +2802,65 @@ pub async fn wake_and_connect_v2_session(
     )
     .await?;
     Ok((driver, outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use tendril_core::crypto::{SigningKeypair, StaticKeypair};
+
+    use super::*;
+
+    fn seed_store() -> (tempfile::TempDir, StateStore, Roster) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = StateStore::open_or_create(dir.path()).expect("store");
+        store
+            .update_roster(|rst| {
+                rst.insert_pinned_host(
+                    "host".to_owned(),
+                    "Host".to_owned(),
+                    *StaticKeypair::from_scalar([0x31; 32]).public_bytes(),
+                    Some(SigningKeypair::from_seed([0x32; 32]).public_key().clone()),
+                    0,
+                    vec![],
+                )?;
+                Ok(())
+            })
+            .expect("seed");
+        let loaded = store.load_roster().expect("load");
+        (dir, store, loaded)
+    }
+
+    #[tokio::test]
+    async fn connect_fork_error_persists_revocation_before_returning() {
+        let (_dir, store, mut working) = seed_store();
+        working.revoke_peer("host").expect("revoke");
+        let lock = AsyncMutex::new(());
+        let fork = RuntimeError::Core(CoreError::RotationForkDetected { seq: 1 });
+        persist_failed_connect_revocation(&store, &lock, "host", &fork, false, &working).await;
+        assert_eq!(
+            store.load_roster().unwrap().get("host").unwrap().state,
+            PeerState::Revoked
+        );
+    }
+
+    #[tokio::test]
+    async fn already_revoked_peer_does_not_rewrite_the_roster() {
+        let (_dir, store, mut working) = seed_store();
+        working.revoke_peer("host").expect("revoke");
+        let lock = AsyncMutex::new(());
+        let err = RuntimeError::Core(CoreError::PeerRevoked("host".to_owned()));
+        persist_failed_connect_revocation(&store, &lock, "host", &err, true, &working).await;
+        assert_eq!(
+            store.load_roster().unwrap().get("host").unwrap().state,
+            PeerState::Active,
+            "a rejected reconnect to a known-revoked peer must not touch the on-disk roster"
+        );
+        let io = RuntimeError::Closed;
+        let active = store.load_roster().unwrap();
+        persist_failed_connect_revocation(&store, &lock, "host", &io, false, &active).await;
+        assert_eq!(
+            store.load_roster().unwrap().get("host").unwrap().state,
+            PeerState::Active
+        );
+    }
 }

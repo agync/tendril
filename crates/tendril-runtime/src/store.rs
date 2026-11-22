@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use tendril_core::crypto::{SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode};
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
-use tendril_core::roster::Roster;
+use tendril_core::roster::{PeerState, Roster};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::RuntimeError;
@@ -234,6 +234,44 @@ impl StateStore {
     {
         let (out, _, _) = self.update_roster_with_state(f)?;
         Ok(out)
+    }
+
+    /// Like [`Self::update_roster`], but when `f` fails, any peer that `f` transitioned to
+    /// [`PeerState::Revoked`] is still persisted (and nothing else) before the error is returned,
+    /// so a detected fork or revocation cannot be lost to the transactional rollback.
+    pub fn update_roster_persisting_revocations<T, F>(&self, f: F) -> Result<T, RuntimeError>
+    where
+        F: FnOnce(&mut Roster) -> Result<T, RuntimeError>,
+    {
+        let _lock = self.lock_roster_file(true)?;
+        let original = self.load_roster_unlocked()?;
+        let mut working = original.clone();
+        match f(&mut working) {
+            Ok(out) => {
+                self.save_roster_unlocked(&working)?;
+                Ok(out)
+            }
+            Err(err) => {
+                let newly_revoked: Vec<String> = working
+                    .entries()
+                    .filter(|(id, entry)| {
+                        entry.state == PeerState::Revoked
+                            && original
+                                .get(id)
+                                .is_some_and(|prev| prev.state != PeerState::Revoked)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if !newly_revoked.is_empty() {
+                    let mut persisted = original;
+                    for id in &newly_revoked {
+                        let _ = persisted.revoke_peer(id);
+                    }
+                    self.save_roster_unlocked(&persisted)?;
+                }
+                Err(err)
+            }
+        }
     }
 
     fn lock_roster_file(&self, exclusive: bool) -> Result<File, RuntimeError> {
