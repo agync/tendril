@@ -12,7 +12,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::crypto::{b64url_decode_array, b64url_encode, is_valid_ed25519_public_key};
 use crate::error::CoreError;
 use crate::grants::canonical_json;
-use crate::v2::canonical_relay_host;
+use crate::v2::{RELAY_V2_EPOCH_SECS, canonical_relay_host, epoch_for_unix};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -68,6 +68,25 @@ pub struct RelayTicket {
     pub not_before: u64,
     pub not_after: u64,
     pub sig: String,
+}
+
+impl RelayTicket {
+    /// Returns the ticket lifetime in seconds (`not_after - not_before`).
+    #[must_use]
+    pub const fn ttl_secs(&self) -> u64 {
+        self.not_after.saturating_sub(self.not_before)
+    }
+
+    /// Returns `true` when the validity window reaches into a later `/v2/relay` hourly epoch than
+    /// it starts in.
+    ///
+    /// A wildcard (`target_pub = "*"`) ticket is replayable against every mailbox for its whole
+    /// TTL, so a relay can link all epochs it spans; a ticket for which this returns `false` and
+    /// whose `target_pub` is a concrete epoch `mailbox_id` is confined to a single epoch.
+    #[must_use]
+    pub const fn spans_multiple_v2_epochs(&self) -> bool {
+        self.not_after / RELAY_V2_EPOCH_SECS > self.not_before / RELAY_V2_EPOCH_SECS
+    }
 }
 
 #[derive(Serialize)]
@@ -313,6 +332,39 @@ pub fn mint_relay_ticket(
         not_after,
         sig: b64url_encode(&sig),
     })
+}
+
+/// Mints a [`RelayTicket`] bound to one concrete epoch `mailbox_id` that never leaves the epoch of
+/// `now_unix`.
+///
+/// `ttl_secs` is clamped to the time left before the epoch boundary so the result never satisfies
+/// [`RelayTicket::spans_multiple_v2_epochs`]. Returns an error when fewer than two seconds remain
+/// in the epoch, in which case the caller should mint against the next epoch's `mailbox_id`.
+pub fn mint_v2_epoch_relay_ticket(
+    signing_key: &SigningKey,
+    relay_host: &str,
+    role: RelayAuthRole,
+    mailbox_id: &[u8; 32],
+    now_unix: u64,
+    ttl_secs: u64,
+) -> Result<RelayTicket, CoreError> {
+    let epoch_end = epoch_for_unix(now_unix)
+        .saturating_add(1)
+        .saturating_mul(RELAY_V2_EPOCH_SECS);
+    let remaining = epoch_end.saturating_sub(1).saturating_sub(now_unix);
+    if remaining == 0 {
+        return Err(CoreError::GrantDenied(
+            "relay ticket epoch exhausted; mint for the next epoch".to_string(),
+        ));
+    }
+    mint_relay_ticket(
+        signing_key,
+        relay_host,
+        role,
+        &b64url_encode(mailbox_id),
+        now_unix,
+        ttl_secs.min(remaining),
+    )
 }
 
 /// Verifies a [`RelayTicket`] strictly against `trusted_issuers`, host, role, target, and clock.
@@ -832,5 +884,62 @@ mod tests {
         let mut h_val = serde_json::to_value(&hmac_proof).unwrap();
         h_val["extra"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RelayAuthProof>(h_val).is_err());
+    }
+
+    #[test]
+    fn priv02_epoch_ticket_stays_in_one_epoch_while_wildcard_spans() {
+        let issuer = test_issuer();
+        let mailbox = test_target_key();
+        let epoch_start = 1000 * RELAY_V2_EPOCH_SECS;
+        let now = epoch_start + 100;
+
+        let bound = mint_v2_epoch_relay_ticket(
+            &issuer,
+            "relay.example.com",
+            RelayAuthRole::Register,
+            &mailbox,
+            now,
+            MAX_RELAY_TICKET_TTL_SECS,
+        )
+        .unwrap();
+        assert!(!bound.spans_multiple_v2_epochs());
+        assert_eq!(bound.ttl_secs(), RELAY_V2_EPOCH_SECS - 101);
+        assert_eq!(bound.target_pub, b64url_encode(&mailbox));
+
+        let short = mint_v2_epoch_relay_ticket(
+            &issuer,
+            "relay.example.com",
+            RelayAuthRole::Dial,
+            &mailbox,
+            now,
+            60,
+        )
+        .unwrap();
+        assert_eq!(short.ttl_secs(), 60);
+
+        let wildcard = mint_relay_ticket(
+            &issuer,
+            "relay.example.com",
+            RelayAuthRole::Register,
+            "*",
+            now,
+            2 * RELAY_V2_EPOCH_SECS,
+        )
+        .unwrap();
+        assert!(wildcard.spans_multiple_v2_epochs());
+        assert_eq!(wildcard.ttl_secs(), 2 * RELAY_V2_EPOCH_SECS);
+
+        let last_second = epoch_start + RELAY_V2_EPOCH_SECS - 1;
+        assert!(
+            mint_v2_epoch_relay_ticket(
+                &issuer,
+                "relay.example.com",
+                RelayAuthRole::Register,
+                &mailbox,
+                last_second,
+                60,
+            )
+            .is_err()
+        );
     }
 }

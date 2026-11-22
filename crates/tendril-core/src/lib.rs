@@ -3,6 +3,8 @@
 //! This crate owns device identity, pairing verification, the sealed Noise
 //! session, capability grants, and path selection policy without direct OS I/O.
 
+use poly1305 as _;
+
 pub mod crypto;
 pub mod error;
 pub mod grants;
@@ -21,14 +23,15 @@ pub use grants::{
 };
 pub use pairing::{
     DEFAULT_ENROLLMENT_TTL_SECS, ENROLL_PROOF_DOMAIN, EnrollmentPolicy, MAX_ENROLLMENT_TTL_SECS,
+    MAX_LIVE_PAIRING_CODES,
 };
 pub use relay_auth::{
     MAX_RELAY_AUTH_SECRET_BYTES, MAX_RELAY_TICKET_TTL_SECS, RELAY_AUTH_HMAC_DOMAIN,
     RELAY_TICKET_CLOCK_SKEW_SECS, RELAY_TICKET_DOMAIN, RelayAuthProof, RelayAuthRole,
     RelayAuthScope, RelayAuthSecret, RelayTicket, compute_relay_auth_hmac,
-    compute_relay_auth_hmac_b64, mint_relay_ticket, relay_auth_hmac_input,
-    relay_ticket_signed_bytes, validate_relay_auth_op, validate_relay_auth_secret,
-    verify_relay_auth_hmac, verify_relay_ticket,
+    compute_relay_auth_hmac_b64, mint_relay_ticket, mint_v2_epoch_relay_ticket,
+    relay_auth_hmac_input, relay_ticket_signed_bytes, validate_relay_auth_op,
+    validate_relay_auth_secret, verify_relay_auth_hmac, verify_relay_ticket,
 };
 pub use roster::{AnchorState, MAX_BURNED_ENROLLMENT_NONCES, TrustAnchor, V2PeerSecrets};
 pub use wire::{

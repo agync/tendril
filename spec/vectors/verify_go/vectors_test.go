@@ -1674,6 +1674,7 @@ func TestWireV2AndRelayAuth(t *testing.T) {
 			Msg3FrameHex               string `json:"msg3_frame_hex"`
 			FinalHandshakeHashHex      string `json:"final_handshake_hash_hex"`
 			PairResponseJSON           string `json:"pair_response_json"`
+			PairResponsePayloadHex     string `json:"pair_response_payload_hex"`
 			PairResponseFrameHex       string `json:"pair_response_frame_hex"`
 			ExportedReconnectSecretHex string `json:"exported_reconnect_secret_hex"`
 			ExportedMailboxSecretHex   string `json:"exported_mailbox_secret_hex"`
@@ -2164,7 +2165,12 @@ func TestWireV2AndRelayAuth(t *testing.T) {
 	if hex.EncodeToString(initConfirmMac) != pk.InitConfirmMacHex {
 		t.Fatalf("PAKE init_confirm_mac mismatch")
 	}
-	pMsg3Payload := append(append([]byte(nil), initConfirmMac...), []byte(pk.PairClaimJSON)...)
+	pMsg3Payload := padBucketed(
+		[]int{4096, 16384, 32768, 63488},
+		append(append([]byte(nil), initConfirmMac...), 0, 0),
+		[]byte(pk.PairClaimJSON),
+	)
+	binary.BigEndian.PutUint16(pMsg3Payload[32:34], uint16(len(pk.PairClaimJSON)))
 	if hex.EncodeToString(pMsg3Payload) != pk.Msg3PayloadHex {
 		t.Fatalf("PAKE msg3 payload mismatch")
 	}
@@ -2194,7 +2200,16 @@ func TestWireV2AndRelayAuth(t *testing.T) {
 		t.Fatalf("PAKE exported mailbox_secret mismatch")
 	}
 
-	pRespCT, err := pRespCS2.encryptWithAD(nil, []byte(pk.PairResponseJSON))
+	pRespPayload := padBucketed(
+		[]int{512, 1024, 2048, 4096, 8192, 16384, 32768, 63488},
+		[]byte{0, 0},
+		[]byte(pk.PairResponseJSON),
+	)
+	binary.BigEndian.PutUint16(pRespPayload[:2], uint16(len(pk.PairResponseJSON)))
+	if hex.EncodeToString(pRespPayload) != pk.PairResponsePayloadHex {
+		t.Fatalf("PAKE pair_response padded payload mismatch")
+	}
+	pRespCT, err := pRespCS2.encryptWithAD(nil, pRespPayload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2202,7 +2217,22 @@ func TestWireV2AndRelayAuth(t *testing.T) {
 		t.Fatalf("PAKE pair_response frame mismatch")
 	}
 	pDec4, err := pInitCS2.decryptWithAD(nil, decodeFrame(t, mustHex(t, pk.PairResponseFrameHex)))
-	if err != nil || string(pDec4) != pk.PairResponseJSON {
+	if err != nil || !bytes.Equal(pDec4, pRespPayload) {
 		t.Fatalf("PAKE pair_response decrypt mismatch: %v", err)
 	}
+}
+
+// padBucketed returns prefix || body zero-padded to the smallest bucket that fits. The caller
+// overwrites the length field inside prefix after the call.
+func padBucketed(buckets []int, prefix, body []byte) []byte {
+	needed := len(prefix) + len(body)
+	for _, b := range buckets {
+		if b >= needed {
+			out := make([]byte, b)
+			copy(out, prefix)
+			copy(out[len(prefix):], body)
+			return out
+		}
+	}
+	panic("payload exceeds largest bucket")
 }

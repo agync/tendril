@@ -8,7 +8,7 @@
 //! - Bucketed inner frame padding (`0x09 PADDED`) and cover traffic (`0x08 PADDING`)
 //! - CSPRNG-jittered keepalive and rekey scheduling (`ScheduleJitterPolicy`, `SealedSession`)
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 
@@ -342,7 +342,6 @@ pub fn verify_v2_relay_challenge_host(
 #[derive(Debug, Default)]
 pub struct RelayDialReplayCache {
     seen: BTreeSet<(u64, [u8; 32], [u8; 16])>,
-    order: VecDeque<(u64, [u8; 32], [u8; 16])>,
 }
 
 impl RelayDialReplayCache {
@@ -355,13 +354,13 @@ impl RelayDialReplayCache {
     /// Returns current number of tracked `(epoch, dial_nonce, conn_id)` entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.order.len()
+        self.seen.len()
     }
 
     /// Returns `true` if no entries are cached.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.order.is_empty()
+        self.seen.is_empty()
     }
 
     /// Checks and records `(epoch, dial_nonce, conn_id)`, pruning entries older than `min_valid_epoch`.
@@ -374,10 +373,9 @@ impl RelayDialReplayCache {
         conn_id: &[u8; 16],
         min_valid_epoch: u64,
     ) -> bool {
-        while let Some(&front) = self.order.front() {
-            if front.0 < min_valid_epoch {
-                self.order.pop_front();
-                self.seen.remove(&front);
+        while let Some(first) = self.seen.first() {
+            if first.0 < min_valid_epoch {
+                self.seen.pop_first();
             } else {
                 break;
             }
@@ -386,11 +384,10 @@ impl RelayDialReplayCache {
         if self.seen.contains(&key) {
             return false;
         }
-        if self.order.len() >= MAX_RELAY_DIAL_REPLAY_ENTRIES {
+        if self.seen.len() >= MAX_RELAY_DIAL_REPLAY_ENTRIES {
             return false;
         }
         self.seen.insert(key);
-        self.order.push_back(key);
         true
     }
 }
@@ -1567,7 +1564,7 @@ pub fn verify_rendezvous_mac(
 #[derive(Debug, Default)]
 pub struct RendezvousReplayCache {
     seen: BTreeSet<[u8; 16]>,
-    order: VecDeque<(u64, [u8; 16])>,
+    by_expiry: BTreeSet<(u64, [u8; 16])>,
 }
 
 impl RendezvousReplayCache {
@@ -1579,9 +1576,9 @@ impl RendezvousReplayCache {
 
     fn prune(&mut self, now_unix: u64) {
         let cutoff = now_unix.saturating_sub(V2_RENDEZVOUS_MAX_SKEW_SECS);
-        while let Some(&(ts, nonce)) = self.order.front() {
+        while let Some(&(ts, nonce)) = self.by_expiry.first() {
             if ts < cutoff {
-                self.order.pop_front();
+                self.by_expiry.pop_first();
                 self.seen.remove(&nonce);
             } else {
                 break;
@@ -1592,13 +1589,13 @@ impl RendezvousReplayCache {
     /// Returns current number of cached nonces (including unexpired entries).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.order.len()
+        self.by_expiry.len()
     }
 
     /// Returns `true` if no nonces are cached.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.order.is_empty()
+        self.by_expiry.is_empty()
     }
 
     /// Checks whether `nonce` has already been seen in the active window.
@@ -1610,7 +1607,7 @@ impl RendezvousReplayCache {
     /// Returns `true` only if `nonce` is unseen and the active window has spare capacity.
     pub fn can_accept(&mut self, nonce: &[u8; 16], now_unix: u64) -> bool {
         self.prune(now_unix);
-        !self.seen.contains(nonce) && self.order.len() < MAX_RENDEZVOUS_REPLAY_ENTRIES
+        !self.seen.contains(nonce) && self.by_expiry.len() < MAX_RENDEZVOUS_REPLAY_ENTRIES
     }
 
     /// Records an authenticated `nonce` at `ts_unix`, failing closed (`false`) if replayed or full.
@@ -1619,11 +1616,11 @@ impl RendezvousReplayCache {
         if self.seen.contains(&nonce) {
             return false;
         }
-        if self.order.len() >= MAX_RENDEZVOUS_REPLAY_ENTRIES {
+        if self.by_expiry.len() >= MAX_RENDEZVOUS_REPLAY_ENTRIES {
             return false;
         }
         self.seen.insert(nonce);
-        self.order.push_back((ts_unix, nonce));
+        self.by_expiry.insert((ts_unix, nonce));
         true
     }
 }
@@ -1746,6 +1743,44 @@ pub fn unpad_msg3_payload(padded: &[u8]) -> Result<&[u8], CoreError> {
         ));
     }
     Ok(&padded[2..2 + json_len])
+}
+
+/// Pads a v2 PAKE `msg3` plaintext as `init_mac (32 B) || uint16_be(len) || claim_json || 0x00...`
+/// rounded up to the smallest `V2_HANDSHAKE_BUCKETS` size, hiding `PairClaim` length.
+pub fn pad_pake_msg3_payload(init_mac: &[u8; 32], claim_json: &[u8]) -> Result<Vec<u8>, CoreError> {
+    let needed = 32 + 2 + claim_json.len();
+    let bucket = select_handshake_bucket(needed)?;
+    let claim_len = u16::try_from(claim_json.len()).map_err(|_| CoreError::FrameTooLarge {
+        len: needed,
+        max: *V2_HANDSHAKE_BUCKETS.last().unwrap_or(&63_488),
+    })?;
+    let mut out = vec![0u8; bucket];
+    out[..32].copy_from_slice(init_mac);
+    out[32..34].copy_from_slice(&claim_len.to_be_bytes());
+    out[34..34 + claim_json.len()].copy_from_slice(claim_json);
+    Ok(out)
+}
+
+/// Unpads a v2 PAKE `msg3` plaintext, returning `(init_mac, claim_json)` after enforcing a
+/// bucket-sized payload and constant-time zero padding.
+pub fn unpad_pake_msg3_payload(padded: &[u8]) -> Result<([u8; 32], &[u8]), CoreError> {
+    if padded.len() < 34 || !V2_HANDSHAKE_BUCKETS.contains(&padded.len()) {
+        return Err(CoreError::PairingAuthFailed);
+    }
+    let claim_len = usize::from(u16::from_be_bytes([padded[32], padded[33]]));
+    if claim_len > padded.len() - 34 {
+        return Err(CoreError::PairingAuthFailed);
+    }
+    let mut nonzero = 0u8;
+    for &b in &padded[34 + claim_len..] {
+        nonzero |= b;
+    }
+    if !bool::from(nonzero.ct_eq(&0u8)) {
+        return Err(CoreError::PairingAuthFailed);
+    }
+    let mut init_mac = [0u8; 32];
+    init_mac.copy_from_slice(&padded[..32]);
+    Ok((init_mac, &padded[34..34 + claim_len]))
 }
 
 /// Outbound bytes and protocol events produced by [`V2SessionInitiator`] and [`V2SessionResponder`].
@@ -2041,7 +2076,14 @@ impl V2SessionInitiator {
                             PeerState::Revoked => {
                                 return Err(CoreError::PeerRevoked(self.target_host_id.clone()));
                             }
-                            PeerState::Active => entry.require_complete_pin()?,
+                            PeerState::Active => {
+                                if roster.crl_revokes_entry(entry) {
+                                    return Err(CoreError::PeerRevoked(
+                                        self.target_host_id.clone(),
+                                    ));
+                                }
+                                entry.require_complete_pin()?
+                            }
                         }
                     }
                     None => return Err(CoreError::HostKeyUnverified),
@@ -2071,6 +2113,7 @@ impl V2SessionInitiator {
                     ) => return Err(err),
                     Err(_) => return Err(CoreError::HostKeyUnverified),
                 }
+                roster.set_peer_min_wire_version(&self.target_host_id, WIRE_VERSION_V2)?;
 
                 let hello = SessionHello {
                     device_id: self.local_device_id.clone(),
@@ -2216,11 +2259,9 @@ impl V2SessionInitiator {
             }
         }
         let crl = roster.crl(&self.target_host_id);
-        if let Some(list) = crl
-            && list
-                .revoked_devices
-                .iter()
-                .any(|d| d == &self.local_device_id || d == &self.target_host_id)
+        if roster.crl_revokes_entry(entry)
+            || roster.crl_revokes_id(&self.local_device_id)
+            || roster.crl_revokes_id(&self.target_host_id)
         {
             return Err(CoreError::PeerRevoked(self.local_device_id.clone()));
         }
@@ -2800,8 +2841,7 @@ impl V2SessionResponder {
                 }
 
                 let crl = roster.crl(&self.local_host_id);
-                if let Some(list) = crl
-                    && list.revoked_devices.iter().any(|d| d == &canonical_peer_id)
+                if roster.crl_revokes_entry(peer_entry) || roster.crl_revokes_id(&canonical_peer_id)
                 {
                     return Err(CoreError::PeerRevoked(canonical_peer_id));
                 }
@@ -2816,6 +2856,7 @@ impl V2SessionResponder {
                     )?;
                     self.active_grant = Some(grant.clone());
                 }
+                roster.set_peer_min_wire_version(&canonical_peer_id, WIRE_VERSION_V2)?;
 
                 let final_hash = *hs.get_handshake_hash();
                 let transport = hs.into_transport_mode()?;
@@ -2959,15 +3000,13 @@ impl V2SessionResponder {
         let peer_static = self
             .peer_static_pub
             .ok_or(CoreError::NotReady("peer static missing"))?;
-        roster.lookup_active_by_static(&peer_static)?;
+        let peer_entry = roster.lookup_active_by_static(&peer_static)?;
         let crl = roster.crl(&self.local_host_id);
         let peer_id = self
             .peer_device_id
             .as_deref()
             .ok_or(CoreError::NotReady("peer device_id missing"))?;
-        if let Some(list) = crl
-            && list.revoked_devices.iter().any(|d| d == peer_id)
-        {
+        if roster.crl_revokes_entry(peer_entry) || roster.crl_revokes_id(peer_id) {
             return Err(CoreError::PeerRevoked(peer_id.to_string()));
         }
         if let Some(ref grant) = self.active_grant {
@@ -3850,9 +3889,7 @@ impl V2PakePairInitiator {
                     serde_json::to_vec(&claim).map_err(|err| CoreError::Json(err.to_string()))?,
                 );
                 let init_mac = compute_pake_init_mac(&keys.pake_confirm_key, &h_post, &claim_json);
-                let mut msg3_pt = Zeroizing::new(Vec::with_capacity(32 + claim_json.len()));
-                msg3_pt.extend_from_slice(&init_mac);
-                msg3_pt.extend_from_slice(&claim_json);
+                let msg3_pt = Zeroizing::new(pad_pake_msg3_payload(&init_mac, &claim_json)?);
 
                 let msg3 = hs.write_message_vec(&msg3_pt)?;
                 actions.push(V2PairAction::WriteBytes(encode_frame(&msg3)?));
@@ -3881,8 +3918,8 @@ impl V2PakePairInitiator {
                 host_pin_verified,
             } => {
                 let pt = transport.read_message_vec(body)?;
-                let resp: PairResponse =
-                    serde_json::from_slice(&pt).map_err(|err| CoreError::Json(err.to_string()))?;
+                let resp: PairResponse = serde_json::from_slice(unpad_msg3_payload(&pt)?)
+                    .map_err(|err| CoreError::Json(err.to_string()))?;
                 match resp {
                     PairResponse::Success {
                         device_id: resp_dev_id,
@@ -3961,9 +3998,85 @@ struct PakeAuthenticatedMsg1 {
     code: Zeroizing<String>,
 }
 
+/// Parsed v2 PAKE `msg1` ready for lock-free Argon2id evaluation.
+///
+/// Produced by [`V2PakePairResponder::parse_pake_msg1_header`] and consumed by
+/// [`V2PakePairResponder::evaluate_pake_msg1`] and [`V2PakePairResponder::finish_pake_msg1`] so a
+/// runtime never holds its `PairingManager` lock across the expensive Argon2id passes.
+pub struct V2PakeMsg1Work {
+    body: Vec<u8>,
+    e_i_pub: [u8; 32],
+    ek_hash: [u8; 32],
+    salt: [u8; V2_PAKE_SALT_LEN],
+    candidate_mac: [u8; 32],
+    params: PakeArgon2Params,
+    path: PairingPathKind,
+}
+
+impl fmt::Debug for V2PakeMsg1Work {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("V2PakeMsg1Work")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl V2PakeMsg1Work {
+    fn from_body(
+        body: &[u8],
+        params: PakeArgon2Params,
+        path: PairingPathKind,
+    ) -> Result<Self, CoreError> {
+        if body.len() != MSG1_LEN + V2_PAKE_MSG1_PAYLOAD_LEN {
+            return Err(CoreError::ProtocolViolation(
+                "v2 PAKE msg1 must carry 16-byte salt and 32-byte MAC",
+            ));
+        }
+        let mut e_i_pub = [0u8; 32];
+        e_i_pub.copy_from_slice(&body[..32]);
+        let ek_hash: [u8; 32] = Sha256::digest(&body[32..MSG1_LEN]).into();
+        let salt: [u8; V2_PAKE_SALT_LEN] =
+            body[MSG1_LEN..MSG1_LEN + V2_PAKE_SALT_LEN]
+                .try_into()
+                .map_err(|_| CoreError::ProtocolViolation("invalid PAKE salt length"))?;
+        let candidate_mac: [u8; 32] = body
+            [MSG1_LEN + V2_PAKE_SALT_LEN..MSG1_LEN + V2_PAKE_MSG1_PAYLOAD_LEN]
+            .try_into()
+            .map_err(|_| CoreError::ProtocolViolation("invalid PAKE msg1 MAC length"))?;
+        Ok(Self {
+            body: body.to_vec(),
+            e_i_pub,
+            ek_hash,
+            salt,
+            candidate_mac,
+            params,
+            path,
+        })
+    }
+
+    /// Returns the `msg1` Argon2id salt used as the replay-cache key.
+    #[must_use]
+    pub const fn salt(&self) -> &[u8; V2_PAKE_SALT_LEN] {
+        &self.salt
+    }
+
+    /// Returns the initiator `msg1` MAC used as the replay-cache key.
+    #[must_use]
+    pub const fn candidate_mac(&self) -> &[u8; 32] {
+        &self.candidate_mac
+    }
+
+    /// Returns the transport path classification this responder was created for.
+    #[must_use]
+    pub const fn path(&self) -> PairingPathKind {
+        self.path
+    }
+}
+
 enum PakeRespPhase {
     AwaitPreamble,
     AwaitMsg1,
+    Msg1Pending,
     AwaitMsg3 {
         hs: Box<NoiseHfsHandshake>,
         authenticated: Option<Box<PakeAuthenticatedMsg1>>,
@@ -4035,14 +4148,7 @@ impl V2PakePairResponder {
         self
     }
 
-    /// Consumes inbound transport bytes, verifying PAKE proof against `manager` and recording into `roster`.
-    pub fn feed_bytes(
-        &mut self,
-        chunk: &[u8],
-        now_unix: u64,
-        manager: &mut PairingManager,
-        roster: &mut Roster,
-    ) -> Result<Vec<V2PairAction>, CoreError> {
+    fn ingest_chunk(&mut self, chunk: &[u8]) -> Result<(), CoreError> {
         if matches!(self.phase, PakeRespPhase::Closed) {
             return Err(CoreError::SessionClosed {
                 code: SessionCloseCode::NORMAL,
@@ -4053,7 +4159,6 @@ impl V2PakePairResponder {
             self.phase = PakeRespPhase::Closed;
             return Err(err);
         }
-        let mut actions = Vec::new();
         if matches!(self.phase, PakeRespPhase::AwaitPreamble) {
             match self.reader.take_preamble() {
                 Ok(Some(preamble)) => {
@@ -4069,12 +4174,123 @@ impl V2PakePairResponder {
                     }
                     self.phase = PakeRespPhase::AwaitMsg1;
                 }
-                Ok(None) => return Ok(actions),
+                Ok(None) => {}
                 Err(err) => {
                     self.phase = PakeRespPhase::Closed;
                     return Err(err);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Returns `true` while the responder waits for a complete `msg1` frame.
+    #[must_use]
+    pub const fn is_awaiting_pake_msg1(&self) -> bool {
+        matches!(
+            self.phase,
+            PakeRespPhase::AwaitPreamble | PakeRespPhase::AwaitMsg1
+        )
+    }
+
+    /// Consumes inbound bytes through the preamble and, once a complete `msg1` frame is buffered,
+    /// returns it as [`V2PakeMsg1Work`] without touching any `PairingManager`.
+    ///
+    /// The caller snapshots allowed codes, runs [`Self::evaluate_pake_msg1`] with no lock held, then
+    /// commits and calls [`Self::finish_pake_msg1`]. Returns `Ok(None)` until `msg1` is complete.
+    pub fn parse_pake_msg1_header(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Option<V2PakeMsg1Work>, CoreError> {
+        self.ingest_chunk(bytes)?;
+        if !matches!(self.phase, PakeRespPhase::AwaitMsg1) {
+            return Ok(None);
+        }
+        match self.reader.next_frame() {
+            Ok(Some(body)) => match V2PakeMsg1Work::from_body(&body, self.params, self.path) {
+                Ok(work) => {
+                    self.phase = PakeRespPhase::Msg1Pending;
+                    Ok(Some(work))
+                }
+                Err(err) => {
+                    self.phase = PakeRespPhase::Closed;
+                    Err(err)
+                }
+            },
+            Ok(None) => Ok(None),
+            Err(err) => {
+                self.phase = PakeRespPhase::Closed;
+                Err(err)
+            }
+        }
+    }
+
+    /// Runs the Argon2id passes for `work` against `allowed_codes`, padding with CSPRNG dummy passes
+    /// up to [`V2_PAKE_FIXED_ARGON2_PASSES`]. Holds no locks and touches no shared state.
+    ///
+    /// Returns the matching keys and code only when the `msg1` MAC verifies and `msg1_cache_ok`.
+    pub fn evaluate_pake_msg1(
+        work: &V2PakeMsg1Work,
+        allowed_codes: &[Zeroizing<String>],
+        msg1_cache_ok: bool,
+    ) -> Result<Option<(PakeKeys, Zeroizing<String>)>, CoreError> {
+        let pre = Preamble::v2_pake_pair().encode();
+        let mut matched: Option<(PakeKeys, Zeroizing<String>)> = None;
+        let mut passes_run: usize = 0;
+        for code in allowed_codes {
+            let candidate_keys = derive_pake_keys(code, &work.salt, work.params)?;
+            passes_run += 1;
+            let expected_mac = compute_pake_msg1_mac(
+                &candidate_keys.pake_init_key,
+                &pre,
+                &work.e_i_pub,
+                &work.ek_hash,
+                &work.salt,
+            );
+            if bool::from(expected_mac.ct_eq(&work.candidate_mac))
+                && msg1_cache_ok
+                && matched.is_none()
+            {
+                matched = Some((candidate_keys, code.clone()));
+            }
+        }
+        while passes_run < V2_PAKE_FIXED_ARGON2_PASSES {
+            let dummy_secret = Zeroizing::new(random_bytes::<32>()?);
+            let _ = derive_pake_keys_from_bytes(&*dummy_secret, &work.salt, work.params)?;
+            passes_run += 1;
+        }
+        Ok(matched)
+    }
+
+    /// Emits the genuine `msg2` when `matched` is `Some` and the `msg1` was recorded in the replay
+    /// cache, otherwise an indistinguishable decoy `msg2`, then awaits `msg3`.
+    pub fn finish_pake_msg1(
+        &mut self,
+        work: V2PakeMsg1Work,
+        matched: Option<(PakeKeys, Zeroizing<String>)>,
+        msg1_recorded: bool,
+    ) -> Result<Vec<V2PairAction>, CoreError> {
+        if !matches!(self.phase, PakeRespPhase::Msg1Pending) {
+            return Err(CoreError::NotReady("v2 PAKE msg1 not pending"));
+        }
+        self.phase = PakeRespPhase::Closed;
+        let mut actions = Vec::new();
+        self.build_msg2(&work, matched, msg1_recorded, &mut actions)?;
+        Ok(actions)
+    }
+
+    /// Consumes inbound transport bytes, verifying PAKE proof against `manager` and recording into `roster`.
+    pub fn feed_bytes(
+        &mut self,
+        chunk: &[u8],
+        now_unix: u64,
+        manager: &mut PairingManager,
+        roster: &mut Roster,
+    ) -> Result<Vec<V2PairAction>, CoreError> {
+        self.ingest_chunk(chunk)?;
+        let mut actions = Vec::new();
+        if matches!(self.phase, PakeRespPhase::AwaitPreamble) {
+            return Ok(actions);
         }
 
         loop {
@@ -4096,6 +4312,85 @@ impl V2PakePairResponder {
         }
     }
 
+    fn build_msg2(
+        &mut self,
+        work: &V2PakeMsg1Work,
+        matched: Option<(PakeKeys, Zeroizing<String>)>,
+        msg1_recorded: bool,
+        actions: &mut Vec<V2PairAction>,
+    ) -> Result<(), CoreError> {
+        let body = work.body.as_slice();
+        let authenticated_match = matched.filter(|_| msg1_recorded);
+        let hello_json = Zeroizing::new(
+            serde_json::to_vec(&self.host_hello).map_err(|err| CoreError::Json(err.to_string()))?,
+        );
+        let msg2_bucket = pake_msg2_bucket_for_hello_len(hello_json.len())?;
+
+        if let Some((keys, code)) = authenticated_match {
+            let prologue = pake_noise_prologue(&keys.pake_context_tag);
+            let builder = NoiseHfsHandshakeBuilder::new()
+                .local_private_key(&self.local_static_priv)
+                .prologue(&prologue);
+            #[cfg(any(test, feature = "test-utils"))]
+            let builder = match self.fixed_ephemeral {
+                Some(eph) => builder.fixed_ephemeral_for_testing_only(eph),
+                None => builder,
+            };
+            let mut hs = builder.build_responder()?;
+            hs.read_message_vec(body)?;
+
+            let pake_hello_key = Zeroizing::new(keys.pake_hello_key);
+            let pake_confirm_key = Zeroizing::new(keys.pake_confirm_key);
+            let msg2 = hs.write_msg2_with_hash(|h_pre| {
+                let sealed_hello = seal_pake_host_hello(&pake_hello_key, h_pre, &hello_json)?;
+                let sealed_len =
+                    u16::try_from(sealed_hello.len()).map_err(|_| CoreError::FrameTooLarge {
+                        len: sealed_hello.len(),
+                        max: MAX_FRAME_LEN,
+                    })?;
+                let resp_mac = compute_pake_resp_mac(&pake_confirm_key, h_pre, &sealed_hello);
+                let mut out = vec![0u8; msg2_bucket];
+                out[..2].copy_from_slice(&sealed_len.to_be_bytes());
+                out[2..2 + sealed_hello.len()].copy_from_slice(&sealed_hello);
+                out[2 + sealed_hello.len()..2 + sealed_hello.len() + 32].copy_from_slice(&resp_mac);
+                Ok(out)
+            })?;
+            let post_msg2_hash = *hs.get_handshake_hash();
+            actions.push(V2PairAction::WriteBytes(encode_frame(&msg2)?));
+            self.phase = PakeRespPhase::AwaitMsg3 {
+                hs: Box::new(hs),
+                authenticated: Some(Box::new(PakeAuthenticatedMsg1 {
+                    keys,
+                    post_msg2_hash,
+                    code,
+                })),
+            };
+        } else {
+            let decoy_static = StaticKeypair::generate()?;
+            let decoy_tag = Zeroizing::new(random_bytes::<32>()?);
+            let prologue = pake_noise_prologue(&decoy_tag);
+            let builder = NoiseHfsHandshakeBuilder::new()
+                .local_private_key(decoy_static.secret_bytes())
+                .prologue(&prologue);
+            #[cfg(any(test, feature = "test-utils"))]
+            let builder = match self.fixed_ephemeral {
+                Some(eph) => builder.fixed_ephemeral_for_testing_only(eph),
+                None => builder,
+            };
+            let mut hs = builder.build_responder()?;
+            hs.read_message_vec(body)?;
+            let mut decoy_payload = vec![0u8; msg2_bucket];
+            getrandom::fill(&mut decoy_payload).map_err(|err| CoreError::Rng(err.to_string()))?;
+            let msg2 = hs.write_message_vec(&decoy_payload)?;
+            actions.push(V2PairAction::WriteBytes(encode_frame(&msg2)?));
+            self.phase = PakeRespPhase::AwaitMsg3 {
+                hs: Box::new(hs),
+                authenticated: None,
+            };
+        }
+        Ok(())
+    }
+
     fn handle_frame(
         &mut self,
         body: &[u8],
@@ -4107,133 +4402,17 @@ impl V2PakePairResponder {
         let phase = std::mem::replace(&mut self.phase, PakeRespPhase::Closed);
         match phase {
             PakeRespPhase::AwaitMsg1 => {
-                if body.len() != MSG1_LEN + V2_PAKE_MSG1_PAYLOAD_LEN {
-                    return Err(CoreError::ProtocolViolation(
-                        "v2 PAKE msg1 must carry 16-byte salt and 32-byte MAC",
-                    ));
-                }
-                let mut e_i_pub = [0u8; 32];
-                e_i_pub.copy_from_slice(&body[..32]);
-                let ek_hash: [u8; 32] = Sha256::digest(&body[32..MSG1_LEN]).into();
-                let salt: [u8; V2_PAKE_SALT_LEN] = body[MSG1_LEN..MSG1_LEN + V2_PAKE_SALT_LEN]
-                    .try_into()
-                    .map_err(|_| CoreError::ProtocolViolation("invalid PAKE salt length"))?;
-                let candidate_mac: [u8; 32] = body
-                    [MSG1_LEN + V2_PAKE_SALT_LEN..MSG1_LEN + V2_PAKE_MSG1_PAYLOAD_LEN]
-                    .try_into()
-                    .map_err(|_| CoreError::ProtocolViolation("invalid PAKE msg1 MAC length"))?;
-
-                let pre = Preamble::v2_pake_pair().encode();
-                let msg1_cache_ok = manager.can_accept_pake_msg1(&salt, &candidate_mac, now_unix);
-                let live_codes = manager.live_codes(now_unix);
-                let mut matched: Option<(PakeKeys, Zeroizing<String>)> = None;
-                let mut passes_run: usize = 0;
-                for (code, _) in live_codes {
-                    let candidate_keys = derive_pake_keys(&code, &salt, self.params)?;
-                    passes_run += 1;
-                    let expected_mac = compute_pake_msg1_mac(
-                        &candidate_keys.pake_init_key,
-                        &pre,
-                        &e_i_pub,
-                        &ek_hash,
-                        &salt,
-                    );
-                    if bool::from(expected_mac.ct_eq(&candidate_mac))
-                        && msg1_cache_ok
-                        && matched.is_none()
-                    {
-                        matched = Some((candidate_keys, code));
-                    }
-                }
-                while passes_run < V2_PAKE_FIXED_ARGON2_PASSES {
-                    let dummy_secret = Zeroizing::new(random_bytes::<32>()?);
-                    let _ = derive_pake_keys_from_bytes(&*dummy_secret, &salt, self.params)?;
-                    passes_run += 1;
-                }
-
-                let authenticated_match = match matched {
-                    Some((keys, code))
-                        if manager.record_pake_msg1(salt, candidate_mac, now_unix) =>
-                    {
-                        Some((keys, code))
-                    }
-                    _ => None,
-                };
-
-                let hello_json = Zeroizing::new(
-                    serde_json::to_vec(&self.host_hello)
-                        .map_err(|err| CoreError::Json(err.to_string()))?,
-                );
-                let msg2_bucket = pake_msg2_bucket_for_hello_len(hello_json.len())?;
-
-                if let Some((keys, code)) = authenticated_match {
-                    let prologue = pake_noise_prologue(&keys.pake_context_tag);
-                    let builder = NoiseHfsHandshakeBuilder::new()
-                        .local_private_key(&self.local_static_priv)
-                        .prologue(&prologue);
-                    #[cfg(any(test, feature = "test-utils"))]
-                    let builder = match self.fixed_ephemeral {
-                        Some(eph) => builder.fixed_ephemeral_for_testing_only(eph),
-                        None => builder,
-                    };
-                    let mut hs = builder.build_responder()?;
-                    hs.read_message_vec(body)?;
-
-                    let pake_hello_key = Zeroizing::new(keys.pake_hello_key);
-                    let pake_confirm_key = Zeroizing::new(keys.pake_confirm_key);
-                    let msg2 = hs.write_msg2_with_hash(|h_pre| {
-                        let sealed_hello =
-                            seal_pake_host_hello(&pake_hello_key, h_pre, &hello_json)?;
-                        let sealed_len = u16::try_from(sealed_hello.len()).map_err(|_| {
-                            CoreError::FrameTooLarge {
-                                len: sealed_hello.len(),
-                                max: MAX_FRAME_LEN,
-                            }
-                        })?;
-                        let resp_mac =
-                            compute_pake_resp_mac(&pake_confirm_key, h_pre, &sealed_hello);
-                        let mut out = vec![0u8; msg2_bucket];
-                        out[..2].copy_from_slice(&sealed_len.to_be_bytes());
-                        out[2..2 + sealed_hello.len()].copy_from_slice(&sealed_hello);
-                        out[2 + sealed_hello.len()..2 + sealed_hello.len() + 32]
-                            .copy_from_slice(&resp_mac);
-                        Ok(out)
-                    })?;
-                    let post_msg2_hash = *hs.get_handshake_hash();
-                    actions.push(V2PairAction::WriteBytes(encode_frame(&msg2)?));
-                    self.phase = PakeRespPhase::AwaitMsg3 {
-                        hs: Box::new(hs),
-                        authenticated: Some(Box::new(PakeAuthenticatedMsg1 {
-                            keys,
-                            post_msg2_hash,
-                            code,
-                        })),
-                    };
-                } else {
-                    let decoy_static = StaticKeypair::generate()?;
-                    let decoy_tag = Zeroizing::new(random_bytes::<32>()?);
-                    let prologue = pake_noise_prologue(&decoy_tag);
-                    let builder = NoiseHfsHandshakeBuilder::new()
-                        .local_private_key(decoy_static.secret_bytes())
-                        .prologue(&prologue);
-                    #[cfg(any(test, feature = "test-utils"))]
-                    let builder = match self.fixed_ephemeral {
-                        Some(eph) => builder.fixed_ephemeral_for_testing_only(eph),
-                        None => builder,
-                    };
-                    let mut hs = builder.build_responder()?;
-                    hs.read_message_vec(body)?;
-                    let mut decoy_payload = vec![0u8; msg2_bucket];
-                    getrandom::fill(&mut decoy_payload)
-                        .map_err(|err| CoreError::Rng(err.to_string()))?;
-                    let msg2 = hs.write_message_vec(&decoy_payload)?;
-                    actions.push(V2PairAction::WriteBytes(encode_frame(&msg2)?));
-                    self.phase = PakeRespPhase::AwaitMsg3 {
-                        hs: Box::new(hs),
-                        authenticated: None,
-                    };
-                }
-                Ok(())
+                let work = V2PakeMsg1Work::from_body(body, self.params, self.path)?;
+                let msg1_cache_ok =
+                    manager.is_pake_msg1_allowed(&work.salt, &work.candidate_mac, now_unix);
+                let allowed = manager.allowed_live_codes(self.path, now_unix);
+                let matched = Self::evaluate_pake_msg1(&work, &allowed, msg1_cache_ok)?;
+                let recorded = matched.is_some()
+                    && manager.commit_pake_msg1(work.salt, work.candidate_mac, now_unix);
+                self.build_msg2(&work, matched, recorded, actions)
+            }
+            PakeRespPhase::Msg1Pending => {
+                Err(CoreError::NotReady("v2 PAKE msg1 evaluation pending"))
             }
             PakeRespPhase::AwaitMsg3 {
                 mut hs,
@@ -4250,18 +4429,12 @@ impl V2PakePairResponder {
                     code: code_str,
                 } = *auth_box;
                 // Do not burn/charge live pairing codes on msg3 failures: an attacker
-                // cannot reach msg3 without a fresh valid msg1 (`can_accept_pake_msg1`),
+                // cannot reach msg3 without a fresh valid msg1 (`is_pake_msg1_allowed`),
                 // and legitimate retries require a fresh msg1 salt.
                 let pt = hs
                     .read_message_vec(body)
                     .map_err(|_| CoreError::PairingAuthFailed)?;
-                if pt.len() < 32 {
-                    return Err(CoreError::PairingAuthFailed);
-                }
-                let init_mac: [u8; 32] = pt[..32]
-                    .try_into()
-                    .map_err(|_| CoreError::PairingAuthFailed)?;
-                let claim_json = &pt[32..];
+                let (init_mac, claim_json) = unpad_pake_msg3_payload(&pt)?;
                 let expected_mac =
                     compute_pake_init_mac(&keys.pake_confirm_key, &post_msg2_hash, claim_json);
                 if !bool::from(expected_mac.ct_eq(&init_mac)) {
@@ -4321,9 +4494,9 @@ impl V2PakePairResponder {
                     status: "pending".to_string(),
                     host_signing_pub: self.host_signing_pub.to_b64url(),
                 };
-                let json = Zeroizing::new(
-                    serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?,
-                );
+                let json = Zeroizing::new(pad_msg3_payload(
+                    &serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?,
+                )?);
                 let ct = transport.write_message_vec(&json)?;
                 actions.push(V2PairAction::WriteBytes(encode_frame(&ct)?));
                 actions.push(V2PairAction::Completed(V2PairOutcome::ResponderPending {
@@ -4383,8 +4556,9 @@ fn write_v2_pair_error(
     let resp = PairResponse::Error {
         error: code.to_string(),
     };
-    let json =
-        Zeroizing::new(serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?);
+    let json = Zeroizing::new(pad_msg3_payload(
+        &serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?,
+    )?);
     let ct = transport.write_message_vec(&json)?;
     actions.push(V2PairAction::WriteBytes(encode_frame(&ct)?));
     actions.push(V2PairAction::Completed(V2PairOutcome::Rejected {
@@ -4751,5 +4925,129 @@ mod tests {
             init.feed_bytes(&[], TEST_NOW_UNIX, 52, &mut cli_roster),
             Err(CoreError::SessionClosed { .. })
         ));
+    }
+
+    fn pake_wire(actions: &[V2PairAction]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for action in actions {
+            if let V2PairAction::WriteBytes(bytes) = action {
+                out.extend_from_slice(bytes);
+            }
+        }
+        out
+    }
+
+    fn split_msg2_with_recorded(
+        recorded: bool,
+    ) -> (
+        V2PakePairInitiator,
+        Vec<u8>,
+        V2PakePairResponder,
+        PairingManager,
+    ) {
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x41; 32]),
+            SigningKeypair::from_seed([0x42; 32]),
+        )
+        .with_host_id("host-split");
+        let cli = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x51; 32]),
+            SigningKeypair::from_seed([0x52; 32]),
+        );
+        let params = PakeArgon2Params::for_testing_only();
+        let mut mgr = PairingManager::new(crate::pairing::PairingConfig::default());
+        let code = mgr
+            .issue_code(crate::pairing::PairingCodeKind::Remote3Group, TEST_NOW_UNIX)
+            .unwrap();
+        let mut init = V2PakePairInitiator::new(&cli, "Cli", "cli", &code, None, params).unwrap();
+        let mut resp = V2PakePairResponder::new(&host, PairingPathKind::Remote, params).unwrap();
+        let m1 = pake_wire(&init.start().unwrap());
+
+        assert!(resp.is_awaiting_pake_msg1());
+        assert!(resp.parse_pake_msg1_header(&m1[..10]).unwrap().is_none());
+        let work = resp
+            .parse_pake_msg1_header(&m1[10..])
+            .unwrap()
+            .expect("complete msg1");
+        assert!(!resp.is_awaiting_pake_msg1());
+        assert_eq!(work.path(), PairingPathKind::Remote);
+
+        let allowed = mgr.allowed_live_codes(work.path(), TEST_NOW_UNIX);
+        let cache_ok = mgr.is_pake_msg1_allowed(work.salt(), work.candidate_mac(), TEST_NOW_UNIX);
+        let matched = V2PakePairResponder::evaluate_pake_msg1(&work, &allowed, cache_ok).unwrap();
+        assert!(matched.is_some());
+        let committed =
+            recorded && mgr.commit_pake_msg1(*work.salt(), *work.candidate_mac(), TEST_NOW_UNIX);
+        let m2 = pake_wire(&resp.finish_pake_msg1(work, matched, committed).unwrap());
+        (init, m2, resp, mgr)
+    }
+
+    #[test]
+    fn sec05_split_msg1_api_completes_pairing_without_manager_during_argon2() {
+        let (mut init, m2, mut resp, mut mgr) = split_msg2_with_recorded(true);
+        let m3 = pake_wire(&init.feed_bytes(&m2).unwrap());
+        let mut roster = Roster::new();
+        let m4 = resp
+            .feed_bytes(&m3, TEST_NOW_UNIX, &mut mgr, &mut roster)
+            .unwrap();
+        assert!(m4.iter().any(|a| matches!(
+            a,
+            V2PairAction::Completed(V2PairOutcome::ResponderPending { .. })
+        )));
+        let done = init.feed_bytes(&pake_wire(&m4)).unwrap();
+        assert!(done.iter().any(|a| matches!(
+            a,
+            V2PairAction::Completed(V2PairOutcome::InitiatorPending { .. })
+        )));
+        assert_eq!(mgr.live_code_count(TEST_NOW_UNIX), 0);
+    }
+
+    #[test]
+    fn sec05_split_msg1_api_unrecorded_match_emits_decoy_and_rejects_reuse() {
+        let (mut init, m2, mut resp, _mgr) = split_msg2_with_recorded(false);
+        assert_eq!(init.feed_bytes(&m2), Err(CoreError::PairingAuthFailed));
+        let work_less = resp.finish_pake_msg1(
+            V2PakeMsg1Work::from_body(
+                &[0u8; MSG1_LEN + V2_PAKE_MSG1_PAYLOAD_LEN],
+                PakeArgon2Params::for_testing_only(),
+                PairingPathKind::Remote,
+            )
+            .unwrap(),
+            None,
+            false,
+        );
+        assert_eq!(
+            work_less.err(),
+            Some(CoreError::NotReady("v2 PAKE msg1 not pending"))
+        );
+    }
+
+    #[test]
+    fn priv03_pake_msg3_padding_roundtrip_buckets_and_rejects_tampering() {
+        let mac = [7u8; 32];
+        let small = pad_pake_msg3_payload(&mac, b"{}").unwrap();
+        let large = pad_pake_msg3_payload(&mac, &[b'x'; 5000]).unwrap();
+        assert_eq!(small.len(), 4096);
+        assert_eq!(large.len(), 16_384);
+        let (got_mac, claim) = unpad_pake_msg3_payload(&small).unwrap();
+        assert_eq!(got_mac, mac);
+        assert_eq!(claim, b"{}");
+
+        let mut bad_pad = small.clone();
+        *bad_pad.last_mut().unwrap() = 1;
+        assert_eq!(
+            unpad_pake_msg3_payload(&bad_pad),
+            Err(CoreError::PairingAuthFailed)
+        );
+        assert_eq!(
+            unpad_pake_msg3_payload(&small[..100]),
+            Err(CoreError::PairingAuthFailed)
+        );
+        let mut over_len = small;
+        over_len[32..34].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            unpad_pake_msg3_payload(&over_len),
+            Err(CoreError::PairingAuthFailed)
+        );
     }
 }

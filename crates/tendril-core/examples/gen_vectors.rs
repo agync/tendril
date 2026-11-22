@@ -37,12 +37,13 @@ use tendril_core::v2::{
     PakeArgon2Params, V2_PAKE_SALT_LEN, canonical_relay_host, compute_pake_init_mac,
     compute_pake_msg1_mac, compute_pake_resp_mac, compute_rendezvous_mac, decode_v2_inner_frame,
     derive_epoch_mailbox, derive_pake_keys, derive_pake_master, encode_dummy_cover_frame,
-    epoch_for_unix, pad_inner_frame, pad_msg3_payload, pake_msg2_bucket_for_hello_len,
-    pake_noise_prologue, seal_pake_host_hello, seal_v2_hello_envelope, sign_v2_relay_accept,
-    sign_v2_relay_dial, sign_v2_relay_register, unpad_inner_frame, unpad_msg3_payload,
-    unseal_pake_host_hello, unseal_v2_hello_envelope, v2_relay_accept_signed_bytes,
-    v2_relay_dial_signed_bytes, v2_relay_register_signed_bytes, verify_v2_relay_accept,
-    verify_v2_relay_dial, verify_v2_relay_register,
+    epoch_for_unix, pad_inner_frame, pad_msg3_payload, pad_pake_msg3_payload,
+    pake_msg2_bucket_for_hello_len, pake_noise_prologue, seal_pake_host_hello,
+    seal_v2_hello_envelope, sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register,
+    unpad_inner_frame, unpad_msg3_payload, unpad_pake_msg3_payload, unseal_pake_host_hello,
+    unseal_v2_hello_envelope, v2_relay_accept_signed_bytes, v2_relay_dial_signed_bytes,
+    v2_relay_register_signed_bytes, verify_v2_relay_accept, verify_v2_relay_dial,
+    verify_v2_relay_register,
 };
 use tendril_core::wire::{
     HostHello, InnerFrameType, Intent, NOISE_PATTERN, PREAMBLE_FLAG_NONE, PairClaim, PairResponse,
@@ -385,6 +386,7 @@ struct V2PakeVector {
     msg3_frame_hex: String,
     final_handshake_hash_hex: String,
     pair_response_json: String,
+    pair_response_payload_hex: String,
     pair_response_frame_hex: String,
     exported_reconnect_secret_hex: String,
     exported_mailbox_secret_hex: String,
@@ -1683,15 +1685,16 @@ fn build_v2_pake_vector(preamble: &[u8; 6]) -> Result<V2PakeVector, Box<dyn std:
         &post_msg2_hash,
         pair_claim_json.as_bytes(),
     );
-    let mut msg3_payload = Vec::with_capacity(32 + pair_claim_json.len());
-    msg3_payload.extend_from_slice(&init_confirm_mac);
-    msg3_payload.extend_from_slice(pair_claim_json.as_bytes());
+    let msg3_payload = pad_pake_msg3_payload(&init_confirm_mac, pair_claim_json.as_bytes())?;
 
     let msg3_body = initiator.write_message_vec(&msg3_payload)?;
     let msg3_frame = encode_frame(&msg3_body)?;
     let (body3, _) = decode_frame(&msg3_frame)?;
     let dec3 = responder.read_message_vec(body3)?;
     assert_eq!(&*dec3, msg3_payload.as_slice());
+    let (unpadded_mac, unpadded_claim) = unpad_pake_msg3_payload(&dec3)?;
+    assert_eq!(unpadded_mac, init_confirm_mac);
+    assert_eq!(unpadded_claim, pair_claim_json.as_bytes());
 
     let final_hash = *initiator.get_handshake_hash();
     assert_eq!(final_hash, *responder.get_handshake_hash());
@@ -1710,11 +1713,13 @@ fn build_v2_pake_vector(preamble: &[u8; 6]) -> Result<V2PakeVector, Box<dyn std:
         host_signing_pub: resp_signing.public_key().to_b64url(),
     };
     let pair_response_json = serde_json::to_string(&pair_resp)?;
-    let resp_ct = resp_tx.write_message_vec(pair_response_json.as_bytes())?;
+    let pair_response_payload = pad_msg3_payload(pair_response_json.as_bytes())?;
+    let resp_ct = resp_tx.write_message_vec(&pair_response_payload)?;
     let pair_response_frame = encode_frame(&resp_ct)?;
     let (body4, _) = decode_frame(&pair_response_frame)?;
     let dec4 = init_tx.read_message_vec(body4)?;
-    assert_eq!(&*dec4, pair_response_json.as_bytes());
+    assert_eq!(&*dec4, pair_response_payload.as_slice());
+    assert_eq!(unpad_msg3_payload(&dec4)?, pair_response_json.as_bytes());
 
     Ok(V2PakeVector {
         preamble_hex: hex::encode(preamble),
@@ -1765,6 +1770,7 @@ fn build_v2_pake_vector(preamble: &[u8; 6]) -> Result<V2PakeVector, Box<dyn std:
         msg3_frame_hex: hex::encode(msg3_frame),
         final_handshake_hash_hex: hex::encode(final_hash),
         pair_response_json,
+        pair_response_payload_hex: hex::encode(&pair_response_payload),
         pair_response_frame_hex: hex::encode(pair_response_frame),
         exported_reconnect_secret_hex: hex::encode(*exported_reconnect),
         exported_mailbox_secret_hex: hex::encode(*exported_mailbox),

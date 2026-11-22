@@ -37,12 +37,13 @@ use tendril_core::v2::{
     PakeArgon2Params, V2_PAKE_SALT_LEN, V2InnerFrame, canonical_relay_host, compute_pake_init_mac,
     compute_pake_msg1_mac, compute_pake_resp_mac, compute_rendezvous_mac, decode_v2_inner_frame,
     derive_epoch_mailbox, derive_pake_keys, derive_pake_master, encode_dummy_cover_frame,
-    epoch_for_unix, pad_inner_frame, pad_msg3_payload, pake_msg2_bucket_for_hello_len,
-    pake_noise_prologue, seal_pake_host_hello, seal_v2_hello_envelope, sign_v2_relay_accept,
-    sign_v2_relay_dial, sign_v2_relay_register, unpad_inner_frame, unpad_msg3_payload,
-    unseal_pake_host_hello, unseal_v2_hello_envelope, v2_relay_accept_signed_bytes,
-    v2_relay_dial_signed_bytes, v2_relay_register_signed_bytes, verify_rendezvous_mac,
-    verify_v2_relay_accept, verify_v2_relay_dial, verify_v2_relay_register,
+    epoch_for_unix, pad_inner_frame, pad_msg3_payload, pad_pake_msg3_payload,
+    pake_msg2_bucket_for_hello_len, pake_noise_prologue, seal_pake_host_hello,
+    seal_v2_hello_envelope, sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register,
+    unpad_inner_frame, unpad_msg3_payload, unpad_pake_msg3_payload, unseal_pake_host_hello,
+    unseal_v2_hello_envelope, v2_relay_accept_signed_bytes, v2_relay_dial_signed_bytes,
+    v2_relay_register_signed_bytes, verify_rendezvous_mac, verify_v2_relay_accept,
+    verify_v2_relay_dial, verify_v2_relay_register,
 };
 use tendril_core::wire::{
     HostHello, InnerFrameType, Intent, NOISE_PATTERN, PREAMBLE_FLAG_NONE, PairResponse, Preamble,
@@ -1049,6 +1050,7 @@ struct V2PakeVector {
     msg3_frame_hex: String,
     final_handshake_hash_hex: String,
     pair_response_json: String,
+    pair_response_payload_hex: String,
     pair_response_frame_hex: String,
     exported_reconnect_secret_hex: String,
     exported_mailbox_secret_hex: String,
@@ -1641,10 +1643,12 @@ fn wire_v2_vectors_match_byte_for_byte() {
         pk.pair_claim_json.as_bytes(),
     );
     assert_eq!(hex::encode(init_confirm_mac), pk.init_confirm_mac_hex);
-    let mut msg3_payload = Vec::with_capacity(32 + pk.pair_claim_json.len());
-    msg3_payload.extend_from_slice(&init_confirm_mac);
-    msg3_payload.extend_from_slice(pk.pair_claim_json.as_bytes());
+    let msg3_payload =
+        pad_pake_msg3_payload(&init_confirm_mac, pk.pair_claim_json.as_bytes()).unwrap();
     assert_eq!(hex::encode(&msg3_payload), pk.msg3_payload_hex);
+    let (unpadded_mac, unpadded_claim) = unpad_pake_msg3_payload(&msg3_payload).unwrap();
+    assert_eq!(unpadded_mac, init_confirm_mac);
+    assert_eq!(unpadded_claim, pk.pair_claim_json.as_bytes());
 
     let pm3 = p_init.write_message_vec(&msg3_payload).unwrap();
     let pf3 = encode_frame(&pm3).unwrap();
@@ -1664,15 +1668,19 @@ fn wire_v2_vectors_match_byte_for_byte() {
     assert_eq!(hex::encode(*p_exp_reconn), pk.exported_reconnect_secret_hex);
     assert_eq!(hex::encode(*p_exp_mbox), pk.exported_mailbox_secret_hex);
 
-    let pr_ct = p_resp_tx
-        .write_message_vec(pk.pair_response_json.as_bytes())
-        .unwrap();
+    let pr_payload = pad_msg3_payload(pk.pair_response_json.as_bytes()).unwrap();
+    assert_eq!(hex::encode(&pr_payload), pk.pair_response_payload_hex);
+    let pr_ct = p_resp_tx.write_message_vec(&pr_payload).unwrap();
     let pr_frame = encode_frame(&pr_ct).unwrap();
     assert_eq!(hex::encode(&pr_frame), pk.pair_response_frame_hex);
     let pdec4 = p_init_tx
         .read_message_vec(decode_frame(&pr_frame).unwrap().0)
         .unwrap();
-    assert_eq!(&*pdec4, pk.pair_response_json.as_bytes());
+    assert_eq!(&*pdec4, pr_payload.as_slice());
+    assert_eq!(
+        unpad_msg3_payload(&pdec4).unwrap(),
+        pk.pair_response_json.as_bytes()
+    );
     assert_eq!(
         decode_hybrid_pub(&pk.responder_signing_pub_hex).to_b64url(),
         serde_json::from_str::<HostHello>(&pk.host_hello_json)

@@ -131,6 +131,9 @@ impl fmt::Debug for IssuedCode {
     }
 }
 
+/// Maximum number of concurrently live (unexpired, unburned) pairing codes per manager.
+pub const MAX_LIVE_PAIRING_CODES: usize = 4;
+
 /// Maximum bounded replay cache entries for v2 PAKE `msg1` `(salt, init_mac)` pairs.
 pub const MAX_PAKE_MSG1_REPLAY_ENTRIES: usize = 1024;
 
@@ -228,6 +231,14 @@ impl PairingManager {
                 c.expired = true;
             }
         }
+        let live_count = self
+            .codes
+            .iter()
+            .filter(|c| !c.burned && !c.expired)
+            .count();
+        if live_count >= MAX_LIVE_PAIRING_CODES {
+            return Err(CoreError::ProtocolViolation("too many live pairing codes"));
+        }
         if self.codes.len() >= 64 {
             let mut live = Vec::new();
             let mut dead = Vec::new();
@@ -294,12 +305,9 @@ impl PairingManager {
         }
 
         if let Some(idx) = matched_idx {
-            let entry = &mut self.codes[idx];
-            entry.burned = true;
-            if entry.kind == PairingCodeKind::Lan2Group
-                && path == PairingPathKind::Remote
-                && !self.config.allow_lan_code_over_remote
-            {
+            let allows = self.allows_code_on_path(self.codes[idx].kind, path);
+            self.codes[idx].burned = true;
+            if !allows {
                 return Err(CoreError::PairingPathDisallowed(
                     "2-group code disallowed on remote path",
                 ));
@@ -318,10 +326,25 @@ impl PairingManager {
         Err(CoreError::PairingCodeInvalid)
     }
 
-    pub(crate) fn live_codes(
+    /// Returns `true` when a code of `kind` may be used on `path` under this manager's policy.
+    ///
+    /// A [`PairingCodeKind::Lan2Group`] code is refused on [`PairingPathKind::Remote`] unless
+    /// `allow_lan_code_over_remote` is set.
+    #[must_use]
+    pub fn allows_code_on_path(&self, kind: PairingCodeKind, path: PairingPathKind) -> bool {
+        !(kind == PairingCodeKind::Lan2Group
+            && path == PairingPathKind::Remote
+            && !self.config.allow_lan_code_over_remote)
+    }
+
+    /// Returns clones of every live code usable on `path`, marking expired codes first.
+    ///
+    /// Codes disallowed on `path` are omitted so they can never match a PAKE `msg1` there.
+    pub fn allowed_live_codes(
         &mut self,
+        path: PairingPathKind,
         now_unix: u64,
-    ) -> Vec<(Zeroizing<String>, PairingCodeKind)> {
+    ) -> Vec<Zeroizing<String>> {
         for c in &mut self.codes {
             if !c.burned && now_unix >= c.expires_at {
                 c.expired = true;
@@ -329,8 +352,8 @@ impl PairingManager {
         }
         self.codes
             .iter()
-            .filter(|c| !c.burned && !c.expired)
-            .map(|c| (c.code.clone(), c.kind))
+            .filter(|c| !c.burned && !c.expired && self.allows_code_on_path(c.kind, path))
+            .map(|c| c.code.clone())
             .collect()
     }
 
@@ -345,7 +368,8 @@ impl PairingManager {
         }
     }
 
-    pub(crate) fn can_accept_pake_msg1(
+    /// Returns `true` if `(salt, init_mac)` is unseen and the replay cache has capacity.
+    pub fn is_pake_msg1_allowed(
         &mut self,
         salt: &[u8; 16],
         init_mac: &[u8; 32],
@@ -356,12 +380,8 @@ impl PairingManager {
             && self.seen_pake_msg1.len() < MAX_PAKE_MSG1_REPLAY_ENTRIES
     }
 
-    pub(crate) fn record_pake_msg1(
-        &mut self,
-        salt: [u8; 16],
-        init_mac: [u8; 32],
-        now_unix: u64,
-    ) -> bool {
+    /// Records `(salt, init_mac)` in the replay cache, returning `false` on replay or exhaustion.
+    pub fn commit_pake_msg1(&mut self, salt: [u8; 16], init_mac: [u8; 32], now_unix: u64) -> bool {
         self.prune_expired_pake_msg1(now_unix);
         if self.seen_pake_msg1.contains(&(salt, init_mac))
             || self.seen_pake_msg1.len() >= MAX_PAKE_MSG1_REPLAY_ENTRIES
@@ -386,6 +406,7 @@ impl PairingManager {
                 c.expired = true;
             }
         }
+        let allow_lan_remote = self.config.allow_lan_code_over_remote;
         let Some(entry) = self
             .codes
             .iter_mut()
@@ -397,7 +418,7 @@ impl PairingManager {
         entry.burned = true;
         if entry.kind == PairingCodeKind::Lan2Group
             && path == PairingPathKind::Remote
-            && !self.config.allow_lan_code_over_remote
+            && !allow_lan_remote
         {
             return Err(CoreError::PairingPathDisallowed(
                 "2-group code disallowed on remote path",
@@ -2516,5 +2537,61 @@ mod tests {
         );
         // Responder did not burn the code because msg3 PairClaim was never sent.
         assert_eq!(mgr.live_code_count(1001), 1);
+    }
+
+    #[test]
+    fn sec06_lan_code_is_filtered_from_remote_live_codes() {
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        assert!(mgr.allows_code_on_path(PairingCodeKind::Lan2Group, PairingPathKind::Lan));
+        assert!(mgr.allows_code_on_path(PairingCodeKind::Remote3Group, PairingPathKind::Lan));
+        assert!(mgr.allows_code_on_path(PairingCodeKind::Remote3Group, PairingPathKind::Remote));
+        assert!(!mgr.allows_code_on_path(PairingCodeKind::Lan2Group, PairingPathKind::Remote));
+        let permissive = PairingManager::new(PairingConfig {
+            allow_lan_code_over_remote: true,
+            ..PairingConfig::default()
+        });
+        assert!(
+            permissive.allows_code_on_path(PairingCodeKind::Lan2Group, PairingPathKind::Remote)
+        );
+
+        mgr.issue_code_with_entropy(PairingCodeKind::Lan2Group, 1000, &[0x11; 32])
+            .unwrap();
+        let remote = mgr
+            .issue_code_with_entropy(PairingCodeKind::Remote3Group, 1000, &[0x22; 32])
+            .unwrap();
+        let on_remote = mgr.allowed_live_codes(PairingPathKind::Remote, 1001);
+        assert_eq!(on_remote.len(), 1);
+        assert_eq!(on_remote[0].as_str(), remote);
+        assert_eq!(mgr.allowed_live_codes(PairingPathKind::Lan, 1001).len(), 2);
+        let after_ttl = 1000 + DEFAULT_PAIRING_TTL_SECS + 1;
+        assert!(
+            mgr.allowed_live_codes(PairingPathKind::Lan, after_ttl)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sec05_pake_msg1_cache_snapshot_and_commit_are_replay_safe() {
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let (salt, mac) = ([0x01; 16], [0x02; 32]);
+        assert!(mgr.is_pake_msg1_allowed(&salt, &mac, 1000));
+        assert!(mgr.commit_pake_msg1(salt, mac, 1000));
+        assert!(!mgr.is_pake_msg1_allowed(&salt, &mac, 1001));
+        assert!(!mgr.commit_pake_msg1(salt, mac, 1001));
+    }
+
+    #[test]
+    fn sec13_issue_code_refuses_beyond_live_cap() {
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        for i in 0..MAX_LIVE_PAIRING_CODES {
+            let entropy = [u8::try_from(i).unwrap() + 1; 32];
+            mgr.issue_code_with_entropy(PairingCodeKind::Remote3Group, 1000, &entropy)
+                .unwrap();
+        }
+        assert_eq!(
+            mgr.issue_code_with_entropy(PairingCodeKind::Lan2Group, 1000, &[0x70; 32]),
+            Err(CoreError::ProtocolViolation("too many live pairing codes"))
+        );
+        assert_eq!(mgr.live_code_count(1000), MAX_LIVE_PAIRING_CODES);
     }
 }
