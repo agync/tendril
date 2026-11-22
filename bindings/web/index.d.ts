@@ -98,6 +98,13 @@ export interface PollEvent {
   code?: number;
   reason?: string;
   peer_device_id?: string;
+  /** `group_manifest_unverified` and `group_rendezvous_unverified` events. */
+  group_id?: string;
+  /** Strict wire JSON of an unverified manifest; never trusted until the group book verifies it. */
+  manifest_json?: string;
+  /** Set on `group_rendezvous_unverified` once the group book applied or refused the frame. */
+  applied?: boolean;
+  error?: string;
 }
 
 export interface IndexedDbVaultOptions {
@@ -255,6 +262,84 @@ export class WasmV2PakePairInitiator {
   free(): void;
 }
 
+export interface GroupMemberView {
+  device_id: string;
+  name: string;
+  caps: string[];
+  endpoints: string[];
+}
+
+export interface GroupView {
+  group_id: string;
+  name: string;
+  seq: number;
+  min_wire_version: number;
+  expires_at: string;
+  members: GroupMemberView[];
+  revoked: string[];
+}
+
+export interface GroupIngestOutcome {
+  group_id: string;
+  seq: number;
+  status: "created" | "updated" | "unchanged";
+  newly_revoked: string[];
+  newly_joined: string[];
+  removed: string[];
+}
+
+export interface GroupBroadcastReport {
+  delivered: string[];
+  offline: string[];
+  failed: [string, string][];
+}
+
+export type GroupEvent =
+  | { event: "app_data"; sender_device_id: string; payload_b64: string }
+  | { event: "manifest_updated"; seq: number }
+  | { event: "member_joined"; device_id: string }
+  /** A peer left the group, or the local device itself did (then the group stops all delivery). */
+  | { event: "member_revoked"; device_id: string }
+  | { event: "audit"; audit: unknown };
+
+export interface GroupSession {
+  readonly peerDeviceId: string | null;
+  isClosed(): boolean;
+  sendData(payload: Uint8Array): Promise<void>;
+  pollEvent?(timeoutMs?: number): Promise<PollEvent>;
+}
+
+export interface TendrilWebGroupOptions {
+  /** Supplies a session for a recipient with none attached; resolve null when unreachable. */
+  sessionFor?: ((peerId: string) => Promise<GroupSession | null> | GroupSession | null) | null;
+  concurrency?: number;
+  sendTimeoutMs?: number;
+  pumpPollMs?: number;
+}
+
+/**
+ * Group fan-out and inbound delivery over the app's sessions. Obtain one with
+ * `TendrilWebClient.openGroup()`. All group policy is decided in WASM.
+ */
+export class TendrilWebGroup {
+  private constructor();
+  readonly groupId: string;
+  isClosed(): boolean;
+  members(): GroupView;
+  /** Returns true, or throws the core error ("group authorization denied: ..."). */
+  authorizePeer(peerId: string, cap: string): true;
+  /** Registers an established session and starts delivering its inbound group data. */
+  attach(session: GroupSession): string;
+  detach(peerId: string): void;
+  handleSessionEvent(session: GroupSession, event: PollEvent | Record<string, unknown>): Promise<void>;
+  /** Rejects once the local device is no longer an active, unrevoked member. */
+  broadcast(data: Uint8Array | string, requiredCap?: string | null): Promise<GroupBroadcastReport>;
+  on(name: GroupEvent["event"] | "*", fn: (event: GroupEvent) => void): () => boolean;
+  /** Resolves the next event, or null on timeout or once closed. */
+  pollEvent(timeoutMs?: number): Promise<GroupEvent | null>;
+  close(): void;
+}
+
 export class WasmV2SessionInitiator {
   constructor(
     identity: unknown,
@@ -275,6 +360,8 @@ export class WasmV2SessionInitiator {
   rekey(now_ms: number): Uint8Array;
   close(code: number, reason: string, now_ms: number): Uint8Array;
   tick(now_unix: number, now_ms: number, roster: unknown): Uint8Array;
+  peer_device_id(): string | undefined;
+  apply_group_rendezvous(book: unknown, roster: unknown, now_unix: number): string;
   is_established(): boolean;
   is_closed(): boolean;
   free(): void;
@@ -288,6 +375,10 @@ export interface TendrilWebClientOptions {
   rosterBytes?: Uint8Array | null;
   onPersistRoster?: ((rosterJson: string) => void | Promise<void>) | null;
   onPersistRosterBytes?: ((rosterBytes: Uint8Array) => void | Promise<void>) | null;
+  groupBookJson?: string | null;
+  groupBookBytes?: Uint8Array | null;
+  onPersistGroupBook?: ((groupBookJson: string) => void | Promise<void>) | null;
+  onPersistGroupBookBytes?: ((groupBookBytes: Uint8Array) => void | Promise<void>) | null;
 }
 
 export interface WebTransportDialOptions {
@@ -331,6 +422,26 @@ export class TendrilWebClient {
   ): string;
   pairingFloor(staticPub: Uint8Array | string): number;
   peerV2Summary(peerId: string): PeerV2Summary;
+  exportGroupBookJson(): string;
+  exportGroupBookBytes(): Uint8Array;
+  groupIds(): string[];
+  groupMembers(groupId: string): GroupView;
+  /** Returns true, or throws the core error ("group authorization denied: ..."). */
+  groupAuthorizePeer(groupId: string, peerId: string, cap: string): true;
+  /**
+   * Hands a manifest (JSON string or object) or a `group_manifest_unverified` session event
+   * received on `session` to the WASM group book, which verifies and pins it.
+   */
+  ingestGroupManifest(
+    manifestOrEvent: string | object,
+    session: { readonly peerDeviceId: string | null }
+  ): Promise<GroupIngestOutcome>;
+  /**
+   * Opens fan-out and inbound delivery for a group whose manifest is already ingested. The
+   * browser is a member-side endpoint: root-side create, add, remove, and admin `sync` are not
+   * available, and there is no inbound listener.
+   */
+  openGroup(groupId: string, options?: TendrilWebGroupOptions): TendrilWebGroup;
   enroll(
     options: WebTransportDialOptions & {
       hostId: string;
@@ -379,6 +490,8 @@ export class TendrilWebClient {
 
 export class TendrilWebSession {
   private constructor();
+  /** Device id derived from the static key authenticated by the handshake. */
+  readonly peerDeviceId: string | null;
   isEstablished(): boolean;
   isClosed(): boolean;
   sendData(payload: Uint8Array | string): Promise<void>;

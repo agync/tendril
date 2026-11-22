@@ -1,4 +1,5 @@
 import initWasm, {
+  WasmGroupBook,
   WasmIdentity,
   WasmPairInitiator,
   WasmRoster,
@@ -28,6 +29,7 @@ import {
   dialRelayV2Stream,
   validateRelayWsUrl,
 } from "./relay.js";
+import { TendrilWebGroup } from "./group.js";
 import { createIndexedDbVault, openTendrilVault } from "./vault.js";
 
 export {
@@ -35,6 +37,7 @@ export {
   MAX_QUEUED_FRAMES,
   MAX_RELAY_FRAME_LEN,
   RelayStream,
+  TendrilWebGroup,
   createIndexedDbVault,
   dialRelayStream,
   dialRelayV2Stream,
@@ -360,22 +363,40 @@ export { WasmV2PakePairInitiator, WasmV2SessionInitiator };
 export class TendrilWebClient {
   #identity;
   #roster;
+  #groups;
   #onPersistRoster;
   #onPersistRosterBytes;
+  #onPersistGroupBook;
+  #onPersistGroupBookBytes;
+  #openGroups = new Set();
+  #groupPersistChain = Promise.resolve();
+  #groupMutationLock = Promise.resolve();
   #freed = false;
   #wasmFreed = false;
   #holders = 0;
   #activeSessions = new Set();
   #persistChain = Promise.resolve();
 
-  constructor(token, identity, roster, onPersistRoster, onPersistRosterBytes = null) {
+  constructor(
+    token,
+    identity,
+    roster,
+    onPersistRoster,
+    onPersistRosterBytes = null,
+    groups = null,
+    onPersistGroupBook = null,
+    onPersistGroupBookBytes = null
+  ) {
     if (token !== CLIENT_TOKEN) {
       throw new Error("Use TendrilWebClient.create()");
     }
     this.#identity = identity;
     this.#roster = roster;
+    this.#groups = groups;
     this.#onPersistRoster = onPersistRoster;
     this.#onPersistRosterBytes = onPersistRosterBytes;
+    this.#onPersistGroupBook = onPersistGroupBook;
+    this.#onPersistGroupBookBytes = onPersistGroupBookBytes;
   }
 
   static async create({
@@ -386,6 +407,10 @@ export class TendrilWebClient {
     rosterBytes = null,
     onPersistRoster = null,
     onPersistRosterBytes = null,
+    groupBookJson = null,
+    groupBookBytes = null,
+    onPersistGroupBook = null,
+    onPersistGroupBookBytes = null,
   } = {}) {
     try {
       await initTendril();
@@ -416,12 +441,32 @@ export class TendrilWebClient {
         identity.free();
         throw err;
       }
+      let groups;
+      try {
+        if (groupBookBytes !== null && groupBookBytes !== undefined) {
+          if (!(groupBookBytes instanceof Uint8Array)) {
+            throw new TypeError("groupBookBytes must be a Uint8Array");
+          }
+          groups = WasmGroupBook.from_json_bytes(identity, groupBookBytes);
+        } else if (groupBookJson) {
+          groups = WasmGroupBook.from_json(identity, groupBookJson);
+        } else {
+          groups = new WasmGroupBook(identity);
+        }
+      } catch (err) {
+        identity.free();
+        roster.free();
+        throw err;
+      }
       return new TendrilWebClient(
         CLIENT_TOKEN,
         identity,
         roster,
         onPersistRoster,
-        onPersistRosterBytes
+        onPersistRosterBytes,
+        groups,
+        onPersistGroupBook,
+        onPersistGroupBookBytes
       );
     } finally {
       if (identityBytes instanceof Uint8Array) {
@@ -429,6 +474,9 @@ export class TendrilWebClient {
       }
       if (rosterBytes instanceof Uint8Array) {
         rosterBytes.fill(0);
+      }
+      if (groupBookBytes instanceof Uint8Array) {
+        groupBookBytes.fill(0);
       }
     }
   }
@@ -456,6 +504,7 @@ export class TendrilWebClient {
       this.#wasmFreed = true;
       this.#identity.free();
       this.#roster.free();
+      this.#groups.free();
     }
   }
 
@@ -629,6 +678,187 @@ export class TendrilWebClient {
   peerV2Summary(peerId) {
     this.#ensureOpen();
     return JSON.parse(this.#roster.peer_v2_summary(peerId));
+  }
+
+  exportGroupBookJson() {
+    this.#ensureOpen();
+    return this.#groups.to_json();
+  }
+
+  exportGroupBookBytes() {
+    this.#ensureOpen();
+    return this.#groups.to_json_bytes();
+  }
+
+  #hasGroupPersistCallback() {
+    return (
+      typeof this.#onPersistGroupBookBytes === "function" ||
+      typeof this.#onPersistGroupBook === "function"
+    );
+  }
+
+  #snapshotGroupBytes() {
+    return this.#hasGroupPersistCallback() ? this.#groups.to_json_bytes() : null;
+  }
+
+  #restoreGroupBytes(prevBytes) {
+    if (prevBytes && !this.#wasmFreed) {
+      try {
+        this.#groups.replace_from_json_bytes(prevBytes);
+      } catch {}
+    }
+  }
+
+  #persistGroupBook() {
+    const fnBytes = this.#onPersistGroupBookBytes;
+    const fnStr = this.#onPersistGroupBook;
+    if (typeof fnBytes !== "function" && typeof fnStr !== "function") {
+      return Promise.resolve();
+    }
+    const run = this.#groupPersistChain.then(async () => {
+      if (this.#wasmFreed) {
+        throw new Error("TendrilWebClient has been freed");
+      }
+      if (typeof fnBytes === "function") {
+        const bytes = this.#groups.to_json_bytes();
+        try {
+          await fnBytes(bytes);
+        } finally {
+          bytes.fill(0);
+        }
+        return;
+      }
+      await fnStr(this.#groups.to_json());
+    });
+    this.#groupPersistChain = run.catch(() => {});
+    return run;
+  }
+
+  /**
+   * Serializes every group book mutation (snapshot, apply, persist, restore on failure) so a
+   * failed persist can never restore a snapshot that erases a concurrent mutation.
+   */
+  #mutateGroupBook(fn) {
+    const run = this.#groupMutationLock.then(() => this.#mutateGroupBookLocked(fn));
+    this.#groupMutationLock = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
+  }
+
+  /** Runs `fn` against the group book and persists the result, restoring state on failure. */
+  async #mutateGroupBookLocked(fn) {
+    if (this.#wasmFreed) {
+      throw new Error("TendrilWebClient has been freed");
+    }
+    const prev = this.#snapshotGroupBytes();
+    try {
+      const result = fn();
+      try {
+        await this.#persistGroupBook();
+      } catch (err) {
+        this.#restoreGroupBytes(prev);
+        throw err;
+      }
+      return result;
+    } catch (err) {
+      this.#restoreGroupBytes(prev);
+      throw err;
+    } finally {
+      if (prev) {
+        prev.fill(0);
+      }
+    }
+  }
+
+  groupIds() {
+    this.#ensureOpen();
+    return JSON.parse(this.#groups.group_ids_json());
+  }
+
+  groupMembers(groupId) {
+    this.#ensureOpen();
+    return JSON.parse(this.#groups.members(groupId));
+  }
+
+  groupAuthorizePeer(groupId, peerId, cap) {
+    this.#ensureOpen();
+    this.#groups.authorize_peer(this.#roster, groupId, peerId, cap, nowUnixSecs());
+    return true;
+  }
+
+  /**
+   * Hands a manifest, or a `group_manifest_unverified` session event, received on `session` to the
+   * WASM group book. The group book verifies it and applies the first-contact pinning rules
+   * against the authenticated peer of `session`; gossip never pins a group.
+   */
+  async ingestGroupManifest(manifestOrEvent, session) {
+    return this.#withHold(async () => {
+      const sender = session?.peerDeviceId;
+      if (typeof sender !== "string" || sender.length === 0) {
+        throw new Error("manifest must arrive on an established authenticated session");
+      }
+      const isEvent =
+        typeof manifestOrEvent === "object" &&
+        manifestOrEvent !== null &&
+        manifestOrEvent.event === "group_manifest_unverified";
+      const text =
+        typeof manifestOrEvent === "string" ? manifestOrEvent : JSON.stringify(manifestOrEvent);
+      const outcome = await this.#mutateGroupBook(() =>
+        JSON.parse(
+          isEvent
+            ? this.#groups.ingest_manifest_event(this.#roster, sender, text, nowUnixSecs())
+            : this.#groups.ingest_manifest(this.#roster, sender, text, nowUnixSecs())
+        )
+      );
+      for (const group of [...this.#openGroups]) {
+        group._onManifestOutcome(outcome);
+      }
+      return outcome;
+    });
+  }
+
+  /** Opens fan-out and inbound delivery for a group whose manifest is already ingested. */
+  openGroup(groupId, options = {}) {
+    this.#ensureOpen();
+    this.#groups.check_local_member(this.#roster, groupId);
+    const roster = this.#roster;
+    const book = this.#groups;
+    const targets = (cap) =>
+      JSON.parse(book.broadcast_targets(roster, groupId, cap ?? null, nowUnixSecs()));
+    const backend = {
+      members: () => this.groupMembers(groupId),
+      authorize: (peerId, cap) => this.groupAuthorizePeer(groupId, peerId, cap),
+      authorizeInbound: (peerId, cap) =>
+        book.authorize_inbound(roster, groupId, peerId, cap, nowUnixSecs()),
+      checkLocal: () => book.check_local_member(roster, groupId),
+      localDeviceId: () => book.local_device_id(),
+      targets,
+      canSend: (peerId, cap) => {
+        if (!targets(cap).includes(peerId)) {
+          throw new Error("recipient is no longer authorized");
+        }
+      },
+      ingestManifest: (session, event) => this.ingestGroupManifest(event, session),
+    };
+    const group = TendrilWebGroup._create(groupId, backend, options, (g) =>
+      this.#openGroups.delete(g)
+    );
+    this.#openGroups.add(group);
+    return group;
+  }
+
+  async #applyGroupRendezvous(wasmSession) {
+    return this.#withHold(() =>
+      this.#mutateGroupBook(() =>
+        JSON.parse(wasmSession.apply_group_rendezvous(this.#groups, this.#roster, nowUnixSecs()))
+      )
+    );
+  }
+
+  #groupHook() {
+    return { applyRendezvous: (wasmSession) => this.#applyGroupRendezvous(wasmSession) };
   }
 
   async enroll({
@@ -1147,7 +1377,9 @@ export class TendrilWebClient {
               releaseSession();
               releaseSession = null;
             }
-          }
+          },
+          false,
+          this.#groupHook()
         );
         releaseSession = this.#attachSession(webSession);
         handedOff = true;
@@ -1292,7 +1524,8 @@ export class TendrilWebClient {
               releaseSession = null;
             }
           },
-          true
+          true,
+          this.#groupHook()
         );
         releaseSession = this.#attachSession(webSession);
         handedOff = true;
@@ -1314,6 +1547,9 @@ export class TendrilWebClient {
       return;
     }
     this.#freed = true;
+    for (const group of [...this.#openGroups]) {
+      group.close();
+    }
     for (const sess of [...this.#activeSessions]) {
       sess._abortFromClientFree();
     }
@@ -1330,6 +1566,8 @@ export class TendrilWebSession {
   #onRelease;
   #queue;
   #isV2;
+  #peerDeviceId;
+  #groupHook;
   #sendChain = Promise.resolve();
   #recvChain = Promise.resolve();
   #closing = false;
@@ -1346,7 +1584,8 @@ export class TendrilWebSession {
     persistFn,
     initialEvents = [],
     onRelease = null,
-    isV2 = false
+    isV2 = false,
+    groupHook = null
   ) {
     if (token !== SESSION_TOKEN) {
       throw new Error("Use TendrilWebClient.connect()");
@@ -1359,6 +1598,38 @@ export class TendrilWebSession {
     this.#onRelease = onRelease;
     this.#queue = [...initialEvents];
     this.#isV2 = Boolean(isV2);
+    this.#groupHook = groupHook;
+    this.#peerDeviceId =
+      typeof session.peer_device_id === "function" ? (session.peer_device_id() ?? null) : null;
+  }
+
+  /** Device id derived from the static key authenticated by the handshake. */
+  get peerDeviceId() {
+    return this.#peerDeviceId;
+  }
+
+  async #applyGroupEvents(events) {
+    if (!this.#groupHook || !events.some((ev) => ev.event === "group_rendezvous_unverified")) {
+      return;
+    }
+    let result;
+    try {
+      result = await this.#groupHook.applyRendezvous(this.#session);
+    } catch (err) {
+      this.#failPersistAndClose(err);
+      throw new Error(`failed to persist group update: ${err.message || err}`, { cause: err });
+    }
+    for (const ev of events) {
+      if (ev.event !== "group_rendezvous_unverified") {
+        continue;
+      }
+      const match = (r) => r.group_id === ev.group_id && r.seq === ev.seq;
+      const rejected = result.rejected.find(match);
+      ev.applied = !rejected && result.applied.some(match);
+      if (rejected) {
+        ev.error = rejected.error;
+      }
+    }
   }
 
   #elapsedMs() {
@@ -1569,6 +1840,7 @@ export class TendrilWebSession {
           }
           const events = JSON.parse(this.#session.drain_events_json());
           if (events && events.length > 0) {
+            await this.#applyGroupEvents(events);
             if (events.some((ev) => ev.event === "revocation_updated")) {
               try {
                 await this.#persist();
@@ -1588,6 +1860,7 @@ export class TendrilWebSession {
           await sendProtocolBytes(this.#stream, b64urlDecode(step.write_b64));
         }
         if (step.events && step.events.length > 0) {
+          await this.#applyGroupEvents(step.events);
           if (step.events.some((ev) => ev.event === "revocation_updated")) {
             try {
               await this.#persist();
