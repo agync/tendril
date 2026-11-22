@@ -1298,6 +1298,7 @@ test("TendrilWebSession v2 tick() self-terminates when grant expires", async () 
       allowInsecureWs: true,
     });
     await acceptPromise;
+    assert.match(sess.peerDeviceId, /^dev_/);
 
     await new Promise((r) => setTimeout(r, 1500));
     await assert.rejects(() => sess.tick(), /expired|grant|closed/i);
@@ -1844,3 +1845,4 @@ test("PRIV-09 createIndexedDbVault encrypts with non-extractable AES-256-GCM and
     assert.match(dts, declRe, `index.d.ts missing export declaration for '${name}'`);
   }
 });
+import "./group.test.mjs";
