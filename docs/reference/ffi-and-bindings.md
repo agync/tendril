@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: FFI ABI and cross-language bindings
-description: Callback-free C ABI surface, thin Go/Python/Node bindings, and Gate #7 binary size and FFI latency baselines.
+description: Callback-free C ABI surface, group mesh calls, thin Go/Python/Node bindings, and Gate #7 binary size and FFI latency baselines.
 status: stable
 tags: [reference, ffi, bindings]
 ---
@@ -43,6 +43,70 @@ Host app (Go / Python / Node.js)
 - `TENDRIL_WOULD_BLOCK` (`1`): timed poll completed with no queued event ready.
 - `TENDRIL_EOF` (`2`): peer stream ended cleanly.
 - Negative codes (`TENDRIL_ERR_INVALID_ARG` `-1`, `TENDRIL_ERR_NOT_FOUND` `-2`, `TENDRIL_ERR_CLOSED` `-5`, `TENDRIL_ERR_PROTOCOL` `-6`, `TENDRIL_ERR_INTERNAL` `-7`): error details are readable via `tendril_last_error`.
+
+## Group mesh C ABI
+
+Small peer mesh groups ([design](../design/groups.md), `spec/groups-v1.md`) reach host languages as thin calls over `tendril-runtime` (`GroupPool`, `GroupHub`, and the admin facade). Bindings never build manifests, evaluate authorization, or see the rendezvous key or pairwise secrets. Admin calls return public manifest JSON only, and every group API needs an endpoint with a state directory (`"groups require a state directory endpoint"`, `TENDRIL_ERR_INVALID_ARG`).
+
+| Function | Purpose |
+|---|---|
+| `tendril_group_create(ep, name, min_wire_version, endpoints_json, out_manifest_json)` | Root creates a group and persists manifest and secrets |
+| `tendril_group_add_member(ep, group_id, peer_id, caps_json, endpoints_json, out_manifest_json)` | Add a roster peer with a known signing key; `caps_json` and `endpoints_json` are null or a JSON array of strings |
+| `tendril_group_remove_member(ep, group_id, peer_id, out_manifest_json)` | Revoke the member and rotate the rendezvous key |
+| `tendril_group_ingest_manifest(ep, manifest_json, sender_peer_id, out_group_id)` | Ingest a manifest from an authenticated peer; `sender_peer_id` must be the peer that delivered it, and first-contact pinning (F11) applies |
+| `tendril_group_open(ep, group_id, listen_addr, out_group)` | Open a `TendrilGroup *`; `listen_addr` may be NULL, otherwise a direct listener is bound and served |
+| `tendril_group_local_endpoint(group, out_endpoint)` | Endpoint bound by `listen_addr`, or `*out_endpoint == NULL` when none |
+| `tendril_group_sync(group, out_report_json)` | Admin push of manifest and rendezvous key to members; needed for Wire v2 groups |
+| `tendril_group_broadcast(group, required_cap, data_ptr, data_len, out_report_json)` | Fan out to members; NULL `required_cap` means `group.send:<group_id>`; report is `{delivered, offline, failed}` with `failed` as `[device_id, error]` pairs |
+| `tendril_group_poll_event(group, timeout_ms, out_event_json)` | `TENDRIL_OK` with an event, `TENDRIL_WOULD_BLOCK` on timeout, `TENDRIL_EOF` once the pool is closed; a parked poll returns `TENDRIL_EOF` promptly when the handle closes |
+| `tendril_group_authorize_peer(group, peer_id, cap)` | `TENDRIL_OK` when the peer holds `cap`; any refusal sets the last error |
+| `tendril_group_close(group)`, `tendril_group_free(group)` | Idempotent close, then free |
+
+**Ownership.** Free every `char **` out string with `tendril_string_free`. `tendril_group_close` is idempotent, releases the handle's `listen_addr` listener so the port is reusable, and later calls on the handle (including `tendril_group_poll_event`) return `TENDRIL_ERR_CLOSED`; `tendril_endpoint_close` shuts down the group hub; `tendril_group_free` is safe after close and must not race with other calls on the handle. The FFI adds a p2p dialer (feature `p2p-iroh`) only when a p2p relay mode is configured explicitly or `TENDRIL_P2P_LOCAL=1` is set. The first `tendril_group_open` on an endpoint routes its inbound session streams through the group hub, so configure transports before it. Ordinary sessions still arrive through `tendril_session_accept` and `tendril_session_accept_v2`. A call already parked in either accept function when the first group opens switches to the group channels at once, and the hub registers every stored group before it handles a stream.
+
+**Python and Node.** `group_open` and `groupOpen` build a standalone `GroupPool` per call and run no hub, so inbound sibling sessions are accepted only on that group's own `listen_addr`; pass one on every member that must be dialed. Admin onboarding also works through ordinary sessions the host accepts and polls. A p2p dialer for `iroh://` member endpoints is added only when a p2p relay mode is configured explicitly or `TENDRIL_P2P_LOCAL=1` is set, as in the FFI; other `p2p_*` settings alone never add one. `Endpoint.close` closes every group still open on the endpoint, and later calls on those groups fail with `group is closed`.
+
+**Relay limits.** Sibling links over a `/v2/relay` mailbox are not implemented: manifest endpoints of that form are not dialed and no group mailbox listener exists. Use direct, local, overlay, broker, p2p, or `/v1/relay` endpoints. See [Small peer mesh groups](../design/groups.md#known-limitations).
+
+**Error mapping.** `GroupNotFound` and unknown peers return `TENDRIL_ERR_NOT_FOUND`, a closed pool or handle returns `TENDRIL_ERR_CLOSED`, I/O and storage failures return `TENDRIL_ERR_INTERNAL`, malformed arguments (including a store-less endpoint) return `TENDRIL_ERR_INVALID_ARG`, and every other core refusal (for example `GroupUnauthorized`, `GroupSeqRollback`, `GroupManifestFork`) returns `TENDRIL_ERR_PROTOCOL`. The core error name and message are preserved in `tendril_last_error`.
+
+**Group event JSON** (`tendril_group_poll_event`):
+
+| `event` | Fields |
+|---|---|
+| `app_data` | `sender_device_id`, `payload_b64` (base64url) |
+| `manifest_updated` | `seq` |
+| `member_joined`, `member_revoked` | `device_id` |
+| `audit` | `audit` (denied or dropped inbound action) |
+
+**Session event JSON** (`tendril_session_poll_event`). Group frames received on an ordinary session are ingested by the runtime (`handle_session_group_frame`) on endpoints with a state directory, so first-contact pinning, admin authority, and the removed-device refusal apply unchanged. The binding only reports a redacted outcome:
+
+| `event` | Fields |
+|---|---|
+| `group_manifest_ingested`, `group_manifest_rejected` | `group_id`, `seq`, `error` (rejections only) |
+| `group_rendezvous_ingested`, `group_rendezvous_rejected` | `group_id`, `seq`, `error` (rejections only); the key is never included |
+| `group_manifest_unverified` | Store-less endpoints only: `group_id`, `seq`, `manifest_json` (input to `group_ingest_manifest`) |
+| `group_rendezvous_unverified` | Store-less endpoints only: `group_id`, `seq` |
+
+### Per-language group surface
+
+| Operation | Go (`Endpoint`, `Group`) | Python (`Endpoint`, `Group`) | Node (`Endpoint`, `Group`) | Kotlin (`TendrilEndpoint`, `TendrilGroup`) | Swift (`TendrilEndpoint`, `TendrilGroup`) |
+|---|---|---|---|---|---|
+| Create | `GroupCreate` | `group_create` | `groupCreate` | `groupCreate` | `groupCreate` |
+| Add member | `GroupAddMember` | `group_add_member` | `groupAddMember` | `groupAddMember` | `groupAddMember` |
+| Remove member | `GroupRemoveMember` | `group_remove_member` | `groupRemoveMember` | `groupRemoveMember` | `groupRemoveMember` |
+| Ingest manifest | `GroupIngestManifest` | `group_ingest_manifest` | `groupIngestManifest` | `groupIngestManifest` | `groupIngestManifest` |
+| Open (optional `listen_addr`) | `OpenGroup` | `group_open` | `groupOpen` | `openGroup` | `openGroup` |
+| Local endpoint | `LocalEndpoint()` | `local_endpoint` | `localEndpoint` | `localEndpoint()` | `localEndpoint()` |
+| Sync | `Sync()` | `sync()` | `sync()` | `sync()` | `sync()` |
+| Broadcast | `Broadcast(data, requiredCap)` | `broadcast(data, required_cap=None)` | `broadcast(data, requiredCap?)` | `broadcast(data, requiredCap)` | `broadcast(data, requiredCap:)` |
+| Poll event | `PollEvent(ms)`: `(nil, nil)` on timeout, `io.EOF` when closed | `poll_event(timeout_ms=5000)`: `None` on timeout | `pollEvent(timeoutMs?)`: `null` on timeout | `pollEvent(ms)`: `null` on timeout, throws when closed | `pollEvent(timeoutMs:)`: `nil` on timeout, throws `.eof` when closed |
+| Authorize peer | `AuthorizePeer` returns an error on refusal | `authorize_peer` returns `True` or raises | `authorizePeer` returns `true` or throws | `authorizePeer` throws on refusal | `authorizePeer` throws on refusal |
+| Close | `Close()` (idempotent, finalizer-safe) | `close()` and context manager; `Endpoint.close()` also closes open groups | `close()`; `Endpoint.close()` also closes open groups | `close()` (`Closeable`) | `close()` |
+
+Create, add, and remove return manifest JSON strings and ingest returns the group id in every binding. Python, Node, Kotlin, and Swift return report and event JSON strings as-is, while Go decodes broadcast and sync reports into `BroadcastReport` and polled events into `GroupEvent` (with `Payload()` to decode `payload_b64`). Errors keep the core name and message in each binding's native type: a Go `error` carrying the FFI code, Python `RuntimeError`, a Node generic-failure `Error`, Kotlin `IllegalStateException` or `IllegalArgumentException`, and Swift `TendrilError`.
+
+Sealed, store-less mobile endpoints (Kotlin `TendrilEndpoint.create`, Swift `TendrilEndpoint(stateDir:)` on Apple platforms) cannot host groups yet and fail with the invalid-argument error above. The Kotlin and Swift group sources compile against the same header but are not verified on Linux CI. The browser has a separate member-only surface; see [Web and mobile bindings](web-and-mobile.md).
 
 ## Language bindings summary
 
