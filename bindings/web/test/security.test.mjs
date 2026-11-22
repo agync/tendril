@@ -1631,20 +1631,33 @@ test("PRIV-08 demo/server.mjs allows /v2/relay upgrade while rejecting query str
   }
 });
 
-test("PRIV-01 dialIrohStream fails closed when p2pRelayAuthToken is passed without explicit relay or ?relay=", async () => {
+test("PRIV-01 dialIrohStream fails closed when p2pRelayAuthToken is passed without explicit relay", async () => {
   const p2pWasmPath = path.join(WEB_ROOT, "pkg-p2p", "tendril_wasm_bg.wasm");
   await initTendrilP2p({ module_or_path: fs.readFileSync(p2pWasmPath) });
-  const sampleEndpoint = `iroh://${"0".repeat(64)}`;
-  const tok = new TextEncoder().encode("scoped-bearer-secret");
+  const bareEndpoint = `iroh://${"0".repeat(64)}`;
+  const attackerUriWithRelay = `${bareEndpoint}?relay=https://attacker.example/`;
+
+  const tok1 = new TextEncoder().encode("scoped-bearer-secret-1");
   await assert.rejects(
     () =>
       dialIrohStream({
-        endpoint: sampleEndpoint,
-        p2pRelayAuthToken: tok,
+        endpoint: bareEndpoint,
+        p2pRelayAuthToken: tok1,
       }),
     /refusing to attach bearer token/i
   );
-  assert.equal(tok.every((b) => b === 0), true, "p2pRelayAuthToken Uint8Array must be zeroized");
+  assert.equal(tok1.every((b) => b === 0), true, "p2pRelayAuthToken tok1 must be zeroized");
+
+  const tok2 = new TextEncoder().encode("scoped-bearer-secret-2");
+  await assert.rejects(
+    () =>
+      dialIrohStream({
+        endpoint: attackerUriWithRelay,
+        p2pRelayAuthToken: tok2,
+      }),
+    /refusing to attach bearer token/i
+  );
+  assert.equal(tok2.every((b) => b === 0), true, "p2pRelayAuthToken tok2 must be zeroized");
 });
 
 test("PRIV-07 byte-slice identity, roster, and PAKE code APIs zeroize caller buffers", async () => {

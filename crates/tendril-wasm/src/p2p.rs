@@ -345,6 +345,12 @@ fn resolve_dial_with_options_relay_mode(
         let map = build_relay_map_wasm(&urls, auth_token)?;
         return Ok((RelayMode::Custom(map), false));
     }
+    if auth_token.is_some() {
+        return Err(
+            "p2pRelayAuthToken requires explicit p2pRelayUrls or relayUrlOverride; refusing to attach bearer token to default n0 or peer URI ?relay= hosts"
+                .to_owned(),
+        );
+    }
     let addr_relays: Vec<RelayConfig> = addr.relay_urls().cloned().map(RelayConfig::from).collect();
     if addr_relays.len() > MAX_P2P_RELAY_URLS {
         return Err(format!(
@@ -352,18 +358,7 @@ fn resolve_dial_with_options_relay_mode(
         ));
     }
     if !addr_relays.is_empty() {
-        let map = RelayMap::from_iter(addr_relays);
-        let map = match auth_token {
-            Some(tok) => map.with_auth_token(tok),
-            None => map,
-        };
-        return Ok((RelayMode::Custom(map), false));
-    }
-    if auth_token.is_some() {
-        return Err(
-            "p2pRelayAuthToken requires explicit p2pRelayUrls, relayUrlOverride, or ?relay= in endpoint URI; refusing to attach bearer token to default public n0 relays"
-                .to_owned(),
-        );
+        return Ok((RelayMode::Custom(RelayMap::from_iter(addr_relays)), false));
     }
     Ok((RelayMode::Default, true))
 }
@@ -551,15 +546,26 @@ mod tests {
             .expect_err("must fail closed");
         assert!(err.contains("refusing to attach bearer token"));
 
-        // dial_with_options() with auth_token and ?relay= builds Custom RelayMap and disables n0 DNS
-        let (mode_tok, allow_n0_tok) =
+        // dial_with_options() with auth_token and ?relay= only (NO explicit p2pRelayUrls) MUST ALSO fail closed
+        let err_relay_only =
             resolve_dial_with_options_relay_mode(&with_relay, None, Some("secret-bearer"))
-                .expect("token with ?relay=");
+                .expect_err("must fail closed on ?relay= without explicit p2pRelayUrls");
+        assert!(err_relay_only.contains("refusing to attach bearer token"));
+
+        // dial_with_options() with explicit p2pRelayUrls and auth_token ignores ?relay= and binds only trusted URLs
+        let trusted_url = RelayUrl::from_str("https://trusted.relay.example/").unwrap();
+        let (mode_tok, allow_n0_tok) = resolve_dial_with_options_relay_mode(
+            &with_relay,
+            Some("[\"https://trusted.relay.example/\"]"),
+            Some("secret-bearer"),
+        )
+        .expect("token with explicit p2pRelayUrls");
         assert!(!allow_n0_tok);
         match mode_tok {
             RelayMode::Custom(map) => {
                 assert_eq!(map.len(), 1);
-                assert!(map.get(&expected_url).is_some());
+                assert!(map.get(&trusted_url).is_some());
+                assert!(map.get(&expected_url).is_none());
             }
             other => panic!("expected RelayMode::Custom, got {other:?}"),
         }
