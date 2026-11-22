@@ -3654,3 +3654,220 @@ fn pq_hybrid_kem_and_half_tampered_signature_adversarial_suite() {
         Err(CoreError::HostKeyUnverified)
     );
 }
+
+mod group_mesh {
+    use tendril_core::crypto::{SigningKeypair, StaticKeypair, device_id};
+    use tendril_core::error::CoreError;
+    use tendril_core::group::{
+        GroupBook, GroupBuildParams, GroupManifest, GroupMember, GroupSigner,
+        MAX_GROUP_MANIFEST_LEN, MAX_GROUP_MEMBERS, V2GroupSecrets, add_member, create_group,
+        group_id_from_root, issue_admin_grant, remove_member, sign_group_manifest,
+        verify_group_manifest,
+    };
+    use tendril_core::wire::{InnerFrameType, decode_inner_frame, encode_inner_frame};
+
+    const NOW: u64 = super::NOW_UNIX;
+
+    struct Dev {
+        st: StaticKeypair,
+        sk: SigningKeypair,
+    }
+
+    impl Dev {
+        fn new(seed: u8) -> Self {
+            let mut scalar = [seed; 32];
+            scalar[0] = seed ^ 0x33;
+            Self {
+                st: StaticKeypair::from_scalar(scalar),
+                sk: SigningKeypair::from_seed([seed ^ 0xC0; 32]),
+            }
+        }
+
+        fn id(&self) -> String {
+            device_id(self.st.public_bytes())
+        }
+
+        fn member(&self, endpoints: Vec<String>, caps: Vec<String>) -> GroupMember {
+            GroupMember::new(
+                self.st.public_bytes(),
+                "dev",
+                self.sk.public_key(),
+                endpoints,
+                caps,
+            )
+        }
+    }
+
+    fn caps(gid: &str) -> Vec<String> {
+        vec![format!("group.send:{gid}"), format!("group.recv:{gid}")]
+    }
+
+    fn base() -> (Dev, String, GroupManifest, V2GroupSecrets) {
+        let root = Dev::new(1);
+        let gid = group_id_from_root(root.sk.public_key());
+        let (m, s) = create_group(
+            &root.sk,
+            "adv",
+            2,
+            root.member(vec![], caps(&gid)),
+            GroupBuildParams::new(NOW),
+        )
+        .unwrap();
+        (root, gid, m, s)
+    }
+
+    #[test]
+    fn group_manifest_adversarial_suite() {
+        let (root, gid, m1, s1) = base();
+        let params = GroupBuildParams::new(NOW);
+        let signer = GroupSigner::root(&root.sk);
+        let mut book = GroupBook::new();
+        book.ingest_group_manifest(&m1, NOW, None).unwrap();
+
+        // 33-member overflow.
+        let mut over = m1.unsigned();
+        for i in 0..MAX_GROUP_MEMBERS {
+            let d = Dev::new(20 + u8::try_from(i).unwrap());
+            over.members.push(d.member(vec![], caps(&gid)));
+        }
+        assert_eq!(over.members.len(), MAX_GROUP_MEMBERS + 1);
+        let m = sign_group_manifest(over, &root.sk).unwrap();
+        assert!(matches!(
+            verify_group_manifest(&m, NOW, None),
+            Err(CoreError::InvalidGroupManifest(_))
+        ));
+
+        // Cross-group capability injection and host-scope escape.
+        for bad in [
+            "group.recv:grp_0000000000000000",
+            "fs.read:/etc/shadow",
+            "shell.exec",
+        ] {
+            let mut u = m1.unsigned();
+            u.members[0].caps = vec![bad.to_string()];
+            let m = sign_group_manifest(u, &root.sk).unwrap();
+            assert!(verify_group_manifest(&m, NOW, None).is_err(), "{bad}");
+        }
+
+        // Revoked omission and re-addition.
+        let victim = Dev::new(2);
+        let (m2, s2) =
+            add_member(&m1, &signer, victim.member(vec![], caps(&gid)), &s1, params).unwrap();
+        let (m3, s3) = remove_member(&m2, &signer, &victim.id(), &s2, params).unwrap();
+        book.ingest_group_manifest(&m2, NOW, None).unwrap();
+        book.ingest_group_manifest(&m3, NOW, None).unwrap();
+        let mut omit = m3.unsigned();
+        omit.seq = 4;
+        omit.revoked_members.clear();
+        let m = sign_group_manifest(omit, &root.sk).unwrap();
+        assert!(book.ingest_group_manifest(&m, NOW, None).is_err());
+        assert!(matches!(
+            add_member(&m3, &signer, victim.member(vec![], caps(&gid)), &s3, params),
+            Err(CoreError::GroupMemberRevoked(_))
+        ));
+
+        // Co-admin removing the founding root.
+        let admin = Dev::new(3);
+        let (m4, _s4) =
+            add_member(&m3, &signer, admin.member(vec![], caps(&gid)), &s3, params).unwrap();
+        book.ingest_group_manifest(&m4, NOW, None).unwrap();
+        let grant = issue_admin_grant(
+            &root.sk,
+            &root.id(),
+            &gid,
+            &admin.id(),
+            admin.sk.public_key(),
+            0,
+            params,
+        )
+        .unwrap();
+        let mut coup = m4.unsigned();
+        coup.seq = 5;
+        coup.members.retain(|m| m.device_id != root.id());
+        coup.signer_device_id = admin.id();
+        coup.signer_signing_pub = Some(admin.sk.public_key().to_b64url());
+        coup.admin_grant = Some(grant);
+        let m = sign_group_manifest(coup, &admin.sk).unwrap();
+        assert!(book.ingest_group_manifest(&m, NOW, None).is_err());
+        assert_eq!(book.manifest(&gid).unwrap().seq, 4);
+
+        // Wire floor 2 -> 1 downgrade.
+        let mut down = m4.unsigned();
+        down.seq = 5;
+        down.min_wire_version = 1;
+        let m = sign_group_manifest(down, &root.sk).unwrap();
+        assert!(matches!(
+            book.ingest_group_manifest(&m, NOW, None),
+            Err(CoreError::GroupWireDowngrade { .. })
+        ));
+
+        // Worst-case realistic 32-member manifest stays below the 32768 byte cap.
+        let mut full = m1.unsigned();
+        for i in 0..(MAX_GROUP_MEMBERS - 1) {
+            let d = Dev::new(60 + u8::try_from(i).unwrap());
+            let eps = vec![
+                "wss://relay-a.example.net/v2/relay".to_string(),
+                "iroh://abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
+            ];
+            let mut c = caps(&gid);
+            c.push(format!("sync.push:{gid}/notes"));
+            c.push(format!("kv.write:{gid}"));
+            full.members.push(d.member(eps, c));
+        }
+        let m = sign_group_manifest(full, &root.sk).unwrap();
+        let len = m.to_wire_bytes().unwrap().len();
+        assert!(len < MAX_GROUP_MANIFEST_LEN, "{len}");
+        verify_group_manifest(&m, NOW, None).unwrap();
+    }
+
+    #[test]
+    fn group_frames_fail_closed_on_wire() {
+        let oversize = vec![b'{'; MAX_GROUP_MANIFEST_LEN + 1];
+        assert!(matches!(
+            encode_inner_frame(InnerFrameType::GroupManifest, &oversize),
+            Err(CoreError::GroupManifestTooLarge { .. })
+        ));
+        for len in [0usize, 1, 59, 61, 4096] {
+            assert!(encode_inner_frame(InnerFrameType::GroupRendezvous, &vec![0; len]).is_err());
+            let mut raw = vec![0x0B];
+            raw.extend_from_slice(&vec![0u8; len]);
+            if len != 60 {
+                assert!(decode_inner_frame(&raw).is_err());
+            }
+        }
+        assert!(decode_inner_frame(&[0x0C, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn group_rendezvous_injection_by_non_admin_is_rejected() {
+        let (root, gid, m1, s1) = base();
+        let params = GroupBuildParams::new(NOW);
+        let member = Dev::new(2);
+        let (m2, s2) = add_member(
+            &m1,
+            &GroupSigner::root(&root.sk),
+            member.member(vec![], caps(&gid)),
+            &s1,
+            params,
+        )
+        .unwrap();
+        let mut book = GroupBook::new();
+        book.ingest_group_manifest(&m2, NOW, None).unwrap();
+        let forged = V2GroupSecrets::new([0xEE; 32], 2)
+            .to_rendezvous_frame(&gid)
+            .unwrap();
+        assert!(
+            book.ingest_group_rendezvous(&member.id(), &forged[..], NOW, None)
+                .is_err()
+        );
+        assert!(book.secrets(&gid).is_none());
+        let good = s2.to_rendezvous_frame(&gid).unwrap();
+        book.ingest_group_rendezvous(&root.id(), &good[..], NOW, None)
+            .unwrap();
+        assert!(
+            book.ingest_group_rendezvous(&member.id(), &forged[..], NOW, None)
+                .is_err()
+        );
+        assert_eq!(book.secrets(&gid), Some(&s2));
+    }
+}

@@ -18,7 +18,7 @@ A core library, language binding, or independent protocol implementation conform
 
 ## 2. Canonical Vector Files (`spec/vectors/`)
 
-Every vector file is generated deterministically from real cryptographic primitives (`cargo run -p tendril-core --example gen_vectors`) and verified independently by both Rust (`crates/tendril-core/tests/vectors.rs`) and Go (`spec/vectors/verify_go/vectors_test.go`).
+Every vector file is generated deterministically from real cryptographic primitives (`cargo run -p tendril-core --example gen_vectors`; `groups.json` uses `--example gen_group_vectors`) and verified independently by both Rust (`crates/tendril-core/tests/vectors.rs`) and Go (`spec/vectors/verify_go/vectors_test.go`).
 
 | File | Contents & Negative Cases |
 |---|---|
@@ -27,6 +27,7 @@ Every vector file is generated deterministically from real cryptographic primiti
 | `rotation.json` | Sequential hybrid signed `RotationRecord` links (`seq = 1`, `seq = 2`), exact 4031-byte raw signed payloads, plus a conflicting `seq = 2` fork vector that MUST trigger revocation |
 | `grants.json` | Unsorted input grant -> exact RFC 8785 JCS canonical bytes + hybrid Ed25519 / ML-DSA-65 signature; valid delegated child grant; invalid widened-scope child grant that MUST fail; signed `RevocationList` |
 | `handshake.json` | Deterministic `intent = pair` and `intent = session` `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` transcripts (`preamble`, `msg1` [1216 B], `msg2` carrying `HostHello.signing_pub`, post-`msg2` `h`, `pairing_sas`, `code_mac`, `msg3`, final hash, encrypted `DATA`, encrypted `REKEY`, and post-rekey encrypted `DATA`) |
+| `groups.json` | `group_id` derivation, six-manifest chain (root-signed and co-admin-signed with `admin_grant`) with exact JCS signed bytes and hybrid signatures, rejections (scope escape, cross-group capability, rollback, revoked re-add, co-admin removing the root, wire downgrade, 33 members, oversize, `group_id` mismatch, expiry, tampering), forged co-admin with a swapped key, bare admin grant, `seq = 2^53`, sequence jump, removal without revocation, co-admin rewriting the root entry, `%` and `\` in capability resources, and explicit `null` optionals, `pair_bootstrap` and `group_mailbox` HKDF outputs, the 60-byte `0x0B` frame, and `SessionHello.groups` |
 | `m2m_enrollment.json` | Signed single-use `pair.enroll` token, hybrid Ed25519 + ML-DSA-65 channel-binding `enroll_proof` (3373 B), post-`msg2` M2M `PairClaim`, verified `"active"` `PairResponse`, and negative replay / wrong-purpose rejection cases |
 
 Canonical hybrid PQ verification in `spec/vectors/verify_go` uses Go stdlib `crypto/mlkem` (`crypto/mlkem/mlkemtest`), `github.com/cloudflare/circl/sign/mldsa/mldsa65`, and an independent Go `Noise_XXhfs` implementation sharing zero code with `tendril-core`.

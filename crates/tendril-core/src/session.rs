@@ -12,6 +12,10 @@ use crate::grants::{
     AuditEvent, Grant, RevocationList, authorize_grant, authorize_path_capability,
     verify_grant_with_chain,
 };
+use crate::group::{
+    GroupManifest, GroupRendezvousFrame, GroupSeq, decode_group_rendezvous_frame,
+    validate_group_seqs,
+};
 use crate::identity::{EndpointIdentity, RotationRecord};
 use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::roster::{PeerState, Roster};
@@ -67,6 +71,10 @@ pub enum SessionAction {
         issuer: String,
         seq: u64,
     },
+    /// Received `0x0A` manifest, parsed but not verified or ingested.
+    GroupManifestReceived(Box<GroupManifest>),
+    /// Received `0x0B` rendezvous frame, not yet authorized or ingested.
+    GroupRendezvousReceived(GroupRendezvousFrame),
     Rekeyed {
         direction: RekeyDirection,
     },
@@ -101,7 +109,9 @@ pub struct SessionMachine {
     target_host_id: Option<String>,
     initial_grant: Option<Grant>,
     initial_crl_seq: Option<u64>,
+    initial_groups: Option<Vec<GroupSeq>>,
     peer_crl_seq: Option<u64>,
+    peer_groups: Option<Vec<GroupSeq>>,
     peer_device_id: Option<String>,
     peer_static_pub: Option<[u8; 32]>,
     active_grant: Option<Grant>,
@@ -144,7 +154,9 @@ impl SessionMachine {
             target_host_id: Some(target_host_id.into()),
             initial_grant: initial_grant.clone(),
             initial_crl_seq: crl_seq,
+            initial_groups: None,
             peer_crl_seq: None,
+            peer_groups: None,
             peer_device_id: None,
             peer_static_pub: None,
             active_grant: initial_grant,
@@ -194,7 +206,9 @@ impl SessionMachine {
             target_host_id: None,
             initial_grant: None,
             initial_crl_seq: None,
+            initial_groups: None,
             peer_crl_seq: None,
+            peer_groups: None,
             peer_device_id: None,
             peer_static_pub: None,
             active_grant: None,
@@ -209,6 +223,19 @@ impl SessionMachine {
     pub fn set_rekey_thresholds(&mut self, max_frames: u64, max_age_ms: u64) {
         self.rekey_max_frames = max_frames.max(1);
         self.rekey_max_age_ms = max_age_ms.max(1);
+    }
+
+    /// Sets the gossip summary advertised in the initiator `SessionHello` (before `msg3`).
+    pub fn set_local_groups(&mut self, groups: Vec<GroupSeq>) -> Result<(), CoreError> {
+        validate_group_seqs(&groups)?;
+        self.initial_groups = (!groups.is_empty()).then_some(groups);
+        Ok(())
+    }
+
+    /// Returns the group gossip summary advertised by the initiator in `SessionHello`, if any.
+    #[must_use]
+    pub fn peer_groups(&self) -> Option<&[GroupSeq]> {
+        self.peer_groups.as_deref()
     }
 
     /// Returns true once the Noise XX handshake has entered transport mode.
@@ -227,6 +254,12 @@ impl SessionMachine {
     #[must_use]
     pub fn peer_device_id(&self) -> Option<&str> {
         self.peer_device_id.as_deref()
+    }
+
+    /// Returns the authenticated peer Noise static key once established.
+    #[must_use]
+    pub const fn peer_static_pub(&self) -> Option<&[u8; 32]> {
+        self.peer_static_pub.as_ref()
     }
 
     /// Returns the `crl_seq` advertised by the initiator in `SessionHello`, if any.
@@ -363,6 +396,25 @@ impl SessionMachine {
             serde_json::to_vec(crl).map_err(|err| CoreError::Json(err.to_string()))?,
         );
         self.send_inner(InnerFrameType::Revocation, &json, now_ms)
+    }
+
+    /// Sends an encrypted `0x0A GROUP_MANIFEST` frame.
+    pub fn send_group_manifest(
+        &mut self,
+        manifest: &GroupManifest,
+        now_ms: u64,
+    ) -> Result<Vec<SessionAction>, CoreError> {
+        let json = manifest.to_wire_bytes()?;
+        self.send_inner(InnerFrameType::GroupManifest, &json, now_ms)
+    }
+
+    /// Sends an encrypted `0x0B GROUP_RENDEZVOUS` frame carrying exactly 60 bytes.
+    pub fn send_group_rendezvous(
+        &mut self,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<SessionAction>, CoreError> {
+        self.send_inner(InnerFrameType::GroupRendezvous, payload, now_ms)
     }
 
     /// Explicitly initiates a Noise `0x04 REKEY` transition on the outgoing cipher state.
@@ -605,6 +657,7 @@ impl SessionMachine {
                     return Err(CoreError::HostKeyUnverified);
                 }
 
+                roster.resolve_signing_pin(target_id, &host_signing_pub)?;
                 let (pinned_static, pinned_signing) = match roster.get(target_id) {
                     Some(entry) => {
                         if entry.min_wire_version > WIRE_VERSION {
@@ -631,37 +684,44 @@ impl SessionMachine {
                     None => return Err(CoreError::HostKeyUnverified),
                 };
 
-                if host_hello.rotation.is_empty()
-                    && peer_static == pinned_static
-                    && host_signing_pub != pinned_signing
-                {
-                    return Err(CoreError::HostKeyUnverified);
-                }
-
-                match roster.apply_verified_rotation(
-                    target_id,
-                    &host_hello.rotation,
-                    &peer_static,
-                    &host_signing_pub,
-                ) {
-                    Ok(_) => {
-                        if !host_hello.rotation.is_empty() {
-                            self.applied_rotation = host_hello.rotation;
-                        }
+                if roster.is_manifest_pinned(target_id) {
+                    if peer_static != pinned_static || host_signing_pub != pinned_signing {
+                        return Err(CoreError::HostKeyUnverified);
                     }
-                    Err(
-                        err @ (CoreError::RotationForkDetected { .. }
-                        | CoreError::IncompletePin(_)
-                        | CoreError::PeerPending(_)
-                        | CoreError::PeerRevoked(_)),
-                    ) => return Err(err),
-                    Err(_) => return Err(CoreError::HostKeyUnverified),
+                } else {
+                    if host_hello.rotation.is_empty()
+                        && peer_static == pinned_static
+                        && host_signing_pub != pinned_signing
+                    {
+                        return Err(CoreError::HostKeyUnverified);
+                    }
+
+                    match roster.apply_verified_rotation(
+                        target_id,
+                        &host_hello.rotation,
+                        &peer_static,
+                        &host_signing_pub,
+                    ) {
+                        Ok(_) => {
+                            if !host_hello.rotation.is_empty() {
+                                self.applied_rotation = host_hello.rotation;
+                            }
+                        }
+                        Err(
+                            err @ (CoreError::RotationForkDetected { .. }
+                            | CoreError::IncompletePin(_)
+                            | CoreError::PeerPending(_)
+                            | CoreError::PeerRevoked(_)),
+                        ) => return Err(err),
+                        Err(_) => return Err(CoreError::HostKeyUnverified),
+                    }
                 }
 
                 let hello = SessionHello {
                     device_id: self.local_device_id.clone(),
                     grant: self.initial_grant.clone(),
                     crl_seq: self.initial_crl_seq,
+                    groups: self.initial_groups.clone(),
                 };
                 let hello_json = Zeroizing::new(
                     serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -752,6 +812,7 @@ impl SessionMachine {
                 let tx = hs.into_transport_mode()?;
 
                 self.peer_crl_seq = hello.crl_seq;
+                self.peer_groups = hello.groups;
                 self.peer_device_id = Some(canonical_peer_id.clone());
                 self.peer_static_pub = Some(peer_static);
                 self.last_rekey_outgoing_ms = now_ms;
@@ -765,7 +826,7 @@ impl SessionMachine {
                 Ok(())
             }
             SessionPhase::Transport(mut tx) => {
-                let pt = tx.read_message_vec(body)?;
+                let pt = Zeroizing::new(tx.read_message_vec(body)?);
                 let (kind, payload) = decode_inner_frame(&pt)?;
                 self.phase = SessionPhase::Transport(tx);
 
@@ -801,6 +862,14 @@ impl SessionMachine {
                             seq,
                         });
                         self.verify_peer_and_active_grant(now_unix, roster)?;
+                    }
+                    InnerFrameType::GroupManifest => {
+                        let manifest = GroupManifest::from_wire_bytes(payload)?;
+                        actions.push(SessionAction::GroupManifestReceived(Box::new(manifest)));
+                    }
+                    InnerFrameType::GroupRendezvous => {
+                        let frame = decode_group_rendezvous_frame(payload)?;
+                        actions.push(SessionAction::GroupRendezvousReceived(frame));
                     }
                     InnerFrameType::Rekey => {
                         if let SessionPhase::Transport(ref mut tx_mut) = self.phase {

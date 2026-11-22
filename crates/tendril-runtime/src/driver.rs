@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tendril_core::error::CoreError;
 use tendril_core::grants::{AuditEvent, Grant, RevocationList};
+use tendril_core::group::{GroupManifest, GroupRendezvousFrame, GroupSeq, V2GroupSecrets};
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
 use tendril_core::pairing::{
     EnrollmentPolicy, PairAction, PairOutcome, PairingInitiator, PairingManager, PairingPathKind,
@@ -82,6 +83,14 @@ fn push_non_write_action(
             pending_events.push_back(SessionEvent::Closed { code, reason });
             (true, true)
         }
+        SessionAction::GroupManifestReceived(manifest) => {
+            pending_events.push_back(SessionEvent::GroupManifestReceived(manifest));
+            (true, false)
+        }
+        SessionAction::GroupRendezvousReceived(frame) => {
+            pending_events.push_back(SessionEvent::GroupRendezvousReceived(frame));
+            (true, false)
+        }
     }
 }
 
@@ -104,11 +113,23 @@ pub const fn pairing_path_kind_for_provider(provider: ProviderId) -> PairingPath
 pub enum SessionEvent {
     AppData(Vec<u8>),
     GrantUpdated(Grant),
-    RevocationUpdated { issuer: String, seq: u64 },
-    Rekeyed { direction: RekeyDirection },
+    RevocationUpdated {
+        issuer: String,
+        seq: u64,
+    },
+    Rekeyed {
+        direction: RekeyDirection,
+    },
     PongReceived(u64),
     Audit(AuditEvent),
-    Closed { code: u16, reason: String },
+    /// Received `0x0A` manifest: parsed but neither verified nor ingested.
+    GroupManifestReceived(Box<GroupManifest>),
+    /// Received `0x0B` rendezvous frame: neither authorized nor ingested.
+    GroupRendezvousReceived(GroupRendezvousFrame),
+    Closed {
+        code: u16,
+        reason: String,
+    },
 }
 
 /// Completed outcome from an async pairing exchange.
@@ -771,6 +792,30 @@ impl SessionDriver {
             crl_seq,
             RosterRef::Direct(roster),
             now_unix,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Initiates a session to a group sibling using a mutex-guarded roster, advertising `groups`
+    /// in the initiator `SessionHello` so the sibling can gossip a newer manifest.
+    pub async fn connect_group_member(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        roster: &Mutex<Roster>,
+        groups: Vec<GroupSeq>,
+        now_unix: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::connect_with_roster(
+            stream,
+            local_identity,
+            target_host_id,
+            None,
+            None,
+            RosterRef::Locked(roster),
+            now_unix,
+            groups,
         )
         .await
     }
@@ -798,6 +843,7 @@ impl SessionDriver {
             crl_seq,
             RosterRef::Locked(roster),
             now_unix,
+            Vec::new(),
         )
         .await
     }
@@ -845,6 +891,7 @@ impl SessionDriver {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn connect_with_roster(
         stream: Box<dyn PathStream>,
         local_identity: &EndpointIdentity,
@@ -853,6 +900,7 @@ impl SessionDriver {
         crl_seq: Option<u64>,
         mut roster: RosterRef<'_>,
         now_unix: u64,
+        groups: Vec<GroupSeq>,
     ) -> Result<Self, RuntimeError> {
         match &roster {
             RosterRef::Direct(r) => check_peer_allows_wire_v1(r, target_host_id)?,
@@ -868,6 +916,7 @@ impl SessionDriver {
             crl_seq,
             None,
         )?;
+        machine.set_local_groups(groups)?;
         let start_actions = machine.start()?;
         let mut driver = Self {
             stream,
@@ -1009,6 +1058,34 @@ impl SessionDriver {
         self.apply_actions(actions).await
     }
 
+    /// Sends encrypted `0x0A GROUP_MANIFEST`.
+    pub async fn send_group_manifest(
+        &mut self,
+        manifest: &GroupManifest,
+    ) -> Result<(), RuntimeError> {
+        let now_ms = self.elapsed_ms();
+        let actions = self.machine.send_group_manifest(manifest, now_ms)?;
+        self.apply_actions(actions).await
+    }
+
+    /// Sends encrypted `0x0B GROUP_RENDEZVOUS` carrying `secrets` for `group_id`.
+    pub async fn send_group_rendezvous(
+        &mut self,
+        secrets: &V2GroupSecrets,
+        group_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let frame = secrets.to_rendezvous_frame(group_id)?;
+        let now_ms = self.elapsed_ms();
+        let actions = self.machine.send_group_rendezvous(&frame[..], now_ms)?;
+        self.apply_actions(actions).await
+    }
+
+    /// Returns the group gossip summary the initiator advertised in `SessionHello`, if any.
+    #[must_use]
+    pub fn peer_groups(&self) -> Option<&[GroupSeq]> {
+        self.machine.peer_groups()
+    }
+
     /// Sends encrypted `0x04 REKEY`.
     pub async fn send_rekey(&mut self) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
@@ -1057,6 +1134,12 @@ impl SessionDriver {
     #[must_use]
     pub fn peer_device_id(&self) -> Option<&str> {
         self.machine.peer_device_id()
+    }
+
+    /// Returns the authenticated peer Noise static key once established.
+    #[must_use]
+    pub const fn peer_static_pub(&self) -> Option<&[u8; 32]> {
+        self.machine.peer_static_pub()
     }
 
     /// Returns the CRL sequence advertised by the peer in `SessionHello`, if any.
@@ -1395,6 +1478,74 @@ impl ConcurrentSession {
             .await
     }
 
+    /// Sends encrypted `0x0A GROUP_MANIFEST` concurrently with inbound polling.
+    pub async fn send_group_manifest(&self, manifest: &GroupManifest) -> Result<(), RuntimeError> {
+        self.run_write_op(|machine, now_ms| machine.send_group_manifest(manifest, now_ms))
+            .await
+    }
+
+    /// Sends encrypted `0x0B GROUP_RENDEZVOUS` carrying `secrets` for `group_id`.
+    pub async fn send_group_rendezvous(
+        &self,
+        secrets: &V2GroupSecrets,
+        group_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let frame = secrets.to_rendezvous_frame(group_id)?;
+        self.run_write_op(|machine, now_ms| machine.send_group_rendezvous(&frame[..], now_ms))
+            .await
+    }
+
+    /// Like [`Self::send_data`], but evaluates `authority` while holding the writer lock and
+    /// before sealing; an `Err` aborts the write and leaves the session untouched.
+    pub async fn send_data_authorized(
+        &self,
+        payload: &[u8],
+        authority: impl FnOnce() -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        self.run_authorized_write_op(authority, |machine, now_ms| {
+            machine.send_data(payload, now_ms)
+        })
+        .await
+    }
+
+    /// Like [`Self::send_group_manifest`], with `authority` evaluated as in
+    /// [`Self::send_data_authorized`].
+    pub async fn send_group_manifest_authorized(
+        &self,
+        manifest: &GroupManifest,
+        authority: impl FnOnce() -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        self.run_authorized_write_op(authority, |machine, now_ms| {
+            machine.send_group_manifest(manifest, now_ms)
+        })
+        .await
+    }
+
+    /// Like [`Self::send_group_rendezvous`], with `authority` evaluated as in
+    /// [`Self::send_data_authorized`].
+    pub async fn send_group_rendezvous_authorized(
+        &self,
+        secrets: &V2GroupSecrets,
+        group_id: &str,
+        authority: impl FnOnce() -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let frame = secrets.to_rendezvous_frame(group_id)?;
+        self.run_authorized_write_op(authority, |machine, now_ms| {
+            machine.send_group_rendezvous(&frame[..], now_ms)
+        })
+        .await
+    }
+
+    /// Returns the group gossip summary the initiator advertised in `SessionHello`, if any.
+    #[must_use]
+    pub fn peer_groups(&self) -> Option<Vec<GroupSeq>> {
+        self.machine
+            .lock()
+            .expect("session machine mutex poisoned")
+            .peer_groups()
+            .map(<[GroupSeq]>::to_vec)
+    }
+
     /// Sends encrypted `0x04 REKEY` concurrently with inbound polling.
     pub async fn send_rekey(&self) -> Result<(), RuntimeError> {
         self.run_write_op(|machine, now_ms| machine.send_rekey(now_ms))
@@ -1552,7 +1703,16 @@ impl ConcurrentSession {
     where
         F: FnOnce(&mut SessionMachine, u64) -> Result<Vec<SessionAction>, CoreError>,
     {
+        self.run_authorized_write_op(|| Ok(()), op).await
+    }
+
+    async fn run_authorized_write_op<A, F>(&self, authority: A, op: F) -> Result<(), RuntimeError>
+    where
+        A: FnOnce() -> Result<(), RuntimeError>,
+        F: FnOnce(&mut SessionMachine, u64) -> Result<Vec<SessionAction>, CoreError>,
+    {
         let mut writer = self.writer.lock().await;
+        authority()?;
         let actions = {
             let now_ms = self.elapsed_ms();
             let mut machine = self.machine.lock().expect("session machine mutex poisoned");

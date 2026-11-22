@@ -21,6 +21,7 @@ p2p-iroh = ["tendril-runtime/p2p-iroh"]
 p2p-iroh-services = ["p2p-iroh", "tendril-runtime/p2p-iroh-services"]
 
 [dependencies]
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tendril-core.workspace = true

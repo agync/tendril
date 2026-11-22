@@ -1,5 +1,7 @@
 //! Tendril reference CLI (`tendril`) for identity, pairing, grants, serving, and dialing.
 
+mod group;
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::SocketAddr;
@@ -27,10 +29,10 @@ use tendril_core::v2::{
 use tendril_runtime::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
     DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, EmbeddedRelay, HalfOpenGuard,
-    HttpWakeProvider, InboundQueue, InboundRouter, LocalDialer, OverlayDialer, OverlayListener,
-    P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, PathDialer, PathListener,
-    PathStream, PreAuthRateLimiter, RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer,
-    RelayV2Listener, RelayV2ListenerConfig, SessionDriver, SessionEvent, StateStore,
+    HttpWakeProvider, InboundQueue, InboundRouter, InboundSession, LocalDialer, OverlayDialer,
+    OverlayListener, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, PathDialer,
+    PathListener, PathStream, PreAuthRateLimiter, RelayClientAuth, RelayDialer, RelayListener,
+    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, SessionDriver, SessionEvent, StateStore,
     V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeDialOptions, WakeSecret, WakeTarget,
     dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_store,
@@ -308,6 +310,11 @@ enum Command {
     },
     /// Revoke an existing peer (`pair.revoke`), failing closed on all future sessions.
     Revoke { peer_id: String },
+    /// Create and operate small peer mesh groups.
+    Group {
+        #[command(subcommand)]
+        cmd: group::GroupCommand,
+    },
     /// Revoke an unused grant or enrollment token nonce on the signed local CRL.
     RevokeToken {
         #[arg(allow_hyphen_values = true)]
@@ -1187,7 +1194,7 @@ async fn handle_v1_session(
             }
         }
     };
-    let Ok(mut driver) = SessionDriver::accept_with_options(
+    let Ok(driver) = SessionDriver::accept_with_options(
         stream,
         &identity,
         &mut roster,
@@ -1201,6 +1208,28 @@ async fn handle_v1_session(
         tracing::debug!("inbound session rejected");
         return;
     };
+    run_v1_session(
+        driver,
+        roster,
+        initial_stamp,
+        store,
+        store_lock,
+        identity,
+        redact_logs,
+    )
+    .await;
+}
+
+/// Runs an accepted ordinary Wire v1 session admitted against `roster` at `initial_stamp`.
+async fn run_v1_session(
+    mut driver: SessionDriver,
+    mut roster: tendril_core::roster::Roster,
+    initial_stamp: Option<tendril_runtime::RosterStamp>,
+    store: Arc<StateStore>,
+    store_lock: Arc<AsyncMutex<()>>,
+    identity: Arc<tendril_core::identity::EndpointIdentity>,
+    redact_logs: bool,
+) {
     let peer_id = driver.peer_device_id().unwrap_or_default().to_owned();
     let mut last_stamp = initial_stamp;
     {
@@ -1334,6 +1363,12 @@ async fn handle_v1_session(
                     break;
                 }
             }
+            Ok(Some(
+                event @ (SessionEvent::GroupManifestReceived(_)
+                | SessionEvent::GroupRendezvousReceived(_)),
+            )) => {
+                group::handle_group_frame(store.as_ref(), &identity.device_id(), &peer_id, &event);
+            }
             Ok(Some(SessionEvent::Closed { code, reason })) => {
                 print_json_line(&serde_json::json!({
                     "event": "closed",
@@ -1421,6 +1456,17 @@ async fn handle_v2_session(
         tracing::debug!("inbound v2 session rejected");
         return;
     };
+    run_v2_session(driver, store, store_lock, identity, redact_logs).await;
+}
+
+/// Runs an accepted, store-backed ordinary Wire v2 session.
+async fn run_v2_session(
+    driver: V2SessionDriver,
+    store: Arc<StateStore>,
+    store_lock: Arc<AsyncMutex<()>>,
+    identity: Arc<tendril_core::identity::EndpointIdentity>,
+    redact_logs: bool,
+) {
     let peer_id = driver.peer_device_id().to_owned();
     let provider = format!("{:?}", driver.provider_id());
     let (initial_roster, initial_stamp) = {
@@ -1582,6 +1628,12 @@ async fn handle_v2_session(
                     }));
                     break;
                 }
+            }
+            Ok(Some(
+                event @ (SessionEvent::GroupManifestReceived(_)
+                | SessionEvent::GroupRendezvousReceived(_)),
+            )) => {
+                group::handle_group_frame(store.as_ref(), &identity.device_id(), &peer_id, &event);
             }
             Ok(Some(SessionEvent::Closed { code, reason })) => {
                 print_json_line(&serde_json::json!({
@@ -2074,6 +2126,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "wire_v2": wire_v2,
             }));
 
+            let group_dialers =
+                group::build_dialers(resolved_relay_auth.clone(), want_p2p.then_some(&p2p_args))
+                    .await?;
+            let group_hub = group::ServeGroups::new(
+                Arc::clone(&store),
+                Arc::clone(&identity),
+                group_dialers,
+                redact_logs,
+            );
+
             let (v1_pair_q, v1_sess_q) = router.split_queues();
             let (v2_pair_q, v2_sess_q) = router.split_v2_queues();
 
@@ -2105,13 +2167,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let lock_c = Arc::clone(&store_lock);
                 let id_c = Arc::clone(&identity);
                 let rl_c = router.session_rate_limiter().clone();
+                let hub_c = Arc::clone(&group_hub);
+                let v2_c = Arc::clone(&v2_state);
                 worker_handles.push(spawn_routed_worker(v1_sess_q, move |stream, guard| {
                     let s = Arc::clone(&store_c);
                     let l = Arc::clone(&lock_c);
                     let id = Arc::clone(&id_c);
                     let r = rl_c.clone();
+                    let hub = Arc::clone(&hub_c);
+                    let v2 = Arc::clone(&v2_c);
                     async move {
-                        handle_v1_session(stream, guard, s, l, id, r, redact_logs).await;
+                        if !hub.refresh() {
+                            handle_v1_session(stream, guard, s, l, id, r, redact_logs).await;
+                            return;
+                        }
+                        match hub.accept(stream, &v2, &r, guard).await {
+                            Some(InboundSession::OrdinaryV1 {
+                                session,
+                                roster,
+                                stamp,
+                            }) => {
+                                run_v1_session(session, roster, stamp, s, l, id, redact_logs).await;
+                            }
+                            Some(InboundSession::OrdinaryV2 { session }) => {
+                                run_v2_session(session, s, l, id, redact_logs).await;
+                            }
+                            Some(InboundSession::Group { .. }) | None => {}
+                        }
                     }
                 }));
             }
@@ -2144,18 +2226,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let id_c = Arc::clone(&identity);
                 let v2_c = Arc::clone(&v2_state);
                 let rl_c = router.v2_session_rate_limiter().clone();
+                let hub_c = Arc::clone(&group_hub);
                 worker_handles.push(spawn_routed_worker(v2_sess_q, move |mut stream, guard| {
                     let s = Arc::clone(&store_c);
                     let l = Arc::clone(&lock_c);
                     let id = Arc::clone(&id_c);
                     let v2 = Arc::clone(&v2_c);
                     let r = rl_c.clone();
+                    let hub = Arc::clone(&hub_c);
                     async move {
                         if !wire_v2 {
                             let _ = stream.close().await;
                             return;
                         }
-                        handle_v2_session(stream, guard, s, l, id, v2, r, redact_logs).await;
+                        if !hub.refresh() {
+                            handle_v2_session(stream, guard, s, l, id, v2, r, redact_logs).await;
+                            return;
+                        }
+                        match hub.accept(stream, &v2, &r, guard).await {
+                            Some(InboundSession::OrdinaryV2 { session }) => {
+                                run_v2_session(session, s, l, id, redact_logs).await;
+                            }
+                            Some(InboundSession::OrdinaryV1 {
+                                session,
+                                roster,
+                                stamp,
+                            }) => {
+                                run_v1_session(session, roster, stamp, s, l, id, redact_logs).await;
+                            }
+                            Some(InboundSession::Group { .. }) | None => {}
+                        }
                     }
                 }));
             }
@@ -2193,6 +2293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = stop_tx.send(true);
             }
             router.close();
+            group_hub.shutdown();
             for handle in worker_handles {
                 handle.abort();
             }
@@ -2816,6 +2917,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }));
             }
         }
+        Command::Group { cmd } => group::run(Arc::clone(&store), cmd).await?,
         Command::Revoke { peer_id } => {
             store.update_roster(|roster| roster.revoke_peer(&peer_id).map_err(Into::into))?;
             print_json_line(&serde_json::json!({ "revoked": peer_id }));

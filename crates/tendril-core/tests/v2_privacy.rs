@@ -992,7 +992,7 @@ fn bucketed_inner_padding_and_dummy_cover_frames() {
             decoded,
             V2InnerFrame::Frame {
                 kind: InnerFrameType::Data,
-                payload
+                payload: zeroize::Zeroizing::new(payload)
             }
         );
     }
@@ -1274,14 +1274,14 @@ fn jittered_keepalive_and_rekey_atomicity_and_age_trigger() {
         s_r.unseal(&rekey_ct).unwrap(),
         V2InnerFrame::Frame {
             kind: InnerFrameType::Rekey,
-            payload: vec![]
+            payload: zeroize::Zeroizing::new(vec![])
         }
     );
     assert_eq!(
         s_r.unseal(&post_out.ciphertext).unwrap(),
         V2InnerFrame::Frame {
             kind: InnerFrameType::Data,
-            payload: b"post-rekey".to_vec()
+            payload: zeroize::Zeroizing::new(b"post-rekey".to_vec())
         }
     );
 

@@ -881,6 +881,7 @@ fn build_session_transcript(
         device_id: device_id(init_static_pub),
         grant: None,
         crl_seq: Some(1),
+        groups: None,
     };
     let session_hello_json = serde_json::to_string(&session_hello)?;
     let n3 = initiator.write_message(session_hello_json.as_bytes(), &mut buf)?;
@@ -1472,6 +1473,7 @@ fn build_v2_reconnect_vector(
         device_id: device_id(&init_static_pub),
         grant: None,
         crl_seq: Some(0),
+        groups: None,
     };
     let session_hello_json = serde_json::to_string(&session_hello)?;
     let msg3_padded_payload = pad_msg3_payload(session_hello_json.as_bytes())?;

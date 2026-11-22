@@ -72,7 +72,8 @@ HostHello = {
 SessionHello = {
   "device_id": string,              // "dev_" + hex_lower(SHA-256(static_pub)[..8])
   "grant"?: Grant,                  // optional grant presented at connect
-  "crl_seq"?: uint64                // highest CRL sequence already cached by initiator
+  "crl_seq"?: uint64,               // highest CRL sequence already cached by initiator
+  "groups"?: [{ "group_id": string, "seq": uint64 }]  // group gossip summary (groups-v1 Section 9), 1..=16 entries, omitted when empty
 }
 
 // msg3 payload, intent = pair (initiator -> responder)
@@ -170,7 +171,9 @@ Inside Noise transport mode, each outer AEAD frame decrypts to a plaintext paylo
 inner_frame = frame_type (1 byte) || payload (0..=65502 bytes)
 ```
 
-Receivers MUST close the session immediately on a 0-byte transport plaintext or any unrecognized `frame_type`.
+Receivers MUST close the session immediately on a 0-byte transport plaintext or any unrecognized `frame_type`. A `0x0A` payload above `32768` bytes or a `0x0B` payload that is not exactly `60` bytes MUST be rejected (`GroupManifestTooLarge`, `InvalidInnerFramePayload`).
+
+`SessionHello` is sent by the initiator only. Peers built before the optional `groups` field reject it as an unknown field (`deny_unknown_fields`); initiators therefore omit `groups` when they hold no groups, and this incompatibility is accepted before 1.0.
 
 | `frame_type` | Name | Payload Layout | Semantics |
 |---|---|---|---|
@@ -181,6 +184,8 @@ Receivers MUST close the session immediately on a 0-byte transport plaintext or 
 | `0x05` | `PING` | `8 B` big-endian `u64` cookie | Liveness probe; peer responds with `0x06 PONG` |
 | `0x06` | `PONG` | `8 B` big-endian `u64` echoed cookie | Liveness response |
 | `0x07` | `CLOSE` | `2 B` big-endian `u16` reason code + optional UTF-8 text | Graceful session close (`payload.len() >= 2`) |
+| `0x0A` | `GROUP_MANIFEST` | Compact UTF-8 JSON `GroupManifest`, `<= 32768 B` | Pushes or gossips a signed group manifest (`spec/groups-v1.md`); surfaced to the caller, never auto-ingested |
+| `0x0B` | `GROUP_RENDEZVOUS` | `20 B` ASCII `group_id` `\|\|` `8 B` big-endian `u64` `seq` `\|\|` `32 B` key, exactly `60 B` | Delivers a group rendezvous key from an admin to a member (`spec/groups-v1.md` Section 7) |
 
 ### 5.1 Noise Rekey Mechanics
 

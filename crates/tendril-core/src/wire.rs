@@ -5,6 +5,9 @@ use subtle::ConstantTimeEq;
 
 use crate::error::CoreError;
 use crate::grants::Grant;
+use crate::group::{
+    GROUP_RENDEZVOUS_FRAME_LEN, GroupSeq, MAX_GROUP_MANIFEST_LEN, validate_group_seqs,
+};
 use crate::identity::RotationRecord;
 
 /// Fixed Noise protocol pattern for Tendril v1 and v2.
@@ -225,8 +228,12 @@ pub enum InnerFrameType {
     Close = 0x07,
     /// Wire v2 pure cover traffic frame (`0x08`), zero-filled and silently discarded after AEAD decrypt.
     Padding = 0x08,
-    /// Wire v2 bucketed padded envelope (`0x09`) wrapping one `0x01..=0x07` inner frame.
+    /// Wire v2 bucketed padded envelope (`0x09`) wrapping one `0x01..=0x07`, `0x0A` or `0x0B` inner frame.
     Padded = 0x09,
+    /// Signed `GroupManifest` push or gossip (`0x0A`), compact JSON of at most 32768 bytes.
+    GroupManifest = 0x0A,
+    /// Group rendezvous key delivery (`0x0B`), exactly 60 bytes.
+    GroupRendezvous = 0x0B,
 }
 
 impl TryFrom<u8> for InnerFrameType {
@@ -243,6 +250,8 @@ impl TryFrom<u8> for InnerFrameType {
             0x07 => Ok(Self::Close),
             0x08 => Ok(Self::Padding),
             0x09 => Ok(Self::Padded),
+            0x0A => Ok(Self::GroupManifest),
+            0x0B => Ok(Self::GroupRendezvous),
             other => Err(CoreError::UnknownInnerFrameType(other)),
         }
     }
@@ -290,6 +299,19 @@ pub(crate) fn validate_inner_payload(
                     max: MAX_TRANSPORT_PLAINTEXT,
                 });
             }
+        }
+        InnerFrameType::GroupManifest => {
+            if payload.len() > MAX_GROUP_MANIFEST_LEN {
+                return Err(CoreError::GroupManifestTooLarge {
+                    len: payload.len(),
+                    max: MAX_GROUP_MANIFEST_LEN,
+                });
+            }
+        }
+        InnerFrameType::GroupRendezvous if payload.len() != GROUP_RENDEZVOUS_FRAME_LEN => {
+            return Err(CoreError::InvalidInnerFramePayload(
+                "GROUP_RENDEZVOUS payload must be exactly 60 bytes",
+            ));
         }
         InnerFrameType::Rekey if !payload.is_empty() => {
             return Err(CoreError::InvalidInnerFramePayload(
@@ -341,7 +363,8 @@ pub(crate) fn validate_inner_payload(
             full.extend_from_slice(payload);
             crate::v2::unpad_inner_frame(&full)?;
         }
-        InnerFrameType::Rekey
+        InnerFrameType::GroupRendezvous
+        | InnerFrameType::Rekey
         | InnerFrameType::Ping
         | InnerFrameType::Pong
         | InnerFrameType::Close => {}
@@ -369,6 +392,30 @@ pub struct SessionHello {
     pub grant: Option<Grant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crl_seq: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "groups_is_unset",
+        deserialize_with = "deserialize_groups"
+    )]
+    pub groups: Option<Vec<GroupSeq>>,
+}
+
+fn groups_is_unset(groups: &Option<Vec<GroupSeq>>) -> bool {
+    groups.as_ref().is_none_or(Vec::is_empty)
+}
+
+fn deserialize_groups<'de, D>(deserializer: D) -> Result<Option<Vec<GroupSeq>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items = Vec::<GroupSeq>::deserialize(deserializer)?;
+    if items.is_empty() {
+        return Err(serde::de::Error::custom(
+            "empty groups array must be omitted from SessionHello",
+        ));
+    }
+    validate_group_seqs(&items).map_err(serde::de::Error::custom)?;
+    Ok(Some(items))
 }
 
 /// Encrypted `msg3` payload for `intent = pair` (`initiator -> responder`).
