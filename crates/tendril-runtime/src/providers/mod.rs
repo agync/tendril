@@ -21,10 +21,13 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tendril_core::policy::ProviderId;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, lookup_host};
 use tokio::time::timeout;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Response as WsHandshakeResponse;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async_tls_with_config};
 
 use crate::error::RuntimeError;
 use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, PathWriter};
@@ -39,8 +42,9 @@ pub use overlay::{
 #[cfg(feature = "p2p-iroh")]
 pub use p2p::{
     MAX_P2P_CUSTOM_RELAYS, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode,
-    TENDRIL_P2P_ALPN, format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_endpoint,
-    parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
+    TENDRIL_P2P_ALPN, extract_p2p_relay_urls_from_endpoint, format_p2p_endpoint,
+    format_p2p_endpoint_with_addrs, parse_p2p_endpoint, parse_p2p_endpoint_filtered,
+    parse_p2p_relay_mode, parse_p2p_relay_modes,
 };
 pub use relay::{EmbeddedRelay, RelayClientAuth, RelayDialer, RelayListener};
 pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};
@@ -69,14 +73,14 @@ pub async fn dial_endpoint_with_auth(
     if endpoint.starts_with("iroh://") {
         #[cfg(feature = "p2p-iroh")]
         {
-            let mode = match normalized_host {
-                Some(spec) => parse_p2p_relay_mode(Some(spec))?,
+            let explicit_mode = match normalized_host {
+                Some(spec) => Some(parse_p2p_relay_mode(Some(spec))?),
                 None if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") => {
-                    P2pRelayMode::Disabled
+                    Some(P2pRelayMode::Disabled)
                 }
-                None => P2pRelayMode::Default,
+                None => None,
             };
-            let dialer = P2pDialer::bind(mode).await?;
+            let dialer = P2pDialer::bind_for_endpoint(endpoint, explicit_mode, false).await?;
             return match dialer.dial(endpoint).await {
                 Ok(stream) => Ok(stream),
                 Err(err) => {
@@ -580,6 +584,83 @@ fn validate_url_host_safety(parsed: &url::Url) -> Result<&str, RuntimeError> {
     Ok(bare)
 }
 
+/// Resolves `parsed_url`'s host once, rejects any resolved cloud-metadata, link-local, or
+/// unspecified address unless `allow_metadata`, then connects TCP directly to a verified
+/// [`std::net::SocketAddr`] so a rebinding resolver cannot swap the address after validation.
+pub(crate) async fn resolve_ws_tcp_stream(
+    parsed_url: &url::Url,
+    allow_metadata: bool,
+) -> Result<TcpStream, RuntimeError> {
+    let host = parsed_url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| RuntimeError::Protocol("URL is missing a host".into()))?;
+    let bare = strip_host_brackets(host).trim_end_matches('.');
+    if bare.is_empty() {
+        return Err(RuntimeError::Protocol("URL is missing a host".into()));
+    }
+    let port = parsed_url
+        .port_or_known_default()
+        .ok_or_else(|| RuntimeError::Protocol("URL is missing a port".into()))?;
+    let addrs: Vec<std::net::SocketAddr> = lookup_host((bare, port)).await?.collect();
+    if addrs.is_empty() {
+        return Err(RuntimeError::Protocol(format!(
+            "host '{bare}' resolved to zero addresses"
+        )));
+    }
+    if !allow_metadata {
+        for addr in &addrs {
+            if is_metadata_or_link_local_ip(addr.ip()) {
+                return Err(RuntimeError::Protocol(format!(
+                    "resolved metadata or link-local address '{}' is not permitted",
+                    addr.ip()
+                )));
+            }
+        }
+    }
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.map_or_else(
+        || RuntimeError::Protocol("failed to connect to resolved address".into()),
+        RuntimeError::Io,
+    ))
+}
+
+/// Opens a WebSocket to `request` over a pre-validated TCP stream from [`resolve_ws_tcp_stream`],
+/// keeping the original hostname for TLS SNI and certificate verification.
+pub(crate) async fn connect_ws_resolved<R>(
+    request: R,
+    config: Option<WebSocketConfig>,
+    label: &'static str,
+) -> Result<
+    (
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        WsHandshakeResponse,
+    ),
+    RuntimeError,
+>
+where
+    R: IntoClientRequest + Unpin,
+{
+    let request = request
+        .into_client_request()
+        .map_err(|err| RuntimeError::Protocol(format!("{label}: invalid request: {err}")))?;
+    let parsed = url::Url::parse(&request.uri().to_string())
+        .map_err(|err| RuntimeError::Protocol(format!("{label}: invalid URL: {err}")))?;
+    let tcp = resolve_ws_tcp_stream(&parsed, false).await?;
+    client_async_tls_with_config(request, tcp, config, None)
+        .await
+        .map_err(|err| RuntimeError::Protocol(format!("{label} failed: {err}")))
+}
+
 /// Validates a WebSocket relay URL (`ws` or `wss`).
 pub(crate) fn validate_ws_url(
     url_str: &str,
@@ -678,4 +759,60 @@ pub(crate) fn validate_iroh_relay_url(url_str: &str) -> Result<url::Url, Runtime
         ));
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ws_url(raw: &str) -> url::Url {
+        url::Url::parse(raw).expect("test url")
+    }
+
+    #[tokio::test]
+    async fn resolve_ws_tcp_stream_rejects_metadata_and_link_local_before_connecting() {
+        for raw in [
+            "ws://[fe80::1]:9/",
+            "ws://0.0.0.0:9/",
+            "ws://169.254.169.254:80/",
+        ] {
+            let err = resolve_ws_tcp_stream(&ws_url(raw), false)
+                .await
+                .expect_err("metadata or link-local must be rejected");
+            assert!(
+                matches!(&err, RuntimeError::Protocol(msg) if msg.contains("not permitted")),
+                "{raw}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_ws_tcp_stream_rejects_empty_host_after_dot_trim() {
+        let err = resolve_ws_tcp_stream(&ws_url("ws://./"), false)
+            .await
+            .expect_err("empty host");
+        assert!(matches!(&err, RuntimeError::Protocol(m) if m.contains("missing a host")));
+    }
+
+    #[tokio::test]
+    async fn resolve_ws_tcp_stream_connects_to_verified_loopback_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let accept = tokio::spawn(async move { listener.accept().await.is_ok() });
+        let stream = resolve_ws_tcp_stream(&ws_url(&format!("ws://localhost:{port}/")), false)
+            .await
+            .expect("loopback stays permitted");
+        assert!(stream.peer_addr().expect("peer").ip().is_loopback());
+        assert!(accept.await.expect("join"));
+    }
+
+    #[tokio::test]
+    async fn connect_ws_resolved_fails_closed_on_link_local_relay() {
+        let err = connect_ws_resolved("ws://[fe80::1]:9/", None, "test connect")
+            .await
+            .expect_err("link-local relay must fail closed");
+        assert!(matches!(err, RuntimeError::Protocol(_)));
+    }
 }

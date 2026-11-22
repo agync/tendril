@@ -37,6 +37,7 @@ const MAX_P2P_RELAY_AUTH_BYTES: usize = 4_096;
 const P2P_STREAM_MAGIC: u8 = 0x54;
 const P2P_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const P2P_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const P2P_ACCEPT_BI_TIMEOUT: Duration = Duration::from_secs(3);
 const P2P_MAGIC_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONCURRENT_ACCEPTS: usize = 64;
@@ -153,6 +154,9 @@ pub struct P2pOptions {
     pub advertise_direct_addrs: bool,
     pub allow_private_addrs: bool,
     pub relay_auth: Option<P2pRelayAuth>,
+    /// `true` when `relay_mode` was derived from an untrusted peer URI rather than supplied by
+    /// the caller, so its relays never count as operator-trusted.
+    pub(crate) uri_derived_relays: bool,
 }
 
 impl Default for P2pOptions {
@@ -178,6 +182,7 @@ impl P2pOptions {
             advertise_direct_addrs: is_disabled,
             allow_private_addrs: is_disabled,
             relay_auth: None,
+            uri_derived_relays: false,
         }
     }
 
@@ -195,7 +200,38 @@ impl P2pOptions {
             advertise_direct_addrs: false,
             allow_private_addrs: is_disabled,
             relay_auth: None,
+            uri_derived_relays: false,
         }
+    }
+
+    /// Derives dialer options for dialing `endpoint`.
+    ///
+    /// When `explicit_mode` is `None` or [`P2pRelayMode::Default`] and the URI carries validated
+    /// `?relay=` URLs, those relays become [`P2pRelayMode::Custom`] / [`P2pRelayMode::CustomMany`]
+    /// so the dialer never contacts `n0` public relays or Pkarr/DNS for that peer. Any other
+    /// explicit mode is kept as given.
+    pub fn for_endpoint(
+        endpoint: &str,
+        explicit_mode: Option<P2pRelayMode>,
+        allow_private_addrs: bool,
+    ) -> Result<Self, RuntimeError> {
+        if let Some(mode) = explicit_mode
+            && !matches!(mode, P2pRelayMode::Default)
+        {
+            let is_disabled = matches!(mode, P2pRelayMode::Disabled);
+            return Ok(
+                Self::for_dialer(mode).with_allow_private_addrs(allow_private_addrs || is_disabled)
+            );
+        }
+        let urls = extract_p2p_relay_urls_from_endpoint(endpoint, allow_private_addrs)?;
+        if urls.is_empty() {
+            return Ok(Self::for_dialer(P2pRelayMode::Default)
+                .with_allow_private_addrs(allow_private_addrs));
+        }
+        let mut opts = Self::for_dialer(parse_p2p_relay_modes(&urls)?)
+            .with_allow_private_addrs(allow_private_addrs);
+        opts.uri_derived_relays = true;
+        Ok(opts)
     }
 
     /// Enables or disables publishing this endpoint to `n0` Pkarr/DNS.
@@ -338,6 +374,17 @@ fn validate_p2p_options(options: &P2pOptions) -> Result<(), RuntimeError> {
                 "relay_auth is invalid when relay_mode is Disabled".into(),
             ));
         }
+        if matches!(options.relay_mode, P2pRelayMode::Default) {
+            return Err(RuntimeError::Protocol(
+                "relay_auth requires an explicit custom relay and is never sent to public relays"
+                    .into(),
+            ));
+        }
+        if options.uri_derived_relays {
+            return Err(RuntimeError::Protocol(
+                "relay_auth is never sent to relays taken from a peer URI".into(),
+            ));
+        }
         match auth {
             P2pRelayAuth::BearerToken(tok) => {
                 validate_p2p_auth_str(tok, "p2p relay bearer token")?;
@@ -409,6 +456,13 @@ async fn build_iroh_endpoint(
     secret_seed: Option<Zeroizing<[u8; 32]>>,
 ) -> Result<Endpoint, RuntimeError> {
     validate_p2p_options(options)?;
+    let relay_urls = configured_relay_urls(&options.relay_mode);
+    let trusted: &[String] = if options.uri_derived_relays {
+        &[]
+    } else {
+        &relay_urls
+    };
+    check_relay_hosts_post_dns(&relay_urls, options.allow_private_addrs, trusted).await?;
 
     let seed = match secret_seed {
         Some(s) => s,
@@ -418,14 +472,7 @@ async fn build_iroh_endpoint(
     let auth_token = resolve_p2p_auth_token(options.relay_auth.as_ref(), secret_key.public())?;
 
     let relay_mode = match &options.relay_mode {
-        P2pRelayMode::Default => match auth_token.as_ref() {
-            Some(tok) => RelayMode::Custom(
-                iroh::endpoint::default_relay_mode()
-                    .relay_map()
-                    .with_auth_token(tok.as_str()),
-            ),
-            None => RelayMode::Default,
-        },
+        P2pRelayMode::Default => RelayMode::Default,
         P2pRelayMode::Custom(url_str) => {
             let mut map = build_custom_relay_map(std::slice::from_ref(url_str))?;
             if let Some(tok) = auth_token.as_ref() {
@@ -501,6 +548,46 @@ pub fn parse_p2p_endpoint_filtered(
     endpoint: &str,
     allow_private_addrs: bool,
 ) -> Result<EndpointAddr, RuntimeError> {
+    parse_p2p_endpoint_trusting(endpoint, allow_private_addrs, &[])
+}
+
+/// Returns the validated `?relay=` URLs of an `iroh://` or `p2p:iroh://` endpoint string.
+///
+/// Metadata and link-local relay hosts always fail closed; loopback, private, CGNAT, and ULA
+/// relay hosts also fail closed unless `allow_private_addrs`.
+pub fn extract_p2p_relay_urls_from_endpoint(
+    endpoint: &str,
+    allow_private_addrs: bool,
+) -> Result<Vec<String>, RuntimeError> {
+    let endpoint = endpoint.strip_prefix("p2p:").unwrap_or(endpoint);
+    let addr = parse_p2p_endpoint_filtered(endpoint, allow_private_addrs)?;
+    Ok(addr.relay_urls().map(ToString::to_string).collect())
+}
+
+fn reject_private_relay_host(validated: &url::Url) -> Result<(), RuntimeError> {
+    let host = validated.host_str().unwrap_or_default();
+    let bare = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    let private = super::is_loopback_host(bare)
+        || bare
+            .parse::<IpAddr>()
+            .is_ok_and(super::is_private_or_reserved_ip);
+    if private {
+        return Err(RuntimeError::Protocol(format!(
+            "private or loopback relay host '{bare}' requires allow_private_addrs"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_p2p_endpoint_trusting(
+    endpoint: &str,
+    allow_private_addrs: bool,
+    trusted_relays: &[String],
+) -> Result<EndpointAddr, RuntimeError> {
     if endpoint.chars().any(char::is_control) {
         return Err(RuntimeError::Protocol(
             "iroh endpoint contains control characters".into(),
@@ -535,6 +622,11 @@ pub fn parse_p2p_endpoint_filtered(
                 }
                 "relay" => {
                     let validated = super::validate_iroh_relay_url(val)?;
+                    if !allow_private_addrs
+                        && !trusted_relays.iter().any(|t| t == validated.as_str())
+                    {
+                        reject_private_relay_host(&validated)?;
+                    }
                     let url = RelayUrl::from_str(validated.as_str()).map_err(|err| {
                         RuntimeError::Protocol(format!("invalid iroh relay URL '{val}': {err}"))
                     })?;
@@ -904,9 +996,100 @@ pub struct P2pDialer {
     guard: Arc<EndpointGuard>,
     write_timeout: Duration,
     allow_private_addrs: bool,
+    trusted_relays: Vec<String>,
+}
+
+fn configured_relay_urls(mode: &P2pRelayMode) -> Vec<String> {
+    let raw: &[String] = match mode {
+        P2pRelayMode::Custom(url) => std::slice::from_ref(url),
+        P2pRelayMode::CustomMany(urls) => urls,
+        P2pRelayMode::Default | P2pRelayMode::Disabled => &[],
+    };
+    raw.iter()
+        .filter_map(|u| super::validate_iroh_relay_url(u).ok())
+        .map(|u| u.as_str().to_owned())
+        .collect()
+}
+
+/// Resolves each relay URL host and rejects metadata and link-local addresses always, and
+/// private, loopback, or reserved addresses unless `allow_private_addrs` or the URL is trusted.
+///
+/// Fails closed on a lookup error, a lookup timeout, or zero resolved addresses. The resolved
+/// addresses cannot be pinned into `iroh`, so a resolver that answers differently on the second
+/// lookup remains an accepted residual limit.
+async fn check_relay_hosts_post_dns(
+    relay_urls: &[String],
+    allow_private_addrs: bool,
+    trusted_relays: &[String],
+) -> Result<(), RuntimeError> {
+    for raw in relay_urls {
+        let parsed = url::Url::parse(raw)
+            .map_err(|err| RuntimeError::Protocol(format!("invalid iroh relay URL: {err}")))?;
+        let trusted = trusted_relays.iter().any(|t| t == parsed.as_str());
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| RuntimeError::Protocol("iroh relay URL is missing a host".into()))?;
+        let bare = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.');
+        if bare.is_empty() {
+            return Err(RuntimeError::Protocol(
+                "iroh relay URL is missing a host".into(),
+            ));
+        }
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| RuntimeError::Protocol("iroh relay URL is missing a port".into()))?;
+        let resolved: Vec<SocketAddr> =
+            match timeout(RELAY_DNS_TIMEOUT, tokio::net::lookup_host((bare, port))).await {
+                Ok(Ok(iter)) => iter.collect(),
+                Ok(Err(err)) => {
+                    return Err(RuntimeError::Protocol(format!(
+                        "iroh relay host '{bare}' failed to resolve: {err}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(RuntimeError::Timeout(
+                        "iroh relay host resolution timed out",
+                    ));
+                }
+            };
+        if resolved.is_empty() {
+            return Err(RuntimeError::Protocol(format!(
+                "iroh relay host '{bare}' resolved to zero addresses"
+            )));
+        }
+        for sock in resolved {
+            let ip = sock.ip();
+            if super::is_metadata_or_link_local_ip(ip)
+                || (!allow_private_addrs && !trusted && super::is_private_or_reserved_ip(ip))
+            {
+                return Err(RuntimeError::Protocol(format!(
+                    "iroh relay host '{bare}' resolved to forbidden address '{ip}'"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl P2pDialer {
+    /// Binds a client endpoint for dialing `endpoint`, deriving custom relays from its `?relay=`
+    /// URLs per [`P2pOptions::for_endpoint`].
+    pub async fn bind_for_endpoint(
+        endpoint: &str,
+        explicit_mode: Option<P2pRelayMode>,
+        allow_private_addrs: bool,
+    ) -> Result<Self, RuntimeError> {
+        Self::bind_with_options(P2pOptions::for_endpoint(
+            endpoint,
+            explicit_mode,
+            allow_private_addrs,
+        )?)
+        .await
+    }
+
     /// Binds a client `iroh` endpoint configured with `relay_mode`.
     pub async fn bind(relay_mode: P2pRelayMode) -> Result<Self, RuntimeError> {
         Self::bind_with_options(P2pOptions::for_dialer(relay_mode)).await
@@ -915,11 +1098,17 @@ impl P2pDialer {
     /// Binds a client `iroh` endpoint with explicit privacy and lookup options.
     pub async fn bind_with_options(options: P2pOptions) -> Result<Self, RuntimeError> {
         let allow_private_addrs = options.allow_private_addrs;
+        let trusted_relays = if options.uri_derived_relays {
+            Vec::new()
+        } else {
+            configured_relay_urls(&options.relay_mode)
+        };
         let endpoint = build_iroh_endpoint(&options, Vec::new(), None).await?;
         Ok(Self {
             guard: EndpointGuard::new(endpoint),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             allow_private_addrs,
+            trusted_relays,
         })
     }
 
@@ -952,7 +1141,11 @@ impl PathDialer for P2pDialer {
     }
 
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
-        let addr = parse_p2p_endpoint_filtered(endpoint, self.allow_private_addrs)?;
+        let addr =
+            parse_p2p_endpoint_trusting(endpoint, self.allow_private_addrs, &self.trusted_relays)?;
+        let relay_urls: Vec<String> = addr.relay_urls().map(ToString::to_string).collect();
+        check_relay_hosts_post_dns(&relay_urls, self.allow_private_addrs, &self.trusted_relays)
+            .await?;
         let conn = timeout(
             P2P_HANDSHAKE_TIMEOUT,
             self.guard.endpoint.connect(addr, TENDRIL_P2P_ALPN),
@@ -1027,5 +1220,214 @@ mod tests {
         let g_other = PeerAcceptGuard::try_acquire(Arc::clone(&counts), other, 4).expect("other");
         drop((g1, g2, g3, g4, g_other));
         assert!(counts.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn private_relay_hosts_fail_closed_unless_private_addrs_allowed() {
+        let ep_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
+        for host in [
+            "http://localhost:8080/",
+            "http://127.0.0.1:8080/",
+            "http://[::1]:8080/",
+            "https://10.0.0.5/",
+            "https://192.168.1.5/",
+            "https://100.64.0.1/",
+            "https://[fd00::1]/",
+        ] {
+            let uri = format!("iroh://{ep_id}?relay={host}");
+            assert!(
+                parse_p2p_endpoint_filtered(&uri, false).is_err(),
+                "{host} must fail closed"
+            );
+            assert!(
+                parse_p2p_endpoint_filtered(&uri, true).is_ok(),
+                "{host} must be allowed with allow_private_addrs"
+            );
+        }
+        let public = format!("iroh://{ep_id}?relay=https://relay.example/");
+        assert!(parse_p2p_endpoint_filtered(&public, false).is_ok());
+        let meta = format!("iroh://{ep_id}?relay=https://169.254.169.254/");
+        assert!(parse_p2p_endpoint_filtered(&meta, true).is_err());
+    }
+
+    #[test]
+    fn extract_relay_urls_and_for_endpoint_derive_custom_relays() {
+        let ep_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
+        let one = format!("iroh://{ep_id}?relay=https://r1.example/");
+        let urls = extract_p2p_relay_urls_from_endpoint(&one, false).expect("extract");
+        assert_eq!(urls, vec!["https://r1.example/".to_owned()]);
+        let prefixed = format!("p2p:iroh://{ep_id}?relay=https://r1.example/");
+        assert_eq!(
+            extract_p2p_relay_urls_from_endpoint(&prefixed, false).expect("prefixed"),
+            urls
+        );
+        assert!(
+            extract_p2p_relay_urls_from_endpoint(&format!("iroh://{ep_id}"), false)
+                .expect("bare")
+                .is_empty()
+        );
+
+        let opts = P2pOptions::for_endpoint(&one, None, false).expect("derive");
+        assert_eq!(
+            opts.relay_mode,
+            P2pRelayMode::Custom("https://r1.example/".to_owned())
+        );
+        assert!(!opts.publish_pkarr && !opts.resolve_pkarr);
+
+        let many = format!("iroh://{ep_id}?relay=https://r1.example/&relay=https://r2.example/");
+        let opts = P2pOptions::for_endpoint(&many, Some(P2pRelayMode::Default), false)
+            .expect("derive many");
+        assert!(matches!(opts.relay_mode, P2pRelayMode::CustomMany(ref u) if u.len() == 2));
+        assert!(!opts.resolve_pkarr);
+
+        let disabled = P2pOptions::for_endpoint(&one, Some(P2pRelayMode::Disabled), false)
+            .expect("explicit disabled");
+        assert_eq!(disabled.relay_mode, P2pRelayMode::Disabled);
+
+        let bare = P2pOptions::for_endpoint(&format!("iroh://{ep_id}"), None, false)
+            .expect("bare default");
+        assert_eq!(bare.relay_mode, P2pRelayMode::Default);
+        assert!(bare.resolve_pkarr);
+
+        let private = format!("iroh://{ep_id}?relay=http://127.0.0.1:9/");
+        assert!(P2pOptions::for_endpoint(&private, None, false).is_err());
+        assert!(P2pOptions::for_endpoint(&private, None, true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn relay_auth_is_refused_for_default_public_relays() {
+        let opts = P2pOptions::for_dialer(P2pRelayMode::Default).with_relay_auth(Some(
+            P2pRelayAuth::BearerToken(Zeroizing::new("tok".to_owned())),
+        ));
+        assert!(matches!(
+            P2pDialer::bind_with_options(opts).await,
+            Err(RuntimeError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dial_rejects_private_relay_hint_before_connecting() {
+        let dialer = P2pDialer::bind_with_options(
+            P2pOptions::for_dialer(P2pRelayMode::Disabled).with_allow_private_addrs(false),
+        )
+        .await
+        .expect("bind");
+        let ep_id = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
+        let err = dialer
+            .dial(&format!("iroh://{ep_id}?relay=https://10.0.0.5/"))
+            .await
+            .err()
+            .expect("private relay hint must be rejected");
+        assert!(
+            matches!(&err, RuntimeError::Protocol(m) if m.contains("allow_private_addrs")),
+            "{err:?}"
+        );
+        dialer.close().await;
+    }
+
+    #[tokio::test]
+    async fn post_dns_relay_check_blocks_forbidden_resolved_addresses() {
+        let loopback = vec!["https://localhost/".to_owned()];
+        assert!(
+            check_relay_hosts_post_dns(&loopback, false, &[])
+                .await
+                .is_err()
+        );
+        assert!(
+            check_relay_hosts_post_dns(&loopback, true, &[])
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_relay_hosts_post_dns(&loopback, false, &loopback)
+                .await
+                .is_ok()
+        );
+        let metadata = vec!["https://169.254.169.254/".to_owned()];
+        assert!(
+            check_relay_hosts_post_dns(&metadata, true, &metadata)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn uri_derived_relays_are_never_trusted_and_are_checked_before_bind() {
+        let ep_id = iroh::SecretKey::from_bytes(&[25u8; 32]).public();
+        let uri = format!("iroh://{ep_id}?relay=http://127.0.0.1:9/");
+        let derived = P2pDialer::bind_with_options(
+            P2pOptions::for_endpoint(&uri, None, true).expect("derive"),
+        )
+        .await
+        .expect("bind derived");
+        assert!(derived.trusted_relays.is_empty());
+        derived.close().await;
+
+        let explicit = P2pDialer::bind_with_options(P2pOptions::for_dialer(P2pRelayMode::Custom(
+            "http://127.0.0.1:9/".to_owned(),
+        )))
+        .await
+        .expect("explicit loopback relay stays permitted");
+        assert_eq!(
+            explicit.trusted_relays,
+            vec!["http://127.0.0.1:9/".to_owned()]
+        );
+        explicit.close().await;
+
+        let mut forged =
+            P2pOptions::for_dialer(P2pRelayMode::Custom("http://127.0.0.1:9/".to_owned()));
+        forged.uri_derived_relays = true;
+        assert!(matches!(
+            P2pDialer::bind_with_options(forged).await,
+            Err(RuntimeError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn for_endpoint_keeps_explicit_local_relays_despite_uri_hints() {
+        let ep_id = iroh::SecretKey::from_bytes(&[26u8; 32]).public();
+        let uri = format!("iroh://{ep_id}?relay=http://127.0.0.1:3340/");
+        let custom = P2pOptions::for_endpoint(
+            &uri,
+            Some(P2pRelayMode::Custom("http://127.0.0.1:3340/".to_owned())),
+            false,
+        )
+        .expect("explicit loopback relay");
+        assert!(matches!(custom.relay_mode, P2pRelayMode::Custom(_)));
+        assert!(!custom.uri_derived_relays);
+        let local = P2pOptions::for_endpoint(&uri, Some(P2pRelayMode::Disabled), false)
+            .expect("local mode");
+        assert!(local.allow_private_addrs);
+        assert!(P2pOptions::for_endpoint(&uri, None, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn post_dns_relay_check_fails_closed_on_unresolvable_or_empty_hosts() {
+        let unresolvable = vec!["https://relay-host.invalid/".to_owned()];
+        assert!(
+            check_relay_hosts_post_dns(&unresolvable, true, &unresolvable)
+                .await
+                .is_err()
+        );
+        let dotted = vec!["https://./".to_owned()];
+        assert!(matches!(
+            check_relay_hosts_post_dns(&dotted, true, &dotted).await,
+            Err(RuntimeError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_auth_is_refused_for_uri_derived_relays() {
+        let ep_id = iroh::SecretKey::from_bytes(&[27u8; 32]).public();
+        let uri = format!("iroh://{ep_id}?relay=http://127.0.0.1:9/");
+        let opts = P2pOptions::for_endpoint(&uri, None, true)
+            .expect("derive")
+            .with_relay_auth(Some(P2pRelayAuth::BearerToken(Zeroizing::new(
+                "tok".to_owned(),
+            ))));
+        assert!(matches!(
+            P2pDialer::bind_with_options(opts).await,
+            Err(RuntimeError::Protocol(m)) if m.contains("peer URI")
+        ));
     }
 }

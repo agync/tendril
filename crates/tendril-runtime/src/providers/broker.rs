@@ -13,9 +13,11 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, StatusCode};
-use tokio_tungstenite::{MaybeTlsStream, accept_hdr_async_with_config, connect_async_with_config};
+use tokio_tungstenite::{MaybeTlsStream, accept_hdr_async_with_config};
 
-use super::{WsBinaryPathStream, ensure_rustls_ring_provider, ws_binary_config};
+use super::{
+    WsBinaryPathStream, connect_ws_resolved, ensure_rustls_ring_provider, ws_binary_config,
+};
 use crate::error::RuntimeError;
 use crate::provider::{
     DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathStream,
@@ -286,11 +288,10 @@ impl PathDialer for BrokerDialer {
         ensure_rustls_ring_provider();
         let (ws, _resp) = timeout(
             UPGRADE_TIMEOUT,
-            connect_async_with_config(req, Some(ws_binary_config()), false),
+            connect_ws_resolved(req, Some(ws_binary_config()), "broker websocket connect"),
         )
         .await
-        .map_err(|_| RuntimeError::Timeout("broker websocket connect timed out"))?
-        .map_err(|err| RuntimeError::Protocol(format!("broker websocket connect failed: {err}")))?;
+        .map_err(|_| RuntimeError::Timeout("broker websocket connect timed out"))??;
 
         Ok(Box::new(WsBinaryPathStream::new(
             ProviderId::Broker,

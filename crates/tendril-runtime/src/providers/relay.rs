@@ -21,10 +21,12 @@ use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, connect_async_with_config};
 
-use super::{WsBinaryPathStream, ensure_rustls_ring_provider, ws_binary_config};
+use super::{
+    WsBinaryPathStream, connect_ws_resolved, ensure_rustls_ring_provider, ws_binary_config,
+};
 use crate::error::RuntimeError;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
 
@@ -175,11 +177,14 @@ async fn connect_and_verify_challenge(
     ensure_rustls_ring_provider();
     let (mut ws, _) = timeout(
         CONTROL_TIMEOUT,
-        connect_async_with_config(relay_url, Some(client_ws_config()), false),
+        connect_ws_resolved(
+            relay_url,
+            Some(client_ws_config()),
+            "relay websocket connect",
+        ),
     )
     .await
-    .map_err(|_| RuntimeError::Timeout("relay websocket connect timed out"))?
-    .map_err(|err| RuntimeError::Protocol(format!("relay websocket connect failed: {err}")))?;
+    .map_err(|_| RuntimeError::Timeout("relay websocket connect timed out"))??;
 
     let RelayServerMsg::Challenge {
         nonce,

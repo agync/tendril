@@ -25,23 +25,42 @@ use tendril_relay::server::ClientWsStream;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout};
-use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::relay::{RelayClientAuth, RelayStream, build_relay_auth_proof};
-use super::{ensure_rustls_ring_provider, ws_binary_config};
+use super::{connect_ws_resolved, ensure_rustls_ring_provider, ws_binary_config};
 use crate::error::RuntimeError;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
-const CONTROL_PING_INTERVAL: Duration = Duration::from_secs(30);
+const CONTROL_PING_MIN_MS: u64 = 22_500;
+const CONTROL_PING_MAX_MS: u64 = 37_500;
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_ACCEPTS: usize = 16;
 const EPOCH_ROTATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BACKOFF_INITIAL: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 const STABLE_UPTIME_RESET: Duration = Duration::from_secs(5);
+
+fn warn_multi_epoch_ticket(auth: &RelayClientAuth) {
+    if let RelayClientAuth::Ticket(ticket) = auth
+        && ticket.spans_multiple_v2_epochs()
+    {
+        tracing::warn!(
+            "v2 relay ticket spans multiple epochs, so the relay can link them; \
+             prefer Tier 2 HMAC admission or per-epoch scoped tickets"
+        );
+    }
+}
+
+/// Returns a CSPRNG-jittered control ping delay in `22.5s..=37.5s` (30s +/- 25%).
+fn jittered_ping_delay() -> Duration {
+    let raw = u32::from_le_bytes(random_bytes::<4>().unwrap_or([0; 4]));
+    Duration::from_millis(
+        CONTROL_PING_MIN_MS + u64::from(raw) % (CONTROL_PING_MAX_MS - CONTROL_PING_MIN_MS + 1),
+    )
+}
 
 fn jittered_backoff(backoff: Duration) -> Duration {
     let base_ms = u64::try_from(backoff.as_millis()).unwrap_or(5_000).max(1);
@@ -127,11 +146,14 @@ async fn connect_and_verify_v2_challenge(
     ensure_rustls_ring_provider();
     let (mut ws, _) = timeout(
         CONTROL_TIMEOUT,
-        connect_async_with_config(relay_url, Some(ws_binary_config()), false),
+        connect_ws_resolved(
+            relay_url,
+            Some(ws_binary_config()),
+            "v2 relay websocket connect",
+        ),
     )
     .await
-    .map_err(|_| RuntimeError::Timeout("v2 relay websocket connect timed out"))?
-    .map_err(|err| RuntimeError::Protocol(format!("v2 relay websocket connect failed: {err}")))?;
+    .map_err(|_| RuntimeError::Timeout("v2 relay websocket connect timed out"))??;
 
     let RelayV2ServerMsg::Challenge {
         nonce,
@@ -274,6 +296,7 @@ impl RelayV2Listener {
         config: RelayV2ListenerConfig,
     ) -> Result<Self, RuntimeError> {
         let secret = Zeroizing::new(mailbox_secret);
+        warn_multi_epoch_ticket(&config.auth);
         let auth = Arc::new(config.auth);
         let parsed = super::validate_ws_url(&relay_url.into(), config.allow_insecure_ws)?;
         let required_host = extract_expected_host(&parsed, config.expected_host.as_deref())?;
@@ -679,11 +702,8 @@ fn spawn_epoch_control_task(
 
             let idle_sleep = tokio::time::sleep(CONTROL_IDLE_TIMEOUT);
             tokio::pin!(idle_sleep);
-            let mut ping_interval = tokio::time::interval_at(
-                TokioInstant::now() + CONTROL_PING_INTERVAL,
-                CONTROL_PING_INTERVAL,
-            );
-            ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let ping_sleep = tokio::time::sleep(jittered_ping_delay());
+            tokio::pin!(ping_sleep);
             let disconnected = loop {
                 if *shutdown_rx.borrow() {
                     let _ = timeout(write_timeout, control_ws.close(None)).await;
@@ -698,7 +718,10 @@ fn spawn_epoch_control_task(
                         let _ = timeout(write_timeout, control_ws.close(None)).await;
                         break true;
                     }
-                    _ = ping_interval.tick() => {
+                    () = &mut ping_sleep => {
+                        ping_sleep
+                            .as_mut()
+                            .reset(TokioInstant::now() + jittered_ping_delay());
                         if !timeout(
                             write_timeout,
                             control_ws.send(Message::Ping(Vec::new().into())),
@@ -717,6 +740,9 @@ fn spawn_epoch_control_task(
                                 idle_sleep
                                     .as_mut()
                                     .reset(TokioInstant::now() + CONTROL_IDLE_TIMEOUT);
+                                ping_sleep
+                                    .as_mut()
+                                    .reset(TokioInstant::now() + jittered_ping_delay());
                                 if let Ok(RelayV2ServerMsg::Incoming {
                                     mailbox_id: inc_mailbox_b64,
                                     epoch: inc_epoch,
@@ -938,6 +964,7 @@ impl RelayV2Dialer {
     /// Attaches stateless admission credentials for relays requiring dial auth.
     #[must_use]
     pub fn with_auth(mut self, auth: RelayClientAuth) -> Self {
+        warn_multi_epoch_ticket(&auth);
         self.auth = auth;
         self
     }
@@ -1008,5 +1035,83 @@ impl PathDialer for RelayV2Dialer {
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
         let url = endpoint.split_once('#').map_or(endpoint, |(u, _)| u);
         self.connect(url).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use tendril_core::identity::EndpointIdentity;
+    use tendril_core::relay_auth::RelayAuthRole;
+    use tendril_core::v2::RELAY_V2_EPOCH_SECS;
+
+    use super::*;
+
+    #[test]
+    fn control_ping_delay_is_jittered_within_bounds() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let d = jittered_ping_delay();
+            assert!(d >= Duration::from_millis(CONTROL_PING_MIN_MS), "{d:?}");
+            assert!(d <= Duration::from_millis(CONTROL_PING_MAX_MS), "{d:?}");
+            seen.insert(d);
+        }
+        assert!(seen.len() > 1, "ping delay must not be constant");
+    }
+
+    struct WarnCounter(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn multi_epoch_ticket_emits_linkability_warning() {
+        let id = EndpointIdentity::generate().expect("identity");
+        let now = 1_795_132_800 - (1_795_132_800 % RELAY_V2_EPOCH_SECS);
+        let target = b64url_encode(
+            id.signing_key()
+                .ed25519_signing_key()
+                .verifying_key()
+                .as_bytes(),
+        );
+        let spanning = id
+            .mint_relay_ticket(
+                "relay.example",
+                RelayAuthRole::Dial,
+                &target,
+                now,
+                RELAY_V2_EPOCH_SECS * 2,
+            )
+            .expect("mint spanning");
+        assert!(spanning.spans_multiple_v2_epochs());
+        let single = id
+            .mint_relay_ticket("relay.example", RelayAuthRole::Dial, &target, now, 60)
+            .expect("mint single");
+        assert!(!single.spans_multiple_v2_epochs());
+
+        let warns = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::with_default(WarnCounter(Arc::clone(&warns)), || {
+            warn_multi_epoch_ticket(&RelayClientAuth::Ticket(single));
+            warn_multi_epoch_ticket(&RelayClientAuth::None);
+            assert_eq!(warns.load(Ordering::SeqCst), 0);
+            warn_multi_epoch_ticket(&RelayClientAuth::Ticket(spanning));
+            assert_eq!(warns.load(Ordering::SeqCst), 1);
+        });
     }
 }
