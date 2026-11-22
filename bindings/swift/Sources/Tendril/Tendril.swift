@@ -1160,3 +1160,232 @@ public final class TendrilSession {
     }
   }
 }
+
+extension TendrilEndpoint {
+  private func manifestCall(_ name: String, _ call: (OpaquePointer, inout UnsafeMutablePointer<CChar>?) throws -> Int32) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try call(h, &out)
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "\(name) failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// Creates a group rooted at this endpoint and returns the signed manifest JSON. Group APIs are not
+  /// available on keychain-sealed mobile endpoints yet: they throw an invalid-argument error
+  /// ("groups require a state directory endpoint"). `endpointsJson` is nil or a JSON array of strings.
+  public func groupCreate(name: String, minWireVersion: UInt8 = 1, endpointsJson: String? = nil) throws -> String {
+    try manifestCall("tendril_group_create") { h, out in
+      try withValidatedCString(name, name: "name") { cName in
+        try withOptionalValidatedCString(endpointsJson, name: "endpointsJson") { cEndpoints in
+          tendril_group_create(h, cName, minWireVersion, cEndpoints, &out)
+        }
+      }
+    }
+  }
+
+  public func groupAddMember(
+    groupId: String,
+    peerId: String,
+    capsJson: String? = nil,
+    endpointsJson: String? = nil
+  ) throws -> String {
+    try manifestCall("tendril_group_add_member") { h, out in
+      try withValidatedCString(groupId, name: "groupId") { cGroup in
+        try withValidatedCString(peerId, name: "peerId") { cPeer in
+          try withOptionalValidatedCString(capsJson, name: "capsJson") { cCaps in
+            try withOptionalValidatedCString(endpointsJson, name: "endpointsJson") { cEndpoints in
+              tendril_group_add_member(h, cGroup, cPeer, cCaps, cEndpoints, &out)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  public func groupRemoveMember(groupId: String, peerId: String) throws -> String {
+    try manifestCall("tendril_group_remove_member") { h, out in
+      try withValidatedCString(groupId, name: "groupId") { cGroup in
+        try withValidatedCString(peerId, name: "peerId") { cPeer in
+          tendril_group_remove_member(h, cGroup, cPeer, &out)
+        }
+      }
+    }
+  }
+
+  /// Ingests a manifest received from the authenticated peer `senderPeerId`; returns its group id.
+  public func groupIngestManifest(manifestJson: String, senderPeerId: String) throws -> String {
+    try manifestCall("tendril_group_ingest_manifest") { h, out in
+      try withValidatedCString(manifestJson, name: "manifestJson") { cManifest in
+        try withValidatedCString(senderPeerId, name: "senderPeerId") { cSender in
+          tendril_group_ingest_manifest(h, cManifest, cSender, &out)
+        }
+      }
+    }
+  }
+
+  /// Opens the group pool. A non-nil `listenAddr` also binds a direct listener the group serves (see
+  /// `TendrilGroup.localEndpoint()`). Configure transports before the first call.
+  public func openGroup(groupId: String, listenAddr: String? = nil) throws -> TendrilGroup {
+    try withHandle { h in
+      var raw: OpaquePointer?
+      let rc = try withValidatedCString(groupId, name: "groupId") { cGroup in
+        try withOptionalValidatedCString(listenAddr, name: "listenAddr") { cListen in
+          tendril_group_open(h, cGroup, cListen, &raw)
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue, let raw else {
+        throw ffiError(rc, fallback: "tendril_group_open failed")
+      }
+      return TendrilGroup(handle: raw)
+    }
+  }
+}
+
+public final class TendrilGroup {
+  private let cond = NSCondition()
+  private var handle: OpaquePointer?
+  private var activeCalls: Int = 0
+  private var closing: Bool = false
+
+  internal init(handle: OpaquePointer) {
+    self.handle = handle
+  }
+
+  deinit {
+    close()
+  }
+
+  /// Closes the group handle and frees it. Idempotent; a `pollEvent` already waiting returns promptly
+  /// and throws `.eof`.
+  public func close() {
+    cond.lock()
+    guard let h = handle else {
+      cond.unlock()
+      return
+    }
+    let firstCloser = !closing
+    closing = true
+    if firstCloser {
+      activeCalls += 1
+    }
+    cond.unlock()
+
+    if firstCloser {
+      _ = tendril_group_close(h)
+      cond.lock()
+      activeCalls -= 1
+      cond.broadcast()
+    } else {
+      cond.lock()
+    }
+
+    while activeCalls > 0 {
+      cond.wait()
+    }
+    if let toFree = handle {
+      handle = nil
+      cond.unlock()
+      tendril_group_free(toFree)
+    } else {
+      cond.unlock()
+    }
+  }
+
+  private func withHandle<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
+    cond.lock()
+    guard !closing, let h = handle else {
+      cond.unlock()
+      throw TendrilError.closed
+    }
+    activeCalls += 1
+    cond.unlock()
+    defer {
+      cond.lock()
+      activeCalls -= 1
+      if activeCalls == 0 {
+        cond.broadcast()
+      }
+      cond.unlock()
+    }
+    return try body(h)
+  }
+
+  /// Sends `data` to every reachable member and returns the `{delivered, offline, failed}` JSON.
+  /// A nil `requiredCap` uses the group's default send capability.
+  public func broadcast(_ data: Data, requiredCap: String? = nil) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withOptionalValidatedCString(requiredCap, name: "requiredCap") { cCap in
+        data.withUnsafeBytes { raw in
+          tendril_group_broadcast(h, cCap, raw.bindMemory(to: UInt8.self).baseAddress, data.count, &out)
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_group_broadcast failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// Pushes the stored manifest (and, for an admin, the rendezvous key) to members and returns the
+  /// report JSON. Wire v2 groups need it; the runtime refuses non-admins.
+  public func sync() throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_group_sync(h, &out)
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_group_sync failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// The endpoint bound by `listenAddr` at open time, or nil when none was requested.
+  public func localEndpoint() throws -> String? {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_group_local_endpoint(h, &out)
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_group_local_endpoint failed")
+      }
+      guard out != nil else {
+        return nil
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// Waits up to `timeoutMs` for the next event JSON (`app_data`, `manifest_updated`,
+  /// `member_joined`, `member_revoked`, `audit`) and returns nil on timeout. Throws `.eof` once the
+  /// pool is closed or the handle is closed while the call is waiting.
+  public func pollEvent(timeoutMs: UInt64) throws -> String? {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_group_poll_event(h, timeoutMs, &out)
+      if rc == TENDRIL_WOULD_BLOCK.rawValue {
+        return nil
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_group_poll_event failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// Throws unless `peerId` currently holds `cap` in the group.
+  public func authorizePeer(_ peerId: String, cap: String) throws {
+    try withHandle { h in
+      let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+        try withValidatedCString(cap, name: "cap") { cCap in
+          tendril_group_authorize_peer(h, cPeer, cCap)
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_group_authorize_peer failed")
+      }
+    }
+  }
+}

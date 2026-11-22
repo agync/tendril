@@ -217,6 +217,27 @@ struct TendrilConformanceTests {
   }
 
   @Test
+  func groupApisRefuseEndpointsWithoutStateDirectory() throws {
+    let ep = try TendrilEndpoint(hostId: "swift-group-refused")
+    defer { ep.close() }
+    #expect(throws: Error.self) {
+      _ = try ep.groupCreate(name: "swift-group")
+    }
+    #expect(throws: Error.self) {
+      _ = try ep.groupAddMember(groupId: "grp_none", peerId: "dev_none")
+    }
+    #expect(throws: Error.self) {
+      _ = try ep.groupRemoveMember(groupId: "grp_none", peerId: "dev_none")
+    }
+    #expect(throws: Error.self) {
+      _ = try ep.groupIngestManifest(manifestJson: "{}", senderPeerId: "dev_none")
+    }
+    #expect(throws: Error.self) {
+      _ = try ep.openGroup(groupId: "grp_none")
+    }
+  }
+
+  @Test
   func m2mEnrollmentAndReplay() throws {
     let host = try TendrilEndpoint(hostId: "swift-m2m-host")
     let anchor = try TendrilEndpoint(hostId: "swift-m2m-anchor")
