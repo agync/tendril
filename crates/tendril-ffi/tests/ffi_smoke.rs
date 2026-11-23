@@ -530,6 +530,32 @@ fn current_unix() -> u64 {
         .as_secs()
 }
 
+/// Parses the `YYYY-MM-DDTHH:MM:SSZ` timestamps that minted grants carry.
+fn rfc3339_utc_to_unix(ts: &str) -> u64 {
+    let b = ts.as_bytes();
+    assert!(
+        b.len() == 20
+            && b[19] == b'Z'
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b[10] == b'T'
+            && b[13] == b':'
+            && b[16] == b':',
+        "unexpected timestamp shape: {ts}"
+    );
+    let num = |r: std::ops::Range<usize>| -> i64 { ts[r].parse().expect("timestamp digits") };
+    let (y, m, d) = (num(0..4), num(5..7), num(8..10));
+    let (hh, mm, ss) = (num(11..13), num(14..16), num(17..19));
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3_600 + mm * 60 + ss).expect("timestamp before epoch")
+}
+
 fn pair_and_mint_c(host_dir: &str, cli_dir: &str, host_name_str: &str, caps_json: &str) -> String {
     let hd = CString::new(host_dir).unwrap();
     let cd = CString::new(cli_dir).unwrap();
@@ -1399,6 +1425,10 @@ fn batch2b_sec08_sec17_sec32_sec37_ffi_hardening() {
         serde_json::from_str(&unsafe { take_cstr(info_p) }).unwrap()
     };
     let cli_dev_c = CString::new(cli_id_info["device_id"].as_str().unwrap()).unwrap();
+    const GRANT_TTL_SECS: u64 = 3;
+    const EXPIRY_WAIT_MAX: Duration = Duration::from_secs(GRANT_TTL_SECS + 5);
+    // Longer than EXPIRY_WAIT_MAX so the parked poll ends by expiry, not WOULD_BLOCK.
+    const POLL_TIMEOUT_MS: u64 = 15_000;
     let short_caps_c = CString::new("[\"fs.read\"]").unwrap();
     let mut short_grant_p: *mut c_char = ptr::null_mut();
     assert_eq!(
@@ -1407,17 +1437,32 @@ fn batch2b_sec08_sec17_sec32_sec37_ffi_hardening() {
                 host_ep,
                 cli_dev_c.as_ptr(),
                 short_caps_c.as_ptr(),
-                1,
+                GRANT_TTL_SECS,
                 &raw mut short_grant_p,
             )
         },
         TENDRIL_OK
     );
-    let short_grant_c = CString::new(unsafe { take_cstr(short_grant_p) }).unwrap();
+    let minted_unix = current_unix();
+    let t_mint = Instant::now();
+    let short_grant = unsafe { take_cstr(short_grant_p) };
+    let not_after = rfc3339_utc_to_unix(
+        serde_json::from_str::<Value>(&short_grant).unwrap()["not_after"]
+            .as_str()
+            .unwrap(),
+    );
+    let short_grant_c = CString::new(short_grant).unwrap();
     let hep2_usize = host_ep as usize;
     let acc2_thr = thread::spawn(move || {
-        unsafe { tendril_session_accept(hep2_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) }
-            .addr()
+        let sess = unsafe {
+            tendril_session_accept(hep2_usize as *mut tendril_ffi::TendrilEndpoint, 5_000)
+        };
+        let err = if sess.is_null() {
+            read_last_err()
+        } else {
+            String::new()
+        };
+        (sess.addr(), err, current_unix(), t_mint.elapsed())
     });
     let hn2_c = CString::new(exp_host_info["host_id"].as_str().unwrap()).unwrap();
     let cli_sess2 = unsafe {
@@ -1430,27 +1475,57 @@ fn batch2b_sec08_sec17_sec32_sec37_ffi_hardening() {
         )
     };
     assert!(!cli_sess2.is_null(), "connect2 failed: {}", read_last_err());
-    let host_sess2 = acc2_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
-    assert!(!host_sess2.is_null());
+    let (host_sess2_addr, accept_err, accept_unix, accept_elapsed) = acc2_thr.join().unwrap();
+    let host_sess2 = host_sess2_addr as *mut tendril_ffi::TendrilSession;
+    assert!(
+        !host_sess2.is_null(),
+        "host accept failed: {accept_err} (not_after={not_after} minted_unix={minted_unix} \
+         accept_unix={accept_unix} mint_to_accept={accept_elapsed:?})"
+    );
 
     let hs2_usize = host_sess2 as usize;
     let poll2_thr = thread::spawn(move || {
+        let entered = current_unix();
         let mut ev_p: *mut c_char = ptr::null_mut();
         let rc = unsafe {
             tendril_session_poll_event(
                 hs2_usize as *mut tendril_ffi::TendrilSession,
-                5_000,
+                POLL_TIMEOUT_MS,
                 &raw mut ev_p,
             )
         };
+        let err = read_last_err();
         if !ev_p.is_null() {
             unsafe { tendril_string_free(ev_p) };
         }
-        rc
+        (rc, err, entered)
     });
-    thread::sleep(Duration::from_millis(2_200));
+    let give_up = Instant::now() + EXPIRY_WAIT_MAX;
+    while current_unix() < not_after {
+        assert!(
+            Instant::now() < give_up,
+            "wall clock did not reach not_after={not_after}: minted_unix={minted_unix} now={} \
+             monotonic_elapsed={:?} (clock stepped back?)",
+            current_unix(),
+            t_mint.elapsed()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !poll2_thr.is_finished(),
+        "poll returned before the rekey: minted_unix={minted_unix} not_after={not_after}"
+    );
     assert_eq!(unsafe { tendril_session_rekey(cli_sess2) }, TENDRIL_OK);
-    assert_eq!(poll2_thr.join().unwrap(), TENDRIL_ERR_PROTOCOL);
+    let (rc, err, entered) = poll2_thr.join().unwrap();
+    assert_eq!(rc, TENDRIL_ERR_PROTOCOL, "poll error: {err}");
+    assert!(
+        err.contains("grant outside validity window"),
+        "poll failed for another reason: {err}"
+    );
+    assert!(
+        entered < not_after,
+        "poll entered after expiry: entered={entered} not_after={not_after}"
+    );
 
     unsafe {
         tendril_session_close(cli_sess2, 1000, ptr::null());
