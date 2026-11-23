@@ -13,3 +13,4 @@ Entries from November 2026.
 - [groups: dial and listen on relay sibling links](23-groups-dial-and-listen-on-relay.md)
 - [Groups on sealed Kotlin and Swift endpoints](23-groups-on-sealed-kotlin-and-swift.md)
 - [ffi: group hub serves /v2/relay sibling links](23-ffi-group-hub-serves-v2-relay.md)
+- [Loopback test listeners: held dead ports and foreign requests ignored](23-loopback-test-listeners-held-dead-ports.md)

@@ -31,6 +31,107 @@ use tendril_runtime::{
 use tendril_runtime::{P2pDialer, P2pListener, P2pRelayMode};
 use tokio::time::timeout;
 
+/// A loopback port nothing listens on, held for the guard's lifetime. The port is the local end
+/// of an established loopback connection: dials to it are refused at once, and ordinary `bind(0)`
+/// allocation will not hand it to another listener, so a retrying client aimed at it cannot land
+/// on a socket bound later by a parallel test. (On macOS an explicit `SO_REUSEADDR` rebind of the
+/// exact port can still succeed; the guard prevents ephemeral allocation, not that.) A socket
+/// that is only bound is not enough, because Darwin drops SYNs to it without a reset and the dial
+/// hangs until the OS connect timeout.
+struct DeadPort {
+    _client: std::net::TcpStream,
+    _server: std::net::TcpStream,
+    addr: SocketAddr,
+}
+
+const DEAD_PORT_SETUP_DEADLINE: Duration = Duration::from_secs(5);
+
+impl DeadPort {
+    fn new() -> Self {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind seed");
+        let client = std::net::TcpStream::connect(listener.local_addr().expect("seed addr"))
+            .expect("connect seed");
+        Self::from_listener(listener, client)
+    }
+
+    /// Keeps the accepted stream whose peer is `client`, dropping any foreign connection (a host
+    /// process may probe a new loopback listener before the client arrives), then closes the
+    /// seed listener. Panics if the client's stream is not accepted before the setup deadline.
+    fn from_listener(listener: std::net::TcpListener, client: std::net::TcpStream) -> Self {
+        let addr = client.local_addr().expect("dead port addr");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking seed listener");
+        let deadline = Instant::now() + DEAD_PORT_SETUP_DEADLINE;
+        let server = loop {
+            match listener.accept() {
+                Ok((stream, peer)) if peer == addr => break stream,
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "dead port setup: seed listener never accepted the client at {addr}"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("accept seed: {err}"),
+            }
+        };
+        Self {
+            _client: client,
+            _server: server,
+            addr,
+        }
+    }
+}
+
+fn assert_dead_port_held(guard: &DeadPort) {
+    let started = Instant::now();
+    let err = std::net::TcpStream::connect_timeout(&guard.addr, Duration::from_secs(2))
+        .expect_err("dial must be refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "refusal was not immediate"
+    );
+    let rebind = tokio::net::TcpSocket::new_v4().expect("rebind socket");
+    let err = rebind.bind(guard.addr).expect_err("port must stay held");
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    #[cfg(target_os = "linux")]
+    {
+        let err = std::net::TcpListener::bind(guard.addr).expect_err("held against SO_REUSEADDR");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+    for _ in 0..2000 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        assert_ne!(
+            probe.local_addr().expect("probe addr").port(),
+            guard.addr.port(),
+            "bind(0) returned the guarded port"
+        );
+    }
+}
+
+#[test]
+fn dead_port_guard_refuses_dials_and_holds_the_port() {
+    assert_dead_port_held(&DeadPort::new());
+}
+
+#[test]
+fn dead_port_guard_ignores_a_foreign_connection_that_arrives_first() {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind seed");
+    let seed = listener.local_addr().expect("seed addr");
+    let stray = std::net::TcpStream::connect(seed).expect("connect stray");
+    let client = std::net::TcpStream::connect(seed).expect("connect client");
+    assert_ne!(
+        stray.local_addr().expect("stray addr"),
+        client.local_addr().expect("client addr")
+    );
+    let guard = DeadPort::from_listener(listener, client);
+    assert_dead_port_held(&guard);
+    drop(stray);
+}
+
 struct ProviderPair {
     listener: Box<dyn PathListener>,
     dialer: Box<dyn PathDialer>,
@@ -144,10 +245,63 @@ async fn setup_provider(provider: ProviderId) -> ProviderPair {
     }
 }
 
+const DIAL_TAG_LEN: usize = 16;
+
+/// Opens one stream pair. A loopback TCP listener also accepts connections from other processes
+/// on the host (a local service-discovery daemon sends `GET /` to every new listening port), and
+/// one stray accepted in place of the dialed stream shifts every later pairing in the test. The
+/// dialer therefore sends a random tag first, and only the accepted stream carrying it is kept.
 async fn open_pair(pair: &mut ProviderPair) -> (Box<dyn PathStream>, Box<dyn PathStream>) {
+    let tag: [u8; DIAL_TAG_LEN] = random_bytes().expect("dial tag");
     let ep = pair.endpoint.clone();
-    let (acc, dial) = tokio::join!(pair.listener.accept(), pair.dialer.dial(&ep));
-    (acc.expect("accept stream"), dial.expect("dial stream"))
+    let dialer = &pair.dialer;
+    let dial = async {
+        let mut cli = dialer.dial(&ep).await.expect("dial stream");
+        cli.send_chunk(&tag).await.expect("send dial tag");
+        cli
+    };
+    let (srv, cli) = tokio::join!(accept_dialed(pair.listener.as_mut(), tag), dial);
+    (srv, cli)
+}
+
+/// Accepts until a stream presents `tag`. Each candidate is read in its own task, and one deadline
+/// covers its whole tag read, so a silent or trickling stray cannot delay the dialed stream;
+/// strays are dropped.
+async fn accept_dialed(
+    listener: &mut dyn PathListener,
+    tag: [u8; DIAL_TAG_LEN],
+) -> Box<dyn PathStream> {
+    let mut checks = tokio::task::JoinSet::new();
+    let deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let mut stream = accepted.expect("accept stream");
+                checks.spawn(async move {
+                    let mut got = [0u8; DIAL_TAG_LEN];
+                    let read_tag = async {
+                        let mut filled = 0;
+                        while filled < got.len() {
+                            match stream.recv_chunk(&mut got[filled..]).await {
+                                Ok(n) if n > 0 => filled += n,
+                                _ => return false,
+                            }
+                        }
+                        true
+                    };
+                    let complete = timeout(Duration::from_secs(5), read_tag).await == Ok(true);
+                    (complete && got == tag).then_some(stream)
+                });
+            }
+            Some(checked) = checks.join_next() => {
+                if let Some(stream) = checked.expect("dial tag check") {
+                    return stream;
+                }
+            }
+            () = &mut deadline => panic!("no accepted stream carried the dial tag"),
+        }
+    }
 }
 
 struct WireTapStream {
@@ -388,6 +542,49 @@ async fn run_six_point_contract(provider: ProviderId) {
 }
 
 #[tokio::test]
+async fn open_pair_skips_foreign_connections_without_waiting_on_silent_ones() {
+    use tokio::io::AsyncWriteExt;
+    for provider in [ProviderId::Direct, ProviderId::Overlay] {
+        let mut pair = setup_provider(provider).await;
+        let addr = pair
+            .endpoint
+            .strip_prefix("overlay://")
+            .unwrap_or(&pair.endpoint)
+            .to_owned();
+        let _silent = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("silent stray");
+        let mut http = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("http stray");
+        http.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write stray request");
+
+        let (mut srv, mut cli) = timeout(Duration::from_secs(4), open_pair(&mut pair))
+            .await
+            .expect("open_pair must not wait for the silent stray");
+
+        send_tendril_frame(cli.as_mut(), b"dialed")
+            .await
+            .expect("send");
+        let mut reader = ResumableFrameReader::new();
+        let got = timeout(
+            Duration::from_secs(2),
+            recv_tendril_frame(srv.as_mut(), &mut reader),
+        )
+        .await
+        .map_err(|_| format!("{provider:?}: accepted stream is silent, not the dialed one"))
+        .expect("recv in time")
+        .expect("recv");
+        assert_eq!(
+            got, b"dialed",
+            "{provider:?}: accepted stream is not the dialed one"
+        );
+    }
+}
+
+#[tokio::test]
 async fn six_point_provider_contract_local() {
     run_six_point_contract(ProviderId::Local).await;
 }
@@ -542,10 +739,8 @@ async fn dial_with_policy_fails_over_from_unreachable_direct_to_live_relay() {
     .await
     .expect("bind relay listener");
 
-    // Pick a bound port then drop listener so TCP dial fails immediately (connection refused).
-    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead port");
-    let dead_addr = dead_listener.local_addr().expect("dead addr");
-    drop(dead_listener);
+    let dead = DeadPort::new();
+    let dead_addr = dead.addr;
 
     let dialers: Vec<Arc<dyn PathDialer>> = vec![
         Arc::new(DirectDialer::new()),
@@ -1435,9 +1630,8 @@ async fn dial_with_policy_respects_p2p_cold_delay_and_falls_back_across_rungs() 
             .expect("p2p dialer"),
     );
 
-    let unused_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused");
-    let dead_addr = unused_listener.local_addr().expect("unused addr");
-    drop(unused_listener);
+    let dead = DeadPort::new();
+    let dead_addr = dead.addr;
 
     // Dead Direct + live P2p -> falls back to P2p after cold delay.
     let dialers: Vec<Arc<dyn PathDialer>> = vec![
@@ -3035,7 +3229,6 @@ async fn relay_client_auth_v1_and_v2_hmac_and_tickets_end_to_end() {
 #[cfg(feature = "p2p-iroh")]
 #[tokio::test]
 async fn p2p_custom_many_validation_and_live_gated_iroh_relay_pairing_and_rekey() {
-    use std::net::TcpListener as StdTcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tendril_core::roster::Roster;
     use tendril_core::session::RekeyDirection;
@@ -3154,10 +3347,9 @@ async fn p2p_custom_many_validation_and_live_gated_iroh_relay_pairing_and_rekey(
         .expect("spawn iroh-relay server");
     let live_relay_url = format!("http://{}", iroh_srv.http_addr().expect("http addr"));
 
-    // Reserve and close a dead loopback port so CustomMany([dead, live]) fails over to live.
-    let dead_sock = StdTcpListener::bind("127.0.0.1:0").expect("bind dead port");
-    let dead_url = format!("http://{}", dead_sock.local_addr().unwrap());
-    drop(dead_sock);
+    // A held dead port so CustomMany([dead, live]) fails over to live.
+    let dead = DeadPort::new();
+    let dead_url = format!("http://{}", dead.addr);
 
     let custom_many = parse_p2p_relay_modes(&[dead_url, live_relay_url.clone()]).unwrap();
     assert!(matches!(custom_many, P2pRelayMode::CustomMany(_)));
@@ -3370,7 +3562,6 @@ async fn p2p_custom_many_validation_and_live_gated_iroh_relay_pairing_and_rekey(
 #[cfg(feature = "p2p-iroh-services")]
 #[tokio::test]
 async fn p2p_iroh_services_derives_rcan_token_on_custom_many_without_pkarr_leak() {
-    use std::net::TcpListener as StdTcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tendril_runtime::{P2pOptions, P2pRelayAuth, parse_p2p_relay_modes};
     use zeroize::Zeroizing;
@@ -3426,9 +3617,8 @@ async fn p2p_iroh_services_derives_rcan_token_on_custom_many_without_pkarr_leak(
         .expect("spawn iroh-relay server");
     let live_relay_url = format!("http://{}", iroh_srv.http_addr().expect("http addr"));
 
-    let dead_sock = StdTcpListener::bind("127.0.0.1:0").expect("bind dead");
-    let dead_url = format!("http://{}", dead_sock.local_addr().unwrap());
-    drop(dead_sock);
+    let dead = DeadPort::new();
+    let dead_url = format!("http://{}", dead.addr);
 
     let mode = parse_p2p_relay_modes(&[dead_url, live_relay_url]).unwrap();
     let auth = P2pRelayAuth::IrohServicesSecret(Zeroizing::new(api_secret_str.clone()));
