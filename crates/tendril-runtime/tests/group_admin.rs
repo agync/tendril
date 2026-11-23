@@ -5,11 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tendril_core::crypto::{SigningKeypair, StaticKeypair};
 use tendril_core::error::CoreError;
-use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+use tendril_core::grants::{RevocationList, RevocationListUnsigned, sign_crl};
 use tendril_core::group::{
     GroupBuildParams, GroupManifest, GroupMember, GroupSigner, V2GroupSecrets, add_member,
     create_group, decode_group_rendezvous_frame, encode_group_rendezvous_frame, group_id_from_root,
-    remove_member,
+    issue_admin_grant, remove_member, renew_manifest,
 };
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::roster::V2PeerSecrets;
@@ -616,4 +616,133 @@ fn removed_device_refuses_a_pushed_rendezvous_frame() {
     let r = ingest_pushed_rendezvous(&b.store, &b.id(), &root_id, &frame);
     assert!(is_unauthorized(&r), "{r:?}");
     assert!(b.store.load_group_book().unwrap().secrets(&gid).is_none());
+}
+
+fn root_signed_list(issuer: &str, revoked: Vec<String>, key: &SigningKeypair) -> RevocationList {
+    sign_crl(
+        RevocationListUnsigned {
+            v: 1,
+            issuer: issuer.to_owned(),
+            seq: 1,
+            revoked_devices: revoked,
+            revoked_nonces: vec![],
+            ts: "2026-11-22T00:00:00Z".to_owned(),
+        },
+        key,
+    )
+    .unwrap()
+}
+
+/// How the member `b` knows the root's revocation list.
+enum RootList {
+    HostLabel(Vec<String>),
+    RotatedAtDeviceId,
+}
+
+/// A root CRL stored under a host label revokes a co-admin for pushed manifests and keys,
+/// and a rotated root keyed by its device id fails both closed.
+#[test]
+fn host_labeled_root_crl_blocks_a_revoked_co_admin() {
+    let a = node(0);
+    let c = node(2);
+    let params = GroupBuildParams::new(now());
+    let root_pub = a.identity.signing_key().public_key().clone();
+    let gid = group_id_from_root(&root_pub);
+    let (m, s) = create_group(
+        a.identity.signing_key(),
+        "t",
+        1,
+        a.member("root", &gid),
+        params,
+    )
+    .unwrap();
+    let root = GroupSigner::root(a.identity.signing_key());
+    let local = node(1);
+    let (m, s) = add_member(&m, &root, local.member("b", &gid), &s, params).unwrap();
+    let (m2, s2) = add_member(&m, &root, c.member("c", &gid), &s, params).unwrap();
+    let grant = issue_admin_grant(
+        a.identity.signing_key(),
+        &a.id(),
+        &gid,
+        &c.id(),
+        c.identity.signing_key().public_key(),
+        0,
+        params,
+    )
+    .unwrap();
+    let co = GroupSigner::co_admin(c.identity.signing_key(), c.id(), grant);
+    let (m3, s3) = renew_manifest(&m2, &co, &s2, params).unwrap();
+    let payload = encode_group_rendezvous_frame(&gid, s3.seq(), s3.group_rendezvous_key()).unwrap();
+    let frame = decode_group_rendezvous_frame(&payload[..]).unwrap();
+
+    let attempt = |list: RootList| {
+        // `b` holds the root-signed manifest; `k` already holds the co-admin manifest.
+        let b = node(1);
+        let k = node(1);
+        store_group(&b, &m2, None);
+        store_group(&k, &m3, None);
+        for x in [&b, &k] {
+            x.store
+                .update_roster(|r| {
+                    match &list {
+                        RootList::HostLabel(revoked) => {
+                            r.insert_pinned_host(
+                                "root-host".into(),
+                                "root".into(),
+                                *a.identity.static_key().public_bytes(),
+                                Some(root_pub.clone()),
+                                0,
+                                vec![],
+                            )?;
+                            let crl = root_signed_list(
+                                "root-host",
+                                revoked.clone(),
+                                a.identity.signing_key(),
+                            );
+                            r.ingest_crl(crl, "root-host", &root_pub)?;
+                        }
+                        RootList::RotatedAtDeviceId => {
+                            r.insert_pinned_host(
+                                a.id(),
+                                "root".into(),
+                                *a.identity.static_key().public_bytes(),
+                                Some(root_pub.clone()),
+                                0,
+                                vec![],
+                            )?;
+                            let mut rotated = node(0).identity;
+                            rotated.rotate(
+                                StaticKeypair::from_scalar([0xD5; 32]),
+                                SigningKeypair::from_seed([0xD6; 32]),
+                                now(),
+                            )?;
+                            let new_pub = rotated.signing_key().public_key().clone();
+                            r.apply_verified_rotation(
+                                &a.id(),
+                                rotated.rotation_chain(),
+                                rotated.static_key().public_bytes(),
+                                &new_pub,
+                            )?;
+                            let crl = root_signed_list(&a.id(), vec![], rotated.signing_key());
+                            r.ingest_crl(crl, &a.id(), &new_pub)?;
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let pushed = ingest_pushed_manifest(&b.store, &b.id(), &c.id(), &m3).map(|_| ());
+        let keyed = ingest_pushed_rendezvous(&k.store, &k.id(), &c.id(), &frame);
+        (pushed, keyed)
+    };
+
+    let (pushed, keyed) = attempt(RootList::HostLabel(vec![c.id()]));
+    assert!(is_unauthorized(&pushed), "{pushed:?}");
+    assert!(is_unauthorized(&keyed), "{keyed:?}");
+    let (pushed, keyed) = attempt(RootList::HostLabel(vec![]));
+    pushed.unwrap();
+    keyed.unwrap();
+    let (pushed, keyed) = attempt(RootList::RotatedAtDeviceId);
+    assert!(is_unauthorized(&pushed), "{pushed:?}");
+    assert!(is_unauthorized(&keyed), "{keyed:?}");
 }

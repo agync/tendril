@@ -5,18 +5,21 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use tendril_core::crypto::{SigningKeypair, StaticKeypair};
-use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+use tendril_core::error::CoreError;
+use tendril_core::grants::{RevocationList, RevocationListUnsigned, sign_crl};
 use tendril_core::group::{
     GroupBuildParams, GroupManifest, GroupMember, GroupSigner, V2GroupSecrets, add_member,
     create_group, group_id_from_root, remove_member, renew_manifest, sign_group_manifest,
 };
 use tendril_core::identity::EndpointIdentity;
 
-use super::{GroupEvent, GroupPool, GroupPoolConfig};
+use super::{GroupEvent, GroupHub, GroupPool, GroupPoolConfig, InboundSession};
 use crate::driver::current_unix_secs;
-use crate::provider::PathDialer;
+use crate::error::RuntimeError;
+use crate::provider::{PathDialer, PathListener};
 use crate::providers::{DirectDialer, DirectListener};
 use crate::store::StateStore;
+use crate::v2_driver::V2ResponderState;
 
 struct Node {
     _dir: TempDir,
@@ -369,6 +372,242 @@ async fn crl_entry_before_the_write_blocks_an_ordinary_admin_push() {
     assert_eq!(report.failed.len(), 1, "{report:?}");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(key_of(&c, &gid).is_none(), "0x0B was sent");
+    pool_b.close();
+    pool_c.close();
+}
+
+fn signed_list(
+    issuer: &str,
+    seq: u64,
+    revoked: Vec<String>,
+    key: &SigningKeypair,
+) -> RevocationList {
+    sign_crl(
+        RevocationListUnsigned {
+            v: 1,
+            issuer: issuer.to_owned(),
+            seq,
+            revoked_devices: revoked,
+            revoked_nonces: vec![],
+            ts: "2026-11-22T00:00:00Z".to_owned(),
+        },
+        key,
+    )
+    .unwrap()
+}
+
+/// `member` pins `root` under `label` and stores `list` there, signed by `root`.
+fn pin_root_with_list(member: &Node, root: &Node, label: &str, list: RevocationList) {
+    let key = root.identity.signing_key().public_key().clone();
+    member
+        .store
+        .update_roster(|r| {
+            r.insert_pinned_host(
+                label.to_owned(),
+                "root".into(),
+                *root.identity.static_key().public_bytes(),
+                Some(key.clone()),
+                0,
+                vec![],
+            )?;
+            r.ingest_crl(list, label, &key)?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn open_pool(node: &Node, gid: &str) -> GroupPool {
+    let dialers: Vec<Arc<dyn PathDialer>> = vec![Arc::new(DirectDialer::new())];
+    GroupPool::open(
+        node.store.clone(),
+        Arc::clone(&node.identity),
+        gid,
+        GroupPoolConfig::new(dialers),
+        None,
+    )
+    .unwrap()
+}
+
+/// A root CRL stored under a host label applies to pool and hub decisions, and a rotated
+/// root keyed by its `device_id` fails every decision closed.
+#[tokio::test]
+async fn root_crl_under_a_host_label_applies_to_pool_decisions() {
+    let mut a = Node::new(9).await;
+    drop(a.listener.take());
+    let mut b = Node::new(10).await;
+    let mut c = Node::new(11).await;
+    drop(c.listener.take());
+    let mut d = Node::new(14).await;
+    let (gid, _, _) = seed(&a, &[&b, &c, &d], 1);
+    let list = signed_list("root-host", 1, vec![c.id()], a.identity.signing_key());
+    pin_root_with_list(&b, &a, "root-host", list);
+    let send = format!("group.send:{gid}");
+    let pool_b = open_pool(&b, &gid);
+    let r = pool_b.authorize_peer(&c.id(), &send);
+    assert!(
+        matches!(r, Err(RuntimeError::Core(CoreError::GroupMemberRevoked(_)))),
+        "{r:?}"
+    );
+    pool_b.authorize_peer(&a.id(), &send).unwrap();
+    pool_b.close();
+
+    // Hub: the root entry has a Wire v2 floor, the group and the session are Wire v1, so the
+    // wire floor narrowing drops the root entry. Its CRL now revokes the local device `b` too
+    // and must still empty the group's pins, so the handshake itself refuses the unrevoked `d`.
+    let both = signed_list(
+        "root-host",
+        2,
+        vec![c.id(), b.id()],
+        a.identity.signing_key(),
+    );
+    let a_pub = a.identity.signing_key().public_key().clone();
+    b.store
+        .update_roster(|r| {
+            r.ingest_crl(both, "root-host", &a_pub)?;
+            r.set_peer_min_wire_version("root-host", 2)?;
+            Ok(())
+        })
+        .unwrap();
+    let dialers: Vec<Arc<dyn PathDialer>> = vec![Arc::new(DirectDialer::new())];
+    let hub = Arc::new(GroupHub::new(
+        b.store.clone(),
+        Arc::clone(&b.identity),
+        GroupPoolConfig::new(dialers),
+        None,
+    ));
+    assert_eq!(hub.sync().unwrap().len(), 1);
+    let mut listener = b.listener.take().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let server_hub = Arc::clone(&hub);
+    tokio::spawn(async move {
+        let state = V2ResponderState::new();
+        while let Ok(stream) = listener.accept().await {
+            let verdict = match server_hub.accept(stream, &state, None, None).await {
+                Ok(InboundSession::Group { peer_device_id, .. }) => {
+                    format!("group:{peer_device_id}")
+                }
+                Ok(_) => "ordinary".to_owned(),
+                Err(err) => format!("refused:{err}"),
+            };
+            let _ = tx.send(verdict);
+        }
+    });
+    let pool_d = d.serve(&gid);
+    pool_d.broadcast(None, b"revoked").await.unwrap();
+    let verdict = loop {
+        let verdict = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if !verdict.contains("invalid preamble") {
+            break verdict;
+        }
+    };
+    assert!(verdict.starts_with("refused:"), "{verdict}");
+    assert!(
+        verdict.contains("peer not found"),
+        "the hub pinned members of a group whose root CRL revokes the local device: {verdict}"
+    );
+    pool_d.close();
+    hub.close();
+
+    // A root keyed by its device id rotates; its re-signed list no longer verifies under the
+    // founding key, so every decision of the pool fails closed and keeps failing.
+    let r = Node::new(12).await;
+    let m = Node::new(13).await;
+    let (gid, _, _) = seed(&r, &[&m], 2);
+    let first = signed_list(&r.id(), 1, vec![], r.identity.signing_key());
+    pin_root_with_list(&m, &r, &r.id(), first);
+    let send = format!("group.send:{gid}");
+    let pool_m = open_pool(&m, &gid);
+    pool_m.authorize_peer(&r.id(), &send).unwrap();
+    let mut rotated = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar([0x41 + 12; 32]),
+        SigningKeypair::from_seed([0x51 + 12; 32]),
+    );
+    rotated
+        .rotate(
+            StaticKeypair::from_scalar([0xD1; 32]),
+            SigningKeypair::from_seed([0xD2; 32]),
+            current_unix_secs(),
+        )
+        .unwrap();
+    let resigned = signed_list(&r.id(), 2, vec![], rotated.signing_key());
+    let new_pub = rotated.signing_key().public_key().clone();
+    m.store
+        .update_roster(|roster| {
+            roster.apply_verified_rotation(
+                &r.id(),
+                rotated.rotation_chain(),
+                rotated.static_key().public_bytes(),
+                &new_pub,
+            )?;
+            roster.ingest_crl(resigned, &r.id(), &new_pub)?;
+            Ok(())
+        })
+        .unwrap();
+    for peer in [r.id(), m.id(), r.id()] {
+        let res = pool_m.authorize_peer(&peer, &send);
+        assert!(
+            matches!(
+                res,
+                Err(RuntimeError::Core(CoreError::GroupUnauthorized(_)))
+            ),
+            "{res:?}"
+        );
+    }
+    pool_m.close();
+}
+
+/// A warm link is closed once the root CRL becomes unresolvable: the member applies the root's
+/// verified rotation, and its pool drops the slot instead of only refusing new decisions.
+#[tokio::test]
+async fn unresolvable_root_crl_closes_warm_links() {
+    let mut b = Node::new(15).await;
+    let mut c = Node::new(16).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let list = signed_list(&b.id(), 1, vec![], b.identity.signing_key());
+    pin_root_with_list(&c, &b, &b.id(), list);
+    let pool_b = b.serve(&gid);
+    let pool_c = c.serve(&gid);
+    let report = pool_b.broadcast(None, b"warm").await.unwrap();
+    assert_eq!(report.delivered, vec![c.id()], "{report:?}");
+    wait_until(|| pool_c.connected_peers().contains(&b.id())).await;
+
+    let mut rotated = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar([0x41 + 15; 32]),
+        SigningKeypair::from_seed([0x51 + 15; 32]),
+    );
+    rotated
+        .rotate(
+            StaticKeypair::from_scalar([0xD3; 32]),
+            SigningKeypair::from_seed([0xD4; 32]),
+            current_unix_secs(),
+        )
+        .unwrap();
+    let new_pub = rotated.signing_key().public_key().clone();
+    c.store
+        .update_roster(|roster| {
+            roster.apply_verified_rotation(
+                &b.id(),
+                rotated.rotation_chain(),
+                rotated.static_key().public_bytes(),
+                &new_pub,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    wait_until(|| pool_c.connected_peers().is_empty()).await;
+    let send = format!("group.send:{gid}");
+    let res = pool_c.authorize_peer(&b.id(), &send);
+    assert!(
+        matches!(
+            res,
+            Err(RuntimeError::Core(CoreError::GroupUnauthorized(_)))
+        ),
+        "{res:?}"
+    );
+    assert!(pool_c.connected_peers().is_empty());
     pool_b.close();
     pool_c.close();
 }

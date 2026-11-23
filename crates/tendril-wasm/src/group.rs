@@ -15,7 +15,7 @@ use tendril_core::grants::{Capability, RevocationList};
 use tendril_core::group::{
     GroupBook, GroupIngestOutcome, GroupIngestStatus, GroupManifest, GroupRendezvousFrame,
     check_first_contact, check_group_capacity, check_rendezvous_local_membership,
-    drop_secrets_if_left, is_active_member, root_device_in,
+    drop_secrets_if_left, is_active_member, root_crl as resolve_root_crl, root_device_in,
 };
 pub use tendril_core::group::{MAX_LOCAL_GROUPS, MAX_STORED_GROUPS};
 use tendril_core::roster::Roster;
@@ -31,18 +31,20 @@ fn invalid(msg: &str) -> String {
     CoreError::GroupUnauthorized(msg.to_owned()).to_string()
 }
 
-/// Returns the stored CRL issued by the founding root of `manifest`, unchanged.
-///
-/// Roster CRLs are verified at ingest, and core accepts only a list whose issuer is the root
-/// device id, so the lookup key is exactly that id. A CRL a root stored under a host id that
-/// differs from its device id is not consulted, matching the runtime.
-fn root_crl<'r>(
-    roster: &'r Roster,
+/// Resolves the effective revocation list of the founding root of `manifest` with
+/// [`tendril_core::group::root_crl`], matching the runtime: every stored list signed by the
+/// pinned root key applies, whatever label the roster stores it under, and a root that rotated
+/// away from that key fails closed. The browser is never a group root, so no list it mints
+/// itself can be root-signed and no local label is passed.
+fn root_crl(
+    roster: &Roster,
     manifest: &GroupManifest,
     root_pub: &HybridSigningPublicKey,
-) -> Option<&'r RevocationList> {
-    let root_id = root_device_in(manifest, root_pub)?;
-    roster.crl(&root_id)
+) -> Result<Option<RevocationList>, String> {
+    let Some(root_id) = root_device_in(manifest, root_pub) else {
+        return Ok(None);
+    };
+    resolve_root_crl(roster, &root_id, root_pub, None).map_err(|e| e.to_string())
 }
 
 fn crl_revokes(crl: Option<&RevocationList>, device_id: &str) -> bool {
@@ -128,14 +130,15 @@ impl WasmGroupBook {
             self.inner.manifest(&manifest.group_id),
             self.inner.root_signing_pub(&manifest.group_id),
         ) {
-            (Some(stored), Some(root_pub)) => root_crl(roster, stored, root_pub),
-            _ => HybridSigningPublicKey::from_b64url(&manifest.root_signing_pub)
-                .ok()
-                .and_then(|root_pub| root_crl(roster, manifest, &root_pub)),
+            (Some(stored), Some(root_pub)) => root_crl(roster, stored, root_pub)?,
+            _ => match HybridSigningPublicKey::from_b64url(&manifest.root_signing_pub) {
+                Ok(root_pub) => root_crl(roster, manifest, &root_pub)?,
+                Err(_) => None,
+            },
         };
         let outcome = self
             .inner
-            .ingest_group_manifest(manifest, now_unix, crl)
+            .ingest_group_manifest(manifest, now_unix, crl.as_ref())
             .map_err(|e| e.to_string())?;
         drop_secrets_if_left(&mut self.inner, &self.local_device_id, &manifest.group_id);
         Ok(outcome)
@@ -169,9 +172,9 @@ impl WasmGroupBook {
             .inner
             .root_signing_pub(group_id)
             .ok_or_else(|| CoreError::GroupNotFound(group_id.to_owned()).to_string())?;
-        let crl = root_crl(roster, manifest, root_pub);
+        let crl = root_crl(roster, manifest, root_pub)?;
         self.inner
-            .authorize_group(group_id, peer_device_id, cap, now_unix, crl)
+            .authorize_group(group_id, peer_device_id, cap, now_unix, crl.as_ref())
             .map_err(|e| e.to_string())
     }
 
@@ -185,11 +188,11 @@ impl WasmGroupBook {
         if !is_active_member(manifest, &self.local_device_id) {
             return Err(invalid("local device is not an active member"));
         }
-        let crl = self
-            .inner
-            .root_signing_pub(group_id)
-            .and_then(|root_pub| root_crl(roster, manifest, root_pub));
-        if crl_revokes(crl, &self.local_device_id) {
+        let crl = match self.inner.root_signing_pub(group_id) {
+            Some(root_pub) => root_crl(roster, manifest, root_pub)?,
+            None => None,
+        };
+        if crl_revokes(crl.as_ref(), &self.local_device_id) {
             return Err(CoreError::GroupMemberRevoked(self.local_device_id.clone()).to_string());
         }
         Ok(())
@@ -242,9 +245,13 @@ impl WasmGroupBook {
         };
         let recv_cap =
             Capability::parse(&format!("group.recv:{group_id}")).map_err(|e| e.to_string())?;
-        if self.inner.manifest(group_id).is_none() {
+        let (Some(manifest), Some(root_pub)) = (
+            self.inner.manifest(group_id),
+            self.inner.root_signing_pub(group_id),
+        ) else {
             return Err(CoreError::GroupNotFound(group_id.to_owned()).to_string());
-        }
+        };
+        root_crl(roster, manifest, root_pub)?;
         if self.local_active(roster, group_id).is_err() {
             return Ok(Vec::new());
         }
@@ -308,11 +315,11 @@ impl WasmGroupBook {
             self.inner.manifest(&frame.group_id),
             self.inner.root_signing_pub(&frame.group_id),
         ) {
-            (Some(manifest), Some(root_pub)) => root_crl(roster, manifest, root_pub),
+            (Some(manifest), Some(root_pub)) => root_crl(roster, manifest, root_pub)?,
             _ => None,
         };
         self.inner
-            .ingest_group_rendezvous_frame(sender, frame, now_unix, crl)
+            .ingest_group_rendezvous_frame(sender, frame, now_unix, crl.as_ref())
             .map_err(|e| e.to_string())
     }
 

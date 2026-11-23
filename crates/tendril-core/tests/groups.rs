@@ -6,7 +6,7 @@ use tendril_core::crypto::{
 };
 use tendril_core::error::CoreError;
 use tendril_core::grants::{
-    Capability, RevocationListUnsigned, canonical_json, sign_crl, sign_grant,
+    Capability, RevocationList, RevocationListUnsigned, canonical_json, sign_crl, sign_grant,
 };
 use tendril_core::group::{
     DEFAULT_MANIFEST_VALIDITY_SECS, GROUP_RENDEZVOUS_FRAME_LEN, GroupBook, GroupBuildParams,
@@ -16,8 +16,8 @@ use tendril_core::group::{
     V2GroupSecrets, add_member, check_first_contact, check_group_capacity,
     check_rendezvous_local_membership, decode_group_rendezvous_frame, derive_group_mailbox_secret,
     derive_pair_bootstrap, drop_secrets_if_left, encode_group_rendezvous_frame, group_id_from_root,
-    group_manifest_signed_bytes, issue_admin_grant, remove_member, renew_manifest, root_device_in,
-    set_min_wire_version, sign_group_manifest, verify_group_manifest,
+    group_manifest_signed_bytes, issue_admin_grant, remove_member, renew_manifest, root_crl,
+    root_device_in, set_min_wire_version, sign_group_manifest, verify_group_manifest,
 };
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::roster::{Roster, V2PeerSecrets};
@@ -751,14 +751,15 @@ fn admin_grant_scope_expiry_crl_and_delegation() {
         .unwrap()
     };
     let m = mk(grant.clone());
-    let clean = crl_for(vec![], vec![]);
+    let via_resolver = |list| resolved_at(&fx, &fx.root.id(), list).unwrap();
+    let clean = via_resolver(crl_for(vec![], vec![]));
     verify_group_manifest(&m, NOW, Some(&clean)).unwrap();
-    let by_device = crl_for(vec![admin.id()], vec![]);
+    let by_device = via_resolver(crl_for(vec![admin.id()], vec![]));
     assert!(matches!(
         verify_group_manifest(&m, NOW, Some(&by_device)),
         Err(CoreError::GroupUnauthorized(_))
     ));
-    let by_nonce = crl_for(vec![], vec![grant.nonce.clone()]);
+    let by_nonce = via_resolver(crl_for(vec![], vec![grant.nonce.clone()]));
     assert!(matches!(
         verify_group_manifest(&m, NOW, Some(&by_nonce)),
         Err(CoreError::GroupUnauthorized(_))
@@ -2460,7 +2461,7 @@ fn authorize_group_denies_a_sender_listed_in_the_root_crl() {
     let cap = Capability::parse(&format!("group.send:{}", fx.gid)).unwrap();
     book.authorize_group(&fx.gid, &b.id(), &cap, NOW, None)
         .unwrap();
-    let crl = crl_for(&fx, vec![b.id()], vec![]);
+    let crl = resolved_at(&fx, &fx.root.id(), crl_for(&fx, vec![b.id()], vec![])).unwrap();
     assert!(matches!(
         book.authorize_group(&fx.gid, &b.id(), &cap, NOW, Some(&crl)),
         Err(CoreError::GroupMemberRevoked(_))
@@ -2880,4 +2881,647 @@ fn rendezvous_membership_check_refuses_left_devices_only() {
         "{err}"
     );
     check_rendezvous_local_membership(&book, &root.id(), &m2.group_id).unwrap();
+}
+
+// Root CRL authority: every stored list signed by the pinned founding root key applies.
+
+fn root_list(
+    issuer: &str,
+    seq: u64,
+    devices: Vec<String>,
+    nonces: Vec<String>,
+    key: &SigningKeypair,
+) -> RevocationList {
+    sign_crl(
+        RevocationListUnsigned {
+            v: 1,
+            issuer: issuer.to_owned(),
+            seq,
+            revoked_devices: devices,
+            revoked_nonces: nonces,
+            ts: "2026-11-25T00:00:00Z".to_owned(),
+        },
+        key,
+    )
+    .unwrap()
+}
+
+fn pin_as(roster: &mut Roster, label: &str, static_pub: &[u8; 32], key: &SigningKeypair) {
+    roster
+        .insert_pinned_host(
+            label.to_owned(),
+            "peer".to_owned(),
+            *static_pub,
+            Some(key.public_key().clone()),
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+}
+
+fn store_list(roster: &mut Roster, list: RevocationList, key: &SigningKeypair) {
+    let issuer = list.issuer.clone();
+    roster.ingest_crl(list, &issuer, key.public_key()).unwrap();
+}
+
+/// A roster that pins the fixture root under `label` and stores `list` there.
+fn resolved_at(fx: &Fixture, label: &str, list: RevocationList) -> Option<RevocationList> {
+    let mut roster = Roster::new();
+    pin_as(&mut roster, label, fx.root.st.public_bytes(), &fx.root.sk);
+    store_list(&mut roster, list, &fx.root.sk);
+    root_crl(&roster, &fx.root.id(), fx.root.sk.public_key(), None).unwrap()
+}
+
+#[test]
+fn root_crl_authority_is_the_pinned_root_key() {
+    let fx = fixture();
+    let root_pub = fx.root.sk.public_key();
+    let x = Dev::new(40);
+    let y = Dev::new(41);
+    let mut roster = Roster::new();
+    pin_as(
+        &mut roster,
+        "root-host",
+        fx.root.st.public_bytes(),
+        &fx.root.sk,
+    );
+    let list = root_list("root-host", 1, vec![x.id()], vec![], &fx.root.sk);
+    store_list(&mut roster, list.clone(), &fx.root.sk);
+    assert_eq!(
+        root_crl(&roster, &fx.root.id(), root_pub, None).unwrap(),
+        Some(list.clone())
+    );
+
+    // A foreign host keyed with the root device id, never rotated, with its own list.
+    let foreign = Dev::new(42);
+    pin_as(
+        &mut roster,
+        &fx.root.id(),
+        foreign.st.public_bytes(),
+        &foreign.sk,
+    );
+    let foreign_list = root_list(&fx.root.id(), 7, vec![y.id()], vec![], &foreign.sk);
+    store_list(&mut roster, foreign_list, &foreign.sk);
+    assert_eq!(
+        root_crl(&roster, &fx.root.id(), root_pub, None).unwrap(),
+        Some(list)
+    );
+
+    // A root-signed list stored under an unrelated entry label still counts.
+    let other = Dev::new(43);
+    pin_as(
+        &mut roster,
+        "other-label",
+        other.st.public_bytes(),
+        &other.sk,
+    );
+    store_list(
+        &mut roster,
+        root_list("other-label", 1, vec![y.id()], vec![], &fx.root.sk),
+        &fx.root.sk,
+    );
+    let merged = root_crl(&roster, &fx.root.id(), root_pub, None)
+        .unwrap()
+        .unwrap();
+    let mut revoked = merged.revoked_devices;
+    revoked.sort();
+    let mut expected = vec![x.id(), y.id()];
+    expected.sort();
+    assert_eq!(revoked, expected);
+}
+
+#[test]
+fn root_crl_unions_label_streams() {
+    let (fx, admin, grant, m2, _s2) = co_admin_fixture();
+    let root_pub = fx.root.sk.public_key();
+    let x = Dev::new(44);
+    let other = Dev::new(45);
+    let co = co_signed(&m2, &admin, &grant, |_| {});
+    let send = Capability::parse(&format!("group.send:{}", fx.gid)).unwrap();
+    for (seq_a, seq_b) in [(9, 1), (1, 1)] {
+        let mut roster = Roster::new();
+        pin_as(&mut roster, "a", fx.root.st.public_bytes(), &fx.root.sk);
+        pin_as(&mut roster, "b", other.st.public_bytes(), &other.sk);
+        store_list(
+            &mut roster,
+            root_list("a", seq_a, vec![x.id()], vec![], &fx.root.sk),
+            &fx.root.sk,
+        );
+        store_list(
+            &mut roster,
+            root_list(
+                "b",
+                seq_b,
+                vec![admin.id()],
+                vec![grant.nonce.clone()],
+                &fx.root.sk,
+            ),
+            &fx.root.sk,
+        );
+        let merged = root_crl(&roster, &fx.root.id(), root_pub, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.revoked_devices, vec![x.id(), admin.id()]);
+        assert_eq!(merged.revoked_nonces, vec![grant.nonce.clone()]);
+        assert_eq!(merged.seq, seq_a.max(seq_b));
+        assert_eq!(merged.issuer, fx.root.id());
+
+        let mut book = GroupBook::new();
+        ingest(&mut book, &m2).unwrap();
+        assert!(matches!(
+            book.authorize_group(&fx.gid, &x.id(), &send, NOW, Some(&merged)),
+            Err(CoreError::GroupMemberRevoked(_))
+        ));
+        assert!(matches!(
+            book.ingest_group_manifest(&co, NOW, Some(&merged)),
+            Err(CoreError::GroupUnauthorized(_))
+        ));
+    }
+}
+
+fn runtime_identity(seed: u8) -> EndpointIdentity {
+    EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar([seed; 32]),
+        SigningKeypair::from_seed([seed.wrapping_add(0x40); 32]),
+    )
+}
+
+fn identity_member(identity: &EndpointIdentity, gid: &str) -> GroupMember {
+    GroupMember::new(
+        identity.static_key().public_bytes(),
+        "root",
+        identity.signing_key().public_key(),
+        vec![],
+        std_caps(gid),
+    )
+}
+
+/// A group rooted at `root` with `c` as a member; returns the founding key and the manifest.
+fn identity_group(root: &EndpointIdentity, c: &Dev) -> (HybridSigningPublicKey, GroupManifest) {
+    let root_pub = root.signing_key().public_key().clone();
+    let gid = group_id_from_root(&root_pub);
+    let (m1, s1) = tendril_core::group::create_group(
+        root.signing_key(),
+        "g",
+        2,
+        identity_member(root, &gid),
+        params(),
+    )
+    .unwrap();
+    let (m2, _) = add_member(
+        &m1,
+        &GroupSigner::root(root.signing_key()),
+        c.member("c", std_caps(&gid)),
+        &s1,
+        params(),
+    )
+    .unwrap();
+    (root_pub, m2)
+}
+
+/// Rotates `root`, re-signs its own list, and applies both on `member` under `label`.
+fn rotate_root(
+    root: &mut EndpointIdentity,
+    root_roster: &mut Roster,
+    member: &mut Roster,
+    label: &str,
+) {
+    root.rotate(
+        StaticKeypair::from_scalar([0xE1; 32]),
+        SigningKeypair::from_seed([0xE2; 32]),
+        NOW,
+    )
+    .unwrap();
+    let resigned = root_roster.resign_crl(root, NOW).unwrap().unwrap();
+    member
+        .apply_verified_rotation(
+            label,
+            root.rotation_chain(),
+            root.static_key().public_bytes(),
+            root.signing_key().public_key(),
+        )
+        .unwrap();
+    member
+        .ingest_crl(resigned, label, root.signing_key().public_key())
+        .unwrap();
+}
+
+#[test]
+fn root_crl_fails_closed_after_root_rotation() {
+    let mut root = runtime_identity(0x31);
+    let root_dev = root.device_id();
+    assert_eq!(root.host_id(), root_dev);
+    let c = Dev::new(46);
+    let (root_pub, manifest) = identity_group(&root, &c);
+    let gid = manifest.group_id.clone();
+    let mut book = GroupBook::new();
+    ingest(&mut book, &manifest).unwrap();
+    let send = Capability::parse(&format!("group.send:{gid}")).unwrap();
+
+    let list = root_list(&root_dev, 1, vec![c.id()], vec![], root.signing_key());
+    let mut root_roster = Roster::new();
+    store_list(&mut root_roster, list.clone(), root.signing_key());
+    let mut member = Roster::new();
+    member
+        .insert_pinned_host(
+            root_dev.clone(),
+            "root".to_owned(),
+            *root.static_key().public_bytes(),
+            Some(root_pub.clone()),
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+    store_list(&mut member, list, root.signing_key());
+    let crl = root_crl(&member, &root_dev, &root_pub, None).unwrap();
+    assert!(matches!(
+        book.authorize_group(&gid, &c.id(), &send, NOW, crl.as_ref()),
+        Err(CoreError::GroupMemberRevoked(_))
+    ));
+
+    rotate_root(&mut root, &mut root_roster, &mut member, &root_dev);
+    assert_eq!(member.get(&root_dev).unwrap().rotation_seq, 1);
+    for roster in [&member, &root_roster] {
+        let err = root_crl(roster, &root_dev, &root_pub, None).unwrap_err();
+        assert!(unauthorized_msg(&err).contains("group root key"), "{err}");
+    }
+}
+
+#[test]
+fn co_admin_grant_honors_a_host_labeled_root_crl() {
+    let (fx, admin, grant, m2, _s2) = co_admin_fixture();
+    let co = co_signed(&m2, &admin, &grant, |_| {});
+    let attempt = |list: RevocationList| {
+        let crl = resolved_at(&fx, "root-host", list);
+        assert!(crl.is_some());
+        let mut book = GroupBook::new();
+        ingest(&mut book, &m2).unwrap();
+        book.ingest_group_manifest(&co, NOW, crl.as_ref())
+            .map(|_| ())
+    };
+    attempt(root_list("root-host", 1, vec![], vec![], &fx.root.sk)).unwrap();
+    for list in [
+        root_list("root-host", 1, vec![admin.id()], vec![], &fx.root.sk),
+        root_list(
+            "root-host",
+            1,
+            vec![],
+            vec![grant.nonce.clone()],
+            &fx.root.sk,
+        ),
+    ] {
+        assert!(matches!(
+            attempt(list),
+            Err(CoreError::GroupUnauthorized(_))
+        ));
+    }
+}
+
+/// Known limitation "Rotated host-labeled root" (`docs/design/groups.md`): a core-API root whose
+/// roster label differs from its `device_id` stops supplying a root CRL once it rotates.
+#[test]
+fn host_labeled_root_rotation_behaviour() {
+    let mut root = runtime_identity(0x32).with_host_id("root-host");
+    let root_dev = root.device_id();
+    let c = Dev::new(47);
+    let (root_pub, manifest) = identity_group(&root, &c);
+    let gid = manifest.group_id.clone();
+    let mut book = GroupBook::new();
+    ingest(&mut book, &manifest).unwrap();
+    let send = Capability::parse(&format!("group.send:{gid}")).unwrap();
+
+    let list = root_list("root-host", 1, vec![c.id()], vec![], root.signing_key());
+    let mut root_roster = Roster::new();
+    store_list(&mut root_roster, list.clone(), root.signing_key());
+    let mut member = Roster::new();
+    pin_as(
+        &mut member,
+        "root-host",
+        root.static_key().public_bytes(),
+        root.signing_key(),
+    );
+    store_list(&mut member, list, root.signing_key());
+    let crl = root_crl(&member, &root_dev, &root_pub, None).unwrap();
+    assert!(matches!(
+        book.authorize_group(&gid, &c.id(), &send, NOW, crl.as_ref()),
+        Err(CoreError::GroupMemberRevoked(_))
+    ));
+
+    rotate_root(&mut root, &mut root_roster, &mut member, "root-host");
+    assert_eq!(root_crl(&member, &root_dev, &root_pub, None).unwrap(), None);
+}
+
+/// A member that has applied the root's verified rotation fails closed before any re-signed
+/// list arrives, whether it holds the founding-key list or no list at all.
+#[test]
+fn root_crl_fails_closed_on_a_known_rotation_without_a_new_list() {
+    for with_list in [true, false] {
+        let mut root = runtime_identity(0x34);
+        let root_dev = root.device_id();
+        let c = Dev::new(48);
+        let (root_pub, _) = identity_group(&root, &c);
+        let mut member = Roster::new();
+        member
+            .insert_pinned_host(
+                root_dev.clone(),
+                "root".to_owned(),
+                *root.static_key().public_bytes(),
+                Some(root_pub.clone()),
+                0,
+                Vec::new(),
+            )
+            .unwrap();
+        let before = if with_list {
+            let list = root_list(&root_dev, 1, vec![], vec![], root.signing_key());
+            store_list(&mut member, list.clone(), root.signing_key());
+            Some(list)
+        } else {
+            None
+        };
+        assert_eq!(
+            root_crl(&member, &root_dev, &root_pub, None).unwrap(),
+            before
+        );
+
+        root.rotate(
+            StaticKeypair::from_scalar([0xE3; 32]),
+            SigningKeypair::from_seed([0xE4; 32]),
+            NOW,
+        )
+        .unwrap();
+        member
+            .apply_verified_rotation(
+                &root_dev,
+                root.rotation_chain(),
+                root.static_key().public_bytes(),
+                root.signing_key().public_key(),
+            )
+            .unwrap();
+        let err = root_crl(&member, &root_dev, &root_pub, None).unwrap_err();
+        assert!(unauthorized_msg(&err).contains("group root key"), "{err}");
+    }
+}
+
+/// A core-API root whose `host_id` differs from its `device_id` mints its own list under its
+/// `host_id` and has no roster entry of its own; its resolver finds that list through the local
+/// label.
+#[test]
+fn root_crl_reads_a_local_host_labeled_root_list() {
+    let root = runtime_identity(0x35).with_host_id("root-host");
+    let root_dev = root.device_id();
+    let c = Dev::new(49);
+    let (root_pub, manifest) = identity_group(&root, &c);
+    let gid = manifest.group_id.clone();
+    let mut book = GroupBook::new();
+    ingest(&mut book, &manifest).unwrap();
+    let send = Capability::parse(&format!("group.send:{gid}")).unwrap();
+
+    let mut roster = Roster::new();
+    roster.revoke_nonce(&root, "nonce-1", NOW).unwrap();
+    store_list(
+        &mut roster,
+        root_list(
+            "root-host",
+            2,
+            vec![c.id()],
+            vec!["nonce-1".to_owned()],
+            root.signing_key(),
+        ),
+        root.signing_key(),
+    );
+    assert!(roster.get("root-host").is_none());
+    assert_eq!(root_crl(&roster, &root_dev, &root_pub, None).unwrap(), None);
+    let crl = root_crl(&roster, &root_dev, &root_pub, Some(root.host_id()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(crl.revoked_devices, vec![c.id()]);
+    assert!(matches!(
+        book.authorize_group(&gid, &c.id(), &send, NOW, Some(&crl)),
+        Err(CoreError::GroupMemberRevoked(_))
+    ));
+}
+
+/// Pins `intruder` under `label` the way an unconfirmed manual pairing does: `Pending`, keyed by
+/// the host-chosen `host_id`, claiming `rotation_seq` on a chain of its own.
+fn pending_rotated_pin(roster: &mut Roster, label: &str, intruder: &Dev, rotation_seq: u64) {
+    roster
+        .record_pending_host(
+            label.to_owned(),
+            "intruder".to_owned(),
+            *intruder.st.public_bytes(),
+            intruder.sk.public_key().clone(),
+            rotation_seq,
+            "000000".to_owned(),
+            Vec::new(),
+        )
+        .unwrap();
+}
+
+/// An unconfirmed host pin keyed by the local root's own `device_id` never closes the groups the
+/// local root founded, whatever rotation it claims.
+#[test]
+fn root_crl_ignores_a_colliding_pending_pin_on_the_root() {
+    for rotation_seq in [1, 5] {
+        let root = runtime_identity(0x36);
+        let root_dev = root.device_id();
+        let c = Dev::new(50);
+        let (root_pub, manifest) = identity_group(&root, &c);
+        let gid = manifest.group_id.clone();
+        let mut book = GroupBook::new();
+        ingest(&mut book, &manifest).unwrap();
+        let send = Capability::parse(&format!("group.send:{gid}")).unwrap();
+
+        let mut roster = Roster::new();
+        pending_rotated_pin(&mut roster, &root_dev, &Dev::new(51), rotation_seq);
+        assert_eq!(
+            root_crl(&roster, &root_dev, &root_pub, Some(root.host_id())).unwrap(),
+            None
+        );
+
+        let list = root_list(&root_dev, 1, vec![c.id()], vec![], root.signing_key());
+        store_list(&mut roster, list.clone(), root.signing_key());
+        let crl = root_crl(&roster, &root_dev, &root_pub, Some(root.host_id())).unwrap();
+        assert_eq!(crl, Some(list));
+        assert!(matches!(
+            book.authorize_group(&gid, &c.id(), &send, NOW, crl.as_ref()),
+            Err(CoreError::GroupMemberRevoked(_))
+        ));
+    }
+}
+
+/// An unconfirmed host pin keyed by the local root's own `device_id` counts as no entry, so the
+/// local root still fails closed once it rotates and re-signs its list under the new key.
+#[test]
+fn root_crl_local_root_rotation_fails_closed_under_a_colliding_pending_pin() {
+    for rotation_seq in [0, 1] {
+        let mut root = runtime_identity(0x38);
+        let root_dev = root.device_id();
+        let c = Dev::new(54);
+        let (root_pub, manifest) = identity_group(&root, &c);
+        let gid = manifest.group_id.clone();
+        let mut book = GroupBook::new();
+        ingest(&mut book, &manifest).unwrap();
+        let send = Capability::parse(&format!("group.send:{gid}")).unwrap();
+
+        let mut roster = Roster::new();
+        let list = root_list(&root_dev, 1, vec![c.id()], vec![], root.signing_key());
+        store_list(&mut roster, list, root.signing_key());
+        pending_rotated_pin(&mut roster, &root_dev, &Dev::new(55), rotation_seq);
+        let crl = root_crl(&roster, &root_dev, &root_pub, Some(root.host_id())).unwrap();
+        assert!(matches!(
+            book.authorize_group(&gid, &c.id(), &send, NOW, crl.as_ref()),
+            Err(CoreError::GroupMemberRevoked(_))
+        ));
+
+        root.rotate(
+            StaticKeypair::from_scalar([0xE5; 32]),
+            SigningKeypair::from_seed([0xE6; 32]),
+            NOW,
+        )
+        .unwrap();
+        roster.resign_crl(&root, NOW).unwrap().unwrap();
+        let err = root_crl(&roster, &root_dev, &root_pub, Some(root.host_id())).unwrap_err();
+        assert!(unauthorized_msg(&err).contains("group root key"), "{err}");
+    }
+}
+
+/// A confirmed peer whose remote-chosen `host_id` equals the local root's `device_id` is an
+/// `Active` entry at `rotation_seq` 0 and can store a higher-seq list of its own under that
+/// label. The local root fails closed rather than treating the group as having no revocations.
+#[test]
+fn root_crl_local_root_fails_closed_under_a_colliding_active_pin_list() {
+    let root = runtime_identity(0x39);
+    let root_dev = root.device_id();
+    let c = Dev::new(56);
+    let (root_pub, manifest) = identity_group(&root, &c);
+    let gid = manifest.group_id.clone();
+    let mut book = GroupBook::new();
+    ingest(&mut book, &manifest).unwrap();
+    let send = Capability::parse(&format!("group.send:{gid}")).unwrap();
+
+    let mut roster = Roster::new();
+    let list = root_list(&root_dev, 1, vec![c.id()], vec![], root.signing_key());
+    store_list(&mut roster, list, root.signing_key());
+    let crl = root_crl(&roster, &root_dev, &root_pub, Some(root.host_id())).unwrap();
+    assert!(matches!(
+        book.authorize_group(&gid, &c.id(), &send, NOW, crl.as_ref()),
+        Err(CoreError::GroupMemberRevoked(_))
+    ));
+
+    let intruder = Dev::new(57);
+    pin_as(
+        &mut roster,
+        &root_dev,
+        intruder.st.public_bytes(),
+        &intruder.sk,
+    );
+    store_list(
+        &mut roster,
+        root_list(&root_dev, 2, vec![], vec![], &intruder.sk),
+        &intruder.sk,
+    );
+    let err = root_crl(&roster, &root_dev, &root_pub, Some(root.host_id())).unwrap_err();
+    assert!(unauthorized_msg(&err).contains("group root key"), "{err}");
+}
+
+/// A member that knows its root under a host label keeps the root list when an unconfirmed,
+/// rotated host pin claims the root `device_id` as its label.
+#[test]
+fn root_crl_ignores_a_colliding_pending_pin_on_a_member() {
+    let root = runtime_identity(0x37).with_host_id("root-host");
+    let root_dev = root.device_id();
+    let c = Dev::new(52);
+    let (root_pub, manifest) = identity_group(&root, &c);
+    let gid = manifest.group_id.clone();
+    let mut book = GroupBook::new();
+    ingest(&mut book, &manifest).unwrap();
+    let send = Capability::parse(&format!("group.send:{gid}")).unwrap();
+
+    let mut member = Roster::new();
+    pin_as(
+        &mut member,
+        "root-host",
+        root.static_key().public_bytes(),
+        root.signing_key(),
+    );
+    let list = root_list("root-host", 1, vec![c.id()], vec![], root.signing_key());
+    store_list(&mut member, list.clone(), root.signing_key());
+    pending_rotated_pin(&mut member, &root_dev, &Dev::new(53), 1);
+    let crl = root_crl(&member, &root_dev, &root_pub, None).unwrap();
+    assert_eq!(crl, Some(list));
+    assert!(matches!(
+        book.authorize_group(&gid, &c.id(), &send, NOW, crl.as_ref()),
+        Err(CoreError::GroupMemberRevoked(_))
+    ));
+}
+
+/// A non-`Pending` entry under the root `device_id` that has rotated keys fails closed even when
+/// nothing shows its key lineage starts at the founding root: a roster entry does not record
+/// where its lineage started, so it cannot be told apart from the root's own entry. The same keys
+/// pinned `Pending` count as no entry. The root's own entry fails closed after each verified
+/// rotation.
+#[test]
+fn root_crl_fails_closed_on_a_rotated_entry_of_unknown_lineage() {
+    let mut root = runtime_identity(0x38);
+    let root_dev = root.device_id();
+    let c = Dev::new(54);
+    let (root_pub, _) = identity_group(&root, &c);
+    let list = root_list(&root_dev, 1, vec![c.id()], vec![], root.signing_key());
+
+    let intruder = Dev::new(55);
+    let mut pending = Roster::new();
+    pending_rotated_pin(&mut pending, &root_dev, &intruder, 1);
+    assert_eq!(
+        root_crl(&pending, &root_dev, &root_pub, None).unwrap(),
+        None
+    );
+    let mut unknown = Roster::new();
+    unknown
+        .insert_pinned_host(
+            root_dev.clone(),
+            "intruder".to_owned(),
+            *intruder.st.public_bytes(),
+            Some(intruder.sk.public_key().clone()),
+            1,
+            Vec::new(),
+        )
+        .unwrap();
+    let err = root_crl(&unknown, &root_dev, &root_pub, None).unwrap_err();
+    assert!(unauthorized_msg(&err).contains("group root key"), "{err}");
+
+    let mut member = Roster::new();
+    member
+        .insert_pinned_host(
+            root_dev.clone(),
+            "root".to_owned(),
+            *root.static_key().public_bytes(),
+            Some(root_pub.clone()),
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+    store_list(&mut member, list.clone(), root.signing_key());
+    assert_eq!(
+        root_crl(&member, &root_dev, &root_pub, None).unwrap(),
+        Some(list)
+    );
+    for (scalar, seed) in [(0xE5, 0xE6), (0xE7, 0xE8)] {
+        root.rotate(
+            StaticKeypair::from_scalar([scalar; 32]),
+            SigningKeypair::from_seed([seed; 32]),
+            NOW,
+        )
+        .unwrap();
+        member
+            .apply_verified_rotation(
+                &root_dev,
+                root.rotation_chain(),
+                root.static_key().public_bytes(),
+                root.signing_key().public_key(),
+            )
+            .unwrap();
+        let err = root_crl(&member, &root_dev, &root_pub, None).unwrap_err();
+        assert!(unauthorized_msg(&err).contains("group root key"), "{err}");
+    }
+    assert_eq!(member.get(&root_dev).unwrap().rotation_seq, 2);
 }
