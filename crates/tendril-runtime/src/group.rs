@@ -715,6 +715,7 @@ struct Inner {
     local_id: String,
     group_id: String,
     root_id: String,
+    root_pub: HybridSigningPublicKey,
     cfg: GroupPoolConfig,
     wake: Option<Arc<dyn WakeProvider>>,
     state: Mutex<PoolState>,
@@ -863,8 +864,12 @@ impl GroupPool {
         }
         let root_id = root_device_of(&book, manifest)
             .ok_or_else(|| CoreError::GroupUnauthorized("founding root missing".to_owned()))?;
+        let root_pub = book
+            .root_signing_pub(group_id)
+            .cloned()
+            .ok_or_else(|| CoreError::GroupNotFound(group_id.to_owned()))?;
         let (roster, roster_stamp) = store.load_roster_with_stamp()?;
-        let crl = roster.crl(&root_id).cloned();
+        let crl = core_group::root_crl(&roster, &root_id, &root_pub, Some(&local_id))?;
         drop(roster);
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE_CAP);
         let v2_state = V2ResponderState::with_config(crate::v2_driver::V2ResponderConfig {
@@ -881,6 +886,7 @@ impl GroupPool {
                 local_id,
                 group_id: group_id.to_owned(),
                 root_id,
+                root_pub,
                 dial_sem: Semaphore::new(dials),
                 admission: PreAuthRateLimiter::new(config.pre_auth.clone()),
                 admin_sessions: Arc::new(Semaphore::new(MAX_ADMIN_SESSIONS)),
@@ -1470,9 +1476,6 @@ impl GroupHub {
         let store = self.store.clone();
         let (mut combined, book) =
             blocking(move || Ok((store.load_roster()?, store.load_group_book()?))).await?;
-        if wire < 2 {
-            combined.retain_active(|_, e| e.min_wire_version < 2);
-        }
         let local_id = self.identity.device_id();
         let mut index = PinIndex::default();
         let pools: Vec<GroupPool> = self
@@ -1480,7 +1483,22 @@ impl GroupHub {
             .into_iter()
             .filter(|p| !p.is_closed())
             .collect();
-        for pool in &pools {
+        // Root CRLs are resolved from the full persisted roster before the wire floor narrows it.
+        let crls: Vec<_> = pools
+            .iter()
+            .map(|pool| {
+                core_group::root_crl(
+                    &combined,
+                    &pool.inner.root_id,
+                    &pool.inner.root_pub,
+                    Some(&local_id),
+                )
+            })
+            .collect();
+        if wire < 2 {
+            combined.retain_active(|_, e| e.min_wire_version < 2);
+        }
+        for (pool, crl) in pools.iter().zip(crls) {
             let gid = pool.group_id();
             let floor_wire = book
                 .manifest(gid)
@@ -1488,7 +1506,13 @@ impl GroupHub {
             if floor_wire != Some(wire) {
                 continue;
             }
-            let crl = combined.crl(&pool.inner.root_id).cloned();
+            let crl = match crl {
+                Ok(crl) => crl,
+                Err(err) => {
+                    tracing::debug!(group = %gid, error = %err, "group pins skipped");
+                    continue;
+                }
+            };
             let pins = match group_pins(&book, gid, &local_id, crl.as_ref(), now) {
                 Ok(pins) => pins,
                 Err(err) => {
@@ -1680,11 +1704,23 @@ pub fn ingest_pushed_manifest(
     if !known {
         core_group::check_first_contact(&roster, local_device_id, sender_device_id, manifest)?;
     }
-    let root_id = match book.manifest(&manifest.group_id) {
-        Some(stored) => root_device_of(&book, stored),
-        None => manifest_root_device(manifest),
+    let root = match (
+        book.manifest(&manifest.group_id),
+        book.root_signing_pub(&manifest.group_id),
+    ) {
+        (Some(stored), Some(root_pub)) => {
+            root_device_of(&book, stored).map(|id| (id, root_pub.clone()))
+        }
+        _ => HybridSigningPublicKey::from_b64url(&manifest.root_signing_pub)
+            .ok()
+            .and_then(|root_pub| Some((root_device_in(manifest, &root_pub)?, root_pub))),
     };
-    let crl = root_id.and_then(|root| roster.crl(&root).cloned());
+    let crl = match root {
+        Some((root_id, root_pub)) => {
+            core_group::root_crl(&roster, &root_id, &root_pub, Some(local_device_id))?
+        }
+        None => None,
+    };
     store.update_group_book(|book| {
         if known && book.manifest(&manifest.group_id).is_none() {
             return Err(CoreError::GroupNotFound(manifest.group_id.clone()).into());
@@ -1718,7 +1754,9 @@ pub(crate) fn require_group_identity(identity: &EndpointIdentity) -> Result<(), 
 ///
 /// Refuses when `local_device_id` is neither an active member nor the root of the stored group,
 /// so a removed device never regains rendezvous secrets. The root CRL is read and released
-/// before the group book lock is taken; a roster read failure fails closed.
+/// before the group book lock is taken; a roster read failure fails closed. A group that is not
+/// stored when the CRL is resolved is refused before the write, so a group pinned meanwhile is
+/// never written without its CRL.
 pub fn ingest_pushed_rendezvous(
     store: &StateStore,
     local_device_id: &str,
@@ -1727,13 +1765,18 @@ pub fn ingest_pushed_rendezvous(
 ) -> Result<(), RuntimeError> {
     let now = current_unix_secs();
     let book = store.load_group_book()?;
-    let root_id = book
-        .manifest(&frame.group_id)
-        .and_then(|m| root_device_of(&book, m));
-    let crl = match root_id {
-        Some(root) => store.load_roster()?.crl(&root).cloned(),
-        None => None,
+    let Some(manifest) = book.manifest(&frame.group_id) else {
+        return Err(CoreError::GroupNotFound(frame.group_id.clone()).into());
     };
+    let (root_id, root_pub) = root_device_of(&book, manifest)
+        .zip(book.root_signing_pub(&frame.group_id).cloned())
+        .ok_or_else(|| CoreError::GroupUnauthorized("founding root missing".to_owned()))?;
+    let crl = core_group::root_crl(
+        &store.load_roster()?,
+        &root_id,
+        &root_pub,
+        Some(local_device_id),
+    )?;
     store.update_group_book(|book| {
         core_group::check_rendezvous_local_membership(book, local_device_id, &frame.group_id)?;
         book.ingest_group_rendezvous_frame(sender_device_id, frame, now, crl.as_ref())
@@ -1802,11 +1845,6 @@ pub fn handle_session_group_frame(
         ingested: result.is_ok(),
         error: result.err().map(|e| e.to_string()),
     })
-}
-
-fn manifest_root_device(manifest: &GroupManifest) -> Option<String> {
-    let root_pub = HybridSigningPublicKey::from_b64url(&manifest.root_signing_pub).ok()?;
-    root_device_in(manifest, &root_pub)
 }
 
 fn root_device_of(book: &GroupBook, manifest: &GroupManifest) -> Option<String> {
@@ -1999,14 +2037,27 @@ impl Inner {
     /// manifest-pinned static key.
     ///
     /// Each stamp is taken before its load, so a write racing the load forces another reload. A
-    /// failed load leaves the state untouched and is returned, so callers fail closed.
+    /// failed load leaves the state untouched and is returned, so callers fail closed and the
+    /// next call retries. An unresolvable root CRL ([`core_group::root_crl`]) also closes every
+    /// slot before it is returned; the roster stamp stays put, so later calls keep failing closed
+    /// until it resolves.
     fn refresh_locked(&self, st: &mut PoolState) -> Result<(), RuntimeError> {
         let stamp = self.store.groups_stamp()?;
         let roster_stamp = self.store.roster_stamp()?;
         let crl = if roster_stamp == st.roster_stamp {
             None
         } else {
-            Some(self.store.load_roster()?.crl(&self.root_id).cloned())
+            let roster = self.store.load_roster()?;
+            match core_group::root_crl(&roster, &self.root_id, &self.root_pub, Some(&self.local_id))
+            {
+                Ok(crl) => Some(crl),
+                Err(err) => {
+                    for (_, link) in std::mem::take(&mut st.slots) {
+                        link.close_transport();
+                    }
+                    return Err(err.into());
+                }
+            }
         };
         let book = if stamp == st.stamp {
             None

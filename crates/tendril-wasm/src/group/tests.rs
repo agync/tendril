@@ -330,6 +330,39 @@ fn authorize_applies_root_crl_stored_under_root_device_id() {
 }
 
 #[test]
+fn authorize_applies_root_crl_stored_under_root_host_id() {
+    let m = mesh();
+    let (book, mut roster) = pinned(&m);
+    let host = m.root.id.host_id().to_owned();
+    assert_ne!(host, m.root.device_id());
+    let sib = m.sibling.device_id();
+    let send = format!("group.send:{}", m.group_id);
+    let list = sign_crl(
+        RevocationListUnsigned {
+            v: 1,
+            issuer: host.clone(),
+            seq: 1,
+            revoked_devices: vec![sib.clone()],
+            revoked_nonces: Vec::new(),
+            ts: CRL_TS.to_owned(),
+        },
+        m.root.id.signing_key(),
+    )
+    .unwrap();
+    roster
+        .ingest_crl(list, &host, m.root.id.signing_key().public_key())
+        .unwrap();
+    let err = book
+        .authorize_inner(&roster, &m.group_id, &sib, &send, NOW)
+        .unwrap_err();
+    assert!(err.contains(&sib), "{err}");
+    let targets = book
+        .broadcast_targets_inner(&roster, &m.group_id, None, NOW)
+        .unwrap();
+    assert!(targets.is_empty(), "{targets:?}");
+}
+
+#[test]
 fn co_admin_manifest_is_accepted_with_root_crl_when_root_host_id_differs() {
     let m = mesh();
     let (mut book, mut roster) = pinned(&m);

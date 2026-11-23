@@ -19,7 +19,7 @@ use crate::crypto::{
 use crate::error::CoreError;
 use crate::grants::{
     Capability, Grant, GrantUnsigned, MAX_CLOCK_SKEW_SECS, RevocationList, canonical_json,
-    sign_grant, sign_grant_deterministic, verify_grant_with_chain,
+    sign_grant, sign_grant_deterministic, verify_crl_signature, verify_grant_with_chain,
 };
 use crate::identity::{format_rfc3339_utc, parse_rfc3339_utc};
 use crate::pairing::is_valid_pairing_endpoint_hint;
@@ -566,10 +566,22 @@ fn verify_admin_grant(
         signer_device_id,
         root_device_id,
         now_unix,
-        root_crl,
+        None,
         |issuer| (issuer == root_device_id).then(|| root_pub.clone()),
     )
     .map_err(|err| deny(err.to_string()))?;
+    if let Some(list) = root_crl {
+        if list
+            .revoked_devices
+            .iter()
+            .any(|d| d == signer_device_id || d == root_device_id)
+        {
+            return Err(deny("device is revoked".to_string()));
+        }
+        if list.revoked_nonces.iter().any(|n| n == &grant.nonce) {
+            return Err(deny("grant nonce is revoked".to_string()));
+        }
+    }
     let needed = admin_cap_for(group_id, signer_pub);
     if !grant.caps.contains(&needed) {
         return Err(deny(
@@ -584,6 +596,7 @@ fn verify_admin_grant(
 /// Ordered checks: size, version, identifiers, `group_id` derivation, name, wire floor, validity
 /// window, members, revoked set, founding root presence, signer role, `admin_grant`, signature.
 /// `MAX_GROUP_CO_ADMINS` is not enforced here; the root enforces it when issuing grants.
+/// `root_crl` is the output of [`root_crl`]: its authority is not re-checked here.
 pub fn verify_group_manifest(
     manifest: &GroupManifest,
     now_unix: u64,
@@ -1137,7 +1150,8 @@ impl GroupBook {
     /// Reports whether `device_id` holds live admin authority in `group_id` at `now_unix`.
     ///
     /// The founding root always qualifies while the stored manifest is unexpired. A co-admin
-    /// qualifies only while its stored `admin_grant` still verifies against `root_crl`.
+    /// qualifies only while its stored `admin_grant` still verifies against `root_crl`, the
+    /// output of [`root_crl`].
     #[must_use]
     pub fn is_group_admin(
         &self,
@@ -1169,7 +1183,8 @@ impl GroupBook {
     /// Accepts iff the signature is valid and `seq` exceeds the stored `seq`. An identical
     /// manifest is a no-op, a different manifest at the same `seq` is [`CoreError::GroupManifestFork`],
     /// and a lower `seq` is [`CoreError::GroupSeqRollback`]. The first ingest of an unknown group
-    /// is trust-on-first-use and MUST come from an explicit administrative push.
+    /// is trust-on-first-use and MUST come from an explicit administrative push. `root_crl` is
+    /// the output of [`root_crl`].
     pub fn ingest_group_manifest(
         &mut self,
         manifest: &GroupManifest,
@@ -1350,10 +1365,10 @@ impl GroupBook {
     /// Checks that `sender_device_id` is an active member of `group_id` holding `cap`.
     ///
     /// Fails closed when the group is unknown, the stored manifest has expired at `now_unix`, the
-    /// sender is revoked by the manifest or listed in `root_crl`, the sender is absent, or no
-    /// member capability covers `cap`. `group.admin:<group_id>`
-    /// is satisfied only by the founding root device or the signer holding a valid `admin_grant`
-    /// in the stored manifest.
+    /// sender is revoked by the manifest or listed in `root_crl` (the output of [`root_crl`]), the
+    /// sender is absent, or no member capability covers `cap`. `group.admin:<group_id>` is
+    /// satisfied only by the founding root device or the signer holding a valid `admin_grant` in
+    /// the stored manifest.
     pub fn authorize_group(
         &self,
         group_id: &str,
@@ -1417,7 +1432,8 @@ impl GroupBook {
     /// Accepts a decoded `0x0B` frame from an authenticated `sender_device_id`.
     ///
     /// Only the founding root device or the stored manifest's `admin_grant` signer may deliver a
-    /// key, and only for exactly the stored manifest `seq`.
+    /// key, and only for exactly the stored manifest `seq`. `root_crl` is the output of
+    /// [`root_crl`].
     pub fn ingest_group_rendezvous_frame(
         &mut self,
         sender_device_id: &str,
@@ -1560,6 +1576,107 @@ pub fn find_peer_by_device_id<'a>(
     roster
         .entries()
         .find(|(_, e)| device_id(&e.static_pub) == wanted)
+}
+
+/// Resolves the effective root revocation list of a group whose founding root is
+/// `root_device_id` with the pinned founding key `root_pub`.
+///
+/// Every stored list with `v == 1` whose signature verifies under `root_pub` applies, whatever
+/// label it is stored under; labels never grant or remove authority. Candidates are the lists
+/// stored under every label a list can be persisted under: each roster entry key, stored
+/// `device_id`, and static-derived `device_id`, `root_device_id`, and `local_host_id`, the
+/// `host_id` under which the local endpoint mints its own lists (a local root without a roster
+/// entry of its own). One authoritative list is returned unchanged. Several are merged into a
+/// local view (`issuer = root_device_id`, maximum `seq` and `ts`, empty `sig`) holding the union
+/// of their revoked devices and nonces, since `seq` is per label. The view covers the lists
+/// stored now: a later root-signed list replaces the earlier one under its label, so an entry
+/// the root drops from that label's list stops applying unless another stored list keeps it.
+/// The merged view is never sent or re-verified.
+///
+/// # Errors
+///
+/// Returns [`CoreError::GroupUnauthorized`] when the root rotated away from the founding key, so
+/// the revocation state of the group can no longer be resolved and every decision consuming it
+/// fails closed: the entry keyed `root_device_id` is not `Pending`, has rotated keys
+/// (`rotation_seq > 0`), and its pinned signing key is no longer `root_pub`, whether or not a
+/// re-signed list has arrived; or the list stored under `root_device_id` does not verify under
+/// `root_pub` and either this endpoint is the root (`local_host_id` equals `root_device_id`), no
+/// entry is keyed `root_device_id`, or that entry is not `Pending` and has rotated keys. A local
+/// root holds the authoritative list under its own label, so it fails closed whenever that list
+/// does not verify, whatever entry a peer pinned under the label. A roster entry does not record where its key lineage started,
+/// so any such rotated entry counts as the root's, whether `Active` or `Revoked`, including a
+/// never-confirmed pin later revoked locally. A `Pending` entry, such as an unconfirmed host pin
+/// whose `host_id` the remote chose, counts as no entry in both rules, so a local root that holds
+/// one under its own `device_id` still fails closed once its re-signed list replaces the founding
+/// one.
+pub fn root_crl(
+    roster: &Roster,
+    root_device_id: &str,
+    root_pub: &HybridSigningPublicKey,
+    local_host_id: Option<&str>,
+) -> Result<Option<RevocationList>, CoreError> {
+    let authoritative =
+        |list: &RevocationList| list.v == 1 && verify_crl_signature(list, root_pub).is_ok();
+    let held = roster
+        .get(root_device_id)
+        .filter(|e| e.state != PeerState::Pending);
+    let rotated_root = held.filter(|e| e.rotation_seq > 0);
+    let rotated_away = rotated_root.is_some_and(|e| e.signing_pub.as_ref() != Some(root_pub));
+    let local_root = local_host_id == Some(root_device_id);
+    let foreign_root_list = roster.crl(root_device_id).is_some_and(|list| {
+        !authoritative(list) && (local_root || held.is_none() || rotated_root.is_some())
+    });
+    if rotated_away || foreign_root_list {
+        return Err(CoreError::GroupUnauthorized(
+            "root revocation list does not verify under the group root key".to_owned(),
+        ));
+    }
+    let labels: BTreeSet<String> = roster
+        .entries()
+        .flat_map(|(key, e)| [key.clone(), e.device_id.clone(), device_id(&e.static_pub)])
+        .chain([root_device_id.to_owned()])
+        .chain(local_host_id.map(str::to_owned))
+        .collect();
+    let mut lists = labels
+        .iter()
+        .filter_map(|label| roster.crl(label))
+        .filter(|list| authoritative(list));
+    let Some(first) = lists.next() else {
+        return Ok(None);
+    };
+    let rest: Vec<&RevocationList> = lists.collect();
+    if rest.is_empty() {
+        return Ok(Some(first.clone()));
+    }
+    let mut merged = RevocationList {
+        v: 1,
+        issuer: root_device_id.to_owned(),
+        seq: first.seq,
+        revoked_devices: Vec::new(),
+        revoked_nonces: Vec::new(),
+        ts: first.ts.clone(),
+        sig: String::new(),
+    };
+    let mut latest = parse_rfc3339_utc(&first.ts)?;
+    for list in std::iter::once(first).chain(rest) {
+        merged.seq = merged.seq.max(list.seq);
+        let ts = parse_rfc3339_utc(&list.ts)?;
+        if ts > latest {
+            latest = ts;
+            merged.ts.clone_from(&list.ts);
+        }
+        for id in &list.revoked_devices {
+            if !merged.revoked_devices.contains(id) {
+                merged.revoked_devices.push(id.clone());
+            }
+        }
+        for nonce in &list.revoked_nonces {
+            if !merged.revoked_nonces.contains(nonce) {
+                merged.revoked_nonces.push(nonce.clone());
+            }
+        }
+    }
+    Ok(Some(merged))
 }
 
 /// F11 first-contact pinning rule for a group not yet stored.
