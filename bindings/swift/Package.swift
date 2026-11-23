@@ -30,7 +30,7 @@ let package = Package(
     ),
     .testTarget(
       name: "TendrilTests",
-      dependencies: ["Tendril"],
+      dependencies: ["Tendril", "CTendril"],
       path: "Tests/TendrilTests"
     ),
   ]

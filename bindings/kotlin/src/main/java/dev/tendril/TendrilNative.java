@@ -39,6 +39,9 @@ final class TendrilNative {
   public static native long endpointNewFromState(
       String identityJson, String rosterJson, String hostId);
 
+  public static native long endpointNewSealed(
+      String stateDir, String identityJson, String rosterJson, String hostId);
+
   public static native void endpointClose(long ptr);
 
   public static native void endpointFree(long ptr);

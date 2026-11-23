@@ -122,6 +122,7 @@ class TendrilClientUnitTest {
         "groupAuthorizePeer",
         "groupClose",
         "groupFree",
+        "endpointNewSealed",
       )) {
       assertTrue("missing TendrilNative.$name", nativeMethods.contains(name))
     }

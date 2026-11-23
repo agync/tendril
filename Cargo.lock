@@ -3895,6 +3895,7 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "iroh-services",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

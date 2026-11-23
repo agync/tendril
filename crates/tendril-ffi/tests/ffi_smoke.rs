@@ -25,17 +25,17 @@ use tendril_ffi::{
     tendril_endpoint_export_roster_json, tendril_endpoint_free, tendril_endpoint_info_json,
     tendril_endpoint_issue_code, tendril_endpoint_mint_enrollment_token,
     tendril_endpoint_mint_grant, tendril_endpoint_mint_relay_ticket, tendril_endpoint_new,
-    tendril_endpoint_new_from_state, tendril_endpoint_pair_accept, tendril_endpoint_pair_initiate,
-    tendril_endpoint_pair_v2_accept, tendril_endpoint_pair_v2_initiate,
-    tendril_endpoint_revoke_peer, tendril_endpoint_revoke_trust_anchor,
-    tendril_endpoint_serve_direct, tendril_endpoint_serve_p2p, tendril_endpoint_serve_relay,
-    tendril_endpoint_serve_relay_v2, tendril_fingerprint_device, tendril_fingerprint_host,
-    tendril_last_error, tendril_pairing_sas, tendril_session_accept, tendril_session_accept_v2,
-    tendril_session_authorize, tendril_session_close, tendril_session_connect,
-    tendril_session_connect_v2, tendril_session_export_roster_json, tendril_session_free,
-    tendril_session_poll_event, tendril_session_rekey, tendril_session_send_data,
-    tendril_session_shutdown, tendril_string_free, tendril_verify_grant_json,
-    tendril_verify_rotation_chain_json,
+    tendril_endpoint_new_from_state, tendril_endpoint_new_sealed, tendril_endpoint_pair_accept,
+    tendril_endpoint_pair_initiate, tendril_endpoint_pair_v2_accept,
+    tendril_endpoint_pair_v2_initiate, tendril_endpoint_revoke_peer,
+    tendril_endpoint_revoke_trust_anchor, tendril_endpoint_serve_direct,
+    tendril_endpoint_serve_p2p, tendril_endpoint_serve_relay, tendril_endpoint_serve_relay_v2,
+    tendril_fingerprint_device, tendril_fingerprint_host, tendril_last_error, tendril_pairing_sas,
+    tendril_session_accept, tendril_session_accept_v2, tendril_session_authorize,
+    tendril_session_close, tendril_session_connect, tendril_session_connect_v2,
+    tendril_session_export_roster_json, tendril_session_free, tendril_session_poll_event,
+    tendril_session_rekey, tendril_session_send_data, tendril_session_shutdown,
+    tendril_string_free, tendril_verify_grant_json, tendril_verify_rotation_chain_json,
 };
 use tendril_runtime::{
     DirectListener, PathListener, PathStream, PrefixedPathStream, SessionDriver, StateStore,
@@ -915,6 +915,397 @@ fn ffi_persists_session_terminating_crl_across_restart() {
     let crl = persisted.crl("crl-host").expect("persisted CRL on error");
     assert_eq!(crl.seq, 1);
     assert_eq!(crl.revoked_nonces, vec![expected_nonce]);
+}
+
+#[test]
+fn sealed_endpoint_persists_crl_and_v2_floor_without_binding_save() {
+    use tendril_core::roster::Roster;
+    use tendril_runtime::V2SessionDriver;
+
+    let host_dir = TempDir::new().unwrap();
+    let cli_dir = TempDir::new().unwrap();
+    let hd_c = CString::new(host_dir.path().to_str().unwrap()).unwrap();
+    let cd_c = CString::new(cli_dir.path().to_str().unwrap()).unwrap();
+    let hname_c = CString::new("sealed-v2-host").unwrap();
+
+    // The client pairs as a pre-sealed binding endpoint did: in memory, roster exported.
+    let host_ep = unsafe { tendril_endpoint_new(hd_c.as_ptr(), hname_c.as_ptr()) };
+    let cli_ep = unsafe { tendril_endpoint_new_from_state(ptr::null(), ptr::null(), ptr::null()) };
+    assert!(!host_ep.is_null(), "{}", read_last_err());
+    assert!(!cli_ep.is_null(), "{}", read_last_err());
+
+    let mut id_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_identity_json(cli_ep, &raw mut id_p) },
+        TENDRIL_OK
+    );
+    let cli_identity_c = CString::new(unsafe { take_cstr(id_p) }).unwrap();
+
+    let mut info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(host_ep, &raw mut info_p) },
+        TENDRIL_OK
+    );
+    let host_info: Value = serde_json::from_str(&unsafe { take_cstr(info_p) }).unwrap();
+    let mut info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(cli_ep, &raw mut info_p) },
+        TENDRIL_OK
+    );
+    let cli_info: Value = serde_json::from_str(&unsafe { take_cstr(info_p) }).unwrap();
+    let cli_dev_c = CString::new(cli_info["device_id"].as_str().unwrap()).unwrap();
+
+    let mut dep_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, ptr::null(), &raw mut dep_p) },
+        TENDRIL_OK
+    );
+    let dep_c = CString::new(unsafe { take_cstr(dep_p) }).unwrap();
+    let mut code_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, ptr::null(), &raw mut code_p) },
+        TENDRIL_OK
+    );
+    let code_c = CString::new(unsafe { take_cstr(code_p) }).unwrap();
+    let pinned_c = CString::new(
+        serde_json::json!({
+            "host_id": "sealed-v2-host",
+            "static_pub_b64": host_info["static_pub"],
+            "signing_pin_b64": host_info["signing_pub"],
+            "rotation_seq": 0,
+            "min_wire_version": 2
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let hep_usize = host_ep.addr();
+    let accept = thread::spawn(move || {
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_v2_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK);
+        serde_json::from_str::<Value>(&unsafe { take_cstr(out) }).unwrap()
+    });
+    let name_c = CString::new("sealed-cli").unwrap();
+    let kind_c = CString::new("cli").unwrap();
+    let mut out_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                cli_ep,
+                dep_c.as_ptr(),
+                ptr::null(),
+                code_c.as_ptr(),
+                name_c.as_ptr(),
+                kind_c.as_ptr(),
+                pinned_c.as_ptr(),
+                &raw mut out_p,
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        read_last_err()
+    );
+    unsafe { take_cstr(out_p) };
+    let sas_c = CString::new(accept.join().unwrap()["sas"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, cli_dev_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let caps_c = CString::new("[\"fs.read:/sealed/*\"]").unwrap();
+    let mut grant_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                cli_dev_c.as_ptr(),
+                caps_c.as_ptr(),
+                300,
+                &raw mut grant_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_str = unsafe { take_cstr(grant_p) };
+    let grant: Grant = serde_json::from_str(&grant_str).unwrap();
+    let grant_c = CString::new(grant_str).unwrap();
+    unsafe { tendril_endpoint_free(host_ep) };
+
+    // Legacy fixture: the paired roster with its v2 floor still at 1, so only a session can
+    // raise it.
+    let mut roster_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_roster_json(cli_ep, &raw mut roster_p) },
+        TENDRIL_OK
+    );
+    let mut legacy: Value = serde_json::from_str(&unsafe { take_cstr(roster_p) }).unwrap();
+    unsafe { tendril_endpoint_free(cli_ep) };
+    assert!(
+        legacy["entries"]["sealed-v2-host"]["v2_secrets"].is_object(),
+        "{legacy}"
+    );
+    legacy["entries"]["sealed-v2-host"]["min_wire_version"] = 1.into();
+    let stale_c = CString::new(legacy.to_string()).unwrap();
+
+    let refused = unsafe {
+        tendril_endpoint_new_sealed(cd_c.as_ptr(), ptr::null(), stale_c.as_ptr(), ptr::null())
+    };
+    assert!(refused.is_null());
+    assert!(read_last_err().contains("a roster seed requires the saved identity"));
+    assert!(!cli_dir.path().join("rt-roster.sealed").exists());
+
+    let cli_ep = unsafe {
+        tendril_endpoint_new_sealed(
+            cd_c.as_ptr(),
+            cli_identity_c.as_ptr(),
+            stale_c.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(!cli_ep.is_null(), "{}", read_last_err());
+    assert!(cli_dir.path().join("rt-roster.sealed").exists());
+    assert!(!cli_dir.path().join("roster.json").exists());
+    let mut roster_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_roster_json(cli_ep, &raw mut roster_p) },
+        TENDRIL_OK
+    );
+    let migrated: Value = serde_json::from_str(&unsafe { take_cstr(roster_p) }).unwrap();
+    assert_eq!(
+        migrated["entries"]["sealed-v2-host"]["min_wire_version"], 1,
+        "{migrated}"
+    );
+    assert!(migrated["crls"]["sealed-v2-host"].is_null(), "{migrated}");
+
+    // A raw host pushes a 0x03 CRL over an established v2 session.
+    let host_store = StateStore::open_or_create(host_dir.path()).unwrap();
+    let host_id = host_store.load_or_generate_identity(None).unwrap();
+    let mut host_roster: Roster = host_store.load_roster().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (v2_ep, accept_handle) = rt.block_on(async {
+        let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let ep = listener.local_endpoint();
+        let handle = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let mut drv = V2SessionDriver::accept(
+                stream,
+                &host_id,
+                &mut host_roster,
+                current_unix(),
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            let crl = sign_crl(
+                RevocationListUnsigned {
+                    v: 1,
+                    issuer: host_id.host_id().to_owned(),
+                    seq: 1,
+                    revoked_devices: Vec::new(),
+                    revoked_nonces: vec![grant.nonce.clone()],
+                    ts: grant.not_before.clone(),
+                },
+                host_id.signing_key(),
+            )
+            .unwrap();
+            drv.send_revocation(&crl).await.unwrap();
+            drv
+        });
+        (ep, handle)
+    });
+    let v2_ep_c = CString::new(v2_ep).unwrap();
+    let sess = unsafe {
+        tendril_session_connect_v2(
+            cli_ep,
+            v2_ep_c.as_ptr(),
+            ptr::null(),
+            hname_c.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(!sess.is_null(), "{}", read_last_err());
+    let drv_host = rt.block_on(accept_handle).unwrap();
+    let mut ev_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_poll_event(sess, 2_000, &raw mut ev_p) },
+        TENDRIL_ERR_PROTOCOL
+    );
+    unsafe {
+        tendril_session_free(sess);
+        tendril_endpoint_free(cli_ep);
+    }
+    drop(drv_host);
+
+    // No export or binding save happened: reopening with the stale legacy roster still sees both.
+    let reopened = unsafe {
+        tendril_endpoint_new_sealed(
+            cd_c.as_ptr(),
+            cli_identity_c.as_ptr(),
+            stale_c.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(!reopened.is_null(), "{}", read_last_err());
+    let mut roster_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_roster_json(reopened, &raw mut roster_p) },
+        TENDRIL_OK
+    );
+    let roster: Value = serde_json::from_str(&unsafe { take_cstr(roster_p) }).unwrap();
+    assert_eq!(
+        roster["entries"]["sealed-v2-host"]["min_wire_version"], 2,
+        "{roster}"
+    );
+    assert_eq!(roster["crls"]["sealed-v2-host"]["seq"], 1, "{roster}");
+    unsafe { tendril_endpoint_free(reopened) };
+}
+
+#[test]
+fn sealed_concurrent_first_opens_seed_once() {
+    use std::sync::{Arc, Barrier};
+    use tendril_core::crypto::StaticKeypair;
+    use tendril_core::roster::Roster;
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("state");
+    let dir_c = Arc::new(CString::new(dir.to_str().unwrap()).unwrap());
+    let open_all = |identity: Option<Arc<CString>>, seed: Option<Arc<CString>>| {
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (barrier, dir_c) = (barrier.clone(), dir_c.clone());
+                let (identity, seed) = (identity.clone(), seed.clone());
+                thread::spawn(move || {
+                    barrier.wait();
+                    let ep = unsafe {
+                        tendril_endpoint_new_sealed(
+                            dir_c.as_ptr(),
+                            identity.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+                            seed.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+                            ptr::null(),
+                        )
+                    };
+                    assert!(!ep.is_null(), "{}", read_last_err());
+                    let mut roster_p: *mut c_char = ptr::null_mut();
+                    assert_eq!(
+                        unsafe { tendril_endpoint_export_roster_json(ep, &raw mut roster_p) },
+                        TENDRIL_OK
+                    );
+                    unsafe { tendril_endpoint_free(ep) };
+                    serde_json::from_str::<Value>(&unsafe { take_cstr(roster_p) }).unwrap()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    // Opens that generate an identity write no runtime state, so none can strand another.
+    open_all(None, None);
+    assert!(!dir.join("rt-roster.sealed").exists());
+    assert!(!dir.join("rt-groups.sealed").exists());
+
+    let ep = unsafe { tendril_endpoint_new_from_state(ptr::null(), ptr::null(), ptr::null()) };
+    let mut id_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_identity_json(ep, &raw mut id_p) },
+        TENDRIL_OK
+    );
+    unsafe { tendril_endpoint_free(ep) };
+    let identity = Arc::new(CString::new(unsafe { take_cstr(id_p) }).unwrap());
+    let peer = StaticKeypair::from_scalar([0x5a; 32]);
+    let mut seed = Roster::new();
+    seed.insert_pinned_host(
+        peer.device_id(),
+        "seeded".to_owned(),
+        *peer.public_bytes(),
+        None,
+        0,
+        Vec::new(),
+    )
+    .unwrap();
+    let seed = Arc::new(CString::new(serde_json::to_string(&seed).unwrap()).unwrap());
+
+    let rosters = open_all(Some(identity.clone()), Some(seed));
+    assert!(
+        rosters[0]["entries"][peer.device_id()].is_object(),
+        "{}",
+        rosters[0]
+    );
+    assert!(rosters.iter().all(|r| *r == rosters[0]));
+
+    // A later stale seed never replaces the runtime roster.
+    let empty = Arc::new(CString::new(serde_json::to_string(&Roster::new()).unwrap()).unwrap());
+    let rosters = open_all(Some(identity), Some(empty));
+    assert!(
+        rosters
+            .iter()
+            .all(|r| r["entries"][peer.device_id()].is_object())
+    );
+}
+
+#[test]
+fn sealed_malformed_seed_fails_only_when_used() {
+    use tendril_core::crypto::StaticKeypair;
+    use tendril_core::roster::Roster;
+
+    let ep = unsafe { tendril_endpoint_new_from_state(ptr::null(), ptr::null(), ptr::null()) };
+    let mut id_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_identity_json(ep, &raw mut id_p) },
+        TENDRIL_OK
+    );
+    unsafe { tendril_endpoint_free(ep) };
+    let identity = CString::new(unsafe { take_cstr(id_p) }).unwrap();
+    let malformed = CString::new("{not a roster").unwrap();
+    let open = |dir: &CString, seed: &CString| unsafe {
+        tendril_endpoint_new_sealed(dir.as_ptr(), identity.as_ptr(), seed.as_ptr(), ptr::null())
+    };
+
+    // A seed that would be used must parse.
+    let tmp = TempDir::new().unwrap();
+    let fresh = tmp.path().join("fresh");
+    let fresh_c = CString::new(fresh.to_str().unwrap()).unwrap();
+    assert!(open(&fresh_c, &malformed).is_null());
+    assert!(read_last_err().contains("invalid roster json"));
+    assert!(!fresh.join("rt-roster.sealed").exists());
+
+    // Initialized state ignores the seed without parsing it.
+    let peer = StaticKeypair::from_scalar([0x5b; 32]);
+    let mut seed = Roster::new();
+    seed.insert_pinned_host(
+        peer.device_id(),
+        "seeded".to_owned(),
+        *peer.public_bytes(),
+        None,
+        0,
+        Vec::new(),
+    )
+    .unwrap();
+    let seed_c = CString::new(serde_json::to_string(&seed).unwrap()).unwrap();
+    let ep = open(&fresh_c, &seed_c);
+    assert!(!ep.is_null(), "{}", read_last_err());
+    unsafe { tendril_endpoint_free(ep) };
+    let ep = open(&fresh_c, &malformed);
+    assert!(!ep.is_null(), "{}", read_last_err());
+    let mut roster_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_roster_json(ep, &raw mut roster_p) },
+        TENDRIL_OK
+    );
+    unsafe { tendril_endpoint_free(ep) };
+    let roster: Value = serde_json::from_str(&unsafe { take_cstr(roster_p) }).unwrap();
+    assert!(roster["entries"][peer.device_id()].is_object(), "{roster}");
 }
 
 #[cfg(feature = "p2p-iroh")]

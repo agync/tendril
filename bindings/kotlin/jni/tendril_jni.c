@@ -546,6 +546,35 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_endpointNewFromState(
   return (jlong)(uintptr_t)ep;
 }
 
+JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_endpointNewSealed(
+    JNIEnv *env, jclass cls, jstring state_dir, jstring identity_json, jstring roster_json,
+    jstring host_id) {
+  (void)cls;
+  char *c_dir = NULL;
+  char *c_id = NULL;
+  char *c_roster = NULL;
+  char *c_host = NULL;
+  TendrilEndpoint *ep = NULL;
+  if (dup_opt_utf8(env, state_dir, &c_dir) &&
+      dup_opt_utf8(env, identity_json, &c_id) &&
+      dup_opt_utf8(env, roster_json, &c_roster) &&
+      dup_opt_utf8(env, host_id, &c_host)) {
+    ep = tendril_endpoint_new_sealed(c_dir, c_id, c_roster, c_host);
+  }
+  free(c_dir);
+  zeroize_cstr_free(c_id);
+  zeroize_cstr_free(c_roster);
+  free(c_host);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
+  if (ep == NULL) {
+    throw_ffi_error(env, TENDRIL_ERR_INTERNAL, "tendril_endpoint_new_sealed failed");
+    return 0;
+  }
+  return (jlong)(uintptr_t)ep;
+}
+
 JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointClose(
     JNIEnv *env, jclass cls, jlong ptr) {
   (void)env;

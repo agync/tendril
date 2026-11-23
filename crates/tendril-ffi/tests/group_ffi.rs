@@ -13,17 +13,20 @@ use tendril_core::group::GroupManifest;
 use tendril_ffi::{
     TENDRIL_ERR_CLOSED, TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_ERR_PROTOCOL,
     TENDRIL_OK, TENDRIL_WOULD_BLOCK, TendrilEndpoint, TendrilGroup, tendril_endpoint_close,
-    tendril_endpoint_enroll_initiate, tendril_endpoint_free, tendril_endpoint_info_json,
-    tendril_endpoint_mint_enrollment_token, tendril_endpoint_new, tendril_endpoint_new_from_state,
-    tendril_endpoint_pair_accept, tendril_endpoint_serve_direct, tendril_group_add_member,
-    tendril_group_authorize_peer, tendril_group_broadcast, tendril_group_close,
-    tendril_group_create, tendril_group_free, tendril_group_ingest_manifest,
-    tendril_group_local_endpoint, tendril_group_open, tendril_group_poll_event,
-    tendril_group_remove_member, tendril_group_sync, tendril_last_error, tendril_session_accept,
-    tendril_session_accept_v2, tendril_session_connect, tendril_session_free,
-    tendril_session_poll_event, tendril_session_shutdown, tendril_string_free,
+    tendril_endpoint_enroll_initiate, tendril_endpoint_export_identity_json, tendril_endpoint_free,
+    tendril_endpoint_info_json, tendril_endpoint_mint_enrollment_token, tendril_endpoint_new,
+    tendril_endpoint_new_from_state, tendril_endpoint_new_sealed, tendril_endpoint_pair_accept,
+    tendril_endpoint_serve_direct, tendril_group_add_member, tendril_group_authorize_peer,
+    tendril_group_broadcast, tendril_group_close, tendril_group_create, tendril_group_free,
+    tendril_group_ingest_manifest, tendril_group_local_endpoint, tendril_group_open,
+    tendril_group_poll_event, tendril_group_remove_member, tendril_group_sync, tendril_last_error,
+    tendril_session_accept, tendril_session_accept_v2, tendril_session_connect,
+    tendril_session_free, tendril_session_poll_event, tendril_session_shutdown,
+    tendril_string_free,
 };
-use tendril_runtime::{DirectDialer, PathDialer, SessionDriver, StateStore};
+use tendril_runtime::{
+    DirectDialer, PathDialer, SessionDriver, StateStore, deserialize_identity_json,
+};
 
 unsafe fn take_cstr(ptr: *mut c_char) -> String {
     assert!(!ptr.is_null());
@@ -61,6 +64,43 @@ impl Node {
         let path = cstr(dir.path().to_str().unwrap());
         let ep = unsafe { tendril_endpoint_new(path.as_ptr(), ptr::null()) };
         assert!(!ep.is_null(), "{}", last_err());
+        Self::from_ep(dir, ep)
+    }
+
+    /// A store-less mobile-style endpoint: identity stays with the caller, the runtime seals
+    /// roster and group state in the directory.
+    fn sealed() -> Self {
+        let dir = TempDir::new().unwrap();
+        let ep = open_sealed(dir.path(), None).unwrap();
+        Self::from_ep(dir, ep)
+    }
+
+    fn identity_json(&self) -> String {
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_export_identity_json(self.ep, &raw mut out) },
+            TENDRIL_OK
+        );
+        unsafe { take_cstr(out) }
+    }
+
+    /// Frees the endpoint and reopens the sealed directory with the exported identity.
+    fn restart_sealed(&mut self) {
+        let identity = self.identity_json();
+        unsafe {
+            tendril_endpoint_close(self.ep);
+            tendril_endpoint_free(self.ep);
+        }
+        self.ep = open_sealed(self.dir.path(), Some(&identity)).unwrap();
+        let mut addr = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_serve_direct(self.ep, ptr::null(), &raw mut addr) },
+            TENDRIL_OK
+        );
+        self.addr = unsafe { take_cstr(addr) };
+    }
+
+    fn from_ep(dir: TempDir, ep: *mut TendrilEndpoint) -> Self {
         let mut info = ptr::null_mut();
         assert_eq!(
             unsafe { tendril_endpoint_info_json(ep, &raw mut info) },
@@ -87,8 +127,32 @@ impl Node {
     }
 }
 
+fn open_sealed(
+    dir: &std::path::Path,
+    identity: Option<&str>,
+) -> Result<*mut TendrilEndpoint, String> {
+    let dir = cstr(dir.to_str().unwrap());
+    let identity = identity.map(cstr);
+    let ep = unsafe {
+        tendril_endpoint_new_sealed(
+            dir.as_ptr(),
+            identity.as_ref().map_or(ptr::null(), |i| i.as_ptr()),
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    if ep.is_null() {
+        Err(last_err())
+    } else {
+        Ok(ep)
+    }
+}
+
 impl Drop for Node {
     fn drop(&mut self) {
+        if self.ep.is_null() {
+            return;
+        }
         unsafe {
             tendril_endpoint_close(self.ep);
             tendril_endpoint_free(self.ep);
@@ -670,13 +734,11 @@ fn group_open_with_listener_reports_bound_endpoint() {
     }
 }
 
-#[test]
-fn session_group_frames_are_ingested_by_the_runtime_and_report_a_redacted_outcome() {
-    let a = Node::new();
-    let b = Node::new();
-    pair(&a, &b);
-    let (gid, _) = create_group(&a, "unverified");
-    let manifest_json = add_member(&a, &gid, &b);
+/// Pushes a fresh group's manifest and rendezvous key from root `a` to `b` over an ordinary
+/// session and returns the group id, the manifest, and the `group_*` events `b` reported.
+fn push_group_over_session(a: &Node, b: &Node) -> (String, GroupManifest, Vec<Value>) {
+    let (gid, _) = create_group(a, "unverified");
+    let manifest_json = add_member(a, &gid, b);
     let secrets = StateStore::open_or_create(a.dir.path())
         .unwrap()
         .load_group_book()
@@ -729,7 +791,15 @@ fn session_group_frames_are_ingested_by_the_runtime_and_report_a_redacted_outcom
         session.send_group_rendezvous(&secrets, &gid).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
     });
-    let events = accept.join().unwrap();
+    (gid, manifest, accept.join().unwrap())
+}
+
+#[test]
+fn session_group_frames_are_ingested_by_the_runtime_and_report_a_redacted_outcome() {
+    let a = Node::new();
+    let b = Node::new();
+    pair(&a, &b);
+    let (gid, manifest, events) = push_group_over_session(&a, &b);
     assert_eq!(events.len(), 2, "{events:?}");
     let manifest_ev = &events[0];
     assert_eq!(manifest_ev["event"], "group_manifest_ingested");
@@ -752,6 +822,197 @@ fn session_group_frames_are_ingested_by_the_runtime_and_report_a_redacted_outcom
         .collect();
     keys.sort_unstable();
     assert_eq!(keys, ["event", "group_id", "seq"]);
+}
+
+fn sealed_store(node: &Node) -> StateStore {
+    let identity = deserialize_identity_json(&node.identity_json()).unwrap();
+    StateStore::open_sealed(node.dir.path(), &identity).unwrap()
+}
+
+#[test]
+fn sealed_endpoint_hosts_group_across_restart() {
+    let a = Node::new();
+    let mut b = Node::sealed();
+    pair(&a, &b);
+    let (gid, _) = create_group(&a, "sealed-mesh");
+    let addr_b = free_addr();
+    let manifest = add_member_at(&a, &gid, &b, &addr_b);
+    assert_eq!(ingest(&b, &manifest, &a.id).unwrap(), gid);
+
+    let ga = open(&a, &gid);
+    let gb = open_at(&b, &gid, Some(&addr_b));
+    let report = broadcast(ga, b"before-restart");
+    assert_eq!(report["delivered"][0], b.id.as_str(), "{report}");
+    let ev = wait_event(gb, "app_data");
+    assert_eq!(
+        b64url_decode(ev["payload_b64"].as_str().unwrap()).unwrap(),
+        b"before-restart"
+    );
+    unsafe { tendril_group_free(gb) };
+
+    let names: Vec<String> = std::fs::read_dir(b.dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(names.iter().any(|n| n == "rt-groups.sealed"), "{names:?}");
+    assert!(names.iter().any(|n| n == "rt-roster.sealed"), "{names:?}");
+    for plain in ["identity.json", "roster.json", "groups.json"] {
+        assert!(!names.iter().any(|n| n == plain), "{names:?}");
+    }
+    let sealed = std::fs::read(b.dir.path().join("rt-groups.sealed")).unwrap();
+    let contains = |needle: &[u8]| sealed.windows(needle.len()).any(|w| w == needle);
+    assert!(!contains(gid.as_bytes()));
+    assert!(!contains(b"group_rendezvous_key"));
+    let root_book = StateStore::open_or_create(a.dir.path())
+        .unwrap()
+        .load_group_book()
+        .unwrap();
+    let key = root_book.secrets(&gid).unwrap().group_rendezvous_key();
+    assert!(!contains(key));
+    assert!(!contains(
+        tendril_core::crypto::b64url_encode(key).as_bytes()
+    ));
+    let persisted = StateStore::open_sealed(
+        b.dir.path(),
+        &tendril_runtime::deserialize_identity_json(&b.identity_json()).unwrap(),
+    )
+    .unwrap()
+    .load_group_book()
+    .unwrap();
+    assert!(
+        tendril_core::group::is_active_member(persisted.manifest(&gid).unwrap(), &b.id),
+        "the ingested manifest is durable before the restart"
+    );
+
+    b.restart_sealed();
+    let gb = open_at(&b, &gid, Some(&addr_b));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let report = broadcast(ga, b"after-restart");
+        if report["delivered"].as_array().unwrap().len() == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{report}");
+        thread::sleep(Duration::from_millis(200));
+    }
+    let ev = wait_event(gb, "app_data");
+    assert_eq!(
+        b64url_decode(ev["payload_b64"].as_str().unwrap()).unwrap(),
+        b"after-restart"
+    );
+    unsafe {
+        tendril_group_free(gb);
+        tendril_group_free(ga);
+    }
+
+    // Fail closed: another identity, no identity, or a tampered file never open the state.
+    let identity = b.identity_json();
+    unsafe {
+        tendril_endpoint_close(b.ep);
+        tendril_endpoint_free(b.ep);
+    }
+    b.ep = ptr::null_mut();
+    let other = Node::sealed().identity_json();
+    let err = open_sealed(b.dir.path(), Some(&other)).unwrap_err();
+    assert!(
+        err.contains("sealed roster state cannot be opened"),
+        "{err}"
+    );
+    let err = open_sealed(b.dir.path(), None).unwrap_err();
+    assert!(
+        err.contains("sealed runtime state exists but no identity was supplied"),
+        "{err}"
+    );
+    let path = b.dir.path().join("rt-groups.sealed");
+    let mut tampered = std::fs::read(&path).unwrap();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    std::fs::write(&path, &tampered).unwrap();
+    let err = open_sealed(b.dir.path(), Some(&identity)).unwrap_err();
+    assert!(
+        err.contains("sealed groups state cannot be opened"),
+        "{err}"
+    );
+    tampered[0] = 0x07;
+    std::fs::write(&path, &tampered).unwrap();
+    let err = open_sealed(b.dir.path(), Some(&identity)).unwrap_err();
+    assert!(err.contains("unsupported sealed state version 7"), "{err}");
+    let err = unsafe {
+        let ep = tendril_endpoint_new_sealed(ptr::null(), ptr::null(), ptr::null(), ptr::null());
+        assert!(ep.is_null());
+        last_err()
+    };
+    assert!(err.contains("state_dir"), "{err}");
+}
+
+#[test]
+fn sealed_endpoints_independent_handles() {
+    let root = Node::sealed();
+    let c = Node::new();
+    let d = Node::new();
+    pair(&root, &c);
+    pair(&root, &d);
+    let (gid, _) = create_group(&root, "two-handles");
+    add_member(&root, &gid, &c);
+
+    let second = open_sealed(root.dir.path(), Some(&root.identity_json())).unwrap();
+    let gid_c = cstr(&gid);
+    let peer_c = cstr(&c.id);
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_group_remove_member(root.ep, gid_c.as_ptr(), peer_c.as_ptr(), &raw mut out)
+        },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    unsafe { take_cstr(out) };
+
+    let peer_d = cstr(&d.id);
+    let endpoints = cstr(&serde_json::to_string(&[&d.addr]).unwrap());
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_group_add_member(
+                second,
+                gid_c.as_ptr(),
+                peer_d.as_ptr(),
+                ptr::null(),
+                endpoints.as_ptr(),
+                &raw mut out,
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    let latest = GroupManifest::from_wire_bytes(unsafe { take_cstr(out) }.as_bytes()).unwrap();
+    assert!(latest.revoked_members.contains(&c.id), "removal undone");
+    unsafe { tendril_endpoint_free(second) };
+
+    let book = sealed_store(&root).load_group_book().unwrap();
+    let stored = book.manifest(&gid).unwrap();
+    assert_eq!(stored.seq, latest.seq);
+    assert!(!tendril_core::group::is_active_member(stored, &c.id));
+    assert!(tendril_core::group::is_active_member(stored, &d.id));
+}
+
+#[test]
+fn sealed_endpoint_ingests_session_group_frames() {
+    let a = Node::new();
+    let b = Node::sealed();
+    pair(&a, &b);
+    let (gid, manifest, events) = push_group_over_session(&a, &b);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["event"], "group_manifest_ingested", "{events:?}");
+    assert_eq!(
+        events[1]["event"], "group_rendezvous_ingested",
+        "{events:?}"
+    );
+    let book = sealed_store(&b).load_group_book().unwrap();
+    assert_eq!(book.manifest(&gid).unwrap().seq, manifest.seq);
+    assert!(book.secrets(&gid).is_some());
 }
 
 #[test]
