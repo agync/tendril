@@ -3871,3 +3871,155 @@ mod group_mesh {
         assert_eq!(book.secrets(&gid), Some(&s2));
     }
 }
+
+fn responder_pending_sas(actions: &[PairAction]) -> String {
+    match completed_pair_outcome(actions) {
+        PairOutcome::ResponderPending { pairing_sas, .. } => pairing_sas,
+        other => panic!("expected ResponderPending, got {other:?}"),
+    }
+}
+
+fn human_pair_v1(
+    peer: &EndpointIdentity,
+    host: &EndpointIdentity,
+    host_roster: &mut Roster,
+) -> Vec<PairAction> {
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Remote3Group, NOW_UNIX)
+        .unwrap();
+    let mut init = PairingInitiator::new(peer, "Peer", "cli", &code, None, None).unwrap();
+    let mut resp = PairingResponder::new(host, PairingPathKind::Remote, None).unwrap();
+    let (_, resp_events) = run_pair_exchange(
+        &mut init,
+        &mut resp,
+        &mut mgr,
+        host_roster,
+        NOW_UNIX,
+        usize::MAX,
+    );
+    resp_events
+}
+
+/// Sends the keyless human `PairClaim` a pre-change initiator builds.
+fn legacy_keyless_pair_v1(
+    peer: &EndpointIdentity,
+    host: &EndpointIdentity,
+    host_roster: &mut Roster,
+) -> Vec<PairAction> {
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Remote3Group, NOW_UNIX)
+        .unwrap();
+    let mut resp = PairingResponder::new(host, PairingPathKind::Remote, None).unwrap();
+    let preamble = Preamble::v1(Intent::Pair).encode();
+    let mut raw = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(peer.static_key().secret_bytes())
+        .prologue(&preamble)
+        .build_initiator()
+        .unwrap();
+    let mut f1 = preamble.to_vec();
+    f1.extend_from_slice(&encode_frame(&raw.write_message_vec(&[]).unwrap()).unwrap());
+    let out2 = collect_pair_writes(
+        &resp
+            .feed_bytes(&f1, NOW_UNIX, &mut mgr, host_roster)
+            .unwrap(),
+    );
+    raw.read_message_vec(decode_frame(&out2).unwrap().0)
+        .unwrap();
+    let mac = tendril_core::crypto::compute_code_mac(&code, raw.get_handshake_hash()).unwrap();
+    let claim = PairClaim {
+        name: "Legacy".into(),
+        kind: "cli".into(),
+        code_mac: Some(b64url_encode(&mac)),
+        enrollment_token: None,
+        signing_pub: None,
+        enroll_proof: None,
+    };
+    let msg3 = raw
+        .write_message_vec(&serde_json::to_vec(&claim).unwrap())
+        .unwrap();
+    resp.feed_bytes(
+        &encode_frame(&msg3).unwrap(),
+        NOW_UNIX,
+        &mut mgr,
+        host_roster,
+    )
+    .unwrap()
+}
+
+#[test]
+fn human_pairing_records_initiator_signing_key() {
+    let host = mk_identity(0x31).with_host_id("host-key-claim");
+    let peer = mk_identity(0x32);
+    let key = peer.signing_key().public_key().clone();
+    let mut roster = Roster::new();
+
+    let sas = responder_pending_sas(&human_pair_v1(&peer, &host, &mut roster));
+    let entry = roster.get(&peer.device_id()).unwrap();
+    assert_eq!(entry.state, PeerState::Pending);
+    assert_eq!(entry.signing_pub.as_ref(), Some(&key));
+    assert_eq!(roster.lookup_active_signing_key(&peer.device_id()), None);
+
+    roster.confirm_peer(&peer.device_id(), Some(&sas)).unwrap();
+    let entry = roster.get(&peer.device_id()).unwrap();
+    assert_eq!(entry.state, PeerState::Active);
+    assert_eq!(entry.signing_pub.as_ref(), Some(&key));
+    assert_eq!(
+        roster.lookup_active_signing_key(&peer.device_id()),
+        Some(key)
+    );
+}
+
+#[test]
+fn v1_repair_enrichment_and_no_replacement() {
+    let host = mk_identity(0x33).with_host_id("host-repair");
+    let peer = mk_identity(0x34);
+    let id = peer.device_id();
+    let key = peer.signing_key().public_key().clone();
+
+    // Legacy keyless active pin, as left by a pre-change pairing.
+    let mut roster = Roster::new();
+    let old_sas = responder_pending_sas(&legacy_keyless_pair_v1(&peer, &host, &mut roster));
+    roster.confirm_peer(&id, Some(&old_sas)).unwrap();
+    assert_eq!(roster.get(&id).unwrap().signing_pub, None);
+
+    // Keyed re-pair enriches the entry and returns it to pending until the new SAS is confirmed.
+    let new_sas = responder_pending_sas(&human_pair_v1(&peer, &host, &mut roster));
+    let entry = roster.get(&id).unwrap();
+    assert_eq!(entry.state, PeerState::Pending);
+    assert_eq!(entry.signing_pub.as_ref(), Some(&key));
+    assert_eq!(roster.lookup_active_signing_key(&id), None);
+    roster.confirm_peer(&id, Some(&new_sas)).unwrap();
+    assert_eq!(roster.lookup_active_signing_key(&id), Some(key.clone()));
+
+    // Same static, another signing key with a valid proof by that key: refused, no mutation.
+    let mut s_bytes = [0x34; 32];
+    s_bytes[0] = 0x34 ^ 0x55;
+    let impostor = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar(s_bytes),
+        SigningKeypair::from_seed([0x99; 32]),
+    );
+    assert_eq!(impostor.device_id(), id);
+    let before = serde_json::to_value(&roster).unwrap();
+    let acts = human_pair_v1(&impostor, &host, &mut roster);
+    assert_eq!(
+        completed_pair_outcome(&acts),
+        PairOutcome::Rejected {
+            error: "protocol_error".to_string()
+        }
+    );
+    assert_eq!(serde_json::to_value(&roster).unwrap(), before);
+    assert_eq!(roster.lookup_active_signing_key(&id), Some(key));
+}
+
+#[test]
+fn old_initiator_new_responder_v1() {
+    let host = mk_identity(0x35).with_host_id("host-legacy");
+    let peer = mk_identity(0x36);
+    let mut roster = Roster::new();
+    responder_pending_sas(&legacy_keyless_pair_v1(&peer, &host, &mut roster));
+    let entry = roster.get(&peer.device_id()).unwrap();
+    assert_eq!(entry.state, PeerState::Pending);
+    assert_eq!(entry.signing_pub, None);
+}

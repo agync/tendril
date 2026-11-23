@@ -15,7 +15,7 @@ Every language binding and independent implementation must match all canonical v
 | File | Verified Primitives | Negative Cases |
 |---|---|---|
 | `spec/vectors/fingerprints.json` | `device_id`, `host_fingerprint`, `device_fingerprint`, `pairing_sas` | Invalid key length rejection |
-| `spec/vectors/pairing_mac.json` | 3-group and 2-group normalization, `argon2id`, `code_mac` | Wrong-code constant-time rejection |
+| `spec/vectors/pairing_mac.json` | 3-group and 2-group normalization, `argon2id`, `code_mac`, human signing key proof (`key_proof`) | Wrong-code constant-time rejection; key proof over another `h` |
 | `spec/vectors/rotation.json` | `seq = 1` and `seq = 2` 4031-byte binary hybrid signatures (`Ed25519 + ML-DSA-65`) and chain bridge | Duplicate `seq` fork detection and unanchored fork rejection |
 | `spec/vectors/grants.json` | RFC 8785 JCS canonicalization, hybrid signature, valid delegation, signed CRL | Widened child scope and forged non-root issuer rejection |
 | `spec/vectors/handshake.json` | Full deterministic `pair` and `session` `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` transcripts, `DATA`, and `REKEY` | Unverified `msg2` host key or pin mismatch abort before `msg3` |

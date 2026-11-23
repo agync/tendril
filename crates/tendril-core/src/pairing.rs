@@ -42,6 +42,9 @@ pub const MAX_ENROLLMENT_TTL_SECS: u64 = 86_400;
 /// 18-byte domain prefix prepended to channel-binding M2M enrollment proofs.
 pub const ENROLL_PROOF_DOMAIN: &[u8] = b"tendril-enroll-v1\0";
 
+/// 20-byte domain prefix prepended to human pairing signing key proofs.
+pub const PAIR_KEY_PROOF_DOMAIN: &[u8] = b"tendril-pair-key-v1\0";
+
 /// Policy controlling autonomous Machine-to-Machine enrollment on a responder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnrollmentPolicy {
@@ -1117,6 +1120,144 @@ pub fn verify_enroll_proof(
     signing_pub.verify(&msg, sig_bytes)
 }
 
+/// Builds the canonical signature input for a human `PairClaim` signing key proof:
+/// `"tendril-pair-key-v1\0" (20 B) || h (32 B) || peer_static_pub (32 B)`.
+#[must_use]
+pub fn pair_key_proof_bytes(handshake_hash: &[u8; 32], peer_static_pub: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PAIR_KEY_PROOF_DOMAIN.len() + 32 + 32);
+    out.extend_from_slice(PAIR_KEY_PROOF_DOMAIN);
+    out.extend_from_slice(handshake_hash);
+    out.extend_from_slice(peer_static_pub);
+    out
+}
+
+/// Signs the human pairing proof that the initiator holding `peer_static_pub` owns `signing_key`.
+pub fn sign_pair_key_proof(
+    signing_key: &SigningKeypair,
+    handshake_hash: &[u8; 32],
+    peer_static_pub: &[u8; 32],
+) -> Result<Vec<u8>, CoreError> {
+    signing_key.sign(&pair_key_proof_bytes(handshake_hash, peer_static_pub))
+}
+
+/// Deterministically signs the human pairing key proof for reproducible test vectors.
+pub fn sign_pair_key_proof_deterministic(
+    signing_key: &SigningKeypair,
+    handshake_hash: &[u8; 32],
+    peer_static_pub: &[u8; 32],
+) -> Result<Vec<u8>, CoreError> {
+    signing_key.sign_deterministic(&pair_key_proof_bytes(handshake_hash, peer_static_pub))
+}
+
+/// Strictly verifies both halves of a channel-bound human pairing key proof.
+pub fn verify_pair_key_proof(
+    signing_pub: &HybridSigningPublicKey,
+    handshake_hash: &[u8; 32],
+    peer_static_pub: &[u8; 32],
+    sig_bytes: &[u8],
+) -> Result<(), CoreError> {
+    signing_pub.verify(
+        &pair_key_proof_bytes(handshake_hash, peer_static_pub),
+        sig_bytes,
+    )
+}
+
+/// Test-only corruptions of the human pairing signing key claim.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyClaimTamper {
+    /// Proof signed over a different handshake hash.
+    WrongTranscript,
+    /// Proof signed over a different initiator static key.
+    WrongStatic,
+    /// Ed25519 half of the proof corrupted.
+    CorruptEd25519,
+    /// ML-DSA-65 half of the proof corrupted.
+    CorruptMlDsa,
+    /// Proof signed by a key other than the claimed `signing_pub`.
+    OtherKey,
+    /// `signing_pub` sent without `enroll_proof`.
+    KeyOnly,
+    /// `signing_pub` that does not decode as a hybrid key.
+    MalformedKey,
+    /// `enroll_proof` that does not decode as `b64url`.
+    MalformedProof,
+    /// Neither field, as a pre-change initiator sends.
+    Omit,
+}
+
+/// Builds the `(signing_pub, enroll_proof)` pair a human `PairClaim` carries.
+pub(crate) fn human_key_claim(
+    signing_key: &SigningKeypair,
+    handshake_hash: &[u8; 32],
+    local_static_pub: &[u8; 32],
+    #[cfg(any(test, feature = "test-utils"))] tamper: Option<KeyClaimTamper>,
+) -> Result<(Option<String>, Option<String>), CoreError> {
+    let signing_pub = Some(signing_key.public_key().to_b64url());
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(t) = tamper {
+        return tampered_key_claim(signing_key, handshake_hash, local_static_pub, t);
+    }
+    let proof = sign_pair_key_proof(signing_key, handshake_hash, local_static_pub)?;
+    Ok((signing_pub, Some(b64url_encode(&proof))))
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn tampered_key_claim(
+    signing_key: &SigningKeypair,
+    handshake_hash: &[u8; 32],
+    local_static_pub: &[u8; 32],
+    tamper: KeyClaimTamper,
+) -> Result<(Option<String>, Option<String>), CoreError> {
+    if tamper == KeyClaimTamper::Omit {
+        return Ok((None, None));
+    }
+    let signing_pub = signing_key.public_key().to_b64url();
+    let mut h = *handshake_hash;
+    let mut st = *local_static_pub;
+    let mut signer = signing_key.clone();
+    match tamper {
+        KeyClaimTamper::WrongTranscript => h[0] ^= 0x01,
+        KeyClaimTamper::WrongStatic => st[0] ^= 0x01,
+        KeyClaimTamper::OtherKey => signer = SigningKeypair::from_seed([0xEE; 32]),
+        _ => {}
+    }
+    let mut proof = sign_pair_key_proof(&signer, &h, &st)?;
+    match tamper {
+        KeyClaimTamper::CorruptEd25519 => proof[0] ^= 0x01,
+        KeyClaimTamper::CorruptMlDsa => proof[crate::crypto::ED25519_SIG_LEN + 7] ^= 0x01,
+        KeyClaimTamper::KeyOnly => return Ok((Some(signing_pub), None)),
+        KeyClaimTamper::MalformedKey => {
+            return Ok((
+                Some(b64url_encode(&[0x42; 16])),
+                Some(b64url_encode(&proof)),
+            ));
+        }
+        KeyClaimTamper::MalformedProof => {
+            return Ok((Some(signing_pub), Some("*".repeat(64))));
+        }
+        _ => {}
+    }
+    Ok((Some(signing_pub), Some(b64url_encode(&proof))))
+}
+
+/// Decodes and verifies a human claim's `(signing_pub, enroll_proof)` after the code burn.
+///
+/// Returns the `PairResponse` error code on failure: `protocol_error` for malformed encodings,
+/// `unauthorized` for a proof that does not verify.
+pub(crate) fn verify_human_key_claim(
+    signing_pub_b64: &str,
+    proof_b64: &str,
+    handshake_hash: &[u8; 32],
+    peer_static_pub: &[u8; 32],
+) -> Result<HybridSigningPublicKey, &'static str> {
+    let key = HybridSigningPublicKey::from_b64url(signing_pub_b64).map_err(|_| "protocol_error")?;
+    let proof = b64url_decode(proof_b64).map_err(|_| "protocol_error")?;
+    verify_pair_key_proof(&key, handshake_hash, peer_static_pub, &proof)
+        .map_err(|err| err.pair_error_code())?;
+    Ok(key)
+}
+
 fn validate_enrollment_token_structure(
     token: &Grant,
     expected_host_id: Option<&str>,
@@ -1285,6 +1426,7 @@ enum InitiatorPhase {
 enum InitiatorAuth {
     Human {
         code: Zeroizing<String>,
+        signing_key: SigningKeypair,
     },
     M2m {
         token: Box<Grant>,
@@ -1303,6 +1445,8 @@ pub struct PairingInitiator {
     pinned_host: Option<PinnedHost>,
     v2_floored_static_pubs: BTreeSet<[u8; 32]>,
     v2_floored_host_ids: BTreeSet<String>,
+    #[cfg(any(test, feature = "test-utils"))]
+    key_claim_tamper: Option<KeyClaimTamper>,
 }
 
 impl fmt::Debug for PairingInitiator {
@@ -1359,6 +1503,7 @@ impl PairingInitiator {
             reader: ResumableFrameReader::new(),
             auth: InitiatorAuth::Human {
                 code: Zeroizing::new(code.into()),
+                signing_key: identity.signing_key().clone(),
             },
             device_name: device_name.into(),
             device_kind: device_kind.into(),
@@ -1366,6 +1511,8 @@ impl PairingInitiator {
             pinned_host,
             v2_floored_static_pubs: BTreeSet::new(),
             v2_floored_host_ids: BTreeSet::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            key_claim_tamper: None,
         })
     }
 
@@ -1395,6 +1542,14 @@ impl PairingInitiator {
             pinned_host,
             fixed_ephemeral,
         )
+    }
+
+    /// Corrupts the human signing key claim in `msg3` strictly in tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_key_claim_tamper_for_testing_only(mut self, tamper: KeyClaimTamper) -> Self {
+        self.key_claim_tamper = Some(tamper);
+        self
     }
 
     /// Creates an autonomous M2M enrollment initiator requiring an out-of-band pinned host key.
@@ -1442,6 +1597,8 @@ impl PairingInitiator {
             pinned_host: Some(pinned_host),
             v2_floored_static_pubs: BTreeSet::new(),
             v2_floored_host_ids: BTreeSet::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            key_claim_tamper: None,
         })
     }
 
@@ -1630,20 +1787,27 @@ impl PairingInitiator {
                 let h = *hs.get_handshake_hash();
                 let sas = pairing_sas(&h);
                 let claim = match &self.auth {
-                    InitiatorAuth::Human { code } => {
+                    InitiatorAuth::Human { code, signing_key } => {
                         actions.push(PairAction::SasReady {
                             pairing_sas: sas.clone(),
                             host_id: host_hello.host_id.clone(),
                             host_static_pub: remote_static,
                         });
                         let mac = compute_code_mac(code, &h)?;
+                        let (signing_pub, enroll_proof) = human_key_claim(
+                            signing_key,
+                            &h,
+                            &self.local_static_pub,
+                            #[cfg(any(test, feature = "test-utils"))]
+                            self.key_claim_tamper,
+                        )?;
                         PairClaim {
                             name: self.device_name.clone(),
                             kind: self.device_kind.clone(),
                             code_mac: Some(b64url_encode(&mac)),
                             enrollment_token: None,
-                            signing_pub: None,
-                            enroll_proof: None,
+                            signing_pub,
+                            enroll_proof,
                         }
                     }
                     InitiatorAuth::M2m { token, signing_key } => {
@@ -2004,7 +2168,9 @@ impl PairingResponder {
                     claim.signing_pub,
                     claim.enroll_proof,
                 ) {
-                    (Some(code_mac), None, None, None) => {
+                    (Some(code_mac), None, signing_pub, enroll_proof)
+                        if signing_pub.is_some() == enroll_proof.is_some() =>
+                    {
                         let mac_bytes: [u8; 32] = match b64url_decode_array(&code_mac) {
                             Ok(m) => m,
                             Err(_) => {
@@ -2024,10 +2190,25 @@ impl PairingResponder {
                             );
                         }
 
+                        let claimed_key = match (signing_pub, enroll_proof) {
+                            (Some(key_b64), Some(proof_b64)) => match verify_human_key_claim(
+                                &key_b64,
+                                &proof_b64,
+                                &post_msg2_hash,
+                                &peer_static,
+                            ) {
+                                Ok(key) => Some(key),
+                                Err(code) => {
+                                    return write_pair_error(&mut transport, code, actions);
+                                }
+                            },
+                            _ => None,
+                        };
+
                         let sas = pairing_sas(&post_msg2_hash);
                         let peer_id = match roster.record_pending_pair(
                             peer_static,
-                            None,
+                            claimed_key,
                             claim.name.clone(),
                             claim.kind.clone(),
                             sas.clone(),
@@ -2593,5 +2774,195 @@ mod tests {
             Err(CoreError::ProtocolViolation("too many live pairing codes"))
         );
         assert_eq!(mgr.live_code_count(1000), MAX_LIVE_PAIRING_CODES);
+    }
+
+    fn v1_claim(
+        init: PairingInitiator,
+        host: &EndpointIdentity,
+        mgr: &mut PairingManager,
+        roster: &mut Roster,
+    ) -> PairOutcome {
+        v1_claim_burning(init, host, mgr, roster, None)
+    }
+
+    /// Runs a v1 exchange; `burn_before_msg3` makes that code unavailable once `msg2` is sent.
+    fn v1_claim_burning(
+        mut init: PairingInitiator,
+        host: &EndpointIdentity,
+        mgr: &mut PairingManager,
+        roster: &mut Roster,
+        burn_before_msg3: Option<&str>,
+    ) -> PairOutcome {
+        fn writes(actions: &[PairAction]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for a in actions {
+                if let PairAction::WriteBytes(b) = a {
+                    out.extend_from_slice(b);
+                }
+            }
+            out
+        }
+        let mut resp = PairingResponder::new(host, PairingPathKind::Remote, None).unwrap();
+        let mut to_resp = writes(&init.start().unwrap());
+        for _ in 0..4 {
+            let acts = resp.feed_bytes(&to_resp, 1000, mgr, roster).unwrap();
+            if let Some(outcome) = acts.iter().find_map(|a| match a {
+                PairAction::Completed(o) => Some(o.clone()),
+                _ => None,
+            }) {
+                return outcome;
+            }
+            to_resp = writes(&init.feed_bytes(&writes(&acts)).unwrap());
+            if let Some(code) = burn_before_msg3.filter(|_| !to_resp.is_empty()) {
+                mgr.burn_pake_code(code, PairingPathKind::Remote, 1000)
+                    .unwrap();
+            }
+        }
+        panic!("responder never completed");
+    }
+
+    #[test]
+    fn v1_key_claim_binding_fails_closed() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x91; 32]),
+            SigningKeypair::from_seed([0x92; 32]),
+        );
+        let dev = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0xA1; 32]),
+            SigningKeypair::from_seed([0xA2; 32]),
+        );
+        let cases = [
+            (KeyClaimTamper::WrongTranscript, "unauthorized", true),
+            (KeyClaimTamper::WrongStatic, "unauthorized", true),
+            (KeyClaimTamper::CorruptEd25519, "unauthorized", true),
+            (KeyClaimTamper::CorruptMlDsa, "unauthorized", true),
+            (KeyClaimTamper::OtherKey, "unauthorized", true),
+            (KeyClaimTamper::MalformedKey, "protocol_error", true),
+            (KeyClaimTamper::MalformedProof, "protocol_error", true),
+            (KeyClaimTamper::KeyOnly, "protocol_error", false),
+        ];
+        for (tamper, code_str, burns) in cases {
+            // A legacy keyless active entry: a verified key claim would demote and enrich it.
+            let mut roster = Roster::new();
+            roster
+                .record_pending_pair(
+                    *dev.static_key().public_bytes(),
+                    None,
+                    "Dev".into(),
+                    "cli".into(),
+                    "old".into(),
+                )
+                .unwrap();
+            roster.confirm_peer(&dev.device_id(), Some("old")).unwrap();
+            let before = serde_json::to_value(&roster).unwrap();
+
+            let mut mgr = PairingManager::new(PairingConfig::default());
+            let code = mgr.issue_code(PairingCodeKind::Remote3Group, 1000).unwrap();
+            let init = PairingInitiator::new(&dev, "Dev", "cli", &code, None, None)
+                .unwrap()
+                .with_key_claim_tamper_for_testing_only(tamper);
+            assert_eq!(
+                v1_claim(init, &host, &mut mgr, &mut roster),
+                PairOutcome::Rejected {
+                    error: code_str.to_string()
+                },
+                "{tamper:?}"
+            );
+            assert_eq!(serde_json::to_value(&roster).unwrap(), before, "{tamper:?}");
+            if burns {
+                assert_eq!(mgr.live_code_count(1000), 0, "{tamper:?}");
+                let retry = PairingInitiator::new(&dev, "Dev", "cli", &code, None, None).unwrap();
+                assert_eq!(
+                    v1_claim(retry, &host, &mut mgr, &mut roster),
+                    PairOutcome::Rejected {
+                        error: "unauthorized".to_string()
+                    },
+                    "{tamper:?}"
+                );
+                assert_eq!(serde_json::to_value(&roster).unwrap(), before, "{tamper:?}");
+            } else {
+                assert_eq!(mgr.live_code_count(1000), 1, "{tamper:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn v1_key_claim_code_is_burned_before_proof_is_checked() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x91; 32]),
+            SigningKeypair::from_seed([0x92; 32]),
+        );
+        let dev = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0xA1; 32]),
+            SigningKeypair::from_seed([0xA2; 32]),
+        );
+        for tamper in [
+            KeyClaimTamper::MalformedProof,
+            KeyClaimTamper::MalformedKey,
+            KeyClaimTamper::CorruptEd25519,
+        ] {
+            let mut roster = Roster::new();
+            let mut mgr = PairingManager::new(PairingConfig::default());
+            let code = mgr.issue_code(PairingCodeKind::Remote3Group, 1000).unwrap();
+            let init = PairingInitiator::new(&dev, "Dev", "cli", &code, None, None)
+                .unwrap()
+                .with_key_claim_tamper_for_testing_only(tamper);
+            assert_eq!(
+                v1_claim_burning(init, &host, &mut mgr, &mut roster, Some(&code)),
+                PairOutcome::Rejected {
+                    error: "unauthorized".to_string()
+                },
+                "{tamper:?}"
+            );
+            assert!(roster.get(&dev.device_id()).is_none(), "{tamper:?}");
+        }
+    }
+
+    #[test]
+    fn v1_keyless_repair_cannot_reconfirm_pending_key() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x91; 32]),
+            SigningKeypair::from_seed([0x92; 32]),
+        );
+        let dev = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0xA1; 32]),
+            SigningKeypair::from_seed([0xA2; 32]),
+        );
+        let mut roster = Roster::new();
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr.issue_code(PairingCodeKind::Remote3Group, 1000).unwrap();
+        let init = PairingInitiator::new(&dev, "Dev", "cli", &code, None, None).unwrap();
+        let PairOutcome::ResponderPending { pairing_sas, .. } =
+            v1_claim(init, &host, &mut mgr, &mut roster)
+        else {
+            panic!("keyed pairing failed");
+        };
+        let before = serde_json::to_value(&roster).unwrap();
+
+        let code = mgr.issue_code(PairingCodeKind::Remote3Group, 1000).unwrap();
+        let legacy = PairingInitiator::new(&dev, "Dev", "cli", &code, None, None)
+            .unwrap()
+            .with_key_claim_tamper_for_testing_only(KeyClaimTamper::Omit);
+        assert_eq!(
+            v1_claim(legacy, &host, &mut mgr, &mut roster),
+            PairOutcome::Rejected {
+                error: "protocol_error".to_string()
+            }
+        );
+        assert_eq!(serde_json::to_value(&roster).unwrap(), before);
+        assert_eq!(roster.lookup_active_signing_key(&dev.device_id()), None);
+        roster
+            .confirm_peer(&dev.device_id(), Some(&pairing_sas))
+            .unwrap();
+        assert_eq!(
+            roster.lookup_active_signing_key(&dev.device_id()),
+            Some(dev.signing_key().public_key().clone())
+        );
     }
 }

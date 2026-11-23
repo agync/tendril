@@ -23,8 +23,9 @@ use tendril_core::identity::{
 };
 use tendril_core::noise::{NoiseHfsHandshakeBuilder, NoiseHfsSeeds};
 use tendril_core::pairing::{
-    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, enroll_proof_bytes, mint_enrollment_token_deterministic,
-    sign_enroll_proof_deterministic, verify_enrollment_token,
+    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, PAIR_KEY_PROOF_DOMAIN, enroll_proof_bytes,
+    mint_enrollment_token_deterministic, pair_key_proof_bytes, sign_enroll_proof_deterministic,
+    sign_pair_key_proof_deterministic, verify_enrollment_token, verify_pair_key_proof,
 };
 use tendril_core::relay_auth::{
     RelayAuthProof, RelayAuthRole, RelayTicket, compute_relay_auth_hmac,
@@ -96,6 +97,20 @@ struct PairingMacVector {
     argon2id: Argon2ParamsSpec,
     remote_3group: PairingMacCase,
     lan_2group: PairingMacCase,
+    key_proof: PairKeyProofCase,
+}
+
+#[derive(Serialize)]
+struct PairKeyProofCase {
+    domain_hex: String,
+    initiator_static_scalar_hex: String,
+    initiator_static_pub_hex: String,
+    initiator_signing_seed_hex: String,
+    initiator_signing_mldsa_seed_hex: String,
+    initiator_signing_pub_hex: String,
+    key_proof_bytes_hex: String,
+    enroll_proof_b64url: String,
+    pair_claim_json: String,
 }
 
 #[derive(Serialize)]
@@ -473,6 +488,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lan_kdf = argon2id_pairing_key(lan_code, &h)?;
     let lan_mac = compute_code_mac(lan_code, &h)?;
 
+    let kp_static_scalar = seq_bytes(0x20);
+    let kp_static_pub = x25519_public_from_scalar(&kp_static_scalar);
+    let kp_seed = seq_bytes(0x60);
+    let kp_mldsa_seed = seq_bytes(0xC0);
+    let kp_key = SigningKeypair::from_seeds(kp_seed, kp_mldsa_seed);
+    let kp_bytes = pair_key_proof_bytes(&h, &kp_static_pub);
+    let kp_sig = sign_pair_key_proof_deterministic(&kp_key, &h, &kp_static_pub)?;
+    verify_pair_key_proof(kp_key.public_key(), &h, &kp_static_pub, &kp_sig)?;
+    let kp_claim = PairClaim {
+        name: "Workstation".to_string(),
+        kind: "cli".to_string(),
+        code_mac: Some(b64url_encode(&remote_mac)),
+        enrollment_token: None,
+        signing_pub: Some(kp_key.public_key().to_b64url()),
+        enroll_proof: Some(b64url_encode(&kp_sig)),
+    };
+
     let pairing_mac = PairingMacVector {
         handshake_hash_hex: hex::encode(h),
         salt_hex: hex::encode(&h[..16]),
@@ -497,6 +529,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kdf_hex: hex::encode(*lan_kdf),
             code_mac_hex: hex::encode(lan_mac),
             code_mac_b64url: b64url_encode(&lan_mac),
+        },
+        key_proof: PairKeyProofCase {
+            domain_hex: hex::encode(PAIR_KEY_PROOF_DOMAIN),
+            initiator_static_scalar_hex: hex::encode(kp_static_scalar),
+            initiator_static_pub_hex: hex::encode(kp_static_pub),
+            initiator_signing_seed_hex: hex::encode(kp_seed),
+            initiator_signing_mldsa_seed_hex: hex::encode(kp_mldsa_seed),
+            initiator_signing_pub_hex: hex::encode(kp_key.public_key().as_bytes()),
+            key_proof_bytes_hex: hex::encode(&kp_bytes),
+            enroll_proof_b64url: b64url_encode(&kp_sig),
+            pair_claim_json: serde_json::to_string(&kp_claim)?,
         },
     };
     write_json(&vectors_dir, "pairing_mac.json", &pairing_mac)?;

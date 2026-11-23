@@ -23,8 +23,9 @@ use tendril_core::identity::{
 };
 use tendril_core::noise::{NoiseHfsHandshakeBuilder, NoiseHfsSeeds};
 use tendril_core::pairing::{
-    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, enroll_proof_bytes, sign_enroll_proof_deterministic,
-    verify_enroll_proof, verify_enrollment_token,
+    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, PAIR_KEY_PROOF_DOMAIN, enroll_proof_bytes,
+    pair_key_proof_bytes, sign_enroll_proof_deterministic, sign_pair_key_proof_deterministic,
+    verify_enroll_proof, verify_enrollment_token, verify_pair_key_proof,
 };
 use tendril_core::relay_auth::{
     RelayAuthProof, RelayAuthRole, RelayTicket, compute_relay_auth_hmac,
@@ -46,8 +47,8 @@ use tendril_core::v2::{
     verify_v2_relay_accept, verify_v2_relay_dial, verify_v2_relay_register,
 };
 use tendril_core::wire::{
-    HostHello, InnerFrameType, Intent, NOISE_PATTERN, PREAMBLE_FLAG_NONE, PairResponse, Preamble,
-    WIRE_VERSION_V2, decode_frame, decode_inner_frame, encode_frame,
+    HostHello, InnerFrameType, Intent, NOISE_PATTERN, PREAMBLE_FLAG_NONE, PairClaim, PairResponse,
+    Preamble, WIRE_VERSION_V2, decode_frame, decode_inner_frame, encode_frame,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -116,6 +117,20 @@ struct PairingMacVector {
     salt_hex: String,
     remote_3group: PairingMacCase,
     lan_2group: PairingMacCase,
+    key_proof: PairKeyProofCase,
+}
+
+#[derive(Deserialize)]
+struct PairKeyProofCase {
+    domain_hex: String,
+    initiator_static_scalar_hex: String,
+    initiator_static_pub_hex: String,
+    initiator_signing_seed_hex: String,
+    initiator_signing_mldsa_seed_hex: String,
+    initiator_signing_pub_hex: String,
+    key_proof_bytes_hex: String,
+    enroll_proof_b64url: String,
+    pair_claim_json: String,
 }
 
 #[derive(Deserialize)]
@@ -260,6 +275,44 @@ fn pairing_mac_vectors_match() {
         assert!(verify_code_mac(&case.code, &h, &decoded).unwrap());
         assert!(!verify_code_mac("TND-WRONG-CODE", &h, &decoded).unwrap());
     }
+
+    let kp = &v.key_proof;
+    assert_eq!(hex::encode(PAIR_KEY_PROOF_DOMAIN), kp.domain_hex);
+    let static_pub = x25519_public_from_scalar(&decode_hex_array(&kp.initiator_static_scalar_hex));
+    assert_eq!(hex::encode(static_pub), kp.initiator_static_pub_hex);
+    let key = SigningKeypair::from_seeds(
+        decode_hex_array(&kp.initiator_signing_seed_hex),
+        decode_hex_array(&kp.initiator_signing_mldsa_seed_hex),
+    );
+    assert_eq!(
+        key.public_key(),
+        &decode_hybrid_pub(&kp.initiator_signing_pub_hex)
+    );
+    assert_eq!(
+        hex::encode(pair_key_proof_bytes(&h, &static_pub)),
+        kp.key_proof_bytes_hex
+    );
+    let sig = sign_pair_key_proof_deterministic(&key, &h, &static_pub).unwrap();
+    assert_eq!(b64url_encode(&sig), kp.enroll_proof_b64url);
+    verify_pair_key_proof(key.public_key(), &h, &static_pub, &sig).unwrap();
+    let mut other_h = h;
+    other_h[0] ^= 1;
+    assert!(verify_pair_key_proof(key.public_key(), &other_h, &static_pub, &sig).is_err());
+
+    let claim: PairClaim = serde_json::from_str(&kp.pair_claim_json).unwrap();
+    assert_eq!(
+        claim.code_mac.as_deref(),
+        Some(v.remote_3group.code_mac_b64url.as_str())
+    );
+    assert_eq!(claim.enrollment_token, None);
+    assert_eq!(
+        claim.signing_pub.as_deref(),
+        Some(key.public_key().to_b64url().as_str())
+    );
+    assert_eq!(
+        claim.enroll_proof.as_deref(),
+        Some(kp.enroll_proof_b64url.as_str())
+    );
 }
 
 #[test]

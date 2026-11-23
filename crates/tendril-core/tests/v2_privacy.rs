@@ -23,12 +23,13 @@ use tendril_core::v2::{
     VerifiedRelayHost, canonical_relay_host, decode_v2_inner_frame, derive_epoch_mailbox,
     derive_epoch_mailbox_window, derive_mailbox_secret, derive_reconnect_secret,
     encode_dummy_cover_frame, epoch_for_unix, epoch_within_skew, pad_inner_frame,
-    sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register, unpad_inner_frame,
-    verify_and_record_v2_relay_dial, verify_v2_relay_accept, verify_v2_relay_challenge_host,
-    verify_v2_relay_dial, verify_v2_relay_dial_in_window, verify_v2_relay_register,
+    pad_pake_msg3_payload, sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register,
+    unpad_inner_frame, unpad_pake_msg3_payload, verify_and_record_v2_relay_dial,
+    verify_v2_relay_accept, verify_v2_relay_challenge_host, verify_v2_relay_dial,
+    verify_v2_relay_dial_in_window, verify_v2_relay_register,
 };
 use tendril_core::wire::{
-    AEAD_TAG_LEN, FLAG_PAKE_PAIR, InnerFrameType, Intent, PREAMBLE_FLAG_NONE, Preamble,
+    AEAD_TAG_LEN, FLAG_PAKE_PAIR, InnerFrameType, Intent, PREAMBLE_FLAG_NONE, PairClaim, Preamble,
     WIRE_VERSION, WIRE_VERSION_V2, decode_frame, encode_frame, encode_inner_frame,
 };
 
@@ -1953,4 +1954,144 @@ fn pake_responder_pads_to_fixed_argon2_pass_floor() {
             )));
         }
     }
+}
+
+fn v2_pake_pair(
+    peer: &EndpointIdentity,
+    host: &EndpointIdentity,
+    host_roster: &mut Roster,
+) -> V2PairOutcome {
+    let params = PakeArgon2Params::production();
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Remote3Group, 1_795_564_800)
+        .unwrap();
+    let mut init = V2PakePairInitiator::new(peer, "Peer", "cli", &code, None, params).unwrap();
+    let mut resp = V2PakePairResponder::new(host, PairingPathKind::Remote, params).unwrap();
+    let mut to_resp = collect_v2_pair_bytes(&init.start().unwrap());
+    for _ in 0..4 {
+        let acts = resp
+            .feed_bytes(&to_resp, 1_795_564_800, &mut mgr, host_roster)
+            .unwrap();
+        if let Some(outcome) = acts.iter().find_map(|a| match a {
+            V2PairAction::Completed(o) => Some(o.clone()),
+            _ => None,
+        }) {
+            return outcome;
+        }
+        to_resp = collect_v2_pair_bytes(&init.feed_bytes(&collect_v2_pair_bytes(&acts)).unwrap());
+    }
+    panic!("v2 PAKE responder never completed");
+}
+
+fn v2_pending_sas(outcome: V2PairOutcome) -> String {
+    match outcome {
+        V2PairOutcome::ResponderPending { pairing_sas, .. } => pairing_sas,
+        other => panic!("expected ResponderPending, got {other:?}"),
+    }
+}
+
+#[test]
+fn v2_pake_pairing_records_initiator_signing_key() {
+    let (host, cli) = test_identities();
+    let key = cli.signing_key().public_key().clone();
+    let mut roster = Roster::new();
+
+    let sas = v2_pending_sas(v2_pake_pair(&cli, &host, &mut roster));
+    let entry = roster.get(&cli.device_id()).unwrap();
+    assert_eq!(entry.state, PeerState::Pending);
+    assert_eq!(entry.signing_pub.as_ref(), Some(&key));
+    assert_eq!(roster.lookup_active_signing_key(&cli.device_id()), None);
+
+    roster.confirm_peer(&cli.device_id(), Some(&sas)).unwrap();
+    assert_eq!(
+        roster.get(&cli.device_id()).unwrap().state,
+        PeerState::Active
+    );
+    assert_eq!(
+        roster.lookup_active_signing_key(&cli.device_id()),
+        Some(key)
+    );
+}
+
+#[test]
+fn v2_repair_enrichment_and_no_replacement() {
+    let (host, cli) = test_identities();
+    let id = cli.device_id();
+    let key = cli.signing_key().public_key().clone();
+
+    // Legacy keyless active pin, as left by a pre-change pairing.
+    let mut roster = Roster::new();
+    roster
+        .record_pending_pair(
+            *cli.static_key().public_bytes(),
+            None,
+            "Cli".to_string(),
+            "cli".to_string(),
+            "old".to_string(),
+        )
+        .unwrap();
+    roster.confirm_peer(&id, Some("old")).unwrap();
+
+    let sas = v2_pending_sas(v2_pake_pair(&cli, &host, &mut roster));
+    let entry = roster.get(&id).unwrap();
+    assert_eq!(entry.state, PeerState::Pending);
+    assert_eq!(entry.signing_pub.as_ref(), Some(&key));
+    assert_eq!(roster.lookup_active_signing_key(&id), None);
+    roster.confirm_peer(&id, Some(&sas)).unwrap();
+    assert_eq!(roster.lookup_active_signing_key(&id), Some(key.clone()));
+
+    // Same static, another signing key with a valid proof by that key: refused, no mutation.
+    let impostor = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar([0x51; 32]),
+        SigningKeypair::from_seed([0x99; 32]),
+    );
+    assert_eq!(impostor.device_id(), id);
+    let before = serde_json::to_value(&roster).unwrap();
+    assert_eq!(
+        v2_pake_pair(&impostor, &host, &mut roster),
+        V2PairOutcome::Rejected {
+            error: "protocol_error".to_string()
+        }
+    );
+    assert_eq!(serde_json::to_value(&roster).unwrap(), before);
+    assert_eq!(roster.lookup_active_signing_key(&id), Some(key));
+}
+
+#[test]
+fn new_claim_fits_pre_change_v2_responder() {
+    #[derive(serde::Deserialize)]
+    struct KeyProofVector {
+        pair_claim_json: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PairingMacVector {
+        key_proof: KeyProofVector,
+    }
+    let raw = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec/vectors/pairing_mac.json"),
+    )
+    .unwrap();
+    let v: PairingMacVector = serde_json::from_str(&raw).unwrap();
+    let keyed = v.key_proof.pair_claim_json.as_bytes();
+
+    // The only steps a pre-change v2 responder applies before ignoring the key fields.
+    let claim: PairClaim = serde_json::from_slice(keyed).unwrap();
+    assert!(claim.signing_pub.is_some() && claim.enroll_proof.is_some());
+    let mac = [0x5A; 32];
+    let padded = pad_pake_msg3_payload(&mac, keyed).unwrap();
+    assert_eq!(padded.len(), 16_384);
+    assert_eq!(unpad_pake_msg3_payload(&padded).unwrap(), (mac, keyed));
+
+    let keyless = serde_json::to_vec(&PairClaim {
+        name: "Workstation".into(),
+        kind: "cli".into(),
+        code_mac: None,
+        enrollment_token: None,
+        signing_pub: None,
+        enroll_proof: None,
+    })
+    .unwrap();
+    assert_eq!(pad_pake_msg3_payload(&mac, &keyless).unwrap().len(), 4096);
 }

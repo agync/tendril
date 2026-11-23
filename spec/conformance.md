@@ -23,7 +23,7 @@ Every vector file is generated deterministically from real cryptographic primiti
 | File | Contents & Negative Cases |
 |---|---|
 | `fingerprints.json` | Static pubkeys -> `device_id`, `host_fingerprint`, `device_fingerprint`; post-`msg2` `h` -> `pairing_sas` |
-| `pairing_mac.json` | 3-group remote (`TND-XXXX-XXXX-XXXX`) and 2-group LAN (`TND-XXXX-XXXX`) codes, normalized forms, `argon2id` keys, and `code_mac` values |
+| `pairing_mac.json` | 3-group remote (`TND-XXXX-XXXX-XXXX`) and 2-group LAN (`TND-XXXX-XXXX`) codes, normalized forms, `argon2id` keys, and `code_mac` values; `key_proof`: signing key claim bytes (`"tendril-pair-key-v1\0"`), deterministic hybrid `enroll_proof`, and the keyed human `PairClaim` (a proof over another `h` MUST fail) |
 | `rotation.json` | Sequential hybrid signed `RotationRecord` links (`seq = 1`, `seq = 2`), exact 4031-byte raw signed payloads, plus a conflicting `seq = 2` fork vector that MUST trigger revocation |
 | `grants.json` | Unsorted input grant -> exact RFC 8785 JCS canonical bytes + hybrid Ed25519 / ML-DSA-65 signature; valid delegated child grant; invalid widened-scope child grant that MUST fail; signed `RevocationList` |
 | `handshake.json` | Deterministic `intent = pair` and `intent = session` `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` transcripts (`preamble`, `msg1` [1216 B], `msg2` carrying `HostHello.signing_pub`, post-`msg2` `h`, `pairing_sas`, `code_mac`, `msg3`, final hash, encrypted `DATA`, encrypted `REKEY`, and post-rekey encrypted `DATA`) |

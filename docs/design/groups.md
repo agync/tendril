@@ -110,7 +110,6 @@ Command-line use is covered in [CLI demo](../usage/cli-demo.md) and host-languag
 | Limit | Detail |
 |---|---|
 | Multipath divergence | When one initiator reaches the same sibling over two paths at once, the two ends can persist the exported secrets of different links. The next dial recovers through a single `pair_bootstrap` retry. Until the current-`seq` key is available to both ends, those siblings cannot reconnect. |
-| Code-paired peers | A peer paired with the human code flow cannot be added to a group, because the host never learns the peer's hybrid signing key. M2M-enrolled peers work. |
 | No per-signer quota | A paired peer that signs manifests can fill the local group slots (`MAX_LOCAL_GROUPS`) with groups it roots. Slot limits are the only bound. |
 | Relay sibling links | A `/v2/relay` endpoint in a manifest is not dialed and no group mailbox listener exists, so siblings cannot link over a mailbox relay. Use direct, local, overlay, broker, p2p, or `/v1/relay` endpoints. |
 | Root CRL key | The runtime reads the founding root's CRL under the root's `device_id`. A CRL stored under a roster key (`host_id`) that differs from that `device_id` is not applied to group decisions. |

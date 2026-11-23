@@ -22,8 +22,8 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::{
-    ARGON2_KEY_LEN, HybridSigningPublicKey, StaticKeypair, b64url_encode, device_id,
-    fingerprint_device, has_control_chars, hkdf_sha256_32, is_valid_ed25519_public_key,
+    ARGON2_KEY_LEN, HybridSigningPublicKey, SigningKeypair, StaticKeypair, b64url_encode,
+    device_id, fingerprint_device, has_control_chars, hkdf_sha256_32, is_valid_ed25519_public_key,
     is_valid_x25519_public_key, normalize_code, pairing_sas, random_bytes,
 };
 use crate::error::CoreError;
@@ -37,7 +37,11 @@ use crate::group::{
 };
 use crate::identity::{EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain_pin};
 use crate::noise::{MSG1_LEN, NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
-use crate::pairing::{PairingManager, PairingPathKind, PinnedHost};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::pairing::KeyClaimTamper;
+use crate::pairing::{
+    PairingManager, PairingPathKind, PinnedHost, human_key_claim, verify_human_key_claim,
+};
 use crate::roster::{PeerState, Roster, V2PeerSecrets};
 use crate::session::{REKEY_MAX_AGE_MS, REKEY_MAX_FRAMES, RekeyDirection, SessionCloseCode};
 use crate::wire::{
@@ -3800,12 +3804,15 @@ pub struct V2PakePairInitiator {
     device_name: String,
     device_kind: String,
     code: Zeroizing<String>,
+    signing_key: SigningKeypair,
     pinned_host: Option<V2PinnedHost>,
     params: PakeArgon2Params,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_ephemeral: Option<[u8; 32]>,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_salt: Option<[u8; V2_PAKE_SALT_LEN]>,
+    #[cfg(any(test, feature = "test-utils"))]
+    key_claim_tamper: Option<KeyClaimTamper>,
 }
 
 impl fmt::Debug for V2PakePairInitiator {
@@ -3858,13 +3865,24 @@ impl V2PakePairInitiator {
             device_name,
             device_kind,
             code: Zeroizing::new(code.into()),
+            signing_key: identity.signing_key().clone(),
             pinned_host,
             params,
             #[cfg(any(test, feature = "test-utils"))]
             fixed_ephemeral: None,
             #[cfg(any(test, feature = "test-utils"))]
             fixed_salt: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            key_claim_tamper: None,
         })
+    }
+
+    /// Corrupts the signing key claim in `msg3` strictly in tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_key_claim_tamper_for_testing_only(mut self, tamper: KeyClaimTamper) -> Self {
+        self.key_claim_tamper = Some(tamper);
+        self
     }
 
     /// Overrides the random 16-byte `channel_salt` strictly in tests.
@@ -4065,13 +4083,20 @@ impl V2PakePairInitiator {
                     host_static_pub: remote_static,
                 });
 
+                let (signing_pub, enroll_proof) = human_key_claim(
+                    &self.signing_key,
+                    &h_post,
+                    &self.local_static_pub,
+                    #[cfg(any(test, feature = "test-utils"))]
+                    self.key_claim_tamper,
+                )?;
                 let claim = PairClaim {
                     name: self.device_name.clone(),
                     kind: self.device_kind.clone(),
                     code_mac: None,
                     enrollment_token: None,
-                    signing_pub: None,
-                    enroll_proof: None,
+                    signing_pub,
+                    enroll_proof,
                 };
                 let claim_json = Zeroizing::new(
                     serde_json::to_vec(&claim).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -4660,10 +4685,26 @@ impl V2PakePairResponder {
                 {
                     return write_v2_pair_error(&mut transport, "protocol_error", actions);
                 }
+                if claim.signing_pub.is_some() != claim.enroll_proof.is_some() {
+                    return write_v2_pair_error(&mut transport, "protocol_error", actions);
+                }
 
                 if let Err(err) = manager.burn_pake_code(&code_str, self.path, now_unix) {
                     return write_v2_pair_error(&mut transport, err.pair_error_code(), actions);
                 }
+
+                let claimed_key = match (&claim.signing_pub, &claim.enroll_proof) {
+                    (Some(key_b64), Some(proof_b64)) => match verify_human_key_claim(
+                        key_b64,
+                        proof_b64,
+                        &post_msg2_hash,
+                        &peer_static,
+                    ) {
+                        Ok(key) => Some(key),
+                        Err(code) => return write_v2_pair_error(&mut transport, code, actions),
+                    },
+                    _ => None,
+                };
 
                 let sas = pairing_sas(&post_msg2_hash);
                 let (reconnect_secret, mailbox_secret) =
@@ -4672,6 +4713,7 @@ impl V2PakePairResponder {
                 let peer_id = match apply_responder_v2_record(
                     roster,
                     peer_static,
+                    claimed_key,
                     &claim.name,
                     &claim.kind,
                     &sas,
@@ -4721,6 +4763,7 @@ impl V2PakePairResponder {
 fn apply_responder_v2_record(
     roster: &mut Roster,
     peer_static: [u8; 32],
+    signing_pub: Option<HybridSigningPublicKey>,
     name: &str,
     kind: &str,
     sas: &str,
@@ -4730,7 +4773,7 @@ fn apply_responder_v2_record(
     let peer_id = staged
         .record_pending_pair(
             peer_static,
-            None,
+            signing_pub,
             name.to_string(),
             kind.to_string(),
             sas.to_string(),
@@ -5272,5 +5315,181 @@ mod tests {
             resp.parse_pake_msg1_header(&[1, 2, 3]).err(),
             Some(CoreError::NotReady("v2 PAKE msg1 already parsed"))
         );
+    }
+
+    fn v2_claim(
+        init: V2PakePairInitiator,
+        host: &EndpointIdentity,
+        mgr: &mut PairingManager,
+        roster: &mut Roster,
+    ) -> V2PairOutcome {
+        v2_claim_burning(init, host, mgr, roster, None)
+    }
+
+    /// Runs a v2 PAKE exchange; `burn_before_msg3` burns that code after `msg1` authenticated it.
+    fn v2_claim_burning(
+        mut init: V2PakePairInitiator,
+        host: &EndpointIdentity,
+        mgr: &mut PairingManager,
+        roster: &mut Roster,
+        burn_before_msg3: Option<&str>,
+    ) -> V2PairOutcome {
+        let params = PakeArgon2Params::for_testing_only();
+        let mut resp = V2PakePairResponder::new(host, PairingPathKind::Remote, params).unwrap();
+        let mut to_resp = pake_wire(&init.start().unwrap());
+        for _ in 0..4 {
+            let acts = resp
+                .feed_bytes(&to_resp, TEST_NOW_UNIX, mgr, roster)
+                .unwrap();
+            if let Some(outcome) = acts.iter().find_map(|a| match a {
+                V2PairAction::Completed(o) => Some(o.clone()),
+                _ => None,
+            }) {
+                return outcome;
+            }
+            to_resp = pake_wire(&init.feed_bytes(&pake_wire(&acts)).unwrap());
+            if let Some(code) = burn_before_msg3.filter(|_| !to_resp.is_empty()) {
+                mgr.burn_pake_code(code, PairingPathKind::Remote, TEST_NOW_UNIX)
+                    .unwrap();
+            }
+        }
+        panic!("responder never completed");
+    }
+
+    #[test]
+    fn v2_key_claim_binding_fails_closed() {
+        use crate::pairing::{KeyClaimTamper, PairingCodeKind, PairingConfig};
+
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x91; 32]),
+            SigningKeypair::from_seed([0x92; 32]),
+        )
+        .with_host_id("host-key-claim");
+        let dev = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0xA1; 32]),
+            SigningKeypair::from_seed([0xA2; 32]),
+        );
+        let params = PakeArgon2Params::for_testing_only();
+        let cases = [
+            (KeyClaimTamper::WrongTranscript, "unauthorized", true),
+            (KeyClaimTamper::WrongStatic, "unauthorized", true),
+            (KeyClaimTamper::CorruptEd25519, "unauthorized", true),
+            (KeyClaimTamper::CorruptMlDsa, "unauthorized", true),
+            (KeyClaimTamper::OtherKey, "unauthorized", true),
+            (KeyClaimTamper::MalformedKey, "protocol_error", true),
+            (KeyClaimTamper::MalformedProof, "protocol_error", true),
+            (KeyClaimTamper::KeyOnly, "protocol_error", false),
+        ];
+        for (tamper, code_str, burns) in cases {
+            let mut roster = Roster::new();
+            roster
+                .record_pending_pair(
+                    *dev.static_key().public_bytes(),
+                    None,
+                    "Dev".into(),
+                    "cli".into(),
+                    "old".into(),
+                )
+                .unwrap();
+            roster.confirm_peer(&dev.device_id(), Some("old")).unwrap();
+            let before = serde_json::to_value(&roster).unwrap();
+
+            let mut mgr = PairingManager::new(PairingConfig::default());
+            let code = mgr
+                .issue_code(PairingCodeKind::Remote3Group, TEST_NOW_UNIX)
+                .unwrap();
+            let init = V2PakePairInitiator::new(&dev, "Dev", "cli", &code, None, params)
+                .unwrap()
+                .with_key_claim_tamper_for_testing_only(tamper);
+            assert_eq!(
+                v2_claim(init, &host, &mut mgr, &mut roster),
+                V2PairOutcome::Rejected {
+                    error: code_str.to_string()
+                },
+                "{tamper:?}"
+            );
+            assert_eq!(serde_json::to_value(&roster).unwrap(), before, "{tamper:?}");
+            let burned = mgr
+                .burn_pake_code(&code, PairingPathKind::Remote, TEST_NOW_UNIX)
+                .is_err();
+            assert_eq!(burned, burns, "{tamper:?}");
+        }
+    }
+
+    #[test]
+    fn v2_key_claim_code_is_burned_before_proof_is_checked() {
+        use crate::pairing::{KeyClaimTamper, PairingCodeKind, PairingConfig};
+
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x91; 32]),
+            SigningKeypair::from_seed([0x92; 32]),
+        )
+        .with_host_id("host-key-claim");
+        let dev = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0xA1; 32]),
+            SigningKeypair::from_seed([0xA2; 32]),
+        );
+        let params = PakeArgon2Params::for_testing_only();
+        for tamper in [
+            KeyClaimTamper::MalformedProof,
+            KeyClaimTamper::MalformedKey,
+            KeyClaimTamper::CorruptEd25519,
+        ] {
+            let mut roster = Roster::new();
+            let mut mgr = PairingManager::new(PairingConfig::default());
+            let code = mgr
+                .issue_code(PairingCodeKind::Remote3Group, TEST_NOW_UNIX)
+                .unwrap();
+            let init = V2PakePairInitiator::new(&dev, "Dev", "cli", &code, None, params)
+                .unwrap()
+                .with_key_claim_tamper_for_testing_only(tamper);
+            // PAKE authentication succeeded: a failed msg1 match would surface as an error from
+            // `feed_bytes`, not as a pair response.
+            assert_eq!(
+                v2_claim_burning(init, &host, &mut mgr, &mut roster, Some(&code)),
+                V2PairOutcome::Rejected {
+                    error: "unauthorized".to_string()
+                },
+                "{tamper:?}"
+            );
+            assert!(roster.get(&dev.device_id()).is_none(), "{tamper:?}");
+        }
+    }
+
+    #[test]
+    fn old_initiator_new_responder_v2() {
+        use crate::pairing::{KeyClaimTamper, PairingCodeKind, PairingConfig};
+
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x91; 32]),
+            SigningKeypair::from_seed([0x92; 32]),
+        )
+        .with_host_id("host-legacy-claim");
+        let dev = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0xB1; 32]),
+            SigningKeypair::from_seed([0xB2; 32]),
+        );
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr
+            .issue_code(PairingCodeKind::Remote3Group, TEST_NOW_UNIX)
+            .unwrap();
+        let init = V2PakePairInitiator::new(
+            &dev,
+            "Dev",
+            "cli",
+            &code,
+            None,
+            PakeArgon2Params::for_testing_only(),
+        )
+        .unwrap()
+        .with_key_claim_tamper_for_testing_only(KeyClaimTamper::Omit);
+        let mut roster = Roster::new();
+        assert!(matches!(
+            v2_claim(init, &host, &mut mgr, &mut roster),
+            V2PairOutcome::ResponderPending { .. }
+        ));
+        let entry = roster.get(&dev.device_id()).unwrap();
+        assert_eq!(entry.state, PeerState::Pending);
+        assert_eq!(entry.signing_pub, None);
     }
 }
