@@ -56,7 +56,7 @@ use tendril_runtime::{
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const TENDRIL_OK: i32 = 0;
@@ -1082,6 +1082,14 @@ impl Drop for GroupRuntime {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Locks `rx` and takes its next item; lock wait and dequeue share one deadline.
+async fn recv_group_queue<T>(
+    rx: &AsyncMutex<mpsc::Receiver<T>>,
+    deadline: tokio::time::Instant,
+) -> Result<Option<T>, tokio::time::error::Elapsed> {
+    timeout_at(deadline, async { rx.lock().await.recv().await }).await
 }
 
 async fn group_inbound_pump(
@@ -2936,6 +2944,11 @@ pub unsafe extern "C" fn tendril_session_connect(
 
 /// Accepts and authenticates the next inbound session stream within `timeout_ms`.
 ///
+/// Once groups run, `timeout_ms` bounds the whole wait for a group-routed session, including
+/// waiting behind another concurrent accept. A call that was parked on the router when the first
+/// group opened and dequeues a stream at that moment completes that stream's handshake under the
+/// pre-auth timeouts, outside `timeout_ms`.
+///
 /// # Safety
 /// `ep` must be a valid endpoint pointer.
 #[unsafe(no_mangle)]
@@ -2957,9 +2970,7 @@ pub unsafe extern "C" fn tendril_session_accept(
             let (stream, guard) = loop {
                 if let Some(groups) = groups.as_ref() {
                     // The group pumps own the router queue from here on.
-                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    let mut rx = groups.v1_rx.lock().await;
-                    return match timeout(left, rx.recv()).await {
+                    return match recv_group_queue(&groups.v1_rx, deadline).await {
                         Ok(Some(driver)) => {
                             accepted.set(true);
                             Ok(driver)
@@ -4002,6 +4013,11 @@ pub unsafe extern "C" fn tendril_session_connect_v2(
 
 /// Accepts and authenticates the next inbound Wire v2 (`0x02`) session stream within `timeout_ms`.
 ///
+/// Once groups run, `timeout_ms` bounds the whole wait for a group-routed session, including
+/// waiting behind another concurrent accept. A call that was parked on the router when the first
+/// group opened and dequeues a stream at that moment completes that stream's handshake under the
+/// pre-auth timeouts, outside `timeout_ms`.
+///
 /// # Safety
 /// `ep` must be a valid endpoint pointer.
 #[unsafe(no_mangle)]
@@ -4023,9 +4039,7 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
             let (stream, guard) = loop {
                 if let Some(groups) = groups.as_ref() {
                     // The group pumps own the router queue from here on.
-                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    let mut rx = groups.v2_rx.lock().await;
-                    return match timeout(left, rx.recv()).await {
+                    return match recv_group_queue(&groups.v2_rx, deadline).await {
                         Ok(Some(driver)) => {
                             accepted.set(true);
                             Ok(driver)
@@ -4894,5 +4908,125 @@ mod p2p_dialer_option_tests {
             .unwrap();
         let res = rt.block_on(P2pDialer::bind_with_options(opts));
         assert!(matches!(res, Err(RuntimeError::Protocol(ref m)) if m.contains("peer URI")));
+    }
+}
+
+#[cfg(test)]
+mod group_accept_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::Instant;
+
+    const HOLD: Duration = Duration::from_secs(10);
+
+    /// Spawns a task that locks `rx`, signals once the guard is held, then keeps it for `hold`.
+    async fn hold_lock<T: Send + 'static>(rx: &Arc<AsyncMutex<mpsc::Receiver<T>>>, hold: Duration) {
+        let (held_tx, held_rx) = oneshot::channel();
+        let rx = Arc::clone(rx);
+        tokio::spawn(async move {
+            let _guard = rx.lock().await;
+            let _ = held_tx.send(());
+            tokio::time::sleep(hold).await;
+        });
+        held_rx.await.unwrap();
+    }
+
+    async fn contended_lock_wait_honours_deadline<T: Send + 'static>() {
+        let (_tx, rx) = mpsc::channel::<T>(1);
+        let rx = Arc::new(AsyncMutex::new(rx));
+        hold_lock(&rx, HOLD).await;
+        let start = Instant::now();
+        let res = recv_group_queue(&rx, start + Duration::from_millis(100)).await;
+        assert!(res.is_err());
+        assert_eq!(Instant::now(), start + Duration::from_millis(100));
+    }
+
+    async fn lock_released_mid_budget_keeps_original_deadline<T: Send + 'static>() {
+        let (_tx, rx) = mpsc::channel::<T>(1);
+        let rx = Arc::new(AsyncMutex::new(rx));
+        hold_lock(&rx, Duration::from_millis(150)).await;
+        let start = Instant::now();
+        let res = recv_group_queue(&rx, start + Duration::from_millis(400)).await;
+        assert!(res.is_err());
+        assert_eq!(Instant::now(), start + Duration::from_millis(400));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_lock_wait_honours_deadline_v1() {
+        contended_lock_wait_honours_deadline::<SessionDriver>().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_lock_wait_honours_deadline_v2() {
+        contended_lock_wait_honours_deadline::<V2SessionDriver>().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_released_mid_budget_keeps_original_deadline_v1() {
+        lock_released_mid_budget_keeps_original_deadline::<SessionDriver>().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_released_mid_budget_keeps_original_deadline_v2() {
+        lock_released_mid_budget_keeps_original_deadline::<V2SessionDriver>().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_released_mid_budget_delivers_queued_item() {
+        let (tx, rx) = mpsc::channel::<u32>(1);
+        let rx = Arc::new(AsyncMutex::new(rx));
+        tx.send(7).await.unwrap();
+        hold_lock(&rx, Duration::from_millis(150)).await;
+        let start = Instant::now();
+        let res = recv_group_queue(&rx, start + Duration::from_millis(400)).await;
+        assert_eq!(res.unwrap(), Some(7));
+        assert_eq!(Instant::now(), start + Duration::from_millis(150));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncontended_zero_budget_still_delivers_queued_item() {
+        let (tx, rx) = mpsc::channel::<u32>(1);
+        let rx = AsyncMutex::new(rx);
+        tx.send(7).await.unwrap();
+        let res = recv_group_queue(&rx, Instant::now()).await;
+        assert_eq!(res.unwrap(), Some(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_zero_budget_times_out_immediately() {
+        let (_tx, rx) = mpsc::channel::<u32>(1);
+        let rx = Arc::new(AsyncMutex::new(rx));
+        hold_lock(&rx, HOLD).await;
+        let start = Instant::now();
+        let res = recv_group_queue(&rx, start).await;
+        assert!(res.is_err());
+        assert_eq!(Instant::now(), start);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_waiter_does_not_lose_items() {
+        let (tx, rx) = mpsc::channel::<u32>(1);
+        let rx = Arc::new(AsyncMutex::new(rx));
+        hold_lock(&rx, Duration::from_millis(150)).await;
+        let start = Instant::now();
+        assert!(
+            recv_group_queue(&rx, start + Duration::from_millis(100))
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tx.send(9).await.unwrap();
+        let res = recv_group_queue(&rx, Instant::now() + Duration::from_millis(100)).await;
+        assert_eq!(res.unwrap(), Some(9));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_queue_reports_none() {
+        let (tx, rx) = mpsc::channel::<u32>(1);
+        let rx = AsyncMutex::new(rx);
+        drop(tx);
+        let res = recv_group_queue(&rx, Instant::now() + Duration::from_secs(1)).await;
+        assert_eq!(res.unwrap(), None);
     }
 }
