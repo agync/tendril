@@ -74,7 +74,7 @@ A dialing peer initiates a stream toward a target mailbox key:
 }
 ```
 
-If `target_pub` has an active control connection and fewer than `max_pending_per_mailbox` pending dials, the relay pushes an `incoming` notification over the listener's control WebSocket and holds the dialer socket waiting for an `accept`:
+If `target_pub` has an active control connection and fewer than `max_pending_per_mailbox` pending dials, the relay pushes an `incoming` notification over the listener's control WebSocket and holds the dialer socket waiting for an `accept`. If that control connection ends before the dial is accepted, the relay MUST fail the dial with `"offline"` at once rather than hold it until `accept_timeout`:
 
 ```jsonc
 // Server -> Listener (control socket)
@@ -83,6 +83,8 @@ If `target_pub` has an active control connection and fewer than `max_pending_per
   "conn_id": string
 }
 ```
+
+A valid `accept` (Section 2.3) claims the pending dial atomically, and the claim and the dial's own withdrawal are mutually exclusive. If the control connection ends or `accept_timeout` passes after an `accept` claimed the dial, the claim wins: the relay MUST NOT fail the dial with `"offline"` or `"timeout"` and answers both sockets with `ready`, failing the dial with `"offline"` only if the relay cannot deliver `ready` to the acceptor socket. If the dial is withdrawn first, it fails with `"offline"` or `"timeout"` and a later `accept` for its `conn_id` fails with `"invalid_request"`.
 
 ### 2.3 Anti-Hijack Stream Accept (Listener Data Socket)
 

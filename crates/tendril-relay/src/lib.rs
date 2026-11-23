@@ -11,5 +11,8 @@ pub use protocol::{
     verify_relay_register,
 };
 pub use rate_limit::{IpTokenLimiter, normalize_rate_limit_ip};
-pub use server::{IpCidr, RelayConfig, RelayError, RelayHandle, RelayServer, TrustedProxyHeader};
+pub use server::{
+    IpCidr, RelayConfig, RelayError, RelayHandle, RelayServer, RelayTestHook, RelayTestPoint,
+    TrustedProxyHeader,
+};
 pub use tendril_core::relay_auth::{RelayAuthProof, RelayAuthScope};

@@ -406,3 +406,134 @@ fn group_e2e_wire_v2_members_are_onboarded_by_sync() {
     assert_eq!(data["sender_device_id"], b_id);
     assert_eq!(data["group_id"], gid);
 }
+
+/// Copies the root's stored manifest and rendezvous key into `dir`'s group book.
+fn copy_group(root_dir: &Path, dir: &Path, gid: &str) {
+    let root = tendril_runtime::StateStore::open_or_create(root_dir).expect("root store");
+    let book = root.load_group_book().expect("root book");
+    let manifest = book.manifest(gid).expect("manifest").clone();
+    let secrets = book.secrets(gid).expect("key").clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    tendril_runtime::StateStore::open_or_create(dir)
+        .expect("member store")
+        .update_group_book(|b| {
+            b.ingest_group_manifest(&manifest, now, None)?;
+            b.install_secrets(gid, secrets.clone())?;
+            Ok(())
+        })
+        .expect("seed member book");
+}
+
+/// A `serve` member whose manifest entry has only a `/v2/relay` hint registers its group
+/// mailbox on its own, with no inbound stream ever arriving, and a sibling then reaches it.
+#[test]
+fn group_e2e_relay_only_serve_member_registers_its_group_mailbox() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let relay = rt
+        .block_on(tendril_runtime::EmbeddedRelay::bind_local("127.0.0.1"))
+        .expect("relay");
+    let relay_url = relay.ws_v2_url();
+    let a_dir = TempDir::new().expect("a dir");
+    let b_dir = TempDir::new().expect("b dir");
+    let c_dir = TempDir::new().expect("c dir");
+    let (a_dir, b_dir, c_dir) = (a_dir.path(), b_dir.path(), c_dir.path());
+    let (a_addr, b_addr, c_addr) = (free_addr(), free_addr(), free_addr());
+
+    let a_info = run_ok(a_dir, &["init"]);
+    let b_id = device_id(b_dir);
+    let c_id = device_id(c_dir);
+    let enroll_serve = Serve::start(a_dir, &a_addr, &["--allow-enroll"]);
+    enroll_with_root(a_dir, &a_info, &enroll_serve, b_dir);
+    enroll_with_root(a_dir, &a_info, &enroll_serve, c_dir);
+    enroll_serve.stop();
+
+    let created = run_ok(
+        a_dir,
+        &[
+            "group",
+            "create",
+            "--name",
+            "relay-only",
+            "--wire-v2",
+            "--endpoint",
+            &format!("direct:{a_addr}"),
+        ],
+    );
+    let gid = created["group_id"].as_str().expect("group id").to_owned();
+    run_ok(
+        a_dir,
+        &[
+            "group",
+            "add",
+            &gid,
+            "--peer",
+            &b_id,
+            "--endpoint",
+            &format!("direct:{b_addr}"),
+        ],
+    );
+    run_ok(
+        a_dir,
+        &[
+            "group",
+            "add",
+            &gid,
+            "--peer",
+            &c_id,
+            "--endpoint",
+            &relay_url,
+        ],
+    );
+    copy_group(a_dir, b_dir, &gid);
+    copy_group(a_dir, c_dir, &gid);
+
+    let mailbox = {
+        let store = tendril_runtime::StateStore::open_or_create(c_dir).expect("c store");
+        let book = store.load_group_book().expect("c book");
+        let secrets = book.secrets(&gid).expect("c key");
+        *tendril_core::group::derive_group_mailbox_secret(
+            secrets.group_rendezvous_key(),
+            secrets.seq(),
+            &c_id,
+        )
+    };
+    let epoch = tendril_core::v2::epoch_for_unix(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+    );
+    let probe = || {
+        rt.block_on(
+            tendril_runtime::RelayV2Dialer::new(mailbox).connect_for_epoch(&relay_url, epoch),
+        )
+        .map(drop)
+    };
+    assert!(probe().is_err(), "mailbox registered before serve started");
+
+    let c_serve = Serve::start(c_dir, &c_addr, &["--wire-v2"]);
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    while let Err(err) = probe() {
+        assert!(
+            Instant::now() < deadline,
+            "serve never registered its group mailbox: {err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let broadcast = run_ok(
+        b_dir,
+        &["group", "broadcast", &gid, "--message", "over-the-relay"],
+    );
+    assert!(
+        names(&broadcast, "delivered").contains(&c_id),
+        "{broadcast}"
+    );
+    let data = c_serve.wait_event("group_data");
+    assert_eq!(data["utf8"], "over-the-relay");
+    c_serve.stop();
+    drop(relay);
+}

@@ -1016,6 +1016,8 @@ pub struct Endpoint {
     self_m2m_enabled: AtomicBool,
     m2m_enabled: AtomicBool,
     groups: StdMutex<Vec<Weak<GroupPool>>>,
+    /// URLs bound by `serveRelay`, so a group pool never displaces their identity mailbox.
+    served_v1_relays: StdMutex<Vec<String>>,
 }
 
 impl Endpoint {
@@ -1130,6 +1132,7 @@ impl Endpoint {
             self_m2m_enabled: AtomicBool::new(false),
             m2m_enabled: AtomicBool::new(has_active_anchor),
             groups: StdMutex::new(Vec::new()),
+            served_v1_relays: StdMutex::new(Vec::new()),
         })
     }
 
@@ -1200,7 +1203,12 @@ impl Endpoint {
     }
 
     #[napi]
-    pub async fn group_open(&self, group_id: String, listen_addr: Option<String>) -> Result<Group> {
+    pub async fn group_open(
+        &self,
+        group_id: String,
+        listen_addr: Option<String>,
+        relay_listen: Option<bool>,
+    ) -> Result<Group> {
         let store = self.group_store()?;
         let addr: Option<SocketAddr> = listen_addr
             .filter(|s| !s.is_empty())
@@ -1223,11 +1231,20 @@ impl Endpoint {
                 .map_err(to_generic_err)?;
             dialers.push(Arc::new(dialer));
         }
+        let served_v1_relays = self
+            .served_v1_relays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let config = GroupPoolConfig::new(dialers)
+            .with_relay_auth(transport_cfg.relay_auth.clone())
+            .with_relay_listen(relay_listen.unwrap_or(false))
+            .with_served_v1_relays(served_v1_relays);
         let pool = GroupPool::open(
             (*store).clone(),
             Arc::clone(&self.identity),
             &group_id,
-            GroupPoolConfig::new(dialers),
+            config,
             None,
         )
         .map_err(to_generic_err)?;
@@ -1292,7 +1309,7 @@ impl Endpoint {
         let cfg = self.snapshot_transport_cfg();
         let key = self.identity.signing_key().ed25519_signing_key();
         let listener = RelayListener::bind_with_auth(
-            relay_url,
+            relay_url.clone(),
             expected_host,
             key,
             DEFAULT_WRITE_TIMEOUT,
@@ -1302,6 +1319,10 @@ impl Endpoint {
         .map_err(to_generic_err)?;
         let ep = listener.local_endpoint();
         self.spawn_listener(Box::new(listener));
+        self.served_v1_relays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(relay_url);
         Ok(ep)
     }
 

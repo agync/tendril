@@ -122,8 +122,6 @@ fn is_active_member(manifest: &GroupManifest, device_id: &str) -> bool {
 
 /// Builds the dialer set shared by `group` subcommands and `serve`: direct, local, relay (with
 /// auth), overlay, broker, and p2p when `p2p_args` is `Some`.
-///
-/// `/v2/relay` sibling links are not dialed; see the group design doc.
 pub(crate) async fn build_dialers(
     relay_auth: RelayClientAuth,
     p2p_args: Option<&P2pTransportArgs>,
@@ -151,9 +149,10 @@ async fn open_pool(
     timeout_secs: u64,
 ) -> Result<GroupPool, Box<dyn Error>> {
     let auth = resolve_relay_auth(&dial.relay_auth)?;
-    let dialers = build_dialers(auth, dial.p2p_enabled().then_some(&dial.p2p_args)).await?;
-    let config =
-        GroupPoolConfig::new(dialers).with_dial_budget(Duration::from_secs(timeout_secs.max(1)));
+    let dialers = build_dialers(auth.clone(), dial.p2p_enabled().then_some(&dial.p2p_args)).await?;
+    let config = GroupPoolConfig::new(dialers)
+        .with_dial_budget(Duration::from_secs(timeout_secs.max(1)))
+        .with_relay_auth(auth);
     Ok(GroupPool::open(
         store.clone(),
         Arc::new(identity),
@@ -325,10 +324,15 @@ fn show(store: &StateStore, group_id: &str) -> Result<(), Box<dyn Error>> {
 }
 
 /// Ingests a `0x0A` or `0x0B` received on an ordinary session during `serve` through the
-/// runtime and prints the redacted outcome.
-pub fn handle_group_frame(store: &StateStore, local_id: &str, peer_id: &str, event: &SessionEvent) {
+/// runtime, prints the redacted outcome, and reports whether the frame was ingested.
+pub fn handle_group_frame(
+    store: &StateStore,
+    local_id: &str,
+    peer_id: &str,
+    event: &SessionEvent,
+) -> bool {
     let Some(outcome) = handle_session_group_frame(store, local_id, peer_id, event) else {
-        return;
+        return false;
     };
     let kind = match outcome.kind {
         GroupFrameKind::Manifest => "manifest",
@@ -349,10 +353,13 @@ pub fn handle_group_frame(store: &StateStore, local_id: &str, peer_id: &str, eve
         line["error"] = serde_json::Value::String(error);
     }
     print_json_line(&line);
+    outcome.ingested
 }
 
 /// `serve` glue around the runtime [`GroupHub`]: keeps pools in sync with the stored book and
-/// prints each pool's events.
+/// prints each pool's events. `serve` refreshes it at startup, on its 250 ms tick, after each
+/// ingested group frame, and before routing an inbound session, so a relay-only member opens its
+/// pools (and registers their relay mailboxes) without waiting for an inbound stream.
 pub struct ServeGroups {
     hub: GroupHub,
     redact_logs: bool,
@@ -360,13 +367,21 @@ pub struct ServeGroups {
 }
 
 impl ServeGroups {
+    /// Builds the serving hub. Its pools register the identity's relay mailboxes
+    /// (`relay_listen`) with `relay_auth`, except on `served_v1_relay`, the `/v1/relay` URL
+    /// whose mailbox `serve` already registers and routes to the hub itself.
     pub fn new(
         store: Arc<StateStore>,
         identity: Arc<EndpointIdentity>,
         dialers: Vec<Arc<dyn PathDialer>>,
+        relay_auth: RelayClientAuth,
+        served_v1_relay: Option<String>,
         redact_logs: bool,
     ) -> Arc<Self> {
-        let config = GroupPoolConfig::new(dialers);
+        let config = GroupPoolConfig::new(dialers)
+            .with_relay_auth(relay_auth)
+            .with_relay_listen(true)
+            .with_served_v1_relays(served_v1_relay.into_iter().collect());
         Arc::new(Self {
             hub: GroupHub::new((*store).clone(), identity, config, None),
             redact_logs,

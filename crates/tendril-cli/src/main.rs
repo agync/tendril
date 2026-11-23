@@ -1174,6 +1174,7 @@ async fn handle_v2_pair(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_v1_session(
     stream: Box<dyn PathStream>,
     pre_auth_guard: HalfOpenGuard,
@@ -1182,6 +1183,7 @@ async fn handle_v1_session(
     identity: Arc<tendril_core::identity::EndpointIdentity>,
     rate_limiter: PreAuthRateLimiter,
     redact_logs: bool,
+    groups: Arc<group::ServeGroups>,
 ) {
     let now = now_unix();
     let (mut roster, initial_stamp) = {
@@ -1216,11 +1218,14 @@ async fn handle_v1_session(
         store_lock,
         identity,
         redact_logs,
+        groups,
     )
     .await;
 }
 
 /// Runs an accepted ordinary Wire v1 session admitted against `roster` at `initial_stamp`.
+/// An ingested group frame re-syncs the serving group pools in `groups`.
+#[allow(clippy::too_many_arguments)]
 async fn run_v1_session(
     mut driver: SessionDriver,
     mut roster: tendril_core::roster::Roster,
@@ -1229,6 +1234,7 @@ async fn run_v1_session(
     store_lock: Arc<AsyncMutex<()>>,
     identity: Arc<tendril_core::identity::EndpointIdentity>,
     redact_logs: bool,
+    groups: Arc<group::ServeGroups>,
 ) {
     let peer_id = driver.peer_device_id().unwrap_or_default().to_owned();
     let mut last_stamp = initial_stamp;
@@ -1367,7 +1373,14 @@ async fn run_v1_session(
                 event @ (SessionEvent::GroupManifestReceived(_)
                 | SessionEvent::GroupRendezvousReceived(_)),
             )) => {
-                group::handle_group_frame(store.as_ref(), &identity.device_id(), &peer_id, &event);
+                if group::handle_group_frame(
+                    store.as_ref(),
+                    &identity.device_id(),
+                    &peer_id,
+                    &event,
+                ) {
+                    groups.refresh();
+                }
             }
             Ok(Some(SessionEvent::Closed { code, reason })) => {
                 print_json_line(&serde_json::json!({
@@ -1439,6 +1452,7 @@ async fn handle_v2_session(
     v2_state: Arc<V2ResponderState>,
     rate_limiter: PreAuthRateLimiter,
     redact_logs: bool,
+    groups: Arc<group::ServeGroups>,
 ) {
     let Ok(driver) = V2SessionDriver::accept_with_store(
         stream,
@@ -1456,16 +1470,18 @@ async fn handle_v2_session(
         tracing::debug!("inbound v2 session rejected");
         return;
     };
-    run_v2_session(driver, store, store_lock, identity, redact_logs).await;
+    run_v2_session(driver, store, store_lock, identity, redact_logs, groups).await;
 }
 
-/// Runs an accepted, store-backed ordinary Wire v2 session.
+/// Runs an accepted, store-backed ordinary Wire v2 session. An ingested group frame re-syncs
+/// the serving group pools in `groups`.
 async fn run_v2_session(
     driver: V2SessionDriver,
     store: Arc<StateStore>,
     store_lock: Arc<AsyncMutex<()>>,
     identity: Arc<tendril_core::identity::EndpointIdentity>,
     redact_logs: bool,
+    groups: Arc<group::ServeGroups>,
 ) {
     let peer_id = driver.peer_device_id().to_owned();
     let provider = format!("{:?}", driver.provider_id());
@@ -1633,7 +1649,14 @@ async fn run_v2_session(
                 event @ (SessionEvent::GroupManifestReceived(_)
                 | SessionEvent::GroupRendezvousReceived(_)),
             )) => {
-                group::handle_group_frame(store.as_ref(), &identity.device_id(), &peer_id, &event);
+                if group::handle_group_frame(
+                    store.as_ref(),
+                    &identity.device_id(),
+                    &peer_id,
+                    &event,
+                ) {
+                    groups.refresh();
+                }
             }
             Ok(Some(SessionEvent::Closed { code, reason })) => {
                 print_json_line(&serde_json::json!({
@@ -2028,6 +2051,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (None, None, None, None, relay_host)
             };
 
+            let served_v1_relay = v1_relay_url.clone();
             let relay_ep = if let Some(relay_url) = v1_relay_url {
                 let rl = RelayListener::bind_with_auth(
                     relay_url,
@@ -2133,8 +2157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&store),
                 Arc::clone(&identity),
                 group_dialers,
+                resolved_relay_auth.clone(),
+                served_v1_relay,
                 redact_logs,
             );
+            group_hub.refresh();
 
             let (v1_pair_q, v1_sess_q) = router.split_queues();
             let (v2_pair_q, v2_sess_q) = router.split_v2_queues();
@@ -2178,7 +2205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let v2 = Arc::clone(&v2_c);
                     async move {
                         if !hub.refresh() {
-                            handle_v1_session(stream, guard, s, l, id, r, redact_logs).await;
+                            handle_v1_session(stream, guard, s, l, id, r, redact_logs, hub).await;
                             return;
                         }
                         match hub.accept(stream, &v2, &r, guard).await {
@@ -2187,10 +2214,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 roster,
                                 stamp,
                             }) => {
-                                run_v1_session(session, roster, stamp, s, l, id, redact_logs).await;
+                                run_v1_session(
+                                    session,
+                                    roster,
+                                    stamp,
+                                    s,
+                                    l,
+                                    id,
+                                    redact_logs,
+                                    Arc::clone(&hub),
+                                )
+                                .await;
                             }
                             Some(InboundSession::OrdinaryV2 { session }) => {
-                                run_v2_session(session, s, l, id, redact_logs).await;
+                                run_v2_session(session, s, l, id, redact_logs, Arc::clone(&hub))
+                                    .await;
                             }
                             Some(InboundSession::Group { .. }) | None => {}
                         }
@@ -2240,19 +2278,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
                         if !hub.refresh() {
-                            handle_v2_session(stream, guard, s, l, id, v2, r, redact_logs).await;
+                            handle_v2_session(stream, guard, s, l, id, v2, r, redact_logs, hub)
+                                .await;
                             return;
                         }
                         match hub.accept(stream, &v2, &r, guard).await {
                             Some(InboundSession::OrdinaryV2 { session }) => {
-                                run_v2_session(session, s, l, id, redact_logs).await;
+                                run_v2_session(session, s, l, id, redact_logs, Arc::clone(&hub))
+                                    .await;
                             }
                             Some(InboundSession::OrdinaryV1 {
                                 session,
                                 roster,
                                 stamp,
                             }) => {
-                                run_v1_session(session, roster, stamp, s, l, id, redact_logs).await;
+                                run_v1_session(
+                                    session,
+                                    roster,
+                                    stamp,
+                                    s,
+                                    l,
+                                    id,
+                                    redact_logs,
+                                    Arc::clone(&hub),
+                                )
+                                .await;
                             }
                             Some(InboundSession::Group { .. }) | None => {}
                         }
@@ -2265,7 +2315,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => break,
-                    _ = relay_sync_interval.tick(), if v2_relay_url.is_some() => {
+                    _ = relay_sync_interval.tick() => {
+                        group_hub.refresh();
                         if let Some(ref v2_url) = v2_relay_url
                             && let Ok(curr_stamp) = store.roster_stamp()
                             && curr_stamp != last_v2_roster_stamp

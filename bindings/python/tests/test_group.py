@@ -1,6 +1,8 @@
 import base64
 import json
+import pathlib
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -44,6 +46,79 @@ def pair(host: "tendril.Endpoint", cli: "tendril.Endpoint") -> None:
     )
     t.join(timeout=10)
     assert res["status"] == "active" and accepted["res"]["status"] == "active"
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+RELAY_BIN = ROOT / "target" / "debug" / "tendril-relay"
+RELAY_SECRET = "tendril-group-relay-hmac-secret-32"
+
+
+class AuthRelay:
+    """A `tendril-relay` on loopback requiring HMAC admission with `RELAY_SECRET`.
+
+    `host` is the relay's canonical host and the host of its URLs; it always binds 127.0.0.1.
+    """
+
+    def __init__(self, host: str = "127.0.0.1") -> None:
+        self.host = host
+
+    def __enter__(self) -> "AuthRelay":
+        if not RELAY_BIN.exists():
+            subprocess.run(
+                ["cargo", "build", "-p", "tendril-relay", "--bin", "tendril-relay"],
+                cwd=str(ROOT),
+                check=True,
+            )
+        self._dir = tempfile.TemporaryDirectory()
+        secret_file = pathlib.Path(self._dir.name) / "relay.secret"
+        secret_file.write_text(RELAY_SECRET, encoding="utf-8")
+        secret_file.chmod(0o600)
+        port = int(free_addr().rsplit(":", 1)[1])
+        self._proc = subprocess.Popen(
+            [
+                str(RELAY_BIN),
+                "--listen",
+                f"127.0.0.1:{port}",
+                "--host",
+                self.host,
+                "--auth-secret-file",
+                str(secret_file),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            self.__exit__(None, None, None)
+            raise RuntimeError("tendril-relay did not listen in time")
+        self.v1_url = f"ws://{self.host}:{port}/v1/relay"
+        self.v2_url = f"ws://{self.host}:{port}/v2/relay"
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._proc.terminate()
+        self._proc.wait(timeout=5)
+        self._dir.cleanup()
+
+
+def with_relay_auth(*endpoints: "tendril.Endpoint") -> None:
+    for ep in endpoints:
+        ep.configure_transports_json(json.dumps({"relay_auth_secret": RELAY_SECRET}))
+
+
+def broadcast_until(group: "tendril.Group", peer: str, payload: bytes) -> dict:
+    deadline = time.monotonic() + 15
+    while True:
+        report = json.loads(group.broadcast(payload))
+        if peer in report["delivered"] or time.monotonic() > deadline:
+            return report
+        time.sleep(0.2)
 
 
 def next_event(group: "tendril.Group", kind: str, timeout_s: float = 10.0) -> dict:
@@ -239,6 +314,131 @@ class GroupTests(unittest.TestCase):
                     )
                 with b.group_open(gid) as gb:
                     self.assertEqual(gb.group_id, gid)
+            finally:
+                b.close()
+                a.close()
+
+    def test_v2_relay_sibling_with_relay_auth(self) -> None:
+        with AuthRelay() as relay, tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
+            a = tendril.Endpoint(da)
+            b = tendril.Endpoint(db)
+            try:
+                with_relay_auth(a, b)
+                pair(a, b)
+                a_id = json.loads(a.info_json())["device_id"]
+                b_id = json.loads(b.info_json())["device_id"]
+                addr_b = free_addr()
+                gid = json.loads(a.group_create("py-relay", 2, [relay.v2_url]))["group_id"]
+                m2 = a.group_add_member(gid, b_id, None, [addr_b])
+                self.assertEqual(b.group_ingest_manifest(m2, a_id), gid)
+
+                with b.group_open(gid, addr_b) as gb, a.group_open(
+                    gid, None, relay_listen=True
+                ) as ga:
+                    report = json.loads(ga.sync())
+                    self.assertEqual(report["delivered"], [b_id], report)
+                    report = broadcast_until(gb, a_id, b"over the relay")
+                    self.assertEqual(report["delivered"], [a_id], report)
+                    ev = next_event(ga, "app_data")
+                    self.assertEqual(ev["sender_device_id"], b_id)
+                    self.assertEqual(b64url_decode(ev["payload_b64"]), b"over the relay")
+            finally:
+                b.close()
+                a.close()
+
+    def test_relay_listen_leaves_a_served_v1_relay_to_the_endpoint(self) -> None:
+        # The control relay is addressed as `localhost`, so its host differs from the served
+        # `127.0.0.1` relay. It is not served, so the root's pool registers the identity there,
+        # and a dial that the control stops answering `offline` proves the mailbox plan ran.
+        with AuthRelay() as served_relay, AuthRelay("localhost") as control, \
+                tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
+            a = tendril.Endpoint(da)
+            b = tendril.Endpoint(db)
+            try:
+                with_relay_auth(a, b)
+                pair(a, b)
+                a_info = json.loads(a.info_json())
+                served = a.serve_relay(served_relay.v1_url)
+                gid = json.loads(
+                    a.group_create("py-served", 1, [control.v1_url, served_relay.v1_url])
+                )["group_id"]
+                control_ep = f"{control.v1_url}#{a_info['relay_pub']}"
+                with a.group_open(gid, None, relay_listen=True):
+                    deadline = time.monotonic() + 15
+                    while True:
+                        try:
+                            b.connect(control_ep, a_info["host_id"], None, None)
+                            break
+                        except RuntimeError as e:
+                            self.assertIn("offline", str(e))
+                            self.assertLess(time.monotonic(), deadline, "pool never registered")
+                            time.sleep(0.1)
+
+                    accepted: dict = {}
+
+                    def accept() -> None:
+                        try:
+                            accepted["sess"] = a.accept_session(10000)
+                        except RuntimeError as e:
+                            accepted["err"] = e
+
+                    t = threading.Thread(target=accept)
+                    t.start()
+                    try:
+                        b.connect(served, a_info["host_id"], None, None)
+                    finally:
+                        t.join(timeout=20)
+                    self.assertIn("sess", accepted, f"served mailbox displaced: {accepted}")
+            finally:
+                b.close()
+                a.close()
+
+    def test_admin_sync_over_ordinary_v2_relay(self) -> None:
+        with AuthRelay() as relay, tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
+            a = tendril.Endpoint(da)
+            b = tendril.Endpoint(db)
+            try:
+                with_relay_auth(a, b)
+                a_info = json.loads(a.info_json())
+                a_addr = a.serve_direct("127.0.0.1:0")
+                code = a.issue_code("lan")
+                accepted: dict = {}
+                t = threading.Thread(
+                    target=lambda: accepted.__setitem__("res", json.loads(a.pair_v2_accept(8000)))
+                )
+                t.start()
+                init = json.loads(b.pair_v2_initiate(a_addr, code, name="py-member", kind="python"))
+                t.join(timeout=10)
+                b_id = accepted["res"]["device_id"]
+                a.confirm_peer(b_id, init["sas"])
+                b.confirm_peer(a_info["host_id"], init["sas"])
+
+                gid = json.loads(a.group_create("py-relay-admin", 2, []))["group_id"]
+                a.group_add_member(gid, b_id, None, [relay.v2_url])
+                b.serve_relay_v2(relay.v2_url, None, a_info["host_id"])
+                seen: list = []
+
+                def member() -> None:
+                    sess = b.accept_v2(15000)
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline:
+                        ev = json.loads(sess.poll_event(100))
+                        if ev["status"] == "eof" or (
+                            ev["status"] == "event" and ev["event"] == "closed"
+                        ):
+                            break
+                        if ev["status"] == "event" and ev["event"].startswith("group_"):
+                            seen.append(ev["event"])
+
+                t = threading.Thread(target=member)
+                t.start()
+                with a.group_open(gid) as ga:
+                    report = json.loads(ga.sync())
+                    t.join(timeout=30)
+                    self.assertEqual(report["delivered"], [b_id], report)
+                self.assertEqual(
+                    seen, ["group_manifest_ingested", "group_rendezvous_ingested"], seen
+                )
             finally:
                 b.close()
                 a.close()

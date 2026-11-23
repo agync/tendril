@@ -305,7 +305,26 @@ pub struct RelayConfig {
     pub auth_scope: RelayAuthScope,
     /// Test-only clock seam overriding wall-clock Unix seconds for deterministic expiry tests.
     pub clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    /// Test-only seam awaited at each [`RelayTestPoint`] so tests can order racing handlers.
+    #[doc(hidden)]
+    pub test_hook: Option<RelayTestHook>,
 }
+
+/// Points at which the relay awaits [`RelayConfig::test_hook`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RelayTestPoint {
+    /// An `accept` claimed a pending dial and has not answered either socket yet.
+    AcceptClaimed,
+    /// A pending dial saw its control connection end or its accept deadline pass.
+    DialTeardown,
+}
+
+/// Hook type of [`RelayConfig::test_hook`].
+#[doc(hidden)]
+pub type RelayTestHook =
+    Arc<dyn Fn(RelayTestPoint) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 impl fmt::Debug for RelayConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -336,6 +355,7 @@ impl fmt::Debug for RelayConfig {
             .field("trusted_issuers", &self.trusted_issuers.len())
             .field("auth_scope", &self.auth_scope)
             .field("clock", &self.clock.as_ref().map(|_| "<clock>"))
+            .field("test_hook", &self.test_hook.as_ref().map(|_| "<hook>"))
             .finish()
     }
 }
@@ -366,6 +386,7 @@ impl Default for RelayConfig {
             trusted_issuers: Vec::new(),
             auth_scope: RelayAuthScope::All,
             clock: None,
+            test_hook: None,
         }
     }
 }
@@ -398,6 +419,12 @@ impl RelayConfig {
         self.clock
             .as_ref()
             .map_or_else(current_unix_secs, |clock| clock())
+    }
+
+    async fn test_point(&self, point: RelayTestPoint) {
+        if let Some(hook) = &self.test_hook {
+            hook(point).await;
+        }
     }
 }
 
@@ -728,8 +755,9 @@ struct PendingDialGuard {
     dial_id: u64,
 }
 
-impl Drop for PendingDialGuard {
-    fn drop(&mut self) {
+impl PendingDialGuard {
+    /// Withdraws this dial unless an `accept` already claimed it; returns whether it withdrew.
+    fn withdraw(&self) -> bool {
         let mut tables = self.state.tables.lock().expect("tables mutex poisoned");
         let matches = tables
             .pending
@@ -739,6 +767,13 @@ impl Drop for PendingDialGuard {
             tables.pending.remove(&self.conn_id);
             decrement_count(&mut tables.pending_counts, &self.target_pub);
         }
+        matches
+    }
+}
+
+impl Drop for PendingDialGuard {
+    fn drop(&mut self) {
+        self.withdraw();
     }
 }
 
@@ -784,8 +819,9 @@ struct PendingV2DialGuard {
     dial_id: u64,
 }
 
-impl Drop for PendingV2DialGuard {
-    fn drop(&mut self) {
+impl PendingV2DialGuard {
+    /// Withdraws this dial unless an `accept` already claimed it; returns whether it withdrew.
+    fn withdraw(&self) -> bool {
         let mut tables = self
             .state
             .tables
@@ -799,6 +835,13 @@ impl Drop for PendingV2DialGuard {
             tables.v2_pending.remove(&self.conn_id);
             decrement_count(&mut tables.v2_pending_counts, &self.target_mailbox);
         }
+        matches
+    }
+}
+
+impl Drop for PendingV2DialGuard {
+    fn drop(&mut self) {
+        self.withdraw();
     }
 }
 
@@ -1511,6 +1554,7 @@ async fn handle_register(
         }
     }
     drop(reg_guard);
+    drop(incoming_rx);
     let _ = timeout(state.config.write_timeout, ws.close(None)).await;
 }
 
@@ -1578,7 +1622,7 @@ async fn handle_dial(
         }
     };
 
-    let _pending_guard = PendingDialGuard {
+    let pending_guard = PendingDialGuard {
         state: Arc::clone(&state),
         target_pub,
         conn_id,
@@ -1597,10 +1641,13 @@ async fn handle_dial(
         }
     }
 
+    // A claimed dial waits for its acceptor, whose `ready` write is bounded by `write_timeout`.
     let accept_deadline = tokio::time::sleep(state.config.accept_timeout);
     tokio::pin!(accept_deadline);
+    let mut claimed = false;
     let acceptor = loop {
         tokio::select! {
+            biased;
             res = &mut match_rx => match res {
                 Ok(transfer) => break transfer,
                 Err(_) => {
@@ -1608,9 +1655,21 @@ async fn handle_dial(
                     return;
                 }
             },
-            () = &mut accept_deadline => {
-                send_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
-                return;
+            () = incoming_tx.closed(), if !claimed => {
+                state.config.test_point(RelayTestPoint::DialTeardown).await;
+                if pending_guard.withdraw() {
+                    send_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
+                    return;
+                }
+                claimed = true;
+            }
+            () = &mut accept_deadline, if !claimed => {
+                state.config.test_point(RelayTestPoint::DialTeardown).await;
+                if pending_guard.withdraw() {
+                    send_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
+                    return;
+                }
+                claimed = true;
             }
             maybe_ws = ws.next() => {
                 match maybe_ws {
@@ -1743,6 +1802,7 @@ async fn handle_accept(
         state: Arc::clone(&state),
         mailbox_pub: target_pub,
     };
+    state.config.test_point(RelayTestPoint::AcceptClaimed).await;
 
     if !send_json(
         &mut ws,
@@ -2036,6 +2096,7 @@ async fn handle_v2_register(
         }
     }
     drop(reg_guard);
+    drop(incoming_rx);
     let _ = timeout(state.config.write_timeout, ws.close(None)).await;
 }
 
@@ -2123,7 +2184,7 @@ async fn handle_v2_dial(
         }
     };
 
-    let _pending_guard = PendingV2DialGuard {
+    let pending_guard = PendingV2DialGuard {
         state: Arc::clone(&state),
         target_mailbox,
         conn_id,
@@ -2149,10 +2210,13 @@ async fn handle_v2_dial(
         }
     }
 
+    // A claimed dial waits for its acceptor, whose `ready` write is bounded by `write_timeout`.
     let accept_deadline = tokio::time::sleep(state.config.accept_timeout);
     tokio::pin!(accept_deadline);
+    let mut claimed = false;
     let acceptor = loop {
         tokio::select! {
+            biased;
             res = &mut match_rx => match res {
                 Ok(transfer) => break transfer,
                 Err(_) => {
@@ -2160,9 +2224,21 @@ async fn handle_v2_dial(
                     return;
                 }
             },
-            () = &mut accept_deadline => {
-                send_v2_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
-                return;
+            () = incoming_tx.closed(), if !claimed => {
+                state.config.test_point(RelayTestPoint::DialTeardown).await;
+                if pending_guard.withdraw() {
+                    send_v2_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
+                    return;
+                }
+                claimed = true;
+            }
+            () = &mut accept_deadline, if !claimed => {
+                state.config.test_point(RelayTestPoint::DialTeardown).await;
+                if pending_guard.withdraw() {
+                    send_v2_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
+                    return;
+                }
+                claimed = true;
             }
             maybe_ws = ws.next() => {
                 match maybe_ws {
@@ -2313,6 +2389,7 @@ async fn handle_v2_accept(
         state: Arc::clone(&state),
         mailbox_id: target_mailbox,
     };
+    state.config.test_point(RelayTestPoint::AcceptClaimed).await;
 
     if !send_json(
         &mut ws,

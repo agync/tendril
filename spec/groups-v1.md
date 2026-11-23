@@ -186,6 +186,18 @@ group_mailbox  = HKDF(ikm = key, salt = seq_be8,
 
 `min` and `max` compare the ASCII `device_id` strings bytewise, so both members derive the same `pair_bootstrap`.
 
+### 8.1 Relay Mailbox
+
+A `/v2/relay` hint is a `ws://` or `wss://` URL hint (Section 3) whose path is `/v2/relay`; it carries no fragment. In a group whose `min_wire_version` is 2, a member whose stored manifest is unexpired, that is an active member not revoked by the root CRL, and that holds the rendezvous key for the stored manifest `seq` MAY register, on such hints in its own `members` entry, the epoch mailboxes of `spec/relay-v2.md` derived from `mailbox_secret = group_mailbox(own device_id)`, at most once per relay host. A sibling dials such a hint of member M with `mailbox_secret = group_mailbox(M)` at the same `seq`, also only when `min_wire_version` is 2; in a group with floor 1 neither end registers or dials group mailboxes, so registration and dialing always agree. A member that applies a manifest with a new `seq` releases its old mailboxes and registers the new ones. A member that cannot re-evaluate its stored manifest and root CRL (for example because the root CRL no longer resolves) releases every relay mailbox, group and identity alike, until it can.
+
+The cutoff is per member: after a rotation, each member listens and dials only under the key it holds. A member that has not yet applied the rotation keeps its old-`seq` mailbox and reaches only members that also hold the old key. A removed member never receives the new key, so it can reach no mailbox of a member that applied its removal; members that have not applied it remain reachable on their old mailboxes, as with `pair_bootstrap`, until they do.
+
+The mailbox only gates discovery: admission is unchanged (Noise statics, manifest pins, and the pairwise or bootstrap secret). Every holder of the current key can derive every member's mailbox and register it; the relay keeps the latest registration, so a key holder can make another member unreachable on that relay, but cannot impersonate it. Implementations SHOULD register a member's mailbox from one process only. Dialing a hint makes an outbound connection to the relay named in a signed manifest; relay admission credentials (`spec/relay-v2.md` Section 3.5) apply to group mailboxes as to any other.
+
+Any other relay URL hint is a `/v1/relay` mailbox of the member's identity: a sibling dials it with the member's `relay_pub` from the manifest as the target, and the member registers it with its own signing key, at most once per relay host, while its stored manifest is unexpired and it is an active member not revoked by the root CRL.
+
+An admin push over an ordinary session to a `/v2/relay` hint uses the ordinary roster entry's own `mailbox_secret`; it reaches the member only when the member serves that ordinary mailbox.
+
 A sibling is pinned by the `static_pub` and `signing_pub_hash` in the stored manifest alone. The dialer resolves the full 1984-byte signing key from `HostHello` and MUST abort before `msg3` when its SHA-256 differs from `signing_pub_hash` or the Noise static differs from `static_pub`. A `HostHello` rotation chain never advances a sibling pin: sibling keys change only through a signed manifest update.
 
 Sibling state is group scoped. Siblings never enter the endpoint's global trust roster, so a sibling cannot open an ordinary session or receive a grant without explicit pairing. Pairwise `V2PeerSecrets` are stored per group and per sibling next to the manifest, and are deleted when any ingested manifest revokes or removes the sibling, and when the group is forgotten.

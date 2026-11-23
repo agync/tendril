@@ -1,12 +1,14 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use tendril_core::crypto::{b64url_decode_array, b64url_encode};
 use tendril_relay::{
-    MAX_RELAY_FRAME_LEN, RelayClientMsg, RelayConfig, RelayServer, RelayServerMsg,
-    sign_relay_accept, sign_relay_register,
+    MAX_RELAY_FRAME_LEN, RelayClientMsg, RelayConfig, RelayServer, RelayServerMsg, RelayTestHook,
+    RelayTestPoint, sign_relay_accept, sign_relay_register,
 };
+use tokio::sync::Notify;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -491,5 +493,203 @@ async fn relay_rejects_zero_byte_binary_frames_without_forwarding() {
         Some(Ok(other)) => panic!("0-byte binary frame must close bridge: {other:?}"),
     }
 
+    handle.stop().await.expect("stop relay");
+}
+
+#[tokio::test]
+async fn relay_fails_a_pending_dial_offline_when_its_registration_ends() {
+    // The accept deadline is far beyond the bound below, so only the registration ending can
+    // answer the dial in time.
+    let server = RelayServer::bind(RelayConfig {
+        accept_timeout: Duration::from_secs(300),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind relay");
+    let handle = server.spawn();
+    let url = handle.ws_url();
+
+    let listener_key = SigningKey::from_bytes(&[0x61; 32]);
+    let (mut listener_ws, _) = connect_async(&url).await.expect("connect listener");
+    let Some(RelayServerMsg::Challenge { nonce, host, .. }) =
+        recv_server_msg(&mut listener_ws).await
+    else {
+        panic!("expected challenge");
+    };
+    let nonce = b64url_decode_array::<32>(&nonce).expect("nonce bytes");
+    let (pub_b64, sig_b64) = sign_relay_register(&listener_key, &host, &nonce);
+    send_client_msg(
+        &mut listener_ws,
+        &RelayClientMsg::Register {
+            pub_key: pub_b64.clone(),
+            sig: sig_b64,
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut listener_ws).await,
+        Some(RelayServerMsg::Registered { .. })
+    ));
+
+    let (mut dialer_ws, _) = connect_async(&url).await.expect("connect dialer");
+    assert!(matches!(
+        recv_server_msg(&mut dialer_ws).await,
+        Some(RelayServerMsg::Challenge { .. })
+    ));
+    send_client_msg(
+        &mut dialer_ws,
+        &RelayClientMsg::Dial {
+            target_pub: pub_b64,
+            conn_id: b64url_encode(&[0x62; 16]),
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut listener_ws).await,
+        Some(RelayServerMsg::Incoming { .. })
+    ));
+
+    // The listener vanishes without a close frame and without accepting.
+    drop(listener_ws);
+    let reply = tokio::time::timeout(Duration::from_secs(10), recv_server_msg(&mut dialer_ws))
+        .await
+        .expect("pending dial outlived its registration");
+    assert_eq!(
+        reply,
+        Some(RelayServerMsg::Error {
+            code: "offline".to_owned()
+        })
+    );
+    handle.stop().await.expect("stop relay");
+}
+
+/// Hooks that hold a claimed accept until the dialer has seen its registration end.
+fn claim_then_teardown_hook() -> (RelayTestHook, Arc<Notify>) {
+    let claimed = Arc::new(Notify::new());
+    let teardown = Arc::new(Notify::new());
+    let on_claim = Arc::clone(&claimed);
+    let hook: RelayTestHook = Arc::new(move |point| {
+        let claimed = Arc::clone(&on_claim);
+        let teardown = Arc::clone(&teardown);
+        Box::pin(async move {
+            match point {
+                RelayTestPoint::AcceptClaimed => {
+                    claimed.notify_one();
+                    teardown.notified().await;
+                }
+                RelayTestPoint::DialTeardown => teardown.notify_one(),
+                _ => {}
+            }
+        })
+    });
+    (hook, claimed)
+}
+
+#[tokio::test]
+async fn relay_an_accept_that_claimed_a_dial_wins_over_registration_end() {
+    let (hook, claimed) = claim_then_teardown_hook();
+    let server = RelayServer::bind(RelayConfig {
+        accept_timeout: Duration::from_secs(300),
+        test_hook: Some(hook),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind relay");
+    let handle = server.spawn();
+    let url = handle.ws_url();
+
+    let listener_key = SigningKey::from_bytes(&[0x71; 32]);
+    let (mut listener_ws, _) = connect_async(&url).await.expect("connect listener");
+    let Some(RelayServerMsg::Challenge { nonce, host, .. }) =
+        recv_server_msg(&mut listener_ws).await
+    else {
+        panic!("expected challenge");
+    };
+    let nonce = b64url_decode_array::<32>(&nonce).expect("nonce bytes");
+    let (pub_b64, sig_b64) = sign_relay_register(&listener_key, &host, &nonce);
+    send_client_msg(
+        &mut listener_ws,
+        &RelayClientMsg::Register {
+            pub_key: pub_b64.clone(),
+            sig: sig_b64,
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut listener_ws).await,
+        Some(RelayServerMsg::Registered { .. })
+    ));
+
+    let conn_id = [0x72; 16];
+    let conn_id_b64 = b64url_encode(&conn_id);
+    let (mut dialer_ws, _) = connect_async(&url).await.expect("connect dialer");
+    assert!(matches!(
+        recv_server_msg(&mut dialer_ws).await,
+        Some(RelayServerMsg::Challenge { .. })
+    ));
+    send_client_msg(
+        &mut dialer_ws,
+        &RelayClientMsg::Dial {
+            target_pub: pub_b64.clone(),
+            conn_id: conn_id_b64.clone(),
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut listener_ws).await,
+        Some(RelayServerMsg::Incoming { .. })
+    ));
+
+    let (mut accept_ws, _) = connect_async(&url).await.expect("connect acceptor");
+    let Some(RelayServerMsg::Challenge {
+        nonce: acc_nonce,
+        host: acc_host,
+        ..
+    }) = recv_server_msg(&mut accept_ws).await
+    else {
+        panic!("expected accept challenge");
+    };
+    let acc_nonce = b64url_decode_array::<32>(&acc_nonce).expect("acc nonce");
+    send_client_msg(
+        &mut accept_ws,
+        &RelayClientMsg::Accept {
+            pub_key: pub_b64,
+            conn_id: conn_id_b64.clone(),
+            sig: sign_relay_accept(&listener_key, &acc_host, &acc_nonce, &conn_id),
+            auth: None,
+        },
+    )
+    .await;
+
+    // The accept holds its claim until the dialer has seen the registration end.
+    claimed.notified().await;
+    drop(listener_ws);
+    let ready = Some(RelayServerMsg::Ready {
+        conn_id: conn_id_b64,
+    });
+    let bound = Duration::from_secs(10);
+    let dialer_reply = tokio::time::timeout(bound, recv_server_msg(&mut dialer_ws))
+        .await
+        .expect("dialer reply");
+    let acceptor_reply = tokio::time::timeout(bound, recv_server_msg(&mut accept_ws))
+        .await
+        .expect("acceptor reply");
+    assert_eq!(dialer_reply, ready);
+    assert_eq!(acceptor_reply, ready);
+
+    dialer_ws
+        .send(Message::Binary(b"after-race".to_vec().into()))
+        .await
+        .expect("send dialer frame");
+    let frame = tokio::time::timeout(bound, accept_ws.next())
+        .await
+        .expect("bridged frame")
+        .expect("acceptor recv")
+        .expect("frame");
+    assert_eq!(frame, Message::Binary(b"after-race".to_vec().into()));
     handle.stop().await.expect("stop relay");
 }

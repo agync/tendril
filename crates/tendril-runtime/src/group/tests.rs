@@ -1273,3 +1273,407 @@ async fn one_peer_cannot_hold_every_pending_bootstrap_commit() {
     drop(silent);
     pool_c.close();
 }
+
+/// Builds a Wire v2 group rooted at `root` whose members advertise `hints[i]` (root first),
+/// and stores it with its key in every node's book.
+fn seed_hinted(
+    root: &Node,
+    others: &[&Node],
+    hints: &[Vec<String>],
+) -> (String, GroupManifest, V2GroupSecrets) {
+    seed_hinted_wire(root, others, hints, 2)
+}
+
+/// [`seed_hinted`] with the given wire floor.
+fn seed_hinted_wire(
+    root: &Node,
+    others: &[&Node],
+    hints: &[Vec<String>],
+    wire: u8,
+) -> (String, GroupManifest, V2GroupSecrets) {
+    let gid = group_id_from_root(root.identity.signing_key().public_key());
+    let params = GroupBuildParams::new(current_unix_secs());
+    let hinted = |node: &Node, i: usize| {
+        let mut m = node.member(&gid);
+        m.endpoints.clone_from(&hints[i]);
+        m
+    };
+    let (mut manifest, mut secrets) = create_group(
+        root.identity.signing_key(),
+        "relay",
+        wire,
+        hinted(root, 0),
+        params,
+    )
+    .unwrap();
+    let signer = GroupSigner::root(root.identity.signing_key());
+    for (i, node) in others.iter().enumerate() {
+        (manifest, secrets) =
+            add_member(&manifest, &signer, hinted(node, i + 1), &secrets, params).unwrap();
+    }
+    for node in std::iter::once(root).chain(others.iter().copied()) {
+        store(node, &manifest, Some(&secrets));
+    }
+    (gid, manifest, secrets)
+}
+
+fn relay_pool(node: &Node, gid: &str) -> GroupPool {
+    GroupPool::open(
+        node.store.clone(),
+        Arc::clone(&node.identity),
+        gid,
+        GroupPoolConfig::new(vec![]).with_relay_listen(true),
+        None,
+    )
+    .unwrap()
+}
+
+async fn local_relay() -> crate::providers::EmbeddedRelay {
+    crate::providers::EmbeddedRelay::start(tendril_relay::RelayConfig {
+        host: "127.0.0.1".to_owned(),
+        ..tendril_relay::RelayConfig::default()
+    })
+    .await
+    .unwrap()
+}
+
+/// `group_mailbox(device)` under `secrets`.
+fn mailbox_of(secrets: &V2GroupSecrets, device: &str) -> [u8; 32] {
+    *tendril_core::group::derive_group_mailbox_secret(
+        secrets.group_rendezvous_key(),
+        secrets.seq(),
+        device,
+    )
+}
+
+async fn probe(secret: [u8; 32], url: &str, epoch: u64) -> Result<(), RuntimeError> {
+    crate::providers::RelayV2Dialer::new(secret)
+        .connect_for_epoch(url, epoch)
+        .await
+        .map(drop)
+}
+
+fn is_offline(res: &Result<(), RuntimeError>) -> bool {
+    matches!(res, Err(RuntimeError::Protocol(m)) if m == "v2 relay dial rejected: offline")
+}
+
+async fn wait_registered(secret: [u8; 32], url: &str, epoch: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe(secret, url, epoch).await.is_err() {
+        assert!(Instant::now() < deadline, "mailbox never registered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_offline(secret: [u8; 32], url: &str, epoch: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let res = probe(secret, url, epoch).await;
+        if is_offline(&res) {
+            return;
+        }
+        assert!(res.is_ok(), "unexpected probe error: {res:?}");
+        assert!(Instant::now() < deadline, "mailbox never released");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn epoch_now() -> u64 {
+    tendril_core::v2::epoch_for_unix(current_unix_secs())
+}
+
+/// Closing a pool while its mailbox listener is about to bind registers nothing.
+#[tokio::test]
+async fn close_during_mailbox_bind_registers_nothing() {
+    let relay = local_relay().await;
+    let url = relay.ws_v2_url();
+    let epoch = epoch_now();
+    let b = Node::new(40).await;
+    let (gid, _, secrets) = seed_hinted(&b, &[], &[vec![url.clone()]]);
+    let pool = relay_pool(&b, &gid);
+    let (reached_rx, mut release) = arm_gate(&pool.inner.hooks.before_mailbox_bind);
+    reached(reached_rx).await;
+    pool.close();
+    tokio::time::timeout(Duration::from_secs(5), release.closed())
+        .await
+        .expect("mailbox task not dropped");
+    let res = probe(mailbox_of(&secrets, &b.id()), &url, epoch).await;
+    assert!(is_offline(&res), "{res:?}");
+    assert!(pool.inner.relay_mailboxes.lock().unwrap().is_empty());
+    assert!(pool.inner.tasks.lock().unwrap().is_empty());
+}
+
+/// A task tracked after close is aborted at once.
+#[tokio::test]
+async fn track_after_close_aborts_the_task() {
+    let b = Node::new(41).await;
+    let (gid, _, _) = seed(&b, &[], 2);
+    let pool = open_pool(&b, &gid);
+    pool.close();
+    let task = tokio::spawn(std::future::pending::<()>());
+    pool.inner.track(task.abort_handle());
+    let res = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap();
+    assert!(res.unwrap_err().is_cancelled());
+}
+
+/// A rotation landing while a relay-arrived bootstrap session waits for its commit refuses
+/// the session and moves the registration to the new mailbox.
+#[tokio::test]
+async fn rotation_during_an_inflight_relay_accept_refuses_and_rotates() {
+    let relay = local_relay().await;
+    let url = relay.ws_v2_url();
+    let epoch = epoch_now();
+    let b = Node::new(42).await;
+    let c = Node::new(43).await;
+    let (gid, m2, s2) = seed_hinted(&b, &[&c], &[vec![], vec![url.clone()]]);
+    let pool_b = relay_pool(&b, &gid);
+    let pool_c = relay_pool(&c, &gid);
+    let old_c = mailbox_of(&s2, &c.id());
+    wait_registered(old_c, &url, epoch).await;
+    let (staged, release_staged) = arm_gate(&pool_c.inner.hooks.staged_inbound);
+    let (done, release_done) = arm_gate(&pool_c.inner.hooks.inbound_done);
+    let sender = pool_b.clone();
+    let sent = tokio::spawn(async move { sender.broadcast(None, b"relay").await });
+    reached(staged).await;
+    let (m3, _) = renew_manifest(
+        &m2,
+        &GroupSigner::root(b.identity.signing_key()),
+        &s2,
+        GroupBuildParams::new(current_unix_secs()),
+    )
+    .unwrap();
+    let s3 = V2GroupSecrets::generate(m3.seq).unwrap();
+    store(&c, &m3, Some(&s3));
+    release_staged.send(()).unwrap();
+    reached(done).await;
+    assert_eq!(pairwise_of(&c, &gid, &b), None);
+    assert!(slot_initiator(&pool_c, &b).is_none());
+    release_done.send(()).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), sent).await;
+    wait_offline(old_c, &url, epoch).await;
+    wait_registered(mailbox_of(&s3, &c.id()), &url, epoch).await;
+    pool_b.close();
+    pool_c.close();
+}
+
+#[tokio::test]
+async fn relay_mailbox_plan_rules() {
+    let b = Node::new(44).await;
+    let c = Node::new(45).await;
+    let hints = vec![
+        "wss://relay.example/v2/relay".to_owned(),
+        "wss://relay.example:443/v2/relay".to_owned(),
+        "wss://other.example/v1/relay".to_owned(),
+    ];
+    let (gid, m2, s2) = seed_hinted(&b, &[&c], &[vec![], hints]);
+    let now = current_unix_secs();
+    let book = c.store.load_group_book().unwrap();
+    let plan = super::relay_mailbox_plan(&book, None, &gid, &c.id(), now, true);
+    assert_eq!(plan.len(), 1, "one entry per relay host");
+    assert_eq!(plan[0].0, "relay.example");
+    assert_eq!(plan[0].1, "wss://relay.example/v2/relay");
+    assert_eq!(*plan[0].2, mailbox_of(&s2, &c.id()));
+    let v1 = super::relay_v1_plan(&book, None, &gid, &c.id(), now, true, &[]);
+    assert_eq!(
+        v1,
+        vec![(
+            "other.example".to_owned(),
+            "wss://other.example/v1/relay".to_owned()
+        )]
+    );
+    let served = ["wss://other.example:443/v1/relay".to_owned()];
+    assert!(super::relay_v1_plan(&book, None, &gid, &c.id(), now, true, &served).is_empty());
+
+    assert!(super::relay_mailbox_plan(&book, None, &gid, &c.id(), now, false).is_empty());
+    assert!(super::relay_v1_plan(&book, None, &gid, &c.id(), now, false, &[]).is_empty());
+    let expired = now + 365 * 24 * 3600;
+    assert!(super::relay_mailbox_plan(&book, None, &gid, &c.id(), expired, true).is_empty());
+    assert!(super::relay_v1_plan(&book, None, &gid, &c.id(), expired, true, &[]).is_empty());
+    let crl = signed_list(&b.id(), 1, vec![c.id()], b.identity.signing_key());
+    assert!(super::relay_mailbox_plan(&book, Some(&crl), &gid, &c.id(), now, true).is_empty());
+    assert!(super::relay_v1_plan(&book, Some(&crl), &gid, &c.id(), now, true, &[]).is_empty());
+
+    let mut keyless = book.clone();
+    keyless.drop_secrets(&gid);
+    assert!(super::relay_mailbox_plan(&keyless, None, &gid, &c.id(), now, true).is_empty());
+
+    let (m3, _) = remove_member(
+        &m2,
+        &GroupSigner::root(b.identity.signing_key()),
+        &c.id(),
+        &s2,
+        GroupBuildParams::new(now),
+    )
+    .unwrap();
+    let mut removed = book.clone();
+    removed.ingest_group_manifest(&m3, now, None).unwrap();
+    assert!(super::relay_mailbox_plan(&removed, None, &gid, &c.id(), now, true).is_empty());
+    assert!(super::relay_v1_plan(&removed, None, &gid, &c.id(), now, true, &[]).is_empty());
+
+    let d = Node::new(46).await;
+    let e = Node::new(47).await;
+    let v2_only = vec!["wss://relay.example/v2/relay".to_owned()];
+    let (gid1, _, _) = seed_hinted_wire(&d, &[&e], &[vec![], v2_only], 1);
+    let book1 = e.store.load_group_book().unwrap();
+    assert!(
+        super::relay_mailbox_plan(&book1, None, &gid1, &e.id(), now, true).is_empty(),
+        "a wire floor 1 group registers no group mailbox"
+    );
+}
+
+#[test]
+fn is_v2_relay_url_accepts_only_v2_paths() {
+    for ok in [
+        "ws://h/v2/relay",
+        "wss://h:1/v2/relay?x",
+        "relay:ws://h/v2/relay",
+    ] {
+        assert!(super::is_v2_relay_url(ok), "{ok}");
+    }
+    for no in ["ws://h/v1/relay", "ws://h/v2/relayx", "https://h/v2/relay"] {
+        assert!(!super::is_v2_relay_url(no), "{no}");
+    }
+}
+
+/// A duplicate `/v1/relay` mailbox claim in one process is declined, and the first claim is
+/// released on drop.
+#[test]
+fn duplicate_v1_mailbox_claim_is_declined() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let first = super::V1MailboxClaim::take("dup-relay-pub", "dup.example");
+        let second = super::V1MailboxClaim::take("dup-relay-pub", "dup.example");
+        let _ = tx.send((first.is_some(), second.is_some()));
+        drop(first);
+        let again = super::V1MailboxClaim::take("dup-relay-pub", "dup.example");
+        let _ = tx.send((again.is_some(), false));
+    });
+    let wait = Duration::from_secs(5);
+    let claimed = rx.recv_timeout(wait).expect("duplicate claim hung");
+    assert_eq!(claimed, (true, false));
+    let again = rx.recv_timeout(wait).expect("claim not released");
+    assert!(again.0);
+}
+
+fn v1_claim_held(node: &Node, host: &str) -> bool {
+    let relay_pub =
+        tendril_core::crypto::b64url_encode(node.identity.signing_key().ed25519_public_bytes());
+    super::V1_MAILBOX_CLAIMS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|c| c.contains(&(relay_pub, host.to_owned())))
+}
+
+/// A refresh that fails closed (here the root CRL turns unresolvable after the root's key
+/// rotation) releases every relay mailbox, `/v2/relay` registration and `/v1/relay` claim alike,
+/// and keeps them released while it keeps failing.
+#[tokio::test]
+async fn failing_refresh_releases_relay_mailboxes() {
+    let relay = local_relay().await;
+    let v2_url = relay.ws_v2_url();
+    let v1_url = relay.ws_url();
+    let epoch = epoch_now();
+    let b = Node::new(70).await;
+    let c = Node::new(71).await;
+    let (gid, _, s1) = seed_hinted(&b, &[&c], &[vec![], vec![v2_url.clone(), v1_url]]);
+    let list = signed_list(&b.id(), 1, vec![], b.identity.signing_key());
+    pin_root_with_list(&c, &b, &b.id(), list);
+    let pool_c = relay_pool(&c, &gid);
+    let mc = mailbox_of(&s1, &c.id());
+    wait_registered(mc, &v2_url, epoch).await;
+    wait_until(|| v1_claim_held(&c, "127.0.0.1")).await;
+
+    let mut rotated = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar([0x41 + 70; 32]),
+        SigningKeypair::from_seed([0x51 + 70; 32]),
+    );
+    rotated
+        .rotate(
+            StaticKeypair::from_scalar([0xD5; 32]),
+            SigningKeypair::from_seed([0xD6; 32]),
+            current_unix_secs(),
+        )
+        .unwrap();
+    let new_pub = rotated.signing_key().public_key().clone();
+    c.store
+        .update_roster(|roster| {
+            roster.apply_verified_rotation(
+                &b.id(),
+                rotated.rotation_chain(),
+                rotated.static_key().public_bytes(),
+                &new_pub,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    wait_offline(mc, &v2_url, epoch).await;
+    wait_until(|| !v1_claim_held(&c, "127.0.0.1")).await;
+    wait_until(|| pool_c.inner.relay_mailboxes.lock().unwrap().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let res = probe(mc, &v2_url, epoch).await;
+    assert!(is_offline(&res), "re-registered while failing: {res:?}");
+    pool_c.close();
+}
+
+/// Close landing between the reconcile's `closed` check and the spawn: the spawned task never
+/// reaches its bind, even when a worker runs it before the spawner tracks it.
+#[test]
+fn close_racing_the_mailbox_spawn_never_starts_the_task() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let b = rt.block_on(Node::new(72));
+    let (gid, _, _) = seed(&b, &[], 2);
+    // Opened outside the runtime: no book watcher, so only this test reconciles.
+    let pool = open_pool(&b, &gid);
+    let (mut bind_reached, _release) = arm_gate(&pool.inner.hooks.before_mailbox_bind);
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&started);
+    let racing = pool.clone();
+    arm(&pool.inner.hooks.after_mailbox_spawn, move || {
+        racing
+            .inner
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if bind_reached.try_recv().is_ok() {
+                seen.store(true, AtomicOrdering::SeqCst);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let plan = vec![(
+        "v2 127.0.0.1".to_owned(),
+        "ws://127.0.0.1:9/v2/relay".to_owned(),
+        Some(zeroize::Zeroizing::new([7u8; 32])),
+    )];
+    rt.block_on(async {
+        pool.inner.reconcile_relay_mailboxes(plan);
+        let task = pool
+            .inner
+            .relay_mailboxes
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .map(|m| m.task.clone())
+            .expect("task recorded");
+        wait_until(|| task.is_finished()).await;
+    });
+    assert!(hook_fired(&pool.inner.hooks.after_mailbox_spawn));
+    assert!(
+        !started.load(AtomicOrdering::SeqCst),
+        "mailbox task started after close"
+    );
+    assert!(gate_armed(&pool.inner.hooks.before_mailbox_bind));
+    pool.close();
+    drop(pool);
+    drop(b);
+}

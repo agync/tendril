@@ -10,3 +10,4 @@ Entries from November 2026.
 - [Bind group root CRL authority to the founding root key](23-bind-group-root-crl-authority-to.md)
 - [Cap first-contact group pins per paired peer](23-cap-first-contact-group-pins-per.md)
 - [groups: commit pairwise secrets only on the initiator's kept path](23-groups-commit-pairwise-secrets-only-on.md)
+- [groups: dial and listen on relay sibling links](23-groups-dial-and-listen-on-relay.md)
