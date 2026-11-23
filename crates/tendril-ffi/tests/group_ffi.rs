@@ -20,8 +20,8 @@ use tendril_ffi::{
     tendril_group_create, tendril_group_free, tendril_group_ingest_manifest,
     tendril_group_local_endpoint, tendril_group_open, tendril_group_poll_event,
     tendril_group_remove_member, tendril_group_sync, tendril_last_error, tendril_session_accept,
-    tendril_session_connect, tendril_session_free, tendril_session_poll_event,
-    tendril_session_shutdown, tendril_string_free,
+    tendril_session_accept_v2, tendril_session_connect, tendril_session_free,
+    tendril_session_poll_event, tendril_session_shutdown, tendril_string_free,
 };
 use tendril_runtime::{DirectDialer, PathDialer, SessionDriver, StateStore};
 
@@ -898,4 +898,127 @@ fn sibling_stream_queued_before_group_open_is_not_refused() {
         tendril_group_free(ga);
         tendril_group_free(gb as *mut TendrilGroup);
     }
+}
+
+/// A parked accept on its own thread. Dropping it closes the endpoint, which wakes the accept, and
+/// joins the thread; declare it after the `Node`s so an unwinding assertion cannot free the
+/// endpoint under the parked call.
+struct AcceptThread {
+    ep: usize,
+    handle: Option<thread::JoinHandle<(usize, Option<String>)>>,
+}
+
+impl AcceptThread {
+    fn spawn(ep: *mut TendrilEndpoint, v2: bool, timeout_ms: u64) -> Self {
+        let ep = ep as usize;
+        let handle = thread::spawn(move || {
+            let ep = ep as *mut TendrilEndpoint;
+            let sess = if v2 {
+                unsafe { tendril_session_accept_v2(ep, timeout_ms) }
+            } else {
+                unsafe { tendril_session_accept(ep, timeout_ms) }
+            };
+            let err = sess.is_null().then(last_err);
+            (sess as usize, err)
+        });
+        Self {
+            ep,
+            handle: Some(handle),
+        }
+    }
+
+    fn join_with_err(mut self) -> (*mut tendril_ffi::TendrilSession, Option<String>) {
+        let (sess, err) = self.handle.take().unwrap().join().unwrap();
+        (sess as *mut tendril_ffi::TendrilSession, err)
+    }
+
+    fn join(self) -> *mut tendril_ffi::TendrilSession {
+        self.join_with_err().0
+    }
+
+    fn close_and_join(self) -> (*mut tendril_ffi::TendrilSession, Option<String>) {
+        unsafe { tendril_endpoint_close(self.ep as *mut TendrilEndpoint) };
+        self.join_with_err()
+    }
+}
+
+impl Drop for AcceptThread {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            unsafe { tendril_endpoint_close(self.ep as *mut TendrilEndpoint) };
+            let sess = handle.join().map_or(0, |(s, _)| s) as *mut tendril_ffi::TendrilSession;
+            if !sess.is_null() {
+                unsafe { tendril_session_free(sess) };
+            }
+        }
+    }
+}
+
+fn assert_second_accept_times_out(ep: *mut TendrilEndpoint, v2: bool, expected_err: &str) {
+    let started = Instant::now();
+    let sess = if v2 {
+        unsafe { tendril_session_accept_v2(ep, 100) }
+    } else {
+        unsafe { tendril_session_accept(ep, 100) }
+    };
+    let elapsed = started.elapsed();
+    assert!(sess.is_null(), "second accept unexpectedly got a session");
+    assert_eq!(last_err(), expected_err);
+    assert!(
+        elapsed >= Duration::from_millis(90) && elapsed < Duration::from_secs(5),
+        "second accept took {elapsed:?}"
+    );
+}
+
+#[test]
+fn concurrent_group_accepts_honour_each_callers_deadline() {
+    let a = Node::new();
+    let b = Node::new();
+    pair(&a, &b);
+    let (gid, _) = create_group(&a, "accept-deadline");
+    let group = open(&a, &gid);
+
+    let first = AcceptThread::spawn(a.ep, false, 20_000);
+    thread::sleep(Duration::from_millis(300));
+    assert_second_accept_times_out(a.ep, false, "timed out accepting session");
+
+    let addr = cstr(&a.addr);
+    let target = cstr(&a.id);
+    let client = unsafe {
+        tendril_session_connect(
+            b.ep,
+            addr.as_ptr(),
+            ptr::null(),
+            target.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(!client.is_null(), "connect: {}", last_err());
+    let server = first.join();
+    assert!(!server.is_null(), "first accept: {}", last_err());
+    unsafe {
+        tendril_session_shutdown(client);
+        tendril_session_shutdown(server);
+        tendril_session_free(client);
+        tendril_session_free(server);
+        tendril_group_free(group);
+    }
+}
+
+#[test]
+fn concurrent_group_accepts_honour_each_callers_deadline_v2() {
+    let a = Node::new();
+    let b = Node::new();
+    pair(&a, &b);
+    let (gid, _) = create_group(&a, "accept-deadline-v2");
+    let group = open(&a, &gid);
+
+    let first = AcceptThread::spawn(a.ep, true, 20_000);
+    thread::sleep(Duration::from_millis(300));
+    assert_second_accept_times_out(a.ep, true, "timed out accepting v2 session");
+
+    let (sess, err) = first.close_and_join();
+    assert!(sess.is_null());
+    assert_eq!(err.as_deref(), Some("listener closed"));
+    unsafe { tendril_group_free(group) };
 }
