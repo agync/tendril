@@ -532,6 +532,11 @@ impl Roster {
     /// Records a newly paired device in `Pending` state after verifying `code_mac`.
     ///
     /// Never promotes a `Pending` peer to `Active` and never un-revokes a `Revoked` peer.
+    /// A `signing_pub` claimed for an existing entry follows the pinning rules of
+    /// `spec/pairing-v1.md` Section 4.1: it fills a keyless entry and returns an `Active` one to
+    /// `Pending` until [`Self::confirm_peer`] with the new SAS. A key differing from one pinned by
+    /// any entry with the same static key, or a keyless claim for a `Pending` entry holding a key,
+    /// fails with [`CoreError::ProtocolViolation`] before any field changes.
     pub fn record_pending_pair(
         &mut self,
         static_pub: [u8; 32],
@@ -549,20 +554,46 @@ impl Roster {
         if self.revoked_key_conflict(&id, &id, &static_pub, signing_pub.as_ref()) {
             return Err(CoreError::PeerRevoked(id));
         }
+        if let Some(existing) = self.entries.get(&id)
+            && existing.state == PeerState::Revoked
+            && existing.static_pub == static_pub
+        {
+            return Err(CoreError::PeerRevoked(id));
+        }
+        if let Some(claimed) = signing_pub.as_ref()
+            && self.entries.values().any(|e| {
+                e.state != PeerState::Revoked
+                    && e.static_pub == static_pub
+                    && e.signing_pub
+                        .as_ref()
+                        .is_some_and(|pinned| pinned != claimed)
+            })
+        {
+            return Err(CoreError::ProtocolViolation(
+                "cannot replace pinned signing key; rotate or revoke",
+            ));
+        }
         if let Some(existing) = self.entries.get_mut(&id) {
             if existing.static_pub != static_pub {
                 return Err(CoreError::ProtocolViolation(
                     "device_id collision with distinct static key",
                 ));
             }
-            if existing.state == PeerState::Revoked {
-                return Err(CoreError::PeerRevoked(id));
-            }
+            let enrich = match (&existing.signing_pub, &signing_pub) {
+                (Some(_), None) if existing.state == PeerState::Pending => {
+                    return Err(CoreError::ProtocolViolation(
+                        "keyless claim cannot supersede an unconfirmed signing key",
+                    ));
+                }
+                (None, Some(_)) => true,
+                _ => false,
+            };
             existing.name = name;
             existing.kind = kind;
             existing.last_pairing_sas = Some(pairing_sas);
-            if let Some(sig) = signing_pub {
-                existing.signing_pub = Some(sig);
+            if enrich {
+                existing.signing_pub = signing_pub;
+                existing.state = PeerState::Pending;
             }
             return Ok(&self.entries[&id]);
         }
@@ -1393,6 +1424,160 @@ impl Roster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_pending_pair_key_rules() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+
+        let st = *StaticKeypair::from_scalar([0x61u8; 32]).public_bytes();
+        let id = device_id(&st);
+        let key = SigningKeypair::from_seed([0x62u8; 32]).public_key().clone();
+        let other = SigningKeypair::from_seed([0x63u8; 32]).public_key().clone();
+        let rec = |r: &mut Roster, k: Option<HybridSigningPublicKey>, sas: &str| {
+            r.record_pending_pair(st, k, "Peer".into(), "cli".into(), sas.into())
+                .map(|e| (e.state, e.signing_pub.clone()))
+        };
+
+        // New entry with a key.
+        let mut fresh = Roster::new();
+        assert_eq!(
+            rec(&mut fresh, Some(key.clone()), "s1"),
+            Ok((PeerState::Pending, Some(key.clone())))
+        );
+
+        // Pending keyless: key set, stays Pending.
+        let mut pending = Roster::new();
+        rec(&mut pending, None, "s1").unwrap();
+        assert_eq!(
+            rec(&mut pending, Some(key.clone()), "s2"),
+            Ok((PeerState::Pending, Some(key.clone())))
+        );
+
+        // Pending keyed: a keyless claim cannot move the SAS that guards the unconfirmed key.
+        let before = serde_json::to_value(&pending).unwrap();
+        assert_eq!(
+            rec(&mut pending, None, "s3"),
+            Err(CoreError::ProtocolViolation(
+                "keyless claim cannot supersede an unconfirmed signing key"
+            ))
+        );
+        assert_eq!(serde_json::to_value(&pending).unwrap(), before);
+        assert!(pending.confirm_peer(&id, Some("s3")).is_err());
+        assert_eq!(pending.lookup_active_signing_key(&id), None);
+        pending.confirm_peer(&id, Some("s2")).unwrap();
+        assert_eq!(pending.lookup_active_signing_key(&id), Some(key.clone()));
+
+        // Active keyless: enrichment returns it to Pending until the new SAS is confirmed.
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x64u8; 32]),
+            SigningKeypair::from_seed([0x65u8; 32]),
+        );
+        let mut active = Roster::new();
+        rec(&mut active, None, "s1").unwrap();
+        active.confirm_peer(&id, Some("s1")).unwrap();
+        let grant = active
+            .mint_grant(&host, &id, vec!["file.read:*".into()], 10, 20, [1u8; 16])
+            .unwrap();
+        assert_eq!(active.lookup_active_signing_key(&id), None);
+        assert_eq!(
+            rec(&mut active, Some(key.clone()), "s2"),
+            Ok((PeerState::Pending, Some(key.clone())))
+        );
+        assert_eq!(active.get(&id).unwrap().grants, vec![grant.clone()]);
+        assert_eq!(active.lookup_active_signing_key(&id), None);
+        assert!(active.confirm_peer(&id, Some("s1")).is_err());
+        active.confirm_peer(&id, Some("s2")).unwrap();
+        assert_eq!(active.lookup_active_signing_key(&id), Some(key.clone()));
+        assert_eq!(active.get(&id).unwrap().grants, vec![grant]);
+
+        // Equal key keeps state.
+        assert_eq!(
+            rec(&mut active, Some(key.clone()), "s3"),
+            Ok((PeerState::Active, Some(key.clone())))
+        );
+        assert_eq!(active.lookup_active_signing_key(&id), Some(key.clone()));
+        // Keyless claim on a keyed entry keeps the pin and state.
+        assert_eq!(
+            rec(&mut active, None, "s4"),
+            Ok((PeerState::Active, Some(key.clone())))
+        );
+
+        // Differing key is refused with no mutation.
+        let before = serde_json::to_value(&active).unwrap();
+        assert_eq!(
+            rec(&mut active, Some(other.clone()), "s5"),
+            Err(CoreError::ProtocolViolation(
+                "cannot replace pinned signing key; rotate or revoke"
+            ))
+        );
+        assert_eq!(serde_json::to_value(&active).unwrap(), before);
+        assert_eq!(active.lookup_active_signing_key(&id), Some(key.clone()));
+
+        // An entry with the same static key under another label (a `host_id`, or a label kept
+        // across rotation) pins its key too.
+        let mut labelled = Roster::new();
+        labelled
+            .insert_pinned_host(
+                "stable-host-id".into(),
+                "Host".into(),
+                st,
+                Some(key.clone()),
+                0,
+                Vec::new(),
+            )
+            .unwrap();
+        let before = serde_json::to_value(&labelled).unwrap();
+        assert_eq!(
+            rec(&mut labelled, Some(other.clone()), "s1"),
+            Err(CoreError::ProtocolViolation(
+                "cannot replace pinned signing key; rotate or revoke"
+            ))
+        );
+        assert_eq!(serde_json::to_value(&labelled).unwrap(), before);
+
+        // Revoked stays revoked, with either key.
+        active.revoke_peer(&id).unwrap();
+        assert_eq!(
+            rec(&mut active, Some(key.clone()), "s6"),
+            Err(CoreError::PeerRevoked(id.clone()))
+        );
+        let before = serde_json::to_value(&active).unwrap();
+        assert_eq!(
+            rec(&mut active, Some(other.clone()), "s7"),
+            Err(CoreError::PeerRevoked(id.clone()))
+        );
+        assert_eq!(serde_json::to_value(&active).unwrap(), before);
+        assert_eq!(active.get(&id).unwrap().state, PeerState::Revoked);
+
+        // A key that shares identity with a revoked sibling entry or anchor is revoked.
+        let sibling_st = *StaticKeypair::from_scalar([0x66u8; 32]).public_bytes();
+        let mut sibling = Roster::new();
+        sibling
+            .record_pending_pair(
+                sibling_st,
+                Some(key.clone()),
+                "S".into(),
+                "cli".into(),
+                "x".into(),
+            )
+            .unwrap();
+        sibling.revoke_peer(&device_id(&sibling_st)).unwrap();
+        assert_eq!(
+            rec(&mut sibling, Some(key.clone()), "s1"),
+            Err(CoreError::PeerRevoked(id.clone()))
+        );
+        assert!(sibling.get(&id).is_none());
+        let mut anchored = Roster::new();
+        anchored
+            .add_trust_anchor("anchor".into(), other.clone())
+            .unwrap();
+        anchored.revoke_trust_anchor("anchor").unwrap();
+        assert_eq!(
+            rec(&mut anchored, Some(other), "s1"),
+            Err(CoreError::PeerRevoked(id.clone()))
+        );
+        assert!(anchored.get(&id).is_none());
+    }
 
     #[test]
     fn revoked_duplicate_static_pub_takes_precedence_and_blocks_session_lookup() {

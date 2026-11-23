@@ -118,7 +118,7 @@ Once revoked, subsequent `dial` attempts fail closed on the host listener during
 
 ## Peer groups
 
-`tendril group` manages a small signed mesh rooted at the local identity. The CLI only builds and persists manifests and drives `GroupPool`; verification and authorization stay in `tendril-core`. Members must already be in the roster as `Active` peers with a known signing key (for example through M2M enrollment); code-paired clients whose signing key the host has not learned fail closed. Group commands require `host_id` to equal `device_id`, and a root identity roots exactly one group because the id derives from its signing key. Endpoint hints may be bare `host:port` (treated as `direct:`) or any other provider hint.
+`tendril group` manages a small signed mesh rooted at the local identity. The CLI only builds and persists manifests and drives `GroupPool`; verification and authorization stay in `tendril-core`. Members must already be in the roster as `Active` peers with a known signing key, learned by code pairing or M2M enrollment; peers code-paired before the signing key claim existed fail closed until they re-pair and the operator confirms the new SAS. Group commands require `host_id` to equal `device_id`, and a root identity roots exactly one group because the id derives from its signing key. Endpoint hints may be bare `host:port` (treated as `direct:`) or any other provider hint.
 
 ```bash
 tendril --state-dir ./a-state group create --name team --endpoint 127.0.0.1:7000

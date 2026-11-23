@@ -642,12 +642,24 @@ func TestPairingMAC(t *testing.T) {
 		CodeMACHex     string `json:"code_mac_hex"`
 		CodeMACB64URL  string `json:"code_mac_b64url"`
 	}
+	type keyProofCase struct {
+		DomainHex                    string `json:"domain_hex"`
+		InitiatorStaticScalarHex     string `json:"initiator_static_scalar_hex"`
+		InitiatorStaticPubHex        string `json:"initiator_static_pub_hex"`
+		InitiatorSigningSeedHex      string `json:"initiator_signing_seed_hex"`
+		InitiatorSigningMLDSASeedHex string `json:"initiator_signing_mldsa_seed_hex"`
+		InitiatorSigningPubHex       string `json:"initiator_signing_pub_hex"`
+		KeyProofBytesHex             string `json:"key_proof_bytes_hex"`
+		EnrollProofB64URL            string `json:"enroll_proof_b64url"`
+		PairClaimJSON                string `json:"pair_claim_json"`
+	}
 	var v struct {
-		HandshakeHashHex string  `json:"handshake_hash_hex"`
-		SaltHex          string  `json:"salt_hex"`
-		MACLabel         string  `json:"mac_label"`
-		Remote3Group     macCase `json:"remote_3group"`
-		LAN2Group        macCase `json:"lan_2group"`
+		HandshakeHashHex string       `json:"handshake_hash_hex"`
+		SaltHex          string       `json:"salt_hex"`
+		MACLabel         string       `json:"mac_label"`
+		Remote3Group     macCase      `json:"remote_3group"`
+		LAN2Group        macCase      `json:"lan_2group"`
+		KeyProof         keyProofCase `json:"key_proof"`
 	}
 	loadVector(t, "pairing_mac.json", &v)
 
@@ -683,6 +695,61 @@ func TestPairingMAC(t *testing.T) {
 		if hmac.Equal(wm.Sum(nil), sum) {
 			t.Fatalf("wrong pairing code unexpectedly matched MAC for %s", c.Code)
 		}
+	}
+
+	kp := v.KeyProof
+	domain := []byte("tendril-pair-key-v1\x00")
+	if hex.EncodeToString(domain) != kp.DomainHex {
+		t.Fatalf("pair key proof domain mismatch")
+	}
+	staticPub, err := curve25519.X25519(mustHex(t, kp.InitiatorStaticScalarHex), curve25519.Basepoint)
+	if err != nil || hex.EncodeToString(staticPub) != kp.InitiatorStaticPubHex {
+		t.Fatalf("pair key proof static pub mismatch: %v", err)
+	}
+	edKey := ed25519.NewKeyFromSeed(mustHex(t, kp.InitiatorSigningSeedHex))
+	var mldsaSeed [mldsa65.SeedSize]byte
+	copy(mldsaSeed[:], mustHex(t, kp.InitiatorSigningMLDSASeedHex))
+	mldsaPK, _ := mldsa65.NewKeyFromSeed(&mldsaSeed)
+	signPub := append([]byte{}, edKey.Public().(ed25519.PublicKey)...)
+	signPub = append(signPub, mldsaPK.Bytes()...)
+	if hex.EncodeToString(signPub) != kp.InitiatorSigningPubHex {
+		t.Fatalf("pair key proof signing pub mismatch")
+	}
+	var proofInput []byte
+	proofInput = append(proofInput, domain...)
+	proofInput = append(proofInput, h...)
+	proofInput = append(proofInput, staticPub...)
+	if hex.EncodeToString(proofInput) != kp.KeyProofBytesHex {
+		t.Fatalf("pair key proof bytes mismatch")
+	}
+	proof := mustB64URL(t, kp.EnrollProofB64URL)
+	if !bytes.Equal(proof[:64], ed25519.Sign(edKey, proofInput)) {
+		t.Fatalf("pair key proof ed25519 half mismatch")
+	}
+	if err := verifyHybridSig(signPub, proofInput, proof); err != nil {
+		t.Fatalf("pair key proof hybrid signature invalid: %v", err)
+	}
+	tampered := append([]byte{}, proofInput...)
+	tampered[len(domain)] ^= 1
+	if verifyHybridSig(signPub, tampered, proof) == nil {
+		t.Fatalf("pair key proof verified over a different transcript")
+	}
+	var claim struct {
+		Name        string `json:"name"`
+		Kind        string `json:"kind"`
+		CodeMAC     string `json:"code_mac"`
+		SigningPub  string `json:"signing_pub"`
+		EnrollProof string `json:"enroll_proof"`
+	}
+	dec := json.NewDecoder(strings.NewReader(kp.PairClaimJSON))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&claim); err != nil {
+		t.Fatalf("pair claim json: %v", err)
+	}
+	if claim.CodeMAC != v.Remote3Group.CodeMACB64URL ||
+		claim.SigningPub != base64.RawURLEncoding.EncodeToString(signPub) ||
+		claim.EnrollProof != kp.EnrollProofB64URL {
+		t.Fatalf("pair claim json fields mismatch")
 	}
 }
 

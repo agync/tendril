@@ -27,7 +27,7 @@ sequenceDiagram
   H->>D: Noise msg2 (e, ee, ekem1, s, es) + HostHello (signing_pub)
   Note over D: Verify HostHello.signing_pub against sh= hash or full pin before msg3; derive h
   Note over D,H: Both compute pairing_sas from SHA-256("tendril-sas-v1" || h)
-  D->>H: Noise msg3 (s, se) + PairClaim (code_mac over h)
+  D->>H: Noise msg3 (s, se) + PairClaim (code_mac over h, signing_pub + key proof)
   H->>D: Encrypted PairResponse (pending) and close
   Note over H: Human compares device_fingerprint + pairing_sas, then runs pair.confirm and pair.mint
 ```
@@ -39,8 +39,9 @@ sequenceDiagram
 | `device_fingerprint` | `group4(first16(upper(hex(SHA-256(static_pub)))))` | `XXXX XXXX XXXX XXXX` |
 | `pairing_sas` | `group4(first16(lower(base32_nopad(SHA-256("tendril-sas-v1" \|\| h)))))` | `xxxx xxxx xxxx xxxx` |
 | `code_mac` | `HMAC-SHA256(argon2id(code_norm, h[..16], t=3, m=65536, p=1, v=0x13), "tendril-pair-v1" \|\| h)` | 32 bytes (`b64url`) |
+| Key proof (`enroll_proof`) | Hybrid signature by `signing_pub` over `"tendril-pair-key-v1\0" \|\| h \|\| initiator static_pub` | 3373 bytes (`b64url`) |
 
-Codes default to a 15-minute TTL, are capped at `MAX_LIVE_PAIRING_CODES = 4` concurrent live codes (`CoreError::ProtocolViolation` when `>= 4` unexpired codes exist), and burn after 5 failed claim attempts across live codes. Manual pairing requires explicit SAS confirmation before leaving `pending` state unless an operator opts in via fingerprint-only confirmation. For opt-in headless deployment without interactive SAS, `PairClaim` carries `enrollment_token`, `signing_pub`, and `enroll_proof` instead of `code_mac`, requires an out-of-band host pin (`PinnedHost`), burns the token nonce atomically, and transitions directly to `"active"` with zero application grants; see [Machine-to-machine enrollment](m2m-enrollment.md).
+Codes default to a 15-minute TTL, are capped at `MAX_LIVE_PAIRING_CODES = 4` concurrent live codes (`CoreError::ProtocolViolation` when `>= 4` unexpired codes exist), and burn after 5 failed claim attempts across live codes. Manual pairing requires explicit SAS confirmation before leaving `pending` state unless an operator opts in via fingerprint-only confirmation. The human `PairClaim` also carries the initiator's hybrid `signing_pub` with a key proof bound to `h` and its static key, verified after the code burns, so the host pins the key it needs for groups (`spec/pairing-v1.md` Section 4.1). Peers paired before that change have no pinned key: a re-pair records it and returns an `active` entry to `pending` until the operator confirms the new SAS. A claim with a different key than one pinned for the same static key, under any label, is refused; signing keys change only through rotation. A keyless claim cannot replace the SAS of a `pending` entry that holds an unconfirmed key. A Wire v1 responder built before the change rejects a keyed claim as `protocol_error`. For opt-in headless deployment without interactive SAS, `PairClaim` carries `enrollment_token`, `signing_pub`, and `enroll_proof` instead of `code_mac`, requires an out-of-band host pin (`PinnedHost`), burns the token nonce atomically, and transitions directly to `"active"` with zero application grants; see [Machine-to-machine enrollment](m2m-enrollment.md).
 
 ## Inner encrypted frames and rotation
 

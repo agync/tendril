@@ -13,7 +13,7 @@ Each Tendril endpoint maintains two long-lived cryptographic keypairs:
 | Key | Algorithm | Size | Role |
 |---|---|---|---|
 | Static keypair | X25519 | 32 B private scalar, 32 B public | Noise `s` key; identifies peer across sessions |
-| Signing keypair | Hybrid Ed25519 + ML-DSA-65 | 32 B Ed25519 seed + 32 B ML-DSA-65 seed; `1984 B` public (`32 B` Ed25519 \|\| `1952 B` ML-DSA-65) | Signs grants, rotation records, CRLs, and M2M proofs (`3373 B` sig with context `"tendril-hybrid-v1"`); `32 B` Ed25519 prefix authenticates relay mailboxes |
+| Signing keypair | Hybrid Ed25519 + ML-DSA-65 | 32 B Ed25519 seed + 32 B ML-DSA-65 seed; `1984 B` public (`32 B` Ed25519 \|\| `1952 B` ML-DSA-65) | Signs grants, rotation records, CRLs, M2M proofs, and pairing key proofs (`3373 B` sig with context `"tendril-hybrid-v1"`); `32 B` Ed25519 prefix authenticates relay mailboxes |
 
 On platforms whose hardware enclaves do not support Curve25519 or ML-DSA-65 directly (for example Apple Secure Enclave or Android StrongBox P-256 enclaves), X25519, Ed25519, and ML-DSA-65 keys are generated in `tendril-core`, persisted wrapped by OS Keychain or Android Keystore AES keys, and zeroized from memory on drop.
 
@@ -107,6 +107,34 @@ code_mac = HMAC-SHA256(key = K, msg = "tendril-pair-v1" || h)
 - `"tendril-pair-v1"` is the exact 15-byte ASCII label (`0x74 65 6e 64 72 69 6c 2d 70 61 69 72 2d 76 31`) concatenated directly with the 32-byte `h` (47 bytes total, no separator).
 - Verification MUST compare the computed 32-byte MAC against `PairClaim.code_mac` using constant-time equality (`subtle::ConstantTimeEq`).
 
+### 4.1 Signing Key Claim
+
+A human `PairClaim` carries the initiator's current hybrid signing key so the responder can pin it (for example to add the peer to a group, `groups-v1.md`). `signing_pub` is the `b64url` 1984-byte key and `enroll_proof` the `b64url` 3373-byte hybrid signature that binds it to this handshake and this initiator static key:
+
+```text
+key_proof_bytes = "tendril-pair-key-v1\0" (20 B) || h (32 B) || peer_static_pub (32 B)
+enroll_proof    = Ed25519(peer_ed25519_priv, key_proof_bytes)
+               || ML-DSA-65(peer_mldsa65_priv, key_proof_bytes, ctx = "tendril-hybrid-v1")
+```
+
+- `h` is the post-`msg2` handshake hash (the `code_mac` input on Wire v1; `h_post` on Wire v2 PAKE, `wire-v2.md` Section 3.2.2). `peer_static_pub` is the initiator static key authenticated by Noise. The domain differs from the M2M `enroll_proof` domain (Section 7.2).
+- A human `PairClaim` MUST carry both `signing_pub` and `enroll_proof`. Responders MUST accept a human claim that carries neither (pre-change initiators) and record no key. A claim that carries exactly one of the two is `protocol_error` and does not burn the code (on Wire v1 the code is not checked; on Wire v2 PAKE it was already authenticated by `msg1` and `init_confirm_mac`).
+- The responder verifies and burns the code first (Section 5), then decodes `signing_pub` and `enroll_proof` (`protocol_error` if malformed) and verifies both signature halves strictly against `signing_pub` (`unauthorized` on failure). Any failure leaves the roster unchanged; the code stays burned.
+- Recording rules, checked in this order. "Entry" is the one labelled `device_id(peer_static_pub)`; rows 1 and 3 also apply to entries with the same static key under another label (a `host_id`, or a label kept across rotation):
+
+| Existing entry | Effect of the claim |
+|---|---|
+| `revoked`, or a claimed key that shares identity with a `revoked` entry or trust anchor | `revoked`, nothing changes |
+| none | New `pending` entry, with the key if claimed |
+| `pending` or `active` with a different pinned key | Keyed claim: `protocol_error`, nothing changes. A pinned signing key changes only through a verified `RotationRecord` chain (`wire-v1.md` Section 4) |
+| `pending` with a key, keyless claim | `protocol_error`, nothing changes: the SAS that guards an unconfirmed key is never replaced by a pairing that did not prove it |
+| `pending`, no key | Key (if claimed) recorded; SAS replaced; stays `pending` |
+| `active`, no key (paired before this section) | Keyed claim: key recorded and the entry returns to `pending`; `pair.confirm` with the new SAS re-activates it, keeping its grants. Keyless claim: SAS replaced, state unchanged |
+| `pending` or `active` with the same key, or `active` with a key and a keyless claim | SAS replaced; no key or state change |
+
+- A claimed key is never usable for grant or group decisions until the operator confirms the SAS of the pairing that delivered it.
+- **Compatibility (pre-1.0):** a Wire v1 responder built before this section rejects a keyed human claim as `protocol_error` (it requires every M2M field to be absent). Initiators MUST NOT retry without the proof. A Wire v2 responder built before this section accepts the claim and ignores both fields. Peers code-paired before this section have no pinned key until they re-pair and the operator confirms the new SAS.
+
 ---
 
 ## 5. Pairing Lifecycle and State Transitions
@@ -120,7 +148,7 @@ code_mac = HMAC-SHA256(key = K, msg = "tendril-pair-v1" || h)
 - **Retry budget:** At most **5** failed `pair` claim attempts per code lifetime. Because a wrong-code or MITM-relayed claim cannot be attributed to a single live code in constant time without leaking existence, every failed `pair` claim increments the failure counter on all currently live codes and burns any code reaching 5 failures. To prevent pairing-window status oracles, responders run a uniform dummy KDF pass when zero live codes exist and return the uniform `"unauthorized"` error code across invalid, expired, or burned pairing codes.
 - **Single-use burn:** A successful `pair` claim immediately burns the matched code.
 - **Re-pairing rules:**
-  - Re-pairing an already `active` static key updates metadata if needed and stays `active`.
+  - Re-pairing an already `active` static key updates metadata if needed and stays `active`, except that a verified signing key claim for an `active` entry without a key returns it to `pending` (Section 4.1).
   - Re-pairing a `revoked` static key MUST fail (`Revoked`) and keep the peer `revoked`; the matched pairing code still burns so an attacker cannot probe live codes with a revoked device.
   - A peer in `pending` state MUST NOT open `intent = session` connections until an operator runs `pair.confirm` after comparing `device_fingerprint` and `pairing_sas`. Whenever a live pairing SAS was recorded during pairing, `pair.confirm` MUST require explicit SAS matching and MUST fail closed if omitted; out-of-band fingerprint-only confirmation requires an explicit opt-in API or flag (`--allow-no-sas`).
 - **Grant separation:** `pair.confirm` marks the roster entry `active` with zero non-session grants by default. Minting capabilities (`pair.mint`) is an independent operation.
