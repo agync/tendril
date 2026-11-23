@@ -13,10 +13,11 @@ use tendril_core::group::GroupManifest;
 use tendril_ffi::{
     TENDRIL_ERR_CLOSED, TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_ERR_PROTOCOL,
     TENDRIL_OK, TENDRIL_WOULD_BLOCK, TendrilEndpoint, TendrilGroup, tendril_endpoint_close,
-    tendril_endpoint_enroll_initiate, tendril_endpoint_export_identity_json, tendril_endpoint_free,
-    tendril_endpoint_info_json, tendril_endpoint_mint_enrollment_token, tendril_endpoint_new,
-    tendril_endpoint_new_from_state, tendril_endpoint_new_sealed, tendril_endpoint_pair_accept,
-    tendril_endpoint_serve_direct, tendril_group_add_member, tendril_group_authorize_peer,
+    tendril_endpoint_configure_transports_json, tendril_endpoint_enroll_initiate,
+    tendril_endpoint_export_identity_json, tendril_endpoint_free, tendril_endpoint_info_json,
+    tendril_endpoint_mint_enrollment_token, tendril_endpoint_new, tendril_endpoint_new_from_state,
+    tendril_endpoint_new_sealed, tendril_endpoint_pair_accept, tendril_endpoint_serve_direct,
+    tendril_endpoint_serve_relay, tendril_group_add_member, tendril_group_authorize_peer,
     tendril_group_broadcast, tendril_group_close, tendril_group_create, tendril_group_free,
     tendril_group_ingest_manifest, tendril_group_local_endpoint, tendril_group_open,
     tendril_group_poll_event, tendril_group_remove_member, tendril_group_sync, tendril_last_error,
@@ -25,7 +26,8 @@ use tendril_ffi::{
     tendril_string_free,
 };
 use tendril_runtime::{
-    DirectDialer, PathDialer, SessionDriver, StateStore, deserialize_identity_json,
+    DirectDialer, EmbeddedRelay, PathDialer, RelayClientAuth, RelayDialer, RelayV2Dialer,
+    SessionDriver, StateStore, deserialize_identity_json,
 };
 
 unsafe fn take_cstr(ptr: *mut c_char) -> String {
@@ -1282,4 +1284,279 @@ fn concurrent_group_accepts_honour_each_callers_deadline_v2() {
     assert!(sess.is_null());
     assert_eq!(err.as_deref(), Some("listener closed"));
     unsafe { tendril_group_free(group) };
+}
+
+const RELAY_SECRET: &str = "tendril-group-relay-hmac-secret-32";
+
+fn configure_relay_auth(node: &Node) {
+    let cfg = cstr(&format!(r#"{{"relay_auth_secret":"{RELAY_SECRET}"}}"#));
+    assert_eq!(
+        unsafe { tendril_endpoint_configure_transports_json(node.ep, cfg.as_ptr()) },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+}
+
+/// The group mailbox `node` registers on a relay, once its store holds the group key.
+fn group_mailbox(node: &Node, gid: &str) -> Option<[u8; 32]> {
+    let book = StateStore::open_or_create(node.dir.path())
+        .unwrap()
+        .load_group_book()
+        .unwrap();
+    let secrets = book.secrets(gid)?;
+    Some(*tendril_core::group::derive_group_mailbox_secret(
+        secrets.group_rendezvous_key(),
+        secrets.seq(),
+        &node.id,
+    ))
+}
+
+/// Dials `mailbox` on the auth-required relay the way a sibling does: it answers once the
+/// mailbox has a registration.
+fn mailbox_registered(rt: &tokio::runtime::Runtime, url: &str, mailbox: [u8; 32]) -> bool {
+    let secret =
+        tendril_core::relay_auth::RelayAuthSecret::from_bytes(RELAY_SECRET.as_bytes()).unwrap();
+    let epoch = tendril_core::v2::epoch_for_unix(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    rt.block_on(
+        RelayV2Dialer::new(mailbox)
+            .with_auth(RelayClientAuth::HmacSecret(secret))
+            .connect_for_epoch(url, epoch),
+    )
+    .is_ok()
+}
+
+fn wait_mailbox_registered(rt: &tokio::runtime::Runtime, url: &str, node: &Node, gid: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(mailbox) = group_mailbox(node, gid)
+            && mailbox_registered(rt, url, mailbox)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "group mailbox of {} never registered on the relay",
+            node.id
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn ffi_group_hub_serves_and_dials_v2_relay_with_relay_auth() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let relay = rt
+        .block_on(EmbeddedRelay::start(tendril_relay::RelayConfig {
+            host: "127.0.0.1".to_owned(),
+            auth_secret: Some(zeroize::Zeroizing::new(RELAY_SECRET.as_bytes().to_vec())),
+            auth_scope: tendril_core::relay_auth::RelayAuthScope::All,
+            ..tendril_relay::RelayConfig::default()
+        }))
+        .unwrap();
+    let url = relay.ws_v2_url();
+
+    let a = Node::new();
+    let b = Node::new();
+    configure_relay_auth(&a);
+    configure_relay_auth(&b);
+    pair(&a, &b);
+
+    // `a` is reachable only through the relay. `b` also runs a pool listener, so the root can push
+    // the group key to it; `b` dials `a` over the relay alone.
+    let addr_b = free_addr();
+    let name = cstr("relay-auth");
+    let endpoints = cstr(&serde_json::to_string(&[&url]).unwrap());
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_group_create(a.ep, name.as_ptr(), 2, endpoints.as_ptr(), &raw mut out) },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    let created: Value = serde_json::from_str(&unsafe { take_cstr(out) }).unwrap();
+    let gid = created["group_id"].as_str().unwrap().to_owned();
+    let hints = cstr(&serde_json::to_string(&[addr_b.as_str(), url.as_str()]).unwrap());
+    let gid_c = cstr(&gid);
+    let peer = cstr(&b.id);
+    assert_eq!(
+        unsafe {
+            tendril_group_add_member(
+                a.ep,
+                gid_c.as_ptr(),
+                peer.as_ptr(),
+                ptr::null(),
+                hints.as_ptr(),
+                &raw mut out,
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    let manifest = unsafe { take_cstr(out) };
+    assert_eq!(ingest(&b, &manifest, &a.id).unwrap(), gid);
+
+    // No stream has reached either endpoint: opening the group starts the hub, and the pool's
+    // book watcher registers the root's group mailbox by itself, with the relay auth.
+    let ga = open(&a, &gid);
+    let gb = open_at(&b, &gid, Some(&addr_b));
+    wait_mailbox_registered(&rt, &url, &a, &gid);
+
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_group_sync(ga, &raw mut out) },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    let report: Value = serde_json::from_str(&unsafe { take_cstr(out) }).unwrap();
+    assert_eq!(report["delivered"], serde_json::json!([b.id]), "{report}");
+
+    // With the key pushed, the member registers its own group mailbox as well.
+    wait_mailbox_registered(&rt, &url, &b, &gid);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let report = loop {
+        let report = broadcast(gb, b"over the relay");
+        if report["delivered"] == serde_json::json!([a.id]) || Instant::now() > deadline {
+            break report;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(report["delivered"], serde_json::json!([a.id]), "{report}");
+    let ev = wait_event(ga, "app_data");
+    assert_eq!(ev["sender_device_id"], b.id.as_str());
+    assert_eq!(
+        b64url_decode(ev["payload_b64"].as_str().unwrap()).unwrap(),
+        b"over the relay"
+    );
+    for g in [ga, gb] {
+        unsafe { tendril_group_free(g) };
+    }
+}
+
+/// Dials the identity mailbox `relay_pub` on a `/v1/relay` URL the way a peer does: `Ok(true)`
+/// once something is registered there, `Ok(false)` while the relay answers `offline`.
+fn v1_mailbox_registered(
+    rt: &tokio::runtime::Runtime,
+    url: &str,
+    relay_pub: &[u8; 32],
+) -> Result<bool, String> {
+    match rt.block_on(RelayDialer::new().connect(url, relay_pub)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.to_string().contains("offline") => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[test]
+fn ffi_group_hub_leaves_a_served_v1_relay_mailbox_to_the_app() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let relay = rt
+        .block_on(EmbeddedRelay::start(tendril_relay::RelayConfig {
+            host: "127.0.0.1".to_owned(),
+            ..tendril_relay::RelayConfig::default()
+        }))
+        .unwrap();
+    // A second relay addressed as `localhost` is the control: its canonical host differs from the
+    // served `127.0.0.1` while both bind plain 127.0.0.1 (the only loopback address every CI
+    // host configures). The app does not serve it, so the pool registers the identity there, and
+    // that registration is the observable proof that the pool's mailbox plan ran.
+    let control = rt
+        .block_on(EmbeddedRelay::start(tendril_relay::RelayConfig {
+            host: "localhost".to_owned(),
+            ..tendril_relay::RelayConfig::default()
+        }))
+        .unwrap();
+    let v1_url = relay.ws_url();
+    let control_url = format!("ws://localhost:{}/v1/relay", control.local_addr().port());
+
+    let a = Node::new();
+    let b = Node::new();
+    pair(&a, &b);
+    let url_c = cstr(&v1_url);
+    let mut served = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_relay(a.ep, url_c.as_ptr(), ptr::null(), &raw mut served) },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    let served = unsafe { take_cstr(served) };
+    let relay_pub = b64url_decode_array::<32>(served.rsplit('#').next().unwrap()).unwrap();
+    let served = cstr(&served);
+
+    // The root's own entry names both relays, the served one first. The app serves the first
+    // mailbox, so the hub must not register a pool on it: ordinary sessions keep arriving
+    // through the app. The second relay is not served, so the hub registers the identity there.
+    let name = cstr("served-v1");
+    let endpoints = cstr(&serde_json::to_string(&[&v1_url, &control_url]).unwrap());
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_group_create(a.ep, name.as_ptr(), 1, endpoints.as_ptr(), &raw mut out) },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    let created: Value = serde_json::from_str(&unsafe { take_cstr(out) }).unwrap();
+    let group = open(&a, created["group_id"].as_str().unwrap());
+
+    // Both mailbox tasks of the plan start in one watcher pass, so once the control is
+    // registered the pool has already had its chance at the served host.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !v1_mailbox_registered(&rt, &control_url, &relay_pub).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "the pool never registered the identity on the unserved relay"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // The accept runs in a scoped thread that always joins before any assertion, so no failure
+    // can free the endpoint while the thread still uses it.
+    let a_ep = a.ep as usize;
+    let b_ep = b.ep as usize;
+    let (client, server) = thread::scope(|scope| {
+        let accept = scope.spawn(move || {
+            (unsafe { tendril_session_accept(a_ep as *mut TendrilEndpoint, 10_000) }) as usize
+        });
+        let target = cstr(&a.id);
+        let client = unsafe {
+            tendril_session_connect(
+                b_ep as *mut TendrilEndpoint,
+                served.as_ptr(),
+                ptr::null(),
+                target.as_ptr(),
+                ptr::null(),
+            )
+        };
+        (
+            client,
+            accept.join().unwrap() as *mut tendril_ffi::TendrilSession,
+        )
+    });
+    let outcome = format!(
+        "connect null: {}, accept null: {}",
+        client.is_null(),
+        server.is_null()
+    );
+    unsafe {
+        for s in [client, server] {
+            if !s.is_null() {
+                tendril_session_shutdown(s);
+                tendril_session_free(s);
+            }
+        }
+        tendril_group_free(group);
+    }
+    assert!(
+        !client.is_null() && !server.is_null(),
+        "the app's served mailbox was displaced: {outcome}"
+    );
 }
