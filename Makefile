@@ -101,6 +101,7 @@ bindings/web: bindings/wasm bindings/wasm-p2p ## Run Web SDK security tests, con
 	cargo build -p tendril-relay --bin tendril-relay
 	cargo build -p tendril-cli --bin tendril-conformance-peer
 	node --test bindings/web/test/security.test.mjs
+	node --test bindings/web/test/group.test.mjs
 	node bindings/web/test/browser_e2e.mjs
 
 bindings/jni: ## Build tendril_jni shared library and run host JVM conformance tests

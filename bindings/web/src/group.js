@@ -11,6 +11,12 @@ export const DEFAULT_GROUP_SEND_TIMEOUT_MS = 1000;
 const EVENT_QUEUE_CAP = 1024;
 const CONTROL_EVENT_RESERVE = 64;
 const DEFAULT_PUMP_POLL_MS = 250;
+/** Distinct queued audit entries one sender may hold; further distinct entries are dropped from the queue (listeners still see them). */
+const MAX_AUDIT_ENTRIES_PER_SENDER = 8;
+
+function copyAudit(audit) {
+  return audit !== null && typeof audit === "object" && !Array.isArray(audit) ? { ...audit } : audit;
+}
 
 function errText(err) {
   return err && err.message ? err.message : String(err);
@@ -41,6 +47,9 @@ export class TendrilWebGroup {
   #pumps = new Map();
   #queue = [];
   #waiters = [];
+  #auditQueued = new Map();
+  #auditKeys = new WeakMap();
+  #auditPerSender = new Map();
   #listeners = new Map();
   #closed = false;
   #localRevoked = false;
@@ -201,7 +210,7 @@ export class TendrilWebGroup {
         try {
           this.#backend.authorizeInbound(sender, cap);
         } catch (err) {
-          this.#emit(this.#audit(sender, cap, errText(err)));
+          this.#emitAudit(sender, this.#audit(sender, cap, errText(err)));
           return;
         }
         this.#emitData(sender, event.data_b64);
@@ -214,20 +223,21 @@ export class TendrilWebGroup {
         try {
           await this.#backend.ingestManifest(session, event);
         } catch (err) {
-          this.#emit(this.#audit(sender, "group.manifest", errText(err)));
+          this.#emitAudit(sender, this.#audit(sender, "group.manifest", errText(err)));
         }
         return;
       }
       case "group_rendezvous_unverified": {
         if (event.group_id === this.#groupId && event.applied === false) {
-          this.#emit(
+          this.#emitAudit(
+            sender,
             this.#audit(sender, `group.admin:${this.#groupId}`, event.error ?? "rendezvous refused")
           );
         }
         return;
       }
       case "audit": {
-        this.#emit({ event: "audit", audit: event.audit });
+        this.#emitAudit(sender, event.audit);
         return;
       }
       default:
@@ -349,50 +359,114 @@ export class TendrilWebGroup {
 
   #audit(subject, cap, reason) {
     return {
-      event: "audit",
-      audit: {
-        ts: Math.floor(Date.now() / 1000),
-        subject: subject ?? "unknown",
-        cap,
-        grant_nonce: null,
-        allow: false,
-        reason,
-      },
+      ts: Math.floor(Date.now() / 1000),
+      subject: subject ?? "unknown",
+      cap,
+      grant_nonce: null,
+      allow: false,
+      reason,
     };
   }
 
   #emitData(sender, payloadB64) {
     if (this.#queue.length >= EVENT_QUEUE_CAP - CONTROL_EVENT_RESERVE) {
-      this.#emit(
+      this.#emitAudit(
+        sender,
         this.#audit(sender, `group.send:${this.#groupId}`, "event queue full; app data dropped")
       );
       return;
     }
-    this.#emit({
-      event: "app_data",
-      sender_device_id: sender,
-      payload_b64: payloadB64,
-    });
+    this.#emit(
+      {
+        event: "app_data",
+        sender_device_id: sender,
+        payload_b64: payloadB64,
+      },
+      EVENT_QUEUE_CAP - CONTROL_EVENT_RESERVE
+    );
   }
 
-  #emit(event) {
+  #notify(name, make) {
+    for (const key of [name, "*"]) {
+      for (const fn of this.#listeners.get(key) ?? []) {
+        try {
+          fn(make());
+        } catch {}
+      }
+    }
+  }
+
+  /**
+   * Delivers a non-audit event. Listeners run first; admission is decided afterwards against the
+   * live queue length: control events may fill the whole queue, `app_data` stops at `limit`.
+   */
+  #emit(event, limit = EVENT_QUEUE_CAP) {
     if (this.#closed) {
       return;
     }
-    for (const name of [event.event, "*"]) {
-      for (const fn of this.#listeners.get(name) ?? []) {
-        try {
-          fn(event);
-        } catch {}
-      }
+    this.#notify(event.event, () => event);
+    if (this.#closed) {
+      return;
     }
     if (this.#waiters.length > 0) {
       this.#waiters.shift()(event);
       return;
     }
-    if (this.#queue.length < EVENT_QUEUE_CAP) {
+    if (this.#queue.length < limit) {
       this.#queue.push(event);
     }
+  }
+
+  /**
+   * Delivers a peer-triggered audit. Audits never use the control-event reserve and are coalesced
+   * per authenticated sender: one queued entry holds the latest audit in full plus a count. A new
+   * distinct entry is queued only below the app-data threshold and while the sender holds fewer than
+   * `MAX_AUDIT_ENTRIES_PER_SENDER` entries; otherwise it is dropped from the queue (never merged into
+   * another cap). Listeners always see every audit, and already queued keys keep counting.
+   */
+  #emitAudit(sender, audit) {
+    if (this.#closed) {
+      return;
+    }
+    const latest = copyAudit(audit);
+    this.#notify("audit", () => ({ event: "audit", audit: copyAudit(latest), count: 1 }));
+    if (this.#closed) {
+      return;
+    }
+    if (this.#waiters.length > 0) {
+      this.#waiters.shift()({ event: "audit", audit: copyAudit(latest), count: 1 });
+      return;
+    }
+    const owner = sender ?? "unknown";
+    const key = this.#auditKey(owner, latest);
+    const queued = this.#auditQueued.get(key);
+    if (queued) {
+      queued.audit = copyAudit(latest);
+      queued.count += 1;
+      return;
+    }
+    if (
+      this.#queue.length < EVENT_QUEUE_CAP - CONTROL_EVENT_RESERVE &&
+      (this.#auditPerSender.get(owner) ?? 0) < MAX_AUDIT_ENTRIES_PER_SENDER
+    ) {
+      const entry = { event: "audit", audit: copyAudit(latest), count: 1 };
+      this.#queue.push(entry);
+      this.#auditQueued.set(key, entry);
+      this.#auditKeys.set(entry, key);
+      this.#auditPerSender.set(owner, (this.#auditPerSender.get(owner) ?? 0) + 1);
+    }
+  }
+
+  /**
+   * Coalescing key: (sender, allow or deny outcome, cap). A deny is never merged into an allow and
+   * caps stay separate, so a later audit cannot mask an earlier refusal. Keys are never shared
+   * between distinct caps; the volume per sender is bounded by `MAX_AUDIT_ENTRIES_PER_SENDER`
+   * in `#emitAudit`, which drops new distinct entries once the sender holds that many.
+   */
+  #auditKey(sender, audit) {
+    const outcome = audit !== null && typeof audit === "object" && audit.allow === true ? "allow" : "deny";
+    const cap = audit !== null && typeof audit === "object" && typeof audit.cap === "string" ? audit.cap : "";
+    return JSON.stringify([sender, outcome, cap]);
   }
 
   /** Subscribes `fn` to `app_data`, `manifest_updated`, `member_joined`, `member_revoked`, `audit`, or `"*"`. */
@@ -412,7 +486,19 @@ export class TendrilWebGroup {
    */
   pollEvent(timeoutMs = 5000) {
     if (this.#queue.length > 0) {
-      return Promise.resolve(this.#queue.shift());
+      const event = this.#queue.shift();
+      const key = this.#auditKeys.get(event);
+      if (key !== undefined && this.#auditQueued.get(key) === event) {
+        this.#auditQueued.delete(key);
+        const sender = JSON.parse(key)[0];
+        const left = (this.#auditPerSender.get(sender) ?? 1) - 1;
+        if (left > 0) {
+          this.#auditPerSender.set(sender, left);
+        } else {
+          this.#auditPerSender.delete(sender);
+        }
+      }
+      return Promise.resolve(event);
     }
     if (this.#closed) {
       return Promise.resolve(null);
@@ -442,6 +528,8 @@ export class TendrilWebGroup {
     this.#sessions.clear();
     this.#pumps.clear();
     this.#queue.length = 0;
+    this.#auditQueued.clear();
+    this.#auditPerSender.clear();
     for (const waiter of this.#waiters.splice(0)) {
       waiter(null);
     }

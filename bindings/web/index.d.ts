@@ -300,7 +300,12 @@ export type GroupEvent =
   | { event: "member_joined"; device_id: string }
   /** A peer left the group, or the local device itself did (then the group stops all delivery). */
   | { event: "member_revoked"; device_id: string }
-  | { event: "audit"; audit: unknown };
+  /**
+   * Refused or passthrough audit. Queued audits are coalesced per authenticated sender: `audit` is the
+   * most recent one in full and `count` is how many audits from that sender the entry covers. Listeners
+   * see every audit with `count: 1`.
+   */
+  | { event: "audit"; audit: unknown; count: number };
 
 export interface GroupSession {
   readonly peerDeviceId: string | null;
