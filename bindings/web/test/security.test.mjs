@@ -261,16 +261,35 @@ test("SEC-21 RelayStream enforces byte/frame caps, drops post-close frames, and 
   assert.deepEqual(closeCalls, [{ code: 1000, reason: "closed" }]);
 });
 
-test("SEC-23 & SEC-27 demo/server.mjs emits security headers, 404s server.mjs, and validates WebSocket upgrades", async () => {
-  const upstreamCaptured = [];
-  const upstreamServer = net.createServer((sock) => {
+// Fake relay upstream for the demo/server.mjs proxy tests. A loopback listener can also be
+// reached by other processes on the host (local service discovery sends `GET /`), so a connection
+// counts only if its first request targets a relay path or carries this test's random WebSocket
+// key, which every request the test sends through the proxy does. Ignored requests are kept for
+// messages. Every complete request head on a counted connection is captured, so a proxy that
+// forwards the upgrade twice on one socket is seen as two requests.
+async function startFakeRelayUpstream(wsKey) {
+  const captured = [];
+  const ignored = [];
+  const server = net.createServer((sock) => {
     let acc = Buffer.alloc(0);
+    let counted = false;
+    sock.on("error", () => {});
     sock.on("data", (chunk) => {
       acc = Buffer.concat([acc, chunk]);
-      const str = acc.toString("utf8");
-      const endIdx = str.indexOf("\r\n\r\n");
-      if (endIdx >= 0) {
-        upstreamCaptured.push(str.slice(0, endIdx + 4));
+      for (let endIdx = acc.indexOf("\r\n\r\n"); endIdx >= 0; endIdx = acc.indexOf("\r\n\r\n")) {
+        const head = acc.subarray(0, endIdx + 4).toString("utf8");
+        acc = acc.subarray(endIdx + 4);
+        if (counted) {
+          captured.push(head);
+          continue;
+        }
+        if (!/^GET \/v[12]\/relay[ ?]/.test(head) && !head.includes(wsKey)) {
+          ignored.push(head.split("\r\n", 1)[0]);
+          sock.destroy();
+          return;
+        }
+        counted = true;
+        captured.push(head);
         sock.write(
           "HTTP/1.1 101 Switching Protocols\r\n" +
             "Upgrade: websocket\r\n" +
@@ -281,8 +300,58 @@ test("SEC-23 & SEC-27 demo/server.mjs emits security headers, 404s server.mjs, a
       }
     });
   });
-  await new Promise((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
-  const upstreamPort = upstreamServer.address().port;
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return {
+    server,
+    port: server.address().port,
+    captured,
+    describeIgnored: () => `ignored foreign requests: ${JSON.stringify(ignored)}`,
+  };
+}
+
+test("fake relay upstream captures every request head written to one socket", async () => {
+  const key = crypto.randomBytes(16).toString("base64");
+  const upstream = await startFakeRelayUpstream(key);
+  const head =
+    `GET /v1/relay HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n` +
+    `Connection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`;
+  const writeOnOneSocket = (chunks) =>
+    new Promise((resolve, reject) => {
+      const opts = { port: upstream.port, host: "127.0.0.1", allowHalfOpen: true };
+      const sock = net.connect(opts, async () => {
+        for (const chunk of chunks) {
+          sock.write(chunk);
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        sock.end();
+      });
+      sock.on("error", reject);
+      sock.on("data", () => {});
+      sock.on("close", resolve);
+    });
+  const waitForCaptured = async (n) => {
+    for (let i = 0; i < 100 && upstream.captured.length < n; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+  try {
+    await writeOnOneSocket([head + head]);
+    await waitForCaptured(2);
+    assert.equal(upstream.captured.length, 2, "two heads in one write");
+    await writeOnOneSocket([head, head]);
+    await waitForCaptured(4);
+    assert.equal(upstream.captured.length, 4, "two heads in separate writes");
+  } finally {
+    upstream.server.close();
+  }
+});
+
+test("SEC-23 & SEC-27 demo/server.mjs emits security headers, 404s server.mjs, and validates WebSocket upgrades", async () => {
+  const validKey = crypto.randomBytes(16).toString("base64");
+  const upstream = await startFakeRelayUpstream(validKey);
+  const upstreamCaptured = upstream.captured;
+  const upstreamServer = upstream.server;
+  const upstreamPort = upstream.port;
 
   let demoServer;
   try {
@@ -305,7 +374,6 @@ test("SEC-23 & SEC-27 demo/server.mjs emits security headers, 404s server.mjs, a
     const leakedSource = await fetch(`${demoServer.baseUrl}/demo/server.mjs`);
     assert.equal(leakedSource.status, 404);
 
-    const validKey = "dGhlIHNhbXBsZSBub25jZQ==";
     const badUpgrades = [
       `GET /v1/relay?leak=1 HTTP/1.1\r\nHost: 127.0.0.1:${demoServer.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${validKey}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
       `GET /other HTTP/1.1\r\nHost: 127.0.0.1:${demoServer.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${validKey}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
@@ -319,7 +387,7 @@ test("SEC-23 & SEC-27 demo/server.mjs emits security headers, 404s server.mjs, a
       const resp = await sendRawTcpRequest(demoServer.port, raw);
       assert.ok(resp.startsWith("HTTP/1.1 400 ") || resp.startsWith("HTTP/1.1 404 "), resp);
     }
-    assert.equal(upstreamCaptured.length, 0);
+    assert.equal(upstreamCaptured.length, 0, upstream.describeIgnored());
 
     const goodUpgrade =
       `GET /v1/relay HTTP/1.1\r\n` +
@@ -332,7 +400,7 @@ test("SEC-23 & SEC-27 demo/server.mjs emits security headers, 404s server.mjs, a
       `Cookie: session=secret\r\n\r\n`;
     const okResp = await sendRawTcpRequest(demoServer.port, goodUpgrade);
     assert.ok(okResp.startsWith("HTTP/1.1 101 "), okResp);
-    assert.equal(upstreamCaptured.length, 1);
+    assert.equal(upstreamCaptured.length, 1, upstream.describeIgnored());
     assert.match(upstreamCaptured[0], /^GET \/v1\/relay HTTP\/1\.1\r\n/);
     assert.doesNotMatch(upstreamCaptured[0], /X-Forwarded-For:/i);
     assert.doesNotMatch(upstreamCaptured[0], /Cookie:/i);
@@ -1576,27 +1644,11 @@ test("PRIV-04 & PRIV-05 v1 connect fails pre-flight on v2 peer before dialing; v
 });
 
 test("PRIV-08 demo/server.mjs allows /v2/relay upgrade while rejecting query strings", async () => {
-  const upstreamCaptured = [];
-  const upstreamServer = net.createServer((sock) => {
-    let acc = Buffer.alloc(0);
-    sock.on("data", (chunk) => {
-      acc = Buffer.concat([acc, chunk]);
-      const str = acc.toString("utf8");
-      const endIdx = str.indexOf("\r\n\r\n");
-      if (endIdx >= 0) {
-        upstreamCaptured.push(str.slice(0, endIdx + 4));
-        sock.write(
-          "HTTP/1.1 101 Switching Protocols\r\n" +
-            "Upgrade: websocket\r\n" +
-            "Connection: Upgrade\r\n" +
-            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
-        );
-        sock.end();
-      }
-    });
-  });
-  await new Promise((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
-  const upstreamPort = upstreamServer.address().port;
+  const validKey = crypto.randomBytes(16).toString("base64");
+  const upstream = await startFakeRelayUpstream(validKey);
+  const upstreamCaptured = upstream.captured;
+  const upstreamServer = upstream.server;
+  const upstreamPort = upstream.port;
 
   let demoServer;
   try {
@@ -1604,7 +1656,6 @@ test("PRIV-08 demo/server.mjs allows /v2/relay upgrade while rejecting query str
       relayHost: "127.0.0.1",
       relayPort: upstreamPort,
     });
-    const validKey = "dGhlIHNhbXBsZSBub25jZQ==";
     const badV2Query =
       `GET /v2/relay?leak=1 HTTP/1.1\r\n` +
       `Host: 127.0.0.1:${demoServer.port}\r\n` +
@@ -1624,7 +1675,7 @@ test("PRIV-08 demo/server.mjs allows /v2/relay upgrade while rejecting query str
       `Sec-WebSocket-Version: 13\r\n\r\n`;
     const okResp = await sendRawTcpRequest(demoServer.port, goodV2);
     assert.ok(okResp.startsWith("HTTP/1.1 101 "), okResp);
-    assert.equal(upstreamCaptured.length, 1);
+    assert.equal(upstreamCaptured.length, 1, upstream.describeIgnored());
     assert.match(upstreamCaptured[0], /^GET \/v2\/relay HTTP\/1\.1\r\n/);
   } finally {
     if (demoServer) demoServer.child.kill();
