@@ -5,6 +5,7 @@ import CryptoKit
 import Security
 #endif
 import Testing
+import CTendril
 @testable import Tendril
 
 private final class SendableBox<T>: @unchecked Sendable {
@@ -373,6 +374,238 @@ struct TendrilConformanceTests {
     #expect(obj1["static_pub"] as? String == obj2["static_pub"] as? String)
     #expect(obj1["signing_pub"] as? String == obj2["signing_pub"] as? String)
   }
+
+  #if canImport(CryptoKit) && canImport(Security)
+  @Test
+  func keychainSealedEndpointHostsGroupAcrossRestart() throws {
+    let fm = FileManager.default
+    let rootDir = fm.temporaryDirectory.appendingPathComponent("tendril-swift-grp-a-\(UUID().uuidString)")
+    let memberDir = fm.temporaryDirectory.appendingPathComponent("tendril-swift-grp-b-\(UUID().uuidString)")
+    defer {
+      try? fm.removeItem(at: rootDir)
+      try? fm.removeItem(at: memberDir)
+    }
+    let rootKey = SymmetricKey(size: .bits256)
+    let memberKey = SymmetricKey(size: .bits256)
+    let rootKc = TendrilKeychainStore(service: "dev.tendril.state.test", account: "grp-a") { rootKey }
+    let memberKc = TendrilKeychainStore(service: "dev.tendril.state.test", account: "grp-b") { memberKey }
+
+    func decodeB64Url(_ s: String) -> Data {
+      var b64 = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+      while b64.count % 4 != 0 { b64.append("=") }
+      return Data(base64Encoded: b64)!
+    }
+    func object(_ json: String) throws -> [String: Any] {
+      try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+    }
+    func broadcastUntilDelivered(_ group: TendrilGroup, _ payload: String) throws -> [String: Any] {
+      let deadline = Date().addingTimeInterval(15)
+      while true {
+        let report = try object(group.broadcast(Data(payload.utf8)))
+        if (report["delivered"] as? [Any])?.count == 1 || Date() > deadline {
+          return report
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+      }
+    }
+    func waitAppData(_ group: TendrilGroup) throws -> [String: Any] {
+      let deadline = Date().addingTimeInterval(15)
+      while Date() < deadline {
+        guard let raw = try group.pollEvent(timeoutMs: 500) else { continue }
+        let ev = try object(raw)
+        if ev["event"] as? String == "app_data" {
+          return ev
+        }
+      }
+      throw TendrilError.invalidArgument("no app_data event in time")
+    }
+
+    let root = try TendrilEndpoint(stateDir: rootDir.path, keychainStore: rootKc)
+    defer { root.close() }
+    let rootInfo = try object(root.infoJson())
+    let rootId = rootInfo["device_id"] as! String
+    let rootAddr = try root.serveDirect(listenAddr: "127.0.0.1:0")
+
+    var member = try TendrilEndpoint(stateDir: memberDir.path, keychainStore: memberKc)
+    let memberInfo = try object(member.infoJson())
+    let memberId = memberInfo["device_id"] as! String
+    let token = try root.mintEnrollmentToken(targetHostId: rootId, subject: memberId, ttlSecs: 300)
+    let queue = DispatchQueue(label: "tendril.swift.sealed-group")
+    let acceptSem = DispatchSemaphore(value: 0)
+    queue.async {
+      _ = try? root.pairAccept(timeoutMs: 10_000)
+      acceptSem.signal()
+    }
+    _ = try member.enrollInitiate(
+      endpoint: rootAddr,
+      hostId: rootId,
+      hostStaticPub: decodeB64Url(rootInfo["static_pub"] as! String),
+      hostSigningPub: decodeB64Url(rootInfo["signing_pub"] as! String),
+      tokenJson: token
+    )
+    #expect(acceptSem.wait(timeout: .now() + 10.0) == .success)
+
+    let created = try object(root.groupCreate(name: "swift-sealed", endpointsJson: "[\"\(rootAddr)\"]"))
+    let gid = created["group_id"] as! String
+    let manifest = try root.groupAddMember(groupId: gid, peerId: memberId)
+    #expect(try member.groupIngestManifest(manifestJson: manifest, senderPeerId: rootId) == gid)
+
+    let rootGroup = try root.openGroup(groupId: gid)
+    defer { rootGroup.close() }
+    let first = try member.openGroup(groupId: gid)
+    #expect((try broadcastUntilDelivered(first, "before")["delivered"] as? [Any])?.count == 1)
+    #expect(try waitAppData(rootGroup)["sender_device_id"] as? String == memberId)
+    first.close()
+    member.close()
+
+    for name in ["rt-groups.sealed", "rt-roster.sealed", "identity.sealed"] {
+      #expect(fm.fileExists(atPath: memberDir.appendingPathComponent(name).path), "\(name)")
+    }
+    for name in ["groups.json", "roster.json", "roster.sealed"] {
+      #expect(!fm.fileExists(atPath: memberDir.appendingPathComponent(name).path), "\(name)")
+    }
+    let excluded = try memberDir.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup
+    #expect(excluded == true)
+
+    member = try TendrilEndpoint(stateDir: memberDir.path, keychainStore: memberKc)
+    let second = try member.openGroup(groupId: gid)
+    #expect((try broadcastUntilDelivered(second, "after")["delivered"] as? [Any])?.count == 1)
+    let ev = try waitAppData(rootGroup)
+    #expect(ev["sender_device_id"] as? String == memberId)
+    #expect(decodeB64Url(ev["payload_b64"] as! String) == Data("after".utf8))
+    second.close()
+    member.close()
+
+    let groupsUrl = memberDir.appendingPathComponent("rt-groups.sealed")
+    var tampered = try Data(contentsOf: groupsUrl)
+    tampered[tampered.count - 1] ^= 0x01
+    try tampered.write(to: groupsUrl)
+    #expect(throws: Error.self) {
+      _ = try TendrilEndpoint(stateDir: memberDir.path, keychainStore: memberKc)
+    }
+  }
+  #endif
+
+  #if canImport(CryptoKit) && canImport(Security)
+  private func jsonObject(_ json: String) throws -> [String: Any] {
+    try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+  }
+
+  private func sealedRosterJson(_ dir: URL, _ identityJson: String) throws -> String {
+    let ep = dir.path.withCString { cDir in
+      identityJson.withCString { cId in tendril_endpoint_new_sealed(cDir, cId, nil, nil) }
+    }
+    guard let ep else {
+      throw TendrilError.invalidArgument("tendril_endpoint_new_sealed failed")
+    }
+    defer { tendril_endpoint_free(ep) }
+    var out: UnsafeMutablePointer<CChar>?
+    guard tendril_endpoint_export_roster_json(ep, &out) == TENDRIL_OK.rawValue, let out else {
+      throw TendrilError.invalidArgument("tendril_endpoint_export_roster_json failed")
+    }
+    defer { tendril_string_free(out) }
+    return String(cString: out)
+  }
+
+  @Test
+  func keychainSealedEndpointMigratesLegacyRosterOnce() throws {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("tendril-swift-mig-\(UUID().uuidString)")
+    defer { try? fm.removeItem(at: base) }
+    let rootDir = base.appendingPathComponent("a")
+    let memberDir = base.appendingPathComponent("b")
+    let legacyDir = base.appendingPathComponent("c")
+    let rootKey = SymmetricKey(size: .bits256)
+    let memberKey = SymmetricKey(size: .bits256)
+    let rootKc = TendrilKeychainStore(service: "dev.tendril.state.test", account: "mig-a") { rootKey }
+    let memberKc = TendrilKeychainStore(service: "dev.tendril.state.test", account: "mig-b") { memberKey }
+    func decodeB64Url(_ s: String) -> Data {
+      var b64 = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+      while b64.count % 4 != 0 { b64.append("=") }
+      return Data(base64Encoded: b64)!
+    }
+
+    let root = try TendrilEndpoint(stateDir: rootDir.path, keychainStore: rootKc)
+    defer { root.close() }
+    let rootInfo = try jsonObject(root.infoJson())
+    let rootHostId = rootInfo["host_id"] as! String
+    let rootAddr = try root.serveDirect(listenAddr: "127.0.0.1:0")
+    let member = try TendrilEndpoint(stateDir: memberDir.path, keychainStore: memberKc)
+    let memberId = try jsonObject(member.infoJson())["device_id"] as! String
+    let token = try root.mintEnrollmentToken(targetHostId: rootHostId, subject: memberId, ttlSecs: 300)
+    let acceptSem = DispatchSemaphore(value: 0)
+    DispatchQueue(label: "tendril.swift.migrate").async {
+      _ = try? root.pairAccept(timeoutMs: 10_000)
+      acceptSem.signal()
+    }
+    _ = try member.enrollInitiate(
+      endpoint: rootAddr,
+      hostId: rootHostId,
+      hostStaticPub: decodeB64Url(rootInfo["static_pub"] as! String),
+      hostSigningPub: decodeB64Url(rootInfo["signing_pub"] as! String),
+      tokenJson: token
+    )
+    #expect(acceptSem.wait(timeout: .now() + 10.0) == .success)
+    member.close()
+
+    let identityJson = try #require(
+      try SealedSwiftStateStore(dirPath: memberDir.path, keychain: memberKc).loadIdentityJson()
+    )
+    func hasRoot(_ rosterJson: String) throws -> Bool {
+      (try jsonObject(rosterJson)["entries"] as? [String: Any])?[rootHostId] != nil
+    }
+    let rosterJson = try sealedRosterJson(memberDir, identityJson)
+    #expect(try hasRoot(rosterJson))
+
+    // A pre-runtime binding directory: identity plus a nonempty binding-sealed roster.
+    try SealedSwiftStateStore(dirPath: legacyDir.path, keychain: memberKc).saveIdentityJson(identityJson)
+    let legacy = legacyDir.appendingPathComponent("roster.sealed")
+    try memberKc.sealState(Data(rosterJson.utf8), authenticating: Data("tendril.roster.v1".utf8))
+      .write(to: legacy)
+    let migrated = try TendrilEndpoint(stateDir: legacyDir.path, keychainStore: memberKc)
+    #expect(try jsonObject(migrated.infoJson())["device_id"] as? String == memberId)
+    migrated.close()
+    #expect(!fm.fileExists(atPath: legacy.path))
+    #expect(fm.fileExists(atPath: legacyDir.appendingPathComponent("rt-roster.sealed").path))
+    #expect(try hasRoot(sealedRosterJson(legacyDir, identityJson)))
+
+    // Cleanup interrupted after migration: the leftover is deleted unread, even if corrupt.
+    try Data([1, 2, 3]).write(to: legacy)
+    try TendrilEndpoint(stateDir: legacyDir.path, keychainStore: memberKc).close()
+    #expect(!fm.fileExists(atPath: legacy.path))
+    #expect(try hasRoot(sealedRosterJson(legacyDir, identityJson)))
+  }
+
+  @Test
+  func keychainConcurrentFirstOpensShareOneIdentity() throws {
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("tendril-swift-race-\(UUID().uuidString)")
+    defer { try? fm.removeItem(at: dir) }
+    let key = SymmetricKey(size: .bits256)
+    let kc = TendrilKeychainStore(service: "dev.tendril.state.test", account: "race") { key }
+
+    let lock = NSLock()
+    var ids: [String] = []
+    DispatchQueue.concurrentPerform(iterations: 4) { _ in
+      let id: String
+      do {
+        let ep = try TendrilEndpoint(stateDir: dir.path, keychainStore: kc)
+        defer { ep.close() }
+        id = try jsonObject(ep.infoJson())["device_id"] as! String
+      } catch {
+        id = "error: \(error)"
+      }
+      lock.lock()
+      ids.append(id)
+      lock.unlock()
+    }
+    #expect(ids.count == 4)
+    #expect(Set(ids).count == 1, "\(ids)")
+    let again = try TendrilEndpoint(stateDir: dir.path, keychainStore: kc)
+    defer { again.close() }
+    #expect(try jsonObject(again.infoJson())["device_id"] as? String == ids.first)
+  }
+  #endif
 
   @Test
   func configureTransportsJSONValidation() throws {

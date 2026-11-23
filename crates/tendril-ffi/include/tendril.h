@@ -71,6 +71,16 @@ TendrilEndpoint *tendril_endpoint_new_from_state(
     const char *roster_json_opt,
     const char *host_id_opt
 );
+/* Like tendril_endpoint_new_from_state, but the runtime persists roster and group state itself in
+ * state_dir (rt-roster.sealed, rt-groups.sealed), sealed under a key derived from the identity.
+ * Group secrets never cross this boundary. Without identity_json_opt an identity is generated and
+ * no runtime state is written: save it, then reopen with it. roster_json_opt needs
+ * identity_json_opt and is parsed and written only for a directory with no runtime state (ignored
+ * otherwise). Callers that generate and save an identity must serialize that per state_dir across
+ * threads and processes (the bindings hold an exclusive lock on state_dir/.identity.lock). NULL
+ * (last error set) when state_dir is NULL or empty or the state cannot be opened. */
+TendrilEndpoint *tendril_endpoint_new_sealed(const char *state_dir, const char *identity_json_opt,
+                                             const char *roster_json_opt, const char *host_id_opt);
 int32_t tendril_endpoint_close(TendrilEndpoint *ep);
 void tendril_endpoint_free(TendrilEndpoint *ep);
 
@@ -181,12 +191,12 @@ TendrilSession *tendril_session_connect_v2(TendrilEndpoint *ep, const char *endp
 TendrilSession *tendril_session_accept_v2(TendrilEndpoint *ep, uint64_t timeout_ms);
 
 /*
- * Group mesh. Admin calls need an endpoint with a state directory and return manifest JSON (public;
- * rendezvous keys and pairwise secrets never cross this boundary). Free every out string with
- * tendril_string_free. caps_json and endpoints_json are null or a JSON array of strings.
+ * Group mesh. Admin calls need a state-directory or sealed endpoint and return manifest JSON
+ * (public; rendezvous keys and pairwise secrets never cross this boundary). Free every out string
+ * with tendril_string_free. caps_json and endpoints_json are null or a JSON array of strings.
  *
  * Ordinary-session 0x0A/0x0B frames: tendril_session_poll_event hands them to the runtime on
- * endpoints with a state directory and reports group_manifest_ingested, group_manifest_rejected,
+ * state-directory or sealed endpoints and reports group_manifest_ingested, group_manifest_rejected,
  * group_rendezvous_ingested or group_rendezvous_rejected ({group_id, seq, error?}). Store-less
  * endpoints keep reporting group_manifest_unverified and group_rendezvous_unverified.
  */

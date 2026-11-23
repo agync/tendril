@@ -16,6 +16,7 @@ pub mod policy;
 pub mod relay_auth;
 pub mod roster;
 pub mod session;
+pub mod state_seal;
 pub mod v2;
 pub mod wire;
 

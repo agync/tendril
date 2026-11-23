@@ -72,6 +72,8 @@ private func withOptionalValidatedCString<R>(
 internal final class SealedSwiftStateStore {
   private static let identityFile = "identity.sealed"
   private static let rosterFile = "roster.sealed"
+  private static let bootstrapLockFile = ".identity.lock"
+  private static let runtimeFiles = ["rt-roster.sealed", "rt-groups.sealed"]
   private static let identityAad = Data("tendril.identity.v1".utf8)
   private static let rosterAad = Data("tendril.roster.v1".utf8)
 
@@ -100,6 +102,12 @@ internal final class SealedSwiftStateStore {
       )
     }
     try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dirUrl.path)
+    // Restoring an older runtime state file would roll back group membership and revocations,
+    // so the directory never enters a backup.
+    var values = URLResourceValues()
+    values.isExcludedFromBackup = true
+    var url = dirUrl
+    try url.setResourceValues(values)
   }
 
   private func readSealed(fileName: String, aad: Data) throws -> String? {
@@ -138,6 +146,9 @@ internal final class SealedSwiftStateStore {
       guard fm.createFile(atPath: tmp.path, contents: sealed, attributes: attrs) else {
         throw TendrilKeychainError.invalidData
       }
+      let handle = try FileHandle(forWritingTo: tmp)
+      defer { try? handle.close() }
+      try handle.synchronize()
       if fm.fileExists(atPath: target.path) {
         _ = try fm.replaceItemAt(target, withItemAt: tmp)
       } else {
@@ -161,27 +172,48 @@ internal final class SealedSwiftStateStore {
     try writeSealed(fileName: Self.identityFile, json: json, aad: Self.identityAad)
   }
 
+  /// Reads the pre-runtime binding roster, kept only to seed a directory once.
   func loadRosterJson() throws -> String? {
     lock.lock()
     defer { lock.unlock() }
     return try readSealed(fileName: Self.rosterFile, aad: Self.rosterAad)
   }
 
-  func saveRoster(_ exportJson: () throws -> String) throws {
+  /// Whether the legacy roster still needs migrating: it exists and the runtime has no state.
+  func legacyRosterNeedsMigration() -> Bool {
+    let fm = FileManager.default
+    let path = { (name: String) in self.dirUrl.appendingPathComponent(name, isDirectory: false).path }
+    return fm.fileExists(atPath: path(Self.rosterFile))
+      && !Self.runtimeFiles.contains { fm.fileExists(atPath: path($0)) }
+  }
+
+  /// Deletes the pre-runtime binding roster, if any, without reading it. A concurrent delete is
+  /// not an error.
+  func deleteLegacyRoster() throws {
     lock.lock()
     defer { lock.unlock() }
-    let json = try exportJson()
-    try writeSealed(fileName: Self.rosterFile, json: json, aad: Self.rosterAad)
+    let path = dirUrl.appendingPathComponent(Self.rosterFile, isDirectory: false).path
+    if Darwin.unlink(path) != 0 && errno != ENOENT {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
   }
-}
 
-private func exportEndpointRosterJson(_ h: OpaquePointer) throws -> String {
-  var out: UnsafeMutablePointer<CChar>?
-  let rc = tendril_endpoint_export_roster_json(h, &out)
-  guard rc == TENDRIL_OK.rawValue else {
-    throw ffiError(rc, fallback: "tendril_endpoint_export_roster_json failed")
+  /// Runs `body` holding an exclusive `flock` on `.identity.lock`, which serializes identity
+  /// bootstrap across threads (each call opens its own descriptor) and processes.
+  func withBootstrapLock<T>(_ body: () throws -> T) throws -> T {
+    let path = dirUrl.appendingPathComponent(Self.bootstrapLockFile, isDirectory: false).path
+    let fd = Darwin.open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
+    guard fd >= 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    defer { _ = Darwin.close(fd) }
+    while flock(fd, LOCK_EX) != 0 {
+      guard errno == EINTR else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+      }
+    }
+    return try body()
   }
-  return takeOutCString(out)
 }
 #endif
 
@@ -324,14 +356,14 @@ public enum TendrilCrypto {
   }
 }
 
+/// A Tendril endpoint. With a `stateDir`, the identity is sealed by the Keychain in
+/// `identity.sealed` and the runtime persists roster and group state itself in `rt-roster.sealed`
+/// and `rt-groups.sealed`, sealed under a key derived from that identity.
 public final class TendrilEndpoint {
   private let cond = NSCondition()
   private var handle: OpaquePointer?
   private var activeCalls: Int = 0
   private var closing: Bool = false
-  #if canImport(CryptoKit) && canImport(Security)
-  private let stateStore: SealedSwiftStateStore?
-  #endif
 
   #if canImport(CryptoKit) && canImport(Security)
   public init(
@@ -344,38 +376,9 @@ public final class TendrilEndpoint {
         dirPath: stateDir,
         keychain: keychainStore ?? TendrilKeychainStore()
       )
-      let idJson = try store.loadIdentityJson()
-      let rosterJson = try store.loadRosterJson()
-      let raw = try withOptionalValidatedCString(idJson, name: "identityJson") { cId in
-        try withOptionalValidatedCString(rosterJson, name: "rosterJson") { cRoster in
-          try withOptionalValidatedCString(hostId, name: "hostId") { cHost in
-            tendril_endpoint_new_from_state(cId, cRoster, cHost)
-          }
-        }
+      self.handle = try store.withBootstrapLock {
+        try Self.openSealed(store, stateDir: stateDir, hostId: hostId)
       }
-      guard let raw else {
-        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new_from_state failed")
-      }
-      do {
-        if idJson == nil {
-          var out: UnsafeMutablePointer<CChar>?
-          let rc = tendril_endpoint_export_identity_json(raw, &out)
-          guard rc == TENDRIL_OK.rawValue else {
-            throw ffiError(rc, fallback: "tendril_endpoint_export_identity_json failed")
-          }
-          try store.saveIdentityJson(takeOutCString(out))
-        }
-        if rosterJson == nil {
-          try store.saveRoster {
-            try exportEndpointRosterJson(raw)
-          }
-        }
-      } catch {
-        tendril_endpoint_free(raw)
-        throw error
-      }
-      self.stateStore = store
-      self.handle = raw
     } else {
       let raw = try withOptionalValidatedCString(hostId, name: "hostId") { cHost in
         tendril_endpoint_new_from_state(nil, nil, cHost)
@@ -383,7 +386,6 @@ public final class TendrilEndpoint {
       guard let raw else {
         throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new_from_state failed")
       }
-      self.stateStore = nil
       self.handle = raw
     }
   }
@@ -398,6 +400,56 @@ public final class TendrilEndpoint {
       throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new failed")
     }
     self.handle = raw
+  }
+  #endif
+
+  #if canImport(CryptoKit) && canImport(Security)
+  private static func newSealed(
+    _ stateDir: String, _ identityJson: String?, _ rosterJson: String?, _ hostId: String?
+  ) throws -> OpaquePointer {
+    let raw = try withValidatedCString(stateDir, name: "stateDir") { cDir in
+      try withOptionalValidatedCString(identityJson, name: "identityJson") { cId in
+        try withOptionalValidatedCString(rosterJson, name: "rosterJson") { cRoster in
+          try withOptionalValidatedCString(hostId, name: "hostId") { cHost in
+            tendril_endpoint_new_sealed(cDir, cId, cRoster, cHost)
+          }
+        }
+      }
+    }
+    guard let raw else {
+      throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new_sealed failed")
+    }
+    return raw
+  }
+
+  /// Saves a generated identity before any runtime state exists under it, then opens with it.
+  /// The reopen syncs the directory, so `identity.sealed` is durable before the first runtime
+  /// write, and seeds the runtime roster from a legacy `roster.sealed` only when needed.
+  private static func openSealed(
+    _ store: SealedSwiftStateStore, stateDir: String, hostId: String?
+  ) throws -> OpaquePointer {
+    var identity = try store.loadIdentityJson()
+    if identity == nil {
+      let fresh = try newSealed(stateDir, nil, nil, hostId)
+      defer { tendril_endpoint_free(fresh) }
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_endpoint_export_identity_json(fresh, &out)
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_export_identity_json failed")
+      }
+      let generated = takeOutCString(out)
+      try store.saveIdentityJson(generated)
+      identity = generated
+    }
+    let seed: String? = try store.legacyRosterNeedsMigration() ? store.loadRosterJson() : nil
+    let raw = try newSealed(stateDir, identity, seed, hostId)
+    do {
+      try store.deleteLegacyRoster()
+    } catch {
+      tendril_endpoint_free(raw)
+      throw error
+    }
+    return raw
   }
   #endif
 
@@ -456,17 +508,6 @@ public final class TendrilEndpoint {
       cond.unlock()
     }
     return try body(h)
-  }
-
-  private func persistRoster(_ h: OpaquePointer) throws {
-    #if canImport(CryptoKit) && canImport(Security)
-    guard let store = stateStore else { return }
-    try store.saveRoster {
-      try exportEndpointRosterJson(h)
-    }
-    #else
-    _ = h
-    #endif
   }
 
   public func infoJson() throws -> String {
@@ -611,9 +652,7 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_pair_initiate failed")
       }
-      let result = takeOutCString(out)
-      try persistRoster(h)
-      return result
+      return takeOutCString(out)
     }
   }
 
@@ -622,22 +661,9 @@ public final class TendrilEndpoint {
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_endpoint_pair_accept(h, timeoutMs, &out)
       guard rc == TENDRIL_OK.rawValue else {
-        let acceptErr = ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
-        if rc != TENDRIL_WOULD_BLOCK.rawValue && rc != TENDRIL_ERR_CLOSED.rawValue {
-          do {
-            try persistRoster(h)
-          } catch {
-            throw TendrilError.ffi(
-              code: rc,
-              message: "\(acceptErr) (roster persist error: \(error))"
-            )
-          }
-        }
-        throw acceptErr
+        throw ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
       }
-      let result = takeOutCString(out)
-      try persistRoster(h)
-      return result
+      return takeOutCString(out)
     }
   }
 
@@ -667,9 +693,7 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_pair_v2_initiate failed")
       }
-      let result = takeOutCString(out)
-      try persistRoster(h)
-      return result
+      return takeOutCString(out)
     }
   }
 
@@ -678,22 +702,9 @@ public final class TendrilEndpoint {
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_endpoint_pair_v2_accept(h, timeoutMs, &out)
       guard rc == TENDRIL_OK.rawValue else {
-        let acceptErr = ffiError(rc, fallback: "tendril_endpoint_pair_v2_accept failed")
-        if rc != TENDRIL_WOULD_BLOCK.rawValue && rc != TENDRIL_ERR_CLOSED.rawValue {
-          do {
-            try persistRoster(h)
-          } catch {
-            throw TendrilError.ffi(
-              code: rc,
-              message: "\(acceptErr) (roster persist error: \(error))"
-            )
-          }
-        }
-        throw acceptErr
+        throw ffiError(rc, fallback: "tendril_endpoint_pair_v2_accept failed")
       }
-      let result = takeOutCString(out)
-      try persistRoster(h)
-      return result
+      return takeOutCString(out)
     }
   }
 
@@ -707,7 +718,6 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_confirm_peer failed")
       }
-      try persistRoster(h)
     }
   }
 
@@ -722,9 +732,7 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_mint_grant failed")
       }
-      let result = takeOutCString(out)
-      try persistRoster(h)
-      return result
+      return takeOutCString(out)
     }
   }
 
@@ -736,7 +744,6 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_revoke_peer failed")
       }
-      try persistRoster(h)
     }
   }
 
@@ -757,7 +764,6 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_add_trust_anchor failed")
       }
-      try persistRoster(h)
     }
   }
 
@@ -769,7 +775,6 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_revoke_trust_anchor failed")
       }
-      try persistRoster(h)
     }
   }
 
@@ -848,9 +853,7 @@ public final class TendrilEndpoint {
       guard rc == TENDRIL_OK.rawValue else {
         throw ffiError(rc, fallback: "tendril_endpoint_enroll_initiate failed")
       }
-      let result = takeOutCString(out)
-      try persistRoster(h)
-      return result
+      return takeOutCString(out)
     }
   }
 
@@ -871,28 +874,9 @@ public final class TendrilEndpoint {
         }
       }
       guard let raw else {
-        let connectErr = ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect failed")
-        do {
-          try persistRoster(h)
-        } catch {
-          throw TendrilError.ffi(
-            code: TENDRIL_ERR_INTERNAL.rawValue,
-            message: "\(connectErr) (roster persist error: \(error))"
-          )
-        }
-        throw connectErr
+        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect failed")
       }
-      do {
-        try persistRoster(h)
-      } catch {
-        tendril_session_free(raw)
-        throw error
-      }
-      #if canImport(CryptoKit) && canImport(Security)
-      return TendrilSession(handle: raw, stateStore: stateStore)
-      #else
       return TendrilSession(handle: raw)
-      #endif
     }
   }
 
@@ -901,11 +885,7 @@ public final class TendrilEndpoint {
       guard let raw = tendril_session_accept(h, timeoutMs) else {
         throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept failed")
       }
-      #if canImport(CryptoKit) && canImport(Security)
-      return TendrilSession(handle: raw, stateStore: stateStore)
-      #else
       return TendrilSession(handle: raw)
-      #endif
     }
   }
 
@@ -926,56 +906,18 @@ public final class TendrilEndpoint {
         }
       }
       guard let raw else {
-        let connectErr = ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect_v2 failed")
-        do {
-          try persistRoster(h)
-        } catch {
-          throw TendrilError.ffi(
-            code: TENDRIL_ERR_INTERNAL.rawValue,
-            message: "\(connectErr) (roster persist error: \(error))"
-          )
-        }
-        throw connectErr
+        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect_v2 failed")
       }
-      do {
-        try persistRoster(h)
-      } catch {
-        tendril_session_free(raw)
-        throw error
-      }
-      #if canImport(CryptoKit) && canImport(Security)
-      return TendrilSession(handle: raw, stateStore: stateStore)
-      #else
       return TendrilSession(handle: raw)
-      #endif
     }
   }
 
   public func acceptV2(timeoutMs: UInt64) throws -> TendrilSession {
     try withHandle { h in
       guard let raw = tendril_session_accept_v2(h, timeoutMs) else {
-        let acceptErr = ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept_v2 failed")
-        do {
-          try persistRoster(h)
-        } catch {
-          throw TendrilError.ffi(
-            code: TENDRIL_ERR_INTERNAL.rawValue,
-            message: "\(acceptErr) (roster persist error: \(error))"
-          )
-        }
-        throw acceptErr
+        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept_v2 failed")
       }
-      do {
-        try persistRoster(h)
-      } catch {
-        tendril_session_free(raw)
-        throw error
-      }
-      #if canImport(CryptoKit) && canImport(Security)
-      return TendrilSession(handle: raw, stateStore: stateStore)
-      #else
       return TendrilSession(handle: raw)
-      #endif
     }
   }
 }
@@ -985,19 +927,10 @@ public final class TendrilSession {
   private var handle: OpaquePointer?
   private var activeCalls: Int = 0
   private var closing: Bool = false
-  private var lockedPersistError: Error?
-  #if canImport(CryptoKit) && canImport(Security)
-  private let stateStore: SealedSwiftStateStore?
 
-  internal init(handle: OpaquePointer, stateStore: SealedSwiftStateStore? = nil) {
-    self.handle = handle
-    self.stateStore = stateStore
-  }
-  #else
   internal init(handle: OpaquePointer) {
     self.handle = handle
   }
-  #endif
 
   deinit {
     free()
@@ -1039,10 +972,6 @@ public final class TendrilSession {
 
   private func withHandle<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
     cond.lock()
-    if let err = lockedPersistError {
-      cond.unlock()
-      throw err
-    }
     guard !closing, let h = handle else {
       cond.unlock()
       throw TendrilError.closed
@@ -1060,22 +989,6 @@ public final class TendrilSession {
     return try body(h)
   }
 
-  private func persistRoster(_ h: OpaquePointer) throws {
-    #if canImport(CryptoKit) && canImport(Security)
-    guard let store = stateStore else { return }
-    try store.saveRoster {
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = tendril_session_export_roster_json(h, &out)
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_session_export_roster_json failed")
-      }
-      return takeOutCString(out)
-    }
-    #else
-    _ = h
-    #endif
-  }
-
   public func sendData(_ data: Data) throws {
     try withHandle { h in
       let rc = data.withUnsafeBytes { raw in
@@ -1088,42 +1001,13 @@ public final class TendrilSession {
   }
 
   public func pollEvent(timeoutMs: UInt64) throws -> String {
-    var shouldFreeOnPersistFailure = false
-    defer {
-      if shouldFreeOnPersistFailure {
-        free()
-      }
-    }
-    return try withHandle { h in
+    try withHandle { h in
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_session_poll_event(h, timeoutMs, &out)
       guard rc == TENDRIL_OK.rawValue else {
-        if rc != TENDRIL_WOULD_BLOCK.rawValue && rc != TENDRIL_EOF.rawValue {
-          do {
-            try persistRoster(h)
-          } catch {
-            cond.lock()
-            lockedPersistError = error
-            cond.unlock()
-            shouldFreeOnPersistFailure = true
-            throw error
-          }
-        }
         throw ffiError(rc, fallback: "tendril_session_poll_event failed")
       }
-      let ev = takeOutCString(out)
-      if ev.contains("\"revocation_updated\"") {
-        do {
-          try persistRoster(h)
-        } catch {
-          cond.lock()
-          lockedPersistError = error
-          cond.unlock()
-          shouldFreeOnPersistFailure = true
-          throw error
-        }
-      }
-      return ev
+      return takeOutCString(out)
     }
   }
 
@@ -1173,9 +1057,9 @@ extension TendrilEndpoint {
     }
   }
 
-  /// Creates a group rooted at this endpoint and returns the signed manifest JSON. Group APIs are not
-  /// available on keychain-sealed mobile endpoints yet: they throw an invalid-argument error
-  /// ("groups require a state directory endpoint"). `endpointsJson` is nil or a JSON array of strings.
+  /// Creates a group rooted at this endpoint and returns the signed manifest JSON. Group APIs need a
+  /// `stateDir`; an endpoint without one throws an invalid-argument error. `endpointsJson` is nil or
+  /// a JSON array of strings.
   public func groupCreate(name: String, minWireVersion: UInt8 = 1, endpointsJson: String? = nil) throws -> String {
     try manifestCall("tendril_group_create") { h, out in
       try withValidatedCString(name, name: "name") { cName in

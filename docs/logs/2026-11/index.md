@@ -11,3 +11,4 @@ Entries from November 2026.
 - [Cap first-contact group pins per paired peer](23-cap-first-contact-group-pins-per.md)
 - [groups: commit pairwise secrets only on the initiator's kept path](23-groups-commit-pairwise-secrets-only-on.md)
 - [groups: dial and listen on relay sibling links](23-groups-dial-and-listen-on-relay.md)
+- [Groups on sealed Kotlin and Swift endpoints](23-groups-on-sealed-kotlin-and-swift.md)

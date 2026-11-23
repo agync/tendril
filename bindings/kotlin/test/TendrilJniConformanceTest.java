@@ -1501,6 +1501,94 @@ public final class TendrilJniConformanceTest {
     }
   }
 
+  private static Map<String, Object> broadcastUntilDelivered(long group, byte[] payload, int want)
+      throws Exception {
+    long deadline = System.nanoTime() + 15_000_000_000L;
+    while (true) {
+      Map<String, Object> report =
+          asObj(Json.parse(TendrilNative.groupBroadcast(group, null, payload)));
+      if (asArr(report.get("delivered")).size() == want || System.nanoTime() > deadline) {
+        return report;
+      }
+      Thread.sleep(200);
+    }
+  }
+
+  private static void verifySealedGroupState() throws Exception {
+    long a = TendrilNative.endpointNew(tempStateDir("tendril-jni-sa-"), null);
+    String bDir = tempStateDir("tendril-jni-sb-");
+    long b = TendrilNative.endpointNewSealed(bDir, null, null, null);
+    long ga = 0;
+    long gb = 0;
+    try {
+      Map<String, Object> aInfo = asObj(Json.parse(TendrilNative.endpointInfoJson(a)));
+      String aId = asStr(aInfo.get("device_id"));
+      String bId = asStr(asObj(Json.parse(TendrilNative.endpointInfoJson(b))).get("device_id"));
+      String bIdentity = TendrilNative.endpointExportIdentityJson(b);
+      String aAddr = TendrilNative.endpointServeDirect(a, "127.0.0.1:0");
+      String bAddr = freeLoopbackAddr();
+      groupEnroll(a, aInfo, aAddr, b, bId);
+
+      String created =
+          TendrilNative.groupCreate(a, "jni-sealed", 1, Json.stringify(List.of(aAddr)));
+      String gid = asStr(asObj(Json.parse(created)).get("group_id"));
+      String manifest =
+          TendrilNative.groupAddMember(a, gid, bId, null, Json.stringify(List.of(bAddr)));
+      check(gid.equals(TendrilNative.groupIngestManifest(b, manifest, aId)), "sealed ingest");
+
+      ga = TendrilNative.groupOpen(a, gid, null);
+      gb = TendrilNative.groupOpen(b, gid, bAddr);
+      byte[] first = "sealed-before".getBytes(StandardCharsets.UTF_8);
+      Map<String, Object> report = broadcastUntilDelivered(ga, first, 1);
+      check(asArr(report.get("delivered")).size() == 1, "sealed delivery: " + report);
+      waitGroupEvent(gb, "app_data");
+      TendrilNative.groupFree(gb);
+      gb = 0;
+      TendrilNative.endpointClose(b);
+      TendrilNative.endpointFree(b);
+      b = 0;
+
+      Path dir = Paths.get(bDir);
+      check(Files.isRegularFile(dir.resolve("rt-groups.sealed")), "rt-groups.sealed missing");
+      check(Files.isRegularFile(dir.resolve("rt-roster.sealed")), "rt-roster.sealed missing");
+      for (String plain : new String[] {"identity.json", "roster.json", "groups.json"}) {
+        check(!Files.exists(dir.resolve(plain)), "plaintext state written: " + plain);
+      }
+      String noIdentityErr = null;
+      try {
+        TendrilNative.endpointNewSealed(bDir, null, null, null);
+      } catch (RuntimeException e) {
+        noIdentityErr = e.getMessage();
+      }
+      check(
+          noIdentityErr != null && noIdentityErr.contains("no identity was supplied"),
+          "existing sealed state without identity must refuse: " + noIdentityErr);
+
+      b = TendrilNative.endpointNewSealed(bDir, bIdentity, null, null);
+      gb = TendrilNative.groupOpen(b, gid, bAddr);
+      byte[] second = "sealed-after".getBytes(StandardCharsets.UTF_8);
+      report = broadcastUntilDelivered(ga, second, 1);
+      check(asArr(report.get("delivered")).size() == 1, "delivery after restart: " + report);
+      Map<String, Object> ev = waitGroupEvent(gb, "app_data");
+      check(
+          "sealed-after"
+              .equals(new String(b64UrlDecode(asStr(ev.get("payload_b64"))), StandardCharsets.UTF_8)),
+          "payload after restart: " + ev);
+    } finally {
+      for (long g : new long[] {ga, gb}) {
+        if (g != 0) {
+          TendrilNative.groupFree(g);
+        }
+      }
+      for (long ep : new long[] {a, b}) {
+        if (ep != 0) {
+          TendrilNative.endpointClose(ep);
+          TendrilNative.endpointFree(ep);
+        }
+      }
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     Path root = Paths.get("").toAbsolutePath().normalize();
     Path peerBin = root.resolve("target").resolve("debug").resolve("tendril-conformance-peer");
@@ -1517,5 +1605,7 @@ public final class TendrilJniConformanceTest {
     System.out.println("JNI_V2_RELAY_OK=true");
     verifyGroupMesh();
     System.out.println("JNI_GROUP_OK=true");
+    verifySealedGroupState();
+    System.out.println("JNI_SEALED_GROUP_OK=true");
   }
 }

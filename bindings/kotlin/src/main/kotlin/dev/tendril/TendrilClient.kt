@@ -2,10 +2,15 @@ package dev.tendril
 
 import java.io.Closeable
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.PosixFilePermissions
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -14,6 +19,9 @@ internal class SealedStateStore(dirPath: String, private val cipher: KeystoreSta
   companion object {
     private const val IDENTITY_FILE = "identity.sealed"
     private const val ROSTER_FILE = "roster.sealed"
+    private const val BOOTSTRAP_LOCK_FILE = ".identity.lock"
+    private val RUNTIME_FILES = listOf("rt-roster.sealed", "rt-groups.sealed")
+    private val bootstrapMonitors = ConcurrentHashMap<String, Any>()
     private val IDENTITY_AAD = "tendril.identity.v1".toByteArray(Charsets.UTF_8)
     private val ROSTER_AAD = "tendril.roster.v1".toByteArray(Charsets.UTF_8)
     private val DIR_PERMS = PosixFilePermissions.fromString("rwx------")
@@ -69,7 +77,10 @@ internal class SealedStateStore(dirPath: String, private val cipher: KeystoreSta
       try {
         Files.setPosixFilePermissions(tmp, FILE_PERMS)
       } catch (_: UnsupportedOperationException) {}
-      Files.write(tmp, sealed)
+      FileOutputStream(tmp.toFile()).use { out ->
+        out.write(sealed)
+        out.fd.sync()
+      }
       try {
         Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
       } catch (_: AtomicMoveNotSupportedException) {
@@ -88,16 +99,53 @@ internal class SealedStateStore(dirPath: String, private val cipher: KeystoreSta
   fun saveIdentityJson(json: String) =
     synchronized(ioLock) { writeSealed(IDENTITY_FILE, json, IDENTITY_AAD) }
 
+  /**
+   * Runs [block] holding the directory's identity bootstrap lock: a JVM monitor per directory
+   * (a second `FileChannel.lock` in one JVM throws instead of waiting) plus an exclusive file lock
+   * on `.identity.lock` for other processes.
+   */
+  fun <T> withBootstrapLock(block: () -> T): T {
+    val monitor = bootstrapMonitors.computeIfAbsent(root.canonicalPath) { Any() }
+    synchronized(monitor) {
+      val path = File(root, BOOTSTRAP_LOCK_FILE).toPath()
+      FileChannel.open(
+          path,
+          StandardOpenOption.CREATE,
+          StandardOpenOption.WRITE,
+          LinkOption.NOFOLLOW_LINKS,
+        )
+        .use { channel ->
+          try {
+            Files.setPosixFilePermissions(path, FILE_PERMS)
+          } catch (_: UnsupportedOperationException) {}
+          val lock = channel.lock()
+          try {
+            return block()
+          } finally {
+            lock.release()
+          }
+        }
+    }
+  }
+
+  /** Whether the legacy roster still needs migrating: it exists and the runtime has no state. */
+  fun legacyRosterNeedsMigration(): Boolean =
+    File(root, ROSTER_FILE).exists() && RUNTIME_FILES.none { File(root, it).exists() }
+
+  /** Reads the pre-runtime binding roster, kept only to seed a directory once. */
   fun loadRosterJson(): String? = synchronized(ioLock) { readSealed(ROSTER_FILE, ROSTER_AAD) }
 
-  fun saveRoster(exportJson: () -> String) =
-    synchronized(ioLock) { writeSealed(ROSTER_FILE, exportJson(), ROSTER_AAD) }
+  /** Deletes the pre-runtime binding roster, if any, without reading it. */
+  fun deleteLegacyRoster() =
+    synchronized(ioLock) { Files.deleteIfExists(File(root, ROSTER_FILE).toPath()) }
 }
 
-class TendrilEndpoint private constructor(
-  handle: Long,
-  private val stateStore: SealedStateStore?,
-) : Closeable {
+/**
+ * A Tendril endpoint. With a [stateDir], the identity is sealed by [KeystoreStateCipher] in
+ * `identity.sealed` and the runtime persists roster and group state itself in `rt-roster.sealed`
+ * and `rt-groups.sealed`, sealed under a key derived from that identity.
+ */
+class TendrilEndpoint private constructor(handle: Long) : Closeable {
   private val lock = ReentrantReadWriteLock()
   private var handleValue: Long = handle
 
@@ -111,24 +159,40 @@ class TendrilEndpoint private constructor(
     ): TendrilEndpoint {
       val dir = stateDir?.takeIf { it.isNotEmpty() }
       if (dir == null) {
-        return TendrilEndpoint(TendrilNative.endpointNewFromState(null, null, hostId), null)
+        return TendrilEndpoint(TendrilNative.endpointNewFromState(null, null, hostId))
       }
       val store = SealedStateStore(dir, stateCipher ?: KeystoreStateCipher())
-      val existingIdentity = store.loadIdentityJson()
-      val existingRoster = store.loadRosterJson()
-      val ptr = TendrilNative.endpointNewFromState(existingIdentity, existingRoster, hostId)
+      return store.withBootstrapLock { TendrilEndpoint(openSealed(store, dir, hostId)) }
+    }
+
+    /**
+     * Saves a generated identity before any runtime state exists under it, then opens with it.
+     * The reopen syncs the directory, so `identity.sealed` is durable before the first runtime
+     * write, and seeds the runtime roster from a legacy `roster.sealed` only when needed.
+     */
+    private fun openSealed(store: SealedStateStore, dir: String, hostId: String?): Long {
+      val identity =
+        store.loadIdentityJson()
+          ?: run {
+            val fresh = TendrilNative.endpointNewSealed(dir, null, null, hostId)
+            val generated =
+              try {
+                TendrilNative.endpointExportIdentityJson(fresh)
+              } finally {
+                TendrilNative.endpointFree(fresh)
+              }
+            store.saveIdentityJson(generated)
+            generated
+          }
+      val seed = if (store.legacyRosterNeedsMigration()) store.loadRosterJson() else null
+      val ptr = TendrilNative.endpointNewSealed(dir, identity, seed, hostId)
       try {
-        if (existingIdentity == null) {
-          store.saveIdentityJson(TendrilNative.endpointExportIdentityJson(ptr))
-        }
-        if (existingRoster == null) {
-          store.saveRoster { TendrilNative.endpointExportRosterJson(ptr) }
-        }
+        store.deleteLegacyRoster()
       } catch (t: Throwable) {
         TendrilNative.endpointFree(ptr)
         throw t
       }
-      return TendrilEndpoint(ptr, store)
+      return ptr
     }
 
     @JvmStatic fun deviceId(staticPub: ByteArray): String = TendrilNative.deviceId(staticPub)
@@ -192,11 +256,6 @@ class TendrilEndpoint private constructor(
       fn(ptr)
     }
 
-  private fun persistRoster(ptr: Long) {
-    val store = stateStore ?: return
-    store.saveRoster { TendrilNative.endpointExportRosterJson(ptr) }
-  }
-
   fun infoJson(): String = withHandle { TendrilNative.endpointInfoJson(it) }
 
   fun serveDirect(listenAddr: String = "127.0.0.1:0"): String =
@@ -239,26 +298,11 @@ class TendrilEndpoint private constructor(
     deviceKind: String = "android",
   ): String =
     withHandle {
-      val out = TendrilNative.endpointPairInitiate(it, endpoint, relayHost, code, deviceName, deviceKind)
-      persistRoster(it)
-      out
+      TendrilNative.endpointPairInitiate(it, endpoint, relayHost, code, deviceName, deviceKind)
     }
 
   fun pairAccept(timeoutMs: Long): String =
-    withHandle {
-      try {
-        val out = TendrilNative.endpointPairAccept(it, timeoutMs)
-        persistRoster(it)
-        out
-      } catch (t: Throwable) {
-        try {
-          persistRoster(it)
-        } catch (pe: Throwable) {
-          t.addSuppressed(pe)
-        }
-        throw t
-      }
-    }
+    withHandle { TendrilNative.endpointPairAccept(it, timeoutMs) }
 
   fun pairV2Initiate(
     endpoint: String,
@@ -269,66 +313,34 @@ class TendrilEndpoint private constructor(
     pinnedHostJson: String? = null,
   ): String =
     withHandle {
-      val out =
-        TendrilNative.endpointPairV2Initiate(
-          it,
-          endpoint,
-          relayHost,
-          code,
-          deviceName,
-          deviceKind,
-          pinnedHostJson,
-        )
-      persistRoster(it)
-      out
+      TendrilNative.endpointPairV2Initiate(
+        it,
+        endpoint,
+        relayHost,
+        code,
+        deviceName,
+        deviceKind,
+        pinnedHostJson,
+      )
     }
 
   fun pairV2Accept(timeoutMs: Long): String =
-    withHandle {
-      try {
-        val out = TendrilNative.endpointPairV2Accept(it, timeoutMs)
-        persistRoster(it)
-        out
-      } catch (t: Throwable) {
-        try {
-          persistRoster(it)
-        } catch (pe: Throwable) {
-          t.addSuppressed(pe)
-        }
-        throw t
-      }
-    }
+    withHandle { TendrilNative.endpointPairV2Accept(it, timeoutMs) }
 
   fun confirmPeer(peerId: String, sas: String? = null) =
-    withHandle {
-      TendrilNative.endpointConfirmPeer(it, peerId, sas)
-      persistRoster(it)
-    }
+    withHandle { TendrilNative.endpointConfirmPeer(it, peerId, sas) }
 
   fun mintGrant(peerId: String, capsJson: String, ttlSecs: Long = 3600): String =
-    withHandle {
-      val out = TendrilNative.endpointMintGrant(it, peerId, capsJson, ttlSecs)
-      persistRoster(it)
-      out
-    }
+    withHandle { TendrilNative.endpointMintGrant(it, peerId, capsJson, ttlSecs) }
 
   fun revokePeer(peerId: String) =
-    withHandle {
-      TendrilNative.endpointRevokePeer(it, peerId)
-      persistRoster(it)
-    }
+    withHandle { TendrilNative.endpointRevokePeer(it, peerId) }
 
   fun addTrustAnchor(anchorId: String, signingPub: ByteArray) =
-    withHandle {
-      TendrilNative.endpointAddTrustAnchor(it, anchorId, signingPub)
-      persistRoster(it)
-    }
+    withHandle { TendrilNative.endpointAddTrustAnchor(it, anchorId, signingPub) }
 
   fun revokeTrustAnchor(anchorId: String) =
-    withHandle {
-      TendrilNative.endpointRevokeTrustAnchor(it, anchorId)
-      persistRoster(it)
-    }
+    withHandle { TendrilNative.endpointRevokeTrustAnchor(it, anchorId) }
 
   fun mintEnrollmentToken(
     targetHostId: String,
@@ -349,21 +361,18 @@ class TendrilEndpoint private constructor(
     deviceKind: String = "machine",
   ): String =
     withHandle {
-      val out =
-        TendrilNative.endpointEnrollInitiate(
-          it,
-          endpoint,
-          relayHost,
-          hostId,
-          hostStaticPub,
-          hostSigningPub,
-          hostRotationSeq,
-          tokenJson,
-          deviceName,
-          deviceKind,
-        )
-      persistRoster(it)
-      out
+      TendrilNative.endpointEnrollInitiate(
+        it,
+        endpoint,
+        relayHost,
+        hostId,
+        hostStaticPub,
+        hostSigningPub,
+        hostRotationSeq,
+        tokenJson,
+        deviceName,
+        deviceKind,
+      )
     }
 
   fun connect(
@@ -373,33 +382,11 @@ class TendrilEndpoint private constructor(
     grantJson: String? = null,
   ): TendrilSession =
     withHandle {
-      var sessionPtr = 0L
-      try {
-        sessionPtr = TendrilNative.sessionConnect(it, endpoint, relayHost, targetHostId, grantJson)
-        persistRoster(it)
-        val ownedPtr = sessionPtr
-        sessionPtr = 0L
-        TendrilSession(ownedPtr, stateStore)
-      } catch (t: Throwable) {
-        if (sessionPtr != 0L) {
-          try {
-            TendrilNative.sessionFree(sessionPtr)
-          } catch (freeErr: Throwable) {
-            t.addSuppressed(freeErr)
-          }
-        } else {
-          try {
-            persistRoster(it)
-          } catch (pe: Throwable) {
-            t.addSuppressed(pe)
-          }
-        }
-        throw t
-      }
+      TendrilSession(TendrilNative.sessionConnect(it, endpoint, relayHost, targetHostId, grantJson))
     }
 
   fun acceptSession(timeoutMs: Long): TendrilSession =
-    withHandle { TendrilSession(TendrilNative.sessionAccept(it, timeoutMs), stateStore) }
+    withHandle { TendrilSession(TendrilNative.sessionAccept(it, timeoutMs)) }
 
   fun connectV2(
     endpoint: String,
@@ -408,63 +395,18 @@ class TendrilEndpoint private constructor(
     grantJson: String? = null,
   ): TendrilSession =
     withHandle {
-      var sessionPtr = 0L
-      try {
-        sessionPtr = TendrilNative.sessionConnectV2(it, endpoint, relayHost, targetHostId, grantJson)
-        persistRoster(it)
-        val ownedPtr = sessionPtr
-        sessionPtr = 0L
-        TendrilSession(ownedPtr, stateStore)
-      } catch (t: Throwable) {
-        if (sessionPtr != 0L) {
-          try {
-            TendrilNative.sessionFree(sessionPtr)
-          } catch (freeErr: Throwable) {
-            t.addSuppressed(freeErr)
-          }
-        } else {
-          try {
-            persistRoster(it)
-          } catch (pe: Throwable) {
-            t.addSuppressed(pe)
-          }
-        }
-        throw t
-      }
+      TendrilSession(
+        TendrilNative.sessionConnectV2(it, endpoint, relayHost, targetHostId, grantJson)
+      )
     }
 
   fun acceptV2(timeoutMs: Long): TendrilSession =
-    withHandle {
-      var sessionPtr = 0L
-      try {
-        sessionPtr = TendrilNative.sessionAcceptV2(it, timeoutMs)
-        persistRoster(it)
-        val ownedPtr = sessionPtr
-        sessionPtr = 0L
-        TendrilSession(ownedPtr, stateStore)
-      } catch (t: Throwable) {
-        if (sessionPtr != 0L) {
-          try {
-            TendrilNative.sessionFree(sessionPtr)
-          } catch (freeErr: Throwable) {
-            t.addSuppressed(freeErr)
-          }
-        } else {
-          try {
-            persistRoster(it)
-          } catch (pe: Throwable) {
-            t.addSuppressed(pe)
-          }
-        }
-        throw t
-      }
-    }
+    withHandle { TendrilSession(TendrilNative.sessionAcceptV2(it, timeoutMs)) }
 
   /**
-   * Creates a group rooted at this endpoint and returns the signed manifest JSON. Group APIs are
-   * not available on sealed mobile endpoints yet: they fail with an invalid-argument error
-   * ("groups require a state directory endpoint"). [endpointsJson] is null or a JSON array of
-   * strings.
+   * Creates a group rooted at this endpoint and returns the signed manifest JSON. Group APIs need
+   * a [stateDir]; an endpoint without one fails with an invalid-argument error.
+   * [endpointsJson] is null or a JSON array of strings.
    */
   fun groupCreate(name: String, minWireVersion: Int = 1, endpointsJson: String? = null): String =
     withHandle { TendrilNative.groupCreate(it, name, minWireVersion, endpointsJson) }
@@ -509,69 +451,22 @@ class TendrilEndpoint private constructor(
   }
 }
 
-class TendrilSession internal constructor(
-  handle: Long,
-  private val stateStore: SealedStateStore? = null,
-) : Closeable {
+class TendrilSession internal constructor(handle: Long) : Closeable {
   private val lock = ReentrantReadWriteLock()
   private var handleValue: Long = handle
-  @Volatile private var persistError: Throwable? = null
 
   private inline fun <T> withHandle(fn: (Long) -> T): T =
     lock.read {
-      persistError?.let {
-        throw IllegalStateException("TendrilSession locked after roster persistence failure", it)
-      }
       val ptr = handleValue
       check(ptr != 0L) { "TendrilSession is closed" }
       fn(ptr)
     }
 
-  private fun persistRoster(ptr: Long) {
-    val store = stateStore ?: return
-    store.saveRoster { TendrilNative.sessionExportRosterJson(ptr) }
-  }
-
   fun sendData(payload: ByteArray) =
     withHandle { TendrilNative.sessionSendData(it, payload) }
 
-  fun pollEvent(timeoutMs: Long): String {
-    var shouldCloseOnPersistFailure = false
-    try {
-      return withHandle {
-        try {
-          val ev = TendrilNative.sessionPollEvent(it, timeoutMs)
-          if (ev.contains("\"revocation_updated\"")) {
-            try {
-              persistRoster(it)
-            } catch (pe: Throwable) {
-              persistError = pe
-              shouldCloseOnPersistFailure = true
-              throw pe
-            }
-          }
-          ev
-        } catch (t: Throwable) {
-          if (!shouldCloseOnPersistFailure) {
-            try {
-              persistRoster(it)
-            } catch (pe: Throwable) {
-              persistError = pe
-              shouldCloseOnPersistFailure = true
-              t.addSuppressed(pe)
-            }
-          }
-          throw t
-        }
-      }
-    } finally {
-      if (shouldCloseOnPersistFailure) {
-        try {
-          close()
-        } catch (_: Throwable) {}
-      }
-    }
-  }
+  fun pollEvent(timeoutMs: Long): String =
+    withHandle { TendrilNative.sessionPollEvent(it, timeoutMs) }
 
   fun authorize(requestedCap: String): Boolean =
     withHandle { TendrilNative.sessionAuthorize(it, requestedCap) }

@@ -1770,43 +1770,121 @@ pub unsafe extern "C" fn tendril_endpoint_new_from_state(
             return ptr::null_mut();
         };
 
-        let identity = match id_json.filter(|s| !s.is_empty()) {
-            Some(raw) => match deserialize_identity_json(raw) {
-                Ok(id) => id,
-                Err(e) => {
-                    set_last_error(e.to_string());
-                    return ptr::null_mut();
-                }
-            },
-            None => {
-                let mut id = match EndpointIdentity::generate() {
-                    Ok(id) => id,
-                    Err(e) => {
-                        set_last_error(e.to_string());
-                        return ptr::null_mut();
-                    }
-                };
-                if let Some(h) = host_opt
-                    && !h.is_empty()
-                {
-                    id = id.with_host_id(h);
-                }
-                id
+        let identity = match identity_from_json_or_generate(id_json, host_opt) {
+            Ok(id) => id,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let roster = match roster_from_json(roster_json) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
             }
         };
 
-        let roster = match roster_json.filter(|s| !s.is_empty()) {
-            Some(raw) => match serde_json::from_str::<Roster>(raw) {
-                Ok(r) => r,
-                Err(e) => {
-                    set_last_error(format!("invalid roster json: {e}"));
-                    return ptr::null_mut();
-                }
-            },
-            None => Roster::new(),
-        };
-
         build_endpoint_handle(None, identity, roster)
+    })
+}
+
+fn identity_from_json_or_generate(
+    identity_json: Option<&str>,
+    host_id: Option<&str>,
+) -> Result<EndpointIdentity, String> {
+    if let Some(raw) = identity_json.filter(|s| !s.is_empty()) {
+        return deserialize_identity_json(raw).map_err(|e| e.to_string());
+    }
+    let mut id = EndpointIdentity::generate().map_err(|e| e.to_string())?;
+    if let Some(h) = host_id
+        && !h.is_empty()
+    {
+        id = id.with_host_id(h);
+    }
+    Ok(id)
+}
+
+fn roster_from_json(roster_json: Option<&str>) -> Result<Roster, String> {
+    match roster_json.filter(|s| !s.is_empty()) {
+        Some(raw) => serde_json::from_str(raw).map_err(|e| format!("invalid roster json: {e}")),
+        None => Ok(Roster::new()),
+    }
+}
+
+/// Opens `dir` as a sealed runtime store per the sealed open rules: existing runtime state needs
+/// the identity that sealed it, a generated identity writes no runtime state, and `roster_json`
+/// seeds only a directory without runtime state, under the identity the caller already saved.
+fn open_sealed_endpoint_state(
+    dir: &str,
+    identity_json: Option<&str>,
+    roster_json: Option<&str>,
+    host_id: Option<&str>,
+) -> Result<(StateStore, EndpointIdentity, Roster), String> {
+    let seed = roster_json.filter(|s| !s.is_empty());
+    if identity_json.is_none_or(str::is_empty) {
+        if seed.is_some() {
+            return Err("a roster seed requires the saved identity".to_owned());
+        }
+        if StateStore::sealed_state_exists(dir).map_err(|e| e.to_string())? {
+            return Err("sealed runtime state exists but no identity was supplied".to_owned());
+        }
+    }
+    let identity = identity_from_json_or_generate(identity_json, host_id)?;
+    let store = StateStore::open_sealed(dir, &identity).map_err(|e| e.to_string())?;
+    if seed.is_some() {
+        store
+            .seed_roster_if_absent_with(|| roster_from_json(seed).map_err(RuntimeError::Storage))
+            .map_err(|e| e.to_string())?;
+    }
+    let roster = store.load_roster().map_err(|e| e.to_string())?;
+    Ok((store, identity, roster))
+}
+
+/// Creates an endpoint whose roster and group state the runtime persists itself in `state_dir`
+/// (`rt-roster.sealed`, `rt-groups.sealed`), sealed under a key derived from the identity. The
+/// identity stays caller-sealed: without `identity_json_opt` one is generated and nothing is
+/// written, so the caller saves it and reopens with it. `roster_json_opt` needs
+/// `identity_json_opt` and is parsed and written only for a directory with no runtime state.
+///
+/// # Safety
+/// `state_dir`, `identity_json_opt`, `roster_json_opt`, and `host_id_opt` must be null or valid
+/// NUL-terminated UTF-8 C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_new_sealed(
+    state_dir: *const c_char,
+    identity_json_opt: *const c_char,
+    roster_json_opt: *const c_char,
+    host_id_opt: *const c_char,
+) -> *mut TendrilEndpoint {
+    ffi_ptr(|| {
+        let Ok(dir_opt) = (unsafe { opt_cstr_to_str(state_dir, "state_dir") }) else {
+            return ptr::null_mut();
+        };
+        let Ok(id_json) = (unsafe { opt_cstr_to_str(identity_json_opt, "identity_json_opt") })
+        else {
+            return ptr::null_mut();
+        };
+        let Ok(roster_json) = (unsafe { opt_cstr_to_str(roster_json_opt, "roster_json_opt") })
+        else {
+            return ptr::null_mut();
+        };
+        let Ok(host_opt) = (unsafe { opt_cstr_to_str(host_id_opt, "host_id_opt") }) else {
+            return ptr::null_mut();
+        };
+        let Some(dir) = dir_opt.filter(|d| !d.is_empty()) else {
+            set_last_error("state_dir is required for a sealed endpoint");
+            return ptr::null_mut();
+        };
+        match open_sealed_endpoint_state(dir, id_json, roster_json, host_opt) {
+            Ok((store, identity, roster)) => {
+                build_endpoint_handle(Some(Arc::new(store)), identity, roster)
+            }
+            Err(e) => {
+                set_last_error(e);
+                ptr::null_mut()
+            }
+        }
     })
 }
 
