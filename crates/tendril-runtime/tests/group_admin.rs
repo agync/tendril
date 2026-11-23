@@ -14,9 +14,9 @@ use tendril_core::group::{
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::roster::V2PeerSecrets;
 use tendril_runtime::{
-    MAX_LOCAL_GROUPS, MAX_STORED_GROUPS, RuntimeError, StateStore, default_group_caps,
-    group_add_member, group_create, group_forget, group_ingest_manifest, group_remove_member,
-    ingest_pushed_manifest, ingest_pushed_rendezvous,
+    MAX_GROUPS_PER_SIGNER, MAX_LOCAL_GROUPS, MAX_STORED_GROUPS, RuntimeError, StateStore,
+    default_group_caps, group_add_member, group_create, group_forget, group_ingest_manifest,
+    group_remove_member, ingest_pushed_manifest, ingest_pushed_rendezvous,
 };
 
 fn now() -> u64 {
@@ -295,6 +295,92 @@ fn add_refuses_unknown_pending_unkeyed_and_crl_revoked_peers() {
 
     let book = a.store.load_group_book().unwrap();
     assert_eq!(book.manifest(&gid).unwrap().members.len(), 1);
+}
+
+/// `a` pins `x` under the host `label` (with its signing key when `label_signing`) and records
+/// the reverse pairing as a `dev_` entry, keyed when `dev_signing` and confirmed when `confirm`.
+fn reverse_pair(
+    a: &Node,
+    x: &Node,
+    label: &str,
+    label_signing: bool,
+    dev_signing: bool,
+    confirm: bool,
+) {
+    a.store
+        .update_roster(|r| {
+            r.record_pending_pair(
+                *x.identity.static_key().public_bytes(),
+                dev_signing.then(|| x.identity.signing_key().public_key().clone()),
+                "peer".into(),
+                "peer".into(),
+                "1111".into(),
+            )?;
+            if confirm {
+                r.confirm_peer(&x.id(), Some("1111"))?;
+            }
+            r.insert_pinned_host(
+                label.into(),
+                "peer".into(),
+                *x.identity.static_key().public_bytes(),
+                label_signing.then(|| x.identity.signing_key().public_key().clone()),
+                0,
+                vec![],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn add_selects_the_usable_entry_of_a_reverse_paired_peer() {
+    for label in ["a-host", "z-host"] {
+        for (dev_signing, confirm) in [(true, false), (false, true)] {
+            let a = node(0);
+            let b = node(1);
+            let gid = group_create(&a.store, &a.identity, "t", 1, vec![])
+                .unwrap()
+                .group_id;
+            reverse_pair(&a, &b, label, true, dev_signing, confirm);
+            let m = group_add_member(&a.store, &a.identity, &gid, &b.id(), vec![], vec![])
+                .unwrap_or_else(|e| panic!("{label} dev_signing={dev_signing}: {e:?}"));
+            let added = m.members.iter().find(|x| x.device_id == b.id()).unwrap();
+            assert_eq!(added, &b.member("peer", &gid));
+        }
+    }
+}
+
+#[test]
+fn add_refuses_a_peer_with_any_crl_revoked_alias() {
+    for label in ["a-host", "z-host"] {
+        let a = node(0);
+        let b = node(1);
+        let gid = group_create(&a.store, &a.identity, "t", 1, vec![])
+            .unwrap()
+            .group_id;
+        reverse_pair(&a, &b, label, true, true, true);
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: a.id(),
+                seq: 1,
+                revoked_devices: vec![label.to_owned()],
+                revoked_nonces: vec![],
+                ts: "2026-11-22T00:00:00Z".to_owned(),
+            },
+            a.identity.signing_key(),
+        )
+        .unwrap();
+        let a_pub = a.identity.signing_key().public_key().clone();
+        a.store
+            .update_roster(|r| r.ingest_crl(crl, &a.id(), &a_pub).map_err(Into::into))
+            .unwrap();
+        let r = group_add_member(&a.store, &a.identity, &gid, &b.id(), vec![], vec![]);
+        assert!(
+            matches!(r, Err(RuntimeError::Core(CoreError::PeerRevoked(_)))),
+            "{label}: {r:?}"
+        );
+    }
 }
 
 #[test]
@@ -745,4 +831,79 @@ fn host_labeled_root_crl_blocks_a_revoked_co_admin() {
     let (pushed, keyed) = attempt(RootList::RotatedAtDeviceId);
     assert!(is_unauthorized(&pushed), "{pushed:?}");
     assert!(is_unauthorized(&keyed), "{keyed:?}");
+}
+
+/// A group rooted at an unrelated key (`seed`) in which `admin` is a co-admin that signed the
+/// manifest adding `member`.
+fn co_admin_group(seed: u8, admin: &Node, member: &Node) -> GroupManifest {
+    let key = SigningKeypair::from_seed([seed; 32]);
+    let gid = group_id_from_root(key.public_key());
+    let root = GroupMember::new(
+        StaticKeypair::from_scalar([seed; 32]).public_bytes(),
+        "root",
+        key.public_key(),
+        vec![],
+        default_group_caps(&gid),
+    );
+    let root_id = root.device_id.clone();
+    let params = GroupBuildParams::new(now());
+    let (m, s) = create_group(&key, "co", 1, root, params).unwrap();
+    let (m, s) = add_member(
+        &m,
+        &GroupSigner::root(&key),
+        admin.member("admin", &gid),
+        &s,
+        params,
+    )
+    .unwrap();
+    let grant = issue_admin_grant(
+        &key,
+        &root_id,
+        &gid,
+        &admin.id(),
+        admin.identity.signing_key().public_key(),
+        0,
+        params,
+    )
+    .unwrap();
+    let co = GroupSigner::co_admin(admin.identity.signing_key(), admin.id(), grant);
+    add_member(&m, &co, member.member("m", &gid), &s, params)
+        .unwrap()
+        .0
+}
+
+/// First-contact pins pushed by one paired peer are capped; another peer has its own quota.
+#[test]
+fn first_contact_quota_applies_per_paired_peer() {
+    let a = node(0);
+    let b = node(1);
+    let c = node(2);
+    pair(&b, &a, true);
+    pair(&b, &c, true);
+    let total = u8::try_from(MAX_GROUPS_PER_SIGNER).unwrap() + 1;
+    for i in 0..total {
+        let m = co_admin_group(0x30 + i, &a, &b);
+        let json = serde_json::to_string(&m).unwrap();
+        let r = group_ingest_manifest(&b.store, &b.id(), &a.id(), &json);
+        let stored = b
+            .store
+            .load_group_book()
+            .unwrap()
+            .manifest(&m.group_id)
+            .is_some();
+        if i + 1 < total {
+            r.unwrap();
+            assert!(stored);
+        } else {
+            assert!(is_unauthorized(&r), "{r:?}");
+            assert!(!stored);
+        }
+    }
+    let m = co_admin_group(0x40, &c, &b);
+    let json = serde_json::to_string(&m).unwrap();
+    group_ingest_manifest(&b.store, &b.id(), &c.id(), &json).unwrap();
+    assert_eq!(
+        b.store.load_group_book().unwrap().group_ids().len(),
+        MAX_GROUPS_PER_SIGNER + 1
+    );
 }

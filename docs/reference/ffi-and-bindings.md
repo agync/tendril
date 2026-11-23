@@ -51,7 +51,7 @@ Small peer mesh groups ([design](../design/groups.md), `spec/groups-v1.md`) reac
 | Function | Purpose |
 |---|---|
 | `tendril_group_create(ep, name, min_wire_version, endpoints_json, out_manifest_json)` | Root creates a group and persists manifest and secrets |
-| `tendril_group_add_member(ep, group_id, peer_id, caps_json, endpoints_json, out_manifest_json)` | Add a roster peer with a known signing key (M2M-enrolled, or code-paired; peers code-paired before the signing key claim must re-pair and confirm first); `caps_json` and `endpoints_json` are null or a JSON array of strings |
+| `tendril_group_add_member(ep, group_id, peer_id, caps_json, endpoints_json, out_manifest_json)` | Add a roster peer with a known signing key (M2M-enrolled, or code-paired; peers code-paired before the signing key claim must re-pair and confirm first). Every roster entry whose stored or static-derived device id is `peer_id` counts: any revoked entry refuses the add, otherwise one `Active` entry with a signing key is used; `caps_json` and `endpoints_json` are null or a JSON array of strings |
 | `tendril_group_remove_member(ep, group_id, peer_id, out_manifest_json)` | Revoke the member and rotate the rendezvous key |
 | `tendril_group_ingest_manifest(ep, manifest_json, sender_peer_id, out_group_id)` | Ingest a manifest from an authenticated peer; `sender_peer_id` must be the peer that delivered it, and first-contact pinning (F11) applies |
 | `tendril_group_open(ep, group_id, listen_addr, out_group)` | Open a `TendrilGroup *`; `listen_addr` may be NULL, otherwise a direct listener is bound and served |

@@ -1,5 +1,7 @@
 //! Group mesh core tests: manifest verification, ingestion rulings R1 to R8, rendezvous keys, frames.
 
+use std::collections::BTreeSet;
+
 use tendril_core::crypto::{
     HybridSigningPublicKey, SigningKeypair, StaticKeypair, b64url_encode, device_id,
     x25519_public_from_scalar,
@@ -12,8 +14,8 @@ use tendril_core::group::{
     DEFAULT_MANIFEST_VALIDITY_SECS, GROUP_RENDEZVOUS_FRAME_LEN, GroupBook, GroupBuildParams,
     GroupIngestStatus, GroupManifest, GroupManifestUnsigned, GroupMember, GroupSeq, GroupSigner,
     MAX_GOSSIP_GROUPS, MAX_GROUP_CO_ADMINS, MAX_GROUP_MANIFEST_LEN, MAX_GROUP_MEMBERS,
-    MAX_LOCAL_GROUPS, MAX_MANIFEST_VALIDITY_SECS, MAX_REVOKED_MEMBERS, MAX_STORED_GROUPS,
-    V2GroupSecrets, add_member, check_first_contact, check_group_capacity,
+    MAX_GROUPS_PER_SIGNER, MAX_LOCAL_GROUPS, MAX_MANIFEST_VALIDITY_SECS, MAX_REVOKED_MEMBERS,
+    MAX_STORED_GROUPS, V2GroupSecrets, add_member, check_first_contact, check_group_capacity,
     check_rendezvous_local_membership, decode_group_rendezvous_frame, derive_group_mailbox_secret,
     derive_pair_bootstrap, drop_secrets_if_left, encode_group_rendezvous_frame, group_id_from_root,
     group_manifest_signed_bytes, issue_admin_grant, remove_member, renew_manifest, root_crl,
@@ -2706,7 +2708,42 @@ fn first_contact_resolves_peer_by_derived_device_id_not_roster_key() {
             Vec::new(),
         )
         .unwrap();
-    check_first_contact(&roster, &local.id(), &root.id(), &m2).unwrap();
+    let handles = check_first_contact(&roster, &local.id(), &root.id(), &m2).unwrap();
+    assert_eq!(
+        handles,
+        BTreeSet::from(["host-chosen-label".to_owned(), root.id()])
+    );
+
+    // Siblings sharing the static key or the signing identity add their handles; others do not.
+    roster
+        .record_pending_pair(
+            *root.st.public_bytes(),
+            Some(root.sk.public_key().clone()),
+            "peer".to_owned(),
+            "peer".to_owned(),
+            "1111".to_owned(),
+        )
+        .unwrap();
+    roster.confirm_peer(&root.id(), Some("1111")).unwrap();
+    let other_static = Dev::new(48);
+    pin_as(
+        &mut roster,
+        "same-signing",
+        other_static.st.public_bytes(),
+        &root.sk,
+    );
+    let unrelated = Dev::new(49);
+    pin_dev(&mut roster, &unrelated);
+    let handles = check_first_contact(&roster, &local.id(), &root.id(), &m2).unwrap();
+    assert_eq!(
+        handles,
+        BTreeSet::from([
+            "host-chosen-label".to_owned(),
+            root.id(),
+            "same-signing".to_owned(),
+            other_static.id(),
+        ])
+    );
 }
 
 #[test]
@@ -2737,6 +2774,81 @@ fn first_contact_refuses_crl_revoked_signer() {
         unauthorized_msg(&err).contains("active paired peer"),
         "{err}"
     );
+}
+
+/// Pins `dev` under `label` with `signing` and records its reverse pairing as a `dev_` entry,
+/// confirmed when `confirm` is set, so the roster holds two entries sharing one static key.
+fn reverse_paired(dev: &Dev, label: &str, signing: bool, confirm: bool) -> Roster {
+    let mut roster = Roster::new();
+    roster
+        .insert_pinned_host(
+            label.to_owned(),
+            "peer".to_owned(),
+            *dev.st.public_bytes(),
+            signing.then(|| dev.sk.public_key().clone()),
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+    roster
+        .record_pending_pair(
+            *dev.st.public_bytes(),
+            Some(dev.sk.public_key().clone()),
+            "peer".to_owned(),
+            "peer".to_owned(),
+            "1111".to_owned(),
+        )
+        .unwrap();
+    if confirm {
+        roster.confirm_peer(&dev.id(), Some("1111")).unwrap();
+    }
+    roster
+}
+
+#[test]
+fn first_contact_selects_the_usable_entry_of_a_reverse_paired_signer() {
+    let local = Dev::new(3);
+    let (root, m2, _, _) = group_with_local(100, &local);
+    for label in ["a-host", "z-host"] {
+        let keyless_alias = reverse_paired(&root, label, false, true);
+        check_first_contact(&keyless_alias, &local.id(), &root.id(), &m2)
+            .unwrap_or_else(|e| panic!("keyless {label}: {e}"));
+        let pending_dev = reverse_paired(&root, label, true, false);
+        check_first_contact(&pending_dev, &local.id(), &root.id(), &m2)
+            .unwrap_or_else(|e| panic!("pending dev_ with {label}: {e}"));
+    }
+}
+
+#[test]
+fn first_contact_refuses_when_any_alias_of_the_signer_is_revoked() {
+    let local = Dev::new(3);
+    let (root, m2, _, _) = group_with_local(100, &local);
+    let admin = Dev::new(6);
+    for label in ["a-host", "z-host"] {
+        let mut roster = reverse_paired(&root, label, true, true);
+        pin_dev(&mut roster, &admin);
+        check_first_contact(&roster, &local.id(), &root.id(), &m2).unwrap();
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: admin.id(),
+                seq: 1,
+                revoked_devices: vec![label.to_owned()],
+                revoked_nonces: Vec::new(),
+                ts: "2026-11-25T00:00:00Z".to_owned(),
+            },
+            &admin.sk,
+        )
+        .unwrap();
+        roster
+            .ingest_crl(crl, &admin.id(), admin.sk.public_key())
+            .unwrap();
+        let err = check_first_contact(&roster, &local.id(), &root.id(), &m2).unwrap_err();
+        assert!(
+            unauthorized_msg(&err).contains("active paired peer"),
+            "{label}: {err}"
+        );
+    }
 }
 
 #[test]
@@ -3524,4 +3636,418 @@ fn root_crl_fails_closed_on_a_rotated_entry_of_unknown_lineage() {
         assert!(unauthorized_msg(&err).contains("group root key"), "{err}");
     }
     assert_eq!(member.get(&root_dev).unwrap().rotation_seq, 2);
+}
+
+// Per-peer quota for first-contact group pins.
+
+struct Pinned {
+    root: Dev,
+    manifest: GroupManifest,
+    secrets: V2GroupSecrets,
+    grant: tendril_core::grants::Grant,
+}
+
+/// A group rooted at a throwaway key (`root_seed`) in which the peer holding `peer_static` and
+/// `peer_sk` is a co-admin that signed the manifest adding `local`.
+fn co_admin_group(
+    root_seed: u8,
+    peer_static: &[u8; 32],
+    peer_sk: &SigningKeypair,
+    local: &Dev,
+) -> Pinned {
+    let root = Dev::new(root_seed);
+    let gid = group_id_from_root(root.sk.public_key());
+    let (m1, s1) = tendril_core::group::create_group(
+        &root.sk,
+        "g",
+        2,
+        root.member("root", std_caps(&gid)),
+        params(),
+    )
+    .unwrap();
+    let peer_id = device_id(peer_static);
+    let peer = GroupMember::new(
+        peer_static,
+        "peer",
+        peer_sk.public_key(),
+        vec![],
+        std_caps(&gid),
+    );
+    let (m2, s2) = add_member(&m1, &GroupSigner::root(&root.sk), peer, &s1, params()).unwrap();
+    let grant = issue_admin_grant(
+        &root.sk,
+        &root.id(),
+        &gid,
+        &peer_id,
+        peer_sk.public_key(),
+        0,
+        params(),
+    )
+    .unwrap();
+    let signer = GroupSigner::co_admin(peer_sk, peer_id, grant.clone());
+    let (manifest, secrets) = add_member(
+        &m2,
+        &signer,
+        local.member("local", std_caps(&gid)),
+        &s2,
+        params(),
+    )
+    .unwrap();
+    Pinned {
+        root,
+        manifest,
+        secrets,
+        grant,
+    }
+}
+
+/// Runs the first-contact rule and the quota-checked ingest for a push from `sender`.
+fn first_contact_pin(
+    book: &mut GroupBook,
+    roster: &Roster,
+    local: &Dev,
+    sender: &str,
+    manifest: &GroupManifest,
+) -> Result<(), CoreError> {
+    let handles = check_first_contact(roster, &local.id(), sender, manifest)?;
+    book.ingest_first_contact_manifest(manifest, NOW, None, &handles)
+        .map(|_| ())
+}
+
+fn quota_refused(r: Result<(), CoreError>) {
+    let err = r.unwrap_err();
+    assert!(
+        unauthorized_msg(&err).contains("pinned by this peer"),
+        "{err}"
+    );
+}
+
+fn pinned_by(book: &GroupBook, gid: &str) -> serde_json::Value {
+    serde_json::to_value(book).unwrap()["groups"][gid]["pinned_by"].clone()
+}
+
+#[test]
+fn first_contact_pins_are_capped_per_peer() {
+    let local = Dev::new(3);
+    let s = Dev::new(60);
+    let t = Dev::new(61);
+    let mut roster = Roster::new();
+    pin_dev(&mut roster, &s);
+    pin_dev(&mut roster, &t);
+    let mut book = GroupBook::new();
+
+    // A record created by a plain ingest is not attributed to anyone.
+    let plain = co_admin_group(150, s.st.public_bytes(), &s.sk, &local);
+    ingest(&mut book, &plain.manifest).unwrap();
+
+    assert_eq!(MAX_GROUPS_PER_SIGNER, 4);
+    let mut pins = Vec::new();
+    for i in 0..u8::try_from(MAX_GROUPS_PER_SIGNER).unwrap() {
+        let g = co_admin_group(151 + i, s.st.public_bytes(), &s.sk, &local);
+        first_contact_pin(&mut book, &roster, &local, &s.id(), &g.manifest).unwrap();
+        pins.push(g);
+    }
+    let fifth = co_admin_group(160, s.st.public_bytes(), &s.sk, &local);
+    quota_refused(first_contact_pin(
+        &mut book,
+        &roster,
+        &local,
+        &s.id(),
+        &fifth.manifest,
+    ));
+    assert!(book.manifest(&fifth.manifest.group_id).is_none());
+
+    let other = co_admin_group(161, t.st.public_bytes(), &t.sk, &local);
+    first_contact_pin(&mut book, &roster, &local, &t.id(), &other.manifest).unwrap();
+
+    // Removing the local device keeps the record and its attribution.
+    let first = &pins[0];
+    let (removed, _) = remove_member(
+        &first.manifest,
+        &GroupSigner::root(&first.root.sk),
+        &local.id(),
+        &first.secrets,
+        params(),
+    )
+    .unwrap();
+    ingest(&mut book, &removed).unwrap();
+    assert!(!book.holds_group(&local.id(), &removed.group_id));
+    quota_refused(first_contact_pin(
+        &mut book,
+        &roster,
+        &local,
+        &s.id(),
+        &fifth.manifest,
+    ));
+
+    assert!(book.forget_group(&pins[1].manifest.group_id));
+    first_contact_pin(&mut book, &roster, &local, &s.id(), &fifth.manifest).unwrap();
+    let sixth = co_admin_group(162, s.st.public_bytes(), &s.sk, &local);
+    quota_refused(first_contact_pin(
+        &mut book,
+        &roster,
+        &local,
+        &s.id(),
+        &sixth.manifest,
+    ));
+}
+
+#[test]
+fn first_contact_pin_without_handles_is_refused() {
+    let local = Dev::new(3);
+    let s = Dev::new(62);
+    let mut book = GroupBook::new();
+    let g = co_admin_group(163, s.st.public_bytes(), &s.sk, &local);
+    let err = book
+        .ingest_first_contact_manifest(&g.manifest, NOW, None, &BTreeSet::new())
+        .unwrap_err();
+    assert!(
+        unauthorized_msg(&err).contains("without peer handles"),
+        "{err}"
+    );
+    assert!(book.manifest(&g.manifest.group_id).is_none());
+
+    // A stored group is an update: quota-exempt, with or without handles.
+    ingest(&mut book, &g.manifest).unwrap();
+    let (renewed, _) = renew_manifest(
+        &g.manifest,
+        &GroupSigner::root(&g.root.sk),
+        &g.secrets,
+        params(),
+    )
+    .unwrap();
+    book.ingest_first_contact_manifest(&renewed, NOW, None, &BTreeSet::new())
+        .unwrap();
+}
+
+fn alias_by_reverse_pairing(roster: &mut Roster, identity: &EndpointIdentity) {
+    roster
+        .record_pending_pair(
+            *identity.static_key().public_bytes(),
+            Some(identity.signing_key().public_key().clone()),
+            "peer".to_owned(),
+            "peer".to_owned(),
+            "1111".to_owned(),
+        )
+        .unwrap();
+    roster
+        .confirm_peer(&identity.device_id(), Some("1111"))
+        .unwrap();
+}
+
+fn rotate_peer(roster: &mut Roster, label: &str, identity: &mut EndpointIdentity) {
+    identity
+        .rotate(
+            StaticKeypair::from_scalar([0xC5; 32]),
+            SigningKeypair::from_seed([0xC6; 32]),
+            NOW,
+        )
+        .unwrap();
+    roster
+        .apply_verified_rotation(
+            label,
+            identity.rotation_chain(),
+            identity.static_key().public_bytes(),
+            identity.signing_key().public_key(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn quota_survives_alias_and_rotation() {
+    let local = Dev::new(3);
+    // Host labels that sort before and after the device-id alias, aliases added before or after
+    // the pins, and rotation through the host pin or through the alias.
+    for host in ["s-host", "a-host"] {
+        for alias_first in [false, true] {
+            for rotate_via_alias in [false, true] {
+                let case = format!("{host} alias_first={alias_first} via_alias={rotate_via_alias}");
+                let mut s = runtime_identity(0x50);
+                let old_static = *s.static_key().public_bytes();
+                let old_sk = SigningKeypair::from_seed([0x50u8.wrapping_add(0x40); 32]);
+                let old_id = s.device_id();
+                let mut roster = Roster::new();
+                pin_as(&mut roster, host, &old_static, &old_sk);
+                if alias_first {
+                    alias_by_reverse_pairing(&mut roster, &s);
+                }
+                let mut book = GroupBook::new();
+                let mut seed = 170u8;
+                let mut next_group = |static_pub: &[u8; 32], sk: &SigningKeypair| {
+                    seed += 1;
+                    co_admin_group(seed, static_pub, sk, &local).manifest
+                };
+                for _ in 0..MAX_GROUPS_PER_SIGNER {
+                    let m = next_group(&old_static, &old_sk);
+                    first_contact_pin(&mut book, &roster, &local, &old_id, &m).unwrap();
+                }
+                if !alias_first {
+                    alias_by_reverse_pairing(&mut roster, &s);
+                    let m = next_group(&old_static, &old_sk);
+                    let r = first_contact_pin(&mut book, &roster, &local, &old_id, &m);
+                    assert!(r.is_err(), "{case}: alias reset the quota");
+                    quota_refused(r);
+                }
+
+                let label = if rotate_via_alias {
+                    old_id.clone()
+                } else {
+                    host.to_owned()
+                };
+                rotate_peer(&mut roster, &label, &mut s);
+                let new_static = *s.static_key().public_bytes();
+                let new_sk = SigningKeypair::from_seed([0xC6; 32]);
+                let m = next_group(&new_static, &new_sk);
+                let r = first_contact_pin(&mut book, &roster, &local, &s.device_id(), &m);
+                assert!(r.is_err(), "{case}: rotation reset the quota");
+                quota_refused(r);
+                let m = next_group(&old_static, &old_sk);
+                let r = first_contact_pin(&mut book, &roster, &local, &old_id, &m);
+                assert!(r.is_err(), "{case}: the unrotated entry reset the quota");
+                quota_refused(r);
+            }
+        }
+    }
+}
+
+/// Documented residual (`docs/design/groups.md` Known limitations "Per-peer pin quota"): a peer
+/// that gains a new roster entry after reaching the cap (here a host pin under a new label) and
+/// rotates through that entry only shares no handle with its earlier records and starts a new
+/// quota.
+#[test]
+fn quota_residual_late_host_alias_rotation() {
+    let local = Dev::new(3);
+    let mut s = runtime_identity(0x51);
+    let old_static = *s.static_key().public_bytes();
+    let old_sk = SigningKeypair::from_seed([0x51u8.wrapping_add(0x40); 32]);
+    let old_id = s.device_id();
+    let mut roster = Roster::new();
+    pin_as(&mut roster, "s-host", &old_static, &old_sk);
+    let mut book = GroupBook::new();
+    for i in 0..u8::try_from(MAX_GROUPS_PER_SIGNER).unwrap() {
+        let g = co_admin_group(190 + i, &old_static, &old_sk, &local);
+        first_contact_pin(&mut book, &roster, &local, &old_id, &g.manifest).unwrap();
+    }
+    pin_as(&mut roster, "s-host2", &old_static, &old_sk);
+    let g = co_admin_group(195, &old_static, &old_sk, &local);
+    quota_refused(first_contact_pin(
+        &mut book,
+        &roster,
+        &local,
+        &old_id,
+        &g.manifest,
+    ));
+
+    rotate_peer(&mut roster, "s-host2", &mut s);
+    let new_sk = SigningKeypair::from_seed([0xC6; 32]);
+    let g = co_admin_group(196, s.static_key().public_bytes(), &new_sk, &local);
+    first_contact_pin(&mut book, &roster, &local, &s.device_id(), &g.manifest).unwrap();
+}
+
+#[test]
+fn updates_at_quota_are_exempt_but_verified() {
+    let local = Dev::new(3);
+    let s = Dev::new(62);
+    let mut roster = Roster::new();
+    pin_dev(&mut roster, &s);
+    let mut book = GroupBook::new();
+    let mut pins = Vec::new();
+    for i in 0..u8::try_from(MAX_GROUPS_PER_SIGNER).unwrap() {
+        let g = co_admin_group(200 + i, s.st.public_bytes(), &s.sk, &local);
+        first_contact_pin(&mut book, &roster, &local, &s.id(), &g.manifest).unwrap();
+        pins.push(g);
+    }
+    let g = &pins[0];
+    let gid = g.manifest.group_id.clone();
+    let attribution = pinned_by(&book, &gid);
+    assert!(attribution.as_array().is_some_and(|a| !a.is_empty()));
+    let handles = check_first_contact(&roster, &local.id(), &s.id(), &pins[1].manifest).unwrap();
+    let update = |book: &mut GroupBook, m: &GroupManifest| {
+        book.ingest_first_contact_manifest(m, NOW, None, &handles)
+            .map(|_| ())
+    };
+    let still_capped = |book: &mut GroupBook, seed: u8| {
+        let extra = co_admin_group(seed, s.st.public_bytes(), &s.sk, &local);
+        quota_refused(first_contact_pin(
+            book,
+            &roster,
+            &local,
+            &s.id(),
+            &extra.manifest,
+        ));
+    };
+
+    // A valid co-admin update and a root-signed update are accepted at the cap.
+    let co = GroupSigner::co_admin(&s.sk, s.id(), g.grant.clone());
+    let (m4, s4) = renew_manifest(&g.manifest, &co, &g.secrets, params()).unwrap();
+    update(&mut book, &m4).unwrap();
+    let root = GroupSigner::root(&g.root.sk);
+    let (m5, s5) = renew_manifest(&m4, &root, &s4, params()).unwrap();
+    update(&mut book, &m5).unwrap();
+    assert_eq!(book.manifest(&gid).unwrap().seq, m5.seq);
+    assert_eq!(pinned_by(&book, &gid), attribution);
+    still_capped(&mut book, 210);
+
+    // Every other ingest rule still applies.
+    assert!(matches!(
+        update(&mut book, &m4),
+        Err(CoreError::GroupSeqRollback { .. })
+    ));
+    let (fork, _) = renew_manifest(&m4, &root, &s4, GroupBuildParams::new(NOW + 5)).unwrap();
+    assert_eq!(fork.seq, m5.seq);
+    assert!(matches!(
+        update(&mut book, &fork),
+        Err(CoreError::GroupManifestFork { .. })
+    ));
+    let alter_root = co_signed(&m5, &s, &g.grant, |u| {
+        let entry = u
+            .members
+            .iter_mut()
+            .find(|m| m.device_id == g.root.id())
+            .unwrap();
+        entry.name = "renamed".to_owned();
+    });
+    let err = update(&mut book, &alter_root).unwrap_err();
+    assert!(
+        unauthorized_msg(&err).contains("founding root entry"),
+        "{err}"
+    );
+    let (m6, _) = remove_member(&m5, &root, &local.id(), &s5, params()).unwrap();
+    update(&mut book, &m6).unwrap();
+    let mut unrevoke = m6.unsigned();
+    unrevoke.seq += 1;
+    unrevoke.revoked_members.clear();
+    let unrevoke = sign_group_manifest(unrevoke, &g.root.sk).unwrap();
+    assert!(update(&mut book, &unrevoke).is_err());
+    assert_eq!(book.manifest(&gid).unwrap().seq, m6.seq);
+    assert_eq!(pinned_by(&book, &gid), attribution);
+    still_capped(&mut book, 211);
+}
+
+#[test]
+fn group_book_pinned_by_round_trips_and_old_books_load() {
+    let local = Dev::new(3);
+    let s = Dev::new(63);
+    let mut roster = Roster::new();
+    pin_dev(&mut roster, &s);
+    let mut book = GroupBook::new();
+    let g = co_admin_group(220, s.st.public_bytes(), &s.sk, &local);
+    first_contact_pin(&mut book, &roster, &local, &s.id(), &g.manifest).unwrap();
+    let json = serde_json::to_string(&book).unwrap();
+    assert!(json.contains("\"pinned_by\""));
+    let back: GroupBook = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, book);
+
+    // A book written before attribution existed loads, and its records count for nobody.
+    let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+    old["groups"][&g.manifest.group_id]
+        .as_object_mut()
+        .unwrap()
+        .remove("pinned_by");
+    let mut old: GroupBook = serde_json::from_value(old).unwrap();
+    assert!(pinned_by(&old, &g.manifest.group_id).is_null());
+    for i in 0..u8::try_from(MAX_GROUPS_PER_SIGNER).unwrap() {
+        let g = co_admin_group(221 + i, s.st.public_bytes(), &s.sk, &local);
+        first_contact_pin(&mut old, &roster, &local, &s.id(), &g.manifest).unwrap();
+    }
 }

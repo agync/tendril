@@ -50,7 +50,7 @@ sequenceDiagram
 
 | Rule | Behavior | Spec |
 |---|---|---|
-| First-contact pin (F11) | The first ingest of an unknown group pins `root_signing_pub`. A runtime pins a manifest pushed over an ordinary session only when the authenticated sender is the manifest's `signer_device_id`, is an `Active` ordinarily paired peer, its pinned signing key equals the manifest signing key, and the local device is an active member. Gossip never creates a group. | R1 |
+| First-contact pin (F11) | The first ingest of an unknown group pins `root_signing_pub`. A runtime pins a manifest pushed over an ordinary session only when the authenticated sender is the manifest's `signer_device_id`, is an `Active` ordinarily paired peer, its pinned signing key equals the manifest signing key, and the local device is an active member, with at most 4 stored groups per pinning peer. When reverse pairing left several roster entries for the sender, any revoked entry refuses the pin and otherwise one `Active` entry with that key suffices; `group_add_member` selects its entry the same way. Gossip never creates a group. | R1 |
 | Sequence rules | `seq > local_seq` and `seq - local_seq <= 1024`. Same `seq` with different bytes is a fork; lower is a rollback. Every later manifest carries the pinned root key and the byte-identical root entry when co-admin signed. | R1, R3 |
 | Revocation | Removal implies permanent revocation, and `revoked_members` only grows (at most 256). A re-added revoked member is refused. | R4 |
 | Rendezvous rotation | A fresh key is generated on creation and on every removal. A `0x0B` is accepted only from the root or a live co-admin, only for the stored `seq`, and after a revocation only with a rotated key. Adding a member keeps the key and re-binds it to the new `seq`. | R8 |
@@ -97,6 +97,7 @@ Command-line use is covered in [CLI demo](../usage/cli-demo.md) and host-languag
 | `MAX_GROUP_CO_ADMINS` | 8 | Enforced by the builder API only |
 | `MAX_LOCAL_GROUPS` | 16 | Groups an endpoint is an active member or root of; a further group is refused, never pinned. Removed groups do not count |
 | `MAX_STORED_GROUPS` | 64 | Stored records of any role, including groups the endpoint was removed from |
+| `MAX_GROUPS_PER_SIGNER` | 4 | First-contact records attributed to one paired peer (aliases and rotation included), any role, including groups the endpoint was removed from; forgetting a group (`group_forget` in `tendril-runtime`) frees one |
 | `MAX_GROUP_MANIFEST_LEN` | 32 KiB (32768 B) | Signed compact manifest; a realistic 32-member manifest is about 20 KiB |
 | `MAX_GROUP_SEQ_JUMP` | 1024 | Largest `seq - local_seq` accepted for a known group |
 | `MAX_MANIFEST_VALIDITY` | 90 days | Maximum `expires_at - ts` (the builder default is 30 days) |
@@ -110,7 +111,7 @@ Command-line use is covered in [CLI demo](../usage/cli-demo.md) and host-languag
 | Limit | Detail |
 |---|---|
 | Multipath divergence | When one initiator reaches the same sibling over two paths at once, the two ends can persist the exported secrets of different links. The next dial recovers through a single `pair_bootstrap` retry. Until the current-`seq` key is available to both ends, those siblings cannot reconnect. |
-| No per-signer quota | A paired peer that signs manifests can fill the local group slots (`MAX_LOCAL_GROUPS`) with groups it roots. Slot limits are the only bound. |
+| Per-peer pin quota | A peer that gains a new roster entry after reaching the cap (a host pin under a new label, or a reverse pairing after a key rotation) and then rotates keys through that entry only starts a new quota. |
 | Relay sibling links | A `/v2/relay` endpoint in a manifest is not dialed and no group mailbox listener exists, so siblings cannot link over a mailbox relay. Use direct, local, overlay, broker, p2p, or `/v1/relay` endpoints. |
 | Rotated host-labeled root | A root whose roster label differs from its `device_id` and that rotates keys stops supplying a root CRL to its groups. Only roots built on the core API directly can carry such a label; runtime roots use their `device_id` and fail closed on rotation. |
 | Colliding host label | A non-`Pending` entry (`Active` or `Revoked`, including a never-confirmed pin later revoked locally) whose label equals a group root's `device_id` and whose keys have rotated closes that root's groups (fail closed), because a roster entry does not record where its key lineage started. A `Pending` pin there counts as no entry. A local root closes its own groups whenever the list under its own label does not verify under its key, so a confirmed peer that chose that label and stored a list of its own there cannot clear the root's revocations. |

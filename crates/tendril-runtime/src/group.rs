@@ -26,7 +26,7 @@ use tendril_core::group::{
     GroupBook, GroupIngestOutcome, GroupManifest, GroupMember, GroupRendezvousFrame, GroupSeq,
     V2GroupSecrets, derive_group_mailbox_secret, is_active_member, root_device_in,
 };
-pub use tendril_core::group::{MAX_LOCAL_GROUPS, MAX_STORED_GROUPS};
+pub use tendril_core::group::{MAX_GROUPS_PER_SIGNER, MAX_LOCAL_GROUPS, MAX_STORED_GROUPS};
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::policy::{CandidateEndpoint, PathPolicyConfig, ProviderId};
 use tendril_core::roster::{PeerState, Roster, RosterEntry, V2PeerSecrets};
@@ -1689,8 +1689,10 @@ async fn accept_handshake(
 /// A known group follows the normal ingest rules. An unknown group is pinned only when the
 /// sender is the manifest's `signer_device_id`, is an `Active` ordinarily paired peer whose
 /// pinned signing key equals the manifest signing key (`root_signing_pub` for the root, else
-/// `signer_signing_pub`), `local_device_id` is an active member, and fewer than
-/// [`MAX_LOCAL_GROUPS`] groups are stored. Roster read failures fail closed.
+/// `signer_signing_pub`), `local_device_id` is an active member, the local group caps
+/// ([`check_group_capacity`]) leave room, and fewer than [`MAX_GROUPS_PER_SIGNER`] stored records
+/// are attributed to that peer; the count and the pin share one group book write. Roster read
+/// failures fail closed.
 pub fn ingest_pushed_manifest(
     store: &StateStore,
     local_device_id: &str,
@@ -1701,9 +1703,16 @@ pub fn ingest_pushed_manifest(
     let roster = store.load_roster()?;
     let book = store.load_group_book()?;
     let known = book.manifest(&manifest.group_id).is_some();
-    if !known {
-        core_group::check_first_contact(&roster, local_device_id, sender_device_id, manifest)?;
-    }
+    let pinned_by = if known {
+        None
+    } else {
+        Some(core_group::check_first_contact(
+            &roster,
+            local_device_id,
+            sender_device_id,
+            manifest,
+        )?)
+    };
     let root = match (
         book.manifest(&manifest.group_id),
         book.root_signing_pub(&manifest.group_id),
@@ -1726,7 +1735,12 @@ pub fn ingest_pushed_manifest(
             return Err(CoreError::GroupNotFound(manifest.group_id.clone()).into());
         }
         check_group_capacity(book, local_device_id, &manifest.group_id)?;
-        let outcome = book.ingest_group_manifest(manifest, now, crl.as_ref())?;
+        let outcome = match &pinned_by {
+            Some(handles) => {
+                book.ingest_first_contact_manifest(manifest, now, crl.as_ref(), handles)?
+            }
+            None => book.ingest_group_manifest(manifest, now, crl.as_ref())?,
+        };
         drop_secrets_if_left(book, local_device_id, &manifest.group_id);
         Ok(outcome)
     })

@@ -634,6 +634,70 @@ fn remove_local(m: &Mesh) -> GroupManifest {
     .0
 }
 
+/// A group rooted at a throwaway actor in which `admin` is a co-admin that signed the manifest
+/// adding `local`.
+fn co_admin_group(admin: &Actor, local: &Actor) -> GroupManifest {
+    let root = Actor::new("throwaway-root");
+    let params = GroupBuildParams::new(NOW);
+    let (m1, s1) = create_group(
+        root.id.signing_key(),
+        "co",
+        1,
+        root.member(Vec::new()),
+        params,
+    )
+    .unwrap();
+    let gid = m1.group_id.clone();
+    let (m2, s2) = add_member(
+        &m1,
+        &GroupSigner::root(root.id.signing_key()),
+        admin.member(caps(&gid)),
+        &s1,
+        params,
+    )
+    .unwrap();
+    let grant = issue_admin_grant(
+        root.id.signing_key(),
+        &root.device_id(),
+        &gid,
+        &admin.device_id(),
+        admin.id.signing_key().public_key(),
+        0,
+        params,
+    )
+    .unwrap();
+    let co = GroupSigner::co_admin(admin.id.signing_key(), admin.device_id(), grant);
+    add_member(&m2, &co, local.member(caps(&gid)), &s2, params)
+        .unwrap()
+        .0
+}
+
+#[test]
+fn first_contact_quota_applies_per_peer() {
+    let local = Actor::new("web-host");
+    let s = Actor::new("s-host");
+    let t = Actor::new("t-host");
+    let mut book = WasmGroupBook::from_parts(local.device_id(), GroupBook::new());
+    let mut roster = Roster::new();
+    pin(&mut roster, &s);
+    pin(&mut roster, &t);
+    for _ in 0..MAX_GROUPS_PER_SIGNER {
+        let m = co_admin_group(&s, &local);
+        book.ingest_manifest_inner(&roster, &s.device_id(), &m, NOW)
+            .unwrap();
+    }
+    let m = co_admin_group(&s, &local);
+    let err = book
+        .ingest_manifest_inner(&roster, &s.device_id(), &m, NOW)
+        .unwrap_err();
+    assert!(err.contains("pinned by this peer"), "{err}");
+    assert!(book.inner.manifest(&m.group_id).is_none());
+    let m = co_admin_group(&t, &local);
+    book.ingest_manifest_inner(&roster, &t.device_id(), &m, NOW)
+        .unwrap();
+    assert_eq!(book.inner.group_ids().len(), MAX_GROUPS_PER_SIGNER + 1);
+}
+
 #[test]
 fn removed_local_device_drops_secrets_and_refuses_rendezvous() {
     let m = mesh();
