@@ -554,3 +554,343 @@ test("group: a CRL revoking the local device after open detaches everything on t
     }
   });
 });
+
+const DATA = { event: "data", data_b64: "AA" };
+
+const revokeManifestEvent = () => ({
+  event: "group_manifest_unverified",
+  group_id: GID,
+  manifest_json: JSON.stringify(FX.manifest_revoke_a),
+});
+
+async function drainAll(group) {
+  const out = [];
+  for (let ev = await group.pollEvent(50); ev; ev = await group.pollEvent(50)) {
+    out.push(ev);
+  }
+  return out;
+}
+
+async function withGroup(fn) {
+  await atFixtureTime(async () => {
+    const client = await clientWithGroup();
+    const group = client.openGroup(GID);
+    try {
+      await fn(group);
+    } finally {
+      group.close();
+      client.free();
+    }
+  });
+}
+
+test("group: unauthorized flood from one peer cannot starve control events", async () => {
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    for (let i = 0; i < 5000; i += 1) {
+      await group.handleSessionEvent(c, DATA);
+    }
+    await group.handleSessionEvent(c, revokeManifestEvent());
+
+    const events = await drainAll(group);
+    assert.equal(events.length, 3);
+    assert.ok(events.some((e) => e.event === "manifest_updated" && e.seq === FX.manifest_revoke_a.seq));
+    assert.ok(events.some((e) => e.event === "member_revoked" && e.device_id === PEER_A));
+    const audits = events.filter((e) => e.event === "audit");
+    assert.equal(audits.length, 1);
+    assert.equal(audits[0].audit.subject, PEER_C);
+    assert.equal(audits[0].count, 5000);
+  });
+});
+
+test("group: no audit entry is admitted at the queue threshold", async () => {
+  await withGroup(async (group) => {
+    const b = new MockSession(PEER_B);
+    const c = new MockSession(PEER_C);
+    let seen = 0;
+    group.on("audit", () => {
+      seen += 1;
+    });
+    for (let i = 0; i < 960; i += 1) {
+      await group.handleSessionEvent(b, DATA);
+    }
+    for (let i = 0; i < 100; i += 1) {
+      await group.handleSessionEvent(b, DATA);
+    }
+    for (let i = 0; i < 50; i += 1) {
+      await group.handleSessionEvent(c, DATA);
+    }
+    await group.handleSessionEvent(c, revokeManifestEvent());
+
+    const events = await drainAll(group);
+    assert.equal(events.length, 962);
+    assert.ok(events.slice(0, 960).every((e) => e.event === "app_data"));
+    assert.equal(events[960].event, "manifest_updated");
+    assert.equal(events[961].event, "member_revoked");
+    assert.equal(events.filter((e) => e.event === "audit").length, 0);
+    assert.equal(seen, 150);
+  });
+});
+
+test("group: an existing audit entry is updated at the threshold without growing the queue", async () => {
+  await withGroup(async (group) => {
+    const b = new MockSession(PEER_B);
+    const c = new MockSession(PEER_C);
+    await group.handleSessionEvent(c, DATA);
+    for (let i = 0; i < 959; i += 1) {
+      await group.handleSessionEvent(b, DATA);
+    }
+    for (let i = 0; i < 10; i += 1) {
+      await group.handleSessionEvent(c, DATA);
+    }
+    await group.handleSessionEvent(b, DATA);
+    await group.handleSessionEvent(c, revokeManifestEvent());
+
+    const events = await drainAll(group);
+    assert.equal(events.length, 962);
+    assert.equal(events[0].event, "audit");
+    assert.equal(events[0].audit.subject, PEER_C);
+    assert.equal(events[0].count, 11);
+    assert.equal(events.filter((e) => e.event === "audit").length, 1);
+    assert.equal(events.filter((e) => e.event === "app_data").length, 959);
+    assert.equal(events.filter((e) => e.event === "manifest_updated").length, 1);
+    assert.equal(events.filter((e) => e.event === "member_revoked").length, 1);
+
+    await group.handleSessionEvent(c, DATA);
+    const fresh = await group.pollEvent(50);
+    assert.equal(fresh.event, "audit");
+    assert.equal(fresh.count, 1);
+    assert.equal(events[0].count, 11);
+  });
+});
+
+test("group: audit coalescing is per sender and a listener sees every audit", async () => {
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    const root = new MockSession(FX.root_device_id);
+    const heard = [];
+    const snapshots = [];
+    group.on("audit", (ev) => {
+      heard.push(ev);
+      snapshots.push(JSON.stringify(ev));
+    });
+    for (let i = 0; i < 3; i += 1) {
+      await group.handleSessionEvent(c, DATA);
+    }
+    await group.handleSessionEvent(root, DATA);
+
+    const events = await drainAll(group);
+    assert.deepEqual(
+      events.map((e) => [e.audit.subject, e.count]),
+      [
+        [PEER_C, 3],
+        [FX.root_device_id, 1],
+      ]
+    );
+    assert.equal(heard.length, 4);
+    assert.ok(heard.every((ev) => ev.count === 1));
+    assert.deepEqual(heard.map((ev) => JSON.stringify(ev)), snapshots);
+  });
+});
+
+test("group: a coalesced audit carries one coherent latest payload per outcome and cap", async () => {
+  const passthrough = {
+    event: "audit",
+    audit: { subject: PEER_C, cap: "fs.read", grant_nonce: "n1", allow: true, reason: "r1", ts: 1 },
+  };
+  const passthroughLater = {
+    event: "audit",
+    audit: { subject: PEER_C, cap: "fs.read", grant_nonce: "n2", allow: true, reason: "r2", ts: 2 },
+  };
+  const refusedManifest = {
+    event: "group_manifest_unverified",
+    group_id: GID,
+    manifest_json: JSON.stringify(FX.stranger_manifest),
+  };
+
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    await group.handleSessionEvent(c, passthrough);
+    await group.handleSessionEvent(c, passthroughLater);
+    const events = await drainAll(group);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].count, 2);
+    assert.deepEqual(events[0].audit, passthroughLater.audit);
+    assert.notEqual(events[0].audit, passthroughLater.audit);
+  });
+
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    await group.handleSessionEvent(c, DATA);
+    await group.handleSessionEvent(c, refusedManifest);
+    await group.handleSessionEvent(c, refusedManifest);
+    const events = await drainAll(group);
+    assert.deepEqual(
+      events.map((e) => [e.audit.cap, e.count]),
+      [
+        [SEND, 1],
+        ["group.manifest", 2],
+      ]
+    );
+    for (const e of events) {
+      assert.equal(e.audit.allow, false);
+      assert.equal(e.audit.grant_nonce, null);
+      assert.equal(e.audit.subject, PEER_C);
+    }
+  });
+});
+
+test("group: a later audit lacking a field does not retain the earlier value", async () => {
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    await group.handleSessionEvent(c, {
+      event: "audit",
+      audit: { subject: PEER_C, cap: "fs.read", grant_nonce: "n1", allow: true, reason: "r1", ts: 1 },
+    });
+    const later = { subject: PEER_C, cap: "fs.read", allow: true, ts: 2 };
+    await group.handleSessionEvent(c, { event: "audit", audit: later });
+    const events = await drainAll(group);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].count, 2);
+    assert.deepEqual(events[0].audit, later);
+    assert.ok(!("grant_nonce" in events[0].audit));
+    assert.ok(!("reason" in events[0].audit));
+  });
+});
+
+test("group: a reentrant app_data listener filling the last data slot keeps the outer event out", async () => {
+  await withGroup(async (group) => {
+    const b = new MockSession(PEER_B);
+    for (let i = 0; i < 959; i += 1) {
+      await group.handleSessionEvent(b, DATA);
+    }
+    let fired = false;
+    group.on("app_data", () => {
+      if (fired) {
+        return;
+      }
+      fired = true;
+      group.handleSessionEvent(b, DATA);
+    });
+    await group.handleSessionEvent(b, DATA);
+    const events = await drainAll(group);
+    assert.equal(fired, true);
+    assert.equal(events.length, 960);
+    assert.ok(events.every((e) => e.event === "app_data"));
+  });
+});
+
+test("group: an allow audit never masks an earlier denial from the same sender", async () => {
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    await group.handleSessionEvent(c, DATA);
+    await group.handleSessionEvent(c, {
+      event: "audit",
+      audit: { subject: PEER_C, cap: SEND, grant_nonce: "n1", allow: true, reason: "ok", ts: 1 },
+    });
+    await group.handleSessionEvent(c, DATA);
+    const events = await drainAll(group);
+    assert.equal(events.length, 2);
+    const denial = events.find((e) => e.audit.allow === false);
+    const allow = events.find((e) => e.audit.allow === true);
+    assert.equal(denial.count, 2);
+    assert.equal(denial.audit.subject, PEER_C);
+    assert.equal(denial.audit.cap, SEND);
+    assert.equal(allow.count, 1);
+    assert.equal(allow.audit.grant_nonce, "n1");
+  });
+});
+
+test("group: distinct caps from one sender stay bounded and are never merged", async () => {
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    let seen = 0;
+    group.on("audit", () => {
+      seen += 1;
+    });
+    const deny = (i) => ({
+      event: "audit",
+      audit: { subject: PEER_C, cap: `cap.${i}`, grant_nonce: null, allow: false, reason: `r${i}`, ts: i },
+    });
+    for (let i = 0; i < 10; i += 1) {
+      await group.handleSessionEvent(c, deny(i));
+    }
+    // Already queued keys keep counting after the limit is reached; new caps stay out.
+    await group.handleSessionEvent(c, deny(0));
+    await group.handleSessionEvent(c, deny(7));
+    for (let i = 10; i < 200; i += 1) {
+      await group.handleSessionEvent(c, deny(i));
+    }
+
+    const events = await drainAll(group);
+    assert.equal(seen, 202);
+    assert.deepEqual(
+      events.map((e) => [e.audit.cap, e.count]),
+      [
+        ["cap.0", 2],
+        ["cap.1", 1],
+        ["cap.2", 1],
+        ["cap.3", 1],
+        ["cap.4", 1],
+        ["cap.5", 1],
+        ["cap.6", 1],
+        ["cap.7", 2],
+      ]
+    );
+    // Draining frees the sender's slots, so the dropped caps can be queued again.
+    await group.handleSessionEvent(c, deny(8));
+    await group.handleSessionEvent(c, deny(9));
+    const later = await drainAll(group);
+    assert.deepEqual(
+      later.map((e) => [e.audit.cap, e.count]),
+      [
+        ["cap.8", 1],
+        ["cap.9", 1],
+      ]
+    );
+  });
+});
+
+test("group: closing the group from an audit listener never enqueues", async () => {
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    group.on("audit", () => group.close());
+    await group.handleSessionEvent(c, DATA);
+    assert.equal(await group.pollEvent(50), null);
+  });
+});
+
+test("group: a listener that re-enters handleSessionEvent coalesces into one entry", async () => {
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    let fired = false;
+    group.on("audit", () => {
+      if (fired) {
+        return;
+      }
+      fired = true;
+      group.handleSessionEvent(c, DATA);
+    });
+    await group.handleSessionEvent(c, DATA);
+    const events = await drainAll(group);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].audit.subject, PEER_C);
+    assert.equal(events[0].count, 2);
+  });
+});
+
+test("group: a parked poller receives an audit directly and indexes nothing", async () => {
+  await withGroup(async (group) => {
+    const c = new MockSession(PEER_C);
+    const parked = group.pollEvent(500);
+    await group.handleSessionEvent(c, DATA);
+    const direct = await parked;
+    assert.equal(direct.event, "audit");
+    assert.equal(direct.count, 1);
+
+    await group.handleSessionEvent(c, DATA);
+    const queued = await group.pollEvent(50);
+    assert.equal(queued.event, "audit");
+    assert.equal(queued.count, 1);
+  });
+});
