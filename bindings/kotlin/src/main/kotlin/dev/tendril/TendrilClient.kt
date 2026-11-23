@@ -429,7 +429,10 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
   /**
    * Opens the group pool. A non-null [listenAddr] also binds a direct listener the group serves
    * (see [TendrilGroup.localEndpoint]). Configure transports before the first call; afterwards inbound sessions
-   * are routed through the group hub and ordinary sessions still arrive through [acceptSession].
+   * are routed through the group hub and ordinary sessions still arrive through [acceptSession]. Call
+   * [serveRelay] before the first call too: the hub leaves the relay hosts served that way to the endpoint only
+   * for calls that returned before it, and a later [serveRelay] on a relay host in the member's own entry
+   * competes with the group.
    */
   fun openGroup(groupId: String, listenAddr: String? = null): TendrilGroup =
     withHandle { TendrilGroup(TendrilNative.groupOpen(it, groupId, listenAddr)) }

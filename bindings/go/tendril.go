@@ -1269,7 +1269,9 @@ func (ep *Endpoint) GroupIngestManifest(manifestJSON, senderPeerID string) (stri
 // OpenGroup opens the lazy full-mesh pool for groupID. A non-empty listenAddr also binds a direct
 // listener that the group serves, reported by Group.LocalEndpoint. Configure transports before the
 // first call; after it, inbound sessions are routed through the group hub and ordinary sessions
-// still arrive through AcceptSession and AcceptV2.
+// still arrive through AcceptSession and AcceptV2. Call ServeRelay before the first call too: the
+// hub leaves the relay hosts served that way to the endpoint only for calls that returned before
+// it, and a later ServeRelay on a relay host in the member's own entry competes with the group.
 func (ep *Endpoint) OpenGroup(groupID, listenAddr string) (*Group, error) {
 	var grp *Group
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {

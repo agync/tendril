@@ -232,7 +232,10 @@ int32_t tendril_group_ingest_manifest(
 /*
  * Opens a group handle (listen_addr may be NULL). The first open on an endpoint routes its inbound session streams through
  * the group hub; configure transports before it. Ordinary sessions still arrive via
- * tendril_session_accept and tendril_session_accept_v2.
+ * tendril_session_accept and tendril_session_accept_v2. The hub reads the URLs served with
+ * tendril_endpoint_serve_relay once, at the first open, and leaves their relay hosts to the app:
+ * let every tendril_endpoint_serve_relay call return before the first open, or the group's
+ * mailbox registration competes with a later call on a relay host named in its own entry.
  */
 int32_t tendril_group_open(
     TendrilEndpoint *ep,

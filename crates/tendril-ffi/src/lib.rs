@@ -918,6 +918,9 @@ pub struct TendrilEndpoint {
     group_rt: StdMutex<Option<Arc<GroupRuntime>>>,
     /// Fired once when the group runtime is installed, so parked accepts switch to its channels.
     group_ready: tokio::sync::Notify,
+    /// `/v1/relay` URLs this endpoint registered its identity mailbox on through
+    /// `tendril_endpoint_serve_relay`; the group hub never registers a pool there.
+    served_v1_relays: StdMutex<Vec<String>>,
 }
 
 impl TendrilEndpoint {
@@ -968,6 +971,12 @@ impl TendrilEndpoint {
     }
 
     /// Returns the endpoint's group runtime, creating it (hub plus inbound pumps) on first use.
+    ///
+    /// The hub is the serving runtime of the endpoint's identity, like `tendril serve`: its pools
+    /// use the endpoint's relay auth and register their relay mailboxes (`relay_listen`). The
+    /// pool book watcher does that on its own tick, so no inbound stream is needed. The
+    /// identity's `/v1/relay` mailbox is left alone on every URL the app already serves with
+    /// `tendril_endpoint_serve_relay` before the first group call (`served_v1_relays`).
     fn ensure_group_runtime(&self) -> Result<Arc<GroupRuntime>, (i32, String)> {
         let Some(store) = self.store.as_ref() else {
             return Err((
@@ -999,10 +1008,18 @@ impl TendrilEndpoint {
                 .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
             dialers.push(Arc::new(dialer));
         }
+        let served_v1_relays = self
+            .served_v1_relays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let hub = Arc::new(GroupHub::new(
             store.as_ref().clone(),
             Arc::new(self.identity.clone()),
-            GroupPoolConfig::new(dialers),
+            GroupPoolConfig::new(dialers)
+                .with_relay_auth(cfg.relay_auth.clone())
+                .with_relay_listen(true)
+                .with_served_v1_relays(served_v1_relays),
             None,
         ));
         {
@@ -1163,6 +1180,7 @@ fn build_endpoint_handle(
         m2m_enabled: AtomicBool::new(has_active_anchor),
         group_rt: StdMutex::new(None),
         group_ready: tokio::sync::Notify::new(),
+        served_v1_relays: StdMutex::new(Vec::new()),
     }))
 }
 
@@ -2077,6 +2095,10 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay(
             Ok(listener) => {
                 let local_ep = listener.local_endpoint();
                 ep.spawn_listener(Box::new(listener));
+                ep.served_v1_relays
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(url.to_owned());
                 unsafe { write_out_cstring(out_endpoint, &local_ep) }
             }
             Err(e) => {
@@ -4551,7 +4573,10 @@ pub unsafe extern "C" fn tendril_group_ingest_manifest(
 ///
 /// The first open on an endpoint starts group dispatch: the endpoint's inbound session streams are
 /// then routed through the group hub, and ordinary sessions still reach `tendril_session_accept`
-/// and `tendril_session_accept_v2`. Configure transports before the first open.
+/// and `tendril_session_accept_v2`. Configure transports before the first open. The hub reads the
+/// URLs served with `tendril_endpoint_serve_relay` once, at the first open, and leaves their relay
+/// hosts to the app: let every such call return before the first open, or the group's mailbox
+/// registration competes with a later call on a relay host named in its own entry.
 ///
 /// `listen_addr` may be null. When set, a direct listener is bound there and served by this
 /// group's pool, and [`tendril_group_local_endpoint`] reports the bound endpoint.

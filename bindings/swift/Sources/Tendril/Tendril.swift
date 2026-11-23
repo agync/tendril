@@ -1111,7 +1111,10 @@ extension TendrilEndpoint {
   }
 
   /// Opens the group pool. A non-nil `listenAddr` also binds a direct listener the group serves (see
-  /// `TendrilGroup.localEndpoint()`). Configure transports before the first call.
+  /// `TendrilGroup.localEndpoint()`). Configure transports before the first call. Call `serveRelay`
+  /// before the first call too: the hub leaves the relay hosts served that way to the endpoint only
+  /// for calls that returned before it, and a later `serveRelay` on a relay host in the member's own
+  /// entry competes with the group.
   public func openGroup(groupId: String, listenAddr: String? = nil) throws -> TendrilGroup {
     try withHandle { h in
       var raw: OpaquePointer?
