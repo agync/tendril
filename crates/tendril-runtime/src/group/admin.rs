@@ -7,13 +7,14 @@
 
 use std::net::SocketAddr;
 
+use tendril_core::crypto::device_id;
 use tendril_core::error::CoreError;
 use tendril_core::group::{
     GroupBook, GroupBuildParams, GroupIngestOutcome, GroupManifest, GroupMember, GroupSigner,
     V2GroupSecrets, add_member, create_group, group_id_from_root, remove_member,
+    resolve_group_peer,
 };
 use tendril_core::identity::EndpointIdentity;
-use tendril_core::roster::PeerState;
 
 use super::{
     check_group_capacity, current_unix_secs, ingest_pushed_manifest, require_group_identity,
@@ -119,8 +120,10 @@ pub fn group_create(
 /// Adds the paired peer `peer_device_id` to a group `identity` roots and returns the new
 /// manifest.
 ///
-/// The peer must be an `Active` roster entry, not revoked by the CRL, with a known signing
-/// key. Empty `caps` grant [`default_group_caps`]. Only the group root may add members.
+/// The peer is every roster entry whose stored or static-derived device id is `peer_device_id`
+/// (a reverse pairing can leave a host label and a `dev_` entry for one peer): none may be
+/// revoked or CRL-revoked, and one must be `Active` with a known signing key. Empty `caps` grant
+/// [`default_group_caps`]. Only the group root may add members.
 pub fn group_add_member(
     store: &StateStore,
     identity: &EndpointIdentity,
@@ -131,19 +134,18 @@ pub fn group_add_member(
 ) -> Result<GroupManifest, RuntimeError> {
     require_group_identity(identity)?;
     let roster = store.load_roster()?;
-    let entry = roster
-        .entries()
-        .map(|(_, e)| e)
-        .find(|e| e.device_id == peer_device_id)
-        .ok_or_else(|| CoreError::PeerNotFound(peer_device_id.to_owned()))?;
-    match entry.state {
-        PeerState::Active => {}
-        PeerState::Pending => return Err(CoreError::PeerPending(peer_device_id.to_owned()).into()),
-        PeerState::Revoked => return Err(CoreError::PeerRevoked(peer_device_id.to_owned()).into()),
-    }
-    if roster.crl_revokes_entry(entry) {
-        return Err(CoreError::PeerRevoked(peer_device_id.to_owned()).into());
-    }
+    let (_, entry) = resolve_group_peer(
+        &roster,
+        |e| e.device_id == peer_device_id || device_id(&e.static_pub) == peer_device_id,
+        None,
+    )
+    .map_err(|err| match err {
+        CoreError::PeerNotFound(_) => CoreError::PeerNotFound(peer_device_id.to_owned()),
+        CoreError::PeerPending(_) => CoreError::PeerPending(peer_device_id.to_owned()),
+        CoreError::PeerRevoked(_) => CoreError::PeerRevoked(peer_device_id.to_owned()),
+        CoreError::IncompletePin(_) => CoreError::IncompletePin(peer_device_id.to_owned()),
+        other => other,
+    })?;
     let signing_pub = entry
         .signing_pub
         .as_ref()

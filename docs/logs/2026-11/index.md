@@ -8,3 +8,4 @@ Entries from November 2026.
 - [web: group audit events coalesce and keep the control reserve free](23-web-group-audit-events-coalesce-and.md)
 - [Pin the signing key of code-paired peers](23-pin-signing-key-of-code-paired-peers.md)
 - [Bind group root CRL authority to the founding root key](23-bind-group-root-crl-authority-to.md)
+- [Cap first-contact group pins per paired peer](23-cap-first-contact-group-pins-per.md)

@@ -70,6 +70,10 @@ pub const MAX_LOCAL_GROUPS: usize = 16;
 /// Hard cap on stored group records, including groups the local device was removed from.
 pub const MAX_STORED_GROUPS: usize = 64;
 
+/// Maximum stored records created by first-contact pins attributed to one paired peer (any role,
+/// including groups the local device was removed from).
+pub const MAX_GROUPS_PER_SIGNER: usize = 4;
+
 /// Maximum entries in `SessionHello.groups`.
 pub const MAX_GOSSIP_GROUPS: usize = 16;
 
@@ -975,6 +979,10 @@ struct GroupRecord {
     rotation_required: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pairwise: BTreeMap<String, V2PeerSecrets>,
+    /// Identity handles of the paired peer whose first-contact push created this record; empty
+    /// for records created any other way.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pinned_by: BTreeSet<String>,
 }
 
 impl GroupRecord {
@@ -1194,6 +1202,45 @@ impl GroupBook {
         self.ingest_inner(manifest, now_unix, root_crl, true)
     }
 
+    /// Ingests a manifest pushed as a first contact by the paired peer whose identity handles are
+    /// `pinned_by` (from [`check_first_contact`]).
+    ///
+    /// A stored group follows [`Self::ingest_group_manifest`] and keeps its attribution: updates
+    /// are quota-exempt. An unknown group is refused with [`CoreError::GroupUnauthorized`] when
+    /// `pinned_by` is empty or while [`MAX_GROUPS_PER_SIGNER`] stored records share a handle with
+    /// it; otherwise it is pinned and attributed to `pinned_by`. `root_crl` is the output of [`root_crl`].
+    pub fn ingest_first_contact_manifest(
+        &mut self,
+        manifest: &GroupManifest,
+        now_unix: u64,
+        root_crl: Option<&RevocationList>,
+        pinned_by: &BTreeSet<String>,
+    ) -> Result<GroupIngestOutcome, CoreError> {
+        if self.groups.contains_key(&manifest.group_id) {
+            return self.ingest_inner(manifest, now_unix, root_crl, true);
+        }
+        if pinned_by.is_empty() {
+            return Err(CoreError::GroupUnauthorized(
+                "first-contact pin without peer handles".to_owned(),
+            ));
+        }
+        let attributed = self
+            .groups
+            .values()
+            .filter(|r| !r.pinned_by.is_disjoint(pinned_by))
+            .count();
+        if attributed >= MAX_GROUPS_PER_SIGNER {
+            return Err(CoreError::GroupUnauthorized(format!(
+                "more than {MAX_GROUPS_PER_SIGNER} groups pinned by this peer"
+            )));
+        }
+        let outcome = self.ingest_inner(manifest, now_unix, root_crl, true)?;
+        if let Some(record) = self.groups.get_mut(&manifest.group_id) {
+            record.pinned_by.clone_from(pinned_by);
+        }
+        Ok(outcome)
+    }
+
     /// Like [`Self::ingest_group_manifest`] but fails with [`CoreError::GroupNotFound`] for a group
     /// that is not already pinned, so gossip can never create groups.
     pub fn ingest_gossiped_manifest(
@@ -1258,6 +1305,7 @@ impl GroupBook {
                     secrets: None,
                     rotation_required: false,
                     pairwise: BTreeMap::new(),
+                    pinned_by: BTreeSet::new(),
                 },
             );
             return Ok(outcome);
@@ -1564,7 +1612,8 @@ impl GroupBook {
     }
 }
 
-/// Resolves the roster entry whose pinned static key derives the device id `wanted`.
+/// Resolves the roster entry whose pinned static key derives the device id `wanted`, selected as
+/// [`resolve_group_peer`] selects it.
 ///
 /// Roster keys are host ids chosen by the host application, so the canonical device id is derived
 /// from the pinned static key rather than trusting the key or the entry label.
@@ -1573,9 +1622,57 @@ pub fn find_peer_by_device_id<'a>(
     roster: &'a Roster,
     wanted: &str,
 ) -> Option<(&'a String, &'a RosterEntry)> {
-    roster
-        .entries()
-        .find(|(_, e)| device_id(&e.static_pub) == wanted)
+    resolve_group_peer(roster, |e| device_id(&e.static_pub) == wanted, None).ok()
+}
+
+/// Selects the roster entry that acts for a peer in group decisions among the entries `matches`
+/// accepts.
+///
+/// A reverse pairing can leave several entries for one peer (a host label and a `dev_` entry
+/// sharing a static key), so the choice never depends on key order: any matching entry that is
+/// `Revoked` or revoked by a CRL refuses the peer, otherwise the first `Active` entry with a pinned
+/// signing key (equal to `signing_pub` when given) is returned.
+///
+/// # Errors
+///
+/// Returns [`CoreError::PeerRevoked`] when a matching entry is revoked,
+/// [`CoreError::IncompletePin`] when an `Active` entry matches but none pins the wanted signing
+/// key, [`CoreError::PeerPending`] when only `Pending` entries match, and
+/// [`CoreError::PeerNotFound`] when none match. Each names the first matching roster key, or
+/// `"peer"` when none match.
+pub fn resolve_group_peer<'a>(
+    roster: &'a Roster,
+    matches: impl Fn(&RosterEntry) -> bool,
+    signing_pub: Option<&HybridSigningPublicKey>,
+) -> Result<(&'a String, &'a RosterEntry), CoreError> {
+    let matching: Vec<(&String, &RosterEntry)> =
+        roster.entries().filter(|(_, e)| matches(e)).collect();
+    let Some((first, _)) = matching.first() else {
+        return Err(CoreError::PeerNotFound("peer".to_owned()));
+    };
+    let name = (*first).clone();
+    if matching
+        .iter()
+        .any(|(_, e)| e.state == PeerState::Revoked || roster.crl_revokes_entry(e))
+    {
+        return Err(CoreError::PeerRevoked(name));
+    }
+    let active = || {
+        matching
+            .iter()
+            .filter(|(_, e)| e.state == PeerState::Active)
+    };
+    if let Some(found) = active().find(|(_, e)| match (&e.signing_pub, signing_pub) {
+        (Some(pinned), Some(wanted)) => pinned == wanted,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }) {
+        return Ok(*found);
+    }
+    if active().next().is_some() {
+        return Err(CoreError::IncompletePin(name));
+    }
+    Err(CoreError::PeerPending(name))
 }
 
 /// Resolves the effective root revocation list of a group whose founding root is
@@ -1682,10 +1779,16 @@ pub fn root_crl(
 /// F11 first-contact pinning rule for a group not yet stored.
 ///
 /// `sender_device_id` is the authenticated session peer. The group is pinnable only when the
-/// sender is the manifest's `signer_device_id`, an `Active` ordinarily paired peer that no CRL
-/// revokes, whose pinned signing key equals the manifest signer key (`signer_signing_pub`, else
-/// `root_signing_pub`), and `local_device_id` is an active member of the manifest. The manifest
-/// signature is not checked here; ingest verifies it.
+/// sender is the manifest's `signer_device_id`, an `Active` ordinarily paired peer whose pinned
+/// signing key equals the manifest signer key (`signer_signing_pub`, else `root_signing_pub`),
+/// with no roster entry for the sender revoked or CRL-revoked (see [`resolve_group_peer`]), and
+/// `local_device_id` is an active member of the manifest. The manifest signature is not checked
+/// here; ingest verifies it.
+///
+/// Returns the identity handles of the sender for [`GroupBook::ingest_first_contact_manifest`]:
+/// the roster key, stored `device_id`, and static-derived `device_id` of the sender's entry and
+/// of every entry, in any state, sharing its static key or signing identity. They stay stable
+/// across reverse-pairing aliases and key rotation through either entry.
 ///
 /// # Errors
 ///
@@ -1695,30 +1798,52 @@ pub fn check_first_contact(
     local_device_id: &str,
     sender_device_id: &str,
     manifest: &GroupManifest,
-) -> Result<(), CoreError> {
+) -> Result<BTreeSet<String>, CoreError> {
     let refuse = |why: &str| CoreError::GroupUnauthorized(why.to_owned());
     if sender_device_id != manifest.signer_device_id {
         return Err(refuse("first contact must come from the manifest signer"));
     }
-    let entry = find_peer_by_device_id(roster, sender_device_id)
-        .map(|(_, e)| e)
-        .filter(|e| e.state == PeerState::Active && !roster.crl_revokes_entry(e))
-        .ok_or_else(|| refuse("manifest signer is not an active paired peer"))?;
     let signer_key = manifest
         .signer_signing_pub
         .as_deref()
         .unwrap_or(&manifest.root_signing_pub);
     let signer_key = HybridSigningPublicKey::from_b64url(signer_key)
         .map_err(|_| refuse("invalid manifest signer key"))?;
-    if entry.signing_pub.as_ref() != Some(&signer_key) {
-        return Err(refuse(
-            "manifest signer key differs from the paired peer's pinned key",
-        ));
-    }
+    let (key, entry) = resolve_group_peer(
+        roster,
+        |e| device_id(&e.static_pub) == sender_device_id,
+        Some(&signer_key),
+    )
+    .map_err(|err| match err {
+        CoreError::IncompletePin(_) => {
+            refuse("manifest signer key differs from the paired peer's pinned key")
+        }
+        _ => refuse("manifest signer is not an active paired peer"),
+    })?;
     if !is_active_member(manifest, local_device_id) {
         return Err(refuse("local device is not an active member"));
     }
-    Ok(())
+    Ok(peer_handles(roster, key, entry))
+}
+
+fn peer_handles(roster: &Roster, key: &str, entry: &RosterEntry) -> BTreeSet<String> {
+    let shares_signing = |other: &RosterEntry| match (&entry.signing_pub, &other.signing_pub) {
+        (Some(a), Some(b)) => a == b || a.ed25519_bytes() == b.ed25519_bytes(),
+        _ => false,
+    };
+    let mut handles = BTreeSet::from([
+        key.to_owned(),
+        entry.device_id.clone(),
+        device_id(&entry.static_pub),
+    ]);
+    for (label, other) in roster.entries() {
+        if other.static_pub == entry.static_pub || shares_signing(other) {
+            handles.insert(label.clone());
+            handles.insert(other.device_id.clone());
+            handles.insert(device_id(&other.static_pub));
+        }
+    }
+    handles
 }
 
 /// Refuses to store `group_id` when it is new and `local_device_id` already holds

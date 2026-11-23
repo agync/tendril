@@ -17,7 +17,7 @@ use tendril_core::group::{
     check_first_contact, check_group_capacity, check_rendezvous_local_membership,
     drop_secrets_if_left, is_active_member, root_crl as resolve_root_crl, root_device_in,
 };
-pub use tendril_core::group::{MAX_LOCAL_GROUPS, MAX_STORED_GROUPS};
+pub use tendril_core::group::{MAX_GROUPS_PER_SIGNER, MAX_LOCAL_GROUPS, MAX_STORED_GROUPS};
 use tendril_core::roster::Roster;
 use wasm_bindgen::prelude::*;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -111,7 +111,8 @@ impl WasmGroupBook {
     ///
     /// A known group follows the normal ingest rules. An unknown group is pinned only when the
     /// sender is the manifest signer, an active paired peer whose pinned signing key equals the
-    /// manifest signing key, and the local device is an active member. Gossip never pins.
+    /// manifest signing key, the local device is an active member, and fewer than
+    /// [`MAX_GROUPS_PER_SIGNER`] stored records are attributed to that peer. Gossip never pins.
     pub(crate) fn ingest_manifest_inner(
         &mut self,
         roster: &Roster,
@@ -120,10 +121,14 @@ impl WasmGroupBook {
         now_unix: u64,
     ) -> Result<GroupIngestOutcome, String> {
         let known = self.inner.manifest(&manifest.group_id).is_some();
-        if !known {
-            check_first_contact(roster, &self.local_device_id, sender_device_id, manifest)
-                .map_err(|e| e.to_string())?;
-        }
+        let pinned_by = if known {
+            None
+        } else {
+            Some(
+                check_first_contact(roster, &self.local_device_id, sender_device_id, manifest)
+                    .map_err(|e| e.to_string())?,
+            )
+        };
         check_group_capacity(&self.inner, &self.local_device_id, &manifest.group_id)
             .map_err(|e| e.to_string())?;
         let crl = match (
@@ -136,10 +141,16 @@ impl WasmGroupBook {
                 Err(_) => None,
             },
         };
-        let outcome = self
-            .inner
-            .ingest_group_manifest(manifest, now_unix, crl.as_ref())
-            .map_err(|e| e.to_string())?;
+        let outcome = match &pinned_by {
+            Some(handles) => {
+                self.inner
+                    .ingest_first_contact_manifest(manifest, now_unix, crl.as_ref(), handles)
+            }
+            None => self
+                .inner
+                .ingest_group_manifest(manifest, now_unix, crl.as_ref()),
+        }
+        .map_err(|e| e.to_string())?;
         drop_secrets_if_left(&mut self.inner, &self.local_device_id, &manifest.group_id);
         Ok(outcome)
     }
