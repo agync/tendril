@@ -26,12 +26,13 @@ pub use driver::{
 };
 pub use error::RuntimeError;
 pub use group::{
-    ADMIN_SESSION_IDLE_TIMEOUT, BroadcastReport, DEFAULT_GROUP_DIAL_BUDGET, GroupEvent,
-    GroupFrameKind, GroupFrameOutcome, GroupHub, GroupPool, GroupPoolConfig, InboundSession,
-    MAX_ADMIN_SESSIONS, MAX_CONCURRENT_GROUP_DIALS, MAX_GROUPS_PER_SIGNER, MAX_LOCAL_GROUPS,
-    MAX_STORED_GROUPS, check_group_capacity, default_group_caps, group_add_member, group_create,
-    group_forget, group_ingest_manifest, group_remove_member, handle_session_group_frame,
-    ingest_pushed_manifest, ingest_pushed_rendezvous, normalize_endpoint_hint,
+    ADMIN_SESSION_IDLE_TIMEOUT, BOOTSTRAP_COMMIT_TIMEOUT, BroadcastReport,
+    DEFAULT_GROUP_DIAL_BUDGET, GroupEvent, GroupFrameKind, GroupFrameOutcome, GroupHub, GroupPool,
+    GroupPoolConfig, InboundSession, MAX_ADMIN_SESSIONS, MAX_CONCURRENT_GROUP_DIALS,
+    MAX_GROUPS_PER_SIGNER, MAX_LOCAL_GROUPS, MAX_PENDING_BOOTSTRAP_COMMITS, MAX_STORED_GROUPS,
+    check_group_capacity, default_group_caps, group_add_member, group_create, group_forget,
+    group_ingest_manifest, group_remove_member, handle_session_group_frame, ingest_pushed_manifest,
+    ingest_pushed_rendezvous, normalize_endpoint_hint,
 };
 pub use provider::{
     DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathReader, PathStream,

@@ -2042,3 +2042,217 @@ async fn close_waits_for_in_flight_state_writes_and_none_follow_it() {
     );
     let _ = tokio::time::timeout(Duration::from_secs(5), dial).await;
 }
+
+/// The inner stream and the held `msg3` of a parked [`CaptureStream`].
+type Released = tokio::sync::oneshot::Sender<(Box<dyn PathStream>, Vec<u8>)>;
+
+/// Forwards until the first read, then buffers writes until one complete outer frame (the
+/// initiator's `msg3`) is held, signals `captured`, and parks. Dropping it hands the inner
+/// stream and the held frame to the test.
+struct CaptureStream {
+    inner: Option<Box<dyn PathStream>>,
+    read: bool,
+    held: Vec<u8>,
+    captured: tokio::sync::watch::Sender<bool>,
+    released: Option<Released>,
+}
+
+impl Drop for CaptureStream {
+    fn drop(&mut self) {
+        if let (Some(inner), Some(tx)) = (self.inner.take(), self.released.take()) {
+            let _ = tx.send((inner, std::mem::take(&mut self.held)));
+        }
+    }
+}
+
+#[async_trait]
+impl PathStream for CaptureStream {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::Direct
+    }
+
+    fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        None
+    }
+
+    async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        if !self.read {
+            return self.inner.as_mut().unwrap().send_chunk(bytes).await;
+        }
+        self.held.extend_from_slice(bytes);
+        let complete = self.held.len() >= 2
+            && self.held.len() >= 2 + usize::from(u16::from_be_bytes([self.held[0], self.held[1]]));
+        if complete {
+            let _ = self.captured.send(true);
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, RuntimeError> {
+        self.read = true;
+        self.inner.as_mut().unwrap().recv_chunk(buf).await
+    }
+
+    async fn close(&mut self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    fn into_split(mut self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
+        self.inner.take().unwrap().into_split()
+    }
+}
+
+/// Maps the hints `path_a` and `path_b` to one listener. The first `path_b` dial goes through a
+/// [`CaptureStream`]; `path_a` dials only once that stream captured its `msg3`. Once `only_a`
+/// is set, `path_b` refuses.
+struct TwoPathDialer {
+    target: String,
+    path_a: String,
+    path_b: String,
+    captured_tx: tokio::sync::watch::Sender<bool>,
+    captured_rx: tokio::sync::watch::Receiver<bool>,
+    released: Mutex<Option<Released>>,
+    only_a: AtomicBool,
+}
+
+#[async_trait]
+impl PathDialer for TwoPathDialer {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::Direct
+    }
+
+    async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+        if endpoint == self.path_a {
+            let mut rx = self.captured_rx.clone();
+            rx.wait_for(|c| *c)
+                .await
+                .map_err(|_| RuntimeError::Closed)?;
+            return DirectDialer::new().dial(&self.target).await;
+        }
+        if endpoint != self.path_b || self.only_a.load(Ordering::Acquire) {
+            return Err(RuntimeError::Protocol("path refused".to_owned()));
+        }
+        let stream = DirectDialer::new().dial(&self.target).await?;
+        let Some(released) = self.released.lock().unwrap().take() else {
+            return Ok(stream);
+        };
+        Ok(Box::new(CaptureStream {
+            inner: Some(stream),
+            read: false,
+            held: Vec::new(),
+            captured: self.captured_tx.clone(),
+            released: Some(released),
+        }))
+    }
+}
+
+/// G5: an initiator races two paths to a first-contact sibling and keeps only one. The
+/// responder commits only the kept path: the discarded path's late `msg3` neither replaces
+/// the kept link nor overwrites the pairwise secrets the two ends agreed on.
+#[tokio::test]
+async fn responder_commits_only_the_path_the_initiator_kept() {
+    let mut a = Node::new(0).await;
+    drop(a.listener.take());
+    let b = Node::new(1).await;
+    let mut c = Node::new(2).await;
+    let path_a = "127.0.0.2:1".to_owned();
+    let path_b = "127.0.0.3:1".to_owned();
+    let gid = group_id_from_root(a.identity.signing_key().public_key());
+    let params = GroupBuildParams::new(now());
+    let (mut manifest, mut secrets) = create_group(
+        a.identity.signing_key(),
+        "multipath",
+        2,
+        a.member("root", &gid, true),
+        params,
+    )
+    .unwrap();
+    let signer = GroupSigner::root(a.identity.signing_key());
+    let mut c_member = c.member("c", &gid, true);
+    c_member.endpoints = vec![format!("direct:{path_b}"), format!("direct:{path_a}")];
+    for member in [b.member("b", &gid, true), c_member] {
+        (manifest, secrets) = add_member(&manifest, &signer, member, &secrets, params).unwrap();
+    }
+    for node in [&a, &b, &c] {
+        store_manifest(node, &manifest, Some(&secrets));
+    }
+
+    let (captured_tx, captured_rx) = tokio::sync::watch::channel(false);
+    let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+    let dialer = Arc::new(TwoPathDialer {
+        target: c.addr.to_string(),
+        path_a,
+        path_b,
+        captured_tx,
+        captured_rx,
+        released: Mutex::new(Some(released_tx)),
+        only_a: AtomicBool::new(false),
+    });
+    let pool_b = pool_for(&b, &gid, vec![Arc::clone(&dialer) as Arc<dyn PathDialer>]);
+    let pool_c = pool_for(&c, &gid, direct_dialers());
+    let mut listener = c.listener.take().unwrap();
+    let (accepts_tx, mut accepts) = tokio::sync::mpsc::unbounded_channel();
+    let server_pool = pool_c.clone();
+    tokio::spawn(async move {
+        while let Ok(stream) = listener.accept().await {
+            let pool = server_pool.clone();
+            let _ = accepts_tx.send(tokio::spawn(async move { pool.accept(stream).await }));
+        }
+    });
+
+    let report = pool_b.broadcast(None, b"w").await.unwrap();
+    assert_eq!(report.delivered, ids([c.id()]), "{report:?}");
+    let acc_b = accepts.recv().await.unwrap();
+    let acc_a = accepts.recv().await.unwrap();
+    let kept = tokio::time::timeout(Duration::from_secs(5), acc_a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.unwrap(), b.id());
+    expect_event(
+        &pool_c,
+        Duration::from_secs(5),
+        |e| matches!(e, GroupEvent::AppData { payload, .. } if payload == b"w"),
+    )
+    .await;
+    let pw_a = pairwise(&b, &gid, &c).expect("b persisted the kept path");
+    assert_eq!(pairwise(&c, &gid, &b).as_ref(), Some(&pw_a));
+
+    let (mut discarded, msg3) = tokio::time::timeout(Duration::from_secs(5), released_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!msg3.is_empty());
+    discarded.send_chunk(&msg3).await.unwrap();
+    let _ = discarded.close().await;
+    drop(discarded);
+    let late = tokio::time::timeout(Duration::from_secs(15), acc_b)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(late.is_err(), "the discarded path was committed: {late:?}");
+    assert_eq!(pairwise(&b, &gid, &c).as_ref(), Some(&pw_a));
+    assert_eq!(pairwise(&c, &gid, &b).as_ref(), Some(&pw_a));
+    assert!(pool_b.connected_peers().contains(&c.id()));
+    assert!(pool_c.connected_peers().contains(&b.id()));
+
+    // Without the bootstrap on either end, the agreed pairwise secret still connects.
+    let (renewed, _) =
+        renew_manifest(&manifest, &signer, &secrets, GroupBuildParams::new(now())).unwrap();
+    store_manifest(&b, &renewed, None);
+    store_manifest(&c, &renewed, None);
+    wait_until(|| {
+        pool_b.manifest().unwrap().seq == renewed.seq
+            && pool_c.manifest().unwrap().seq == renewed.seq
+    })
+    .await;
+    dialer.only_a.store(true, Ordering::Release);
+    pool_b.disconnect_all();
+    pool_c.disconnect_all();
+    let report = pool_b.broadcast(None, b"pairwise-only").await.unwrap();
+    assert_eq!(report.delivered, ids([c.id()]), "{report:?}");
+    assert_eq!(pairwise(&c, &gid, &b).as_ref(), Some(&pw_a));
+    pool_b.close();
+    pool_c.close();
+}

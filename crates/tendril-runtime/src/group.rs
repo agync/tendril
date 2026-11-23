@@ -47,7 +47,7 @@ use crate::provider::{
 };
 use crate::rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 use crate::store::{RosterStamp, StateStore};
-use crate::v2_driver::{ConcurrentV2Session, V2ResponderState, V2SessionDriver};
+use crate::v2_driver::{ConcurrentV2Session, StagedCommit, V2ResponderState, V2SessionDriver};
 use crate::wake::{DEFAULT_WAKE_TIMEOUT, WakeProvider, WakeSecret, WakeTarget};
 
 /// Maximum concurrent sibling dials started by one pool.
@@ -67,6 +67,18 @@ pub const ADMIN_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Concurrent admin control sessions one pool serves; further ones are refused.
 pub const MAX_ADMIN_SESSIONS: usize = 4;
+
+/// Wait for the initiator's first transport frame on an inbound session admitted under the
+/// group `pair_bootstrap`; the session is dropped without persisting when none arrives.
+pub const BOOTSTRAP_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Uncommitted inbound bootstrap sessions one pool holds (one first-contact path per sibling);
+/// further ones are refused.
+pub const MAX_PENDING_BOOTSTRAP_COMMITS: usize = 32;
+
+/// Uncommitted inbound bootstrap sessions one pool holds from one authenticated peer; a
+/// further one from that peer is refused, so one member cannot hold the pool-wide slots.
+pub const MAX_PENDING_BOOTSTRAP_COMMITS_PER_PEER: usize = 2;
 
 /// Per-peer outcome of one [`GroupPool::broadcast`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -539,6 +551,45 @@ impl Accepted {
     }
 }
 
+/// One of [`MAX_PENDING_BOOTSTRAP_COMMITS_PER_PEER`] pending-commit slots of a peer, released
+/// on drop.
+struct PeerPendingSlot {
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+    peer: String,
+}
+
+impl PeerPendingSlot {
+    fn take(counts: &Arc<Mutex<HashMap<String, usize>>>, peer: &str) -> Option<Self> {
+        let mut map = counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = map.entry(peer.to_owned()).or_insert(0);
+        if *held >= MAX_PENDING_BOOTSTRAP_COMMITS_PER_PEER {
+            return None;
+        }
+        *held += 1;
+        Some(Self {
+            counts: Arc::clone(counts),
+            peer: peer.to_owned(),
+        })
+    }
+}
+
+impl Drop for PeerPendingSlot {
+    fn drop(&mut self) {
+        let mut map = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = map.get_mut(&self.peer) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                map.remove(&self.peer);
+            }
+        }
+    }
+}
+
 /// Everything needed to admit or dial one active sibling, derived from the stored book.
 struct MemberPin {
     device_id: String,
@@ -696,6 +747,31 @@ type TestHook = Mutex<Option<Box<dyn FnOnce() + Send>>>;
 struct TestHooks {
     after_pairwise_persist: TestHook,
     before_write: TestHook,
+    staged_inbound: TestGate,
+    committed_inbound: TestGate,
+    inbound_done: TestGate,
+    commit_timeout: Mutex<Option<Duration>>,
+}
+
+/// Test-only async interleave point: `(reached, release)`, used at most once.
+#[cfg(test)]
+type TestGate = Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+>;
+
+#[cfg(test)]
+async fn fire_gate(gate: &TestGate) {
+    let armed = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some((reached, release)) = armed {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
 }
 
 #[cfg(test)]
@@ -727,6 +803,8 @@ struct Inner {
     v2_state: V2ResponderState,
     admission: PreAuthRateLimiter,
     admin_sessions: Arc<Semaphore>,
+    pending_commits: Arc<Semaphore>,
+    pending_by_peer: Arc<Mutex<HashMap<String, usize>>>,
     closed: AtomicBool,
     close_notify: tokio::sync::Notify,
     watcher_started: AtomicBool,
@@ -890,6 +968,8 @@ impl GroupPool {
                 dial_sem: Semaphore::new(dials),
                 admission: PreAuthRateLimiter::new(config.pre_auth.clone()),
                 admin_sessions: Arc::new(Semaphore::new(MAX_ADMIN_SESSIONS)),
+                pending_commits: Arc::new(Semaphore::new(MAX_PENDING_BOOTSTRAP_COMMITS)),
+                pending_by_peer: Arc::new(Mutex::new(HashMap::new())),
                 cfg: config,
                 wake,
                 state: Mutex::new(PoolState {
@@ -1562,7 +1642,7 @@ impl GroupHub {
                 accepted.close();
                 return Err(err);
             }
-            pool.inner.install(accepted, peer.clone(), kind)?;
+            pool.inner.install_inbound(accepted, kind).await?;
             return Ok(InboundSession::Group {
                 group_id: pool.group_id().to_owned(),
                 peer_device_id: peer,
@@ -2165,6 +2245,8 @@ impl Inner {
     }
 
     /// [`Self::admit_locked`] plus the wire floor and, on Wire v2, a recognized group secret.
+    /// A session admitted under the bootstrap secret also needs `matched` to still be the
+    /// current-`seq` `pair_bootstrap` for `peer`.
     fn admit_session_locked(
         &self,
         st: &PoolState,
@@ -2172,6 +2254,7 @@ impl Inner {
         peer_static: &[u8; 32],
         wire: u8,
         kind: Option<SecretKind>,
+        matched: Option<&[u8; 32]>,
     ) -> Result<(), RuntimeError> {
         self.admit_locked(st, peer, peer_static)?;
         let floor = st
@@ -2179,14 +2262,35 @@ impl Inner {
             .manifest(&self.group_id)
             .map_or(1, |m| m.min_wire_version);
         match wire {
-            1 if floor >= 2 => Err(CoreError::VersionDowngrade {
-                peer_min: floor,
-                negotiated: 1,
+            1 if floor >= 2 => {
+                return Err(CoreError::VersionDowngrade {
+                    peer_min: floor,
+                    negotiated: 1,
+                }
+                .into());
             }
-            .into()),
-            2 if kind.is_none() => Err(CoreError::HostKeyUnverified.into()),
-            _ => Ok(()),
+            2 if kind.is_none() => return Err(CoreError::HostKeyUnverified.into()),
+            _ => {}
         }
+        if kind == Some(SecretKind::Bootstrap) {
+            let current = bootstrap_secrets(
+                &st.book,
+                &self.group_id,
+                &self.local_id,
+                peer,
+                current_unix_secs(),
+            )
+            .ok();
+            let fresh = current
+                .zip(matched)
+                .is_some_and(|(c, m)| bool::from(c.reconnect_secret().ct_eq(m)));
+            if !fresh {
+                return Err(
+                    CoreError::GroupUnauthorized("stale bootstrap secret".to_owned()).into(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Returns the current book and founding-root CRL as one coherent view.
@@ -2686,6 +2790,82 @@ impl Inner {
         Ok(dialed.1)
     }
 
+    /// Installs an inbound sibling session. One admitted under the bootstrap secret on Wire v2
+    /// is held unpublished, unpersisted, and silent until the initiator's first transport frame
+    /// authenticates and is not `0x07 CLOSE` (the commit); the staged frame is then handled by
+    /// the link's normal read path. CLOSE, EOF, an error, pool close, or
+    /// [`BOOTSTRAP_COMMIT_TIMEOUT`] drop it without persisting. At most
+    /// [`MAX_PENDING_BOOTSTRAP_COMMITS_PER_PEER`] sessions of one peer and
+    /// [`MAX_PENDING_BOOTSTRAP_COMMITS`] in all wait at once; a session over either cap is
+    /// refused.
+    async fn install_inbound(
+        self: &Arc<Self>,
+        mut accepted: Accepted,
+        kind: Option<SecretKind>,
+    ) -> Result<Arc<Link>, RuntimeError> {
+        let peer = accepted.peer_id.clone();
+        if kind != Some(SecretKind::Bootstrap) || accepted.wire() != 2 {
+            return self.install(accepted, peer, kind);
+        }
+        let Some(peer_slot) = PeerPendingSlot::take(&self.pending_by_peer, &peer) else {
+            accepted.close();
+            return Err(RuntimeError::RateLimited(
+                "pending bootstrap commit cap per peer",
+            ));
+        };
+        let Ok(permit) = Arc::clone(&self.pending_commits).try_acquire_owned() else {
+            accepted.close();
+            return Err(RuntimeError::RateLimited("pending bootstrap commit cap"));
+        };
+        let closed = self.close_notify.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if self.closed.load(Ordering::Acquire) {
+            accepted.close();
+            return Err(RuntimeError::Closed);
+        }
+        #[cfg(test)]
+        fire_gate(&self.hooks.staged_inbound).await;
+        let AcceptedIo::V2(driver) = &mut accepted.io else {
+            unreachable!("wire checked above");
+        };
+        let staged = tokio::select! {
+            biased;
+            () = &mut closed => Err(RuntimeError::Closed),
+            res = timeout(self.commit_timeout(), driver.stage_commit_frame()) => match res {
+                Ok(Ok(StagedCommit::Commit)) => Ok(()),
+                Ok(Ok(StagedCommit::Close)) => Err(RuntimeError::Closed),
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err(RuntimeError::Timeout("bootstrap commit frame timed out")),
+            },
+        };
+        if let Err(err) = staged {
+            accepted.close();
+            return Err(err);
+        }
+        #[cfg(test)]
+        fire_gate(&self.hooks.committed_inbound).await;
+        let installed = self.install(accepted, peer, kind);
+        drop(permit);
+        drop(peer_slot);
+        #[cfg(test)]
+        fire_gate(&self.hooks.inbound_done).await;
+        installed
+    }
+
+    fn commit_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(wait) = *self
+            .hooks
+            .commit_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return wait;
+        }
+        BOOTSTRAP_COMMIT_TIMEOUT
+    }
+
     /// Publishes an authenticated session in its slot inside the one critical section that also
     /// runs the revocation sweep.
     ///
@@ -2696,6 +2876,10 @@ impl Inner {
     /// the link checked again before it is published, so a revocation, rotation, or CRL entry
     /// that landed around the persistence step is never missed. Any failure drops the link (and
     /// the secrets it persisted) and is returned.
+    ///
+    /// The open check runs under the state lock that is held through persistence and slot
+    /// publication; close sets `closed` before it takes that lock to drain the slots, so a
+    /// session either lands before the drain or persists and publishes nothing.
     fn install(
         self: &Arc<Self>,
         accepted: Accepted,
@@ -2704,15 +2888,19 @@ impl Inner {
     ) -> Result<Arc<Link>, RuntimeError> {
         let now = current_unix_secs();
         let mut st = self.lock_state();
-        let verdict = self.refresh_locked(&mut st).and_then(|()| {
-            self.admit_session_locked(
-                &st,
-                &accepted.peer_id,
-                &accepted.peer_static,
-                accepted.wire(),
-                kind,
-            )
-        });
+        let verdict = self
+            .refresh_locked(&mut st)
+            .and_then(|()| {
+                self.admit_session_locked(
+                    &st,
+                    &accepted.peer_id,
+                    &accepted.peer_static,
+                    accepted.wire(),
+                    kind,
+                    accepted.matched.as_deref(),
+                )
+            })
+            .and_then(|()| self.ensure_open());
         if let Err(err) = verdict {
             drop(st);
             accepted.close();
@@ -2738,6 +2926,7 @@ impl Inner {
             peer_static,
             peer_groups,
             exported,
+            matched,
             ..
         } = accepted;
         let link = Arc::new(Link {
@@ -2774,7 +2963,14 @@ impl Inner {
             fire(&self.hooks.after_pairwise_persist);
             let verdict = persisted.and_then(|()| {
                 self.refresh_locked(&mut st)?;
-                self.admit_session_locked(&st, &link.peer_id, &link.peer_static, wire, kind)
+                self.admit_session_locked(
+                    &st,
+                    &link.peer_id,
+                    &link.peer_static,
+                    wire,
+                    kind,
+                    matched.as_deref(),
+                )
             });
             if let Err(err) = verdict {
                 st.slots.remove(&link.peer_id);
@@ -2937,7 +3133,7 @@ impl Inner {
             .flatten();
         if let Some(kind) = routed {
             let peer = accepted.peer_id.clone();
-            self.install(accepted, peer.clone(), kind)?;
+            self.install_inbound(accepted, kind).await?;
             return Ok(peer);
         }
         self.admit_admin_session(accepted).await

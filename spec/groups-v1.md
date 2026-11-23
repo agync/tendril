@@ -194,7 +194,8 @@ The bootstrap only gates discovery: identity is authenticated by the Noise stati
 
 - The responder accepts `msg1` under either the stored pairwise secret or the current-`seq` `pair_bootstrap`.
 - The initiator dials with the stored pairwise secret first. When that handshake fails it retries once with `pair_bootstrap`. Without a stored pairwise secret it dials with `pair_bootstrap`.
-- A session admitted under `pair_bootstrap` overwrites the stored pairwise secret on both ends with its exported secrets, after `Established`. A session admitted under the pairwise secret keeps it.
+- A session admitted under `pair_bootstrap` overwrites the stored pairwise secret on both ends with its exported secrets. The initiator persists them after `Established`, only for the session its path selection kept, and before it writes any frame on that session; it never writes on a session it discards, and a session it refuses carries only `0x07 CLOSE`. The responder writes nothing on the session (except a refusal `0x07 CLOSE`) until the commit: the first transport frame after `Established` that authenticates under the session keys and is not `0x07 CLOSE`, whatever its inner type (including `0x08` cover, `0x04 REKEY` and `0x05 PING`). On the commit the responder checks admission against its current manifest, CRL and current-`seq` key (the `pair_bootstrap` that admitted the session must still be the current one), persists, publishes the session, and then processes that frame normally. A session that closes, fails, or delivers no frame within 10 seconds is dropped without persisting. A responder holds at most 2 uncommitted sessions per authenticated peer and 32 in all per group, and refuses a session over either bound. A session admitted under the pairwise secret keeps it.
+- The commit is not atomic across the two ends: if the kept path fails after the initiator persisted and before the responder commits, or the responder refuses the session at a bound or at the commit, the ends hold different pairwise secrets until the next dial, whose `pair_bootstrap` retry overwrites both ends.
 - When both siblings dial each other at once, both ends keep the link initiated by the lower `device_id`, and pairwise secrets are persisted only from that surviving link.
 - A persistence failure closes the link; it is never ignored.
 - When `min_wire_version >= 2`, both ends refuse Wire v1 sibling sessions.
@@ -214,7 +215,7 @@ Onboarding: a member that holds the manifest but not the current-`seq` key canno
 
 A key installed this way is picked up by the member's open group listener without a restart.
 
-Known limitation: when one initiator establishes two bootstrap-admitted links to the same sibling at once (for example over two paths), the lower-`device_id` rule does not separate them and the two ends can persist the exported secrets of different links. The next dial then fails under the stored pairwise secret and recovers through the single `pair_bootstrap` retry, which overwrites both ends again. While the current-`seq` key is unavailable to either end, those siblings cannot reconnect until it is delivered.
+Compatibility: no frame is added. An initiator built before this rule also sends `0x0A` after `Established` (Section 9), so a new responder commits on it; a responder built before this rule may still persist the secrets of a discarded session.
 
 ---
 

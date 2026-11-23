@@ -67,7 +67,7 @@ Authority is never cached. Admission is re-checked after pairwise persistence, a
 | Frame `0x0A` `GROUP_MANIFEST` | Compact manifest JSON, at most 32768 bytes |
 | Frame `0x0B` `GROUP_RENDEZVOUS` | `group_id (20 B) \|\| seq (8 B) \|\| key (32 B)`, exactly 60 bytes |
 | `SessionHello.groups` | Optional gossip list of `{group_id, seq}`, at most 16, sent by the initiator only and limited to the group of the session it is dialing |
-| Wire v2 bootstrap | A first sibling link is admitted under `pair_bootstrap` (HKDF over the rendezvous key, `seq`, and both device ids). After `Established` both ends overwrite their stored pairwise secret with the exported ones, so later dials use the pairwise secret and rotate only on revocation |
+| Wire v2 bootstrap | A first sibling link is admitted under `pair_bootstrap` (HKDF over the rendezvous key, `seq`, and both device ids). Both ends overwrite their stored pairwise secret with the exported ones, so later dials use the pairwise secret and rotate only on revocation. The initiator persists the exported secrets of the session it kept before its first frame; the responder persists them only when it authenticates that first frame (any frame but CLOSE), so a discarded path is never persisted |
 
 See [Wire protocol and pairing](wire-and-pairing.md) and [Wire v2 privacy profile](wire-v2-privacy.md) for the surrounding frame and handshake rules.
 
@@ -105,12 +105,15 @@ Command-line use is covered in [CLI demo](../usage/cli-demo.md) and host-languag
 | `MAX_GOSSIP_GROUPS` | 16 | Entries in `SessionHello.groups` |
 | `MAX_ADMIN_SESSIONS` | 4 | Concurrent ordinary admin control sessions per pool |
 | `ADMIN_SESSION_IDLE_TIMEOUT` | 10 s | Idle limit of such a session |
+| `BOOTSTRAP_COMMIT_TIMEOUT` | 10 s | Wait for the initiator's first frame on a bootstrap-admitted session |
+| `MAX_PENDING_BOOTSTRAP_COMMITS` | 32 | Uncommitted bootstrap sessions per pool |
+| `MAX_PENDING_BOOTSTRAP_COMMITS_PER_PEER` | 2 | Uncommitted bootstrap sessions per pool from one peer; a further one from that peer is refused, so one member cannot starve the others |
 
 ## Known limitations
 
 | Limit | Detail |
 |---|---|
-| Multipath divergence | When one initiator reaches the same sibling over two paths at once, the two ends can persist the exported secrets of different links. The next dial recovers through a single `pair_bootstrap` retry. Until the current-`seq` key is available to both ends, those siblings cannot reconnect. |
+| Non-atomic commit | The initiator persists the exported secrets before the responder commits them. If the kept path fails in between, or the responder refuses the session at the commit (pending caps, rotation), the ends differ until the next dial's single `pair_bootstrap` retry, which needs the current-`seq` key on both ends. |
 | Per-peer pin quota | A peer that gains a new roster entry after reaching the cap (a host pin under a new label, or a reverse pairing after a key rotation) and then rotates keys through that entry only starts a new quota. |
 | Relay sibling links | A `/v2/relay` endpoint in a manifest is not dialed and no group mailbox listener exists, so siblings cannot link over a mailbox relay. Use direct, local, overlay, broker, p2p, or `/v1/relay` endpoints. |
 | Rotated host-labeled root | A root whose roster label differs from its `device_id` and that rotates keys stops supplying a root CRL to its groups. Only roots built on the core API directly can carry such a label; runtime roots use their `device_id` and fail closed on rotation. |
