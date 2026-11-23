@@ -1,25 +1,33 @@
 //! Interleave tests that need the pool's test-only hooks.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
 
 use tempfile::TempDir;
 use tendril_core::crypto::{SigningKeypair, StaticKeypair};
 use tendril_core::error::CoreError;
 use tendril_core::grants::{RevocationList, RevocationListUnsigned, sign_crl};
+use tendril_core::group::GroupSeq;
 use tendril_core::group::{
     GroupBuildParams, GroupManifest, GroupMember, GroupSigner, V2GroupSecrets, add_member,
     create_group, group_id_from_root, remove_member, renew_manifest, sign_group_manifest,
 };
 use tendril_core::identity::EndpointIdentity;
+use tendril_core::policy::ProviderId;
+use tendril_core::roster::{Roster, V2PeerSecrets};
+use tendril_core::v2::PaddingPolicy;
+use tokio::sync::oneshot;
 
 use super::{GroupEvent, GroupHub, GroupPool, GroupPoolConfig, InboundSession};
-use crate::driver::current_unix_secs;
+use crate::driver::{SessionEvent, current_unix_secs};
 use crate::error::RuntimeError;
-use crate::provider::{PathDialer, PathListener};
+use crate::provider::{PathDialer, PathListener, PathReader, PathStream, PathWriter};
 use crate::providers::{DirectDialer, DirectListener};
 use crate::store::StateStore;
-use crate::v2_driver::V2ResponderState;
+use crate::v2_driver::{V2ResponderState, V2SessionDriver};
 
 struct Node {
     _dir: TempDir,
@@ -609,5 +617,659 @@ async fn unresolvable_root_crl_closes_warm_links() {
     );
     assert!(pool_c.connected_peers().is_empty());
     pool_b.close();
+    pool_c.close();
+}
+
+/// Counts the responder's transport writes.
+struct CountingStream {
+    inner: Box<dyn PathStream>,
+    writes: Arc<AtomicUsize>,
+}
+
+struct CountingWriter {
+    inner: Box<dyn PathWriter>,
+    writes: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl PathWriter for CountingWriter {
+    async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        self.writes.fetch_add(1, AtomicOrdering::SeqCst);
+        self.inner.send_chunk(bytes).await
+    }
+
+    async fn close(&mut self) -> Result<(), RuntimeError> {
+        self.inner.close().await
+    }
+}
+
+#[async_trait]
+impl PathStream for CountingStream {
+    fn provider_id(&self) -> ProviderId {
+        self.inner.provider_id()
+    }
+
+    fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.inner.peer_ip()
+    }
+
+    async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        self.writes.fetch_add(1, AtomicOrdering::SeqCst);
+        self.inner.send_chunk(bytes).await
+    }
+
+    async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, RuntimeError> {
+        self.inner.recv_chunk(buf).await
+    }
+
+    async fn close(&mut self) -> Result<(), RuntimeError> {
+        self.inner.close().await
+    }
+
+    fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
+        let writes = self.writes;
+        let (r, w) = self.inner.into_split();
+        (r, Box::new(CountingWriter { inner: w, writes }))
+    }
+}
+
+/// A raw Wire v2 sibling session from `b` into `pool_c.accept`.
+struct Raw {
+    driver: V2SessionDriver,
+    roster: Roster,
+    accept: tokio::task::JoinHandle<Result<String, RuntimeError>>,
+    writes: Arc<AtomicUsize>,
+}
+
+/// `b`'s current `pair_bootstrap` with `c`.
+fn bootstrap_of(b: &Node, c: &Node, gid: &str) -> V2PeerSecrets {
+    let book = b.store.load_group_book().unwrap();
+    super::bootstrap_secrets(&book, gid, &b.id(), &c.id(), current_unix_secs()).unwrap()
+}
+
+/// Dials a raw initiator from `b` with `secret` into `pool_c.accept` over a counted stream.
+async fn raw_initiator(b: &Node, c: &Node, pool_c: &GroupPool, secret: &V2PeerSecrets) -> Raw {
+    raw_initiator_over(b, c, pool_c, secret, |s| s).await
+}
+
+/// [`raw_initiator`] with the initiator's dialed stream wrapped by `wrap`.
+async fn raw_initiator_over(
+    b: &Node,
+    c: &Node,
+    pool_c: &GroupPool,
+    secret: &V2PeerSecrets,
+    wrap: impl FnOnce(Box<dyn PathStream>) -> Box<dyn PathStream>,
+) -> Raw {
+    let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .unwrap();
+    let addr = listener.local_addr();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&writes);
+    let pool = pool_c.clone();
+    let accept = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        pool.accept(Box::new(CountingStream {
+            inner: stream,
+            writes: counted,
+        }))
+        .await
+    });
+    let gid = pool_c.group_id().to_owned();
+    let seq = pool_c.manifest().unwrap().seq;
+    let mut roster = Roster::new();
+    roster
+        .insert_pinned_host(
+            c.id(),
+            "sibling".into(),
+            *c.identity.static_key().public_bytes(),
+            None,
+            0,
+            vec![],
+        )
+        .unwrap();
+    roster
+        .pin_signing_hash(&c.id(), c.identity.signing_key().public_key().sha256_hash())
+        .unwrap();
+    roster.upgrade_peer_to_v2(&c.id(), secret.clone()).unwrap();
+    let locked = Mutex::new(roster);
+    let stream = wrap(DirectDialer::new().dial(&addr.to_string()).await.unwrap());
+    let driver = V2SessionDriver::connect_group_member(
+        stream,
+        &b.identity,
+        &c.id(),
+        *secret.reconnect_secret(),
+        PaddingPolicy::v2_default(),
+        &locked,
+        vec![GroupSeq { group_id: gid, seq }],
+        current_unix_secs(),
+    )
+    .await
+    .unwrap();
+    Raw {
+        driver,
+        roster: locked.into_inner().unwrap(),
+        accept,
+        writes,
+    }
+}
+
+/// Arms `gate`; returns its `reached` receiver and `release` sender.
+fn arm_gate(gate: &super::TestGate) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    *gate.lock().unwrap() = Some((reached_tx, release_rx));
+    (reached_rx, release_tx)
+}
+
+fn gate_armed(gate: &super::TestGate) -> bool {
+    gate.lock().unwrap().is_some()
+}
+
+async fn reached(rx: oneshot::Receiver<()>) {
+    tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("gate not reached")
+        .unwrap();
+}
+
+async fn verdict(
+    accept: tokio::task::JoinHandle<Result<String, RuntimeError>>,
+) -> Result<String, RuntimeError> {
+    tokio::time::timeout(Duration::from_secs(5), accept)
+        .await
+        .expect("accept did not finish")
+        .unwrap()
+}
+
+fn pairwise_of(node: &Node, gid: &str, peer: &Node) -> Option<V2PeerSecrets> {
+    node.store
+        .load_group_book()
+        .unwrap()
+        .pairwise_secrets(gid, &peer.id())
+        .cloned()
+}
+
+fn permits_free(pool: &GroupPool) -> bool {
+    pool.inner.pending_commits.available_permits() == super::MAX_PENDING_BOOTSTRAP_COMMITS
+}
+
+fn slot_initiator(pool: &GroupPool, peer: &Node) -> Option<String> {
+    pool.inner
+        .lock_state()
+        .slots
+        .get(&peer.id())
+        .map(|l| l.initiator_id.clone())
+}
+
+/// A PING committing a bootstrap session: the responder writes nothing (no PONG) and persists
+/// nothing until the commit; the PONG follows the install.
+#[tokio::test]
+async fn bootstrap_commit_on_ping_writes_nothing_before_persistence() {
+    let b = Node::new(20).await;
+    let c = Node::new(21).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let (staged, release_staged) = arm_gate(&pool_c.inner.hooks.staged_inbound);
+    let (committed, release_committed) = arm_gate(&pool_c.inner.hooks.committed_inbound);
+    let mut raw = raw_initiator(&b, &c, &pool_c, &bootstrap_of(&b, &c, &gid)).await;
+    reached(staged).await;
+    let w0 = raw.writes.load(AtomicOrdering::SeqCst);
+    release_staged.send(()).unwrap();
+    raw.driver.send_ping(7).await.unwrap();
+    reached(committed).await;
+    assert_eq!(
+        raw.writes.load(AtomicOrdering::SeqCst),
+        w0,
+        "wrote before commit"
+    );
+    assert_eq!(pairwise_of(&c, &gid, &b), None);
+    release_committed.send(()).unwrap();
+    loop {
+        let ev = tokio::time::timeout(
+            Duration::from_secs(5),
+            raw.driver.next_event(current_unix_secs(), &mut raw.roster),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match ev {
+            Some(SessionEvent::PongReceived(7)) => break,
+            Some(_) => {}
+            None => panic!("closed before PONG"),
+        }
+    }
+    assert_eq!(
+        pairwise_of(&c, &gid, &b).as_ref(),
+        raw.driver.exported_v2_secrets()
+    );
+    assert_eq!(verdict(raw.accept).await.unwrap(), b.id());
+    pool_c.close();
+}
+
+/// An eventless cover frame commits.
+#[tokio::test]
+async fn bootstrap_commit_on_cover_frame() {
+    let b = Node::new(22).await;
+    let c = Node::new(23).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let (committed, release) = arm_gate(&pool_c.inner.hooks.committed_inbound);
+    let mut raw = raw_initiator(&b, &c, &pool_c, &bootstrap_of(&b, &c, &gid)).await;
+    raw.driver.send_dummy_cover(256).await.unwrap();
+    reached(committed).await;
+    release.send(()).unwrap();
+    assert_eq!(verdict(raw.accept).await.unwrap(), b.id());
+    assert_eq!(
+        pairwise_of(&c, &gid, &b).as_ref(),
+        raw.driver.exported_v2_secrets()
+    );
+    pool_c.close();
+}
+
+/// The committing DATA frame is not lost: it is delivered after the install.
+#[tokio::test]
+async fn bootstrap_first_data_frame_is_delivered_after_commit() {
+    let b = Node::new(24).await;
+    let c = Node::new(25).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let mut raw = raw_initiator(&b, &c, &pool_c, &bootstrap_of(&b, &c, &gid)).await;
+    raw.driver.send_data(b"first").await.unwrap();
+    assert_eq!(verdict(raw.accept).await.unwrap(), b.id());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match pool_c.poll_event(left).await {
+            Some(GroupEvent::AppData { payload, .. }) if payload == b"first" => break,
+            Some(_) => {}
+            None => panic!("first data frame lost"),
+        }
+    }
+    pool_c.close();
+}
+
+/// CLOSE, EOF, or no frame within the commit timeout drop the session without persisting.
+#[tokio::test]
+async fn bootstrap_close_or_eof_before_commit_persists_nothing() {
+    let b = Node::new(26).await;
+    let c = Node::new(27).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let secret = bootstrap_of(&b, &c, &gid);
+    for case in ["close", "eof", "timeout"] {
+        let (_committed, _release) = arm_gate(&pool_c.inner.hooks.committed_inbound);
+        if case == "timeout" {
+            *pool_c.inner.hooks.commit_timeout.lock().unwrap() = Some(Duration::from_millis(50));
+        }
+        let mut raw = raw_initiator(&b, &c, &pool_c, &secret).await;
+        let silent = match case {
+            "close" => {
+                raw.driver.send_close(1000, "bye").await.unwrap();
+                None
+            }
+            "eof" => {
+                drop(raw.driver);
+                None
+            }
+            _ => Some(raw.driver),
+        };
+        let res = verdict(raw.accept).await;
+        assert!(res.is_err(), "{case}: {res:?}");
+        assert!(
+            gate_armed(&pool_c.inner.hooks.committed_inbound),
+            "{case}: committed"
+        );
+        assert_eq!(pairwise_of(&c, &gid, &b), None, "{case}");
+        assert!(permits_free(&pool_c), "{case}");
+        assert!(!pool_c.connected_peers().contains(&b.id()), "{case}");
+        drop(silent);
+    }
+    pool_c.close();
+}
+
+/// Closing the pool cancels a session waiting for its commit frame.
+#[tokio::test]
+async fn close_cancels_a_pending_bootstrap_commit() {
+    let b = Node::new(28).await;
+    let c = Node::new(29).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let (staged, release) = arm_gate(&pool_c.inner.hooks.staged_inbound);
+    let raw = raw_initiator(&b, &c, &pool_c, &bootstrap_of(&b, &c, &gid)).await;
+    reached(staged).await;
+    pool_c.close();
+    release.send(()).unwrap();
+    let res = verdict(raw.accept).await;
+    assert!(matches!(res, Err(RuntimeError::Closed)), "{res:?}");
+    assert!(permits_free(&pool_c));
+    drop(raw.driver);
+}
+
+/// Bootstrap sessions over the pending cap are refused at once and persist nothing.
+#[tokio::test]
+async fn pending_bootstrap_commits_are_capped() {
+    let b = Node::new(30).await;
+    let c = Node::new(31).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let secret = bootstrap_of(&b, &c, &gid);
+    let held = Arc::clone(&pool_c.inner.pending_commits)
+        .try_acquire_many_owned(u32::try_from(super::MAX_PENDING_BOOTSTRAP_COMMITS).unwrap())
+        .unwrap();
+    let raw = raw_initiator(&b, &c, &pool_c, &secret).await;
+    let res = verdict(raw.accept).await;
+    assert!(matches!(res, Err(RuntimeError::RateLimited(_))), "{res:?}");
+    assert_eq!(pairwise_of(&c, &gid, &b), None);
+    drop(held);
+    let mut raw = raw_initiator(&b, &c, &pool_c, &secret).await;
+    raw.driver.send_ping(1).await.unwrap();
+    assert_eq!(verdict(raw.accept).await.unwrap(), b.id());
+    assert_eq!(
+        pairwise_of(&c, &gid, &b).as_ref(),
+        raw.driver.exported_v2_secrets()
+    );
+    pool_c.close();
+}
+
+/// A rotation landing while a bootstrap session waits for its commit refuses it at the commit.
+#[tokio::test]
+async fn rotation_before_commit_refuses_the_staged_session() {
+    let b = Node::new(32).await;
+    let c = Node::new(33).await;
+    let (gid, m2, s2) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let (committed, release) = arm_gate(&pool_c.inner.hooks.committed_inbound);
+    let mut raw = raw_initiator(&b, &c, &pool_c, &bootstrap_of(&b, &c, &gid)).await;
+    raw.driver.send_ping(3).await.unwrap();
+    reached(committed).await;
+    let (m3, _) = renew_manifest(
+        &m2,
+        &GroupSigner::root(b.identity.signing_key()),
+        &s2,
+        GroupBuildParams::new(current_unix_secs()),
+    )
+    .unwrap();
+    let s3 = V2GroupSecrets::generate(m3.seq).unwrap();
+    store(&c, &m3, Some(&s3));
+    release.send(()).unwrap();
+    let res = verdict(raw.accept).await;
+    assert!(
+        matches!(
+            res,
+            Err(RuntimeError::Core(CoreError::GroupUnauthorized(_)))
+        ),
+        "{res:?}"
+    );
+    assert_eq!(pairwise_of(&c, &gid, &b), None);
+    pool_c.close();
+}
+
+/// Close landing after the commit frame authenticated and before the install (close's flag
+/// and slot drain run in that window) publishes and persists nothing.
+#[tokio::test]
+async fn close_after_the_commit_frame_publishes_and_persists_nothing() {
+    let b = Node::new(60).await;
+    let c = Node::new(61).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let (committed, release) = arm_gate(&pool_c.inner.hooks.committed_inbound);
+    let mut raw = raw_initiator(&b, &c, &pool_c, &bootstrap_of(&b, &c, &gid)).await;
+    raw.driver.send_ping(5).await.unwrap();
+    reached(committed).await;
+    pool_c
+        .inner
+        .closed
+        .store(true, std::sync::atomic::Ordering::Release);
+    pool_c.disconnect_all();
+    release.send(()).unwrap();
+    let res = verdict(raw.accept).await;
+    assert!(matches!(res, Err(RuntimeError::Closed)), "{res:?}");
+    assert_eq!(pairwise_of(&c, &gid, &b), None);
+    assert!(pool_c.inner.lock_state().slots.is_empty());
+    assert!(permits_free(&pool_c));
+    pool_c.close();
+}
+
+/// A first REKEY commits; the DATA after it is delivered under the advanced receive key.
+#[tokio::test]
+async fn bootstrap_commit_on_rekey_then_data() {
+    let b = Node::new(62).await;
+    let c = Node::new(63).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let (committed, release) = arm_gate(&pool_c.inner.hooks.committed_inbound);
+    let mut raw = raw_initiator(&b, &c, &pool_c, &bootstrap_of(&b, &c, &gid)).await;
+    raw.driver.send_rekey().await.unwrap();
+    reached(committed).await;
+    assert_eq!(pairwise_of(&c, &gid, &b), None);
+    release.send(()).unwrap();
+    assert_eq!(verdict(raw.accept).await.unwrap(), b.id());
+    raw.driver.send_data(b"after rekey").await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match pool_c.poll_event(left).await {
+            Some(GroupEvent::AppData { payload, .. }) if payload == b"after rekey" => break,
+            Some(_) => {}
+            None => panic!("data after the committing rekey lost"),
+        }
+    }
+    assert_eq!(
+        pairwise_of(&c, &gid, &b).as_ref(),
+        raw.driver.exported_v2_secrets()
+    );
+    pool_c.close();
+}
+
+/// Flips the last byte of every chunk written once `armed` is set.
+struct TamperStream {
+    inner: Box<dyn PathStream>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl PathStream for TamperStream {
+    fn provider_id(&self) -> ProviderId {
+        self.inner.provider_id()
+    }
+
+    fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.inner.peer_ip()
+    }
+
+    async fn send_chunk(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        if !self.armed.load(AtomicOrdering::SeqCst) || bytes.is_empty() {
+            return self.inner.send_chunk(bytes).await;
+        }
+        let mut tampered = bytes.to_vec();
+        if let Some(last) = tampered.last_mut() {
+            *last ^= 0x01;
+        }
+        self.inner.send_chunk(&tampered).await
+    }
+
+    async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, RuntimeError> {
+        self.inner.recv_chunk(buf).await
+    }
+
+    async fn close(&mut self) -> Result<(), RuntimeError> {
+        self.inner.close().await
+    }
+
+    fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
+        self.inner.into_split()
+    }
+}
+
+/// A first frame that fails authentication drops the session without persisting.
+#[tokio::test]
+async fn bootstrap_first_frame_failing_authentication_persists_nothing() {
+    let b = Node::new(64).await;
+    let c = Node::new(65).await;
+    let (gid, _, _) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    *pool_c.inner.hooks.commit_timeout.lock().unwrap() = Some(Duration::from_secs(2));
+    let (_committed, _release) = arm_gate(&pool_c.inner.hooks.committed_inbound);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&armed);
+    let raw = raw_initiator_over(&b, &c, &pool_c, &bootstrap_of(&b, &c, &gid), |s| {
+        Box::new(TamperStream {
+            inner: s,
+            armed: flag,
+        })
+    })
+    .await;
+    let mut driver = raw.driver;
+    armed.store(true, AtomicOrdering::SeqCst);
+    driver.send_ping(9).await.unwrap();
+    let res = verdict(raw.accept).await;
+    assert!(res.is_err(), "{res:?}");
+    assert!(gate_armed(&pool_c.inner.hooks.committed_inbound));
+    assert_eq!(pairwise_of(&c, &gid, &b), None);
+    assert!(permits_free(&pool_c));
+    pool_c.close();
+}
+
+/// A rotation landing between pairwise persistence and the second admission check, with the
+/// membership unchanged, refuses the session and removes the secrets it persisted.
+#[tokio::test]
+async fn rotation_after_persistence_refuses_and_removes_the_secrets() {
+    let b = Node::new(66).await;
+    let c = Node::new(67).await;
+    let (gid, m2, s2) = seed(&b, &[&c], 2);
+    let pool_c = open_pool(&c, &gid);
+    let (m3, _) = renew_manifest(
+        &m2,
+        &GroupSigner::root(b.identity.signing_key()),
+        &s2,
+        GroupBuildParams::new(current_unix_secs()),
+    )
+    .unwrap();
+    let s3 = V2GroupSecrets::generate(m3.seq).unwrap();
+    let c_store = c.store.clone();
+    arm(&pool_c.inner.hooks.after_pairwise_persist, move || {
+        c_store
+            .update_group_book(|book| {
+                book.ingest_group_manifest(&m3, current_unix_secs(), None)?;
+                book.install_secrets(&m3.group_id, s3)?;
+                Ok(())
+            })
+            .unwrap();
+    });
+    let mut raw = raw_initiator(&b, &c, &pool_c, &bootstrap_of(&b, &c, &gid)).await;
+    raw.driver.send_ping(4).await.unwrap();
+    let res = verdict(raw.accept).await;
+    assert!(hook_fired(&pool_c.inner.hooks.after_pairwise_persist));
+    assert!(
+        matches!(
+            res,
+            Err(RuntimeError::Core(CoreError::GroupUnauthorized(_)))
+        ),
+        "{res:?}"
+    );
+    assert_eq!(pairwise_of(&c, &gid, &b), None);
+    assert!(pool_c.inner.lock_state().slots.is_empty());
+    pool_c.close();
+}
+
+/// Both members dial each other on first contact: both ends keep the link whose initiator has
+/// the smaller id and hold its secrets, so a later pairwise-only reconnect works.
+#[tokio::test]
+async fn simultaneous_first_contact_keeps_the_lower_initiator_link() {
+    let mut b = Node::new(34).await;
+    let mut c = Node::new(35).await;
+    let (gid, m2, s2) = seed(&b, &[&c], 2);
+    let pool_b = b.serve(&gid);
+    let pool_c = c.serve(&gid);
+    let (b_staged, b_release) = arm_gate(&pool_b.inner.hooks.staged_inbound);
+    let (c_staged, c_release) = arm_gate(&pool_c.inner.hooks.staged_inbound);
+    let (b_done, b_done_release) = arm_gate(&pool_b.inner.hooks.inbound_done);
+    let (c_done, c_done_release) = arm_gate(&pool_c.inner.hooks.inbound_done);
+    let sender_b = pool_b.clone();
+    let sender_c = pool_c.clone();
+    let from_b = tokio::spawn(async move { sender_b.broadcast(None, b"from-b").await });
+    let from_c = tokio::spawn(async move { sender_c.broadcast(None, b"from-c").await });
+    reached(b_staged).await;
+    reached(c_staged).await;
+    for (sent, peer) in [(from_b, c.id()), (from_c, b.id())] {
+        let report = tokio::time::timeout(Duration::from_secs(10), sent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.delivered, vec![peer], "{report:?}");
+    }
+    b_release.send(()).unwrap();
+    c_release.send(()).unwrap();
+    reached(b_done).await;
+    reached(c_done).await;
+    b_done_release.send(()).unwrap();
+    c_done_release.send(()).unwrap();
+    let lower = std::cmp::min(b.id(), c.id());
+    wait_until(|| {
+        slot_initiator(&pool_b, &c).as_deref() == Some(lower.as_str())
+            && slot_initiator(&pool_c, &b).as_deref() == Some(lower.as_str())
+    })
+    .await;
+    let pw = pairwise_of(&b, &gid, &c);
+    assert!(pw.is_some());
+    assert_eq!(pairwise_of(&c, &gid, &b), pw);
+
+    let (m3, _) = renew_manifest(
+        &m2,
+        &GroupSigner::root(b.identity.signing_key()),
+        &s2,
+        GroupBuildParams::new(current_unix_secs()),
+    )
+    .unwrap();
+    store(&b, &m3, None);
+    store(&c, &m3, None);
+    wait_until(|| {
+        pool_b.manifest().unwrap().seq == m3.seq && pool_c.manifest().unwrap().seq == m3.seq
+    })
+    .await;
+    pool_b.disconnect_all();
+    pool_c.disconnect_all();
+    let report = pool_b.broadcast(None, b"pairwise-only").await.unwrap();
+    assert_eq!(report.delivered, vec![c.id()], "{report:?}");
+    assert_eq!(pairwise_of(&b, &gid, &c), pw);
+    assert_eq!(pairwise_of(&c, &gid, &b), pw);
+    pool_b.close();
+    pool_c.close();
+}
+
+/// One peer holding more than its share of pending commits is refused, while another
+/// member's bootstrap session still commits.
+#[tokio::test]
+async fn one_peer_cannot_hold_every_pending_bootstrap_commit() {
+    let b = Node::new(36).await;
+    let c = Node::new(37).await;
+    let d = Node::new(38).await;
+    let (gid, _, _) = seed(&b, &[&c, &d], 2);
+    let pool_c = open_pool(&c, &gid);
+    let from_b = bootstrap_of(&b, &c, &gid);
+    let mut silent = Vec::new();
+    for _ in 0..super::MAX_PENDING_BOOTSTRAP_COMMITS_PER_PEER {
+        silent.push(raw_initiator(&b, &c, &pool_c, &from_b).await);
+    }
+    wait_until(|| {
+        pool_c.inner.pending_commits.available_permits()
+            == super::MAX_PENDING_BOOTSTRAP_COMMITS - super::MAX_PENDING_BOOTSTRAP_COMMITS_PER_PEER
+    })
+    .await;
+    let over = raw_initiator(&b, &c, &pool_c, &from_b).await;
+    let res = verdict(over.accept).await;
+    assert!(matches!(res, Err(RuntimeError::RateLimited(_))), "{res:?}");
+
+    let mut other = raw_initiator(&d, &c, &pool_c, &bootstrap_of(&d, &c, &gid)).await;
+    other.driver.send_ping(9).await.unwrap();
+    assert_eq!(verdict(other.accept).await.unwrap(), d.id());
+    assert_eq!(
+        pairwise_of(&c, &gid, &d).as_ref(),
+        other.driver.exported_v2_secrets()
+    );
+    assert_eq!(pairwise_of(&c, &gid, &b), None);
+    drop(silent);
     pool_c.close();
 }

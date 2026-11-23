@@ -655,6 +655,17 @@ struct V2TransportCore {
     role: SessionRole,
     active_grant: Option<Grant>,
     closed: bool,
+    /// A frame unsealed by [`V2SessionDriver::stage_commit_frame`], handled first by the next read.
+    staged: Option<V2InnerFrame>,
+}
+
+/// Outcome of [`V2SessionDriver::stage_commit_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StagedCommit {
+    /// An authenticated frame other than `0x07 CLOSE` arrived and is staged.
+    Commit,
+    /// The peer sent `0x07 CLOSE` or ended the stream.
+    Close,
 }
 
 impl V2TransportCore {
@@ -922,6 +933,16 @@ impl V2TransportCore {
             });
         }
         let decoded = self.sealed.unseal(body)?;
+        self.handle_decoded(decoded, now_unix, now_ms, roster)
+    }
+
+    fn handle_decoded(
+        &mut self,
+        decoded: V2InnerFrame,
+        now_unix: u64,
+        now_ms: u64,
+        roster: &mut Roster,
+    ) -> Result<WireHandleOutcome, CoreError> {
         let mut events = Vec::new();
         let mut writes = Vec::new();
         let mut should_close = false;
@@ -1576,6 +1597,7 @@ impl V2SessionDriver {
                 },
                 active_grant,
                 closed: false,
+                staged: None,
             },
             frame_reader,
             pending_events: VecDeque::new(),
@@ -1947,6 +1969,7 @@ impl V2SessionDriver {
                 },
                 active_grant,
                 closed: false,
+                staged: None,
             },
             frame_reader,
             pending_events: VecDeque::new(),
@@ -2285,6 +2308,44 @@ impl V2SessionDriver {
             .await
     }
 
+    /// Reads and unseals the first transport frame after `Established` without acting on it.
+    ///
+    /// Nothing is written and no roster or store is touched. A frame other than `0x07 CLOSE` is
+    /// staged and handled first by the next `next_event_*` call (also after
+    /// [`Self::into_concurrent`]); CLOSE or EOF returns [`StagedCommit::Close`]. Any error marks
+    /// the session closed.
+    pub(crate) async fn stage_commit_frame(&mut self) -> Result<StagedCommit, RuntimeError> {
+        let res = self.read_commit_frame().await;
+        if !matches!(res, Ok(StagedCommit::Commit)) {
+            self.core.closed = true;
+        }
+        res
+    }
+
+    async fn read_commit_frame(&mut self) -> Result<StagedCommit, RuntimeError> {
+        let mut recv_buf = vec![0u8; MAX_OUTER_FRAME_LEN];
+        let body = loop {
+            if let Some(b) = self.frame_reader.next_frame()? {
+                break b;
+            }
+            let n = self.stream.recv_chunk(&mut recv_buf).await?;
+            if n == 0 {
+                return Ok(StagedCommit::Close);
+            }
+            self.frame_reader.push(&recv_buf[..n])?;
+        };
+        match self.core.sealed.unseal(&body)? {
+            V2InnerFrame::Frame {
+                kind: InnerFrameType::Close,
+                ..
+            } => Ok(StagedCommit::Close),
+            frame => {
+                self.core.staged = Some(frame);
+                Ok(StagedCommit::Commit)
+            }
+        }
+    }
+
     async fn next_event_with_roster(
         &mut self,
         mut roster: V2RosterRef<'_>,
@@ -2298,7 +2359,10 @@ impl V2SessionDriver {
             if self.core.closed {
                 return Ok(None);
             }
-            let body = if let Some(b) = self.frame_reader.next_frame()? {
+            let staged = self.core.staged.take();
+            let body = if staged.is_some() {
+                Vec::new()
+            } else if let Some(b) = self.frame_reader.next_frame()? {
                 b
             } else {
                 let n = self.stream.recv_chunk(&mut recv_buf).await?;
@@ -2310,12 +2374,16 @@ impl V2SessionDriver {
             };
             let now_unix = now_fn();
             let now_ms = self.elapsed_ms();
+            let core = &mut self.core;
+            let handle = |r: &mut Roster| match staged {
+                Some(frame) => core.handle_decoded(frame, now_unix, now_ms, r),
+                None => core.handle_wire_body(&body, now_unix, now_ms, r),
+            };
             let res = match &mut roster {
-                V2RosterRef::Direct(r) => self.core.handle_wire_body(&body, now_unix, now_ms, r),
+                V2RosterRef::Direct(r) => handle(r),
                 V2RosterRef::Locked(m) => {
                     let mut guard = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    self.core
-                        .handle_wire_body(&body, now_unix, now_ms, &mut guard)
+                    handle(&mut guard)
                 }
             };
             match res {
@@ -2696,16 +2764,20 @@ impl ConcurrentV2Session {
             if let Some(ev) = self.pop_pending_event() {
                 return Ok(Some(ev));
             }
-            if self
-                .core
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .closed
-            {
-                return Ok(None);
-            }
+            let staged = {
+                let mut core = self
+                    .core
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if core.closed {
+                    return Ok(None);
+                }
+                core.staged.take()
+            };
 
-            let body = if let Some(b) = read_half.frame_reader.next_frame()? {
+            let body = if staged.is_some() {
+                Vec::new()
+            } else if let Some(b) = read_half.frame_reader.next_frame()? {
                 b
             } else {
                 let read_half_ref = &mut *read_half;
@@ -2734,7 +2806,10 @@ impl ConcurrentV2Session {
                 let mut roster_guard = roster
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                core.handle_wire_body(&body, now_unix, now_ms, &mut roster_guard)
+                match staged {
+                    Some(frame) => core.handle_decoded(frame, now_unix, now_ms, &mut roster_guard),
+                    None => core.handle_wire_body(&body, now_unix, now_ms, &mut roster_guard),
+                }
             };
             match feed_res {
                 Ok(WireHandleOutcome {
