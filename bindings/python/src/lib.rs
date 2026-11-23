@@ -944,6 +944,8 @@ struct Endpoint {
     self_m2m_enabled: Arc<AtomicBool>,
     m2m_enabled: Arc<AtomicBool>,
     groups: StdMutex<Vec<Weak<GroupPool>>>,
+    /// URLs bound by `serve_relay`, so a group pool never displaces their identity mailbox.
+    served_v1_relays: Arc<StdMutex<Vec<String>>>,
 }
 
 impl Endpoint {
@@ -1025,6 +1027,7 @@ impl Endpoint {
                 self_m2m_enabled: Arc::new(AtomicBool::new(false)),
                 m2m_enabled: Arc::new(AtomicBool::new(has_active_anchor)),
                 groups: StdMutex::new(Vec::new()),
+                served_v1_relays: Arc::new(StdMutex::new(Vec::new())),
             })
         })
     }
@@ -1105,12 +1108,13 @@ impl Endpoint {
         })
     }
 
-    #[pyo3(signature = (group_id, listen_addr=None))]
+    #[pyo3(signature = (group_id, listen_addr=None, relay_listen=false))]
     fn group_open(
         &self,
         py: Python<'_>,
         group_id: &str,
         listen_addr: Option<&str>,
+        relay_listen: bool,
     ) -> PyResult<Group> {
         let store = self.group_store()?;
         let identity = Arc::clone(&self.identity);
@@ -1118,6 +1122,11 @@ impl Endpoint {
         let transport_cfg = self.snapshot_transport_cfg();
         let relay_auth = transport_cfg.relay_auth.clone();
         let p2p_opts = transport_cfg.build_p2p_group_options();
+        let served_v1_relays = self
+            .served_v1_relays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let group_id = group_id.to_owned();
         let addr: Option<SocketAddr> = listen_addr
             .filter(|s| !s.is_empty())
@@ -1132,7 +1141,7 @@ impl Endpoint {
                 let mut dialers: Vec<Arc<dyn PathDialer>> = vec![
                     Arc::new(DirectDialer::new()),
                     Arc::new(LocalDialer::new()),
-                    Arc::new(RelayDialer::new().with_auth(relay_auth)),
+                    Arc::new(RelayDialer::new().with_auth(relay_auth.clone())),
                     Arc::new(OverlayDialer::new()),
                     Arc::new(BrokerDialer::new()),
                 ];
@@ -1141,7 +1150,10 @@ impl Endpoint {
                         P2pDialer::bind_with_options(opts).await.map_err(py_err)?,
                     ));
                 }
-                let config = GroupPoolConfig::new(dialers);
+                let config = GroupPoolConfig::new(dialers)
+                    .with_relay_auth(relay_auth)
+                    .with_relay_listen(relay_listen)
+                    .with_served_v1_relays(served_v1_relays);
                 let pool = GroupPool::open((*store).clone(), identity, &group_id, config, None)
                     .map_err(py_err)?;
                 let mut local_endpoint = None;
@@ -1268,10 +1280,11 @@ impl Endpoint {
         let exp = expected_host.map(ToOwned::to_owned);
         let key = self.identity.signing_key().ed25519_signing_key();
         let cfg = self.snapshot_transport_cfg();
+        let served = Arc::clone(&self.served_v1_relays);
         py.detach(move || {
             let listener = rt
                 .block_on(RelayListener::bind_with_auth(
-                    url,
+                    url.clone(),
                     exp,
                     key,
                     DEFAULT_WRITE_TIMEOUT,
@@ -1280,6 +1293,10 @@ impl Endpoint {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let ep = listener.local_endpoint();
             router.spawn_listener(rt.handle(), Box::new(listener));
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(url);
             Ok(ep)
         })
     }

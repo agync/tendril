@@ -128,7 +128,7 @@ The dialer sends:
 }
 ```
 
-If `target_mailbox_id` has an active control connection and fewer than `max_pending_per_mailbox` pending dials, the relay pushes an `incoming` notification over the listener's control WebSocket including the dialer's `challenge.nonce` (`dial_nonce`) and `dial_token`:
+If `target_mailbox_id` has an active control connection and fewer than `max_pending_per_mailbox` pending dials, the relay pushes an `incoming` notification over the listener's control WebSocket including the dialer's `challenge.nonce` (`dial_nonce`) and `dial_token`. If that control connection ends before the dial is accepted, the relay MUST fail the dial with `"offline"` at once rather than hold it until `accept_timeout`:
 
 ```jsonc
 // Server -> Listener (control socket)
@@ -146,6 +146,8 @@ If `target_mailbox_id` has an active control connection and fewer than `max_pend
   1. Look up `epoch` in its active `RelayEpochWindow` (`epoch >= min_valid_epoch`) and verify `dial_token` against `dial_auth_key` over `("tendril-relay-v2-dial\0" || canonical(relay_host) || dial_nonce || mailbox_id || conn_id || epoch_be)` using constant-time comparison (`subtle::ConstantTimeEq`).
   2. ONLY AFTER `dial_token` verifies, check and record `(epoch, dial_nonce, conn_id)` in a bounded `RelayDialReplayCache` to reject replayed `incoming` notifications from a malicious relay. At capacity, `RelayDialReplayCache` evicts only expired epochs (`epoch < min_valid_epoch`) and fails closed without evicting live entries.
 - If `dial_token` fails verification, is replayed, or `epoch` is outside the listener's active window, the listener MUST silently ignore the `incoming` notification without opening a data connection or performing a Noise handshake.
+
+A valid `accept` (Section 3.3) claims the pending dial atomically, and the claim and the dial's own withdrawal are mutually exclusive. If the control connection ends or `accept_timeout` passes after an `accept` claimed the dial, the claim wins: the relay MUST NOT fail the dial with `"offline"` or `"timeout"` and answers both sockets with `ready`, failing the dial with `"offline"` only if the relay cannot deliver `ready` to the acceptor socket. If the dial is withdrawn first, it fails with `"offline"` or `"timeout"` and a later `accept` for its `conn_id` fails with `"invalid_request"`.
 
 ### 3.3 Anti-Hijack Stream Accept (Listener Data Socket)
 

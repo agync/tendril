@@ -105,7 +105,11 @@ export class Endpoint {
   ): Promise<string>;
   groupRemoveMember(groupId: string, peerId: string): Promise<string>;
   groupIngestManifest(manifestJson: string, senderPeerId: string): Promise<string>;
-  groupOpen(groupId: string, listenAddr?: string | null): Promise<Group>;
+  groupOpen(
+    groupId: string,
+    listenAddr?: string | null,
+    relayListen?: boolean | null
+  ): Promise<Group>;
   close(): void;
 }
 

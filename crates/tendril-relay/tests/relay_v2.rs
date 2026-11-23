@@ -1209,3 +1209,214 @@ async fn relay_enforces_shared_v1_and_v2_max_mailboxes_cap() {
     drop((v1_ws1, v2_ws1));
     handle.stop().await.expect("stop relay");
 }
+
+#[tokio::test]
+async fn relay_v2_fails_a_pending_dial_offline_when_its_registration_ends() {
+    use std::time::Duration;
+
+    // The accept deadline is far beyond the bound below, so only the registration ending can
+    // answer the dial in time.
+    let server = RelayServer::bind(RelayConfig {
+        accept_timeout: Duration::from_secs(300),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind relay");
+    let handle = server.spawn();
+    let v2_url = handle.ws_v2_url();
+    let mailbox = derive_epoch_mailbox(&[0xD1; 32], now_unix_secs() / 3600);
+
+    let (mut listener_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge { nonce, host, .. }) = recv_v2_msg(&mut listener_ws).await
+    else {
+        panic!("expected v2 challenge");
+    };
+    let nonce = b64url_decode_array::<32>(&nonce).unwrap();
+    send_v2_msg(
+        &mut listener_ws,
+        &RelayV2ClientMsg::Register {
+            mailbox_id: mailbox.mailbox_id_b64url(),
+            epoch: mailbox.epoch,
+            sig: b64url_encode(&sign_v2_relay_register(&mailbox, &host, &nonce).unwrap()),
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_v2_msg(&mut listener_ws).await,
+        Some(RelayV2ServerMsg::Registered { .. })
+    ));
+
+    let (mut dialer_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge { nonce, host, .. }) = recv_v2_msg(&mut dialer_ws).await
+    else {
+        panic!("expected v2 dial challenge");
+    };
+    let nonce = b64url_decode_array::<32>(&nonce).unwrap();
+    let conn_id = [0xD2; 16];
+    send_v2_msg(
+        &mut dialer_ws,
+        &RelayV2ClientMsg::Dial {
+            target_mailbox_id: mailbox.mailbox_id_b64url(),
+            epoch: mailbox.epoch,
+            conn_id: b64url_encode(&conn_id),
+            dial_token: b64url_encode(
+                &sign_v2_relay_dial(&mailbox, &host, &nonce, &conn_id).unwrap(),
+            ),
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_v2_msg(&mut listener_ws).await,
+        Some(RelayV2ServerMsg::Incoming { .. })
+    ));
+
+    // The listener vanishes without a close frame and without accepting.
+    drop(listener_ws);
+    let reply = tokio::time::timeout(Duration::from_secs(10), recv_v2_msg(&mut dialer_ws))
+        .await
+        .expect("pending dial outlived its registration");
+    assert_eq!(
+        reply,
+        Some(RelayV2ServerMsg::Error {
+            code: "offline".to_owned()
+        })
+    );
+    handle.stop().await.expect("stop relay");
+}
+
+#[tokio::test]
+async fn relay_v2_an_accept_that_claimed_a_dial_wins_over_registration_end() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tendril_relay::{RelayTestHook, RelayTestPoint};
+    use tokio::sync::Notify;
+
+    // The accept holds its claim until the dialer has seen the registration end.
+    let claimed = Arc::new(Notify::new());
+    let teardown = Arc::new(Notify::new());
+    let on_claim = Arc::clone(&claimed);
+    let hook: RelayTestHook = Arc::new(move |point| {
+        let claimed = Arc::clone(&on_claim);
+        let teardown = Arc::clone(&teardown);
+        Box::pin(async move {
+            match point {
+                RelayTestPoint::AcceptClaimed => {
+                    claimed.notify_one();
+                    teardown.notified().await;
+                }
+                RelayTestPoint::DialTeardown => teardown.notify_one(),
+                _ => {}
+            }
+        })
+    });
+    let server = RelayServer::bind(RelayConfig {
+        accept_timeout: Duration::from_secs(300),
+        test_hook: Some(hook),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind relay");
+    let handle = server.spawn();
+    let v2_url = handle.ws_v2_url();
+    let mailbox = derive_epoch_mailbox(&[0xD3; 32], now_unix_secs() / 3600);
+
+    let (mut listener_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge { nonce, host, .. }) = recv_v2_msg(&mut listener_ws).await
+    else {
+        panic!("expected v2 challenge");
+    };
+    let nonce = b64url_decode_array::<32>(&nonce).unwrap();
+    send_v2_msg(
+        &mut listener_ws,
+        &RelayV2ClientMsg::Register {
+            mailbox_id: mailbox.mailbox_id_b64url(),
+            epoch: mailbox.epoch,
+            sig: b64url_encode(&sign_v2_relay_register(&mailbox, &host, &nonce).unwrap()),
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_v2_msg(&mut listener_ws).await,
+        Some(RelayV2ServerMsg::Registered { .. })
+    ));
+
+    let (mut dialer_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge { nonce, host, .. }) = recv_v2_msg(&mut dialer_ws).await
+    else {
+        panic!("expected v2 dial challenge");
+    };
+    let nonce = b64url_decode_array::<32>(&nonce).unwrap();
+    let conn_id = [0xD4; 16];
+    let conn_id_b64 = b64url_encode(&conn_id);
+    send_v2_msg(
+        &mut dialer_ws,
+        &RelayV2ClientMsg::Dial {
+            target_mailbox_id: mailbox.mailbox_id_b64url(),
+            epoch: mailbox.epoch,
+            conn_id: conn_id_b64.clone(),
+            dial_token: b64url_encode(
+                &sign_v2_relay_dial(&mailbox, &host, &nonce, &conn_id).unwrap(),
+            ),
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_v2_msg(&mut listener_ws).await,
+        Some(RelayV2ServerMsg::Incoming { .. })
+    ));
+
+    let (mut accept_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge {
+        nonce: acc_nonce,
+        host: acc_host,
+        ..
+    }) = recv_v2_msg(&mut accept_ws).await
+    else {
+        panic!("expected v2 accept challenge");
+    };
+    let acc_nonce = b64url_decode_array::<32>(&acc_nonce).unwrap();
+    send_v2_msg(
+        &mut accept_ws,
+        &RelayV2ClientMsg::Accept {
+            mailbox_id: mailbox.mailbox_id_b64url(),
+            epoch: mailbox.epoch,
+            conn_id: conn_id_b64.clone(),
+            sig: b64url_encode(
+                &sign_v2_relay_accept(&mailbox, &acc_host, &acc_nonce, &conn_id).unwrap(),
+            ),
+            auth: None,
+        },
+    )
+    .await;
+
+    claimed.notified().await;
+    drop(listener_ws);
+    let ready = Some(RelayV2ServerMsg::Ready {
+        conn_id: conn_id_b64,
+    });
+    let bound = Duration::from_secs(10);
+    let dialer_reply = tokio::time::timeout(bound, recv_v2_msg(&mut dialer_ws))
+        .await
+        .expect("dialer reply");
+    let acceptor_reply = tokio::time::timeout(bound, recv_v2_msg(&mut accept_ws))
+        .await
+        .expect("acceptor reply");
+    assert_eq!(dialer_reply, ready);
+    assert_eq!(acceptor_reply, ready);
+
+    dialer_ws
+        .send(Message::Binary(b"after-race".to_vec().into()))
+        .await
+        .expect("send dialer frame");
+    let frame = tokio::time::timeout(bound, accept_ws.next())
+        .await
+        .expect("bridged frame")
+        .expect("acceptor recv")
+        .expect("frame");
+    assert_eq!(frame, Message::Binary(b"after-race".to_vec().into()));
+    handle.stop().await.expect("stop relay");
+}

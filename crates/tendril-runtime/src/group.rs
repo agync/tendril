@@ -10,7 +10,7 @@
 //! `groups.json` or `roster.json` is read or written, one file at a time: store file locks are
 //! never nested, and the root CRL is read and released before the group book lock is taken.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::Duration;
@@ -30,7 +30,7 @@ pub use tendril_core::group::{MAX_GROUPS_PER_SIGNER, MAX_LOCAL_GROUPS, MAX_STORE
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::policy::{CandidateEndpoint, PathPolicyConfig, ProviderId};
 use tendril_core::roster::{PeerState, Roster, RosterEntry, V2PeerSecrets};
-use tendril_core::v2::{MAX_PADDED_PAYLOAD_LEN, PaddingPolicy};
+use tendril_core::v2::{MAX_PADDED_PAYLOAD_LEN, PaddingPolicy, canonical_relay_host};
 use tendril_core::wire::{Intent, Preamble};
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::task::AbortHandle;
@@ -44,6 +44,9 @@ use crate::driver::{
 use crate::error::RuntimeError;
 use crate::provider::{
     DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream, PrefixedPathStream, peek_exact,
+};
+use crate::providers::{
+    RelayClientAuth, RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig,
 };
 use crate::rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 use crate::store::{RosterStamp, StateStore};
@@ -60,6 +63,8 @@ const EVENT_QUEUE_CAP: usize = 1024;
 const CONTROL_EVENT_RESERVE: usize = 64;
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
 const BOOK_WATCH_INTERVAL: Duration = Duration::from_millis(250);
+/// Earliest respawn of a relay mailbox listener task after it finished.
+const MAILBOX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Idle limit of an ordinary admin control session accepted by a pool: it closes when no
 /// group control frame arrives for this long.
@@ -120,6 +125,13 @@ pub struct GroupPoolConfig {
     pub padding: PaddingPolicy,
     pub pre_auth: PreAuthConfig,
     pub wake_targets: HashMap<String, (WakeTarget, WakeSecret)>,
+    /// Relay admission credentials for `/v2/relay` sibling dials and mailbox listeners.
+    pub relay_auth: RelayClientAuth,
+    /// Registers this pool's relay mailboxes; set only on the one process serving the identity.
+    pub relay_listen: bool,
+    /// `/v1/relay` URLs on which the host process already registers the identity's relay
+    /// mailbox and routes session streams to its [`GroupHub`]; the pool never registers there.
+    pub served_v1_relays: Vec<String>,
 }
 
 impl GroupPoolConfig {
@@ -135,7 +147,36 @@ impl GroupPoolConfig {
             padding: PaddingPolicy::v2_default(),
             pre_auth: PreAuthConfig::default(),
             wake_targets: HashMap::new(),
+            relay_auth: RelayClientAuth::None,
+            relay_listen: false,
+            served_v1_relays: Vec::new(),
         }
+    }
+
+    /// Sets the relay admission credentials used for sibling relay dials and listeners.
+    #[must_use]
+    pub fn with_relay_auth(mut self, relay_auth: RelayClientAuth) -> Self {
+        self.relay_auth = relay_auth;
+        self
+    }
+
+    /// Registers the local member's relay mailboxes on the relay hints of its own manifest
+    /// entry: the group mailbox on each `/v2/relay` host while the current key is held, and the
+    /// identity's relay mailbox on each other relay host. Off by default: a relay keeps only
+    /// the latest registration of a mailbox, so only the one process that serves the identity
+    /// may set it.
+    #[must_use]
+    pub fn with_relay_listen(mut self, relay_listen: bool) -> Self {
+        self.relay_listen = relay_listen;
+        self
+    }
+
+    /// Names the `/v1/relay` URLs whose identity mailbox the host process already serves
+    /// itself, routing their session streams to its [`GroupHub`].
+    #[must_use]
+    pub fn with_served_v1_relays(mut self, urls: Vec<String>) -> Self {
+        self.served_v1_relays = urls;
+        self
     }
 
     /// Overrides the per-peer write timeout.
@@ -443,6 +484,10 @@ struct OrdinaryTarget {
     host_id: String,
     roster: Roster,
     wire: u8,
+    /// The entry's own pair mailbox, dialed on `/v2/relay` hints (Wire v2 only).
+    relay_mailbox: Option<Zeroizing<[u8; 32]>>,
+    /// The member's manifest-pinned relay key, appended to other relay hints.
+    relay_pub: String,
 }
 
 /// Resolves `member` to an `Active`, CRL-clean ordinary roster entry with a complete pin whose
@@ -464,6 +509,10 @@ fn ordinary_target(roster: &Roster, member: &GroupMember) -> Option<OrdinaryTarg
     } else {
         return None;
     };
+    let relay_mailbox = entry
+        .v2_secrets
+        .as_ref()
+        .map(|s| Zeroizing::new(*s.mailbox_secret()));
     let host_id = host_id.clone();
     let mut narrowed = roster.clone();
     narrowed.retain_active(|key, _| key == host_id);
@@ -471,6 +520,8 @@ fn ordinary_target(roster: &Roster, member: &GroupMember) -> Option<OrdinaryTarg
         host_id,
         roster: narrowed,
         wire,
+        relay_mailbox,
+        relay_pub: member.relay_pub.clone(),
     })
 }
 
@@ -751,6 +802,8 @@ struct TestHooks {
     committed_inbound: TestGate,
     inbound_done: TestGate,
     commit_timeout: Mutex<Option<Duration>>,
+    before_mailbox_bind: TestGate,
+    after_mailbox_spawn: TestHook,
 }
 
 /// Test-only async interleave point: `(reached, release)`, used at most once.
@@ -809,8 +862,52 @@ struct Inner {
     close_notify: tokio::sync::Notify,
     watcher_started: AtomicBool,
     tasks: Mutex<Vec<AbortHandle>>,
+    relay_mailboxes: Mutex<HashMap<String, MailboxListener>>,
     #[cfg(test)]
     hooks: TestHooks,
+}
+
+/// One relay mailbox listener task, keyed in [`Inner::relay_mailboxes`] by kind and canonical
+/// relay host.
+struct MailboxListener {
+    url: String,
+    secret: Option<Zeroizing<[u8; 32]>>,
+    task: AbortHandle,
+    retry_after: Option<Instant>,
+}
+
+/// One planned relay mailbox registration: `(key, url, group mailbox secret)`. A `None` secret
+/// is the identity's `/v1/relay` mailbox.
+type MailboxPlan = Vec<(String, String, Option<Zeroizing<[u8; 32]>>)>;
+
+/// `(relay_pub, canonical host)` pairs whose `/v1/relay` identity mailbox a pool of this
+/// process holds, so two pools of one identity never displace each other on a relay.
+static V1_MAILBOX_CLAIMS: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+
+/// A held [`V1_MAILBOX_CLAIMS`] entry, released on drop.
+struct V1MailboxClaim((String, String));
+
+impl V1MailboxClaim {
+    fn take(relay_pub: &str, host: &str) -> Option<Self> {
+        let key = (relay_pub.to_owned(), host.to_owned());
+        let inserted = V1_MAILBOX_CLAIMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashSet::new)
+            .insert(key.clone());
+        inserted.then(|| Self(key))
+    }
+}
+
+impl Drop for V1MailboxClaim {
+    fn drop(&mut self) {
+        let mut claims = V1_MAILBOX_CLAIMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(claims) = claims.as_mut() {
+            claims.remove(&self.0);
+        }
+    }
 }
 
 impl Drop for Inner {
@@ -821,6 +918,14 @@ impl Drop for Inner {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for link in state.slots.values() {
             link.shutdown();
+        }
+        for (_, mailbox) in self
+            .relay_mailboxes
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+        {
+            mailbox.task.abort();
         }
         for task in self
             .tasks
@@ -988,6 +1093,7 @@ impl GroupPool {
                 close_notify: tokio::sync::Notify::new(),
                 watcher_started: AtomicBool::new(false),
                 tasks: Mutex::new(Vec::new()),
+                relay_mailboxes: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 hooks: TestHooks::default(),
             }),
@@ -1026,9 +1132,15 @@ impl GroupPool {
                     return;
                 }
                 let mut st = inner.lock_state();
-                if let Err(err) = inner.refresh_locked(&mut st) {
-                    tracing::debug!(error = %err, "group book refresh failed");
-                }
+                let plan = match inner.refresh_locked(&mut st) {
+                    Ok(()) => inner.relay_mailbox_plan_locked(&st),
+                    Err(err) => {
+                        tracing::debug!(error = %err, "group book refresh failed");
+                        MailboxPlan::new()
+                    }
+                };
+                drop(st);
+                inner.reconcile_relay_mailboxes(plan);
             }
         });
         self.inner.track(task.abort_handle());
@@ -1304,49 +1416,10 @@ impl GroupPool {
 
     /// Spawns an accept loop over `listener`. Each stream must obtain a pre-auth admission slot
     /// before a handshake task is spawned for it.
-    pub fn serve(&self, mut listener: Box<dyn PathListener>) {
+    pub fn serve(&self, listener: Box<dyn PathListener>) {
         self.ensure_book_watcher();
         let weak: Weak<Inner> = Arc::downgrade(&self.inner);
-        let handle = tokio::spawn(async move {
-            loop {
-                let mut stream = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(_) => {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        if weak.strong_count() == 0 {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-                let Some(inner) = weak.upgrade() else {
-                    return;
-                };
-                if inner.closed.load(Ordering::Acquire) {
-                    return;
-                }
-                let guard = match inner.admission.try_acquire_for_stream(
-                    stream.provider_id(),
-                    stream.peer_ip(),
-                    stream.peer_transport_id().as_deref(),
-                ) {
-                    Ok(g) => g,
-                    Err(err) => {
-                        tracing::debug!(error = %err, "group inbound session not admitted");
-                        let _ = stream.close().await;
-                        continue;
-                    }
-                };
-                let task = tokio::spawn(async move {
-                    if let Err(err) = Arc::clone(&inner).accept_stream(stream, guard).await {
-                        tracing::debug!(error = %err, "group inbound session refused");
-                    }
-                });
-                if let Some(inner) = weak.upgrade() {
-                    inner.track(task.abort_handle());
-                }
-            }
-        });
+        let handle = tokio::spawn(accept_loop(weak, listener, true));
         self.inner.track(handle.abort_handle());
     }
 
@@ -1371,6 +1444,15 @@ impl GroupPool {
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         self.inner.close_notify.notify_waiters();
+        for (_, mailbox) in self
+            .inner
+            .relay_mailboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+        {
+            mailbox.task.abort();
+        }
         self.disconnect_all();
         for task in self
             .inner
@@ -1382,6 +1464,51 @@ impl GroupPool {
             task.abort();
         }
         self.inner.store.close();
+    }
+}
+
+/// Accepts streams from `listener` into the pool. Each stream must obtain a pre-auth admission
+/// slot before a handshake task is spawned for it. With `retry`, an accept error is retried;
+/// without it, the loop ends when the listener reports [`RuntimeError::Closed`].
+async fn accept_loop(weak: Weak<Inner>, mut listener: Box<dyn PathListener>, retry: bool) {
+    loop {
+        let mut stream = match listener.accept().await {
+            Ok(s) => s,
+            Err(RuntimeError::Closed) if !retry => return,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if weak.strong_count() == 0 {
+                    return;
+                }
+                continue;
+            }
+        };
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        if inner.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let guard = match inner.admission.try_acquire_for_stream(
+            stream.provider_id(),
+            stream.peer_ip(),
+            stream.peer_transport_id().as_deref(),
+        ) {
+            Ok(g) => g,
+            Err(err) => {
+                tracing::debug!(error = %err, "group inbound session not admitted");
+                let _ = stream.close().await;
+                continue;
+            }
+        };
+        let task = tokio::spawn(async move {
+            if let Err(err) = Arc::clone(&inner).accept_stream(stream, guard).await {
+                tracing::debug!(error = %err, "group inbound session refused");
+            }
+        });
+        if let Some(inner) = weak.upgrade() {
+            inner.track(task.abort_handle());
+        }
     }
 }
 
@@ -1953,15 +2080,162 @@ fn member_static(manifest: &GroupManifest, device_id: &str) -> Option<[u8; 32]> 
         .and_then(|m| b64url_decode_array::<32>(&m.static_pub).ok())
 }
 
-fn candidates_from_hints(hints: &[String]) -> Vec<CandidateEndpoint> {
+/// Dial candidates for `hints`; `/v2/relay` hints are kept only when `v2_relay` (a mailbox
+/// secret to dial them with is known).
+fn candidates_from_hints(hints: &[String], v2_relay: bool) -> Vec<CandidateEndpoint> {
     hints
         .iter()
         .enumerate()
+        .filter(|(_, hint)| v2_relay || !is_v2_relay_url(hint))
         .filter_map(|(id, hint)| {
             let (provider, addr) = classify_hint(hint)?;
             Some(CandidateEndpoint::new(id, provider, addr))
         })
         .collect()
+}
+
+/// Parses a `ws://` or `wss://` relay hint, with or without the `relay:` prefix.
+fn relay_url(hint: &str) -> Option<url::Url> {
+    let raw = hint.strip_prefix("relay:").unwrap_or(hint);
+    let parsed = url::Url::parse(raw).ok()?;
+    matches!(parsed.scheme(), "ws" | "wss").then_some(parsed)
+}
+
+/// Whether `hint` is a `/v2/relay` mailbox relay URL.
+fn is_v2_relay_url(hint: &str) -> bool {
+    relay_url(hint).is_some_and(|u| u.path() == "/v2/relay")
+}
+
+/// The canonical relay host (no port) of a relay hint: the identity a relay verifies.
+fn relay_url_host(hint: &str) -> Option<String> {
+    canonical_relay_host(relay_url(hint)?.host_str()?).ok()
+}
+
+/// `(canonical host, url, group mailbox secret)` for each `/v2/relay` host of the local
+/// member's own entry (first hint per host wins), when `relay_listen` is set, the group's
+/// `min_wire_version` is 2 (siblings dial group mailboxes only at that floor), the local device
+/// is an active, root-CRL-clean member, and `pair_bootstrap` holds (unexpired manifest and
+/// current-`seq` key). The secret is `group_mailbox(local_id)` at that `seq`.
+fn relay_mailbox_plan(
+    book: &GroupBook,
+    crl: Option<&RevocationList>,
+    group_id: &str,
+    local_id: &str,
+    now: u64,
+    relay_listen: bool,
+) -> Vec<(String, String, Zeroizing<[u8; 32]>)> {
+    if !relay_listen
+        || recipient_ok(book, group_id, crl, local_id, local_id).is_err()
+        || book
+            .pair_bootstrap(group_id, local_id, local_id, now)
+            .is_err()
+    {
+        return Vec::new();
+    }
+    let (Some(manifest), Some(secrets)) = (book.manifest(group_id), book.secrets(group_id)) else {
+        return Vec::new();
+    };
+    if manifest.min_wire_version < 2 {
+        return Vec::new();
+    }
+    let Some(member) = manifest.members.iter().find(|m| m.device_id == local_id) else {
+        return Vec::new();
+    };
+    let mut plan: Vec<(String, String, Zeroizing<[u8; 32]>)> = Vec::new();
+    for hint in member.endpoints.iter().filter(|h| is_v2_relay_url(h)) {
+        let Some(host) = relay_url_host(hint) else {
+            continue;
+        };
+        if plan.iter().any(|(h, _, _)| *h == host) {
+            continue;
+        }
+        let url = hint.strip_prefix("relay:").unwrap_or(hint).to_owned();
+        let secret =
+            derive_group_mailbox_secret(secrets.group_rendezvous_key(), secrets.seq(), local_id);
+        plan.push((host, url, secret));
+    }
+    plan
+}
+
+/// `(canonical host, url)` for each relay host of the local member's own entry whose hints
+/// are not `/v2/relay` (first hint per host wins), when `relay_listen` is set, the stored
+/// manifest is unexpired, and the local device is an active, root-CRL-clean member. Hosts of
+/// `served` are left to the host process.
+fn relay_v1_plan(
+    book: &GroupBook,
+    crl: Option<&RevocationList>,
+    group_id: &str,
+    local_id: &str,
+    now: u64,
+    relay_listen: bool,
+    served: &[String],
+) -> Vec<(String, String)> {
+    if !relay_listen || recipient_ok(book, group_id, crl, local_id, local_id).is_err() {
+        return Vec::new();
+    }
+    let Some(manifest) = book.manifest(group_id) else {
+        return Vec::new();
+    };
+    let Some(member) = manifest.members.iter().find(|m| m.device_id == local_id) else {
+        return Vec::new();
+    };
+    if !member
+        .endpoints
+        .iter()
+        .any(|h| relay_url(h).is_some() && !is_v2_relay_url(h))
+        || core_group::verify_group_manifest(manifest, now, crl).is_err()
+    {
+        return Vec::new();
+    }
+    let served: Vec<String> = served.iter().filter_map(|u| relay_url_host(u)).collect();
+    let mut plan: Vec<(String, String)> = Vec::new();
+    for hint in &member.endpoints {
+        if relay_url(hint).is_none() || is_v2_relay_url(hint) {
+            continue;
+        }
+        let Some(host) = relay_url_host(hint) else {
+            continue;
+        };
+        if served.contains(&host) || plan.iter().any(|(h, _)| *h == host) {
+            continue;
+        }
+        plan.push((host, hint.strip_prefix("relay:").unwrap_or(hint).to_owned()));
+    }
+    plan
+}
+
+/// The relay dialer of one sibling dial: `/v2/relay` URLs go to a [`RelayV2Dialer`] on the
+/// target's mailbox, other relay URLs to the configured relay dialer with the target's
+/// manifest-pinned relay key appended as `#<relay_pub>`.
+struct SiblingRelayDialer {
+    v1: Option<Arc<dyn PathDialer>>,
+    v2: Option<RelayV2Dialer>,
+    relay_pub: String,
+}
+
+#[async_trait::async_trait]
+impl PathDialer for SiblingRelayDialer {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::Relay
+    }
+
+    async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+        if is_v2_relay_url(endpoint) {
+            let v2 = self
+                .v2
+                .as_ref()
+                .ok_or_else(|| RuntimeError::Protocol("no relay mailbox secret".to_owned()))?;
+            return v2.dial(endpoint).await;
+        }
+        let v1 = self
+            .v1
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Protocol("no relay dialer".to_owned()))?;
+        if endpoint.contains('#') {
+            return v1.dial(endpoint).await;
+        }
+        v1.dial(&format!("{endpoint}#{}", self.relay_pub)).await
+    }
 }
 
 fn classify_hint(hint: &str) -> Option<(ProviderId, String)> {
@@ -2117,13 +2391,176 @@ impl Inner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Registers a pool task so close aborts it. Close sets `closed` before it takes the
+    /// `tasks` mutex, so a task tracked after its drain is aborted here at once.
     fn track(&self, handle: AbortHandle) {
         let mut tasks = self
             .tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            handle.abort();
+            return;
+        }
         tasks.retain(|t| !t.is_finished());
         tasks.push(handle);
+    }
+
+    /// The relay mailboxes this pool should hold now: [`relay_mailbox_plan`] plus the
+    /// identity's mailbox on each other relay host of the local entry ([`relay_v1_plan`]).
+    fn relay_mailbox_plan_locked(&self, st: &PoolState) -> MailboxPlan {
+        let now = current_unix_secs();
+        let listen = self.cfg.relay_listen;
+        let v2 = relay_mailbox_plan(
+            &st.book,
+            st.crl.as_ref(),
+            &self.group_id,
+            &self.local_id,
+            now,
+            listen,
+        )
+        .into_iter()
+        .map(|(host, url, secret)| (format!("v2 {host}"), url, Some(secret)));
+        let v1 = relay_v1_plan(
+            &st.book,
+            st.crl.as_ref(),
+            &self.group_id,
+            &self.local_id,
+            now,
+            listen,
+            &self.cfg.served_v1_relays,
+        )
+        .into_iter()
+        .map(|(host, url)| (format!("v1 {host}"), url, None));
+        v2.chain(v1).collect()
+    }
+
+    /// Brings the relay mailbox listener tasks in line with `plan`. Only the book watcher calls
+    /// it, so plans never interleave. A task whose entry left the plan or changed its URL or
+    /// secret is aborted; a missing entry is spawned; a finished task is respawned no sooner
+    /// than [`MAILBOX_RETRY_DELAY`] after it was seen finished. Nothing is spawned once the
+    /// pool is closed, and a spawned task starts only after this call released the
+    /// `relay_mailboxes` lock and only while the pool is open (see [`Self::run_relay_mailbox`]).
+    fn reconcile_relay_mailboxes(self: &Arc<Self>, plan: MailboxPlan) {
+        let mut mailboxes = self
+            .relay_mailboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        mailboxes.retain(|key, current| {
+            let keep = plan.iter().any(|(k, url, secret)| {
+                k == key
+                    && *url == current.url
+                    && match (secret, &current.secret) {
+                        (Some(a), Some(b)) => bool::from(a.ct_eq(&**b)),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            });
+            if !keep {
+                current.task.abort();
+            }
+            keep
+        });
+        let now = Instant::now();
+        for (key, url, secret) in plan {
+            if let Some(current) = mailboxes.get_mut(&key) {
+                if !current.task.is_finished() {
+                    continue;
+                }
+                match current.retry_after {
+                    None => {
+                        current.retry_after = Some(now + MAILBOX_RETRY_DELAY);
+                        continue;
+                    }
+                    Some(at) if now < at => continue,
+                    Some(_) => {}
+                }
+            }
+            let task = tokio::spawn(Self::run_relay_mailbox(
+                Arc::downgrade(self),
+                url.clone(),
+                secret.clone(),
+            ));
+            #[cfg(test)]
+            fire(&self.hooks.after_mailbox_spawn);
+            self.track(task.abort_handle());
+            mailboxes.insert(
+                key,
+                MailboxListener {
+                    url,
+                    secret,
+                    task: task.abort_handle(),
+                    retry_after: None,
+                },
+            );
+        }
+    }
+
+    /// Binds one relay mailbox listener and accepts its streams into the pool until the
+    /// listener ends. With `secret` it registers the group mailbox on a `/v2/relay` URL;
+    /// without, the identity's relay mailbox on a `/v1/relay` URL, while no other pool of this
+    /// process holds it there.
+    ///
+    /// The task first takes the `relay_mailboxes` lock, which its spawner holds until the task
+    /// is recorded there, and returns when the pool is closed: close sets `closed` before it
+    /// takes that lock, so a task either starts before close drains and aborts it, or not at
+    /// all.
+    async fn run_relay_mailbox(weak: Weak<Self>, url: String, secret: Option<Zeroizing<[u8; 32]>>) {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        {
+            let _mailboxes = inner
+                .relay_mailboxes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.closed.load(Ordering::Acquire) {
+                return;
+            }
+        }
+        #[cfg(test)]
+        fire_gate(&inner.hooks.before_mailbox_bind).await;
+        let auth = inner.cfg.relay_auth.clone();
+        let identity = Arc::clone(&inner.identity);
+        drop(inner);
+        let bound: Result<(Box<dyn PathListener>, Option<V1MailboxClaim>), RuntimeError> =
+            match secret {
+                Some(secret) => {
+                    let cfg = RelayV2ListenerConfig {
+                        auth,
+                        ..RelayV2ListenerConfig::default()
+                    };
+                    RelayV2Listener::bind_with_config(url, *secret, cfg)
+                        .await
+                        .map(|l| (Box::new(l) as Box<dyn PathListener>, None))
+                }
+                None => {
+                    let signing = identity.signing_key();
+                    let relay_pub = b64url_encode(signing.ed25519_public_bytes());
+                    let host = relay_url_host(&url).unwrap_or_default();
+                    match V1MailboxClaim::take(&relay_pub, &host) {
+                        None => Err(RuntimeError::Protocol(
+                            "relay mailbox held by another pool".to_owned(),
+                        )),
+                        Some(claim) => RelayListener::bind_with_auth(
+                            url,
+                            None,
+                            signing.ed25519_signing_key(),
+                            DEFAULT_WRITE_TIMEOUT,
+                            auth,
+                        )
+                        .await
+                        .map(|l| (Box::new(l) as Box<dyn PathListener>, Some(claim))),
+                    }
+                }
+            };
+        match bound {
+            Ok((listener, _claim)) => accept_loop(weak, listener, false).await,
+            Err(err) => tracing::debug!(error = %err, "group relay mailbox not registered"),
+        }
     }
 
     /// Reloads the book and the founding-root CRL when either file changed, emitting membership
@@ -2514,7 +2951,7 @@ impl Inner {
         if let Err(err) = self.control_authority(peer, &*recipient) {
             return Delivery::Failed(err.to_string());
         }
-        let candidates = candidates_from_hints(&member.endpoints);
+        let candidates = candidates_from_hints(&member.endpoints, target.relay_mailbox.is_some());
         if candidates.is_empty() {
             return Delivery::Offline;
         }
@@ -2580,6 +3017,30 @@ impl Inner {
             .max(self.cfg.write_timeout)
     }
 
+    /// The configured dialers with the relay dialer replaced (or added) by a
+    /// [`SiblingRelayDialer`] for one target: `mailbox` for its `/v2/relay` hints (with the
+    /// pool's relay auth) and its manifest-pinned `relay_pub` for other relay hints.
+    fn relay_dialers(
+        &self,
+        mailbox: Option<&[u8; 32]>,
+        relay_pub: &str,
+    ) -> Vec<Arc<dyn PathDialer>> {
+        let mut dialers = self.cfg.dialers.clone();
+        let position = dialers
+            .iter()
+            .position(|d| d.provider_id() == ProviderId::Relay);
+        let sibling: Arc<dyn PathDialer> = Arc::new(SiblingRelayDialer {
+            v1: position.map(|i| Arc::clone(&dialers[i])),
+            v2: mailbox.map(|m| RelayV2Dialer::new(*m).with_auth(self.cfg.relay_auth.clone())),
+            relay_pub: relay_pub.to_owned(),
+        });
+        match position {
+            Some(i) => dialers[i] = sibling,
+            None => dialers.push(sibling),
+        }
+        dialers
+    }
+
     /// Opens an ordinary session to `target` over the member's manifest endpoints within the
     /// dial budget, authenticated against the narrowed persisted roster entry.
     async fn dial_ordinary(
@@ -2591,14 +3052,17 @@ impl Inner {
             host_id,
             roster,
             wire,
+            relay_mailbox,
+            relay_pub,
         } = target;
+        let dialers = self.relay_dialers(relay_mailbox.as_deref(), &relay_pub);
         let roster = Arc::new(Mutex::new(roster));
         let session_roster = Arc::clone(&roster);
         let identity = Arc::clone(&self.identity);
         let (_, io) = timeout(
             self.cfg.dial_budget,
             dial_with_policy_verified(
-                &self.cfg.dialers,
+                &dialers,
                 self.cfg.policy,
                 candidates,
                 move |_cand, stream| {
@@ -2667,10 +3131,15 @@ impl Inner {
             .cloned()
             .ok_or_else(|| DialError::Failed("not a member".to_owned()))?;
         let pin = member_pin(&book, manifest, &self.local_id, &member, now).map_err(failed)?;
-        let candidates = candidates_from_hints(&member.endpoints);
+        let mailbox = pin
+            .bootstrap
+            .as_ref()
+            .map(|s| Zeroizing::new(*s.mailbox_secret()));
+        let candidates = candidates_from_hints(&member.endpoints, mailbox.is_some());
         if candidates.is_empty() {
             return Err(DialError::Offline("no usable endpoint".to_owned()));
         }
+        let dialers = self.relay_dialers(mailbox.as_deref(), &member.relay_pub);
         let groups = vec![GroupSeq {
             group_id: self.group_id.clone(),
             seq: manifest.seq,
@@ -2709,7 +3178,13 @@ impl Inner {
             };
             let kind = attempt.as_ref().map(|(k, _)| *k);
             match self
-                .dial_once(&attempt_pin, candidates.clone(), groups.clone(), left)
+                .dial_once(
+                    &attempt_pin,
+                    &dialers,
+                    candidates.clone(),
+                    groups.clone(),
+                    left,
+                )
                 .await
             {
                 Ok(accepted) => {
@@ -2726,6 +3201,7 @@ impl Inner {
     async fn dial_once(
         self: &Arc<Self>,
         pin: &MemberPin,
+        dialers: &[Arc<dyn PathDialer>],
         candidates: Vec<CandidateEndpoint>,
         groups: Vec<GroupSeq>,
         budget: Duration,
@@ -2740,7 +3216,7 @@ impl Inner {
         let dialed = timeout(
             budget,
             dial_with_policy_verified(
-                &self.cfg.dialers,
+                dialers,
                 self.cfg.policy,
                 candidates,
                 move |_cand, stream| {
