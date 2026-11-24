@@ -1,7 +1,7 @@
 ---
 type: Design
 title: Wire protocol and pairing
-description: Preamble framing, Noise XXhfs hybrid PQ handshake, transcript-bound pairing proof, hybrid key rotation chains, and inner encrypted transport frames.
+description: Preamble framing, Noise XXhfs hybrid PQ handshake, transcript-bound pairing proof, signed multi-route pairing URIs, hybrid key rotation chains, and inner encrypted transport frames including signed route announcements.
 status: stable
 tags: [design, wire, pairing]
 ---
@@ -43,9 +43,43 @@ sequenceDiagram
 
 Codes default to a 15-minute TTL, are capped at `MAX_LIVE_PAIRING_CODES = 4` concurrent live codes (`CoreError::ProtocolViolation` when `>= 4` unexpired codes exist), and burn after 5 failed claim attempts across live codes. Manual pairing requires explicit SAS confirmation before leaving `pending` state unless an operator opts in via fingerprint-only confirmation. The human `PairClaim` also carries the initiator's hybrid `signing_pub` with a key proof bound to `h` and its static key, verified after the code burns, so the host pins the key it needs for groups (`spec/pairing-v1.md` Section 4.1). Peers paired before that change have no pinned key: a re-pair records it and returns an `active` entry to `pending` until the operator confirms the new SAS. A claim with a different key than one pinned for the same static key, under any label, is refused; signing keys change only through rotation. A keyless claim cannot replace the SAS of a `pending` entry that holds an unconfirmed key. A Wire v1 responder built before the change rejects a keyed claim as `protocol_error`. For opt-in headless deployment without interactive SAS, `PairClaim` carries `enrollment_token`, `signing_pub`, and `enroll_proof` instead of `code_mac`, requires an out-of-band host pin (`PinnedHost`), burns the token nonce atomically, and transitions directly to `"active"` with zero application grants; see [Machine-to-machine enrollment](m2m-enrollment.md).
 
+## Pairing URIs, route statements and multi-rung pairing
+
+A host shows one `tendril://pair?...` URI. Besides the pins (`k`, `sh`, optional `id` and `seq`), it carries the fields that make one QR code work across several paths (`spec/pairing-v1.md` Section 6):
+
+| Field | Form | Rule |
+|---|---|---|
+| `ep` | Comma-separated hints, at most `6`, each at most `256` bytes | Dialing hints only. Never `local:` or `unix://` from a URI. No `#`. |
+| `rp` | 43-character base64url Ed25519 key | Selects the host's `/v1/relay` mailbox. Required with a `/v1/relay` hint, forbidden without one, and checked equal to the Ed25519 half of the authenticated `HostHello.signing_pub` before `msg3`. Never persisted. |
+| `rq` | Decimal route sequence, `1..=2^53-1` | Present exactly when `rs` is, immediately before it. |
+| `rs` | 86-character base64url Ed25519 signature | Always last. Signs `"tendril-pairing-routes-v1\0" || uri_bytes_before_rs` with the Ed25519 half of the host identity key, so it covers every other parameter byte for byte. |
+
+A URI is at most `1,024` bytes. A builder aims for `711` bytes (QR Version 21, ECC M) and reports its length without trimming to meet the target. The URI parser rejects a URI that mixes a `Lan2Group` code with a remote-class hint, because the responder burns a two-group code claimed over a remote path.
+
+**Order of checks.** An initiator races the URI's hints (Wire v1) or tries them one at a time (Wire v2, so each rung receives its own offline-testable proof). For each candidate it verifies `msg2` and the `HostHello` against the pin, then `rp`, then `rs`, and only then builds `msg3`. An invalid `rs` aborts the attempt before any claim bytes exist and leaves the code live. A statement whose `sh` no longer matches the host's current key (the host rotated after issuing the URI) is reported as `route_key_rotated` and authorizes nothing.
+
+**Commit boundary.** An attempt becomes irrevocable immediately before the first write that carries any `msg3` byte. After that point every outcome ends the attempt: no other rung is dialed, no `msg3` is rebuilt, and nothing is persisted on the client. A result marked `committed` tells the caller the code may be spent and the recovery is a new code.
+
+**What a pairing stores.** Persistence follows the client's route policy (`allSigned` by default). Only a statement that verified under the host's authenticated key, and whose signed code equals the code used, yields `signed` routes. A merge never lowers the stored route sequence. See [Seamless pairing defaults](../usage/seamless-pairing.md) for the policy table.
+
+## Signed route announcements (`0x0C`)
+
+A host keeps its paired clients' `signed` routes current inside the session. Its route set is one statement: the host's static key, `sh`, a persistent sequence, an issue time and up to six hints.
+
+| Item | Rule |
+|---|---|
+| Payload | `route_set_body || sig`, `3455..=5003` bytes. The body is `82..=1630` bytes: version, static key, `sh`, `seq`, `issued_at`, count, then length-prefixed hints. |
+| Signature | `3373`-byte hybrid `Ed25519 || ML-DSA-65` over `"tendril-route-set-v1\0" || body`. Both halves must verify. |
+| Direction | Responder to initiator only. A responder that receives `0x0C` closes the session. |
+| Opt-in | Sent only to an initiator whose `SessionHello` carried `route_seq`. Other clients never see the frame. |
+| Wire v2 | Valid only inside `0x09 PADDED`. A session with padding disabled neither sends nor receives it. |
+| Client acceptance | Entry active and not revoked, keys match the pin, signature verifies, `issued_at` at most 24 hours ahead, and `seq` newer than the stored one (or equal over a route set that came from a URI). A rejection is recorded and never closes the session. |
+
+The host's sequence lives in its roster, so it survives restarts and only moves when the advertised set changes. Structural failures close the session; semantic ones never do. See `spec/wire-v1.md` Section 5.2 for the exact bytes and the receive pipeline.
+
 ## Inner encrypted frames and rotation
 
-Inside `intent = session`, decrypted Noise transport frames (`<= 65503` bytes) carry a 1-byte `frame_type` prefix (`0x01 DATA`, `0x02 GRANT`, `0x03 REVOCATION`, `0x04 REKEY`, `0x05 PING`, `0x06 PONG`, `0x07 CLOSE`). Peers trigger `0x04 REKEY` automatically after `1_048_576` frames or 15 minutes and re-evaluate active grants against the latest revocation list.
+Inside `intent = session`, decrypted Noise transport frames (`<= 65503` bytes) carry a 1-byte `frame_type` prefix (`0x01 DATA`, `0x02 GRANT`, `0x03 REVOCATION`, `0x04 REKEY`, `0x05 PING`, `0x06 PONG`, `0x07 CLOSE`, plus `0x0C ROUTE_SET` below). Peers trigger `0x04 REKEY` automatically after `1_048_576` frames or 15 minutes and re-evaluate active grants against the latest revocation list.
 
 Key rotations carry a strictly monotonic `seq` counter and a `3373`-byte hybrid `Ed25519 || ML-DSA-65` signature (`ctx = "tendril-hybrid-v1"`) over the `4031`-byte payload (`"tendril-rot-v1\0" || seq_be8 || prev_signing_pub (1984 B) || new_signing_pub (1984 B) || new_static_pub (32 B) || ts_be8`). Any conflicting valid record at the same `seq` moves the peer entry immediately to `revoked`.
 

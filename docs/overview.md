@@ -27,6 +27,7 @@ In scope:
 
 - Pairwise encrypted links between desktop, phone, browser, and server endpoints
 - Human-verified pairing via short code and SAS/fingerprint comparison, plus opt-in machine-to-machine (M2M) single-use token enrollment with trust anchors
+- One pairing QR code that carries several host-signed routes (LAN, overlay, relay), automatic fallback between them on later connects, and signed route updates when a host's addresses change (see [Seamless pairing defaults](usage/seamless-pairing.md))
 - Signed, expiring, revocable capability grants checked on connection and on every authorized action
 - Pluggable providers spanning local, direct, overlay, peer-to-peer, relay, and broker paths
 - Small peer mesh groups of up to 32 devices: a signed membership manifest over independent pairwise sessions, with revocation and rendezvous-key rotation (see [Small peer mesh groups](design/groups.md))

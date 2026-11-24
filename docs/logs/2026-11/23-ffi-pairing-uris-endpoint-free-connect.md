@@ -1,0 +1,26 @@
+---
+type: Log Entry
+title: "ffi: pairing URIs, endpoint-free connect and route announcements"
+description: "The C ABI issues signed pairing URIs, pairs from them, connects over stored routes, manages and applies routes, and runs the route announcer on every FFI host."
+tags: [log, update]
+kind: Update
+status: stable
+---
+
+ffi: pairing URIs, endpoint-free connect and route announcements:
+
+**Behaviour change for existing FFI apps:** `tendril_session_connect` and `tendril_session_connect_v2` now run the runtime Day-2 connect. A `NULL` or empty `endpoint` dials the peer's stored routes; a non-empty one is normalized as an explicit operator endpoint and passes the egress layer before it is dialed. FFI hosts advertise automatically (`advertise: auto`) and sign their routes by default.
+
+- **New calls (`crates/tendril-ffi/src/lib.rs`, `include/tendril.h`):** `tendril_endpoint_issue_pairing_uri`, `tendril_endpoint_pair_uri`, `tendril_endpoint_pair_v2_uri`, `tendril_session_connect_with_options` (recovery URI, `replace_routes`, route policy), `tendril_endpoint_set_peer_routes`, `tendril_endpoint_peer_routes`, `tendril_endpoint_clear_peer_routes`, `tendril_endpoint_apply_route_uri` and `tendril_endpoint_refresh_routes` (network snapshot JSON, optional `out_json`). All are additive; the existing declarations are unchanged.
+- **Configuration:** `tendril_endpoint_configure_transports_json` accepts `advertised_endpoints`, `relay_auth_origins` (validated at configuration time), `advertise`, `route_policy` and `sign_routes`.
+- **Hosting:** each endpoint owns a `RouteAnnouncer` over one roster handle shared with pairing, connects and route ingest. Served listeners (including unspecified binds) feed the announced set; the first serve, issuance or refresh starts its timer, and accepted sessions are registered before they are returned. The `auto-advertise` feature is on by default.
+- **Wake:** a Wire v2 connect to an explicit endpoint with a configured `WakeProvider` honours `wake_pre_wake` (wake first, or connect first and wake after a miss), then runs the same policy connect (retried as the wake options say), so a woken session negotiates `route_seq`, ingests route sets and honours a recovery URI. Only an uncommitted miss a wake can fix wakes or retries: `AttemptError::is_transient_precommit`, or transport misses mixed with relay `offline` refusals (the sleeping host); admission refusals, missing routes and committed attempts are final.
+- **Failures surface:** an accept whose announcer registration fails returns `NULL` and closes the session; an empty `code` option fails before any dial.
+- **Revocation state:** FFI route writes, every other FFI roster write (including a Wire v1 session persisting its CRL) go through the shared roster handle, and every write or reload merges CRLs that a session accepted but has not persisted yet.
+- **Lock order:** pairing URI issuance passes the pairing manager to the announcer, which publishes before it locks it, and FFI roster writes take the roster file lock before the in-memory roster; no call holds the pairing manager or the in-memory roster across announcer or store I/O, so issuing URIs during `pair_accept` cannot deadlock.
+- **Error text:** `tendril_last_error` passes every message through the shared `tendril_runtime::redact` helpers (URLs to `scheme://host[:port]`, pairing codes in any case, quoted values to the end of the line, hints in failure lists); JSON errors report only category, line and column, and code kinds and relay ticket roles are never echoed. Code kinds parse in any case.
+- **Kept paths:** `tendril_endpoint_pair_initiate` and `tendril_endpoint_pair_v2_initiate` still store no routes (documented under "Legacy pairing").
+- **Operator P2P:** `p2p_pkarr` reaches the runtime dialer set, so an explicit `iroh://` connect with `false` makes no address lookup.
+- **Docs:** `docs/reference/ffi-and-bindings.md` gains "Pairing URIs and routes".
+- **Tests (`crates/tendril-ffi/tests/ffi_routes.rs`):** signed issuance, URI pairing and endpoint-free connect on state-directory, sealed and store-less endpoints; Wire v2 URI pairing and connect; issue and pair options (unsigned, `save_route`, explicit endpoint); configuration validation; explicit advertising; the route setter, view and clear; offline application (fresh, stale, approved, unsigned, unknown host); connects with recovery URIs; a refresh that delivers a route set to a live session; a sealed host that keeps its route sequence across close and reopen; an empty code override; error redaction (including quoted values, code kinds, string lists and network snapshots); URI issuance in a loop while Wire v1 and v2 pairings complete on a state-directory host; a woken explicit Wire v2 connect that receives a route set and applies a recovery URI. In-crate tests cover the `p2p_pkarr` override, a failed announcer registration, CRLs kept across FFI route writes and reloads, a session CRL persisted without dropping other unpersisted peer and trust-anchor CRLs, the wake retry predicate, and a CRL and a route set sent back to back on one session.
+- **See also:** [pairing: multi-route URIs, signed routes and automatic fallback](23-pairing-multi-route-uris-signed-routes.md) for the feature as a whole.

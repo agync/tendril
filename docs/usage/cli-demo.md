@@ -47,7 +47,7 @@ Each endpoint isolates its `0o700` state directory containing `0o600` `identity.
 tendril --state-dir ./host-state init --host-id my-host
 tendril --state-dir ./cli-state init
 
-# 2. Start host listener (direct TCP, optional relay/embedded-relay/p2p/overlay/broker, and pairing code)
+# 2. Start host listener (direct TCP, optional relay/embedded-relay/p2p/overlay/broker, and a pairing code and signed URI)
 tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --issue-code lan
 
 # Optional multi-rung host serving (zero-setup P2P, managed relays, Wire v2, or wake hints):
@@ -63,7 +63,7 @@ tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --issue-code lan
 #  pass --relay-auth-secret-file (or TENDRIL_RELAY_AUTH_SECRET) or --relay-ticket-file on serve/pair/dial for managed Tendril relays;
 #  pass --wire-v2 on serve/pair/dial for Wire 0x02 PAKE/pseudonymous sessions;
 #  --relay-v2 requires --wire-v2 AND --relay or --embedded-relay (--relay-host alone errors);
-#  pass --wake-url (requires --wire-v2), --wake-adapter <webhook|apns|fcm|unified-push> (default webhook),
+#  pass --wake-url (requires --wire-v2 and --endpoint), --wake-adapter <webhook|apns|fcm|unified-push> (default webhook),
 #  --wake-secret-file (or TENDRIL_WAKE_SECRET), --wake-auth-header-file, and --wake-pre-wake on dial for opaque wake hints;
 #  CLI secret files and --relay-ticket-file enforce regular non-symlink files <= 16 KiB with Unix 0600 permissions (mode & 0o077 == 0);
 #  pass --no-pkarr on default relay mode to opt out of Pkarr/DNS, or --include-direct-addrs for non-metadata ?addr= hints.)
@@ -84,6 +84,95 @@ tendril --state-dir ./cli-state dial --target my-host --endpoint 127.0.0.1:PORT 
   --grant '<grant_json>' --message "hello-tendril"
 tendril --state-dir ./host-state revoke <client_device_id>
 ```
+
+## Pairing URIs and stored routes
+
+`serve --issue-code` prints a host-signed `tendril://pair?...` URI in its `listening` line (redacted under `--redact-logs`). The CLI advertises explicitly: concrete `--listen` binds, the `--relay`, `--relay-v2`, `--p2p`, `--overlay` and `--broker` listener endpoints and each `--advertise-endpoint`, never an interface scan.
+
+```bash
+# Host: advertise two routes and issue a signed URI whose code kind follows its routes
+tendril --state-dir ./host-state serve --listen 192.168.1.20:7000 \
+  --advertise-endpoint overlay://100.64.0.7:7000 --issue-code auto
+# listening line adds: pairing_uri, advertised_endpoints, dropped_endpoints, uri_len, qr_version_m, route_seq
+
+# Client: pair from the URI, race its hints, and store every signed route
+tendril --state-dir ./cli-state pair --pairing-uri "tendril://pair?..."
+
+# Day 2: dial the stored routes, no --endpoint
+tendril --state-dir ./cli-state dial --target my-host --grant '<grant_json>' --message "hello-tendril"
+```
+
+| Flag | Command | Effect |
+|---|---|---|
+| `--issue-code auto` | `serve` | Picks the long code whenever any non-LAN route is advertised or none survives, else the short one. `lan` and `remote` force a kind; `lan` with remote listeners issues a LAN-only URI and reports the dropped hints. |
+| `--advertise-endpoint <HINT>` | `serve` (repeatable) | Adds a route to the announced set and to URIs. |
+| `--no-route-signature` | `serve` | Issues URIs without `rq` and `rs`. For interop tests with old clients only. |
+| `--route-policy all-signed\|committed-only\|none` | `pair`, `dial`, `route apply` | Which routes to keep. Default `all-signed`. |
+| `--save-route` | `pair` | Keeps the route that carried an unsigned pairing. Conflicts with `--route-policy none`. |
+| `--relay-auth-origin <scheme://host:port>` | `pair`, `dial` (repeatable) | Origins that may receive relay admission material. An explicit `--endpoint` is always allowed. |
+| `--pairing-uri <URI>` | `dial` | Uses a fresh URI of this peer as a recovery URI. Its keys are checked before the session commits and its code is never sent. |
+| `--replace-routes` | `dial`, `route apply` | Approves replacing the stored signed routes when the URI is not newer. |
+
+The `pair` result adds `provider`, `endpoint`, `committed`, `route_check` (`verified`, `unsigned` or `route_key_rotated`), `routes_persisted`, `routes_reason` and `skipped`. `--endpoint` still dials only that endpoint and stores it as an `operator` route.
+
+`/v2/relay` is never used for pairing: `pair --relay-v2` and a `/v2/relay` `--endpoint` are rejected. Pair over another route, then connect with `dial --relay-v2`.
+
+### Route commands
+
+`tendril route` inspects and edits a paired peer's routes. `route list`, `route set` and `route clear` each print one JSON line with `routes` (`hint` and `source`), `route_meta` (`seq`, `issued_at`, `origin`) and `last_route_set`, the outcome of the last announcement a `dial` received (kept in `route-status.json` in the state directory). `route apply` prints `target`, `applied`, `reason`, `routes` and `route_meta`, without `last_route_set`.
+
+```bash
+tendril --state-dir ./cli-state route list --target my-host
+tendril --state-dir ./cli-state route set --target my-host --endpoint 192.168.1.20:7000 --endpoint wss://relay.example/v1/relay
+tendril --state-dir ./cli-state route set --target my-host --clear
+tendril --state-dir ./cli-state route clear --target my-host --source signed   # operator (default), signed, committed, all
+tendril --state-dir ./cli-state route apply --pairing-uri "tendril://pair?..." [--replace-routes]
+```
+
+`route set` replaces the `operator` routes only (at most six, one bad hint rejects the list). `route apply` finds the active peer whose keys the URI names, requires a valid host signature, and applies it offline under the rules in [Seamless pairing defaults](seamless-pairing.md#recovery-by-a-fresh-qr).
+
+### Waking a peer on dial
+
+`dial --wire-v2 --endpoint <E> --wake-url <U>` sends an opaque wake hint to a sleeping peer and connects to it. The wake wraps the same policy connect as any other `dial`: the session sends `route_seq`, ingests `0x0C` route sets, honours `--route-policy`, and takes `--pairing-uri` (with `--replace-routes`) as a recovery URI. `--endpoint` is the operator route of that connect.
+
+```bash
+# Connect first; a wakeable miss sends the hint and retries. A fresh URI is the recovery URI.
+tendril --state-dir ./cli-state dial --target my-phone --wire-v2 \
+  --endpoint wss://relay.example/v2/relay --relay-v2 \
+  --wake-url https://push.example/wake --wake-secret-file ./wake.sec \
+  --pairing-uri "tendril://pair?..." --grant '<grant_json>'
+
+# Send the hint first, then connect (up to 10 attempts, 100 ms apart)
+tendril --state-dir ./cli-state dial --target my-phone --wire-v2 --endpoint 192.168.1.30:7000 \
+  --wake-url https://push.example/wake --wake-secret-file ./wake.sec --wake-pre-wake
+```
+
+| Run | Behaviour |
+|---|---|
+| Without `--wake-pre-wake` | The connect runs once. Only a wakeable miss (an uncommitted transport failure, or a relay reporting the peer's mailbox `offline`) sends the hint and retries. A wrong key, a refused grant, a relay admission refusal, no dialable routes or a connect that already committed ends the dial at once and sends no hint. |
+| With `--wake-pre-wake` | The hint goes first, then the connect runs with the same retries. |
+| Result | The `connected` line adds `wake_outcome` (`Delivered`, `Coalesced`, `Noop` or `Skipped`; `null` when no hint was sent). A failure prints the redacted `attempt_failed` line described below. |
+
+`--wake-url` needs `--wire-v2` and `--endpoint`. See [Opaque wake providers](../design/wake-providers.md#wake-around-a-connect) for the retry rules.
+
+### Diagnostics and redaction
+
+Pairing codes, pairing URIs and relay URLs can carry credentials, tokens or a spendable code, so the CLI never prints raw input in an error or a diagnostic. Every message passes the shared helpers in `tendril_runtime::redact` (the same code as the C ABI and the Python, Node and browser bindings).
+
+| Output | What it prints |
+|---|---|
+| Error text on stderr | The error with every URL reduced to `scheme://host[:port]`, so no user info, path, query or fragment. A pairing code in any case and a token holding `@`, a backslash, a `%` escape or a query become `<redacted>`. A quote starts a value that is redacted to the end of its line. |
+| A pairing URI that does not parse | `invalid pairing URI: ...` naming the failure only. Unknown or duplicate parameter names are never echoed. |
+| `attempt_failed` line (failed `pair` or `dial`) | `error`, `error_code`, `committed`, `skipped` and `failures`, each hint shown as `scheme://host[:port]`, `provider:host:port` or `<redacted>`. |
+| `dropped_endpoints` on the `listening` line | Each dropped hint in the same redacted form, since an operator hint may hold credentials. |
+| `--redact-logs` | Also redacts `pairing_code`, `pairing_uri`, decrypted payload text and `token_nonce` in the JSON events. |
+| `--relay-auth-origin` errors | An invalid origin is printed as its `scheme://host[:port]` or `<redacted>`. |
+
+A hint without `://` keeps its prefix only for the providers `direct`, `local`, `overlay`, `relay`, `broker` and `p2p` (`p2p:<redacted>` when the rest is not a plain host and port); any other prefix, such as `user:secret`, is redacted whole. A URL with `@` in its path, query or fragment is redacted whole too. A host name outside plain DNS, IPv4 and IPv6 characters is redacted whole. So is a URL with a backslash: a URL parser reads the backslash as the end of the authority, so user info before it would otherwise show up as the host. Redacting already redacted text changes nothing, so a message built from redacted parts stays as it is.
+
+### Upgrading
+
+`tendril pair --pairing-uri` used to save every hint in the URI to the roster (`relay_hints`) on both wires, without dialing them later. Hosts now sign their pairing URIs, and `pair` saves every route of a URI whose signature verifies as host-signed routes, which `dial` uses without `--endpoint` and which the host keeps current. A URI without a valid host signature saves no route by default: `--save-route` saves only the route that carried the pairing, and `--endpoint` saves that endpoint. Hints saved by earlier versions stay in `relay_hints` as display data and are not migrated into dialable routes: re-pair with a fresh URI, apply one with `tendril route apply`, or pass `--endpoint`.
 
 ## Headless M2M enrollment and log redaction
 
