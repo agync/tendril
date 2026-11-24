@@ -6,6 +6,7 @@ build-backend = "maturin"
 name = "tendril-sdk"
 version = "0.1.0"
 description = "Python bindings for Tendril private device-to-device links."
+readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 

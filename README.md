@@ -17,7 +17,7 @@ Tendril extracts the pairing ceremony, sealed session protocol, capability grant
 
 | Path | Contents |
 |---|---|
-| `crates/` | Rust workspace (`tendril-core` and future runtime, relay, CLI, FFI, and WASM crates) |
+| `crates/` | Rust workspace (`tendril-core`, `tendril-relay`, `tendril-runtime`, `tendril-cli`, `tendril-ffi`, `tendril-wasm`) |
 | `bindings/` | Thin host-language packages (Go, Python, TypeScript, Swift, Kotlin) |
 | `spec/` | Normative wire, pairing, grant, and relay specifications plus `vectors/` |
 | `docs/` | OKF v0.2 documentation bundle |
