@@ -1139,11 +1139,226 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointEnrollInitiate(
   return take_out_string(env, out);
 }
 
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointIssuePairingUri(
+    JNIEnv *env, jclass cls, jlong ptr, jstring options_json) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
+    return NULL;
+  }
+  char *c_opts = NULL;
+  if (!dup_opt_utf8(env, options_json, &c_opts)) {
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_endpoint_issue_pairing_uri((TendrilEndpoint *)(uintptr_t)ptr, c_opts, &out);
+  free(c_opts);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_issue_pairing_uri failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+typedef int32_t (*pair_uri_fn)(
+    TendrilEndpoint *, const char *, const char *, const char *, const char *, char **);
+
+static jstring pair_uri_common(
+    JNIEnv *env, jlong ptr, jstring pairing_uri, jstring name, jstring kind, jstring options_json,
+    pair_uri_fn fn, const char *what) {
+  if (ptr == 0 || pairing_uri == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid pairing uri arguments");
+    return NULL;
+  }
+  char *c_uri = NULL;
+  char *c_name = NULL;
+  char *c_kind = NULL;
+  char *c_opts = NULL;
+  char *out = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, pairing_uri, &c_uri) &&
+      dup_opt_utf8(env, name, &c_name) &&
+      dup_opt_utf8(env, kind, &c_kind) &&
+      dup_opt_utf8(env, options_json, &c_opts)) {
+    rc = fn((TendrilEndpoint *)(uintptr_t)ptr, c_uri, c_name, c_kind, c_opts, &out);
+  }
+  zeroize_cstr_free(c_uri);
+  free(c_name);
+  free(c_kind);
+  zeroize_cstr_free(c_opts);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, what);
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointPairUri(
+    JNIEnv *env, jclass cls, jlong ptr, jstring pairing_uri, jstring name, jstring kind,
+    jstring options_json) {
+  (void)cls;
+  return pair_uri_common(
+      env, ptr, pairing_uri, name, kind, options_json, tendril_endpoint_pair_uri,
+      "tendril_endpoint_pair_uri failed");
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointPairV2Uri(
+    JNIEnv *env, jclass cls, jlong ptr, jstring pairing_uri, jstring name, jstring kind,
+    jstring options_json) {
+  (void)cls;
+  return pair_uri_common(
+      env, ptr, pairing_uri, name, kind, options_json, tendril_endpoint_pair_v2_uri,
+      "tendril_endpoint_pair_v2_uri failed");
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointSetPeerRoutes(
+    JNIEnv *env, jclass cls, jlong ptr, jstring peer_id, jstring routes_json) {
+  (void)cls;
+  if (ptr == 0 || peer_id == NULL || routes_json == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid setPeerRoutes arguments");
+    return;
+  }
+  char *c_peer = NULL;
+  char *c_routes = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, peer_id, &c_peer) && dup_opt_utf8(env, routes_json, &c_routes)) {
+    rc = tendril_endpoint_set_peer_routes((TendrilEndpoint *)(uintptr_t)ptr, c_peer, c_routes);
+  }
+  free(c_peer);
+  free(c_routes);
+  if ((*env)->ExceptionCheck(env)) {
+    return;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_set_peer_routes failed");
+  }
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointPeerRoutes(
+    JNIEnv *env, jclass cls, jlong ptr, jstring peer_id) {
+  (void)cls;
+  if (ptr == 0 || peer_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid peerRoutes arguments");
+    return NULL;
+  }
+  char *c_peer = NULL;
+  if (!dup_opt_utf8(env, peer_id, &c_peer)) {
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_endpoint_peer_routes((TendrilEndpoint *)(uintptr_t)ptr, c_peer, &out);
+  free(c_peer);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_peer_routes failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointClearPeerRoutes(
+    JNIEnv *env, jclass cls, jlong ptr, jstring peer_id, jstring source) {
+  (void)cls;
+  if (ptr == 0 || peer_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid clearPeerRoutes arguments");
+    return;
+  }
+  char *c_peer = NULL;
+  char *c_source = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, peer_id, &c_peer) && dup_opt_utf8(env, source, &c_source)) {
+    rc = tendril_endpoint_clear_peer_routes((TendrilEndpoint *)(uintptr_t)ptr, c_peer, c_source);
+  }
+  free(c_peer);
+  free(c_source);
+  if ((*env)->ExceptionCheck(env)) {
+    return;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_clear_peer_routes failed");
+  }
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointApplyRouteUri(
+    JNIEnv *env, jclass cls, jlong ptr, jstring pairing_uri, jstring options_json) {
+  (void)cls;
+  if (ptr == 0 || pairing_uri == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid applyRouteUri arguments");
+    return NULL;
+  }
+  char *c_uri = NULL;
+  char *c_opts = NULL;
+  char *out = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, pairing_uri, &c_uri) && dup_opt_utf8(env, options_json, &c_opts)) {
+    rc = tendril_endpoint_apply_route_uri((TendrilEndpoint *)(uintptr_t)ptr, c_uri, c_opts, &out);
+  }
+  zeroize_cstr_free(c_uri);
+  free(c_opts);
+  if ((*env)->ExceptionCheck(env)) {
+    return NULL;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_apply_route_uri failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointRefreshRoutes(
+    JNIEnv *env, jclass cls, jlong ptr, jstring snapshot_json) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
+    return NULL;
+  }
+  char *c_snap = NULL;
+  if (!dup_opt_utf8(env, snapshot_json, &c_snap)) {
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_endpoint_refresh_routes((TendrilEndpoint *)(uintptr_t)ptr, c_snap, &out);
+  free(c_snap);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_refresh_routes failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
+JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionConnectWithOptions(
+    JNIEnv *env, jclass cls, jlong ep_ptr, jstring target_host_id, jstring options_json) {
+  (void)cls;
+  if (ep_ptr == 0 || target_host_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid sessionConnectWithOptions arguments");
+    return 0;
+  }
+  char *c_target = NULL;
+  char *c_opts = NULL;
+  TendrilSession *sess = NULL;
+  if (dup_opt_utf8(env, target_host_id, &c_target) && dup_opt_utf8(env, options_json, &c_opts)) {
+    sess = tendril_session_connect_with_options(
+        (TendrilEndpoint *)(uintptr_t)ep_ptr, c_target, c_opts);
+  }
+  free(c_target);
+  zeroize_cstr_free(c_opts);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
+  if (sess == NULL) {
+    throw_ffi_error(env, TENDRIL_ERR_INTERNAL, "tendril_session_connect_with_options failed");
+    return 0;
+  }
+  return (jlong)(uintptr_t)sess;
+}
+
 JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionConnect(
     JNIEnv *env, jclass cls, jlong ep_ptr, jstring endpoint, jstring relay_host,
     jstring target_host_id, jstring grant_json) {
   (void)cls;
-  if (ep_ptr == 0 || endpoint == NULL || target_host_id == NULL) {
+  if (ep_ptr == 0 || target_host_id == NULL) {
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid sessionConnect arguments");
     return 0;
   }
@@ -1196,7 +1411,7 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionConnectV2(
     JNIEnv *env, jclass cls, jlong ep_ptr, jstring endpoint, jstring relay_host,
     jstring target_host_id, jstring grant_json) {
   (void)cls;
-  if (ep_ptr == 0 || endpoint == NULL || target_host_id == NULL) {
+  if (ep_ptr == 0 || target_host_id == NULL) {
     throw_ex(env, "java/lang/IllegalArgumentException", "invalid sessionConnectV2 arguments");
     return 0;
   }

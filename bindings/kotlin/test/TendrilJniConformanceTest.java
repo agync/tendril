@@ -1589,6 +1589,410 @@ public final class TendrilJniConformanceTest {
     }
   }
 
+  // ---- Pairing URIs and routes -------------------------------------------------------------
+
+  private static long newEp(String prefix, String hostId) throws IOException {
+    return TendrilNative.endpointNew(tempStateDir(prefix), hostId);
+  }
+
+  private static String deviceIdOf(long ep) {
+    return asStr(asObj(Json.parse(TendrilNative.endpointInfoJson(ep))).get("device_id"));
+  }
+
+  private static String hostIdOf(long ep) {
+    return asStr(asObj(Json.parse(TendrilNative.endpointInfoJson(ep))).get("host_id"));
+  }
+
+  private static Map<String, Object> issue(long host, String optionsJson) {
+    return asObj(Json.parse(TendrilNative.endpointIssuePairingUri(host, optionsJson)));
+  }
+
+  private static long seqOf(Map<String, Object> m, String key) {
+    return ((Number) m.get(key)).longValue();
+  }
+
+  /** Pairs [client] with [host] over a scanned URI and confirms on the host; returns the client result. */
+  private static Map<String, Object> pairViaUri(long host, long client, String uri, boolean v2)
+      throws Exception {
+    final String[] hostRes = new String[1];
+    final Throwable[] failure = new Throwable[1];
+    Thread accept =
+        new Thread(
+            () -> {
+              try {
+                hostRes[0] =
+                    v2
+                        ? TendrilNative.endpointPairV2Accept(host, 15000)
+                        : TendrilNative.endpointPairAccept(host, 15000);
+              } catch (Throwable t) {
+                failure[0] = t;
+              }
+            });
+    accept.start();
+    Map<String, Object> res;
+    try {
+      res =
+          asObj(
+              Json.parse(
+                  v2
+                      ? TendrilNative.endpointPairV2Uri(client, uri, "jni-client", "machine", null)
+                      : TendrilNative.endpointPairUri(client, uri, "jni-client", "machine", null)));
+    } finally {
+      accept.join(20000);
+    }
+    check(failure[0] == null, "host accept failed: " + failure[0]);
+    Map<String, Object> hostMap = asObj(Json.parse(hostRes[0]));
+    check(asStr(res.get("sas")).equals(asStr(hostMap.get("sas"))), "sas mismatch");
+    TendrilNative.endpointConfirmPeer(host, asStr(hostMap.get("device_id")), asStr(hostMap.get("sas")));
+    return res;
+  }
+
+  /** Runs [connect] on this thread while [host] accepts; returns {client, host} session handles. */
+  private static long[] connectAndAccept(
+      long host, boolean v2, long acceptMs, java.util.function.LongSupplier connect) throws Exception {
+    final long[] hostSess = new long[1];
+    final Throwable[] failure = new Throwable[1];
+    Thread accept =
+        new Thread(
+            () -> {
+              try {
+                hostSess[0] =
+                    v2 ? TendrilNative.sessionAcceptV2(host, acceptMs) : TendrilNative.sessionAccept(host, acceptMs);
+              } catch (Throwable t) {
+                failure[0] = t;
+              }
+            });
+    accept.start();
+    long client = 0;
+    RuntimeException connectErr = null;
+    try {
+      client = connect.getAsLong();
+    } catch (RuntimeException e) {
+      connectErr = e;
+    }
+    accept.join(acceptMs + 5000);
+    if (connectErr != null) {
+      if (hostSess[0] != 0) {
+        TendrilNative.sessionFree(hostSess[0]);
+      }
+      throw connectErr;
+    }
+    check(failure[0] == null && hostSess[0] != 0, "host accept failed: " + failure[0]);
+    return new long[] {client, hostSess[0]};
+  }
+
+  private static long[] connectStored(long client, long host, String hostId, String grant, boolean v2)
+      throws Exception {
+    return connectStored(client, host, hostId, grant, v2, 10000);
+  }
+
+  private static long[] connectStored(
+      long client, long host, String hostId, String grant, boolean v2, long acceptMs) throws Exception {
+    return connectAndAccept(
+        host,
+        v2,
+        acceptMs,
+        () ->
+            v2
+                ? TendrilNative.sessionConnectV2(client, null, null, hostId, grant)
+                : TendrilNative.sessionConnect(client, "", null, hostId, grant));
+  }
+
+  private static void expectData(long sess, String want) {
+    long deadline = System.nanoTime() + 10_000_000_000L;
+    while (System.nanoTime() < deadline) {
+      Map<String, Object> ev = asObj(Json.parse(TendrilNative.sessionPollEvent(sess, 500)));
+      if ("data".equals(ev.get("event"))) {
+        String got = new String(b64UrlDecode(asStr(ev.get("data_b64"))), StandardCharsets.UTF_8);
+        check(want.equals(got), "data mismatch: " + got);
+        return;
+      }
+    }
+    throw new AssertionError("no data event");
+  }
+
+  private static void roundTrip(long a, long b, String text) {
+    TendrilNative.sessionSendData(a, text.getBytes(StandardCharsets.UTF_8));
+    expectData(b, text);
+  }
+
+  private static List<String> routesOf(long ep, String peerId, String source) {
+    Map<String, Object> view = asObj(Json.parse(TendrilNative.endpointPeerRoutes(ep, peerId)));
+    List<String> out = new ArrayList<>();
+    for (Object r : asArr(view.get("routes"))) {
+      Map<String, Object> route = asObj(r);
+      if (source.equals(route.get("source"))) {
+        out.add(asStr(route.get("hint")));
+      }
+    }
+    java.util.Collections.sort(out);
+    return out;
+  }
+
+  private static String snapshot(String... networks) {
+    return "{\"networks\":[" + String.join(",", networks) + "]}";
+  }
+
+  private static String network(String id, String iface, int ifIndex, String transports, String... addrs) {
+    List<String> quoted = new ArrayList<>();
+    for (String a : addrs) {
+      quoted.add("\"" + a + "\"");
+    }
+    return "{\"id\":\"" + id + "\",\"iface\":\"" + iface + "\",\"if_index\":" + ifIndex
+        + ",\"transports\":[" + transports + "],\"addrs\":[" + String.join(",", quoted) + "]}";
+  }
+
+  /** Polls the session (route sets never reach its stream) until the client records [seq] as applied. */
+  private static void waitRouteSet(long client, long clientSess, String hostId, long seq) {
+    long deadline = System.nanoTime() + 15_000_000_000L;
+    while (System.nanoTime() < deadline) {
+      Map<String, Object> ev = asObj(Json.parse(TendrilNative.sessionPollEvent(clientSess, 250)));
+      check("would_block".equals(ev.get("status")), "route sets never reach the event stream: " + ev);
+      Map<String, Object> view = asObj(Json.parse(TendrilNative.endpointPeerRoutes(client, hostId)));
+      Object last = view.get("last_route_set");
+      if (last != null) {
+        Map<String, Object> lastMap = asObj(last);
+        if ("applied".equals(lastMap.get("outcome")) && seqOf(lastMap, "seq") == seq) {
+          return;
+        }
+      }
+    }
+    throw new AssertionError("route set " + seq + " not applied");
+  }
+
+  private static String recoveryOptions(boolean v2, String grant, String uri, boolean replace) {
+    return "{\"wire\":" + (v2 ? 2 : 1) + ",\"grant\":" + grant + ",\"recovery_uri\":"
+        + Json.stringify(uri) + (replace ? ",\"replace_routes\":true" : "") + "}";
+  }
+
+  private static void verifyPairingUriFlow(boolean v2) throws Exception {
+    String label = v2 ? "v2" : "v1";
+    long host = newEp("tendril-jni-ph-", "jni-routes-host-" + label);
+    long client = newEp("tendril-jni-pc-", null);
+    long[] sessions = null;
+    try {
+      String listen = TendrilNative.endpointServeDirect(host, "127.0.0.1:0");
+      Map<String, Object> issued = issue(host, null);
+      String uri = asStr(issued.get("uri"));
+      check(uri.contains("&rq=") && uri.contains("&rs="), label + " URI is signed: " + uri);
+      check(seqOf(issued, "route_seq") >= 1, label + " route_seq");
+      check(seqOf(issued, "uri_len") == uri.length(), label + " uri_len");
+      check(seqOf(issued, "qr_version_m") >= 1, label + " qr_version_m");
+      check(asArr(issued.get("dropped")).isEmpty(), label + " dropped: " + issued.get("dropped"));
+      check(new java.net.URI(uri).toString().equals(uri), label + " builder URI is a java.net.URI fixpoint");
+
+      Map<String, Object> res = pairViaUri(host, client, uri, v2);
+      check("active".equals(res.get("status")), label + " status: " + res);
+      check("verified".equals(res.get("route_check")), label + " route_check: " + res);
+      check(Boolean.TRUE.equals(res.get("committed")), label + " committed: " + res);
+      String hostId = hostIdOf(host);
+      check(hostId.equals(res.get("host_id")), label + " host_id");
+      check(routesOf(client, hostId, "signed").equals(List.of("direct:" + listen)), label + " signed routes");
+      Map<String, Object> view = asObj(Json.parse(TendrilNative.endpointPeerRoutes(client, hostId)));
+      check(seqOf(asObj(view.get("route_meta")), "seq") == seqOf(issued, "route_seq"), label + " route_meta");
+
+      String grant =
+          TendrilNative.endpointMintGrant(
+              host, deviceIdOf(client), Json.stringify(List.of("fs.read")), 3600);
+      sessions = connectStored(client, host, hostId, grant, v2);
+      roundTrip(sessions[0], sessions[1], "stored-" + label);
+      TendrilNative.sessionFree(sessions[0]);
+      TendrilNative.sessionFree(sessions[1]);
+      sessions = null;
+
+      // Route setter: atomic, operator-only.
+      TendrilNative.endpointSetPeerRoutes(client, hostId, Json.stringify(List.of("127.0.0.1:1", "127.0.0.1:2")));
+      TendrilNative.endpointSetPeerRoutes(client, hostId, Json.stringify(List.of("127.0.0.1:3")));
+      check(routesOf(client, hostId, "operator").equals(List.of("direct:127.0.0.1:3")), label + " operator");
+      boolean rejected = false;
+      try {
+        TendrilNative.endpointSetPeerRoutes(client, hostId, Json.stringify(List.of("127.0.0.1:4", "host#frag")));
+      } catch (IllegalStateException e) {
+        rejected = true;
+      }
+      check(rejected, label + " bad entry rejects the list");
+      check(routesOf(client, hostId, "operator").equals(List.of("direct:127.0.0.1:3")), label + " atomic");
+      TendrilNative.endpointClearPeerRoutes(client, hostId, null);
+      check(routesOf(client, hostId, "operator").isEmpty(), label + " operator cleared");
+      check(routesOf(client, hostId, "signed").size() == 1, label + " signed kept");
+
+      // Recovery with an equal rq: the URI's hints are dialed, the stored routes stay untouched.
+      TendrilNative.endpointClearPeerRoutes(client, hostId, "signed");
+      Map<String, Object> same = issue(host, null);
+      String sameOptions = recoveryOptions(v2, grant, asStr(same.get("uri")), false);
+      sessions =
+          connectAndAccept(
+              host, v2, 10000, () -> TendrilNative.sessionConnectWithOptions(client, hostId, sameOptions));
+      roundTrip(sessions[0], sessions[1], "recovery-" + label);
+      TendrilNative.sessionFree(sessions[0]);
+      TendrilNative.sessionFree(sessions[1]);
+      sessions = null;
+      check(routesOf(client, hostId, "signed").isEmpty(), label + " equal rq leaves routes untouched");
+
+      // Offline apply of a fresh signed URI after the host's set changes.
+      TendrilNative.endpointServeDirect(host, "127.0.0.1:0");
+      Map<String, Object> fresh = issue(host, null);
+      check(seqOf(fresh, "route_seq") == seqOf(same, "route_seq") + 1, label + " set change bumps seq");
+      Map<String, Object> applied =
+          asObj(Json.parse(TendrilNative.endpointApplyRouteUri(client, asStr(fresh.get("uri")), null)));
+      check(Boolean.TRUE.equals(applied.get("applied")), label + " apply: " + applied);
+      check(routesOf(client, hostId, "signed").size() == 2, label + " applied routes");
+
+      // With every route cleared, a connect has nothing to dial; a recovery URI approved with
+      // replace_routes dials its hints and restores the signed routes.
+      TendrilNative.endpointClearPeerRoutes(client, hostId, "all");
+      boolean noRoutes = false;
+      try {
+        connectStored(client, host, hostId, grant, v2, 1500);
+      } catch (IllegalStateException e) {
+        noRoutes = e.getMessage() != null && e.getMessage().contains("no dialable stored routes");
+      }
+      check(noRoutes, label + " cleared routes cannot connect");
+      String replaceOptions = recoveryOptions(v2, grant, asStr(fresh.get("uri")), true);
+      sessions =
+          connectAndAccept(
+              host, v2, 10000, () -> TendrilNative.sessionConnectWithOptions(client, hostId, replaceOptions));
+      roundTrip(sessions[0], sessions[1], "replace-" + label);
+      check(routesOf(client, hostId, "signed").size() == 2, label + " recovery replaced routes");
+
+      boolean badOption = false;
+      try {
+        TendrilNative.sessionConnectWithOptions(client, hostId, "{\"wire\":3}");
+      } catch (IllegalStateException e) {
+        badOption = true;
+      }
+      check(badOption, label + " bad options are refused");
+    } finally {
+      if (sessions != null) {
+        TendrilNative.sessionFree(sessions[0]);
+        TendrilNative.sessionFree(sessions[1]);
+      }
+      TendrilNative.endpointClose(host);
+      TendrilNative.endpointClose(client);
+      TendrilNative.endpointFree(host);
+      TendrilNative.endpointFree(client);
+    }
+  }
+
+  /** Multi-network snapshots through refreshRoutes: seq bumps, retention across NULL, delivery to live sessions. */
+  private static void verifyRefreshRoutes() throws Exception {
+    long host = newEp("tendril-jni-rh-", "jni-refresh-host");
+    long client = newEp("tendril-jni-rc-", null);
+    long[] sessions = null;
+    try {
+      String loopback = TendrilNative.endpointServeDirect(host, "127.0.0.1:0");
+      String any = TendrilNative.endpointServeDirect(host, "0.0.0.0:0");
+      String port = any.substring(any.lastIndexOf(':') + 1);
+      String wifi = network("n1", "wlan0", 3, "\"wifi\"", "10.255.77.20/24");
+      String tun = network("n2", "tun0", 4, "\"vpn\"", "100.101.1.2");
+      String cell = network("n3", "rmnet0", 5, "\"cellular\"", "100.70.3.4", "203.0.113.7");
+
+      Map<String, Object> first =
+          asObj(Json.parse(TendrilNative.endpointRefreshRoutes(host, snapshot(wifi, tun, cell))));
+      long seq0 = seqOf(first, "route_seq");
+      Map<String, Object> issued = issue(host, null);
+      check(seqOf(issued, "route_seq") == seq0, "issuance uses the refreshed set");
+      String uri = asStr(issued.get("uri"));
+      check(uri.contains("10.255.77.20"), "wifi LAN address advertised: " + uri);
+      check(uri.contains("100.101.1.2"), "vpn address advertised: " + uri);
+      check(!uri.contains("100.70.3.4") && !uri.contains("203.0.113.7"), "cellular addresses withheld: " + uri);
+      check(uri.contains("overlay"), "vpn address is an overlay hint: " + uri);
+
+      Map<String, Object> res = pairViaUri(host, client, uri, false);
+      String hostId = hostIdOf(host);
+      String grant =
+          TendrilNative.endpointMintGrant(
+              host, asStr(res.get("device_id")), Json.stringify(List.of("fs.read")), 3600);
+      // A client that learned its routes from a URI reports route_seq 0, so the host's current set
+      // is the first host-initiated frame of its first session.
+      sessions = connectStored(client, host, hostId, grant, false);
+      waitRouteSet(client, sessions[0], hostId, seq0);
+      TendrilNative.sessionFree(sessions[0]);
+      TendrilNative.sessionFree(sessions[1]);
+      sessions = connectStored(client, host, hostId, grant, false);
+
+      Map<String, Object> again =
+          asObj(Json.parse(TendrilNative.endpointRefreshRoutes(host, snapshot(wifi, tun, cell))));
+      check(Boolean.FALSE.equals(again.get("changed")) && seqOf(again, "route_seq") == seq0, "same snapshot: " + again);
+      Map<String, Object> timer = asObj(Json.parse(TendrilNative.endpointRefreshRoutes(host, null)));
+      check(Boolean.FALSE.equals(timer.get("changed")) && seqOf(timer, "route_seq") == seq0,
+          "timer refresh reuses the retained snapshot: " + timer);
+
+      Map<String, Object> noWifi =
+          asObj(Json.parse(TendrilNative.endpointRefreshRoutes(host, snapshot(tun, cell))));
+      check(Boolean.TRUE.equals(noWifi.get("changed")) && seqOf(noWifi, "route_seq") == seq0 + 1, "wifi lost: " + noWifi);
+      waitRouteSet(client, sessions[0], hostId, seq0 + 1);
+      List<String> signed = routesOf(client, hostId, "signed");
+      check(!signed.contains("direct:10.255.77.20:" + port), "lost LAN route removed: " + signed);
+      check(signed.contains("direct:" + loopback), "loopback route kept: " + signed);
+
+      Map<String, Object> empty = asObj(Json.parse(TendrilNative.endpointRefreshRoutes(host, snapshot())));
+      check(Boolean.FALSE.equals(empty.get("changed")), "an empty snapshot is debounced: " + empty);
+
+      boolean badSnapshot = false;
+      try {
+        TendrilNative.endpointRefreshRoutes(host, "{\"networks\":1}");
+      } catch (IllegalStateException e) {
+        badSnapshot = true;
+      }
+      check(badSnapshot, "malformed snapshot is refused");
+      roundTrip(sessions[1], sessions[0], "still-open");
+    } finally {
+      if (sessions != null) {
+        TendrilNative.sessionFree(sessions[0]);
+        TendrilNative.sessionFree(sessions[1]);
+      }
+      TendrilNative.endpointClose(host);
+      TendrilNative.endpointClose(client);
+      TendrilNative.endpointFree(host);
+      TendrilNative.endpointFree(client);
+    }
+  }
+
+  /** A sealed host keeps its route sequence across close and reopen; config keys are accepted. */
+  private static void verifySealedRouteSeq() throws Exception {
+    String dir = tempStateDir("tendril-jni-seq-");
+    long first = TendrilNative.endpointNewSealed(dir, null, null, "jni-seq-host");
+    String identity = TendrilNative.endpointExportIdentityJson(first);
+    TendrilNative.endpointFree(first);
+    long seqB;
+    long ep = TendrilNative.endpointNewSealed(dir, identity, null, null);
+    try {
+      TendrilNative.endpointConfigureTransportsJson(
+          ep,
+          "{\"advertise\":\"explicit\",\"advertised_endpoints\":[\"192.168.40.1:4100\"],"
+              + "\"relay_auth_origins\":[\"https://relay.example\"],\"route_policy\":\"all_signed\","
+              + "\"sign_routes\":true}");
+      long a = seqOf(issue(ep, null), "route_seq");
+      TendrilNative.endpointConfigureTransportsJson(
+          ep, "{\"advertise\":\"explicit\",\"advertised_endpoints\":[\"192.168.40.1:4101\"]}");
+      seqB = seqOf(issue(ep, null), "route_seq");
+      check(seqB == a + 1, "changed set bumps the sequence");
+    } finally {
+      TendrilNative.endpointClose(ep);
+      TendrilNative.endpointFree(ep);
+    }
+    ep = TendrilNative.endpointNewSealed(dir, identity, null, null);
+    try {
+      TendrilNative.endpointConfigureTransportsJson(
+          ep, "{\"advertise\":\"explicit\",\"advertised_endpoints\":[\"192.168.40.1:4101\"]}");
+      check(seqOf(issue(ep, null), "route_seq") == seqB, "unchanged set keeps the persisted sequence");
+      TendrilNative.endpointConfigureTransportsJson(
+          ep, "{\"advertise\":\"explicit\",\"advertised_endpoints\":[\"192.168.40.1:4102\"]}");
+      check(seqOf(issue(ep, null), "route_seq") == seqB + 1, "a changed set bumps from the persisted sequence");
+    } finally {
+      TendrilNative.endpointClose(ep);
+      TendrilNative.endpointFree(ep);
+    }
+  }
+
+  private static void verifyPairingUriRoutes() throws Exception {
+    verifyPairingUriFlow(false);
+    verifyPairingUriFlow(true);
+    verifyRefreshRoutes();
+    verifySealedRouteSeq();
+  }
+
   public static void main(String[] args) throws Exception {
     Path root = Paths.get("").toAbsolutePath().normalize();
     Path peerBin = root.resolve("target").resolve("debug").resolve("tendril-conformance-peer");
@@ -1607,5 +2011,7 @@ public final class TendrilJniConformanceTest {
     System.out.println("JNI_GROUP_OK=true");
     verifySealedGroupState();
     System.out.println("JNI_SEALED_GROUP_OK=true");
+    verifyPairingUriRoutes();
+    System.out.println("JNI_PAIRING_URI_ROUTES_OK=true");
   }
 }
