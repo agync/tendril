@@ -1354,7 +1354,7 @@ async fn probe(secret: [u8; 32], url: &str, epoch: u64) -> Result<(), RuntimeErr
 }
 
 fn is_offline(res: &Result<(), RuntimeError>) -> bool {
-    matches!(res, Err(RuntimeError::Protocol(m)) if m == "v2 relay dial rejected: offline")
+    matches!(res, Err(e @ RuntimeError::RelayOffline(_)) if e.to_string() == "v2 relay dial rejected: offline")
 }
 
 async fn wait_registered(secret: [u8; 32], url: &str, epoch: u64) {

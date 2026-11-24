@@ -40,10 +40,15 @@ use crate::noise::{MSG1_LEN, NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseT
 #[cfg(any(test, feature = "test-utils"))]
 use crate::pairing::KeyClaimTamper;
 use crate::pairing::{
-    PairingManager, PairingPathKind, PinnedHost, human_key_claim, verify_human_key_claim,
+    PairingManager, PairingPathKind, PersistPlan, PinnedHost, VerifiedHost, VerifiedRouteStatement,
+    human_key_claim, verify_human_key_claim,
 };
-use crate::roster::{PeerState, Roster, V2PeerSecrets};
-use crate::session::{REKEY_MAX_AGE_MS, REKEY_MAX_FRAMES, RekeyDirection, SessionCloseCode};
+use crate::roster::{PairMergeOutcome, PeerState, Roster, V2PeerSecrets};
+use crate::routes::RouteSet;
+use crate::session::{
+    REKEY_MAX_AGE_MS, REKEY_MAX_FRAMES, RekeyDirection, RouteExpectation, SessionCloseCode,
+    SessionRole, check_route_seq, check_route_set_send, receive_route_set, verify_session_host,
+};
 use crate::wire::{
     AEAD_TAG_LEN, FLAG_PAKE_PAIR, HostHello, InnerFrameType, Intent, MAX_FRAME_LEN,
     MAX_TRANSPORT_PLAINTEXT, PREAMBLE_FLAG_NONE, PREAMBLE_LEN, PairClaim, PairResponse, Preamble,
@@ -244,6 +249,65 @@ impl Roster {
         staged.upgrade_peer_to_v2(host_id, v2_secrets.clone())?;
         *self = staged;
         Ok(host_id.clone())
+    }
+
+    /// Atomically persists a verified v2 pairing initiator outcome with its route plan.
+    ///
+    /// As [`Self::apply_v2_pair_initiator_outcome`], but writes no legacy `relay_hints`: the
+    /// pin is staged as [`Self::insert_pinned_host_with_plan`] (pin verified) or
+    /// [`Self::record_pending_host_with_plan`] would, the entry is upgraded to Wire v2, and then
+    /// `plan` is merged under the route high-water rule, so an operator `/v2/relay` route is
+    /// accepted on a first v2 pairing. On any error the roster is unchanged. Returns the host id
+    /// and the merge outcome.
+    pub fn apply_v2_pair_initiator_outcome_with_plan(
+        &mut self,
+        outcome: &V2PairOutcome,
+        host_name: impl Into<String>,
+        plan: &PersistPlan,
+    ) -> Result<(String, PairMergeOutcome), CoreError> {
+        let V2PairOutcome::InitiatorPending {
+            host_id,
+            host_static_pub,
+            host_signing_pub,
+            host_rotation_seq,
+            pairing_sas,
+            host_pin_verified,
+            v2_secrets,
+            ..
+        } = outcome
+        else {
+            return Err(CoreError::ProtocolViolation(
+                "expected V2PairOutcome::InitiatorPending",
+            ));
+        };
+        let mut staged = self.clone();
+        let name = host_name.into();
+        if *host_pin_verified {
+            staged.insert_pinned_host(
+                host_id.clone(),
+                name,
+                *host_static_pub,
+                Some(host_signing_pub.clone()),
+                *host_rotation_seq,
+                Vec::new(),
+            )?;
+        } else {
+            staged.record_pending_host(
+                host_id.clone(),
+                name,
+                *host_static_pub,
+                host_signing_pub.clone(),
+                *host_rotation_seq,
+                pairing_sas.clone(),
+                Vec::new(),
+            )?;
+        }
+        // Upgrade before the merge so an operator `/v2/relay` route in the plan sees the
+        // Wire v2 secrets this pairing produced.
+        staged.upgrade_peer_to_v2(host_id, v2_secrets.clone())?;
+        let merged = staged.merge_pair_plan(host_id, plan)?;
+        *self = staged;
+        Ok((host_id.clone(), merged))
     }
 }
 
@@ -850,7 +914,8 @@ impl PaddingPolicy {
     }
 }
 
-/// Pads an inner `0x01..=0x07` frame into a `0x09 PADDED` envelope aligned to `policy.buckets()`.
+/// Pads an inner `0x01..=0x07` or `0x0A..=0x0C` frame into a `0x09 PADDED` envelope aligned to
+/// `policy.buckets()`, failing with `FrameTooLarge` when no bucket holds `4 + payload.len()`.
 pub fn pad_inner_frame(
     kind: InnerFrameType,
     payload: &[u8],
@@ -994,10 +1059,11 @@ impl fmt::Debug for V2InnerFrame {
     }
 }
 
-const fn is_group_frame(kind: InnerFrameType) -> bool {
+/// Frames valid only inside `0x09 PADDED`: never sealed or accepted bare.
+const fn is_padded_only_frame(kind: InnerFrameType) -> bool {
     matches!(
         kind,
-        InnerFrameType::GroupManifest | InnerFrameType::GroupRendezvous
+        InnerFrameType::GroupManifest | InnerFrameType::GroupRendezvous | InnerFrameType::RouteSet
     )
 }
 
@@ -1386,7 +1452,7 @@ impl SealedSession {
                 payload,
                 &self.padding,
             )?))
-        } else if is_group_frame(kind) {
+        } else if is_padded_only_frame(kind) {
             Err(CoreError::UnknownInnerFrameType(kind as u8))
         } else {
             Ok(Zeroizing::new(encode_inner_frame(kind, payload)?))
@@ -1426,10 +1492,12 @@ impl SealedSession {
         })
     }
 
-    /// Seals one inner frame (`0x01..=0x03`, `0x05..=0x07`), applying `PaddingPolicy` when enabled.
+    /// Seals one inner frame (`0x01..=0x03`, `0x05..=0x07`, or `0x0A..=0x0C` when padding is
+    /// enabled), applying `PaddingPolicy` when enabled.
     ///
     /// Rejects `Rekey`, `Padding`, and `Padded` (use [`Self::seal_rekey`] and
-    /// [`Self::seal_dummy_cover`]), and fails closed before mutating TX nonce or frame counters.
+    /// [`Self::seal_dummy_cover`]), the padded-only `0x0A..=0x0C` without padding, and a frame no
+    /// bucket fits (`FrameTooLarge`); every failure leaves TX nonce and frame counters unchanged.
     pub fn seal(
         &mut self,
         kind: InnerFrameType,
@@ -1517,8 +1585,8 @@ impl SealedSession {
 
     /// Decrypts and decodes an incoming transport frame.
     ///
-    /// In v1 mode (`!padding.is_enabled()`), rejects `0x08`, `0x09`, and the group frames
-    /// `0x0A`/`0x0B` (`UnknownInnerFrameType`); group frames travel only inside `0x09 PADDED`.
+    /// In v1 mode (`!padding.is_enabled()`), rejects `0x08`, `0x09`, and the padded-only frames
+    /// `0x0A..=0x0C` (`UnknownInnerFrameType`), which travel only inside `0x09 PADDED`.
     ///
     /// A returned `0x0B GROUP_RENDEZVOUS` payload carries the group rendezvous key. Callers MUST
     /// treat it as secret and wipe it (for example by moving it into `Zeroizing`) after decoding.
@@ -1529,7 +1597,7 @@ impl SealedSession {
         let decoded = if !self.padding.enabled {
             let (kind, payload) = decode_inner_frame(&plaintext)?;
             if matches!(kind, InnerFrameType::Padding | InnerFrameType::Padded)
-                || is_group_frame(kind)
+                || is_padded_only_frame(kind)
             {
                 return Err(CoreError::UnknownInnerFrameType(kind as u8));
             }
@@ -1917,6 +1985,11 @@ pub struct V2SessionInitiator {
     applied_rotation: Vec<RotationRecord>,
     peer_static_pub: Option<[u8; 32]>,
     exported_secrets: Option<V2PeerSecrets>,
+    route_expectation: Option<RouteExpectation>,
+    local_route_seq: Option<u64>,
+    presented_rotation: Vec<RotationRecord>,
+    verified_recovery: Option<VerifiedRouteStatement>,
+    route_sets: Vec<RouteSet>,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_rendezvous_nonce: Option<[u8; 16]>,
 }
@@ -1962,6 +2035,11 @@ impl V2SessionInitiator {
             applied_rotation: Vec::new(),
             peer_static_pub: None,
             exported_secrets: None,
+            route_expectation: None,
+            local_route_seq: None,
+            presented_rotation: Vec::new(),
+            verified_recovery: None,
+            route_sets: Vec::new(),
             #[cfg(any(test, feature = "test-utils"))]
             fixed_rendezvous_nonce: None,
         })
@@ -2003,6 +2081,52 @@ impl V2SessionInitiator {
     pub fn with_padding_policy(mut self, padding: PaddingPolicy) -> Self {
         self.padding = padding;
         self
+    }
+
+    /// Sets the route expectation checked against `HostHello` before `msg3` (before
+    /// [`Self::start`]).
+    pub fn with_route_expectation(
+        mut self,
+        expectation: RouteExpectation,
+    ) -> Result<Self, CoreError> {
+        self.require_unstarted()?;
+        self.route_expectation = Some(expectation);
+        Ok(self)
+    }
+
+    /// Sets `SessionHello.route_seq` (before [`Self::start`]). `Some` opts in to `0x0C
+    /// ROUTE_SET` frames, which arrive only inside `0x09 PADDED`.
+    pub fn with_route_seq(mut self, route_seq: Option<u64>) -> Result<Self, CoreError> {
+        self.require_unstarted()?;
+        check_route_seq(route_seq)?;
+        self.local_route_seq = route_seq;
+        Ok(self)
+    }
+
+    fn require_unstarted(&self) -> Result<(), CoreError> {
+        if !matches!(self.phase, V2InitPhase::Init(_)) {
+            return Err(CoreError::NotReady(
+                "route options are set on an initiator before start()",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the `HostHello.rotation` records the host presented, kept on every outcome.
+    #[must_use]
+    pub fn presented_rotation(&self) -> &[RotationRecord] {
+        &self.presented_rotation
+    }
+
+    /// Returns the recovery URI's route statement verified under the presented host key.
+    #[must_use]
+    pub const fn verified_recovery_statement(&self) -> Option<&VerifiedRouteStatement> {
+        self.verified_recovery.as_ref()
+    }
+
+    /// Drains the decoded, not yet verified `0x0C` route sets received so far.
+    pub fn take_route_sets(&mut self) -> Vec<RouteSet> {
+        std::mem::take(&mut self.route_sets)
     }
 
     /// Returns true once the v2 handshake has completed and entered [`SealedSession`] transport mode.
@@ -2141,6 +2265,7 @@ impl V2SessionInitiator {
                 if host_hello.proto_version != WIRE_VERSION_V2 {
                     return Err(CoreError::UnsupportedVersion(host_hello.proto_version));
                 }
+                self.presented_rotation.clone_from(&host_hello.rotation);
                 if host_hello.host_id != self.target_host_id
                     || host_hello.host_id.is_empty()
                     || has_control_chars(&host_hello.host_id)
@@ -2155,60 +2280,19 @@ impl V2SessionInitiator {
                     return Err(CoreError::HostKeyUnverified);
                 }
 
-                roster.resolve_signing_pin(&self.target_host_id, &host_signing_pub)?;
-                let (pinned_static, pinned_signing) = match roster.get(&self.target_host_id) {
-                    Some(entry) => {
-                        check_wire_version(entry.min_wire_version, WIRE_VERSION_V2)?;
-                        match entry.state {
-                            PeerState::Pending => {
-                                return Err(CoreError::PeerPending(self.target_host_id.clone()));
-                            }
-                            PeerState::Revoked => {
-                                return Err(CoreError::PeerRevoked(self.target_host_id.clone()));
-                            }
-                            PeerState::Active => {
-                                if roster.crl_revokes_entry(entry) {
-                                    return Err(CoreError::PeerRevoked(
-                                        self.target_host_id.clone(),
-                                    ));
-                                }
-                                entry.require_complete_pin()?
-                            }
-                        }
-                    }
-                    None => return Err(CoreError::HostKeyUnverified),
-                };
-                if roster.is_manifest_pinned(&self.target_host_id) {
-                    if peer_static != pinned_static || host_signing_pub != pinned_signing {
-                        return Err(CoreError::HostKeyUnverified);
-                    }
-                } else {
-                    if host_hello.rotation.is_empty()
-                        && peer_static == pinned_static
-                        && host_signing_pub != pinned_signing
-                    {
-                        return Err(CoreError::HostKeyUnverified);
-                    }
-                    match roster.apply_verified_rotation(
-                        &self.target_host_id,
-                        &host_hello.rotation,
-                        &peer_static,
-                        &host_signing_pub,
-                    ) {
-                        Ok(_) => {
-                            if !host_hello.rotation.is_empty() {
-                                self.applied_rotation = host_hello.rotation;
-                            }
-                        }
-                        Err(
-                            err @ (CoreError::RotationForkDetected { .. }
-                            | CoreError::IncompletePin(_)
-                            | CoreError::PeerPending(_)
-                            | CoreError::PeerRevoked(_)),
-                        ) => return Err(err),
-                        Err(_) => return Err(CoreError::HostKeyUnverified),
-                    }
+                let verified = verify_session_host(
+                    roster,
+                    &self.target_host_id,
+                    &host_hello.rotation,
+                    &peer_static,
+                    &host_signing_pub,
+                    WIRE_VERSION_V2,
+                    self.route_expectation.as_ref(),
+                )?;
+                if verified.rotation_applied {
+                    self.applied_rotation = host_hello.rotation;
                 }
+                self.verified_recovery = verified.recovery_statement;
                 roster.set_peer_min_wire_version(&self.target_host_id, WIRE_VERSION_V2)?;
 
                 let hello = SessionHello {
@@ -2216,6 +2300,7 @@ impl V2SessionInitiator {
                     grant: self.initial_grant.clone(),
                     crl_seq: self.initial_crl_seq,
                     groups: self.initial_groups.clone(),
+                    route_seq: self.local_route_seq,
                 };
                 let hello_bytes = Zeroizing::new(
                     serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -2343,6 +2428,12 @@ impl V2SessionInitiator {
                         self.phase = V2InitPhase::Closed;
                         actions.push(V2SessionAction::CloseTransport { code, reason });
                     }
+                    InnerFrameType::RouteSet => receive_route_set(
+                        SessionRole::Initiator,
+                        self.local_route_seq.is_some(),
+                        &payload,
+                        &mut self.route_sets,
+                    )?,
                     InnerFrameType::Padding | InnerFrameType::Padded => {
                         return Err(CoreError::UnknownInnerFrameType(kind as u8));
                     }
@@ -2646,6 +2737,7 @@ pub struct V2SessionResponder {
     peer_static_pub: Option<[u8; 32]>,
     peer_crl_seq: Option<u64>,
     peer_groups: Option<Vec<GroupSeq>>,
+    peer_route_seq: Option<u64>,
     active_grant: Option<Grant>,
     exported_secrets: Option<V2PeerSecrets>,
     matched_rendezvous_secret: Option<Zeroizing<[u8; 32]>>,
@@ -2681,6 +2773,7 @@ impl V2SessionResponder {
             peer_static_pub: None,
             peer_crl_seq: None,
             peer_groups: None,
+            peer_route_seq: None,
             active_grant: None,
             exported_secrets: None,
             matched_rendezvous_secret: None,
@@ -2741,6 +2834,30 @@ impl V2SessionResponder {
     #[must_use]
     pub fn peer_groups(&self) -> Option<&[GroupSeq]> {
         self.peer_groups.as_deref()
+    }
+
+    /// Returns the `route_seq` the initiator sent in `SessionHello`, if any.
+    #[must_use]
+    pub const fn peer_route_seq(&self) -> Option<u64> {
+        self.peer_route_seq
+    }
+
+    /// Seals a `0x0C ROUTE_SET` payload inside `0x09 PADDED` for an initiator that sent
+    /// `SessionHello.route_seq`. The payload must decode as a [`RouteSet`].
+    ///
+    /// Fails without state change, leaving the session open, with `FrameTooLarge` when no
+    /// padding bucket holds `4 + payload.len()` bytes and with `UnknownInnerFrameType` when
+    /// padding is disabled.
+    pub fn send_route_set(
+        &mut self,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2RespPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        check_route_set_send(self.peer_route_seq, payload)?;
+        seal_transport_action(sealed, InnerFrameType::RouteSet, payload, now_ms)
     }
 
     /// Returns the currently verified capability grant associated with this session, if any.
@@ -3027,6 +3144,7 @@ impl V2SessionResponder {
                 );
                 self.peer_crl_seq = hello.crl_seq;
                 self.peer_groups = hello.groups;
+                self.peer_route_seq = hello.route_seq;
                 self.peer_device_id = Some(canonical_peer_id.clone());
                 self.peer_static_pub = Some(peer_static);
                 self.phase = V2RespPhase::Transport(Box::new(sealed));
@@ -3137,6 +3255,11 @@ impl V2SessionResponder {
                         })?;
                         self.phase = V2RespPhase::Closed;
                         actions.push(V2SessionAction::CloseTransport { code, reason });
+                    }
+                    InnerFrameType::RouteSet => {
+                        return Err(CoreError::InvalidInnerFramePayload(
+                            "route set from initiator",
+                        ));
                     }
                     InnerFrameType::Padding | InnerFrameType::Padded => {
                         return Err(CoreError::UnknownInnerFrameType(kind as u8));
@@ -3782,6 +3905,11 @@ enum PakeInitPhase {
         hs: Box<NoiseHfsHandshake>,
         keys: PakeKeys,
     },
+    AwaitCommit {
+        hs: Box<NoiseHfsHandshake>,
+        keys: PakeKeys,
+        host: PakeVerifiedHost,
+    },
     AwaitResponse {
         transport: Box<NoiseTransport>,
         host_id: String,
@@ -3793,6 +3921,56 @@ enum PakeInitPhase {
         host_pin_verified: bool,
     },
     Closed,
+}
+
+/// Host identity a v2 PAKE initiator verified from the sealed `HostHello`.
+struct PakeVerifiedHost {
+    host_id: String,
+    host_static_pub: [u8; 32],
+    verified_host_signing_pub: HybridSigningPublicKey,
+    verified_seq: Option<u64>,
+    presented_rotation: Vec<RotationRecord>,
+    pairing_sas: String,
+}
+
+/// Rotation sequence of an unpinned `HostHello.rotation` chain, verified from its first
+/// record's previous key (`0` for an empty chain).
+fn presented_chain_seq(
+    presented_rotation: &[RotationRecord],
+    host_static_pub: &[u8; 32],
+    host_signing: &HybridSigningPublicKey,
+) -> Result<u64, CoreError> {
+    let Some(first) = presented_rotation.first() else {
+        return Ok(0);
+    };
+    let root_sig = HybridSigningPublicKey::from_b64url(&first.prev_signing_pub)
+        .map_err(|_| CoreError::HostKeyUnverified)?;
+    verify_rotation_chain_pin(
+        &SigningKeyPin::Full(root_sig),
+        host_static_pub,
+        first.seq.saturating_sub(1),
+        presented_rotation,
+        host_static_pub,
+        host_signing,
+    )
+    .map_err(|_| CoreError::HostKeyUnverified)
+}
+
+fn verified_host_view(
+    host_id: &str,
+    host_static_pub: &[u8; 32],
+    signing_pub: &HybridSigningPublicKey,
+    verified_seq: Option<u64>,
+    presented_rotation: &[RotationRecord],
+) -> VerifiedHost {
+    VerifiedHost {
+        host_id: host_id.to_string(),
+        static_pub: *host_static_pub,
+        signing_pub: signing_pub.clone(),
+        rotation_seq: verified_seq.unwrap_or_else(|| {
+            presented_chain_seq(presented_rotation, host_static_pub, signing_pub).unwrap_or(0)
+        }),
+    }
 }
 
 /// Wire v2 (`0x02`, `flags = 0x01`) hybrid PAKE + `ML-KEM-768` pairing initiator.
@@ -3807,6 +3985,7 @@ pub struct V2PakePairInitiator {
     signing_key: SigningKeypair,
     pinned_host: Option<V2PinnedHost>,
     params: PakeArgon2Params,
+    deferred_claim: bool,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_ephemeral: Option<[u8; 32]>,
     #[cfg(any(test, feature = "test-utils"))]
@@ -3868,6 +4047,7 @@ impl V2PakePairInitiator {
             signing_key: identity.signing_key().clone(),
             pinned_host,
             params,
+            deferred_claim: false,
             #[cfg(any(test, feature = "test-utils"))]
             fixed_ephemeral: None,
             #[cfg(any(test, feature = "test-utils"))]
@@ -3899,6 +4079,117 @@ impl V2PakePairInitiator {
     pub fn with_fixed_ephemeral_for_testing_only(mut self, eph_seed: [u8; 32]) -> Self {
         self.fixed_ephemeral = Some(eph_seed);
         self
+    }
+
+    /// Defers `msg3`: a verified `msg2` emits only `SasReady` and parks until
+    /// [`Self::commit_claim`].
+    #[must_use]
+    pub fn with_deferred_claim(mut self) -> Self {
+        self.deferred_claim = true;
+        self
+    }
+
+    /// Returns `true` while a verified `msg2` waits for [`Self::commit_claim`].
+    #[must_use]
+    pub const fn is_awaiting_commit(&self) -> bool {
+        matches!(self.phase, PakeInitPhase::AwaitCommit { .. })
+    }
+
+    /// The host verified from the sealed `HostHello`, once `msg2` has been accepted.
+    #[must_use]
+    pub fn verified_host(&self) -> Option<VerifiedHost> {
+        match &self.phase {
+            PakeInitPhase::AwaitCommit { host, .. } => Some(verified_host_view(
+                &host.host_id,
+                &host.host_static_pub,
+                &host.verified_host_signing_pub,
+                host.verified_seq,
+                &host.presented_rotation,
+            )),
+            PakeInitPhase::AwaitResponse {
+                host_id,
+                host_static_pub,
+                verified_host_signing_pub,
+                verified_seq,
+                presented_rotation,
+                ..
+            } => Some(verified_host_view(
+                host_id,
+                host_static_pub,
+                verified_host_signing_pub,
+                *verified_seq,
+                presented_rotation,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Builds and returns the `msg3` claim (`init_confirm_mac` and key claim) of a deferred
+    /// initiator from this handshake's `h`.
+    ///
+    /// Fails with `NotReady` before a verified `msg2` or when called twice.
+    pub fn commit_claim(&mut self) -> Result<Vec<V2PairAction>, CoreError> {
+        if !self.is_awaiting_commit() {
+            return Err(CoreError::NotReady(
+                "v2 PAKE initiator is not awaiting commit",
+            ));
+        }
+        let PakeInitPhase::AwaitCommit { hs, keys, host } =
+            std::mem::replace(&mut self.phase, PakeInitPhase::Closed)
+        else {
+            return Err(CoreError::NotReady(
+                "v2 PAKE initiator is not awaiting commit",
+            ));
+        };
+        let mut actions = Vec::new();
+        self.write_claim(hs, &keys, host, &mut actions)?;
+        Ok(actions)
+    }
+
+    fn write_claim(
+        &mut self,
+        mut hs: Box<NoiseHfsHandshake>,
+        keys: &PakeKeys,
+        host: PakeVerifiedHost,
+        actions: &mut Vec<V2PairAction>,
+    ) -> Result<(), CoreError> {
+        let h_post = *hs.get_handshake_hash();
+        let (signing_pub, enroll_proof) = human_key_claim(
+            &self.signing_key,
+            &h_post,
+            &self.local_static_pub,
+            #[cfg(any(test, feature = "test-utils"))]
+            self.key_claim_tamper,
+        )?;
+        let claim = PairClaim {
+            name: self.device_name.clone(),
+            kind: self.device_kind.clone(),
+            code_mac: None,
+            enrollment_token: None,
+            signing_pub,
+            enroll_proof,
+        };
+        let claim_json = Zeroizing::new(
+            serde_json::to_vec(&claim).map_err(|err| CoreError::Json(err.to_string()))?,
+        );
+        let init_mac = compute_pake_init_mac(&keys.pake_confirm_key, &h_post, &claim_json);
+        let msg3_pt = Zeroizing::new(pad_pake_msg3_payload(&init_mac, &claim_json)?);
+
+        let msg3 = hs.write_message_vec(&msg3_pt)?;
+        actions.push(V2PairAction::WriteBytes(encode_frame(&msg3)?));
+
+        let transport = hs.into_transport_mode()?;
+        self.phase = PakeInitPhase::AwaitResponse {
+            transport: Box::new(transport),
+            host_id: host.host_id,
+            host_static_pub: host.host_static_pub,
+            verified_host_signing_pub: host.verified_host_signing_pub,
+            verified_seq: host.verified_seq,
+            presented_rotation: host.presented_rotation,
+            pairing_sas: host.pairing_sas,
+            host_pin_verified: self.pinned_host.is_some(),
+        };
+        Ok(())
     }
 
     /// Emits the v2 PAKE preamble (`TND\x02\x02\x01`) + `msg1` carrying `channel_salt || init_mac`.
@@ -4082,43 +4373,19 @@ impl V2PakePairInitiator {
                     host_id: host_hello.host_id.clone(),
                     host_static_pub: remote_static,
                 });
-
-                let (signing_pub, enroll_proof) = human_key_claim(
-                    &self.signing_key,
-                    &h_post,
-                    &self.local_static_pub,
-                    #[cfg(any(test, feature = "test-utils"))]
-                    self.key_claim_tamper,
-                )?;
-                let claim = PairClaim {
-                    name: self.device_name.clone(),
-                    kind: self.device_kind.clone(),
-                    code_mac: None,
-                    enrollment_token: None,
-                    signing_pub,
-                    enroll_proof,
-                };
-                let claim_json = Zeroizing::new(
-                    serde_json::to_vec(&claim).map_err(|err| CoreError::Json(err.to_string()))?,
-                );
-                let init_mac = compute_pake_init_mac(&keys.pake_confirm_key, &h_post, &claim_json);
-                let msg3_pt = Zeroizing::new(pad_pake_msg3_payload(&init_mac, &claim_json)?);
-
-                let msg3 = hs.write_message_vec(&msg3_pt)?;
-                actions.push(V2PairAction::WriteBytes(encode_frame(&msg3)?));
-
-                let transport = hs.into_transport_mode()?;
-                self.phase = PakeInitPhase::AwaitResponse {
-                    transport: Box::new(transport),
+                let host = PakeVerifiedHost {
                     host_id: host_hello.host_id,
                     host_static_pub: remote_static,
                     verified_host_signing_pub: host_signing_pub,
                     verified_seq,
                     presented_rotation: host_hello.rotation,
                     pairing_sas: sas,
-                    host_pin_verified: self.pinned_host.is_some(),
                 };
-                Ok(())
+                if self.deferred_claim {
+                    self.phase = PakeInitPhase::AwaitCommit { hs, keys, host };
+                    return Ok(());
+                }
+                self.write_claim(hs, &keys, host, actions)
             }
             PakeInitPhase::AwaitResponse {
                 mut transport,
@@ -4150,23 +4417,13 @@ impl V2PakePairInitiator {
                         if host_signing != verified_host_signing_pub {
                             return Err(CoreError::HostKeyUnverified);
                         }
-                        let host_rotation_seq = if let Some(seq) = verified_seq {
-                            seq
-                        } else if let Some(first) = presented_rotation.first() {
-                            let root_sig =
-                                HybridSigningPublicKey::from_b64url(&first.prev_signing_pub)
-                                    .map_err(|_| CoreError::HostKeyUnverified)?;
-                            verify_rotation_chain_pin(
-                                &SigningKeyPin::Full(root_sig),
-                                &host_static_pub,
-                                first.seq.saturating_sub(1),
+                        let host_rotation_seq = match verified_seq {
+                            Some(seq) => seq,
+                            None => presented_chain_seq(
                                 &presented_rotation,
                                 &host_static_pub,
                                 &host_signing,
-                            )
-                            .map_err(|_| CoreError::HostKeyUnverified)?
-                        } else {
-                            0
+                            )?,
                         };
                         let (reconnect_secret, mailbox_secret) =
                             transport.export_v2_secrets(&host_static_pub);
@@ -4196,6 +4453,9 @@ impl V2PakePairInitiator {
                     }
                 }
             }
+            PakeInitPhase::AwaitCommit { .. } => Err(CoreError::ProtocolViolation(
+                "unexpected frame while awaiting the v2 PAKE claim commit",
+            )),
             PakeInitPhase::Init => Err(CoreError::NotReady("v2 PAKE initiator not started")),
             PakeInitPhase::Closed => Err(CoreError::SessionClosed {
                 code: SessionCloseCode::NORMAL,

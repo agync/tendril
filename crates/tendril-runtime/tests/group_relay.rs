@@ -201,7 +201,7 @@ impl Prober {
 }
 
 fn is_offline(res: &Result<(), RuntimeError>) -> bool {
-    matches!(res, Err(RuntimeError::Protocol(m)) if m == "v2 relay dial rejected: offline")
+    matches!(res, Err(e @ RuntimeError::RelayOffline(_)) if e.to_string() == "v2 relay dial rejected: offline")
 }
 
 fn pairwise(node: &Node, gid: &str, peer: &Node) -> Option<V2PeerSecrets> {

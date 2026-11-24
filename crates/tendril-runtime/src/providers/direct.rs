@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::RuntimeError;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, IoPathStream, PathDialer, PathListener, PathStream};
+use crate::redact::redact_hint;
 
 /// TCP listener implementing the `direct` path provider.
 pub struct DirectListener {
@@ -46,6 +47,13 @@ impl DirectListener {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The bound socket, for reading socket options such as `IPV6_V6ONLY`
+    /// (`ServedListener::from_listener`).
+    #[must_use]
+    pub const fn tcp_listener(&self) -> &TcpListener {
+        &self.listener
     }
 }
 
@@ -139,8 +147,27 @@ impl PathDialer for DirectDialer {
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
         let addr_str = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
         let addr: SocketAddr = addr_str.parse().map_err(|err| {
-            RuntimeError::Protocol(format!("invalid tcp endpoint '{endpoint}': {err}"))
+            RuntimeError::Protocol(format!(
+                "invalid tcp endpoint {}: {err}",
+                redact_hint(endpoint)
+            ))
         })?;
         self.connect(addr).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::advertise::ServedListener;
+
+    #[tokio::test]
+    async fn served_listener_reads_the_bound_socket() {
+        let listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .expect("bind");
+        let served = ServedListener::from_listener(listener.tcp_listener()).expect("served");
+        assert_eq!(served.addr(), listener.local_addr());
+        assert_eq!(served.v6only(), None, "an IPv4 bind has no IPV6_V6ONLY");
     }
 }

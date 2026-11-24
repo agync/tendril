@@ -17,7 +17,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-p2p-iroh = ["dep:futures-util", "dep:iroh", "dep:n0-future", "dep:ring", "dep:url", "dep:wasm-bindgen-futures"]
+p2p-iroh = ["dep:futures-util", "dep:iroh", "dep:n0-future", "dep:ring", "dep:wasm-bindgen-futures"]
 
 [dependencies]
 futures-util = { version = "0.3", optional = true }
@@ -27,7 +27,7 @@ ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"], optional = 
 serde.workspace = true
 serde_json.workspace = true
 tendril-core.workspace = true
-url = { workspace = true, optional = true }
+url.workspace = true
 wasm-bindgen = "=0.2.130"
 wasm-bindgen-futures = { version = "0.4", optional = true }
 zeroize.workspace = true

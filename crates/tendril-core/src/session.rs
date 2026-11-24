@@ -18,7 +18,9 @@ use crate::group::{
 };
 use crate::identity::{EndpointIdentity, RotationRecord};
 use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
+use crate::pairing::{PairingUri, RouteCheck, VerifiedRouteStatement};
 use crate::roster::{PeerState, Roster};
+use crate::routes::{MAX_ROUTE_SEQ, RouteSet};
 use crate::wire::{
     HostHello, InnerFrameType, Intent, Preamble, ResumableFrameReader, SessionHello, WIRE_VERSION,
     decode_inner_frame, encode_frame, encode_inner_frame,
@@ -29,6 +31,9 @@ pub const REKEY_MAX_FRAMES: u64 = 1_048_576;
 
 /// Maximum elapsed session duration in milliseconds before triggering automatic `0x04 REKEY` (`15m`).
 pub const REKEY_MAX_AGE_MS: u64 = 15 * 60 * 1_000;
+
+/// Maximum decoded `0x0C ROUTE_SET` frames queued per session; older entries are dropped.
+pub const MAX_QUEUED_ROUTE_SETS: usize = 4;
 
 /// Canonical `0x07 CLOSE` reason codes.
 pub struct SessionCloseCode;
@@ -86,6 +91,273 @@ pub enum SessionAction {
     },
 }
 
+/// What a Day-2 connect expects of the host it reaches, checked before session `msg3`.
+///
+/// Built only by [`RouteExpectation::for_connect`]. After `HostHello` verifies against the pin
+/// and before the rotation is applied or `msg3` is written, the session initiator checks that
+/// `relay_pub` names the presented signing key, that the recovery URI's `k` and `sh` name the
+/// presented keys (signed or not), and that its route statement, if any, verifies.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RouteExpectation {
+    relay_pub: Option<[u8; 32]>,
+    recovery_uri: Option<PairingUri>,
+}
+
+impl fmt::Debug for RouteExpectation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouteExpectation")
+            .field("relay_pub", &self.relay_pub)
+            .field("recovery_uri", &self.recovery_uri)
+            .finish()
+    }
+}
+
+impl RouteExpectation {
+    /// Builds the expectation for a connect to `target_peer_id`.
+    ///
+    /// Parses `recovery_uri` and rejects it when its `id` names another host. The relay key is
+    /// the one agreed by `operator_relay_key` (an operator `URL#key`), `uri_rp` and the recovery
+    /// URI's `rp`; any two that differ are rejected.
+    pub fn for_connect(
+        target_peer_id: &str,
+        recovery_uri: Option<&str>,
+        operator_relay_key: Option<[u8; 32]>,
+        uri_rp: Option<[u8; 32]>,
+    ) -> Result<Self, CoreError> {
+        let recovery_uri = recovery_uri.map(PairingUri::parse).transpose()?;
+        if let Some(id) = recovery_uri.as_ref().and_then(|u| u.host_id.as_deref())
+            && id != target_peer_id
+        {
+            return Err(CoreError::InvalidPairingUri(
+                "recovery URI is for a different host".into(),
+            ));
+        }
+        let mut relay_pub = None;
+        let keys = [
+            operator_relay_key,
+            uri_rp,
+            recovery_uri.as_ref().and_then(|u| u.relay_pub),
+        ];
+        for key in keys.into_iter().flatten() {
+            match relay_pub {
+                Some(prev) if prev != key => {
+                    return Err(CoreError::InvalidPairingUri(
+                        "operator relay key does not match the URI rp".into(),
+                    ));
+                }
+                _ => relay_pub = Some(key),
+            }
+        }
+        Ok(Self {
+            relay_pub,
+            recovery_uri,
+        })
+    }
+
+    /// The expected Ed25519 relay mailbox key.
+    #[must_use]
+    pub const fn relay_pub(&self) -> Option<&[u8; 32]> {
+        self.relay_pub.as_ref()
+    }
+
+    /// The parsed recovery URI, if any.
+    #[must_use]
+    pub const fn recovery_uri(&self) -> Option<&PairingUri> {
+        self.recovery_uri.as_ref()
+    }
+
+    fn check(
+        &self,
+        presented_static: &[u8; 32],
+        presented_signing: &HybridSigningPublicKey,
+    ) -> Result<Option<VerifiedRouteStatement>, CoreError> {
+        if self
+            .relay_pub
+            .is_some_and(|rp| rp != *presented_signing.ed25519_bytes())
+        {
+            return Err(CoreError::HostKeyUnverified);
+        }
+        let Some(uri) = &self.recovery_uri else {
+            return Ok(None);
+        };
+        if uri.host_static_pub != *presented_static
+            || uri.host_signing_pub_hash != presented_signing.sha256_hash()
+        {
+            return Err(CoreError::HostKeyUnverified);
+        }
+        match uri.verify_route_statement_for_session(presented_signing) {
+            RouteCheck::Verified(statement) => Ok(Some(statement)),
+            RouteCheck::Unsigned(_) => Ok(None),
+            RouteCheck::Invalid => Err(CoreError::InvalidPairingUri(
+                "route statement does not verify".into(),
+            )),
+        }
+    }
+}
+
+/// Result of [`verify_session_host`].
+pub(crate) struct VerifiedSessionHost {
+    pub(crate) rotation_applied: bool,
+    pub(crate) recovery_statement: Option<VerifiedRouteStatement>,
+}
+
+/// Verifies a session `HostHello` against `target_id`'s pin, then `expectation`.
+///
+/// With an expectation the pin is verified on a staged roster, so a failed expectation leaves
+/// `roster` unchanged; a failed pin check keeps its evidence (resolved hash pin, fork
+/// revocation) as without an expectation.
+pub(crate) fn verify_session_host(
+    roster: &mut Roster,
+    target_id: &str,
+    rotation: &[RotationRecord],
+    peer_static: &[u8; 32],
+    host_signing_pub: &HybridSigningPublicKey,
+    negotiated_wire: u8,
+    expectation: Option<&RouteExpectation>,
+) -> Result<VerifiedSessionHost, CoreError> {
+    let Some(expectation) = expectation else {
+        let rotation_applied = verify_host_pin(
+            roster,
+            target_id,
+            rotation,
+            peer_static,
+            host_signing_pub,
+            negotiated_wire,
+        )?;
+        return Ok(VerifiedSessionHost {
+            rotation_applied,
+            recovery_statement: None,
+        });
+    };
+    let mut staged = roster.clone();
+    let rotation_applied = match verify_host_pin(
+        &mut staged,
+        target_id,
+        rotation,
+        peer_static,
+        host_signing_pub,
+        negotiated_wire,
+    ) {
+        Ok(applied) => applied,
+        Err(err) => {
+            *roster = staged;
+            return Err(err);
+        }
+    };
+    let recovery_statement = expectation.check(peer_static, host_signing_pub)?;
+    *roster = staged;
+    Ok(VerifiedSessionHost {
+        rotation_applied,
+        recovery_statement,
+    })
+}
+
+/// Checks `target_id`'s pin against the presented keys and applies a verified rotation.
+///
+/// Returns `true` when a non-empty rotation chain was applied.
+fn verify_host_pin(
+    roster: &mut Roster,
+    target_id: &str,
+    rotation: &[RotationRecord],
+    peer_static: &[u8; 32],
+    host_signing_pub: &HybridSigningPublicKey,
+    negotiated_wire: u8,
+) -> Result<bool, CoreError> {
+    roster.resolve_signing_pin(target_id, host_signing_pub)?;
+    let (pinned_static, pinned_signing) = match roster.get(target_id) {
+        Some(entry) => {
+            if entry.min_wire_version > negotiated_wire {
+                return Err(CoreError::VersionDowngrade {
+                    peer_min: entry.min_wire_version,
+                    negotiated: negotiated_wire,
+                });
+            }
+            match entry.state {
+                PeerState::Pending => {
+                    return Err(CoreError::PeerPending(target_id.to_string()));
+                }
+                PeerState::Revoked => {
+                    return Err(CoreError::PeerRevoked(target_id.to_string()));
+                }
+                PeerState::Active => {
+                    if roster.crl_revokes_entry(entry) {
+                        return Err(CoreError::PeerRevoked(target_id.to_string()));
+                    }
+                    entry.require_complete_pin()?
+                }
+            }
+        }
+        None => return Err(CoreError::HostKeyUnverified),
+    };
+
+    if roster.is_manifest_pinned(target_id) {
+        if *peer_static != pinned_static || *host_signing_pub != pinned_signing {
+            return Err(CoreError::HostKeyUnverified);
+        }
+        return Ok(false);
+    }
+    if rotation.is_empty() && *peer_static == pinned_static && *host_signing_pub != pinned_signing {
+        return Err(CoreError::HostKeyUnverified);
+    }
+    match roster.apply_verified_rotation(target_id, rotation, peer_static, host_signing_pub) {
+        Ok(_) => Ok(!rotation.is_empty()),
+        Err(
+            err @ (CoreError::RotationForkDetected { .. }
+            | CoreError::IncompletePin(_)
+            | CoreError::PeerPending(_)
+            | CoreError::PeerRevoked(_)),
+        ) => Err(err),
+        Err(_) => Err(CoreError::HostKeyUnverified),
+    }
+}
+
+/// Rejects a `SessionHello.route_seq` above `2^53 - 1`.
+pub(crate) fn check_route_seq(route_seq: Option<u64>) -> Result<(), CoreError> {
+    if route_seq.is_some_and(|seq| seq > MAX_ROUTE_SEQ) {
+        return Err(CoreError::ProtocolViolation(
+            "route_seq must be at most 2^53 - 1",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that a responder may send `payload` as `0x0C`: the initiator negotiated route sets and
+/// the payload is a well-formed route set.
+pub(crate) fn check_route_set_send(
+    peer_route_seq: Option<u64>,
+    payload: &[u8],
+) -> Result<(), CoreError> {
+    if peer_route_seq.is_none() {
+        return Err(CoreError::NotReady("peer did not negotiate route sets"));
+    }
+    RouteSet::decode(payload).map(|_| ())
+}
+
+/// Receive pipeline steps 2 to 5 for one decrypted `0x0C` payload: a responder closes, an
+/// initiator that did not negotiate route sets drops it unparsed, otherwise it is decoded
+/// (structural errors close) and queued.
+pub(crate) fn receive_route_set(
+    role: SessionRole,
+    negotiated: bool,
+    payload: &[u8],
+    queue: &mut Vec<RouteSet>,
+) -> Result<(), CoreError> {
+    if role == SessionRole::Responder {
+        return Err(CoreError::InvalidInnerFramePayload(
+            "route set from initiator",
+        ));
+    }
+    if !negotiated {
+        return Ok(());
+    }
+    let set = RouteSet::decode(payload)?;
+    if queue.len() >= MAX_QUEUED_ROUTE_SETS {
+        queue.remove(0);
+    }
+    queue.push(set);
+    Ok(())
+}
+
 enum SessionPhase {
     Init(Box<NoiseHfsHandshake>),
     AwaitMsg2(Box<NoiseHfsHandshake>),
@@ -119,6 +391,12 @@ pub struct SessionMachine {
     last_rekey_outgoing_ms: u64,
     rekey_max_frames: u64,
     rekey_max_age_ms: u64,
+    route_expectation: Option<Box<RouteExpectation>>,
+    local_route_seq: Option<u64>,
+    peer_route_seq: Option<u64>,
+    presented_rotation: Vec<RotationRecord>,
+    verified_recovery: Option<Box<VerifiedRouteStatement>>,
+    route_sets: Vec<RouteSet>,
 }
 
 impl fmt::Debug for SessionMachine {
@@ -164,6 +442,12 @@ impl SessionMachine {
             last_rekey_outgoing_ms: 0,
             rekey_max_frames: REKEY_MAX_FRAMES,
             rekey_max_age_ms: REKEY_MAX_AGE_MS,
+            route_expectation: None,
+            local_route_seq: None,
+            peer_route_seq: None,
+            presented_rotation: Vec::new(),
+            verified_recovery: None,
+            route_sets: Vec::new(),
         })
     }
 
@@ -216,7 +500,79 @@ impl SessionMachine {
             last_rekey_outgoing_ms: 0,
             rekey_max_frames: REKEY_MAX_FRAMES,
             rekey_max_age_ms: REKEY_MAX_AGE_MS,
+            route_expectation: None,
+            local_route_seq: None,
+            peer_route_seq: None,
+            presented_rotation: Vec::new(),
+            verified_recovery: None,
+            route_sets: Vec::new(),
         })
+    }
+
+    /// Sets the route expectation checked against `HostHello` before `msg3` (initiator, before
+    /// [`Self::start`]).
+    pub fn with_route_expectation(
+        mut self,
+        expectation: RouteExpectation,
+    ) -> Result<Self, CoreError> {
+        self.require_unstarted_initiator()?;
+        self.route_expectation = Some(Box::new(expectation));
+        Ok(self)
+    }
+
+    /// Sets `SessionHello.route_seq` (initiator, before [`Self::start`]). `Some` opts in to
+    /// `0x0C ROUTE_SET` frames; `None` keeps the pre-route-set behaviour.
+    pub fn with_route_seq(mut self, route_seq: Option<u64>) -> Result<Self, CoreError> {
+        self.require_unstarted_initiator()?;
+        check_route_seq(route_seq)?;
+        self.local_route_seq = route_seq;
+        Ok(self)
+    }
+
+    fn require_unstarted_initiator(&self) -> Result<(), CoreError> {
+        if self.role != SessionRole::Initiator || !matches!(self.phase, SessionPhase::Init(_)) {
+            return Err(CoreError::NotReady(
+                "route options are set on an initiator before start()",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the `route_seq` the initiator sent in `SessionHello` (responder, after `msg3`).
+    #[must_use]
+    pub const fn peer_route_seq(&self) -> Option<u64> {
+        self.peer_route_seq
+    }
+
+    /// Returns the `HostHello.rotation` records the host presented, kept on every outcome.
+    #[must_use]
+    pub fn presented_rotation(&self) -> &[RotationRecord] {
+        &self.presented_rotation
+    }
+
+    /// Returns the recovery URI's route statement verified under the presented host key.
+    #[must_use]
+    pub fn verified_recovery_statement(&self) -> Option<&VerifiedRouteStatement> {
+        self.verified_recovery.as_deref()
+    }
+
+    /// Drains the decoded, not yet verified `0x0C` route sets received so far.
+    pub fn take_route_sets(&mut self) -> Vec<RouteSet> {
+        std::mem::take(&mut self.route_sets)
+    }
+
+    /// Sends a `0x0C ROUTE_SET` payload (responder only, to an initiator that sent
+    /// `SessionHello.route_seq`). The payload must decode as a [`RouteSet`].
+    pub fn send_route_set(
+        &mut self,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<SessionAction>, CoreError> {
+        if self.role != SessionRole::Responder {
+            return Err(CoreError::NotReady("only a responder sends route sets"));
+        }
+        check_route_set_send(self.peer_route_seq, payload)?;
+        self.send_inner(InnerFrameType::RouteSet, payload, now_ms)
     }
 
     /// Overrides the automatic rekey thresholds (`frames`, `age_ms`).
@@ -638,6 +994,7 @@ impl SessionMachine {
                 if host_hello.host_id.is_empty() || has_control_chars(&host_hello.host_id) {
                     return Err(CoreError::ProtocolViolation("invalid host_id in HostHello"));
                 }
+                self.presented_rotation.clone_from(&host_hello.rotation);
                 let host_signing_pub = HybridSigningPublicKey::from_b64url(&host_hello.signing_pub)
                     .map_err(|_| {
                         CoreError::ProtocolViolation("invalid signing_pub in HostHello")
@@ -657,71 +1014,26 @@ impl SessionMachine {
                     return Err(CoreError::HostKeyUnverified);
                 }
 
-                roster.resolve_signing_pin(target_id, &host_signing_pub)?;
-                let (pinned_static, pinned_signing) = match roster.get(target_id) {
-                    Some(entry) => {
-                        if entry.min_wire_version > WIRE_VERSION {
-                            return Err(CoreError::VersionDowngrade {
-                                peer_min: entry.min_wire_version,
-                                negotiated: WIRE_VERSION,
-                            });
-                        }
-                        match entry.state {
-                            PeerState::Pending => {
-                                return Err(CoreError::PeerPending(target_id.to_string()));
-                            }
-                            PeerState::Revoked => {
-                                return Err(CoreError::PeerRevoked(target_id.to_string()));
-                            }
-                            PeerState::Active => {
-                                if roster.crl_revokes_entry(entry) {
-                                    return Err(CoreError::PeerRevoked(target_id.to_string()));
-                                }
-                                entry.require_complete_pin()?
-                            }
-                        }
-                    }
-                    None => return Err(CoreError::HostKeyUnverified),
-                };
-
-                if roster.is_manifest_pinned(target_id) {
-                    if peer_static != pinned_static || host_signing_pub != pinned_signing {
-                        return Err(CoreError::HostKeyUnverified);
-                    }
-                } else {
-                    if host_hello.rotation.is_empty()
-                        && peer_static == pinned_static
-                        && host_signing_pub != pinned_signing
-                    {
-                        return Err(CoreError::HostKeyUnverified);
-                    }
-
-                    match roster.apply_verified_rotation(
-                        target_id,
-                        &host_hello.rotation,
-                        &peer_static,
-                        &host_signing_pub,
-                    ) {
-                        Ok(_) => {
-                            if !host_hello.rotation.is_empty() {
-                                self.applied_rotation = host_hello.rotation;
-                            }
-                        }
-                        Err(
-                            err @ (CoreError::RotationForkDetected { .. }
-                            | CoreError::IncompletePin(_)
-                            | CoreError::PeerPending(_)
-                            | CoreError::PeerRevoked(_)),
-                        ) => return Err(err),
-                        Err(_) => return Err(CoreError::HostKeyUnverified),
-                    }
+                let verified = verify_session_host(
+                    roster,
+                    target_id,
+                    &host_hello.rotation,
+                    &peer_static,
+                    &host_signing_pub,
+                    WIRE_VERSION,
+                    self.route_expectation.as_deref(),
+                )?;
+                if verified.rotation_applied {
+                    self.applied_rotation = host_hello.rotation;
                 }
+                self.verified_recovery = verified.recovery_statement.map(Box::new);
 
                 let hello = SessionHello {
                     device_id: self.local_device_id.clone(),
                     grant: self.initial_grant.clone(),
                     crl_seq: self.initial_crl_seq,
                     groups: self.initial_groups.clone(),
+                    route_seq: self.local_route_seq,
                 };
                 let hello_json = Zeroizing::new(
                     serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -813,6 +1125,7 @@ impl SessionMachine {
 
                 self.peer_crl_seq = hello.crl_seq;
                 self.peer_groups = hello.groups;
+                self.peer_route_seq = hello.route_seq;
                 self.peer_device_id = Some(canonical_peer_id.clone());
                 self.peer_static_pub = Some(peer_static);
                 self.last_rekey_outgoing_ms = now_ms;
@@ -901,6 +1214,12 @@ impl SessionMachine {
                         self.phase = SessionPhase::Closed;
                         actions.push(SessionAction::CloseTransport { code, reason });
                     }
+                    InnerFrameType::RouteSet => receive_route_set(
+                        self.role,
+                        self.local_route_seq.is_some(),
+                        payload,
+                        &mut self.route_sets,
+                    )?,
                     InnerFrameType::Padding | InnerFrameType::Padded => {
                         return Err(CoreError::UnknownInnerFrameType(kind as u8));
                     }
@@ -1071,6 +1390,10 @@ mod tests {
     use crate::crypto::{SigningKeypair, StaticKeypair};
 
     fn established_pair() -> (SessionMachine, SessionMachine) {
+        established_pair_with(None)
+    }
+
+    fn established_pair_with(route_seq: Option<u64>) -> (SessionMachine, SessionMachine) {
         let host = EndpointIdentity::from_keys(
             StaticKeypair::from_scalar([0x51; 32]),
             SigningKeypair::from_seed([0x52; 32]),
@@ -1105,8 +1428,10 @@ mod tests {
             )
             .unwrap();
 
-        let mut init =
-            SessionMachine::new_initiator(&cli, host.host_id(), None, Some(7), None).unwrap();
+        let mut init = SessionMachine::new_initiator(&cli, host.host_id(), None, Some(7), None)
+            .unwrap()
+            .with_route_seq(route_seq)
+            .unwrap();
         let mut resp = SessionMachine::new_responder(&host, None).unwrap();
 
         let mut m1 = Vec::new();
@@ -1136,6 +1461,123 @@ mod tests {
         resp.feed_bytes(&m3, 1_795_564_800, 3, &mut host_roster)
             .unwrap();
         (init, resp)
+    }
+
+    fn host_identity() -> EndpointIdentity {
+        EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x51; 32]),
+            SigningKeypair::from_seed([0x52; 32]),
+        )
+    }
+
+    fn route_set_payload(seq: u64) -> Vec<u8> {
+        RouteSet::sign(
+            &host_identity(),
+            seq,
+            1_795_564_800,
+            vec!["direct:192.168.1.20:9100".into()],
+        )
+        .unwrap()
+        .encode()
+    }
+
+    fn malformed_route_sets() -> [Vec<u8>; 2] {
+        let mut trailing = route_set_payload(1);
+        trailing.push(0);
+        [vec![0; crate::routes::MIN_ROUTE_SET_PAYLOAD - 1], trailing]
+    }
+
+    /// Encrypts a raw inner frame from `m`, bypassing the send-side checks.
+    fn raw_frame(m: &mut SessionMachine, kind: InnerFrameType, payload: &[u8]) -> Vec<u8> {
+        let SessionPhase::Transport(ref mut tx) = m.phase else {
+            panic!("not established");
+        };
+        encrypt_inner(tx, kind, payload).unwrap()
+    }
+
+    fn feed(m: &mut SessionMachine, bytes: &[u8]) -> Result<Vec<SessionAction>, CoreError> {
+        m.feed_bytes(bytes, 1_795_564_800, 10, &mut Roster::new())
+    }
+
+    #[test]
+    fn route_set_negotiation_send_and_queue() {
+        let (mut init, mut resp) = established_pair_with(Some(3));
+        assert_eq!(resp.peer_route_seq(), Some(3));
+        for seq in 1..=5 {
+            let mut wire = Vec::new();
+            for a in resp.send_route_set(&route_set_payload(seq), 10).unwrap() {
+                if let SessionAction::WriteBytes(b) = a {
+                    wire.extend_from_slice(&b);
+                }
+            }
+            assert_eq!(feed(&mut init, &wire), Ok(vec![]));
+        }
+        let seqs: Vec<u64> = init.take_route_sets().iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![2, 3, 4, 5]);
+        assert!(init.take_route_sets().is_empty());
+        assert!(init.is_established());
+        assert!(matches!(
+            init.send_route_set(&route_set_payload(1), 10),
+            Err(CoreError::NotReady(_))
+        ));
+        assert_eq!(
+            resp.send_route_set(&[0; 8], 10),
+            Err(CoreError::InvalidInnerFramePayload("route set"))
+        );
+        assert!(resp.is_established());
+
+        let (_init, mut plain_resp) = established_pair();
+        assert_eq!(plain_resp.peer_route_seq(), None);
+        assert!(matches!(
+            plain_resp.send_route_set(&route_set_payload(1), 10),
+            Err(CoreError::NotReady(_))
+        ));
+    }
+
+    #[test]
+    fn negotiated_malformed_route_set_closes() {
+        for payload in malformed_route_sets() {
+            let (mut init, mut resp) = established_pair_with(Some(0));
+            let wire = raw_frame(&mut resp, InnerFrameType::RouteSet, &payload);
+            assert_eq!(
+                feed(&mut init, &wire),
+                Err(CoreError::InvalidInnerFramePayload("route set"))
+            );
+            assert!(init.is_closed());
+        }
+    }
+
+    #[test]
+    fn unnegotiated_initiator_drops_route_sets_unparsed() {
+        let (mut init, mut resp) = established_pair();
+        let [short, trailing] = malformed_route_sets();
+        for payload in [route_set_payload(1), short, trailing] {
+            let wire = raw_frame(&mut resp, InnerFrameType::RouteSet, &payload);
+            assert_eq!(feed(&mut init, &wire), Ok(vec![]));
+            assert!(init.is_established());
+        }
+        assert!(init.take_route_sets().is_empty());
+        let wire = raw_frame(&mut resp, InnerFrameType::Data, b"open");
+        assert_eq!(
+            feed(&mut init, &wire),
+            Ok(vec![SessionAction::AppData(b"open".to_vec())])
+        );
+    }
+
+    #[test]
+    fn responder_closes_on_route_set() {
+        let [short, _] = malformed_route_sets();
+        for payload in [route_set_payload(1), short] {
+            let (mut init, mut resp) = established_pair_with(Some(0));
+            let wire = raw_frame(&mut init, InnerFrameType::RouteSet, &payload);
+            assert_eq!(
+                feed(&mut resp, &wire),
+                Err(CoreError::InvalidInnerFramePayload(
+                    "route set from initiator"
+                ))
+            );
+            assert!(resp.is_closed());
+        }
     }
 
     #[test]

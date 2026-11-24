@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use tendril_core::crypto::{b64url_decode_array, b64url_encode, random_bytes};
 use tendril_core::policy::ProviderId;
 use tendril_core::relay_auth::{
-    RelayAuthProof, RelayAuthSecret, RelayTicket, compute_relay_auth_hmac_b64,
+    RelayAuthProof, RelayAuthSecret, RelayTicket, compute_relay_auth_hmac_b64, origin_allowed,
 };
 use tendril_relay::protocol::{
     MAX_RELAY_FRAME_LEN, RelayClientMsg, RelayServerMsg, sign_relay_accept, sign_relay_register,
@@ -27,8 +27,9 @@ use tokio_tungstenite::tungstenite::Message;
 use super::{
     WsBinaryPathStream, connect_ws_resolved, ensure_rustls_ring_provider, ws_binary_config,
 };
-use crate::error::RuntimeError;
+use crate::error::{RelayOffline, RuntimeError};
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
+use crate::redact::{redact_hint, redact_url_str};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_ACCEPTS: usize = 16;
@@ -144,7 +145,10 @@ fn extract_url_host(relay_url: &str) -> Result<String, RuntimeError> {
         .strip_prefix("wss://")
         .or_else(|| relay_url.strip_prefix("ws://"))
         .ok_or_else(|| {
-            RuntimeError::Protocol(format!("relay URL must use ws:// or wss://: '{relay_url}'"))
+            RuntimeError::Protocol(format!(
+                "relay URL must use ws:// or wss://: {}",
+                redact_url_str(relay_url)
+            ))
         })?;
     let authority = after_scheme
         .split(['/', '?', '#'])
@@ -160,7 +164,8 @@ fn extract_url_host(relay_url: &str) -> Result<String, RuntimeError> {
     };
     if host.is_empty() {
         return Err(RuntimeError::Protocol(format!(
-            "missing host in relay URL: '{relay_url}'"
+            "missing host in relay URL: {}",
+            redact_url_str(relay_url)
         )));
     }
     Ok(host.to_owned())
@@ -488,6 +493,9 @@ pub struct RelayDialer {
     write_timeout: Duration,
     allow_insecure_ws: bool,
     auth: RelayClientAuth,
+    /// No admission material may be presented (none configured, or withheld by the origin
+    /// gate): a relay demanding dial auth fails fast with `relay_auth_unconfigured`.
+    auth_withheld: bool,
 }
 
 impl Default for RelayDialer {
@@ -505,6 +513,7 @@ impl RelayDialer {
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             allow_insecure_ws: false,
             auth: RelayClientAuth::None,
+            auth_withheld: false,
         }
     }
 
@@ -545,6 +554,16 @@ impl RelayDialer {
         let parsed = super::validate_ws_url(relay_url, self.allow_insecure_ws)?;
         let (mut ws, host, nonce, auth_required) =
             connect_and_verify_challenge(parsed.as_str(), self.expected_host.as_deref()).await?;
+        if self.auth_withheld
+            && auth_required
+                .as_deref()
+                .is_some_and(|reqs| reqs.iter().any(|r| r == "dial"))
+        {
+            return Err(RuntimeError::Protocol(format!(
+                "relay_auth_unconfigured: relay '{host}' requires admission credentials and its \
+                 origin is not in relay_auth_origins"
+            )));
+        }
         let conn_id_bytes = random_bytes::<16>()?;
         let conn_id_b64 = b64url_encode(&conn_id_bytes);
         let target_b64 = b64url_encode(target_signing_pub);
@@ -571,6 +590,9 @@ impl RelayDialer {
             RelayServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => {
                 Ok(Box::new(RelayStream::new(ws, self.write_timeout)))
             }
+            RelayServerMsg::Error { code } if code == "offline" => {
+                Err(RuntimeError::RelayOffline(RelayOffline::V1Dial))
+            }
             RelayServerMsg::Error { code } => Err(RuntimeError::Protocol(format!(
                 "relay dial rejected: {code}"
             ))),
@@ -590,11 +612,126 @@ impl PathDialer for RelayDialer {
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
         let (url, target_b64) = endpoint.split_once('#').ok_or_else(|| {
             RuntimeError::Protocol(format!(
-                "relay endpoint must include '#<b64url_signing_pub>': '{endpoint}'"
+                "relay endpoint must include #<b64url_signing_pub>: {}",
+                redact_hint(endpoint)
             ))
         })?;
         let target_pub = b64url_decode_array::<32>(target_b64)?;
         self.connect(url, &target_pub).await
+    }
+}
+
+/// Admission material for a pairing or Day-2 relay dial to `dial_url`.
+///
+/// Returns `auth` only when the URL's origin `(scheme, host, port)` is byte-equal to one of
+/// `origins` ([`origin_allowed`]) or `operator_endpoint` is set (the explicit operator endpoint
+/// of this call). Origins learned from a pairing URI, a stored `signed` or `committed` route or
+/// an announcement get [`RelayClientAuth::None`].
+#[must_use]
+pub fn gate_relay_auth<S: AsRef<str>>(
+    auth: &RelayClientAuth,
+    dial_url: &str,
+    origins: &[S],
+    operator_endpoint: bool,
+) -> RelayClientAuth {
+    if operator_endpoint || origin_allowed(dial_url, origins) {
+        auth.clone()
+    } else {
+        RelayClientAuth::None
+    }
+}
+
+/// Relay adapter for pairing and Day-2 candidates: dials a fragment-free `/v1/relay` hint to a
+/// target mailbox key that never comes from the hint, and attaches admission material only
+/// through [`gate_relay_auth`] on the dialed URL.
+///
+/// A hint that carries `#` is rejected. When no admission material may be presented and the
+/// relay demands dial authentication, the dial fails with `relay_auth_unconfigured`.
+#[derive(Debug, Clone)]
+pub struct RelayHintDialer {
+    target_key: [u8; 32],
+    auth: RelayClientAuth,
+    origins: Vec<String>,
+    operator_endpoint: bool,
+    expected_host: Option<String>,
+    write_timeout: Duration,
+}
+
+impl RelayHintDialer {
+    /// Adapter dialing the mailbox of `target_key` (the Ed25519 component of the host key).
+    #[must_use]
+    pub fn new(target_key: [u8; 32]) -> Self {
+        Self {
+            target_key,
+            auth: RelayClientAuth::None,
+            origins: Vec::new(),
+            operator_endpoint: false,
+            expected_host: None,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+        }
+    }
+
+    /// Configured admission material and the origins allowed to receive it.
+    #[must_use]
+    pub fn with_admission(mut self, auth: RelayClientAuth, origins: Vec<String>) -> Self {
+        self.auth = auth;
+        self.origins = origins;
+        self
+    }
+
+    /// Marks the dial target as the explicit operator endpoint of this call.
+    #[must_use]
+    pub fn with_operator_endpoint(mut self, operator: bool) -> Self {
+        self.operator_endpoint = operator;
+        self
+    }
+
+    /// Requires the server `Challenge.host` field to match `host`.
+    #[must_use]
+    pub fn with_expected_host(mut self, host: Option<String>) -> Self {
+        self.expected_host = host;
+        self
+    }
+
+    /// Overrides the per-write backpressure timeout.
+    #[must_use]
+    pub fn with_write_timeout(mut self, write_timeout: Duration) -> Self {
+        self.write_timeout = write_timeout;
+        self
+    }
+
+    /// `true` when a dial to `dial_url` would carry admission material.
+    #[must_use]
+    pub fn attaches_credentials(&self, dial_url: &str) -> bool {
+        !matches!(self.gated_auth(dial_url), RelayClientAuth::None)
+    }
+
+    fn gated_auth(&self, dial_url: &str) -> RelayClientAuth {
+        gate_relay_auth(&self.auth, dial_url, &self.origins, self.operator_endpoint)
+    }
+}
+
+#[async_trait]
+impl PathDialer for RelayHintDialer {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::Relay
+    }
+
+    async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+        if endpoint.contains('#') {
+            return Err(RuntimeError::Protocol(format!(
+                "invalid: relay hint must not carry a fragment: {}",
+                redact_hint(endpoint)
+            )));
+        }
+        let auth = self.gated_auth(endpoint);
+        let mut dialer = RelayDialer::new().with_write_timeout(self.write_timeout);
+        dialer.auth_withheld = matches!(auth, RelayClientAuth::None);
+        dialer.auth = auth;
+        if let Some(host) = &self.expected_host {
+            dialer = dialer.with_expected_host(host.clone());
+        }
+        dialer.connect(endpoint, &self.target_key).await
     }
 }
 

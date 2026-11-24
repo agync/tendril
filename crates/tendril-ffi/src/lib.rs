@@ -24,29 +24,40 @@ use tendril_core::identity::{
     EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
 };
 use tendril_core::pairing::{
-    EnrollmentPolicy, PairAction, PairOutcome, PairingCodeKind, PairingConfig, PairingInitiator,
-    PairingManager, PinnedHost, mint_enrollment_token,
+    DroppedHint, EnrollmentPolicy, IssueOptions, PairAction, PairOutcome, PairingCodeKind,
+    PairingConfig, PairingInitiator, PairingManager, PairingUri, PersistOpts, PinnedHost,
+    RoutePolicy, mint_enrollment_token,
 };
-use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket};
-use tendril_core::roster::{AnchorState, PeerState, Roster};
+use tendril_core::policy::{CandidateEndpoint, ProviderId};
+use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket, origin_allowed};
+use tendril_core::roster::{AnchorState, PeerState, Roster, RouteMeta, RouteSource, StoredRoute};
 use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
+use tendril_runtime::announce::unix_ms;
+use tendril_runtime::driver::{AttemptError, ConnectOpts, PairPolicyOptions};
+use tendril_runtime::providers::SkippedHint;
+use tendril_runtime::providers::hints::{
+    HintDialerConfig, HintDialers, RouteApplyOpts, apply_signed_route_uri, clear_peer_routes_in,
+    peer_routes_in, set_peer_routes_in,
+};
+use tendril_runtime::redact::{redact_error, redact_hint, redact_json_error, redact_text};
 use tendril_runtime::{
-    BrokerDialer, ConcurrentSession, ConcurrentV2Session, DEFAULT_PRE_AUTH_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, GroupEvent, GroupFrameKind,
-    GroupFrameOutcome, GroupHub, GroupPool, GroupPoolConfig, HttpWakeProvider, InboundQueue,
-    InboundRouter, InboundSession, LocalDialer, MAX_OUTER_FRAME_LEN, OverlayDialer, PathDialer,
-    PathListener, PathStream, PreAuthRateLimiter, RelayClientAuth, RelayDialer, RelayListener,
-    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError, SessionDriver,
-    SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeDialOptions,
-    WakeSecret, WakeTarget, deserialize_identity_json, dial_endpoint_with_auth,
-    drive_m2m_enroll_initiator_with_floor, drive_pair_responder_with_policy,
-    drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_timeout,
-    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
-    group_add_member, group_create, group_ingest_manifest, group_remove_member,
-    handle_session_group_frame, pairing_path_kind_for_provider, pinned_pairing_floor, recv_routed,
-    serialize_identity_json, wake_and_dial_v2,
+    AddressSource, AdvertiseInputs, AdvertiseMode, BrokerDialer, ConcurrentSession,
+    ConcurrentV2Session, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer,
+    DirectListener, GroupEvent, GroupFrameKind, GroupFrameOutcome, GroupHub, GroupPool,
+    GroupPoolConfig, HttpWakeProvider, InboundQueue, InboundRouter, InboundSession, LastRouteSet,
+    LocalDialer, MAX_OUTER_FRAME_LEN, NetworkSnapshot, OverlayDialer, PathDialer, PathListener,
+    PathStream, PreAuthRateLimiter, RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer,
+    RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer, RouteSetSink,
+    RuntimeError, ServedListener, SessionDriver, SessionEvent, StateStore, V2ResponderState,
+    V2SessionDriver, WakeAdapterKind, WakeProvider, WakeSecret, WakeTarget,
+    deserialize_identity_json, dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
+    drive_pair_responder_with_policy, drive_pair_responder_with_store,
+    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
+    drive_v2_pake_pair_responder_with_store, group_add_member, group_create, group_ingest_manifest,
+    group_remove_member, handle_session_group_frame, pairing_path_kind_for_provider,
+    pinned_pairing_floor, recv_routed, serialize_identity_json,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{
@@ -72,11 +83,20 @@ thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
+/// Stores `msg` for [`tendril_last_error`] in redacted form: the shared runtime scrubber
+/// ([`redact_text`]) keeps only `scheme://host[:port]` of a URL, masks pairing codes and redacts
+/// a quoted value to the end of its line, so raw caller input never reaches a host app's logs.
 fn set_last_error(msg: impl Into<String>) {
-    let s = msg.into();
+    let s = redact_text(&msg.into());
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = s;
     });
+}
+
+/// `invalid <name>: invalid JSON (<category>) at line L column C`. A serde message can quote a
+/// field name or value (a code, a URI), so only its category and position are reported.
+fn json_error(name: &str, err: &serde_json::Error) -> String {
+    format!("invalid {name}: {}", redact_json_error(err))
 }
 
 fn clear_last_error() {
@@ -212,41 +232,42 @@ fn lock_roster(roster: &StdMutex<Roster>) -> std::sync::MutexGuard<'_, Roster> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Applies `f` to the roster. The caller must already hold `store_lock` when `store` is `Some`.
+/// Every CRL `roster` holds, keyed by issuer (paired peers and trust anchors).
+fn held_crls(roster: &Roster) -> Vec<(String, RevocationList)> {
+    roster
+        .entries()
+        .map(|(id, _)| id)
+        .chain(roster.trust_anchors().map(|(id, _)| id))
+        .filter_map(|id| roster.crl(id).map(|crl| (id.clone(), crl.clone())))
+        .collect()
+}
+
+/// Applies `f` to the roster as one [`RosterAccess::update`] transaction; nothing is written
+/// when `f` fails. With a store the caller must already hold the endpoint's `store_lock`.
 ///
-/// Lock order is `store_lock` then `roster`. With a store, `f` runs transactionally on the
-/// latest on-disk roster and the committed roster replaces the in-memory copy before `roster`
-/// is released.
-fn commit_roster_update<T, F>(
-    store: Option<&Arc<StateStore>>,
-    roster: &StdMutex<Roster>,
-    f: F,
-) -> Result<T, (i32, String)>
+/// Lock order (`tendril_runtime::announce` module docs): `store_lock`, then the roster file
+/// lock, then the in-memory roster mutex, which is never held while `f` runs or across store
+/// I/O. `f` runs on the latest on-disk roster with the CRLs only the in-memory copy holds (accepted
+/// by a session, not yet persisted) merged in, and the committed roster, again with any such
+/// CRLs, replaces the in-memory copy.
+fn commit_roster_update<T, F>(access: &RosterAccess, f: F) -> Result<T, (i32, String)>
 where
     F: FnOnce(&mut Roster) -> Result<T, (i32, String)>,
 {
-    let mut guard = lock_roster(roster);
-    let Some(store) = store else {
-        return f(&mut guard);
-    };
     let mut failure: Option<(i32, String)> = None;
-    let res = store.update_roster_with_state(|disk| {
-        f(disk).map_err(|e| {
-            failure = Some(e);
-            RuntimeError::Protocol(String::new())
+    access
+        .update(|roster| {
+            f(roster).map_err(|e| {
+                failure = Some(e);
+                RuntimeError::Protocol(String::new())
+            })
         })
-    });
-    match res {
-        Ok((out, committed, _stamp)) => {
-            *guard = committed;
-            Ok(out)
-        }
-        Err(e) => Err(failure.unwrap_or((TENDRIL_ERR_INTERNAL, e.to_string()))),
-    }
+        .map_err(|e| failure.unwrap_or((TENDRIL_ERR_INTERNAL, e.to_string())))
 }
 
 /// Reloads the on-disk roster into `roster` under `store_lock` (lock order `store_lock` then
-/// `roster`) without taking an exclusive write lock or rewriting `roster.json`.
+/// `roster`) without taking an exclusive write lock or rewriting `roster.json`. CRLs only the
+/// in-memory copy holds are kept (merged into the reloaded copy).
 fn load_roster_from_store_locked(
     store: Option<&Arc<StateStore>>,
     store_lock: &AsyncMutex<()>,
@@ -258,8 +279,14 @@ fn load_roster_from_store_locked(
     };
     let _store_guard = rt.block_on(store_lock.lock());
     let disk = store.load_roster().map_err(|e| e.to_string())?;
-    *lock_roster(roster) = disk;
+    replace_keeping_crls(&mut lock_roster(roster), disk);
     Ok(())
+}
+
+/// Replaces the in-memory roster with `disk`, keeping the CRLs only the in-memory copy holds.
+fn replace_keeping_crls(memory: &mut Roster, mut disk: Roster) {
+    disk.merge_crl_evidence(&held_crls(memory));
+    *memory = disk;
 }
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -294,6 +321,16 @@ struct TransportConfigInput {
     wake_max_attempts: Option<usize>,
     #[zeroize(skip)]
     wake_timeout_ms: Option<u64>,
+    #[zeroize(skip)]
+    advertised_endpoints: Option<Vec<String>>,
+    #[zeroize(skip)]
+    relay_auth_origins: Option<Vec<String>>,
+    #[zeroize(skip)]
+    advertise: Option<AdvertiseMode>,
+    #[zeroize(skip)]
+    route_policy: Option<RoutePolicy>,
+    #[zeroize(skip)]
+    sign_routes: Option<bool>,
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -335,6 +372,14 @@ struct EndpointTransportConfig {
     #[cfg(feature = "p2p-iroh")]
     p2p_relay_auth: Option<P2pRelayAuth>,
     wake: Option<WakeTransportConfig>,
+    /// Developer-listed hints added to the announced route set.
+    advertised_endpoints: Vec<String>,
+    /// Relay origins that may receive admission material.
+    relay_auth_origins: Vec<String>,
+    advertise: AdvertiseMode,
+    route_policy: RoutePolicy,
+    /// `None` means the default, signed issuance.
+    sign_routes: Option<bool>,
 }
 
 impl fmt::Debug for EndpointTransportConfig {
@@ -352,7 +397,13 @@ impl fmt::Debug for EndpointTransportConfig {
                 .field("p2p_allow_private_addrs", &self.p2p_allow_private_addrs)
                 .field("p2p_relay_auth", &self.p2p_relay_auth);
         }
-        dbg.field("wake", &self.wake).finish()
+        dbg.field("wake", &self.wake)
+            .field("advertised_endpoints", &self.advertised_endpoints)
+            .field("relay_auth_origins", &self.relay_auth_origins)
+            .field("advertise", &self.advertise)
+            .field("route_policy", &self.route_policy)
+            .field("sign_routes", &self.sign_routes)
+            .finish()
     }
 }
 
@@ -541,7 +592,27 @@ impl EndpointTransportConfig {
             None
         };
 
+        let relay_auth_origins = input.relay_auth_origins.take().unwrap_or_default();
+        if let Some(index) = relay_auth_origins
+            .iter()
+            .position(|o| !origin_allowed(o, std::slice::from_ref(o)))
+        {
+            // The entry itself is never echoed: a pasted URL may carry credentials.
+            return Err((
+                TENDRIL_ERR_INVALID_ARG,
+                format!(
+                    "invalid relay_auth_origins entry at index {index}: expected an origin \
+                     (ws, wss, http or https scheme, host and optional port)"
+                ),
+            ));
+        }
+
         Ok(Self {
+            advertised_endpoints: input.advertised_endpoints.take().unwrap_or_default(),
+            relay_auth_origins,
+            advertise: input.advertise.unwrap_or_default(),
+            route_policy: input.route_policy.unwrap_or_default(),
+            sign_routes: input.sign_routes,
             relay_auth,
             #[cfg(feature = "p2p-iroh")]
             p2p_relay_mode,
@@ -555,6 +626,46 @@ impl EndpointTransportConfig {
             p2p_relay_auth,
             wake,
         })
+    }
+
+    fn sign_routes(&self) -> bool {
+        self.sign_routes.unwrap_or(true)
+    }
+
+    /// The runtime pairing and Day-2 dialer set. `relay_host` is the expected relay host of an
+    /// explicit operator endpoint (relay challenge host, or Iroh relay mode for `iroh://`).
+    fn hint_dialers(
+        &self,
+        operator_endpoint: Option<&str>,
+        relay_host: Option<&str>,
+    ) -> Result<Arc<HintDialers>, RuntimeError> {
+        let relay_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
+        let iroh_operator = operator_endpoint.is_some_and(|e| e.starts_with("iroh://"));
+        #[cfg(not(feature = "p2p-iroh"))]
+        let _ = iroh_operator;
+        #[cfg(feature = "p2p-iroh")]
+        let p2p_relay_mode = if let Some(ref m) = self.p2p_relay_mode {
+            Some(m.clone())
+        } else if let Some(spec) = relay_host.filter(|_| iroh_operator) {
+            Some(parse_p2p_relay_mode(Some(spec))?)
+        } else if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") {
+            Some(P2pRelayMode::Disabled)
+        } else {
+            None
+        };
+        let config = HintDialerConfig {
+            relay_auth: self.relay_auth.clone(),
+            relay_expected_host: relay_host.filter(|_| !iroh_operator).map(ToOwned::to_owned),
+            #[cfg(feature = "p2p-iroh")]
+            p2p_relay_mode,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_relay_auth: self.p2p_relay_auth.clone(),
+            #[cfg(feature = "p2p-iroh")]
+            p2p_allow_private_addrs: self.p2p_allow_private_addrs.unwrap_or(false),
+            #[cfg(feature = "p2p-iroh")]
+            p2p_pkarr: self.p2p_pkarr,
+        };
+        Ok(Arc::new(HintDialers::new(config)))
     }
 
     #[cfg(feature = "p2p-iroh")]
@@ -679,13 +790,13 @@ fn lookup_v2_mailbox_secret_for_target(
     let entry = roster.get(target_host_id).ok_or_else(|| {
         (
             TENDRIL_ERR_NOT_FOUND,
-            format!("target '{target_host_id}' not found in roster"),
+            format!("target {target_host_id} not found in roster"),
         )
     })?;
     if entry.state == PeerState::Revoked {
         return Err((
             TENDRIL_ERR_PROTOCOL,
-            format!("target '{target_host_id}' is revoked"),
+            format!("target {target_host_id} is revoked"),
         ));
     }
     entry
@@ -695,7 +806,7 @@ fn lookup_v2_mailbox_secret_for_target(
         .ok_or_else(|| {
             (
                 TENDRIL_ERR_PROTOCOL,
-                format!("target '{target_host_id}' has no v2 mailbox_secret"),
+                format!("target {target_host_id} has no v2 mailbox_secret"),
             )
         })
 }
@@ -782,53 +893,6 @@ async fn dial_endpoint_v2_with_options(
         return dialer.dial(endpoint).await;
     }
     dial_endpoint_with_auth(endpoint, normalized_host, cfg.relay_auth.clone()).await
-}
-
-async fn build_dialer_with_options(
-    endpoint: &str,
-    relay_host: Option<&str>,
-    cfg: &EndpointTransportConfig,
-    v2_mailbox_secret: Option<[u8; 32]>,
-) -> Result<Box<dyn PathDialer>, RuntimeError> {
-    let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
-    if endpoint.starts_with("iroh://") {
-        #[cfg(feature = "p2p-iroh")]
-        {
-            let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host)?;
-            return Ok(Box::new(P2pDialer::bind_with_options(opts).await?));
-        }
-        #[cfg(not(feature = "p2p-iroh"))]
-        {
-            let _ = normalized_host;
-            return Err(RuntimeError::Protocol(
-                "p2p-iroh feature is not enabled in tendril-ffi".to_owned(),
-            ));
-        }
-    }
-    if endpoint.starts_with("overlay://") {
-        return Ok(Box::new(OverlayDialer::new()));
-    }
-    if endpoint.starts_with("broker+ws://") || endpoint.starts_with("broker+wss://") {
-        return Ok(Box::new(BrokerDialer::new()));
-    }
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        if let Some(secret) = v2_mailbox_secret {
-            let mut dialer = RelayV2Dialer::new(secret).with_auth(cfg.relay_auth.clone());
-            if let Some(host) = normalized_host {
-                dialer = dialer.with_expected_host(host);
-            }
-            return Ok(Box::new(dialer));
-        }
-        let mut dialer = RelayDialer::new().with_auth(cfg.relay_auth.clone());
-        if let Some(host) = normalized_host {
-            dialer = dialer.with_expected_host(host);
-        }
-        return Ok(Box::new(dialer));
-    }
-    if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
-        return Ok(Box::new(LocalDialer::new()));
-    }
-    Ok(Box::new(DirectDialer::new()))
 }
 
 async fn drive_v1_pair_initiator_with_roster_floors(
@@ -921,9 +985,130 @@ pub struct TendrilEndpoint {
     /// `/v1/relay` URLs this endpoint registered its identity mailbox on through
     /// `tendril_endpoint_serve_relay`; the group hub never registers a pool there.
     served_v1_relays: StdMutex<Vec<String>>,
+    /// Roster handle shared by pairing, Day-2 connects, route ingest and the route setter; it
+    /// wraps `store` and `roster` and records each peer's last route set.
+    route_access: RosterAccess,
+    /// Keeps paired clients' `signed` routes current.
+    announcer: Arc<RouteAnnouncer>,
+    /// The announcer's timer task, aborted by `tendril_endpoint_close`.
+    announcer_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set once the endpoint serves a listener, issues a pairing URI or refreshes its routes;
+    /// from then on advertising input changes publish and the announcer timer runs.
+    hosting: AtomicBool,
+    /// Endpoint strings of every listener served through this handle, including unspecified
+    /// binds (used only by auto enumeration).
+    served_endpoints: StdMutex<Vec<String>>,
+    /// Pairing-capable TCP listeners (`tendril_endpoint_serve_direct`) for auto enumeration.
+    served_listeners: StdMutex<Vec<ServedListener>>,
 }
 
 impl TendrilEndpoint {
+    fn advertise_inputs(&self) -> AdvertiseInputs {
+        let cfg = self.snapshot_transport_cfg();
+        AdvertiseInputs {
+            mode: cfg.advertise,
+            served_endpoints: self
+                .served_endpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            listeners: self
+                .served_listeners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            advertised_endpoints: cfg.advertised_endpoints.clone(),
+        }
+    }
+
+    /// Marks the endpoint as a host and starts the announcer timer (scheduled sends, the empty
+    /// snapshot debounce and the periodic re-enumeration) once.
+    fn start_hosting(&self) {
+        if !self.hosting.swap(true, Ordering::AcqRel) {
+            let _guard = self.rt.enter();
+            let task = self
+                .announcer
+                .spawn(Some(tendril_runtime::DEFAULT_ROUTE_REFRESH_INTERVAL));
+            *self
+                .announcer_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+        }
+    }
+
+    /// Hands the current advertising inputs to the announcer and, on a hosting endpoint,
+    /// publishes the recomputed set. A failed publish (for example an exhausted sequence) is
+    /// reported by the next issuance or refresh.
+    fn sync_advertising(&self) {
+        self.announcer.set_inputs(self.advertise_inputs());
+        if self.hosting.load(Ordering::Acquire) {
+            let _ = self.announcer.publish(unix_ms());
+        }
+    }
+
+    /// Records a served listener for advertising, then publishes.
+    fn record_served(&self, endpoint: String, listener: Option<ServedListener>) {
+        {
+            let mut served = self
+                .served_endpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !served.contains(&endpoint) {
+                served.push(endpoint);
+            }
+        }
+        if let Some(l) = listener {
+            self.served_listeners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(l);
+        }
+        self.start_hosting();
+        self.sync_advertising();
+    }
+
+    /// Registers an accepted responder session with the announcer before the caller can send
+    /// anything on it, so a newer signed route set is its first host-initiated frame.
+    ///
+    /// On failure the session is closed and the error returned: an accept never hands out a
+    /// session that skipped its initial route set.
+    fn register_route_session(&self, session: &SessionBackend) -> Result<(), String> {
+        let (sink, peer_route_seq) = session.route_sink();
+        self.register_route_sink(&sink, peer_route_seq, || session.close_now(&self.rt))
+    }
+
+    fn register_route_sink(
+        &self,
+        sink: &Arc<dyn RouteSetSink>,
+        peer_route_seq: Option<u64>,
+        close: impl FnOnce(),
+    ) -> Result<(), String> {
+        match self.rt.block_on(self.announcer.on_session_established(
+            sink,
+            peer_route_seq,
+            unix_ms(),
+        )) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                close();
+                Err(format!("route announcer registration failed: {e}"))
+            }
+        }
+    }
+
+    /// Runs a route write on the shared roster handle (which merges unpersisted CRLs before it
+    /// writes) under the endpoint's store lock, so it serializes with [`Self::mutate_roster`].
+    fn route_write<T>(
+        &self,
+        f: impl FnOnce(&RosterAccess) -> Result<T, RuntimeError>,
+    ) -> Result<T, RuntimeError> {
+        let _store_guard = self
+            .store
+            .as_ref()
+            .map(|_| self.rt.block_on(self.store_lock.lock()));
+        f(&self.route_access)
+    }
+
     fn mutate_roster<T, F>(&self, f: F) -> Result<T, (i32, String)>
     where
         F: FnOnce(&mut Roster) -> Result<T, (i32, String)>,
@@ -932,7 +1117,7 @@ impl TendrilEndpoint {
             .store
             .as_ref()
             .map(|_| self.rt.block_on(self.store_lock.lock()));
-        commit_roster_update(self.store.as_ref(), &self.roster, f)
+        commit_roster_update(&self.route_access, f)
     }
 
     fn load_roster_from_store(&self) -> Result<(), String> {
@@ -1068,6 +1253,9 @@ impl TendrilEndpoint {
     }
 }
 
+/// Close code sent when an accepted session cannot be registered with the route announcer.
+const ROUTE_REGISTRATION_CLOSE_CODE: u16 = 1011;
+
 const GROUP_ORDINARY_QUEUE_CAP: usize = 16;
 const GROUP_PUMP_WAIT: Duration = Duration::from_secs(3600);
 
@@ -1166,12 +1354,20 @@ fn build_endpoint_handle(
     let has_active_anchor = roster
         .trust_anchors()
         .any(|(_, a)| a.state == AnchorState::Active);
+    let roster = Arc::new(StdMutex::new(roster));
+    let route_access = RosterAccess::new(store.clone(), Arc::clone(&roster));
+    let announcer = Arc::new(RouteAnnouncer::new(
+        identity.clone(),
+        route_access.clone(),
+        AdvertiseInputs::default(),
+        AddressSource::platform_default(),
+    ));
     Box::into_raw(Box::new(TendrilEndpoint {
         rt,
         store,
         store_lock: Arc::new(AsyncMutex::new(())),
         identity,
-        roster: Arc::new(StdMutex::new(roster)),
+        roster,
         pair_mgr: Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default()))),
         router: InboundRouter::new(),
         v2_state: Arc::new(V2ResponderState::new()),
@@ -1181,6 +1377,12 @@ fn build_endpoint_handle(
         group_rt: StdMutex::new(None),
         group_ready: tokio::sync::Notify::new(),
         served_v1_relays: StdMutex::new(Vec::new()),
+        route_access,
+        announcer,
+        announcer_task: StdMutex::new(None),
+        hosting: AtomicBool::new(false),
+        served_endpoints: StdMutex::new(Vec::new()),
+        served_listeners: StdMutex::new(Vec::new()),
     }))
 }
 
@@ -1220,16 +1422,41 @@ fn group_frame_outcome_json(outcome: &GroupFrameOutcome) -> serde_json::Value {
 }
 
 enum SessionBackend {
-    V1(ConcurrentSession),
-    V2(ConcurrentV2Session),
+    V1(Arc<ConcurrentSession>),
+    V2(Arc<ConcurrentV2Session>),
 }
 
 impl SessionBackend {
+    fn v1(driver: SessionDriver) -> Self {
+        Self::V1(Arc::new(driver.into_concurrent()))
+    }
+
+    fn v2(driver: V2SessionDriver) -> Self {
+        Self::V2(Arc::new(driver.into_concurrent()))
+    }
+
+    /// The announcer's weak write handle and the client's `SessionHello.route_seq`.
+    fn route_sink(&self) -> (Arc<dyn RouteSetSink>, Option<u64>) {
+        match self {
+            Self::V1(s) => (Arc::clone(s) as Arc<dyn RouteSetSink>, s.peer_route_seq()),
+            Self::V2(s) => (Arc::clone(s) as Arc<dyn RouteSetSink>, s.peer_route_seq()),
+        }
+    }
+
     fn shutdown(&self) {
         match self {
             Self::V1(s) => s.shutdown(),
             Self::V2(s) => s.shutdown(),
         }
+    }
+
+    /// Sends a best-effort close frame and stops the session.
+    fn close_now(&self, rt: &Runtime) {
+        let _ = rt.block_on(timeout(
+            Duration::from_secs(2),
+            self.send_close(ROUTE_REGISTRATION_CLOSE_CODE, "route registration failed"),
+        ));
+        self.shutdown();
     }
 
     async fn send_data(&self, payload: &[u8]) -> Result<(), RuntimeError> {
@@ -1289,6 +1516,8 @@ pub struct TendrilSession {
     store: Option<Arc<StateStore>>,
     store_lock: Arc<AsyncMutex<()>>,
     roster: Arc<StdMutex<Roster>>,
+    /// The endpoint's roster handle over `store` and `roster`.
+    route_access: RosterAccess,
     v1_root_id: Option<String>,
     v1_local_signing: Option<(String, HybridSigningPublicKey)>,
     local_device_id: String,
@@ -1339,41 +1568,48 @@ impl TendrilSession {
         )
     }
 
+    /// Persists the CRL a v1 session accepted for `issuer` when it is newer than the stored
+    /// one; otherwise reloads the roster. Either way the in-memory copy keeps every CRL only it
+    /// holds.
+    ///
+    /// Lock order: `store_lock`, then the roster file lock ([`RosterAccess::update`]), then the
+    /// in-memory roster mutex, which is never held across store I/O.
     fn persist_v1_crl_if_newer(&self, issuer: &str) -> Result<(), String> {
         let Some(ref store) = self.store else {
             return Ok(());
         };
         let _store_guard = self.rt.block_on(self.store_lock.lock());
-        let mut guard = lock_roster(&self.roster);
+        let held = {
+            let guard = lock_roster(&self.roster);
+            guard.crl(issuer).cloned().map(|crl| {
+                let key = guard.get(issuer).and_then(|e| e.signing_pub.clone());
+                (crl, key)
+            })
+        };
         let disk = store.load_roster().map_err(|e| e.to_string())?;
-        let Some(crl) = guard.crl(issuer).cloned() else {
-            *guard = disk;
+        let Some((crl, memory_key)) = held.filter(|(crl, _)| {
+            disk.crl(issuer)
+                .is_none_or(|existing| crl.seq > existing.seq)
+        }) else {
+            replace_keeping_crls(&mut lock_roster(&self.roster), disk);
             return Ok(());
         };
-        let needs_persist = disk
-            .crl(issuer)
-            .is_none_or(|existing| crl.seq > existing.seq);
-        if !needs_persist {
-            *guard = disk;
-            return Ok(());
-        }
         let issuer_pub = if let Some((ref local_id, ref local_pub)) = self.v1_local_signing
             && local_id == issuer
         {
             local_pub.clone()
         } else {
             disk.lookup_active_signing_key(issuer)
-                .or_else(|| guard.get(issuer).and_then(|e| e.signing_pub.clone()))
-                .ok_or_else(|| format!("missing signing key for CRL issuer '{issuer}'"))?
+                .or_else(|| disk.lookup_active_anchor_key(issuer))
+                .or(memory_key)
+                .ok_or_else(|| format!("missing signing key for CRL issuer {issuer}"))?
         };
-        let (_out, committed, _stamp) = store
-            .update_roster_with_state(|d| match d.ingest_crl(crl, issuer, &issuer_pub) {
+        self.route_access
+            .update(|d| match d.ingest_crl(crl, issuer, &issuer_pub) {
                 Ok(()) | Err(CoreError::CrlStaleSeq { .. }) => Ok(()),
                 Err(err) => Err(err.into()),
             })
-            .map_err(|e| e.to_string())?;
-        *guard = committed;
-        Ok(())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1589,7 +1825,7 @@ pub unsafe extern "C" fn tendril_verify_rotation_chain_json(
         let chain: Vec<RotationRecord> = match serde_json::from_str(chain_s) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(format!("invalid chain_json: {e}"));
+                set_last_error(json_error("chain_json", &e));
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
@@ -1654,14 +1890,14 @@ pub unsafe extern "C" fn tendril_verify_grant_json(
         let grant: Grant = match serde_json::from_str(grant_s) {
             Ok(g) => g,
             Err(e) => {
-                set_last_error(format!("invalid grant_json: {e}"));
+                set_last_error(json_error("grant_json", &e));
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
         let key_map_raw: HashMap<String, String> = match serde_json::from_str(keys_s) {
             Ok(m) => m,
             Err(e) => {
-                set_last_error(format!("invalid issuer_keys_json: {e}"));
+                set_last_error(json_error("issuer_keys_json", &e));
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
@@ -1669,7 +1905,7 @@ pub unsafe extern "C" fn tendril_verify_grant_json(
             HashMap::with_capacity(key_map_raw.len());
         for (id, b64) in key_map_raw {
             let Ok(k) = HybridSigningPublicKey::from_b64url(&b64) else {
-                set_last_error(format!("invalid signing key for issuer '{id}'"));
+                set_last_error(format!("invalid signing key for issuer {id}"));
                 return TENDRIL_ERR_INVALID_ARG;
             };
             key_map.insert(id, k);
@@ -1678,7 +1914,7 @@ pub unsafe extern "C" fn tendril_verify_grant_json(
             Some(s) if !s.is_empty() => match serde_json::from_str(s) {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    set_last_error(format!("invalid crl_json_opt: {e}"));
+                    set_last_error(json_error("crl_json_opt", &e));
                     return TENDRIL_ERR_INVALID_ARG;
                 }
             },
@@ -1825,7 +2061,7 @@ fn identity_from_json_or_generate(
 
 fn roster_from_json(roster_json: Option<&str>) -> Result<Roster, String> {
     match roster_json.filter(|s| !s.is_empty()) {
-        Some(raw) => serde_json::from_str(raw).map_err(|e| format!("invalid roster json: {e}")),
+        Some(raw) => serde_json::from_str(raw).map_err(|e| json_error("roster json", &e)),
         None => Ok(Roster::new()),
     }
 }
@@ -1906,7 +2142,8 @@ pub unsafe extern "C" fn tendril_endpoint_new_sealed(
     })
 }
 
-/// Closes the endpoint's inbound router and wakes any parked `pair_accept`/`session_accept` calls.
+/// Closes the endpoint's inbound router, wakes any parked `pair_accept`/`session_accept` calls and
+/// stops the route announcer's refresh timer.
 ///
 /// Safe to invoke concurrently with blocked accept calls prior to calling [`tendril_endpoint_free`].
 ///
@@ -1923,6 +2160,14 @@ pub unsafe extern "C" fn tendril_endpoint_close(ep: *mut TendrilEndpoint) -> i32
         ep.router.close();
         if let Some(groups) = ep.group_runtime() {
             groups.shutdown();
+        }
+        if let Some(task) = ep
+            .announcer_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            task.abort();
         }
         TENDRIL_OK
     })
@@ -2047,7 +2292,9 @@ pub unsafe extern "C" fn tendril_endpoint_serve_direct(
         match ep.rt.block_on(DirectListener::bind(addr, None)) {
             Ok(listener) => {
                 let local_ep = listener.local_endpoint();
+                let served = ServedListener::from_listener(listener.tcp_listener()).ok();
                 ep.spawn_listener(Box::new(listener));
+                ep.record_served(local_ep.clone(), served);
                 unsafe { write_out_cstring(out_endpoint, &local_ep) }
             }
             Err(e) => {
@@ -2099,6 +2346,7 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(url.to_owned());
+                ep.record_served(local_ep.clone(), None);
                 unsafe { write_out_cstring(out_endpoint, &local_ep) }
             }
             Err(e) => {
@@ -2149,6 +2397,7 @@ pub unsafe extern "C" fn tendril_endpoint_serve_p2p(
                 Ok(listener) => {
                     let local_ep = listener.local_endpoint();
                     ep.spawn_listener(Box::new(listener));
+                    ep.record_served(local_ep.clone(), None);
                     unsafe { write_out_cstring(out_endpoint, &local_ep) }
                 }
                 Err(e) => {
@@ -2185,17 +2434,21 @@ pub unsafe extern "C" fn tendril_endpoint_issue_code(
             Ok(v) => v,
             Err(rc) => return rc,
         };
-        let pk = match kind_opt {
-            None | Some("" | "lan") => PairingCodeKind::Lan2Group,
-            Some("remote") => PairingCodeKind::Remote3Group,
-            Some(other) => {
-                set_last_error(format!("invalid pairing code kind '{other}'"));
+        let pk = match kind_opt.filter(|k| !k.is_empty()).map(str::parse) {
+            None => PairingCodeKind::Lan2Group,
+            Some(Ok(kind)) => kind,
+            Some(Err(_)) => {
+                set_last_error("invalid pairing code kind: expected lan or remote");
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
         let ep = unsafe { &*ep };
-        let mut mgr = ep.pair_mgr.lock().expect("pair_mgr mutex poisoned");
-        match mgr.issue_code(pk, now_unix()) {
+        let issued = ep
+            .pair_mgr
+            .lock()
+            .expect("pair_mgr mutex poisoned")
+            .issue_code(pk, now_unix());
+        match issued {
             Ok(code) => {
                 let code = Zeroizing::new(code);
                 unsafe { write_out_cstring(out_code, &code) }
@@ -2537,7 +2790,7 @@ pub unsafe extern "C" fn tendril_endpoint_mint_grant(
         let caps: Vec<String> = match serde_json::from_str(caps_s) {
             Ok(c) => c,
             Err(e) => {
-                set_last_error(format!("invalid caps_json: {e}"));
+                set_last_error(json_error("caps_json", &e));
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
@@ -2795,7 +3048,7 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
         let token: Grant = match serde_json::from_str(token_s) {
             Ok(t) => t,
             Err(e) => {
-                set_last_error(format!("invalid token_json: {e}"));
+                set_last_error(json_error("token_json", &e));
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
@@ -2894,10 +3147,165 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
     })
 }
 
-/// Opens an authenticated Noise XX session toward `target_host_id` via `endpoint`.
+fn parse_grant_json(raw: Option<&str>, name: &str) -> Result<Option<Grant>, String> {
+    match raw {
+        Some(g) if !g.is_empty() => serde_json::from_str(g)
+            .map(Some)
+            .map_err(|e| json_error(name, &e)),
+        _ => Ok(None),
+    }
+}
+
+/// Inputs of a Day-2 connect through the runtime policy path.
+struct ConnectRequest<'a> {
+    wire: u8,
+    target: &'a str,
+    grant: Option<Grant>,
+    /// Explicit operator endpoint; `None` connects over the stored routes.
+    endpoint: Option<&'a str>,
+    relay_host: Option<&'a str>,
+    recovery_uri: Option<String>,
+    replace_routes: bool,
+    route_policy: Option<RoutePolicy>,
+}
+
+/// Runs `SessionDriver` / `V2SessionDriver::connect_with_policy_and_store` against the
+/// endpoint's roster handle and wraps the winner. Route sets the session receives are ingested
+/// under the effective route policy.
+///
+/// A Wire v2 connect to an explicit endpoint on an endpoint with a configured `WakeProvider`
+/// runs the wake around the policy connect ([`connect_with_wake`]),
+/// so a woken connect also negotiates `route_seq`, ingests route sets and honours a recovery
+/// URI.
+fn connect_session(ep: &TendrilEndpoint, req: ConnectRequest<'_>) -> *mut TendrilSession {
+    let cfg = ep.snapshot_transport_cfg();
+    let endpoint = req.endpoint.filter(|e| !e.is_empty());
+    let dialers = match cfg.hint_dialers(endpoint, req.relay_host) {
+        Ok(d) => d,
+        Err(e) => {
+            set_last_error(e.to_string());
+            return ptr::null_mut();
+        }
+    };
+    let connect_once = || {
+        let mut opts = ConnectOpts::new(Arc::clone(&dialers));
+        opts.grant.clone_from(&req.grant);
+        opts.recovery_uri.clone_from(&req.recovery_uri);
+        opts.replace_routes = req.replace_routes;
+        opts.policy = req.route_policy.unwrap_or(cfg.route_policy);
+        opts.operator_endpoint = endpoint.map(ToOwned::to_owned);
+        opts.relay_auth_origins.clone_from(&cfg.relay_auth_origins);
+        policy_connect(ep, req.wire, req.target, opts)
+    };
+    let wake = cfg
+        .wake
+        .as_ref()
+        .filter(|_| req.wire == 2 && endpoint.is_some());
+    let res = ep.rt.block_on(async {
+        match wake {
+            Some(wake) => connect_with_wake(wake, connect_once).await,
+            None => connect_once().await,
+        }
+    });
+    let synced = ep.load_roster_from_store();
+    match res {
+        Ok(session) => {
+            if let Err(e) = synced {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+            Box::into_raw(Box::new(TendrilSession {
+                rt: Arc::clone(&ep.rt),
+                store: ep.store.clone(),
+                store_lock: Arc::clone(&ep.store_lock),
+                roster: Arc::clone(&ep.roster),
+                route_access: ep.route_access.clone(),
+                v1_root_id: (req.wire != 2).then(|| req.target.to_owned()),
+                v1_local_signing: None,
+                local_device_id: ep.identity.device_id(),
+                session,
+            }))
+        }
+        Err(err) => {
+            let msg = attempt_error_message(&err);
+            match synced {
+                Ok(()) => set_last_error(msg),
+                Err(pe) => set_last_error(format!("{msg} (roster sync error: {pe})")),
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+/// One policy connect over the endpoint's roster handle.
+async fn policy_connect(
+    ep: &TendrilEndpoint,
+    wire: u8,
+    target: &str,
+    opts: ConnectOpts,
+) -> Result<SessionBackend, AttemptError> {
+    let identity = Arc::new(ep.identity.clone());
+    if wire == 2 {
+        V2SessionDriver::connect_with_policy_and_store(identity, target, &ep.route_access, opts)
+            .await
+            .map(|r| SessionBackend::v2(r.session))
+    } else {
+        SessionDriver::connect_with_policy_and_store(identity, target, &ep.route_access, opts)
+            .await
+            .map(|r| SessionBackend::v1(r.session))
+    }
+}
+
+/// The wake flow around a whole policy connect: with `pre_wake`, the
+/// best-effort wake hint first; without it, one connect first and the wake hint only after a
+/// miss a wake can fix ([`AttemptError::is_wakeable_miss`]). Then up to `max_attempts` connects
+/// `retry_delay_ms` apart, retried only on such a miss; any other failure is final.
+async fn connect_with_wake<T, F, Fut>(
+    wake: &WakeTransportConfig,
+    mut connect: F,
+) -> Result<T, AttemptError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AttemptError>>,
+{
+    let retryable = AttemptError::is_wakeable_miss;
+    if !wake.pre_wake {
+        match connect().await {
+            Err(err) if retryable(&err) => {}
+            done => return done,
+        }
+    }
+    let now = now_unix();
+    let tag = wake.secret.derive_tag(now);
+    let wake_timeout = Duration::from_millis(wake.timeout_ms);
+    let provider = HttpWakeProvider::new()
+        .with_cooldown_secs(0)
+        .with_timeout(wake_timeout);
+    let _ = timeout(
+        wake_timeout,
+        provider.notify_best_effort(&wake.target, &tag, now),
+    )
+    .await;
+    let attempts = wake.max_attempts.max(1);
+    let mut attempt = 1;
+    loop {
+        match connect().await {
+            Err(err) if retryable(&err) && attempt < attempts => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(wake.retry_delay_ms)).await;
+            }
+            done => return done,
+        }
+    }
+}
+
+/// Opens an authenticated Noise XX session toward `target_host_id`.
+///
+/// A `NULL` or empty `endpoint` connects over the peer's stored routes; a non-empty one is an explicit operator endpoint dialed alone.
 ///
 /// # Safety
-/// `ep`, `endpoint`, and `target_host_id` must be valid non-null pointers; `relay_host` and `grant_json` may be null.
+/// `ep` and `target_host_id` must be valid non-null pointers; `endpoint`, `relay_host` and
+/// `grant_json` may be null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_session_connect(
     ep: *mut TendrilEndpoint,
@@ -2911,7 +3319,7 @@ pub unsafe extern "C" fn tendril_session_connect(
             set_last_error("null endpoint");
             return ptr::null_mut();
         }
-        let Ok(ep_s) = (unsafe { cstr_to_str(endpoint, "endpoint") }) else {
+        let Ok(ep_s) = (unsafe { opt_cstr_to_str(endpoint, "endpoint") }) else {
             return ptr::null_mut();
         };
         let Ok(relay_host_s) = (unsafe { opt_cstr_to_str(relay_host, "relay_host") }) else {
@@ -2923,122 +3331,27 @@ pub unsafe extern "C" fn tendril_session_connect(
         let Ok(grant_opt) = (unsafe { opt_cstr_to_str(grant_json, "grant_json") }) else {
             return ptr::null_mut();
         };
-        let grant: Option<Grant> = match grant_opt {
-            Some(g) if !g.is_empty() => match serde_json::from_str(g) {
-                Ok(parsed) => Some(parsed),
-                Err(e) => {
-                    set_last_error(format!("invalid grant_json: {e}"));
-                    return ptr::null_mut();
-                }
-            },
-            _ => None,
+        let grant = match parse_grant_json(grant_opt, "grant_json") {
+            Ok(g) => g,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
         };
-
         let ep = unsafe { &*ep };
-        let cfg = ep.snapshot_transport_cfg();
-        if let Err(e) = ep.load_roster_from_store() {
-            set_last_error(e);
-            return ptr::null_mut();
-        }
-        let mut working_roster = lock_roster(&ep.roster).clone();
-        if let Err(e) = tendril_core::session::check_peer_allows_wire_v1(&working_roster, target_s)
-        {
-            set_last_error(e.to_string());
-            return ptr::null_mut();
-        }
-        let v2_secret = if is_v2_relay_endpoint(ep_s) {
-            match lookup_v2_mailbox_secret_for_target(&working_roster, target_s) {
-                Ok(s) => Some(s),
-                Err((_, msg)) => {
-                    set_last_error(msg);
-                    return ptr::null_mut();
-                }
-            }
-        } else {
-            None
-        };
-        let was_revoked = working_roster
-            .get(target_s)
-            .is_some_and(|e| e.state == PeerState::Revoked);
-        let res = ep.rt.block_on(async {
-            let stream = dial_endpoint_v2_with_options(ep_s, relay_host_s, &cfg, v2_secret)
-                .await
-                .map_err(|e| RuntimeError::Protocol(e.to_string()))?;
-            SessionDriver::connect(
-                stream,
-                &ep.identity,
-                target_s,
+        connect_session(
+            ep,
+            ConnectRequest {
+                wire: 1,
+                target: target_s,
                 grant,
-                &mut working_roster,
-                now_unix(),
-            )
-            .await
-        });
-
-        match res {
-            Ok(driver) => {
-                let applied_rotation = driver.applied_rotation().to_vec();
-                let sync_res = if !applied_rotation.is_empty()
-                    && let Some(entry) = working_roster.get(target_s)
-                    && let Some(ref presented_signing) = entry.signing_pub
-                {
-                    let peer_static = entry.static_pub;
-                    let presented_signing = presented_signing.clone();
-                    ep.mutate_roster(|rst| {
-                        rst.apply_verified_rotation(
-                            target_s,
-                            &applied_rotation,
-                            &peer_static,
-                            &presented_signing,
-                        )
-                        .map(|_| ())
-                        .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
-                    })
-                    .map_err(|(_, msg)| msg)
-                } else {
-                    ep.load_roster_from_store()
-                };
-                if let Err(e) = sync_res {
-                    set_last_error(e);
-                    return ptr::null_mut();
-                }
-                Box::into_raw(Box::new(TendrilSession {
-                    rt: Arc::clone(&ep.rt),
-                    store: ep.store.clone(),
-                    store_lock: Arc::clone(&ep.store_lock),
-                    roster: Arc::clone(&ep.roster),
-                    v1_root_id: Some(target_s.to_owned()),
-                    v1_local_signing: None,
-                    local_device_id: ep.identity.device_id(),
-                    session: SessionBackend::V1(driver.into_concurrent()),
-                }))
-            }
-            Err(err) => {
-                let fork = matches!(
-                    err,
-                    RuntimeError::Core(CoreError::RotationForkDetected { .. })
-                );
-                let fresh_revoked = !was_revoked
-                    && working_roster
-                        .get(target_s)
-                        .is_some_and(|e| e.state == PeerState::Revoked);
-                let sync_res = if fork || fresh_revoked {
-                    ep.mutate_roster(|rst| match rst.revoke_peer(target_s) {
-                        Ok(()) | Err(CoreError::PeerNotFound(_)) => Ok(()),
-                        Err(e) => Err((TENDRIL_ERR_INTERNAL, e.to_string())),
-                    })
-                    .map_err(|(_, msg)| msg)
-                } else {
-                    ep.load_roster_from_store()
-                };
-                if let Err(pe) = sync_res {
-                    set_last_error(format!("{err} (roster persist error: {pe})"));
-                } else {
-                    set_last_error(err.to_string());
-                }
-                ptr::null_mut()
-            }
-        }
+                endpoint: ep_s,
+                relay_host: relay_host_s,
+                recovery_uri: None,
+                replace_routes: false,
+                route_policy: None,
+            },
+        )
     })
 }
 
@@ -3126,8 +3439,9 @@ pub unsafe extern "C" fn tendril_session_accept(
                         .await
                         .map_err(|e| format!("load roster task failed: {e}"))?
                         .map_err(|e| e.to_string())?;
-                    *lock_roster(&ep.roster) = disk.clone();
-                    disk
+                    let mut guard = lock_roster(&ep.roster);
+                    replace_keeping_crls(&mut guard, disk);
+                    guard.clone()
                 };
                 SessionDriver::accept_with_options(
                     stream,
@@ -3167,15 +3481,21 @@ pub unsafe extern "C" fn tendril_session_accept(
                 }
                 let local_id = ep.identity.host_id().to_owned();
                 let local_sig = ep.identity.signing_key().public_key().clone();
+                let session = SessionBackend::v1(driver);
+                if let Err(e) = ep.register_route_session(&session) {
+                    set_last_error(e);
+                    return ptr::null_mut();
+                }
                 Box::into_raw(Box::new(TendrilSession {
                     rt: Arc::clone(&ep.rt),
                     store: ep.store.clone(),
                     store_lock: Arc::clone(&ep.store_lock),
                     roster: Arc::clone(&ep.roster),
+                    route_access: ep.route_access.clone(),
                     v1_root_id: Some(local_id.clone()),
                     v1_local_signing: Some((local_id, local_sig)),
                     local_device_id: ep.identity.device_id(),
-                    session: SessionBackend::V1(driver.into_concurrent()),
+                    session,
                 }))
             }
             Err(e) => {
@@ -3491,12 +3811,7 @@ pub unsafe extern "C" fn tendril_endpoint_configure_transports_json(
         let input: TransportConfigInput = match serde_json::from_str(cfg_s) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(format!(
-                    "invalid transport_config_json: {:?} at line {} column {}",
-                    e.classify(),
-                    e.line(),
-                    e.column()
-                ));
+                set_last_error(json_error("transport_config_json", &e));
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
@@ -3508,11 +3823,10 @@ pub unsafe extern "C" fn tendril_endpoint_configure_transports_json(
             }
         };
         let ep = unsafe { &*ep };
-        let mut guard = ep
-            .transport_cfg
+        *ep.transport_cfg
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = parsed;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = parsed;
+        ep.sync_advertising();
         TENDRIL_OK
     })
 }
@@ -3551,8 +3865,8 @@ pub unsafe extern "C" fn tendril_endpoint_mint_relay_ticket(
             None | Some("" | "any") => RelayAuthRole::Any,
             Some("register") => RelayAuthRole::Register,
             Some("dial") => RelayAuthRole::Dial,
-            Some(other) => {
-                set_last_error(format!("invalid relay ticket role '{other}'"));
+            Some(_) => {
+                set_last_error("invalid relay ticket role: expected any, register or dial");
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
@@ -3662,6 +3976,7 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay_v2(
             ep.spawn_listener(Box::new(listener));
         }
         let local_ep = first_ep.unwrap_or_else(|| url_s.to_owned());
+        ep.record_served(local_ep.clone(), None);
         unsafe { write_out_cstring(out_endpoint, &local_ep) }
     })
 }
@@ -3721,12 +4036,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_initiate(
                 let pin_in: FfiPinnedHostInput = match serde_json::from_str(raw) {
                     Ok(v) => v,
                     Err(e) => {
-                        set_last_error(format!(
-                            "invalid pinned_host_json_opt: {:?} at line {} column {}",
-                            e.classify(),
-                            e.line(),
-                            e.column()
-                        ));
+                        set_last_error(json_error("pinned_host_json_opt", &e));
                         return TENDRIL_ERR_INVALID_ARG;
                     }
                 };
@@ -3966,12 +4276,14 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_accept(
     })
 }
 
-/// Opens an authenticated Wire v2 (`0x02`) pseudonymous session toward `target_host_id` via `endpoint`.
+/// Opens an authenticated Wire v2 (`0x02`) pseudonymous session toward `target_host_id`.
 ///
-/// Honors configured `RelayClientAuth`, `P2pOptions`, and `WakeProvider` (`wake_and_connect_v2_session`).
+/// A `NULL` or empty `endpoint` connects over the peer's stored routes; a non-empty one is an explicit operator endpoint. With a configured
+/// `WakeProvider` an explicit endpoint is woken first, then connected through the same policy
+/// connect (route negotiation and route set ingest included).
 ///
 /// # Safety
-/// `ep`, `endpoint`, and `target_host_id` must be valid non-null pointers; `relay_host_opt` and
+/// `ep` and `target_host_id` must be valid non-null pointers; `endpoint`, `relay_host_opt` and
 /// `grant_json_opt` may be null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_session_connect_v2(
@@ -3986,7 +4298,7 @@ pub unsafe extern "C" fn tendril_session_connect_v2(
             set_last_error("null endpoint");
             return ptr::null_mut();
         }
-        let Ok(ep_s) = (unsafe { cstr_to_str(endpoint, "endpoint") }) else {
+        let Ok(ep_opt) = (unsafe { opt_cstr_to_str(endpoint, "endpoint") }) else {
             return ptr::null_mut();
         };
         let Ok(relay_host_s) = (unsafe { opt_cstr_to_str(relay_host_opt, "relay_host_opt") })
@@ -3999,115 +4311,28 @@ pub unsafe extern "C" fn tendril_session_connect_v2(
         let Ok(grant_opt) = (unsafe { opt_cstr_to_str(grant_json_opt, "grant_json_opt") }) else {
             return ptr::null_mut();
         };
-        let grant: Option<Grant> = match grant_opt {
-            Some(g) if !g.is_empty() => match serde_json::from_str(g) {
-                Ok(parsed) => Some(parsed),
-                Err(e) => {
-                    set_last_error(format!("invalid grant_json_opt: {e}"));
-                    return ptr::null_mut();
-                }
-            },
-            _ => None,
+        let grant = match parse_grant_json(grant_opt, "grant_json_opt") {
+            Ok(g) => g,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
         };
 
         let ep = unsafe { &*ep };
-        let cfg = ep.snapshot_transport_cfg();
-        if let Err(e) = ep.load_roster_from_store() {
-            set_last_error(e);
-            return ptr::null_mut();
-        }
-        let v2_secret = if is_v2_relay_endpoint(ep_s) {
-            let roster = lock_roster(&ep.roster);
-            match lookup_v2_mailbox_secret_for_target(&roster, target_s) {
-                Ok(s) => Some(s),
-                Err((_, msg)) => {
-                    set_last_error(msg);
-                    return ptr::null_mut();
-                }
-            }
-        } else {
-            None
-        };
-
-        let res: Result<V2SessionDriver, String> = ep.rt.block_on(async {
-            let stream = if let Some(ref wake_cfg) = cfg.wake {
-                let dialer = build_dialer_with_options(ep_s, relay_host_s, &cfg, v2_secret)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let http_wake = Arc::new(
-                    HttpWakeProvider::new()
-                        .with_cooldown_secs(0)
-                        .with_timeout(Duration::from_millis(wake_cfg.timeout_ms)),
-                );
-                let wake_opts = WakeDialOptions::new(
-                    http_wake,
-                    wake_cfg.target.clone(),
-                    wake_cfg.secret.clone(),
-                )
-                .with_pre_wake(wake_cfg.pre_wake)
-                .with_retry_delay(Duration::from_millis(wake_cfg.retry_delay_ms))
-                .with_max_attempts(wake_cfg.max_attempts)
-                .with_wake_timeout(Duration::from_millis(wake_cfg.timeout_ms));
-                wake_and_dial_v2(&*dialer, ep_s, &wake_opts, now_unix())
-                    .await
-                    .map(|(stream, _)| stream)
-                    .map_err(|e| e.to_string())?
-            } else {
-                dial_endpoint_v2_with_options(ep_s, relay_host_s, &cfg, v2_secret)
-                    .await
-                    .map_err(|e| e.to_string())?
-            };
-            if let Some(ref store) = ep.store {
-                V2SessionDriver::connect_with_store(
-                    stream,
-                    &ep.identity,
-                    target_s,
-                    grant,
-                    store,
-                    &ep.store_lock,
-                    now_unix(),
-                )
-                .await
-                .map_err(|e| e.to_string())
-            } else {
-                V2SessionDriver::connect_locked(
-                    stream,
-                    &ep.identity,
-                    target_s,
-                    grant,
-                    &ep.roster,
-                    now_unix(),
-                )
-                .await
-                .map_err(|e| e.to_string())
-            }
-        });
-
-        match res {
-            Ok(driver) => {
-                if let Err(e) = ep.load_roster_from_store() {
-                    set_last_error(e);
-                    return ptr::null_mut();
-                }
-                Box::into_raw(Box::new(TendrilSession {
-                    rt: Arc::clone(&ep.rt),
-                    store: ep.store.clone(),
-                    store_lock: Arc::clone(&ep.store_lock),
-                    roster: Arc::clone(&ep.roster),
-                    v1_root_id: None,
-                    v1_local_signing: None,
-                    local_device_id: ep.identity.device_id(),
-                    session: SessionBackend::V2(driver.into_concurrent()),
-                }))
-            }
-            Err(e) => {
-                match ep.load_roster_from_store() {
-                    Ok(()) => set_last_error(e),
-                    Err(pe) => set_last_error(format!("{e} (roster sync error: {pe})")),
-                }
-                ptr::null_mut()
-            }
-        }
+        connect_session(
+            ep,
+            ConnectRequest {
+                wire: 2,
+                target: target_s,
+                grant,
+                endpoint: ep_opt,
+                relay_host: relay_host_s,
+                recovery_uri: None,
+                replace_routes: false,
+                route_policy: None,
+            },
+        )
     })
 }
 
@@ -4226,15 +4451,21 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
                     set_last_error(e);
                     return ptr::null_mut();
                 }
+                let session = SessionBackend::v2(driver);
+                if let Err(e) = ep.register_route_session(&session) {
+                    set_last_error(e);
+                    return ptr::null_mut();
+                }
                 Box::into_raw(Box::new(TendrilSession {
                     rt: Arc::clone(&ep.rt),
                     store: ep.store.clone(),
                     store_lock: Arc::clone(&ep.store_lock),
                     roster: Arc::clone(&ep.roster),
+                    route_access: ep.route_access.clone(),
                     v1_root_id: None,
                     v1_local_signing: None,
                     local_device_id: ep.identity.device_id(),
-                    session: SessionBackend::V2(driver.into_concurrent()),
+                    session,
                 }))
             }
             Err(e) => {
@@ -4243,6 +4474,804 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
                     Err(pe) => set_last_error(format!("{e} (roster sync error: {pe})")),
                 }
                 ptr::null_mut()
+            }
+        }
+    })
+}
+
+const fn provider_name(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Local => "local",
+        ProviderId::Direct => "direct",
+        ProviderId::Overlay => "overlay",
+        ProviderId::P2p => "p2p",
+        ProviderId::Relay => "relay",
+        ProviderId::Broker => "broker",
+    }
+}
+
+const fn code_kind_name(kind: PairingCodeKind) -> &'static str {
+    match kind {
+        PairingCodeKind::Lan2Group => "lan",
+        PairingCodeKind::Remote3Group => "remote",
+    }
+}
+
+fn routes_json(routes: &[StoredRoute]) -> serde_json::Value {
+    routes
+        .iter()
+        .map(|r| serde_json::json!({"hint": r.hint, "source": r.source.as_str()}))
+        .collect()
+}
+
+fn skipped_json(skipped: &[SkippedHint]) -> serde_json::Value {
+    skipped
+        .iter()
+        .map(|s| serde_json::json!({"hint": s.hint, "reason": s.reason.as_str()}))
+        .collect()
+}
+
+/// Dropped advertised hints, each only as [`DroppedHint::redacted_hint`]: an operator hint may
+/// carry credentials or a code.
+fn dropped_json(dropped: &[DroppedHint]) -> serde_json::Value {
+    dropped
+        .iter()
+        .map(|d| serde_json::json!({"hint": d.redacted_hint(), "reason": d.reason}))
+        .collect()
+}
+
+fn route_meta_json(meta: Option<RouteMeta>) -> serde_json::Value {
+    meta.map_or(serde_json::Value::Null, |m| {
+        serde_json::json!({
+            "seq": m.seq,
+            "issued_at": m.issued_at,
+            "origin": m.origin,
+        })
+    })
+}
+
+fn last_route_set_json(last: Option<LastRouteSet>) -> serde_json::Value {
+    last.map_or(
+        serde_json::Value::Null,
+        |l| serde_json::json!({"outcome": l.outcome, "seq": l.seq}),
+    )
+}
+
+/// Result code of a runtime route or pairing error.
+const fn runtime_error_code(err: &RuntimeError) -> i32 {
+    match err {
+        RuntimeError::Core(CoreError::PeerNotFound(_)) => TENDRIL_ERR_NOT_FOUND,
+        RuntimeError::Core(CoreError::InvalidPairingUri(_) | CoreError::PairingCodeInvalid) => {
+            TENDRIL_ERR_INVALID_ARG
+        }
+        _ => TENDRIL_ERR_PROTOCOL,
+    }
+}
+
+/// The error of a failed policy pairing or connect, with whether the code may be spent, the
+/// hints that were never dialed and each failed candidate. Each hint and nested error is
+/// redacted before it is formatted in.
+fn attempt_error_message(err: &AttemptError) -> String {
+    let mut msg = redact_error(&err.error);
+    if err.committed {
+        msg.push_str(" (committed: the pairing code may be spent)");
+    }
+    if !err.skipped.is_empty() {
+        let list: Vec<String> = err
+            .skipped
+            .iter()
+            .map(|s| format!("{} ({})", redact_hint(&s.hint), s.reason.as_str()))
+            .collect();
+        msg.push_str("; skipped: ");
+        msg.push_str(&list.join(", "));
+    }
+    if !err.failures.is_empty() {
+        let list: Vec<String> = err
+            .failures
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} ({}: {})",
+                    redact_hint(&f.hint),
+                    provider_name(f.provider),
+                    redact_error(&f.error)
+                )
+            })
+            .collect();
+        msg.push_str("; failed: ");
+        msg.push_str(&list.join(", "));
+    }
+    msg
+}
+
+/// Parses optional options JSON (`NULL` or `""` means defaults).
+fn parse_options<T: serde::de::DeserializeOwned + Default>(
+    raw: Option<&str>,
+    name: &str,
+) -> Result<T, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(json) => serde_json::from_str(json).map_err(|e| json_error(name, &e)),
+        None => Ok(T::default()),
+    }
+}
+
+fn parse_pairing_uri(raw: &str) -> Result<PairingUri, String> {
+    PairingUri::parse(raw.trim()).map_err(|e| format!("invalid pairing_uri: {e}"))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct IssueUriOptions {
+    kind: Option<String>,
+    host_name: Option<String>,
+    sign_routes: Option<bool>,
+}
+
+/// Issues a single-use pairing code inside a pairing URI built from the announced route set.
+///
+/// `options_json_opt` is `NULL` or `{"kind": "auto"|"lan"|"remote", "host_name": str,
+/// "sign_routes": bool}`. Hints come only from the announced set (served listeners,
+/// `advertised_endpoints` and, with `advertise: auto`, enumerated LAN and overlay addresses).
+/// `*out_json` is `{"uri", "code_kind", "dropped", "uri_len", "qr_version_m", "route_seq"}`.
+///
+/// # Safety
+/// `ep` and `out_json` must be valid non-null pointers; `options_json_opt` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_issue_pairing_uri(
+    ep: *mut TendrilEndpoint,
+    options_json_opt: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(opts_raw) = (unsafe { opt_cstr_to_str(options_json_opt, "options_json_opt") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let opts: IssueUriOptions = match parse_options(opts_raw, "options_json_opt") {
+            Ok(o) => o,
+            Err(e) => {
+                set_last_error(e);
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let requested_kind = match opts.kind.as_deref() {
+            None | Some("") => None,
+            Some(k) if k.eq_ignore_ascii_case("auto") => None,
+            Some(k) => match k.parse::<PairingCodeKind>() {
+                Ok(kind) => Some(kind),
+                Err(_) => {
+                    // Never echoes the input.
+                    set_last_error("invalid pairing code kind: expected auto, lan or remote");
+                    return TENDRIL_ERR_INVALID_ARG;
+                }
+            },
+        };
+        let ep = unsafe { &*ep };
+        let cfg = ep.snapshot_transport_cfg();
+        let host_name = opts
+            .host_name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| ep.identity.host_id().to_owned());
+        let issue = IssueOptions {
+            requested_kind,
+            sign_routes: opts.sign_routes.unwrap_or_else(|| cfg.sign_routes()),
+        };
+        ep.start_hosting();
+        ep.announcer.set_inputs(ep.advertise_inputs());
+        // The announcer publishes (roster file lock) before it takes the pairing manager, the
+        // order a concurrent pairing claim uses; the manager is never held across the call.
+        let issued = ep
+            .announcer
+            .issue_pairing_uri(&ep.pair_mgr, &host_name, issue, unix_ms());
+        match issued {
+            Ok(issued) => {
+                let out = Zeroizing::new(
+                    serde_json::json!({
+                        "uri": issued.uri,
+                        "code_kind": code_kind_name(issued.code_kind),
+                        "dropped": dropped_json(&issued.dropped),
+                        "uri_len": issued.uri_len,
+                        "qr_version_m": issued.qr_version_m,
+                        "route_seq": issued.route_seq,
+                    })
+                    .to_string(),
+                );
+                unsafe { write_out_cstring(out_json, &out) }
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                runtime_error_code(&e)
+            }
+        }
+    })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct PairUriOptions {
+    route_policy: Option<RoutePolicy>,
+    save_route: Option<bool>,
+    endpoint: Option<String>,
+    code: Option<String>,
+}
+
+/// One pairing initiator outcome, reduced to what the C result reports.
+struct InitiatorResult {
+    device_id: String,
+    host_id: String,
+    sas: String,
+    host_confirmed: bool,
+}
+
+/// Shared body of [`tendril_endpoint_pair_uri`] and [`tendril_endpoint_pair_v2_uri`].
+unsafe fn pair_uri_impl(
+    ep: *mut TendrilEndpoint,
+    wire: u8,
+    pairing_uri: *const c_char,
+    name_opt: *const c_char,
+    device_kind_opt: *const c_char,
+    options_json_opt: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    if ep.is_null() || out_json.is_null() {
+        set_last_error("null endpoint or out_json");
+        return TENDRIL_ERR_INVALID_ARG;
+    }
+    let Ok(uri_s) = (unsafe { cstr_to_str(pairing_uri, "pairing_uri") }) else {
+        return TENDRIL_ERR_INVALID_ARG;
+    };
+    let Ok(name_s) = (unsafe { opt_cstr_to_str(name_opt, "name_opt") }) else {
+        return TENDRIL_ERR_INVALID_ARG;
+    };
+    let Ok(kind_s) = (unsafe { opt_cstr_to_str(device_kind_opt, "device_kind_opt") }) else {
+        return TENDRIL_ERR_INVALID_ARG;
+    };
+    let Ok(opts_raw) = (unsafe { opt_cstr_to_str(options_json_opt, "options_json_opt") }) else {
+        return TENDRIL_ERR_INVALID_ARG;
+    };
+    let opts: PairUriOptions = match parse_options(opts_raw, "options_json_opt") {
+        Ok(o) => o,
+        Err(e) => {
+            set_last_error(e);
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+    };
+    let uri = match parse_pairing_uri(uri_s) {
+        Ok(u) => u,
+        Err(e) => {
+            set_last_error(e);
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+    };
+    // An explicit code override that is empty is malformed input, not "use the URI code".
+    if opts.code.as_deref().is_some_and(|c| c.trim().is_empty()) {
+        set_last_error(CoreError::PairingCodeInvalid.to_string());
+        return TENDRIL_ERR_INVALID_ARG;
+    }
+    let ep = unsafe { &*ep };
+    let cfg = ep.snapshot_transport_cfg();
+    let operator = opts.endpoint.filter(|e| !e.is_empty());
+    let dialers = match cfg.hint_dialers(operator.as_deref(), None) {
+        Ok(d) => d,
+        Err(e) => {
+            set_last_error(e.to_string());
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+    };
+    let code = Zeroizing::new(opts.code.unwrap_or_else(|| uri.code.clone()));
+    let mut popts = PairPolicyOptions::new(
+        name_s.filter(|n| !n.is_empty()).unwrap_or("ffi-device"),
+        kind_s.filter(|k| !k.is_empty()).unwrap_or("ffi"),
+        code.as_str(),
+        dialers,
+    );
+    popts.uri = Some(uri);
+    popts.operator_endpoint = operator;
+    popts.persist = PersistOpts {
+        policy: opts.route_policy.unwrap_or(cfg.route_policy),
+        save_committed: opts.save_route.unwrap_or(false),
+        ..PersistOpts::default()
+    };
+    popts.relay_auth_origins.clone_from(&cfg.relay_auth_origins);
+    let identity = Arc::new(ep.identity.clone());
+
+    let res = if wire == 2 {
+        ep.rt
+            .block_on(
+                tendril_runtime::v2_driver::drive_v2_pair_initiator_with_policy(
+                    identity,
+                    &ep.route_access,
+                    popts,
+                ),
+            )
+            .map(|r| {
+                let outcome = match r.drive.outcome {
+                    V2PairOutcome::InitiatorPending {
+                        device_id,
+                        host_id,
+                        pairing_sas,
+                        host_pin_verified,
+                        ..
+                    } => Ok(InitiatorResult {
+                        device_id,
+                        host_id,
+                        sas: pairing_sas,
+                        host_confirmed: host_pin_verified,
+                    }),
+                    V2PairOutcome::Rejected { error } => Err(error),
+                    V2PairOutcome::ResponderPending { .. } => {
+                        Err("unexpected responder outcome".to_owned())
+                    }
+                };
+                (
+                    outcome,
+                    r.route,
+                    r.committed,
+                    r.route_check,
+                    r.routes_persisted,
+                    r.routes_reason,
+                    r.skipped,
+                )
+            })
+    } else {
+        ep.rt
+            .block_on(tendril_runtime::driver::drive_pair_initiator_with_policy(
+                identity,
+                &ep.route_access,
+                popts,
+            ))
+            .map(|r| {
+                let outcome = match r.drive.outcome {
+                    PairOutcome::InitiatorPending {
+                        device_id,
+                        host_id,
+                        pairing_sas,
+                        host_pin_verified,
+                        ..
+                    } => Ok(InitiatorResult {
+                        device_id,
+                        host_id,
+                        sas: pairing_sas,
+                        host_confirmed: host_pin_verified,
+                    }),
+                    PairOutcome::Rejected { error } => Err(error),
+                    _ => Err("unexpected pairing outcome".to_owned()),
+                };
+                (
+                    outcome,
+                    r.route,
+                    r.committed,
+                    r.route_check,
+                    r.routes_persisted,
+                    r.routes_reason,
+                    r.skipped,
+                )
+            })
+    };
+    if let Err(e) = ep.load_roster_from_store() {
+        set_last_error(e);
+        return TENDRIL_ERR_INTERNAL;
+    }
+    let (outcome, route, committed, route_check, routes_persisted, routes_reason, skipped) =
+        match res {
+            Ok(parts) => parts,
+            Err(err) => {
+                set_last_error(attempt_error_message(&err));
+                return runtime_error_code(&err.error);
+            }
+        };
+    let res = match outcome {
+        Ok(r) => r,
+        Err(error) => {
+            set_last_error(error);
+            return TENDRIL_ERR_PROTOCOL;
+        }
+    };
+    let route: CandidateEndpoint = route;
+    let out = serde_json::json!({
+        "device_id": res.device_id,
+        "host_id": res.host_id,
+        "sas": res.sas,
+        "status": if res.host_confirmed { "active" } else { "pending" },
+        "host_confirmed": res.host_confirmed,
+        "provider": provider_name(route.provider),
+        "endpoint": route.addr,
+        "committed": committed,
+        "route_check": route_check.as_str(),
+        "routes_persisted": routes_json(&routes_persisted),
+        "routes_reason": routes_reason,
+        "skipped": skipped_json(&skipped),
+    });
+    unsafe { write_out_cstring(out_json, &out.to_string()) }
+}
+
+/// Pairs over Wire v1 with a scanned pairing URI: races its hints (or the explicit operator
+/// `endpoint` option alone) and commits on the first candidate that verifies the host pin, `rp`
+/// and route statement. Routes are persisted under the route policy.
+///
+/// `options_json_opt` is `NULL` or `{"route_policy": "all_signed"|"committed_only"|"none",
+/// "save_route": bool, "endpoint": str, "code": str}`; `code` overrides the URI code. `*out_json`
+/// is `{"device_id", "host_id", "sas", "status", "host_confirmed", "provider", "endpoint",
+/// "committed", "route_check", "routes_persisted", "skipped"}`.
+///
+/// # Safety
+/// `ep`, `pairing_uri` and `out_json` must be valid non-null pointers; the other strings may be
+/// null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_pair_uri(
+    ep: *mut TendrilEndpoint,
+    pairing_uri: *const c_char,
+    name_opt: *const c_char,
+    device_kind_opt: *const c_char,
+    options_json_opt: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| unsafe {
+        pair_uri_impl(
+            ep,
+            1,
+            pairing_uri,
+            name_opt,
+            device_kind_opt,
+            options_json_opt,
+            out_json,
+        )
+    })
+}
+
+/// Wire v2 PAKE pairing with a scanned pairing URI, one rung at a time.
+/// Options and result as [`tendril_endpoint_pair_uri`].
+///
+/// # Safety
+/// As [`tendril_endpoint_pair_uri`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_pair_v2_uri(
+    ep: *mut TendrilEndpoint,
+    pairing_uri: *const c_char,
+    name_opt: *const c_char,
+    device_kind_opt: *const c_char,
+    options_json_opt: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| unsafe {
+        pair_uri_impl(
+            ep,
+            2,
+            pairing_uri,
+            name_opt,
+            device_kind_opt,
+            options_json_opt,
+            out_json,
+        )
+    })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ConnectOptionsInput {
+    wire: Option<u8>,
+    grant: Option<Grant>,
+    endpoint: Option<String>,
+    relay_host: Option<String>,
+    recovery_uri: Option<String>,
+    replace_routes: Option<bool>,
+    route_policy: Option<RoutePolicy>,
+}
+
+/// Opens a session toward `target_host_id` with options.
+///
+/// `options_json` is `NULL` or `{"wire": 1|2, "grant": obj, "endpoint": str, "relay_host": str,
+/// "recovery_uri": str, "replace_routes": bool, "route_policy": str}`. Without `endpoint` the
+/// stored routes are dialed. `relay_host` is the expected relay host of an explicit `endpoint`
+/// (the Iroh relay mode for `iroh://`), as in [`tendril_session_connect`]. `recovery_uri` is a fresh pairing URI of the peer, honoured with and without
+/// `endpoint`: its keys are checked before session `msg3` on every candidate, a signed one adds
+/// its hints, and its routes replace the `signed` routes when its `rq` is newer (or with
+/// `replace_routes`). Its code is never sent.
+///
+/// # Safety
+/// `ep` and `target_host_id` must be valid non-null pointers; `options_json` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_connect_with_options(
+    ep: *mut TendrilEndpoint,
+    target_host_id: *const c_char,
+    options_json: *const c_char,
+) -> *mut TendrilSession {
+    ffi_ptr(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return ptr::null_mut();
+        }
+        let Ok(target_s) = (unsafe { cstr_to_str(target_host_id, "target_host_id") }) else {
+            return ptr::null_mut();
+        };
+        let Ok(opts_raw) = (unsafe { opt_cstr_to_str(options_json, "options_json") }) else {
+            return ptr::null_mut();
+        };
+        let opts: ConnectOptionsInput = match parse_options(opts_raw, "options_json") {
+            Ok(o) => o,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let wire = opts.wire.unwrap_or(1);
+        if wire != 1 && wire != 2 {
+            set_last_error(format!("invalid wire {wire}: expected 1 or 2"));
+            return ptr::null_mut();
+        }
+        let ep = unsafe { &*ep };
+        connect_session(
+            ep,
+            ConnectRequest {
+                wire,
+                target: target_s,
+                grant: opts.grant,
+                endpoint: opts.endpoint.as_deref(),
+                relay_host: opts.relay_host.as_deref(),
+                recovery_uri: opts.recovery_uri.filter(|u| !u.is_empty()),
+                replace_routes: opts.replace_routes.unwrap_or(false),
+                route_policy: opts.route_policy,
+            },
+        )
+    })
+}
+
+/// Replaces the `operator` routes of `peer_id`.
+///
+/// `routes_json` is a JSON array of endpoint strings, each normalized like an explicit
+/// endpoint; one invalid entry rejects the whole list and nothing is written. `[]` clears the
+/// `operator` routes. Returns `0`, `TENDRIL_ERR_INVALID_ARG` for a bad argument or list,
+/// `TENDRIL_ERR_NOT_FOUND` for an unknown peer, or `TENDRIL_ERR_PROTOCOL` for a pending or
+/// revoked one, with the last error set.
+///
+/// # Safety
+/// `ep`, `peer_id` and `routes_json` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_set_peer_routes(
+    ep: *mut TendrilEndpoint,
+    peer_id: *const c_char,
+    routes_json: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        if routes_json.is_null() {
+            set_last_error("null pointer for routes_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(raw) = (unsafe { json_string_list(routes_json, "routes_json") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let ep = unsafe { &*ep };
+        match ep.route_write(|access| set_peer_routes_in(access, peer_s, &raw)) {
+            Ok(_) => TENDRIL_OK,
+            Err(e) => {
+                set_last_error(e.to_string());
+                runtime_error_code(&e)
+            }
+        }
+    })
+}
+
+/// Writes the stored routes of `peer_id` as `{"routes": [{"hint", "source"}], "route_meta":
+/// {"seq", "issued_at", "origin"} | null, "last_route_set": {"outcome", "seq"} | null}`.
+///
+/// # Safety
+/// `ep`, `peer_id` and `out_json` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_peer_routes(
+    ep: *mut TendrilEndpoint,
+    peer_id: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let ep = unsafe { &*ep };
+        match peer_routes_in(&ep.route_access, peer_s) {
+            Ok(view) => {
+                let out = serde_json::json!({
+                    "routes": routes_json(&view.routes),
+                    "route_meta": route_meta_json(view.route_meta),
+                    "last_route_set": last_route_set_json(view.last_route_set),
+                });
+                unsafe { write_out_cstring(out_json, &out.to_string()) }
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                runtime_error_code(&e)
+            }
+        }
+    })
+}
+
+/// Removes the routes of `peer_id` from one source: `NULL` or `"operator"`, `"signed"`,
+/// `"committed"`, or `"all"` for every source. `route_meta` is kept.
+///
+/// # Safety
+/// `ep` and `peer_id` must be valid non-null pointers; `source_opt` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_clear_peer_routes(
+    ep: *mut TendrilEndpoint,
+    peer_id: *const c_char,
+    source_opt: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(source_s) = (unsafe { opt_cstr_to_str(source_opt, "source_opt") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let source = match source_s {
+            None | Some("" | "operator") => Some(RouteSource::Operator),
+            Some("signed") => Some(RouteSource::Signed),
+            Some("committed") => Some(RouteSource::Committed),
+            Some("all") => None,
+            Some(_) => {
+                set_last_error("invalid route source: expected operator, signed, committed or all");
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let ep = unsafe { &*ep };
+        match ep.route_write(|access| clear_peer_routes_in(access, peer_s, source)) {
+            Ok(()) => TENDRIL_OK,
+            Err(e) => {
+                set_last_error(e.to_string());
+                runtime_error_code(&e)
+            }
+        }
+    })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ApplyRouteOptions {
+    replace_routes: Option<bool>,
+    route_policy: Option<RoutePolicy>,
+}
+
+/// Applies a fresh signed pairing URI to the paired host whose keys it carries, offline. No network and no code use.
+///
+/// `options_json_opt` is `NULL` or `{"replace_routes": bool, "route_policy": str}`. Under
+/// `all_signed` a newer `rq` replaces the `signed` routes; otherwise only `replace_routes` does.
+/// `*out_json` is `{"peer_id", "applied": bool, "reason", "route_seq"}`.
+///
+/// # Safety
+/// `ep`, `pairing_uri` and `out_json` must be valid non-null pointers; `options_json_opt` may be
+/// null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_apply_route_uri(
+    ep: *mut TendrilEndpoint,
+    pairing_uri: *const c_char,
+    options_json_opt: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(uri_s) = (unsafe { cstr_to_str(pairing_uri, "pairing_uri") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(opts_raw) = (unsafe { opt_cstr_to_str(options_json_opt, "options_json_opt") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let opts: ApplyRouteOptions = match parse_options(opts_raw, "options_json_opt") {
+            Ok(o) => o,
+            Err(e) => {
+                set_last_error(e);
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let uri = match parse_pairing_uri(uri_s) {
+            Ok(u) => u,
+            Err(e) => {
+                set_last_error(e);
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let ep = unsafe { &*ep };
+        let apply = RouteApplyOpts {
+            policy: opts
+                .route_policy
+                .unwrap_or_else(|| ep.snapshot_transport_cfg().route_policy),
+            replace_routes: opts.replace_routes.unwrap_or(false),
+        };
+        match ep.route_write(|access| {
+            access.update(|roster| apply_signed_route_uri(roster, &uri, apply))
+        }) {
+            Ok(res) => {
+                let out = serde_json::json!({
+                    "peer_id": res.peer_id,
+                    "applied": res.applied,
+                    "reason": res.reason,
+                    "route_seq": res.route_meta.map(|m| m.seq),
+                });
+                unsafe { write_out_cstring(out_json, &out.to_string()) }
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                runtime_error_code(&e)
+            }
+        }
+    })
+}
+
+/// Re-scans the host's routes and publishes a changed set to paired
+/// clients' live sessions.
+///
+/// `snapshot_json_opt` is `NULL` or the complete current network snapshot, never a delta:
+/// `{"networks": [{"id": str, "iface": str, "if_index": int, "transports":
+/// ["wifi"|"ethernet"|"cellular"|"vpn"|"other"], "addrs": [str]}]}`. A snapshot switches the
+/// endpoint to snapshot addressing and is retained; `NULL` re-enumerates natively, or reuses the
+/// retained snapshot on Android. A snapshot with zero networks applies only after it persists
+/// for 30 s. `*out_json` (when `out_json` is non-null) is `{"route_seq", "changed": bool}`.
+///
+/// # Safety
+/// `ep` must be a valid non-null pointer; `snapshot_json_opt` and `out_json` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_refresh_routes(
+    ep: *mut TendrilEndpoint,
+    snapshot_json_opt: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(snap_raw) = (unsafe { opt_cstr_to_str(snapshot_json_opt, "snapshot_json_opt") })
+        else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let snapshot = match snap_raw.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(json) => match NetworkSnapshot::from_json(json) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    set_last_error(format!("invalid snapshot_json_opt: {e}"));
+                    return TENDRIL_ERR_INVALID_ARG;
+                }
+            },
+            None => None,
+        };
+        let ep = unsafe { &*ep };
+        ep.start_hosting();
+        ep.announcer.set_inputs(ep.advertise_inputs());
+        match ep.announcer.refresh(unix_ms(), snapshot) {
+            Ok(outcome) => {
+                if out_json.is_null() {
+                    return TENDRIL_OK;
+                }
+                let out = serde_json::json!({
+                    "route_seq": outcome.route_seq(),
+                    "changed": outcome.changed,
+                });
+                unsafe { write_out_cstring(out_json, &out.to_string()) }
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                runtime_error_code(&e)
             }
         }
     })
@@ -4373,7 +5402,8 @@ unsafe fn json_string_list(ptr: *const c_char, name: &str) -> Result<Vec<String>
     }
     serde_json::from_str::<Vec<String>>(raw).map_err(|e| {
         set_last_error(format!(
-            "invalid {name}: expected a JSON array of strings: {e}"
+            "{} (expected a JSON array of strings)",
+            json_error(name, &e)
         ));
         TENDRIL_ERR_INVALID_ARG
     })
@@ -4969,6 +5999,22 @@ mod p2p_dialer_option_tests {
     }
 
     #[test]
+    fn operator_iroh_connect_honours_the_pkarr_override() {
+        let endpoint = format!("iroh://{BASEPOINT_ID}");
+        let resolves = |pkarr: Option<bool>| {
+            let mut cfg = EndpointTransportConfig::default();
+            cfg.p2p_pkarr = pkarr;
+            cfg.hint_dialers(Some(&endpoint), None)
+                .expect("dialers")
+                .operator_p2p_options(&endpoint)
+                .expect("options")
+                .resolve_pkarr
+        };
+        assert!(resolves(None), "default relays keep the default lookup");
+        assert!(!resolves(Some(false)), "p2p_pkarr false turns lookup off");
+    }
+
+    #[test]
     fn group_dialer_options_require_an_explicit_relay_mode() {
         if std::env::var("TENDRIL_P2P_LOCAL").as_deref() != Ok("1") {
             assert!(
@@ -5131,5 +6177,645 @@ mod group_accept_tests {
         drop(tx);
         let res = recv_group_queue(&rx, Instant::now() + Duration::from_secs(1)).await;
         assert_eq!(res.unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod route_state_tests {
+    use super::*;
+    use std::path::Path;
+    use std::thread;
+    use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+    use tendril_core::routes::RouteSet;
+    use tendril_runtime::RelayOffline;
+
+    fn cs(s: &str) -> CString {
+        CString::new(s).expect("no interior NUL")
+    }
+
+    unsafe fn take(p: *mut c_char) -> String {
+        assert!(!p.is_null());
+        let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
+        unsafe { tendril_string_free(p) };
+        s
+    }
+
+    fn last_err() -> String {
+        LAST_ERROR.with(|c| c.borrow().clone())
+    }
+
+    struct Ep(*mut TendrilEndpoint);
+
+    impl Ep {
+        fn new(dir: &Path, host_id: Option<&str>) -> Self {
+            let d = cs(dir.to_str().unwrap());
+            let h = host_id.map(cs);
+            let ep = unsafe {
+                tendril_endpoint_new(d.as_ptr(), h.as_ref().map_or(ptr::null(), |c| c.as_ptr()))
+            };
+            assert!(!ep.is_null(), "{}", last_err());
+            Self(ep)
+        }
+
+        fn get(&self) -> &TendrilEndpoint {
+            unsafe { &*self.0 }
+        }
+
+        fn disk_crl_seq(&self, issuer: &str) -> Option<u64> {
+            let store = self.get().store.as_ref().unwrap();
+            store.load_roster().unwrap().crl(issuer).map(|c| c.seq)
+        }
+
+        fn memory_crl_seq(&self, issuer: &str) -> Option<u64> {
+            lock_roster(&self.get().roster).crl(issuer).map(|c| c.seq)
+        }
+    }
+
+    impl Drop for Ep {
+        fn drop(&mut self) {
+            unsafe { tendril_endpoint_free(self.0) };
+        }
+    }
+
+    struct Sess(*mut TendrilSession);
+
+    impl Drop for Sess {
+        fn drop(&mut self) {
+            unsafe { tendril_session_free(self.0) };
+        }
+    }
+
+    fn crl(issuer: &EndpointIdentity, issuer_id: &str, seq: u64) -> RevocationList {
+        sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: issuer_id.to_owned(),
+                seq,
+                revoked_devices: vec!["dev_other".to_owned()],
+                revoked_nonces: vec![],
+                ts: "2026-11-23T00:00:00Z".to_owned(),
+            },
+            issuer.signing_key(),
+        )
+        .unwrap()
+    }
+
+    struct OpenSink;
+
+    #[async_trait::async_trait]
+    impl RouteSetSink for OpenSink {
+        fn peer_id(&self) -> String {
+            "dev_peer".to_owned()
+        }
+
+        async fn send_route_set(&self, _payload: &[u8]) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_route_registration_closes_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ep = Ep::new(tmp.path(), None);
+        // Nothing published yet, so registration reads the stored local routes: make that fail.
+        std::fs::write(tmp.path().join("roster.json"), b"not a roster").unwrap();
+        let sink: Arc<dyn RouteSetSink> = Arc::new(OpenSink);
+
+        let mut closed = false;
+        let err = ep
+            .get()
+            .register_route_sink(&sink, Some(0), || closed = true)
+            .expect_err("registration must fail");
+        assert!(closed, "the session is closed");
+        assert!(err.contains("route announcer registration failed"), "{err}");
+
+        // A client that negotiated no route sets needs no registration.
+        ep.get()
+            .register_route_sink(&sink, None, || panic!("not closed"))
+            .expect("no route_seq");
+    }
+
+    #[test]
+    fn ffi_route_writes_keep_unpersisted_crls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ep = Ep::new(tmp.path(), None);
+        let host = EndpointIdentity::generate().unwrap();
+        let host_id = host.host_id().to_owned();
+        let host_pub = host.signing_key().public_key().clone();
+        ep.get()
+            .mutate_roster(|r| {
+                r.insert_pinned_host(
+                    host_id.clone(),
+                    "Host".to_owned(),
+                    *host.static_key().public_bytes(),
+                    Some(host_pub.clone()),
+                    0,
+                    vec![],
+                )
+                .map(|_| ())
+                .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+            })
+            .unwrap();
+        // A CRL a live session accepted into the shared roster that is not on disk yet.
+        let accept = |seq| {
+            lock_roster(&ep.get().roster)
+                .ingest_crl(crl(&host, &host_id, seq), &host_id, &host_pub)
+                .unwrap();
+            assert_eq!(ep.disk_crl_seq(&host_id), (seq > 1).then(|| seq - 1));
+        };
+        let peer = cs(&host_id);
+
+        accept(1);
+        let routes = cs(r#"["127.0.0.1:7000"]"#);
+        assert_eq!(
+            unsafe { tendril_endpoint_set_peer_routes(ep.0, peer.as_ptr(), routes.as_ptr()) },
+            TENDRIL_OK,
+            "{}",
+            last_err()
+        );
+        assert_eq!(ep.memory_crl_seq(&host_id), Some(1), "set kept the CRL");
+        assert_eq!(ep.disk_crl_seq(&host_id), Some(1), "set persisted the CRL");
+
+        accept(2);
+        assert_eq!(
+            unsafe { tendril_endpoint_clear_peer_routes(ep.0, peer.as_ptr(), ptr::null()) },
+            TENDRIL_OK
+        );
+        assert_eq!(ep.memory_crl_seq(&host_id), Some(2), "clear kept the CRL");
+        assert_eq!(ep.disk_crl_seq(&host_id), Some(2));
+
+        accept(3);
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_peer_routes(ep.0, peer.as_ptr(), &raw mut out) },
+            TENDRIL_OK
+        );
+        drop(unsafe { take(out) });
+        ep.get().load_roster_from_store().unwrap();
+        assert_eq!(
+            ep.memory_crl_seq(&host_id),
+            Some(3),
+            "a reload kept the CRL"
+        );
+        ep.get().mutate_roster(|_| Ok(())).unwrap();
+        assert_eq!(ep.disk_crl_seq(&host_id), Some(3), "any write persists it");
+    }
+
+    fn serve_direct(ep: &Ep) -> String {
+        let a = cs("127.0.0.1:0");
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_serve_direct(ep.0, a.as_ptr(), &raw mut out) },
+            TENDRIL_OK,
+            "{}",
+            last_err()
+        );
+        unsafe { take(out) }
+    }
+
+    /// Pairs `client` with `host` over a signed pairing URI and returns the host's grant JSON.
+    fn pair(host: &Ep, client: &Ep) -> String {
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_issue_pairing_uri(host.0, ptr::null(), &raw mut out) },
+            TENDRIL_OK
+        );
+        let issued: serde_json::Value = serde_json::from_str(&unsafe { take(out) }).unwrap();
+        let host_addr = host.0 as usize;
+        let acceptor = thread::spawn(move || {
+            let mut out = ptr::null_mut();
+            let rc = unsafe {
+                tendril_endpoint_pair_accept(
+                    host_addr as *mut TendrilEndpoint,
+                    15_000,
+                    &raw mut out,
+                )
+            };
+            assert_eq!(rc, TENDRIL_OK, "{}", last_err());
+            serde_json::from_str::<serde_json::Value>(&unsafe { take(out) }).unwrap()
+        });
+        let uri = cs(issued["uri"].as_str().unwrap());
+        let mut out = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_uri(
+                client.0,
+                uri.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &raw mut out,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK, "{}", last_err());
+        drop(unsafe { take(out) });
+        let accepted = acceptor.join().unwrap();
+        let device = cs(accepted["device_id"].as_str().unwrap());
+        let sas = cs(accepted["sas"].as_str().unwrap());
+        assert_eq!(
+            unsafe { tendril_endpoint_confirm_peer(host.0, device.as_ptr(), sas.as_ptr()) },
+            TENDRIL_OK
+        );
+        let caps = cs(r#"["fs.read"]"#);
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                tendril_endpoint_mint_grant(
+                    host.0,
+                    device.as_ptr(),
+                    caps.as_ptr(),
+                    3600,
+                    &raw mut out,
+                )
+            },
+            TENDRIL_OK
+        );
+        unsafe { take(out) }
+    }
+
+    /// Connects `client` to `host` over its stored routes; returns (client, host) sessions.
+    fn connect(host: &Ep, client: &Ep, host_id: &str, grant: &str) -> (Sess, Sess) {
+        let host_addr = host.0 as usize;
+        let acceptor = thread::spawn(move || {
+            let sess = unsafe { tendril_session_accept(host_addr as *mut TendrilEndpoint, 10_000) };
+            sess as usize
+        });
+        let target = cs(host_id);
+        let g = cs(grant);
+        let c = unsafe {
+            tendril_session_connect(
+                client.0,
+                ptr::null(),
+                ptr::null(),
+                target.as_ptr(),
+                g.as_ptr(),
+            )
+        };
+        assert!(!c.is_null(), "{}", last_err());
+        let h = acceptor.join().unwrap() as *mut TendrilSession;
+        assert!(!h.is_null(), "host accept failed");
+        (Sess(c), Sess(h))
+    }
+
+    /// Inserts a pinned peer and a trust anchor into `ep`'s roster (persisted), then accepts a
+    /// CRL from each into the in-memory copy only, as a live session would. Returns their ids.
+    fn hold_unpersisted_crls(ep: &Ep) -> [String; 2] {
+        let peer = EndpointIdentity::generate().unwrap();
+        let anchor = EndpointIdentity::generate().unwrap();
+        let peer_id = peer.host_id().to_owned();
+        let anchor_id = "anchor-held".to_owned();
+        let peer_pub = peer.signing_key().public_key().clone();
+        let anchor_pub = anchor.signing_key().public_key().clone();
+        ep.get()
+            .mutate_roster(|r| {
+                r.insert_pinned_host(
+                    peer_id.clone(),
+                    "Peer".to_owned(),
+                    *peer.static_key().public_bytes(),
+                    Some(peer_pub.clone()),
+                    0,
+                    vec![],
+                )
+                .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))?;
+                r.add_trust_anchor(anchor_id.clone(), anchor_pub.clone())
+                    .map(|_| ())
+                    .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+            })
+            .unwrap();
+        let mut roster = lock_roster(&ep.get().roster);
+        roster
+            .ingest_crl(crl(&peer, &peer_id, 1), &peer_id, &peer_pub)
+            .unwrap();
+        roster
+            .ingest_crl(crl(&anchor, &anchor_id, 1), &anchor_id, &anchor_pub)
+            .unwrap();
+        [peer_id, anchor_id]
+    }
+
+    #[test]
+    fn persisting_a_session_crl_keeps_other_unpersisted_crls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Ep::new(&tmp.path().join("host"), Some("crl-keep-host"));
+        let client = Ep::new(&tmp.path().join("client"), None);
+        serve_direct(&host);
+        let grant = pair(&host, &client);
+        let host_id = host.get().identity.host_id().to_owned();
+        let (c, _h) = connect(&host, &client, &host_id, &grant);
+        let held = hold_unpersisted_crls(&client);
+        // The v1 session accepted a newer CRL from its host that is not on disk either.
+        let host_pub = host.get().identity.signing_key().public_key().clone();
+        lock_roster(&client.get().roster)
+            .ingest_crl(crl(&host.get().identity, &host_id, 1), &host_id, &host_pub)
+            .unwrap();
+        for id in held.iter().chain([&host_id]) {
+            assert_eq!(client.disk_crl_seq(id), None, "{id} is held in memory only");
+        }
+
+        let sess = unsafe { &*c.0 };
+        assert!(matches!(sess.session, SessionBackend::V1(_)));
+        sess.persist_v1_crl_if_newer(&host_id).unwrap();
+
+        assert_eq!(
+            client.disk_crl_seq(&host_id),
+            Some(1),
+            "session CRL persisted"
+        );
+        assert_eq!(client.memory_crl_seq(&host_id), Some(1));
+        for id in &held {
+            assert_eq!(
+                client.memory_crl_seq(id),
+                Some(1),
+                "{id} CRL kept in memory"
+            );
+            assert_eq!(
+                client.disk_crl_seq(id),
+                Some(1),
+                "{id} CRL persisted with it"
+            );
+        }
+    }
+
+    fn wake_config(url: &str, pre_wake: bool) -> WakeTransportConfig {
+        WakeTransportConfig {
+            target: WakeTarget::new(WakeAdapterKind::Webhook, url).unwrap(),
+            secret: WakeSecret::from_bytes([7; 32]),
+            pre_wake,
+            retry_delay_ms: 1,
+            max_attempts: 3,
+            timeout_ms: 2_000,
+        }
+    }
+
+    /// A loopback webhook counting `POST` requests (a host service may probe new loopback
+    /// listeners with `GET /`; those are not counted).
+    fn wake_hits() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if buf[..n].starts_with(b"POST ") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        });
+        (format!("http://{addr}/wake"), hits)
+    }
+
+    fn miss(error: RuntimeError, committed: bool) -> AttemptError {
+        let mut err = AttemptError::from(error);
+        err.committed = committed;
+        err
+    }
+
+    /// Runs `connect_with_wake` over a connect that always fails with `make()`; returns the
+    /// number of connects and wake hints.
+    fn wake_run(pre_wake: bool, make: impl Fn() -> AttemptError) -> (usize, usize) {
+        let (url, hits) = wake_hits();
+        let wake = wake_config(&url, pre_wake);
+        let calls = std::cell::Cell::new(0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let res: Result<(), AttemptError> = rt.block_on(connect_with_wake(&wake, || {
+            calls.set(calls.get() + 1);
+            let err = make();
+            async move { Err(err) }
+        }));
+        assert!(res.is_err());
+        (calls.get(), hits.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn wake_retries_only_misses_a_wake_can_fix() {
+        let io = || {
+            miss(
+                RuntimeError::Io(std::io::ErrorKind::ConnectionRefused.into()),
+                false,
+            )
+        };
+        // pre_wake=false: connect, wake on the transient miss, then max_attempts retries.
+        assert_eq!(wake_run(false, io), (4, 1));
+        // pre_wake=true: wake, then max_attempts connects.
+        assert_eq!(wake_run(true, io), (3, 1));
+
+        // A relay that reports the sleeping host's mailbox offline is a wakeable miss.
+        for offline in [
+            RelayOffline::V2Dial,
+            RelayOffline::V1Dial,
+            RelayOffline::PinnedKey,
+        ] {
+            let make = || miss(RuntimeError::RelayOffline(offline), false);
+            assert_eq!(wake_run(false, make), (4, 1), "{offline:?}");
+        }
+        // The text alone is not a typed refusal: an untyped look-alike is final.
+        let lookalike = || {
+            miss(
+                RuntimeError::Protocol("v2 relay dial rejected: offline".into()),
+                false,
+            )
+        };
+        assert_eq!(wake_run(false, lookalike), (1, 0), "untyped text is final");
+
+        // A permanent protocol error, a committed attempt and a core error are final.
+        let permanent = |what: &str| match what {
+            "unauthorized" => miss(
+                RuntimeError::Protocol("v2 relay dial rejected: unauthorized".into()),
+                false,
+            ),
+            "committed offline" => miss(RuntimeError::RelayOffline(RelayOffline::V2Dial), true),
+            "protocol" => miss(
+                RuntimeError::Protocol("no dialable stored routes".into()),
+                false,
+            ),
+            "committed" => miss(
+                RuntimeError::Io(std::io::ErrorKind::BrokenPipe.into()),
+                true,
+            ),
+            _ => miss(RuntimeError::Core(CoreError::PairingCodeInvalid), false),
+        };
+        for what in [
+            "protocol",
+            "committed",
+            "core",
+            "unauthorized",
+            "committed offline",
+        ] {
+            let make = || permanent(what);
+            assert_eq!(wake_run(false, make), (1, 0), "{what}: no wake, no retry");
+            assert_eq!(wake_run(true, make), (1, 1), "{what}: pre-wake, no retry");
+        }
+    }
+
+    #[test]
+    fn attempt_error_text_survives_the_last_error_scrub_unchanged() {
+        // attempt_error_message redacts each hint and nested error; set_last_error then
+        // scrubs the whole message again. The second pass must change nothing.
+        let mut err = miss(
+            RuntimeError::Egress {
+                reason: tendril_runtime::providers::SkipReason::BlockedAddress,
+                detail: tendril_runtime::redact::redact_host("bad host!"),
+            },
+            true,
+        );
+        err.skipped = vec![SkippedHint::new(
+            "wss://u:p@relay.example:8443/v2/relay?t=s3cret".to_owned(),
+            tendril_runtime::providers::SkipReason::BlockedAddress,
+        )];
+        err.failures = vec![tendril_runtime::driver::CandidateFailure {
+            hint: "direct:TND-ABCD-EFGH:1".to_owned(),
+            provider: tendril_core::policy::ProviderId::Direct,
+            error: RuntimeError::RelayOffline(RelayOffline::V2Dial),
+        }];
+        let msg = attempt_error_message(&err);
+        assert_eq!(redact_text(&msg), msg, "double redaction changed {msg}");
+        assert!(msg.contains("wss://relay.example:8443"), "{msg}");
+        for leaked in ["s3cret", "ABCD", "u:p", "/v2/relay"] {
+            assert!(!msg.contains(leaked), "{leaked} leaked: {msg}");
+        }
+    }
+
+    #[test]
+    fn crl_and_route_set_on_one_session_persist_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Ep::new(&tmp.path().join("host"), Some("crl-host"));
+        let client = Ep::new(&tmp.path().join("client"), None);
+        let listen = serve_direct(&host);
+        let grant = pair(&host, &client);
+        let host_id = host.get().identity.host_id().to_owned();
+        let seq0 = lock_roster(&client.get().roster)
+            .get(&host_id)
+            .and_then(|e| e.route_meta)
+            .map(|m| m.seq)
+            .unwrap();
+        // An earlier session already delivered the host's current set, so the client sends
+        // `route_seq = seq0` and the host has no initial announcement for this session. Without
+        // it the initial set may be processed alone and rate-limit the set sent below.
+        let current: Vec<String> = lock_roster(&client.get().roster)
+            .get(&host_id)
+            .unwrap()
+            .routes_from(RouteSource::Signed)
+            .map(str::to_owned)
+            .collect();
+        let earlier = RouteSet::sign(&host.get().identity, seq0, now_unix(), current).unwrap();
+        client
+            .get()
+            .route_access
+            .update(|r| Ok(r.apply_route_announcement(&host_id, &earlier, now_unix())?))
+            .unwrap();
+        assert_eq!(
+            lock_roster(&client.get().roster)
+                .get(&host_id)
+                .unwrap()
+                .hello_route_seq(RoutePolicy::AllSigned),
+            Some(seq0)
+        );
+        let (c, h) = connect(&host, &client, &host_id, &grant);
+
+        // The host sends a CRL and a newer route set back to back, before the client reads.
+        let identity = &host.get().identity;
+        let revocation = crl(identity, &host_id, 1);
+        let routes = vec![format!("direct:{listen}"), "direct:127.0.0.1:9".to_owned()];
+        let set = RouteSet::sign(identity, seq0 + 1, now_unix(), routes.clone()).unwrap();
+        let SessionBackend::V1(ref hs) = unsafe { &*h.0 }.session else {
+            panic!("v1 session");
+        };
+        host.get().rt.block_on(async {
+            hs.send_revocation(&revocation).await.unwrap();
+            RouteSetSink::send_route_set(hs.as_ref(), &set.encode())
+                .await
+                .unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut revoked_event = false;
+        loop {
+            let mut out = ptr::null_mut();
+            match unsafe { tendril_session_poll_event(c.0, 200, &raw mut out) } {
+                TENDRIL_OK => {
+                    let ev: serde_json::Value =
+                        serde_json::from_str(&unsafe { take(out) }).unwrap();
+                    revoked_event |= ev["event"] == "revocation_updated";
+                }
+                TENDRIL_WOULD_BLOCK => {}
+                rc => panic!("poll failed {rc}: {}", last_err()),
+            }
+            let applied = client
+                .get()
+                .route_access
+                .last_route_set(&host_id)
+                .is_some_and(|l| l.seq == seq0 + 1 && l.outcome == "applied");
+            if revoked_event && applied {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "CRL or route set lost"
+            );
+        }
+        assert_eq!(client.disk_crl_seq(&host_id), Some(1), "CRL persisted");
+        assert_eq!(
+            client.memory_crl_seq(&host_id),
+            Some(1),
+            "CRL kept in memory"
+        );
+        let disk = client.get().store.as_ref().unwrap().load_roster().unwrap();
+        let signed: Vec<_> = disk
+            .get(&host_id)
+            .unwrap()
+            .routes
+            .iter()
+            .filter(|r| r.source == RouteSource::Signed)
+            .map(|r| r.hint.clone())
+            .collect();
+        assert_eq!(signed, routes, "route set persisted");
+    }
+
+    #[test]
+    fn close_stops_the_announcer_refresh_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = Ep::new(dir.path(), Some("close-host"));
+        let addr = cs("127.0.0.1:0");
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_serve_direct(ep.0, addr.as_ptr(), &raw mut out) },
+            TENDRIL_OK,
+            "{}",
+            last_err()
+        );
+        drop(unsafe { take(out) });
+        let running = |ep: &Ep| {
+            ep.get()
+                .announcer_task
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|h| !h.is_finished())
+        };
+        assert_eq!(running(&ep), Some(true), "hosting starts the timer task");
+
+        assert_eq!(unsafe { tendril_endpoint_close(ep.0) }, TENDRIL_OK);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running(&ep) != Some(false) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "close left the refresh task running"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            unsafe { tendril_endpoint_close(ep.0) },
+            TENDRIL_OK,
+            "close is idempotent"
+        );
     }
 }

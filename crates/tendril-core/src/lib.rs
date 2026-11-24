@@ -13,8 +13,10 @@ pub mod identity;
 pub mod noise;
 pub mod pairing;
 pub mod policy;
+pub mod redact;
 pub mod relay_auth;
 pub mod roster;
+pub mod routes;
 pub mod session;
 pub mod state_seal;
 pub mod v2;
@@ -36,6 +38,9 @@ pub use relay_auth::{
     validate_relay_auth_secret, verify_relay_auth_hmac, verify_relay_ticket,
 };
 pub use roster::{AnchorState, MAX_BURNED_ENROLLMENT_NONCES, TrustAnchor, V2PeerSecrets};
+pub use routes::{
+    MAX_ROUTE_SEQ, MAX_ROUTE_SET_PAYLOAD, MIN_ROUTE_SET_PAYLOAD, ROUTE_SET_DOMAIN, RouteSet,
+};
 pub use wire::{
     AEAD_TAG_LEN, FLAG_PAKE_PAIR, MAX_APP_DATA_LEN, MAX_FRAME_LEN, MAX_TRANSPORT_PLAINTEXT,
     NOISE_PATTERN, PREAMBLE_FLAG_NONE, PREAMBLE_LEN, PREAMBLE_MAGIC, WIRE_VERSION, WIRE_VERSION_V2,

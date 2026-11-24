@@ -164,16 +164,16 @@ fn full_pair_confirm_mint_data_rekey_rotate_delegate_revoke_close_lifecycle() {
     let code = mgr
         .issue_code_with_entropy(PairingCodeKind::Lan2Group, NOW_UNIX, &[7u8; 32])
         .unwrap();
-    let uri = PairingUri {
-        host_name: "Studio Host".to_string(),
-        code: code.clone(),
-        host_static_pub: *host_id.static_key().public_bytes(),
-        host_signing_pub_hash: host_id.signing_key().signing_pub_hash(),
-        endpoints: vec!["direct:192.168.1.50:7000".to_string()],
-        host_id: None,
-        rotation_seq: None,
-    };
-    let parsed_uri = PairingUri::parse(&uri.encode()).unwrap();
+    let uri = PairingUri::new(
+        "Studio Host",
+        code.clone(),
+        *host_id.static_key().public_bytes(),
+        host_id.signing_key().signing_pub_hash(),
+        vec!["direct:192.168.1.50:7000".to_string()],
+        None,
+        None,
+    );
+    let parsed_uri = PairingUri::parse(&uri.try_encode().unwrap()).unwrap();
     assert_eq!(parsed_uri, uri);
 
     let mut p_init = PairingInitiator::new(
@@ -1933,16 +1933,16 @@ fn batch1_sec11_qr_pinned_pairing_works_after_host_rotation() {
         let code = mgr
             .issue_code_with_entropy(PairingCodeKind::Lan2Group, NOW_UNIX + 30, &[3u8; 32])
             .unwrap();
-        let uri = PairingUri {
-            host_name: "Rotated Host".into(),
+        let uri = PairingUri::new(
+            "Rotated Host",
             code,
-            host_static_pub: *host.static_key().public_bytes(),
-            host_signing_pub_hash: host.signing_key().signing_pub_hash(),
-            endpoints: vec!["direct:127.0.0.1:7000".into()],
-            host_id: include_meta.then(|| host.host_id().to_string()),
-            rotation_seq: include_meta.then(|| host.rotation_seq()),
-        };
-        let parsed = PairingUri::parse(&uri.encode()).unwrap();
+            *host.static_key().public_bytes(),
+            host.signing_key().signing_pub_hash(),
+            vec!["direct:127.0.0.1:7000".into()],
+            include_meta.then(|| host.host_id().to_string()),
+            include_meta.then(|| host.rotation_seq()),
+        );
+        let parsed = PairingUri::parse(&uri.try_encode().unwrap()).unwrap();
         assert_eq!(parsed, uri);
 
         let mut p_init = PairingInitiator::new(
@@ -2413,8 +2413,9 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
             "expected invalid PairingUri rejection for {bad_uri}"
         );
     }
+    let rp_b64 = b64url_encode(host.signing_key().ed25519_public_bytes());
     let ok_uri = format!(
-        "tendril://pair?v=1&host=Studio&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&ep=direct:192.168.1.50:7000,relay:wss://relay.example/v1/relay"
+        "tendril://pair?v=1&host=Studio&code=TND-AAAA-BBBB-CCCC&k={k_b64}&sh={sh_b64}&rp={rp_b64}&ep=direct:192.168.1.50:7000,relay:wss://relay.example/v1/relay"
     );
     assert!(PairingUri::parse(&ok_uri).is_ok());
 
@@ -3835,7 +3836,7 @@ mod group_mesh {
                 assert!(decode_inner_frame(&raw).is_err());
             }
         }
-        assert!(decode_inner_frame(&[0x0C, 0, 0]).is_err());
+        assert!(decode_inner_frame(&[0x0D, 0, 0]).is_err());
     }
 
     #[test]

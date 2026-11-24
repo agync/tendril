@@ -20,11 +20,13 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
+use super::egress::{DestClass, SkipReason, classify_destination};
 use crate::error::RuntimeError;
 use crate::provider::{
     DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathReader, PathStream,
     PathWriter,
 };
+use crate::redact::{redact_hint, redact_host, redact_text, redact_url_str};
 
 /// ALPN registered on iroh endpoints carrying Tendril `Intent::Pair` and `Intent::Session`.
 pub const TENDRIL_P2P_ALPN: &[u8] = b"tendril/p2p/v1";
@@ -157,6 +159,12 @@ pub struct P2pOptions {
     /// `true` when `relay_mode` was derived from an untrusted peer URI rather than supplied by
     /// the caller, so its relays never count as operator-trusted.
     pub(crate) uri_derived_relays: bool,
+    /// `true` for the lookup-free hint dialer: no address lookup service is installed whatever
+    /// `publish_pkarr` or `resolve_pkarr` say, and every dial is filtered to the relay map.
+    pub(crate) hint_dialer: bool,
+    /// Relay host names answered only from these already checked addresses (operator
+    /// endpoints); other names resolve with blocked answers removed.
+    pub(crate) dns_pins: Vec<(String, Vec<IpAddr>)>,
 }
 
 impl Default for P2pOptions {
@@ -183,6 +191,8 @@ impl P2pOptions {
             allow_private_addrs: is_disabled,
             relay_auth: None,
             uri_derived_relays: false,
+            hint_dialer: false,
+            dns_pins: Vec::new(),
         }
     }
 
@@ -201,7 +211,25 @@ impl P2pOptions {
             allow_private_addrs: is_disabled,
             relay_auth: None,
             uri_derived_relays: false,
+            hint_dialer: false,
+            dns_pins: Vec::new(),
         }
+    }
+
+    /// Options for the lookup-free dialer used for pairing URI hints and stored routes.
+    ///
+    /// `configured_mode` is the operator's relay mode; `None` means [`P2pRelayMode::Default`].
+    /// The endpoint never installs `PkarrResolver`, `DnsAddressLookup`, or any other address
+    /// lookup service, even if `resolve_pkarr` is later set, and each dial keeps only `relay=`
+    /// URLs from this relay map and `addr=` literals outside the always-blocked set (see
+    /// [`filter_p2p_hint`]). Hint relays never become a custom relay map.
+    #[must_use]
+    pub fn for_hint_dialer(configured_mode: Option<P2pRelayMode>) -> Self {
+        let mut opts = Self::for_dialer(configured_mode.unwrap_or_default())
+            .with_resolve_pkarr(false)
+            .with_allow_private_addrs(true);
+        opts.hint_dialer = true;
+        opts
     }
 
     /// Options for the shared dialer of a group pool, or `None` when none may be built.
@@ -261,6 +289,13 @@ impl P2pOptions {
             .with_allow_private_addrs(allow_private_addrs);
         opts.uri_derived_relays = true;
         Ok(opts)
+    }
+
+    /// Answers these relay host names only from the given, already checked addresses.
+    #[must_use]
+    pub(crate) fn with_dns_pins(mut self, pins: Vec<(String, Vec<IpAddr>)>) -> Self {
+        self.dns_pins = pins;
+        self
     }
 
     /// Enables or disables publishing this endpoint to `n0` Pkarr/DNS.
@@ -346,12 +381,16 @@ pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeE
             let validated = super::validate_iroh_relay_url(url)?;
             let canonical = validated.as_str().to_owned();
             let _ = RelayUrl::from_str(&canonical).map_err(|err| {
-                RuntimeError::Protocol(format!("invalid iroh relay URL '{url}': {err}"))
+                RuntimeError::Protocol(format!(
+                    "invalid iroh relay URL {}: {err}",
+                    redact_url_str(url)
+                ))
             })?;
             Ok(P2pRelayMode::Custom(canonical))
         }
         Some(other) => Err(RuntimeError::Protocol(format!(
-            "invalid p2p relay mode '{other}' (expected default, disabled, local, or relay URL)"
+            "invalid p2p relay mode {} (expected default, disabled, local, or relay URL)",
+            redact_hint(other)
         ))),
     }
 }
@@ -369,7 +408,10 @@ pub fn parse_p2p_relay_modes(urls: &[String]) -> Result<P2pRelayMode, RuntimeErr
         let validated = super::validate_iroh_relay_url(raw)?;
         let canonical = validated.as_str().to_owned();
         let _ = RelayUrl::from_str(&canonical).map_err(|err| {
-            RuntimeError::Protocol(format!("invalid iroh relay URL '{raw}': {err}"))
+            RuntimeError::Protocol(format!(
+                "invalid iroh relay URL {}: {err}",
+                redact_url_str(raw)
+            ))
         })?;
         validated_urls.push(canonical);
     }
@@ -437,7 +479,10 @@ fn build_custom_relay_map(urls: &[String]) -> Result<RelayMap, RuntimeError> {
     for raw in urls {
         let validated = super::validate_iroh_relay_url(raw)?;
         let url = RelayUrl::from_str(validated.as_str()).map_err(|err| {
-            RuntimeError::Protocol(format!("invalid iroh relay URL '{raw}': {err}"))
+            RuntimeError::Protocol(format!(
+                "invalid iroh relay URL {}: {err}",
+                redact_url_str(raw)
+            ))
         })?;
         let cfg = if validated.scheme() == "http" {
             IrohRelayConfig::new(url, None)
@@ -491,7 +536,13 @@ async fn build_iroh_endpoint(
     } else {
         &relay_urls
     };
-    check_relay_hosts_post_dns(&relay_urls, options.allow_private_addrs, trusted).await?;
+    check_relay_hosts_pinned(
+        &relay_urls,
+        options.allow_private_addrs,
+        trusted,
+        &options.dns_pins,
+    )
+    .await?;
 
     let seed = match secret_seed {
         Some(s) => s,
@@ -522,10 +573,16 @@ async fn build_iroh_endpoint(
     let mut builder = Endpoint::builder(presets::Minimal)
         .relay_mode(relay_mode)
         .secret_key(secret_key);
-    if options.publish_pkarr {
+    if !options.dns_pins.is_empty() {
+        builder = builder.dns_resolver(iroh::dns::DnsResolver::custom(PinnedDnsResolver {
+            pins: options.dns_pins.clone(),
+            inner: iroh::dns::DnsResolver::new(),
+        }));
+    }
+    if options.publish_pkarr && !options.hint_dialer {
         builder = builder.address_lookup(iroh::address_lookup::PkarrPublisher::n0_dns());
     }
-    if options.resolve_pkarr {
+    if options.resolve_pkarr && !options.hint_dialer {
         builder = builder.address_lookup(iroh::address_lookup::PkarrResolver::n0_dns());
         builder = builder.address_lookup(iroh::address_lookup::DnsAddressLookup::n0_dns());
     }
@@ -606,7 +663,8 @@ fn reject_private_relay_host(validated: &url::Url) -> Result<(), RuntimeError> {
             .is_ok_and(super::is_private_or_reserved_ip);
     if private {
         return Err(RuntimeError::Protocol(format!(
-            "private or loopback relay host '{bare}' requires allow_private_addrs"
+            "private or loopback relay host '{}' requires allow_private_addrs",
+            redact_host(bare)
         )));
     }
     Ok(())
@@ -624,9 +682,8 @@ fn parse_p2p_endpoint_trusting(
     }
     let raw = endpoint.strip_prefix("iroh://").unwrap_or(endpoint);
     let (id_part, query_part) = raw.split_once('?').unwrap_or((raw, ""));
-    let id = EndpointId::from_str(id_part).map_err(|err| {
-        RuntimeError::Protocol(format!("invalid iroh endpoint id '{id_part}': {err}"))
-    })?;
+    let id = EndpointId::from_str(id_part)
+        .map_err(|err| RuntimeError::Protocol(format!("invalid iroh endpoint id: {err}")))?;
 
     let mut addrs = Vec::new();
     if !query_part.is_empty() {
@@ -634,13 +691,13 @@ fn parse_p2p_endpoint_trusting(
             if pair.is_empty() {
                 continue;
             }
-            let (key, val) = pair.split_once('=').ok_or_else(|| {
-                RuntimeError::Protocol(format!("invalid iroh query param '{pair}'"))
-            })?;
+            let (key, val) = pair
+                .split_once('=')
+                .ok_or_else(|| RuntimeError::Protocol("invalid iroh query param".to_owned()))?;
             match key {
                 "addr" => {
                     let sock: SocketAddr = val.parse().map_err(|err| {
-                        RuntimeError::Protocol(format!("invalid iroh socket addr '{val}': {err}"))
+                        RuntimeError::Protocol(format!("invalid iroh socket addr: {err}"))
                     })?;
                     if super::is_metadata_or_link_local_ip(sock.ip())
                         || (!allow_private_addrs && super::is_private_or_reserved_ip(sock.ip()))
@@ -657,19 +714,106 @@ fn parse_p2p_endpoint_trusting(
                         reject_private_relay_host(&validated)?;
                     }
                     let url = RelayUrl::from_str(validated.as_str()).map_err(|err| {
-                        RuntimeError::Protocol(format!("invalid iroh relay URL '{val}': {err}"))
+                        RuntimeError::Protocol(format!(
+                            "invalid iroh relay URL {}: {err}",
+                            redact_url_str(val)
+                        ))
                     })?;
                     addrs.push(TransportAddr::Relay(url));
                 }
-                other => {
-                    return Err(RuntimeError::Protocol(format!(
-                        "unknown iroh endpoint query parameter '{other}'"
-                    )));
+                _ => {
+                    return Err(RuntimeError::Protocol(
+                        "unknown iroh endpoint query parameter".to_owned(),
+                    ));
                 }
             }
         }
     }
     Ok(EndpointAddr::from_parts(id, addrs))
+}
+
+/// An `iroh://` hint reduced to what the lookup-free hint dialer may contact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P2pHintAddr {
+    /// Filtered endpoint string (`iroh://<id>[?addr=...&relay=...]`).
+    pub endpoint: String,
+    /// Hint `relay=` URLs dropped because they are not in the configured relay map.
+    pub dropped_relays: Vec<String>,
+}
+
+/// Returns the URLs of the relay map an endpoint built with `mode` uses.
+fn relay_map_urls(mode: &P2pRelayMode) -> Result<Vec<RelayUrl>, RuntimeError> {
+    let map = match mode {
+        P2pRelayMode::Default => RelayMode::Default.relay_map(),
+        P2pRelayMode::Custom(url) => build_custom_relay_map(std::slice::from_ref(url))?,
+        P2pRelayMode::CustomMany(urls) => build_custom_relay_map(urls)?,
+        P2pRelayMode::Disabled => return Ok(Vec::new()),
+    };
+    Ok(map.urls::<Vec<_>>())
+}
+
+fn filter_hint_addr(
+    hint: &str,
+    relay_map: &[RelayUrl],
+) -> Result<(EndpointAddr, Vec<String>), SkipReason> {
+    let raw = hint.strip_prefix("p2p:").unwrap_or(hint);
+    if raw.chars().any(char::is_control) || raw.contains('#') {
+        return Err(SkipReason::Invalid);
+    }
+    let rest = raw.strip_prefix("iroh://").ok_or(SkipReason::Invalid)?;
+    let (id_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let id = EndpointId::from_str(id_part).map_err(|_| SkipReason::Invalid)?;
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    let mut relays: Vec<RelayUrl> = Vec::new();
+    let mut dropped = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (key, val) = pair.split_once('=').ok_or(SkipReason::Invalid)?;
+        match key {
+            "addr" => {
+                let sock: SocketAddr = val.parse().map_err(|_| SkipReason::Invalid)?;
+                if classify_destination(sock.ip()) != DestClass::Blocked && !addrs.contains(&sock) {
+                    addrs.push(sock);
+                }
+            }
+            "relay" => {
+                let url = RelayUrl::from_str(val).map_err(|_| SkipReason::Invalid)?;
+                if relay_map.contains(&url) {
+                    if !relays.contains(&url) {
+                        relays.push(url);
+                    }
+                } else {
+                    dropped.push(val.to_owned());
+                }
+            }
+            _ => return Err(SkipReason::Invalid),
+        }
+    }
+    if relays.is_empty() {
+        relays = relay_map.to_vec();
+    }
+    if relays.is_empty() && addrs.is_empty() {
+        return Err(SkipReason::IrohRelayNotConfigured);
+    }
+    let parts = addrs
+        .into_iter()
+        .map(TransportAddr::Ip)
+        .chain(relays.into_iter().map(TransportAddr::Relay));
+    Ok((EndpointAddr::from_parts(id, parts), dropped))
+}
+
+/// Filters an `iroh://` (or `p2p:iroh://`) hint for the lookup-free hint dialer of `relay_mode`.
+///
+/// Keeps `relay=` URLs that are members of the relay map of `relay_mode` and `addr=` literals
+/// outside the always-blocked set. If no hint relay is in the map, every relay in the map is
+/// used. Fails with [`SkipReason::IrohRelayNotConfigured`] when the map is empty and no `addr=`
+/// survives, and with [`SkipReason::Invalid`] on a malformed hint.
+pub fn filter_p2p_hint(hint: &str, relay_mode: &P2pRelayMode) -> Result<P2pHintAddr, SkipReason> {
+    let map = relay_map_urls(relay_mode).map_err(|_| SkipReason::IrohRelayNotConfigured)?;
+    let (addr, dropped_relays) = filter_hint_addr(hint, &map)?;
+    Ok(P2pHintAddr {
+        endpoint: format_p2p_endpoint_with_addrs(&addr, true),
+        dropped_relays,
+    })
 }
 
 struct P2pConnDropper {
@@ -1026,6 +1170,11 @@ pub struct P2pDialer {
     write_timeout: Duration,
     allow_private_addrs: bool,
     trusted_relays: Vec<String>,
+    /// Relay map of a lookup-free hint dialer; `None` for every other dialer.
+    hint_relay_map: Option<Vec<RelayUrl>>,
+    /// Relay host names answered from their checked addresses ([`P2pOptions::with_dns_pins`]),
+    /// at bind and on every dial.
+    dns_pins: Vec<(String, Vec<IpAddr>)>,
 }
 
 fn configured_relay_urls(mode: &P2pRelayMode) -> Vec<String> {
@@ -1042,14 +1191,17 @@ fn configured_relay_urls(mode: &P2pRelayMode) -> Vec<String> {
 
 /// Resolves each relay URL host and rejects metadata and link-local addresses always, and
 /// private, loopback, or reserved addresses unless `allow_private_addrs` or the URL is trusted.
+/// A host named in `pins` is answered from its checked addresses without a lookup.
 ///
-/// Fails closed on a lookup error, a lookup timeout, or zero resolved addresses. The resolved
-/// addresses cannot be pinned into `iroh`, so a resolver that answers differently on the second
-/// lookup remains an accepted residual limit.
-async fn check_relay_hosts_post_dns(
+/// Fails closed on a lookup error, a lookup timeout, or zero resolved addresses. For a host
+/// without a DNS pin the resolved addresses cannot be pinned into `iroh`, so a resolver that
+/// answers differently on the second lookup remains an accepted residual limit; a pinned host
+/// is answered from its pin by this check and by `iroh`.
+async fn check_relay_hosts_pinned(
     relay_urls: &[String],
     allow_private_addrs: bool,
     trusted_relays: &[String],
+    pins: &[(String, Vec<IpAddr>)],
 ) -> Result<(), RuntimeError> {
     for raw in relay_urls {
         let parsed = url::Url::parse(raw)
@@ -1070,12 +1222,18 @@ async fn check_relay_hosts_post_dns(
         let port = parsed
             .port_or_known_default()
             .ok_or_else(|| RuntimeError::Protocol("iroh relay URL is missing a port".into()))?;
-        let resolved: Vec<SocketAddr> =
+        let shown = redact_host(bare);
+        let pinned = pinned_addrs(pins, bare)
+            .map(|ips| ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect());
+        let resolved: Vec<SocketAddr> = if let Some(addrs) = pinned {
+            addrs
+        } else {
             match timeout(RELAY_DNS_TIMEOUT, tokio::net::lookup_host((bare, port))).await {
                 Ok(Ok(iter)) => iter.collect(),
                 Ok(Err(err)) => {
                     return Err(RuntimeError::Protocol(format!(
-                        "iroh relay host '{bare}' failed to resolve: {err}"
+                        "iroh relay host '{shown}' failed to resolve: {}",
+                        redact_text(&err.to_string().replace(bare, &shown))
                     )));
                 }
                 Err(_) => {
@@ -1083,10 +1241,11 @@ async fn check_relay_hosts_post_dns(
                         "iroh relay host resolution timed out",
                     ));
                 }
-            };
+            }
+        };
         if resolved.is_empty() {
             return Err(RuntimeError::Protocol(format!(
-                "iroh relay host '{bare}' resolved to zero addresses"
+                "iroh relay host '{shown}' resolved to zero addresses"
             )));
         }
         for sock in resolved {
@@ -1095,12 +1254,119 @@ async fn check_relay_hosts_post_dns(
                 || (!allow_private_addrs && !trusted && super::is_private_or_reserved_ip(ip))
             {
                 return Err(RuntimeError::Protocol(format!(
-                    "iroh relay host '{bare}' resolved to forbidden address '{ip}'"
+                    "iroh relay host '{shown}' resolved to forbidden address '{ip}'"
                 )));
             }
         }
     }
     Ok(())
+}
+
+fn pinned_addrs<'a>(pins: &'a [(String, Vec<IpAddr>)], host: &str) -> Option<&'a [IpAddr]> {
+    let host = host.trim_end_matches('.');
+    pins.iter()
+        .find(|(h, _)| h.eq_ignore_ascii_case(host))
+        .map(|(_, ips)| ips.as_slice())
+}
+
+type DnsAnswer<T> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<iroh::dns::BoxIter<T>, iroh::dns::DnsError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+const PINNED_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Iroh DNS for an operator endpoint: pinned relay host names answer from the addresses the
+/// egress layer checked (one lookup per dial), other names resolve through the default
+/// resolver with always-blocked answers removed.
+#[derive(Debug)]
+struct PinnedDnsResolver {
+    pins: Vec<(String, Vec<IpAddr>)>,
+    inner: iroh::dns::DnsResolver,
+}
+
+impl PinnedDnsResolver {
+    fn answer<T: Send + 'static>(
+        &self,
+        host: String,
+        pick: fn(IpAddr) -> Option<T>,
+        v6: bool,
+    ) -> DnsAnswer<T> {
+        if let Some(ips) = pinned_addrs(&self.pins, &host) {
+            let out: Vec<T> = ips.iter().copied().filter_map(pick).collect();
+            return Box::pin(async move { Ok(Box::new(out.into_iter()) as iroh::dns::BoxIter<T>) });
+        }
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let ips: Vec<IpAddr> = if v6 {
+                inner
+                    .lookup_ipv6(host, PINNED_DNS_LOOKUP_TIMEOUT)
+                    .await?
+                    .collect()
+            } else {
+                inner
+                    .lookup_ipv4(host, PINNED_DNS_LOOKUP_TIMEOUT)
+                    .await?
+                    .collect()
+            };
+            let out: Vec<T> = ips
+                .into_iter()
+                .filter(|ip| classify_destination(*ip) != DestClass::Blocked)
+                .filter_map(pick)
+                .collect();
+            Ok(Box::new(out.into_iter()) as iroh::dns::BoxIter<T>)
+        })
+    }
+}
+
+impl iroh::dns::Resolver for PinnedDnsResolver {
+    fn lookup_ipv4(&self, host: String) -> DnsAnswer<std::net::Ipv4Addr> {
+        self.answer(
+            host,
+            |ip| match ip {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            },
+            false,
+        )
+    }
+
+    fn lookup_ipv6(&self, host: String) -> DnsAnswer<std::net::Ipv6Addr> {
+        self.answer(
+            host,
+            |ip| match ip {
+                IpAddr::V6(v6) => Some(v6),
+                IpAddr::V4(_) => None,
+            },
+            true,
+        )
+    }
+
+    fn lookup_txt(&self, host: String) -> DnsAnswer<iroh::dns::TxtRecordData> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let records: Vec<_> = inner
+                .lookup_txt(host, PINNED_DNS_LOOKUP_TIMEOUT)
+                .await?
+                .collect();
+            Ok(Box::new(records.into_iter()) as iroh::dns::BoxIter<_>)
+        })
+    }
+
+    fn clear_cache(&self) {
+        self.inner.clear_cache();
+    }
+
+    fn reset(&self) -> Box<dyn iroh::dns::Resolver> {
+        self.inner.reset();
+        Box::new(Self {
+            pins: self.pins.clone(),
+            inner: self.inner.clone(),
+        })
+    }
 }
 
 impl P2pDialer {
@@ -1119,6 +1385,14 @@ impl P2pDialer {
         .await
     }
 
+    /// Binds the lookup-free hint dialer for URI hints and stored routes
+    /// ([`P2pOptions::for_hint_dialer`]).
+    pub async fn bind_hint_dialer(
+        configured_mode: Option<P2pRelayMode>,
+    ) -> Result<Self, RuntimeError> {
+        Self::bind_with_options(P2pOptions::for_hint_dialer(configured_mode)).await
+    }
+
     /// Binds a client `iroh` endpoint configured with `relay_mode`.
     pub async fn bind(relay_mode: P2pRelayMode) -> Result<Self, RuntimeError> {
         Self::bind_with_options(P2pOptions::for_dialer(relay_mode)).await
@@ -1132,13 +1406,35 @@ impl P2pDialer {
         } else {
             configured_relay_urls(&options.relay_mode)
         };
+        let hint_relay_map = if options.hint_dialer {
+            Some(relay_map_urls(&options.relay_mode)?)
+        } else {
+            None
+        };
         let endpoint = build_iroh_endpoint(&options, Vec::new(), None).await?;
         Ok(Self {
             guard: EndpointGuard::new(endpoint),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             allow_private_addrs,
             trusted_relays,
+            hint_relay_map,
+            dns_pins: options.dns_pins,
         })
+    }
+
+    /// Returns `true` for a dialer built with [`P2pOptions::for_hint_dialer`].
+    #[must_use]
+    pub fn is_hint_dialer(&self) -> bool {
+        self.hint_relay_map.is_some()
+    }
+
+    /// Returns `true` when the endpoint has any address lookup service installed.
+    #[must_use]
+    pub fn uses_address_lookup(&self) -> bool {
+        self.guard
+            .endpoint
+            .address_lookup()
+            .is_ok_and(|services| !services.is_empty())
     }
 
     /// Overrides the per-write backpressure timeout.
@@ -1170,11 +1466,28 @@ impl PathDialer for P2pDialer {
     }
 
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
-        let addr =
-            parse_p2p_endpoint_trusting(endpoint, self.allow_private_addrs, &self.trusted_relays)?;
-        let relay_urls: Vec<String> = addr.relay_urls().map(ToString::to_string).collect();
-        check_relay_hosts_post_dns(&relay_urls, self.allow_private_addrs, &self.trusted_relays)
+        let addr = if let Some(map) = &self.hint_relay_map {
+            filter_hint_addr(endpoint, map)
+                .map_err(|reason| {
+                    RuntimeError::Protocol(format!("iroh hint is not dialable: {reason}"))
+                })?
+                .0
+        } else {
+            let addr = parse_p2p_endpoint_trusting(
+                endpoint,
+                self.allow_private_addrs,
+                &self.trusted_relays,
+            )?;
+            let relay_urls: Vec<String> = addr.relay_urls().map(ToString::to_string).collect();
+            check_relay_hosts_pinned(
+                &relay_urls,
+                self.allow_private_addrs,
+                &self.trusted_relays,
+                &self.dns_pins,
+            )
             .await?;
+            addr
+        };
         let conn = timeout(
             P2P_HANDSHAKE_TIMEOUT,
             self.guard.endpoint.connect(addr, TENDRIL_P2P_ALPN),
@@ -1205,8 +1518,16 @@ impl PathDialer for P2pDialer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    async fn check_relay_hosts_post_dns(
+        relay_urls: &[String],
+        allow_private_addrs: bool,
+        trusted_relays: &[String],
+    ) -> Result<(), RuntimeError> {
+        check_relay_hosts_pinned(relay_urls, allow_private_addrs, trusted_relays, &[]).await
+    }
 
     #[test]
     fn parse_p2p_endpoint_supports_ipv6_relay_and_rejects_unknown_params() {
@@ -1453,6 +1774,53 @@ mod tests {
         assert!(P2pOptions::for_endpoint(&uri, None, false).is_err());
     }
 
+    /// A dial whose relay host is pinned must pass the relay check without a system lookup
+    /// (`.invalid` never resolves), then wait on the connect: no relay listens there.
+    pub(crate) async fn assert_pinned_dial_skips_lookup(
+        dial: impl std::future::Future<Output = Result<Box<dyn PathStream>, RuntimeError>>,
+    ) {
+        match timeout(Duration::from_secs(3), dial).await {
+            Err(_) => {}
+            Ok(Err(err)) => assert!(!err.to_string().contains("resolve"), "{err}"),
+            Ok(Ok(_)) => panic!("no relay listens on the pinned address"),
+        }
+    }
+
+    pub(crate) const PINNED_RELAY: &str = "pinned-relay.invalid";
+
+    #[tokio::test]
+    async fn dial_answers_pinned_relay_hosts_without_a_lookup() {
+        let ep_id = iroh::SecretKey::from_bytes(&[29u8; 32]).public();
+        let uri = format!("iroh://{ep_id}?relay=https://{PINNED_RELAY}/");
+        let opts = P2pOptions::for_endpoint(&uri, None, true)
+            .expect("derive")
+            .with_dns_pins(vec![(
+                PINNED_RELAY.to_owned(),
+                vec![IpAddr::from([127, 0, 0, 1])],
+            )]);
+        let dialer = P2pDialer::bind_with_options(opts).await.expect("bind");
+        assert_pinned_dial_skips_lookup(dialer.dial(&uri)).await;
+        dialer.close().await;
+    }
+
+    #[tokio::test]
+    async fn relay_host_errors_never_echo_a_raw_host() {
+        let unresolvable = vec!["https://x;tok=s3cret.invalid/".to_owned()];
+        let pinned_bad = vec!["https://p;s3cret/".to_owned()];
+        let pins = [("p;s3cret".to_owned(), vec![IpAddr::from([10, 0, 0, 1])])];
+        let errs = [
+            check_relay_hosts_post_dns(&unresolvable, true, &[]).await,
+            check_relay_hosts_pinned(&pinned_bad, false, &[], &pins).await,
+            reject_private_relay_host(
+                &url::Url::parse("https://x;s3cret.localhost/").expect("url"),
+            ),
+        ];
+        for err in errs {
+            let text = err.expect_err("refused").to_string();
+            assert!(!text.contains("s3cret"), "{text}");
+        }
+    }
+
     #[tokio::test]
     async fn post_dns_relay_check_fails_closed_on_unresolvable_or_empty_hosts() {
         let unresolvable = vec!["https://relay-host.invalid/".to_owned()];
@@ -1481,5 +1849,33 @@ mod tests {
             P2pDialer::bind_with_options(opts).await,
             Err(RuntimeError::Protocol(m)) if m.contains("peer URI")
         ));
+    }
+
+    #[tokio::test]
+    async fn pinned_dns_answers_pinned_relays_only_from_checked_addresses() {
+        let pinned = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));
+        let resolver = iroh::dns::DnsResolver::custom(PinnedDnsResolver {
+            pins: vec![("relay.example".to_owned(), vec![pinned])],
+            inner: iroh::dns::DnsResolver::new(),
+        });
+        let v4: Vec<IpAddr> = resolver
+            .lookup_ipv4("Relay.Example.", Duration::from_secs(1))
+            .await
+            .expect("pinned")
+            .collect();
+        assert_eq!(v4, vec![pinned]);
+        let v6: Vec<IpAddr> = resolver
+            .lookup_ipv6("relay.example", Duration::from_secs(1))
+            .await
+            .expect("pinned")
+            .collect();
+        assert!(v6.is_empty());
+        assert_eq!(
+            pinned_addrs(
+                &[("relay.example".to_owned(), vec![pinned])],
+                "other.example"
+            ),
+            None
+        );
     }
 }

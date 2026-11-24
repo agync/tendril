@@ -9,6 +9,7 @@ use crate::group::{
     GROUP_RENDEZVOUS_FRAME_LEN, GroupSeq, MAX_GROUP_MANIFEST_LEN, validate_group_seqs,
 };
 use crate::identity::RotationRecord;
+use crate::routes::MAX_ROUTE_SEQ;
 
 /// Fixed Noise protocol pattern for Tendril v1 and v2.
 pub const NOISE_PATTERN: &str = "Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256";
@@ -234,6 +235,8 @@ pub enum InnerFrameType {
     GroupManifest = 0x0A,
     /// Group rendezvous key delivery (`0x0B`), exactly 60 bytes.
     GroupRendezvous = 0x0B,
+    /// Host-signed route set (`0x0C`), responder to initiator only; decoded by `routes::RouteSet`.
+    RouteSet = 0x0C,
 }
 
 impl TryFrom<u8> for InnerFrameType {
@@ -252,6 +255,7 @@ impl TryFrom<u8> for InnerFrameType {
             0x09 => Ok(Self::Padded),
             0x0A => Ok(Self::GroupManifest),
             0x0B => Ok(Self::GroupRendezvous),
+            0x0C => Ok(Self::RouteSet),
             other => Err(CoreError::UnknownInnerFrameType(other)),
         }
     }
@@ -292,7 +296,10 @@ pub(crate) fn validate_inner_payload(
     payload: &[u8],
 ) -> Result<(), CoreError> {
     match kind {
-        InnerFrameType::Data | InnerFrameType::Grant | InnerFrameType::Revocation => {
+        InnerFrameType::Data
+        | InnerFrameType::Grant
+        | InnerFrameType::Revocation
+        | InnerFrameType::RouteSet => {
             if payload.len() > MAX_APP_DATA_LEN {
                 return Err(CoreError::FrameTooLarge {
                     len: 1 + payload.len(),
@@ -398,10 +405,30 @@ pub struct SessionHello {
         deserialize_with = "deserialize_groups"
     )]
     pub groups: Option<Vec<GroupSeq>>,
+    /// Initiator opt-in to `0x0C ROUTE_SET`: the last host route sequence it applied (`0..=2^53-1`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_route_seq"
+    )]
+    pub route_seq: Option<u64>,
 }
 
 fn groups_is_unset(groups: &Option<Vec<GroupSeq>>) -> bool {
     groups.as_ref().is_none_or(Vec::is_empty)
+}
+
+fn deserialize_route_seq<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let seq = u64::deserialize(deserializer)?;
+    if seq > MAX_ROUTE_SEQ {
+        return Err(serde::de::Error::custom(
+            "route_seq must be at most 2^53 - 1",
+        ));
+    }
+    Ok(Some(seq))
 }
 
 fn deserialize_groups<'de, D>(deserializer: D) -> Result<Option<Vec<GroupSeq>>, D::Error>
@@ -796,5 +823,66 @@ mod tests {
                 max: MAX_READ_BUFFER_LEN
             })
         );
+    }
+
+    #[test]
+    fn route_set_tag_applies_only_the_generic_bound() {
+        assert_eq!(
+            InnerFrameType::try_from(0x0C).unwrap(),
+            InnerFrameType::RouteSet
+        );
+        assert_eq!(
+            InnerFrameType::try_from(0x0D),
+            Err(CoreError::UnknownInnerFrameType(0x0D))
+        );
+        for len in [0usize, 1, 3_454, 5_004, MAX_APP_DATA_LEN] {
+            let payload = vec![0xA5; len];
+            let enc = encode_inner_frame(InnerFrameType::RouteSet, &payload).unwrap();
+            let (kind, body) = decode_inner_frame(&enc).unwrap();
+            assert_eq!(kind, InnerFrameType::RouteSet);
+            assert_eq!(body.len(), len);
+        }
+        assert_eq!(
+            encode_inner_frame(InnerFrameType::RouteSet, &vec![0; MAX_APP_DATA_LEN + 1]),
+            Err(CoreError::FrameTooLarge {
+                len: MAX_TRANSPORT_PLAINTEXT + 1,
+                max: MAX_TRANSPORT_PLAINTEXT
+            })
+        );
+    }
+
+    #[test]
+    fn session_hello_route_seq_field_rules() {
+        let base = SessionHello {
+            device_id: "dev_0123456789abcdef".to_string(),
+            grant: None,
+            crl_seq: None,
+            groups: None,
+            route_seq: None,
+        };
+        let json = serde_json::to_string(&base).unwrap();
+        assert!(!json.contains("route_seq"));
+        assert_eq!(serde_json::from_str::<SessionHello>(&json).unwrap(), base);
+
+        for seq in [0, 7, MAX_ROUTE_SEQ] {
+            let with = SessionHello {
+                route_seq: Some(seq),
+                ..base.clone()
+            };
+            let text = serde_json::to_string(&with).unwrap();
+            assert!(text.contains(&format!("\"route_seq\":{seq}")));
+            assert_eq!(serde_json::from_str::<SessionHello>(&text).unwrap(), with);
+        }
+
+        let parse = |seq: serde_json::Value| {
+            serde_json::from_value::<SessionHello>(serde_json::json!({
+                "device_id": "dev_0123456789abcdef",
+                "route_seq": seq
+            }))
+        };
+        assert!(parse(serde_json::json!(MAX_ROUTE_SEQ + 1)).is_err());
+        assert!(parse(serde_json::json!(null)).is_err());
+        assert!(parse(serde_json::json!(-1)).is_err());
+        assert!(parse(serde_json::json!("5")).is_err());
     }
 }

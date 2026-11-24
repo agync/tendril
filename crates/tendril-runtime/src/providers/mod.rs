@@ -2,6 +2,8 @@
 
 pub mod broker;
 pub mod direct;
+pub mod egress;
+pub mod hints;
 pub mod local;
 pub mod overlay;
 #[cfg(feature = "p2p-iroh")]
@@ -21,7 +23,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tendril_core::policy::ProviderId;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, lookup_host};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -31,9 +33,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async_tls_with_c
 
 use crate::error::RuntimeError;
 use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, PathWriter};
+use crate::redact::{redact_text, redact_url_str};
 
 pub use broker::{BrokerDialer, BrokerListener, BrokerServerConfig};
 pub use direct::{DirectDialer, DirectListener};
+pub use egress::{
+    AddrPolicy, CheckedHint, DefaultAddrPolicy, DestClass, EgressAddrPolicy, EgressContext,
+    EgressDialer, EgressKind, HintSource, HostResolver, SkipReason, SkippedHint, SystemResolver,
+    check_hint, classify_destination, path_class,
+};
 pub use local::{LocalDialer, LocalListener};
 pub use overlay::{
     OverlayConfig, OverlayDialer, OverlayHelperDialer, OverlayHelperListener, OverlayListener,
@@ -41,10 +49,10 @@ pub use overlay::{
 };
 #[cfg(feature = "p2p-iroh")]
 pub use p2p::{
-    MAX_P2P_CUSTOM_RELAYS, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode,
-    TENDRIL_P2P_ALPN, extract_p2p_relay_urls_from_endpoint, format_p2p_endpoint,
-    format_p2p_endpoint_with_addrs, parse_p2p_endpoint, parse_p2p_endpoint_filtered,
-    parse_p2p_relay_mode, parse_p2p_relay_modes,
+    MAX_P2P_CUSTOM_RELAYS, P2pDialer, P2pHintAddr, P2pListener, P2pOptions, P2pRelayAuth,
+    P2pRelayMode, TENDRIL_P2P_ALPN, extract_p2p_relay_urls_from_endpoint, filter_p2p_hint,
+    format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_endpoint,
+    parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
 };
 pub use relay::{EmbeddedRelay, RelayClientAuth, RelayDialer, RelayListener};
 pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};
@@ -584,40 +592,22 @@ fn validate_url_host_safety(parsed: &url::Url) -> Result<&str, RuntimeError> {
     Ok(bare)
 }
 
-/// Resolves `parsed_url`'s host once, rejects any resolved cloud-metadata, link-local, or
-/// unspecified address unless `allow_metadata`, then connects TCP directly to a verified
-/// [`std::net::SocketAddr`] so a rebinding resolver cannot swap the address after validation.
+/// Resolves `parsed_url`'s host once through `policy`'s resolver, checks every answer with
+/// `policy`, then connects TCP directly to a checked [`std::net::SocketAddr`] so a rebinding
+/// resolver cannot swap the address after validation. The URL is not rewritten: callers keep
+/// the original authority for TLS SNI, certificate verification and the `Host` header.
 pub(crate) async fn resolve_ws_tcp_stream(
     parsed_url: &url::Url,
-    allow_metadata: bool,
+    policy: &dyn AddrPolicy,
 ) -> Result<TcpStream, RuntimeError> {
     let host = parsed_url
         .host_str()
         .filter(|h| !h.is_empty())
         .ok_or_else(|| RuntimeError::Protocol("URL is missing a host".into()))?;
-    let bare = strip_host_brackets(host).trim_end_matches('.');
-    if bare.is_empty() {
-        return Err(RuntimeError::Protocol("URL is missing a host".into()));
-    }
     let port = parsed_url
         .port_or_known_default()
         .ok_or_else(|| RuntimeError::Protocol("URL is missing a port".into()))?;
-    let addrs: Vec<std::net::SocketAddr> = lookup_host((bare, port)).await?.collect();
-    if addrs.is_empty() {
-        return Err(RuntimeError::Protocol(format!(
-            "host '{bare}' resolved to zero addresses"
-        )));
-    }
-    if !allow_metadata {
-        for addr in &addrs {
-            if is_metadata_or_link_local_ip(addr.ip()) {
-                return Err(RuntimeError::Protocol(format!(
-                    "resolved metadata or link-local address '{}' is not permitted",
-                    addr.ip()
-                )));
-            }
-        }
-    }
+    let addrs = egress::resolve_checked(host, port, policy).await?;
     let mut last_err = None;
     for addr in addrs {
         match TcpStream::connect(addr).await {
@@ -636,6 +626,9 @@ pub(crate) async fn resolve_ws_tcp_stream(
 
 /// Opens a WebSocket to `request` over a pre-validated TCP stream from [`resolve_ws_tcp_stream`],
 /// keeping the original hostname for TLS SNI and certificate verification.
+///
+/// The address policy is the one scoped by [`egress::with_addr_policy`] (as
+/// [`EgressDialer`] does around a dial), else [`DefaultAddrPolicy`].
 pub(crate) async fn connect_ws_resolved<R>(
     request: R,
     config: Option<WebSocketConfig>,
@@ -650,15 +643,27 @@ pub(crate) async fn connect_ws_resolved<R>(
 where
     R: IntoClientRequest + Unpin,
 {
-    let request = request
-        .into_client_request()
-        .map_err(|err| RuntimeError::Protocol(format!("{label}: invalid request: {err}")))?;
-    let parsed = url::Url::parse(&request.uri().to_string())
-        .map_err(|err| RuntimeError::Protocol(format!("{label}: invalid URL: {err}")))?;
-    let tcp = resolve_ws_tcp_stream(&parsed, false).await?;
+    let request = request.into_client_request().map_err(|err| {
+        RuntimeError::Protocol(format!(
+            "{label}: invalid request: {}",
+            redact_text(&err.to_string())
+        ))
+    })?;
+    let parsed = url::Url::parse(&request.uri().to_string()).map_err(|err| {
+        RuntimeError::Protocol(format!(
+            "{label}: invalid URL: {}",
+            redact_text(&err.to_string())
+        ))
+    })?;
+    let tcp = match egress::scoped_addr_policy() {
+        Some(policy) => resolve_ws_tcp_stream(&parsed, &*policy).await?,
+        None => resolve_ws_tcp_stream(&parsed, &DefaultAddrPolicy).await?,
+    };
     client_async_tls_with_config(request, tcp, config, None)
         .await
-        .map_err(|err| RuntimeError::Protocol(format!("{label} failed: {err}")))
+        .map_err(|err| {
+            RuntimeError::Protocol(format!("{label} failed: {}", redact_text(&err.to_string())))
+        })
 }
 
 /// Validates a WebSocket relay URL (`ws` or `wss`).
@@ -673,14 +678,19 @@ pub(crate) fn validate_ws_url(
     }
     let trimmed = url_str.trim();
     let parsed = url::Url::parse(trimmed).map_err(|err| {
-        RuntimeError::Protocol(format!("invalid websocket URL '{url_str}': {err}"))
+        RuntimeError::Protocol(format!(
+            "invalid websocket URL {}: {}",
+            redact_url_str(url_str),
+            redact_text(&err.to_string())
+        ))
     })?;
     let is_cleartext = match parsed.scheme() {
         "wss" => false,
         "ws" => true,
         other => {
             return Err(RuntimeError::Protocol(format!(
-                "unsupported websocket scheme '{other}'"
+                "unsupported websocket scheme '{}'",
+                redact_text(other)
             )));
         }
     };
@@ -718,7 +728,8 @@ pub(crate) fn validate_broker_ws_url(
                 .is_some_and(|s| s.eq_ignore_ascii_case("wss://"));
         if !is_ws {
             return Err(RuntimeError::Protocol(format!(
-                "broker endpoint must use broker+ws(s):// or ws(s)://: '{url_str}'"
+                "broker endpoint must use broker+ws(s):// or ws(s)://: {}",
+                redact_url_str(url_str)
             )));
         }
         return validate_ws_url(rest, allow_insecure_ws);
@@ -736,7 +747,11 @@ pub(crate) fn validate_iroh_relay_url(url_str: &str) -> Result<url::Url, Runtime
     }
     let trimmed = url_str.trim();
     let parsed = url::Url::parse(trimmed).map_err(|err| {
-        RuntimeError::Protocol(format!("invalid iroh relay URL '{url_str}': {err}"))
+        RuntimeError::Protocol(format!(
+            "invalid iroh relay URL {}: {}",
+            redact_url_str(url_str),
+            redact_text(&err.to_string())
+        ))
     })?;
     if parsed.query().is_some() {
         return Err(RuntimeError::Protocol(
@@ -748,7 +763,8 @@ pub(crate) fn validate_iroh_relay_url(url_str: &str) -> Result<url::Url, Runtime
         "http" => true,
         other => {
             return Err(RuntimeError::Protocol(format!(
-                "unsupported iroh relay URL scheme '{other}'"
+                "unsupported iroh relay URL scheme '{}'",
+                redact_text(other)
             )));
         }
     };
@@ -776,22 +792,29 @@ mod tests {
             "ws://0.0.0.0:9/",
             "ws://169.254.169.254:80/",
         ] {
-            let err = resolve_ws_tcp_stream(&ws_url(raw), false)
+            let err = resolve_ws_tcp_stream(&ws_url(raw), &DefaultAddrPolicy)
                 .await
                 .expect_err("metadata or link-local must be rejected");
-            assert!(
-                matches!(&err, RuntimeError::Protocol(msg) if msg.contains("not permitted")),
+            assert_eq!(
+                err.skip_reason(),
+                Some(egress::SkipReason::BlockedAddress),
                 "{raw}: {err:?}"
             );
+            assert!(err.to_string().contains("not permitted"), "{raw}: {err}");
         }
     }
 
     #[tokio::test]
     async fn resolve_ws_tcp_stream_rejects_empty_host_after_dot_trim() {
-        let err = resolve_ws_tcp_stream(&ws_url("ws://./"), false)
+        let err = resolve_ws_tcp_stream(&ws_url("ws://./"), &DefaultAddrPolicy)
             .await
             .expect_err("empty host");
-        assert!(matches!(&err, RuntimeError::Protocol(m) if m.contains("missing a host")));
+        assert_eq!(
+            err.skip_reason(),
+            Some(egress::SkipReason::Invalid),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("missing a host"), "{err}");
     }
 
     #[tokio::test]
@@ -801,9 +824,12 @@ mod tests {
             .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let accept = tokio::spawn(async move { listener.accept().await.is_ok() });
-        let stream = resolve_ws_tcp_stream(&ws_url(&format!("ws://localhost:{port}/")), false)
-            .await
-            .expect("loopback stays permitted");
+        let stream = resolve_ws_tcp_stream(
+            &ws_url(&format!("ws://localhost:{port}/")),
+            &DefaultAddrPolicy,
+        )
+        .await
+        .expect("loopback stays permitted");
         assert!(stream.peer_addr().expect("peer").ip().is_loopback());
         assert!(accept.await.expect("join"));
     }
@@ -813,6 +839,6 @@ mod tests {
         let err = connect_ws_resolved("ws://[fe80::1]:9/", None, "test connect")
             .await
             .expect_err("link-local relay must fail closed");
-        assert!(matches!(err, RuntimeError::Protocol(_)));
+        assert_eq!(err.skip_reason(), Some(egress::SkipReason::BlockedAddress));
     }
 }

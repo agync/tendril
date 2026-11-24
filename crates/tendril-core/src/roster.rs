@@ -19,6 +19,14 @@ use crate::grants::{
 use crate::identity::{
     EndpointIdentity, RotationRecord, format_rfc3339_utc, verify_rotation_chain,
 };
+use crate::identity::{detect_rotation_fork, verify_rotation_record};
+use crate::pairing::{
+    AnnouncedRouteSet, LocalRouteState, MAX_PAIRING_ENDPOINT_HINT_LEN, PersistPlan, RoutePolicy,
+    VerifiedRouteStatement, announce_rank, is_ipc_hint, is_v2_relay_hint,
+    is_valid_pairing_endpoint_hint, provider_of_valid_hint,
+};
+use crate::policy::ProviderId;
+use crate::routes::{MAX_ROUTE_SEQ, RouteSet};
 use crate::wire::{WIRE_VERSION, WIRE_VERSION_V2};
 
 fn default_min_wire_version() -> u8 {
@@ -153,6 +161,16 @@ pub struct RosterEntry {
     pub min_wire_version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v2_secrets: Option<V2PeerSecrets>,
+    /// Day-2 routes, unique per `(hint, source)`. Legacy `relay_hints` are never dialed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<StoredRoute>,
+    /// Freshness of the `signed` routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_meta: Option<RouteMeta>,
+    /// The `signed` hints an explicit approval wrote; only these are protected from
+    /// equal-sequence displacement while `route_meta.origin` is `Approved`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    approved_signed: Vec<String>,
 }
 
 impl RosterEntry {
@@ -173,6 +191,322 @@ impl RosterEntry {
         Ok((static_pub, signing_pub))
     }
 }
+
+impl RosterEntry {
+    /// Hints of the stored routes from `source`, in stored order.
+    pub fn routes_from(&self, source: RouteSource) -> impl Iterator<Item = &str> {
+        self.routes
+            .iter()
+            .filter(move |r| r.source == source)
+            .map(|r| r.hint.as_str())
+    }
+
+    /// The `SessionHello.route_seq` a client sends to this host under `policy`.
+    ///
+    /// `None` unless the policy is `AllSigned` and the entry holds `route_meta`. The stored
+    /// sequence for `Session` and `Approved` metadata, `0` for metadata from a URI.
+    #[must_use]
+    pub fn hello_route_seq(&self, policy: RoutePolicy) -> Option<u64> {
+        if policy != RoutePolicy::AllSigned {
+            return None;
+        }
+        self.route_meta.map(|m| match m.origin {
+            RouteOrigin::Session | RouteOrigin::Approved => m.seq,
+            RouteOrigin::Uri => 0,
+        })
+    }
+
+    fn hints_from(&self, source: RouteSource) -> Vec<String> {
+        self.routes_from(source).map(str::to_owned).collect()
+    }
+
+    /// The explicitly approved `signed` hints protected at an equal sequence.
+    #[must_use]
+    pub fn approved_signed_routes(&self) -> &[String] {
+        &self.approved_signed
+    }
+
+    /// Replaces the `signed` routes with a set that was not explicitly approved.
+    fn replace_signed_unapproved(&mut self, hints: Vec<String>) {
+        self.approved_signed.clear();
+        self.replace_source(RouteSource::Signed, hints);
+    }
+
+    fn replace_source(&mut self, source: RouteSource, hints: Vec<String>) {
+        self.routes.retain(|r| r.source != source);
+        for hint in hints {
+            if !self.has_route(&hint, source) {
+                self.routes.push(StoredRoute { hint, source });
+            }
+        }
+    }
+
+    fn has_route(&self, hint: &str, source: RouteSource) -> bool {
+        self.routes
+            .iter()
+            .any(|r| r.source == source && r.hint == hint)
+    }
+}
+
+/// Who authorized a stored route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteSource {
+    /// Typed by the local operator or developer.
+    Operator,
+    /// Listed in a verified host route statement or route set.
+    Signed,
+    /// The route that carried an unsigned pairing commit, kept on opt-in.
+    Committed,
+}
+
+impl RouteSource {
+    /// Snake-case spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Signed => "signed",
+            Self::Committed => "committed",
+        }
+    }
+
+    const fn cap(self) -> usize {
+        match self {
+            Self::Operator => MAX_OPERATOR_ROUTES,
+            Self::Signed => MAX_SIGNED_ROUTES,
+            Self::Committed => MAX_COMMITTED_ROUTES,
+        }
+    }
+}
+
+/// One persisted Day-2 route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRoute {
+    pub hint: String,
+    pub source: RouteSource,
+}
+
+/// Where the current `signed` routes came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteOrigin {
+    /// A signed pairing URI.
+    Uri,
+    /// A `0x0C ROUTE_SET` announcement.
+    Session,
+    /// An explicitly approved stale or equal-sequence URI.
+    Approved,
+}
+
+/// High-water mark of the `signed` routes. `seq` never decreases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteMeta {
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at: Option<u64>,
+    pub origin: RouteOrigin,
+}
+
+/// Maximum `operator` routes per peer.
+pub const MAX_OPERATOR_ROUTES: usize = 6;
+/// Maximum `signed` routes per peer.
+pub const MAX_SIGNED_ROUTES: usize = 6;
+/// Maximum `committed` routes per peer.
+pub const MAX_COMMITTED_ROUTES: usize = 1;
+/// Maximum stored routes per peer across all sources.
+pub const MAX_STORED_ROUTES: usize = MAX_OPERATOR_ROUTES + MAX_SIGNED_ROUTES + MAX_COMMITTED_ROUTES;
+
+/// A normalized operator endpoint for [`Roster::set_routes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorEndpoint {
+    /// Normalized hint, persisted as an `operator` route.
+    pub hint: String,
+    /// Ed25519 relay mailbox key from a `URL#key` input; checked against the pin, never stored.
+    pub relay_key: Option<[u8; 32]>,
+}
+
+/// Result of [`Roster::merge_pair_plan`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PairMergeOutcome {
+    /// Plan routes stored after the merge.
+    pub persisted: Vec<StoredRoute>,
+    /// `stale_route_seq` when the plan's `rq` was below the high-water mark, else the plan's
+    /// own reason.
+    pub reason: Option<&'static str>,
+}
+
+/// Why [`Roster::apply_route_announcement`] ignored a route set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteSetIgnored {
+    PeerInactive,
+    KeyMismatch,
+    BadSignature,
+    FutureIssuedAt,
+    StaleSeq,
+}
+
+impl RouteSetIgnored {
+    /// Snake-case reason recorded as `route_set_ignored{reason}`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerInactive => "peer_inactive",
+            Self::KeyMismatch => "key_mismatch",
+            Self::BadSignature => "bad_signature",
+            Self::FutureIssuedAt => "future_issued_at",
+            Self::StaleSeq => "stale_seq",
+        }
+    }
+}
+
+/// Result of [`Roster::apply_route_announcement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteSetOutcome {
+    /// The set replaced the `signed` routes.
+    Applied {
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
+    Ignored(RouteSetIgnored),
+}
+
+/// Largest accepted `issued_at` lead over the local clock (clock-skew bound, not replay).
+pub const MAX_ROUTE_SET_FUTURE_SECS: u64 = 86_400;
+
+/// The pinned keys of one entry when a Day-2 connect started, taken by [`Roster::pin_snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinSnapshot {
+    peer_id: String,
+    static_pub: [u8; 32],
+    signing_pub: HybridSigningPublicKey,
+    rotation_seq: u64,
+    min_wire_version: u8,
+    route_meta: Option<RouteMeta>,
+}
+
+impl PinSnapshot {
+    /// The roster key this snapshot was taken of.
+    #[must_use]
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+
+    #[must_use]
+    pub const fn static_pub(&self) -> &[u8; 32] {
+        &self.static_pub
+    }
+
+    #[must_use]
+    pub const fn signing_pub(&self) -> &HybridSigningPublicKey {
+        &self.signing_pub
+    }
+
+    #[must_use]
+    pub const fn rotation_seq(&self) -> u64 {
+        self.rotation_seq
+    }
+
+    #[must_use]
+    pub const fn min_wire_version(&self) -> u8 {
+        self.min_wire_version
+    }
+
+    #[must_use]
+    pub const fn route_meta(&self) -> Option<RouteMeta> {
+        self.route_meta
+    }
+}
+
+fn invalid_route(msg: &str) -> CoreError {
+    CoreError::InvalidPairingUri(msg.to_owned())
+}
+
+/// Validation of one route for `entry`.
+fn validate_route(hint: &str, source: RouteSource, entry: &RosterEntry) -> Result<(), CoreError> {
+    if hint.len() > MAX_PAIRING_ENDPOINT_HINT_LEN
+        || hint.contains('#')
+        || !is_valid_pairing_endpoint_hint(hint)
+    {
+        return Err(invalid_route("invalid route hint"));
+    }
+    if is_ipc_hint(hint) && source != RouteSource::Operator {
+        return Err(invalid_route("IPC routes are operator-only"));
+    }
+    if is_v2_relay_hint(hint) {
+        match source {
+            RouteSource::Committed => {
+                return Err(invalid_route("/v2/relay cannot be a committed route"));
+            }
+            RouteSource::Operator if entry.v2_secrets.is_none() => {
+                return Err(invalid_route(
+                    "/v2/relay route needs a Wire v2 pairing with this peer",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Validates, deduplicates and caps a full replacement list for one source.
+fn checked_source_list(
+    hints: impl IntoIterator<Item = String>,
+    source: RouteSource,
+    entry: &RosterEntry,
+) -> Result<Vec<String>, CoreError> {
+    let mut out: Vec<String> = Vec::new();
+    for hint in hints {
+        validate_route(&hint, source, entry)?;
+        if !out.contains(&hint) {
+            out.push(hint);
+        }
+    }
+    if out.len() > source.cap() {
+        return Err(CoreError::InvalidPairingUri(format!(
+            "at most {} {} routes",
+            source.cap(),
+            source.as_str()
+        )));
+    }
+    Ok(out)
+}
+
+/// Applies the route caps to an equal-sequence union: `protected` routes are always kept, then the
+/// best-ranked of `others` while two per provider and six in total allow.
+fn cap_signed_union(protected: Vec<String>, others: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut per_provider: BTreeMap<ProviderId, usize> = BTreeMap::new();
+    for hint in protected {
+        if out.len() < MAX_SIGNED_ROUTES && !out.contains(&hint) {
+            *per_provider
+                .entry(provider_of_valid_hint(&hint))
+                .or_default() += 1;
+            out.push(hint);
+        }
+    }
+    let mut ranked: Vec<(usize, String)> = others.into_iter().enumerate().collect();
+    ranked.sort_by_key(|(i, h)| (announce_rank(h), *i));
+    for (_, hint) in ranked {
+        if out.len() >= MAX_SIGNED_ROUTES {
+            break;
+        }
+        if out.contains(&hint) {
+            continue;
+        }
+        let count = per_provider
+            .entry(provider_of_valid_hint(&hint))
+            .or_default();
+        if *count >= MAX_ANNOUNCED_PER_PROVIDER {
+            continue;
+        }
+        *count += 1;
+        out.push(hint);
+    }
+    out
+}
+
+const MAX_ANNOUNCED_PER_PROVIDER: usize = crate::pairing::MAX_ANNOUNCED_HINTS_PER_PROVIDER;
 
 fn signing_keys_share_identity(a: &HybridSigningPublicKey, b: &HybridSigningPublicKey) -> bool {
     a == b || a.ed25519_bytes() == b.ed25519_bytes()
@@ -206,6 +540,12 @@ pub struct Roster {
     trust_anchors: BTreeMap<String, TrustAnchor>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     burned_enrollment_nonces: BTreeMap<String, u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::pairing::deserialize_local_routes"
+    )]
+    local_routes: Option<Box<LocalRouteState>>,
     #[serde(skip)]
     signing_hash_pins: BTreeMap<String, [u8; 32]>,
     #[serde(skip)]
@@ -311,6 +651,37 @@ impl Roster {
         }
         entry.signing_pub = Some(presented.clone());
         Ok(())
+    }
+
+    /// The host's published announced route set, if any.
+    #[must_use]
+    pub fn local_routes(&self) -> Option<&LocalRouteState> {
+        self.local_routes.as_deref()
+    }
+
+    /// Publishes `set` as the host's announced route set `C(seq)`.
+    ///
+    /// An unchanged set returns the stored state. A changed (or first) set takes the next
+    /// sequence (first value `1`) and `issued_at = now_unix`. The caller persists the roster
+    /// before signing or sending anything. A changed set at `seq = 2^53-1` fails with
+    /// `ProtocolViolation("route sequence exhausted")` and changes nothing.
+    pub fn bump_local_routes(
+        &mut self,
+        set: &AnnouncedRouteSet,
+        now_unix: u64,
+    ) -> Result<LocalRouteState, CoreError> {
+        let digest = LocalRouteState::digest_of(set.routes());
+        let next_seq = match &self.local_routes {
+            Some(state) if *state.digest() == digest => return Ok(LocalRouteState::clone(state)),
+            Some(state) if state.seq() >= MAX_ROUTE_SEQ => {
+                return Err(CoreError::ProtocolViolation("route sequence exhausted"));
+            }
+            Some(state) => state.seq() + 1,
+            None => 1,
+        };
+        let state = LocalRouteState::new(next_seq, now_unix, set.routes().to_vec());
+        self.local_routes = Some(Box::new(state.clone()));
+        Ok(state)
     }
 
     /// Looks up an entry by roster key (`host_id` or `device_id`).
@@ -440,6 +811,9 @@ impl Roster {
             relay_hints,
             min_wire_version: WIRE_VERSION,
             v2_secrets: None,
+            routes: Vec::new(),
+            route_meta: None,
+            approved_signed: Vec::new(),
         };
         self.entries.insert(host_id.clone(), entry);
         Ok(&self.entries[&host_id])
@@ -505,6 +879,9 @@ impl Roster {
             relay_hints,
             min_wire_version: WIRE_VERSION,
             v2_secrets: None,
+            routes: Vec::new(),
+            route_meta: None,
+            approved_signed: Vec::new(),
         };
         self.entries.insert(host_id.clone(), entry);
         Ok(&self.entries[&host_id])
@@ -611,6 +988,9 @@ impl Roster {
             relay_hints: Vec::new(),
             min_wire_version: WIRE_VERSION,
             v2_secrets: None,
+            routes: Vec::new(),
+            route_meta: None,
+            approved_signed: Vec::new(),
         };
         self.entries.insert(id.clone(), entry);
         Ok(&self.entries[&id])
@@ -1357,6 +1737,9 @@ impl Roster {
             relay_hints: Vec::new(),
             min_wire_version: WIRE_VERSION,
             v2_secrets: None,
+            routes: Vec::new(),
+            route_meta: None,
+            approved_signed: Vec::new(),
         };
         self.entries.insert(id.clone(), entry);
         Ok(&self.entries[&id])
@@ -1418,6 +1801,494 @@ impl Roster {
             return Ok(None);
         }
         self.mint_crl_update(issuer, None, now_unix).map(Some)
+    }
+}
+
+/// Day-2 routes, route metadata and session authorization.
+impl Roster {
+    fn entry_mut(&mut self, peer_id: &str) -> Result<&mut RosterEntry, CoreError> {
+        self.entries
+            .get_mut(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))
+    }
+
+    fn require_active(&self, peer_id: &str) -> Result<&RosterEntry, CoreError> {
+        let entry = self
+            .entries
+            .get(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+        match entry.state {
+            PeerState::Pending => Err(CoreError::PeerPending(peer_id.to_string())),
+            PeerState::Revoked => Err(CoreError::PeerRevoked(peer_id.to_string())),
+            PeerState::Active if self.crl_revokes_entry(entry) => {
+                Err(CoreError::PeerRevoked(peer_id.to_string()))
+            }
+            PeerState::Active => Ok(entry),
+        }
+    }
+
+    /// `SHA-256` of the entry's pinned signing key, or its in-memory hash pin.
+    fn pinned_signing_hash(&self, peer_id: &str, entry: &RosterEntry) -> Option<[u8; 32]> {
+        entry
+            .signing_pub
+            .as_ref()
+            .map(HybridSigningPublicKey::sha256_hash)
+            .or_else(|| self.signing_hash_pins.get(peer_id).copied())
+    }
+
+    /// Fails with `HostKeyUnverified` unless `(k, sh)` name the entry's pinned keys.
+    fn check_signed_keys(
+        &self,
+        peer_id: &str,
+        entry: &RosterEntry,
+        k: &[u8; 32],
+        sh: &[u8; 32],
+    ) -> Result<(), CoreError> {
+        let pinned = self
+            .pinned_signing_hash(peer_id, entry)
+            .ok_or(CoreError::HostKeyUnverified)?;
+        if entry.static_pub != *k || !bool::from(pinned.ct_eq(sh)) {
+            return Err(CoreError::HostKeyUnverified);
+        }
+        Ok(())
+    }
+
+    /// Takes a [`PinSnapshot`] of a complete, non-revoked pin for a Day-2 connect.
+    pub fn pin_snapshot(&self, peer_id: &str) -> Result<PinSnapshot, CoreError> {
+        let entry = self
+            .entries
+            .get(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+        if entry.state == PeerState::Revoked {
+            return Err(CoreError::PeerRevoked(peer_id.to_string()));
+        }
+        let (static_pub, signing_pub) = entry.require_complete_pin()?;
+        Ok(PinSnapshot {
+            peer_id: peer_id.to_owned(),
+            static_pub,
+            signing_pub,
+            rotation_seq: entry.rotation_seq,
+            min_wire_version: entry.min_wire_version,
+            route_meta: entry.route_meta,
+        })
+    }
+
+    /// [`Self::insert_pinned_host`] followed by [`Self::merge_pair_plan`] as one transaction:
+    /// on any error the roster is unchanged.
+    pub fn insert_pinned_host_with_plan(
+        &mut self,
+        host_id: String,
+        name: String,
+        static_pub: [u8; 32],
+        signing_pub: Option<HybridSigningPublicKey>,
+        rotation_seq: u64,
+        plan: &PersistPlan,
+    ) -> Result<PairMergeOutcome, CoreError> {
+        let mut staged = self.clone();
+        staged.insert_pinned_host(
+            host_id.clone(),
+            name,
+            static_pub,
+            signing_pub,
+            rotation_seq,
+            Vec::new(),
+        )?;
+        let outcome = staged.merge_pair_plan(&host_id, plan)?;
+        *self = staged;
+        Ok(outcome)
+    }
+
+    /// [`Self::record_pending_host`] followed by [`Self::merge_pair_plan`] as one transaction:
+    /// on any error the roster is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_pending_host_with_plan(
+        &mut self,
+        host_id: String,
+        name: String,
+        static_pub: [u8; 32],
+        signing_pub: HybridSigningPublicKey,
+        rotation_seq: u64,
+        pairing_sas: String,
+        plan: &PersistPlan,
+    ) -> Result<PairMergeOutcome, CoreError> {
+        let mut staged = self.clone();
+        staged.record_pending_host(
+            host_id.clone(),
+            name,
+            static_pub,
+            signing_pub,
+            rotation_seq,
+            pairing_sas,
+            Vec::new(),
+        )?;
+        let outcome = staged.merge_pair_plan(&host_id, plan)?;
+        *self = staged;
+        Ok(outcome)
+    }
+
+    /// Merges a pairing's [`PersistPlan`] into the latest entry under the route high-water rule.
+    ///
+    /// `signed` routes are replaced when the plan's `rq` is above `route_meta.seq` (or there is
+    /// no meta), unioned and capped at an equal `rq` (only the routes an explicit approval wrote
+    /// are always kept; routes later equal-sequence merges added compete by rank), and kept with
+    /// reason `stale_route_seq` below it. `committed` is replaced only by a
+    /// plan `committed`; `operator` is added, never removed. `route_meta.seq` never decreases.
+    /// Every plan route is validated first; on error nothing changes.
+    pub fn merge_pair_plan(
+        &mut self,
+        peer_id: &str,
+        plan: &PersistPlan,
+    ) -> Result<PairMergeOutcome, CoreError> {
+        let entry = self
+            .entries
+            .get(peer_id)
+            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+        if entry.state == PeerState::Revoked || self.crl_revokes_entry(entry) {
+            return Err(CoreError::PeerRevoked(peer_id.to_string()));
+        }
+        let plan_signed =
+            checked_source_list(plan.signed().iter().cloned(), RouteSource::Signed, entry)?;
+        if let Some(rq) = plan.route_seq() {
+            if !(1..=MAX_ROUTE_SEQ).contains(&rq) {
+                return Err(invalid_route("route sequence out of range"));
+            }
+            let (k, sh) = plan
+                .signed_host_keys()
+                .ok_or(CoreError::HostKeyUnverified)?;
+            self.check_signed_keys(peer_id, entry, k, sh)?;
+        }
+        let committed = checked_source_list(plan.committed.clone(), RouteSource::Committed, entry)?;
+        let operator = checked_source_list(plan.operator.clone(), RouteSource::Operator, entry)?;
+        if let Some(op) = operator.first()
+            && !entry.has_route(op, RouteSource::Operator)
+            && entry.routes_from(RouteSource::Operator).count() >= MAX_OPERATOR_ROUTES
+        {
+            return Err(invalid_route("at most 6 operator routes"));
+        }
+
+        let entry = self.entry_mut(peer_id)?;
+        let mut reason = plan.reason;
+        if let Some(rq) = plan.route_seq() {
+            match entry.route_meta {
+                Some(m) if rq < m.seq => reason = Some("stale_route_seq"),
+                Some(m) if rq == m.seq => {
+                    let approved = m.origin == RouteOrigin::Approved;
+                    let (protected, mut others): (Vec<String>, Vec<String>) = entry
+                        .hints_from(RouteSource::Signed)
+                        .into_iter()
+                        .partition(|h| approved && entry.approved_signed.contains(h));
+                    others.extend(plan_signed);
+                    let merged = cap_signed_union(protected, others);
+                    entry.replace_source(RouteSource::Signed, merged);
+                }
+                _ => {
+                    entry.replace_signed_unapproved(plan_signed);
+                    entry.route_meta = Some(RouteMeta {
+                        seq: rq,
+                        issued_at: None,
+                        origin: RouteOrigin::Uri,
+                    });
+                }
+            }
+        }
+        if !committed.is_empty() {
+            entry.replace_source(RouteSource::Committed, committed);
+        }
+        for hint in operator {
+            if !entry.has_route(&hint, RouteSource::Operator) {
+                entry.routes.push(StoredRoute {
+                    hint,
+                    source: RouteSource::Operator,
+                });
+            }
+        }
+
+        let planned = plan
+            .signed()
+            .iter()
+            .map(|h| (h, RouteSource::Signed))
+            .chain(plan.committed.iter().map(|h| (h, RouteSource::Committed)))
+            .chain(plan.operator.iter().map(|h| (h, RouteSource::Operator)));
+        let persisted = planned
+            .filter(|(h, src)| entry.has_route(h, *src))
+            .map(|(h, source)| StoredRoute {
+                hint: h.clone(),
+                source,
+            })
+            .collect();
+        Ok(PairMergeOutcome { persisted, reason })
+    }
+
+    /// Replaces the `operator` routes of an `Active` peer with already-normalized endpoints.
+    ///
+    /// A `relay_key` must equal the Ed25519 component of this entry's pinned signing key, checked
+    /// on the same pin this call writes under. `signed` and `committed` routes and `route_meta`
+    /// are untouched. Returns the entry's full route list.
+    pub fn set_routes(
+        &mut self,
+        peer_id: &str,
+        endpoints: Vec<OperatorEndpoint>,
+    ) -> Result<&[StoredRoute], CoreError> {
+        let entry = self.require_active(peer_id)?;
+        for ep in &endpoints {
+            if let Some(key) = &ep.relay_key {
+                let matches = entry
+                    .signing_pub
+                    .as_ref()
+                    .is_some_and(|s| bool::from(s.ed25519_bytes().ct_eq(key)));
+                if !matches {
+                    return Err(invalid_route(
+                        "relay key does not match the pinned host key",
+                    ));
+                }
+            }
+        }
+        let hints = checked_source_list(
+            endpoints.into_iter().map(|ep| ep.hint),
+            RouteSource::Operator,
+            entry,
+        )?;
+        let entry = self.entry_mut(peer_id)?;
+        entry.replace_source(RouteSource::Operator, hints);
+        Ok(&entry.routes)
+    }
+
+    /// Removes the routes of one source, or all routes. `route_meta` is kept so stale
+    /// announcements stay rejected.
+    pub fn clear_routes(
+        &mut self,
+        peer_id: &str,
+        source: Option<RouteSource>,
+    ) -> Result<(), CoreError> {
+        let entry = self.entry_mut(peer_id)?;
+        entry
+            .routes
+            .retain(|r| source.is_some_and(|s| r.source != s));
+        if source.is_none_or(|s| s == RouteSource::Signed) {
+            entry.approved_signed.clear();
+        }
+        Ok(())
+    }
+
+    fn statement_signed_list(
+        &self,
+        peer_id: &str,
+        statement: &VerifiedRouteStatement,
+    ) -> Result<Vec<String>, CoreError> {
+        let entry = self.require_active(peer_id)?;
+        self.check_signed_keys(peer_id, entry, statement.host_static_pub(), statement.sh())?;
+        checked_source_list(
+            statement
+                .hints()
+                .iter()
+                .filter(|h| !is_ipc_hint(h))
+                .cloned(),
+            RouteSource::Signed,
+            entry,
+        )
+    }
+
+    /// Applies a fresh signed URI's routes: requires `rq > route_meta.seq` (or no meta), then
+    /// replaces the `signed` routes and sets `route_meta = {rq, None, Uri}`.
+    ///
+    /// The statement must name this entry's pinned keys (`HostKeyUnverified`). Returns `false`
+    /// without change when `rq` is not newer.
+    pub fn replace_signed_routes(
+        &mut self,
+        peer_id: &str,
+        statement: &VerifiedRouteStatement,
+    ) -> Result<bool, CoreError> {
+        let hints = self.statement_signed_list(peer_id, statement)?;
+        let entry = self.entry_mut(peer_id)?;
+        let rq = statement.route_seq();
+        if entry.route_meta.is_some_and(|m| rq <= m.seq) {
+            return Ok(false);
+        }
+        entry.replace_signed_unapproved(hints);
+        entry.route_meta = Some(RouteMeta {
+            seq: rq,
+            issued_at: None,
+            origin: RouteOrigin::Uri,
+        });
+        Ok(true)
+    }
+
+    /// Explicitly approved replacement: replaces the `signed` routes whatever the sequence and
+    /// sets `route_meta = {max(stored, rq), None, Approved}`, so equal-sequence sets cannot
+    /// undo it.
+    pub fn replace_routes_approved(
+        &mut self,
+        peer_id: &str,
+        statement: &VerifiedRouteStatement,
+    ) -> Result<(), CoreError> {
+        let hints = self.statement_signed_list(peer_id, statement)?;
+        let entry = self.entry_mut(peer_id)?;
+        let seq = entry
+            .route_meta
+            .map_or(0, |m| m.seq)
+            .max(statement.route_seq());
+        entry.replace_source(RouteSource::Signed, hints.clone());
+        entry.approved_signed = hints;
+        entry.route_meta = Some(RouteMeta {
+            seq,
+            issued_at: None,
+            origin: RouteOrigin::Approved,
+        });
+        Ok(())
+    }
+
+    /// Ingests CRLs a candidate roster clone accepted, verifying each against the issuer key
+    /// this roster holds: an active paired peer's or an active trust anchor's. Unverifiable,
+    /// stale or unknown-issuer lists are skipped. Returns the number ingested.
+    pub fn merge_crl_evidence(&mut self, crls: &[(String, RevocationList)]) -> usize {
+        let mut ingested = 0;
+        for (issuer, crl) in crls {
+            let Some(key) = self
+                .lookup_active_signing_key(issuer)
+                .or_else(|| self.lookup_active_anchor_key(issuer))
+            else {
+                continue;
+            };
+            if self.ingest_crl(crl.clone(), issuer, &key).is_ok() {
+                ingested += 1;
+            }
+        }
+        ingested
+    }
+
+    /// Client acceptance of a host route set, in order: active
+    /// peer, key binding, signature, issue time, sequence, then an atomic replacement of the
+    /// `signed` routes. `operator` and `committed` routes are never touched.
+    pub fn apply_route_announcement(
+        &mut self,
+        peer_id: &str,
+        set: &RouteSet,
+        now_unix: u64,
+    ) -> Result<RouteSetOutcome, CoreError> {
+        let ignored = |r| Ok(RouteSetOutcome::Ignored(r));
+        let Ok(entry) = self.require_active(peer_id) else {
+            return ignored(RouteSetIgnored::PeerInactive);
+        };
+        let Some(signing_pub) = entry.signing_pub.as_ref() else {
+            return ignored(RouteSetIgnored::KeyMismatch);
+        };
+        if set.static_pub != entry.static_pub
+            || !bool::from(signing_pub.sha256_hash().ct_eq(&set.sh))
+        {
+            return ignored(RouteSetIgnored::KeyMismatch);
+        }
+        if set.verify(signing_pub).is_err() {
+            return ignored(RouteSetIgnored::BadSignature);
+        }
+        if set.issued_at > now_unix.saturating_add(MAX_ROUTE_SET_FUTURE_SECS) {
+            return ignored(RouteSetIgnored::FutureIssuedAt);
+        }
+        if let Some(m) = entry.route_meta
+            && !(set.seq > m.seq || (set.seq == m.seq && m.origin == RouteOrigin::Uri))
+        {
+            return ignored(RouteSetIgnored::StaleSeq);
+        }
+        let hints = checked_source_list(set.routes.iter().cloned(), RouteSource::Signed, entry)?;
+        let entry = self.entry_mut(peer_id)?;
+        let before = entry.hints_from(RouteSource::Signed);
+        let added = hints
+            .iter()
+            .filter(|h| !before.contains(h))
+            .cloned()
+            .collect();
+        let removed = before
+            .iter()
+            .filter(|h| !hints.contains(h))
+            .cloned()
+            .collect();
+        entry.replace_signed_unapproved(hints);
+        entry.route_meta = Some(RouteMeta {
+            seq: set.seq,
+            issued_at: Some(set.issued_at),
+            origin: RouteOrigin::Session,
+        });
+        Ok(RouteSetOutcome::Applied { added, removed })
+    }
+
+    /// Final authorization of an established session (shared by native and WASM): the entry
+    /// exists, is `Active` and not CRL-revoked, its wire floor allows `negotiated_wire`, and the
+    /// session's keys equal the pin.
+    pub fn check_established_session(
+        &self,
+        peer_id: &str,
+        static_pub: &[u8; 32],
+        signing_pub: &HybridSigningPublicKey,
+        negotiated_wire: u8,
+    ) -> Result<(), CoreError> {
+        let entry = self.require_active(peer_id)?;
+        if entry.min_wire_version > negotiated_wire {
+            return Err(CoreError::VersionDowngrade {
+                peer_min: entry.min_wire_version,
+                negotiated: negotiated_wire,
+            });
+        }
+        let signing_matches = entry.signing_pub.as_ref() == Some(signing_pub);
+        if !bool::from(entry.static_pub.ct_eq(static_pub)) || !signing_matches {
+            return Err(CoreError::HostKeyUnverified);
+        }
+        Ok(())
+    }
+
+    /// Reconciles rotation records every Day-2 candidate was shown against the pin the connect
+    /// started from.
+    ///
+    /// Keeps records that verify individually and are reachable from `original`'s signing key at
+    /// `seq > original.rotation_seq`, then runs fork detection over them. A fork revokes the
+    /// entry and its siblings as [`Self::apply_verified_rotation`] does and returns
+    /// `RotationForkDetected`. A snapshot taken of another roster key fails with
+    /// `HostKeyUnverified` before any change.
+    pub fn reconcile_rotation_evidence(
+        &mut self,
+        peer_id: &str,
+        original: &PinSnapshot,
+        records: &[RotationRecord],
+    ) -> Result<(), CoreError> {
+        if !self.entries.contains_key(peer_id) {
+            return Err(CoreError::PeerNotFound(peer_id.to_string()));
+        }
+        if original.peer_id != peer_id {
+            return Err(CoreError::HostKeyUnverified);
+        }
+        let verified: Vec<(&RotationRecord, _)> = records
+            .iter()
+            .filter_map(|r| verify_rotation_record(r).ok().map(|v| (r, v)))
+            .filter(|(_, v)| v.seq > original.rotation_seq)
+            .collect();
+        let mut trusted = vec![original.signing_pub.clone()];
+        loop {
+            let before = trusted.len();
+            for (_, v) in &verified {
+                if trusted.contains(&v.prev_signing_pub) && !trusted.contains(&v.new_signing_pub) {
+                    trusted.push(v.new_signing_pub.clone());
+                }
+            }
+            if trusted.len() == before {
+                break;
+            }
+        }
+        let reachable: Vec<RotationRecord> = verified
+            .iter()
+            .filter(|(_, v)| trusted.contains(&v.prev_signing_pub))
+            .map(|(r, _)| (*r).clone())
+            .collect();
+        match detect_rotation_fork(&reachable) {
+            Err(err @ CoreError::RotationForkDetected { .. }) => {
+                let entry = self.entry_mut(peer_id)?;
+                entry.state = PeerState::Revoked;
+                entry.grants.clear();
+                entry.v2_secrets = None;
+                let current = (entry.static_pub, entry.signing_pub.clone());
+                self.revoke_siblings_by_keys(current.0, current.1.as_ref());
+                self.revoke_siblings_by_keys(original.static_pub, Some(&original.signing_pub));
+                Err(err)
+            }
+            _ => Ok(()),
+        }
     }
 }
 

@@ -30,7 +30,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::relay::{RelayClientAuth, RelayStream, build_relay_auth_proof};
 use super::{connect_ws_resolved, ensure_rustls_ring_provider, ws_binary_config};
-use crate::error::RuntimeError;
+use crate::error::{RelayOffline, RuntimeError};
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -906,7 +906,18 @@ pub struct RelayV2Dialer {
     unix_secs: Option<u64>,
     #[zeroize(skip)]
     auth: RelayClientAuth,
+    /// Gated secret: fetched only after the relay connect (with its address check) and the
+    /// challenge succeed; `mailbox_secret` is unused when set.
+    #[zeroize(skip)]
+    secret_source: Option<MailboxSecretSource>,
+    /// No admission material may be presented: a relay demanding dial auth fails fast with
+    /// `relay_auth_unconfigured`.
+    #[zeroize(skip)]
+    auth_withheld: bool,
 }
+
+/// Releases a peer's mailbox secret to one dial, or `None` when it is not authorized.
+pub(crate) type MailboxSecretSource = Arc<dyn Fn() -> Option<Zeroizing<[u8; 32]>> + Send + Sync>;
 
 impl std::fmt::Debug for RelayV2Dialer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -914,7 +925,9 @@ impl std::fmt::Debug for RelayV2Dialer {
             .field("expected_host", &self.expected_host)
             .field("allow_insecure_ws", &self.allow_insecure_ws)
             .field("mailbox_secret", &"<redacted>")
+            .field("gated_secret", &self.secret_source.is_some())
             .field("auth", &self.auth)
+            .field("auth_withheld", &self.auth_withheld)
             .finish()
     }
 }
@@ -930,7 +943,26 @@ impl RelayV2Dialer {
             allow_insecure_ws: false,
             unix_secs: None,
             auth: RelayClientAuth::None,
+            secret_source: None,
+            auth_withheld: false,
         }
+    }
+
+    /// A dialer whose mailbox secret comes from `source`, consulted only after the relay
+    /// connect and challenge succeed.
+    #[must_use]
+    pub(crate) fn gated(source: MailboxSecretSource) -> Self {
+        let mut dialer = Self::new([0; 32]);
+        dialer.secret_source = Some(source);
+        dialer
+    }
+
+    /// Marks admission material as withheld: a relay demanding dial auth fails fast with
+    /// `relay_auth_unconfigured` before the secret is fetched or a dial is sent.
+    #[must_use]
+    pub(crate) fn with_auth_withheld(mut self, withheld: bool) -> Self {
+        self.auth_withheld = withheld;
+        self
     }
 
     /// Explicitly permits cleartext `ws://` outside loopback hosts.
@@ -985,8 +1017,25 @@ impl RelayV2Dialer {
         let required_host = extract_expected_host(&parsed, self.expected_host.as_deref())?;
         let (mut ws, verified_host, nonce, _srv_epoch, auth_required) =
             connect_and_verify_v2_challenge(parsed.as_str(), &required_host).await?;
+        if self.auth_withheld
+            && auth_required
+                .as_deref()
+                .is_some_and(|reqs| reqs.iter().any(|r| r == "dial"))
+        {
+            return Err(RuntimeError::Protocol(format!(
+                "relay_auth_unconfigured: v2 relay '{}' requires admission credentials and its \
+                 origin is not in relay_auth_origins",
+                verified_host.as_str()
+            )));
+        }
+        let secret = match &self.secret_source {
+            Some(source) => source().ok_or_else(|| {
+                RuntimeError::Protocol("relay_v2_not_authorized: mailbox secret withheld".into())
+            })?,
+            None => Zeroizing::new(self.mailbox_secret),
+        };
 
-        let mailbox = derive_epoch_mailbox(&self.mailbox_secret, epoch);
+        let mailbox = derive_epoch_mailbox(&secret, epoch);
         let conn_id = random_bytes::<16>()?;
         let conn_id_b64 = b64url_encode(&conn_id);
         let dial_token = sign_v2_relay_dial(&mailbox, verified_host.as_str(), &nonce, &conn_id)?;
@@ -1015,6 +1064,9 @@ impl RelayV2Dialer {
         match recv_v2_control_msg(&mut ws).await? {
             RelayV2ServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => {
                 Ok(Box::new(RelayStream::new(ws, self.write_timeout)))
+            }
+            RelayV2ServerMsg::Error { code } if code == "offline" => {
+                Err(RuntimeError::RelayOffline(RelayOffline::V2Dial))
             }
             RelayV2ServerMsg::Error { code } => Err(RuntimeError::Protocol(format!(
                 "v2 relay dial rejected: {code}"
