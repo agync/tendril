@@ -355,7 +355,7 @@ session = host.accept_session(5000)
 session.authorize(&quot;notes.sync&quot;)                   # True</code></pre>
 </div>
 <div class="code-panel" role="tabpanel" id="panel-typescript" aria-labelledby="tab-typescript" data-lang="typescript">
-<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>npm install @tendril-sdk/node</code><button type="button" class="copy" data-copy="npm install @tendril-sdk/node">Copy</button></div>
+<div class="install"><code><span class="c-p" aria-hidden="true">$ </span>npm install ./tendril-node-0.1.0-&lt;platform&gt;.tar.gz</code><button type="button" class="copy" data-copy="npm install ./tendril-node-0.1.0-&lt;platform&gt;.tar.gz">Copy</button></div>
 <pre tabindex="0" aria-label="TypeScript example"><code>import tendril from &quot;@tendril-sdk/node&quot;;
 
 const host = new tendril.Endpoint(&quot;./laptop-state&quot;, &quot;laptop&quot;);
@@ -392,7 +392,7 @@ if err != nil { return err }
 ok, err := sess.Authorize(&quot;notes.sync&quot;) // true</code></pre>
 </div>
 <div class="code-panel" role="tabpanel" id="panel-swift" aria-labelledby="tab-swift" data-lang="swift">
-<div class="install"><code><span class="c-p" aria-hidden="true"></span>.package(url: &quot;https://github.com/agync/tendril&quot;, from: &quot;0.1.0&quot;)</code><button type="button" class="copy" data-copy=".package(url: &quot;https://github.com/agync/tendril&quot;, from: &quot;0.1.0&quot;)">Copy</button></div>
+<div class="install"><code><span class="c-p" aria-hidden="true"></span>.package(path: &quot;bindings/swift&quot;)</code><button type="button" class="copy" data-copy=".package(path: &quot;bindings/swift&quot;)">Copy</button></div>
 <pre tabindex="0" aria-label="Swift example"><code>import Foundation
 import Tendril
 
@@ -473,7 +473,7 @@ tendril --state-dir ./nas-state enroll --endpoint 192.168.1.20:7000 --host-id ma
 tendril --state-dir ./mac-mini-state mint &lt;device_id&gt; --cap backup.write</code></pre>
 </div>
   </div>
-  <p class="small muted code-foot">Events are polled, not called back, so nothing re-enters your event loop. In the browser, Tendril joins as a client through a relay.</p>
+  <p class="small muted code-foot">Events are polled, not called back, so nothing re-enters your event loop. In the browser, install <code>@tendril-sdk/web</code> from npm to join as a client through a relay. Prebuilt <code>tendril-node</code> tarballs, <code>tendril-ffi</code> archives for Go, and <code>TendrilFFI.xcframework</code> for Apple ship on <a href="https://github.com/agync/tendril/releases">GitHub Releases</a>; <code>dev.agync:tendril-android</code> is published on GitHub Packages Maven.</p>
 </section>
 
 <section id="trust" class="band wrap" aria-labelledby="h-trust">
