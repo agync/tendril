@@ -21,7 +21,6 @@
     "src/",
     "pkg/",
     "pkg-p2p/",
-    "demo/",
     "index.d.ts"
   ]
 }
