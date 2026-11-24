@@ -313,6 +313,14 @@ func VerifyGrantJSON(
 type Endpoint struct {
 	mu  sync.RWMutex
 	ptr *C.TendrilEndpoint
+
+	// cfgMu serializes transport configuration and guards cfg, the last full transport
+	// configuration sent through ConfigureTransportsJSON or ConfigureRoutes. The C ABI replaces
+	// the whole configuration on every call, so ConfigureRoutes merges into this cache.
+	// The cache holds relay tickets and secrets as Go strings that cannot be zeroized; Close
+	// drops the reference, but the memory lives until the garbage collector reclaims it.
+	cfgMu sync.Mutex
+	cfg   map[string]json.RawMessage
 }
 
 // NewEndpoint creates a new endpoint backed by stateDir (or ephemeral in-memory when empty).
@@ -337,7 +345,11 @@ func NewEndpoint(stateDir, hostID string) (*Endpoint, error) {
 }
 
 // Close frees the underlying native TendrilEndpoint handle idempotently without blocking on active accepts.
+// It also clears the transport configuration cache, which holds secrets until close.
 func (ep *Endpoint) Close() error {
+	ep.cfgMu.Lock()
+	ep.cfg = nil
+	ep.cfgMu.Unlock()
 	ep.mu.RLock()
 	h := ep.ptr
 	if h != nil {
@@ -429,8 +441,16 @@ func (ep *Endpoint) ServeRelay(relayURL, expectedHost string) (string, error) {
 }
 
 // ConfigureTransportsJSON applies a JSON transport configuration (relay auth, P2P, wake) to this endpoint.
+// It replaces the whole configuration and updates the cache that ConfigureRoutes merges into.
 func (ep *Endpoint) ConfigureTransportsJSON(transportConfigJSON string) error {
-	return ep.withHandle(func(h *C.TendrilEndpoint) error {
+	ep.cfgMu.Lock()
+	defer ep.cfgMu.Unlock()
+	return ep.configureTransportsLocked(transportConfigJSON)
+}
+
+// configureTransportsLocked sends transportConfigJSON and caches it on success. cfgMu must be held.
+func (ep *Endpoint) configureTransportsLocked(transportConfigJSON string) error {
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
 		ccfg, err := toCStr(transportConfigJSON, "transportConfigJSON")
 		if err != nil {
 			return err
@@ -442,6 +462,16 @@ func (ep *Endpoint) ConfigureTransportsJSON(transportConfigJSON string) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(transportConfigJSON), &cfg); err != nil || cfg == nil {
+		// Keep the previous cache rather than silently dropping credentials on the next merge.
+		return fmt.Errorf("transport configuration applied but is not a JSON object; route cache unchanged")
+	}
+	ep.cfg = cfg
+	return nil
 }
 
 // MintRelayTicket mints a canonical signed stateless Ed25519 RelayTicket JSON object.
@@ -849,7 +879,9 @@ func (ep *Endpoint) EnrollInitiate(
 	return res, err
 }
 
-// Connect opens an authenticated Noise XX session toward targetHostID.
+// Connect opens an authenticated Noise XX session toward targetHostID. An empty endpoint dials the
+// peer's stored routes (signed, operator and committed); a non-empty one is an explicit operator
+// endpoint, normalized and dialed alone.
 func (ep *Endpoint) Connect(endpoint, relayHost, targetHostID, grantJSON string) (*Session, error) {
 	var sess *Session
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
@@ -897,6 +929,7 @@ func (ep *Endpoint) AcceptSession(timeoutMs uint64) (*Session, error) {
 }
 
 // ConnectV2 opens an authenticated Wire v2 pseudonymous session toward targetHostID via endpoint.
+// An empty endpoint dials the peer's stored routes.
 func (ep *Endpoint) ConnectV2(endpoint, relayHost, targetHostID, grantJSON string) (*Session, error) {
 	var sess *Session
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
@@ -1442,4 +1475,449 @@ func (g *Group) AuthorizePeer(peerID, capability string) error {
 		}
 		return nil
 	})
+}
+
+// RouteConfig holds the route keys of the transport configuration. Nil and empty-string fields are
+// left unchanged, so the endpoint keeps its defaults ("auto" advertising, "all_signed" policy,
+// signed routes). For the list fields, nil leaves the current value and a pointer to an empty
+// slice clears it.
+type RouteConfig struct {
+	// AdvertisedEndpoints lists extra hints added to the announced route set.
+	AdvertisedEndpoints *[]string `json:"advertised_endpoints,omitempty"`
+	// RelayAuthOrigins lists "scheme://host[:port]" origins that may receive relay admission material.
+	RelayAuthOrigins *[]string `json:"relay_auth_origins,omitempty"`
+	// Advertise is "auto" (default) or "explicit".
+	Advertise string `json:"advertise,omitempty"`
+	// RoutePolicy is "all_signed" (default), "committed_only" or "none".
+	RoutePolicy string `json:"route_policy,omitempty"`
+	// SignRoutes overrides route signing for issued URIs; nil keeps the default (true).
+	SignRoutes *bool `json:"sign_routes,omitempty"`
+}
+
+// ConfigureRoutes merges the set route keys of c into the last full transport configuration
+// this binding sent and applies the result. Other keys, such as relay credentials, are kept.
+func (ep *Endpoint) ConfigureRoutes(c RouteConfig) error {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	var routes map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &routes); err != nil {
+		return err
+	}
+	ep.cfgMu.Lock()
+	defer ep.cfgMu.Unlock()
+	merged := make(map[string]json.RawMessage, len(ep.cfg)+len(routes))
+	for k, v := range ep.cfg {
+		merged[k] = v
+	}
+	for k, v := range routes {
+		merged[k] = v
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return err
+	}
+	return ep.configureTransportsLocked(string(out))
+}
+
+// IssuePairingURIOptions selects how Endpoint.IssuePairingURI builds a URI. Zero values keep defaults.
+type IssuePairingURIOptions struct {
+	// Kind is "auto", "lan" or "remote".
+	Kind     string `json:"kind,omitempty"`
+	HostName string `json:"host_name,omitempty"`
+	// SignRoutes overrides the endpoint's route signing default; nil keeps it.
+	SignRoutes *bool `json:"sign_routes,omitempty"`
+}
+
+// DroppedHint is a hint left out of the announced set or the URI, with the reason.
+type DroppedHint struct {
+	Hint   string `json:"hint"`
+	Reason string `json:"reason"`
+}
+
+// IssuedPairingURI is the result of Endpoint.IssuePairingURI.
+type IssuedPairingURI struct {
+	URI        string        `json:"uri"`
+	CodeKind   string        `json:"code_kind"`
+	Dropped    []DroppedHint `json:"dropped"`
+	URILen     int           `json:"uri_len"`
+	QRVersionM int           `json:"qr_version_m"`
+	// RouteSeq is nil when the URI carries no route statement.
+	RouteSeq *uint64 `json:"route_seq"`
+}
+
+// withOptJSON marshals v and passes it as a C string, or passes nil when v is nil.
+func withOptJSON(v any, name string, fn func(*C.char) error) error {
+	if v == nil {
+		return fn(nil)
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("tendril: %s: %w", name, err)
+	}
+	return withOptCStr(string(raw), name, fn)
+}
+
+// decodeOut frees out and decodes its JSON into v.
+func decodeOut(out *C.char, v any) error {
+	return json.Unmarshal([]byte(takeOutCStr(out)), v)
+}
+
+// IssuePairingURI builds a pairing URI from the announced route set. The endpoint becomes a
+// route-announcing host on first use. A nil opts keeps every default.
+func (ep *Endpoint) IssuePairingURI(opts *IssuePairingURIOptions) (IssuedPairingURI, error) {
+	var res IssuedPairingURI
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		var o any
+		if opts != nil {
+			o = opts
+		}
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptJSON(o, "opts", func(co *C.char) error {
+			rc = C.tendril_endpoint_issue_pairing_uri(h, co, &out)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return decodeOut(out, &res)
+	})
+	return res, err
+}
+
+// PairURIOptions tunes Endpoint.PairURI and Endpoint.PairV2URI. Zero values keep defaults.
+type PairURIOptions struct {
+	// RoutePolicy is "all_signed", "committed_only" or "none".
+	RoutePolicy string `json:"route_policy,omitempty"`
+	// SaveRoute persists the committed route of an unsigned URI.
+	SaveRoute bool `json:"save_route,omitempty"`
+	// Endpoint is dialed alone and stored as an operator route.
+	Endpoint string `json:"endpoint,omitempty"`
+	// Code overrides the code carried by the URI.
+	Code string `json:"code,omitempty"`
+}
+
+// Route is one stored route and the source that produced it ("operator", "signed", "committed").
+type Route struct {
+	Hint   string `json:"hint"`
+	Source string `json:"source"`
+}
+
+// SkippedHint is a hint that was reported and never dialed.
+type SkippedHint struct {
+	Hint   string `json:"hint"`
+	Reason string `json:"reason"`
+}
+
+// PairURIResult is the client-side outcome of pairing through a URI.
+type PairURIResult struct {
+	DeviceID      string `json:"device_id"`
+	HostID        string `json:"host_id"`
+	SAS           string `json:"sas"`
+	Status        string `json:"status"`
+	HostConfirmed bool   `json:"host_confirmed"`
+	Provider      string `json:"provider"`
+	Endpoint      string `json:"endpoint"`
+	Committed     bool   `json:"committed"`
+	// RouteCheck is "verified", "unsigned" or "route_key_rotated".
+	RouteCheck      string  `json:"route_check"`
+	RoutesPersisted []Route `json:"routes_persisted"`
+	// RoutesReason is "unsigned_uri", "route_key_rotated" or "stale_route_seq" when the
+	// pairing wrote no routes, and empty otherwise.
+	RoutesReason string        `json:"routes_reason"`
+	Skipped      []SkippedHint `json:"skipped"`
+}
+
+func (ep *Endpoint) pairURI(v2 bool, uri, name, kind string, opts *PairURIOptions) (PairURIResult, error) {
+	var res PairURIResult
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		curi, err := toCStr(uri, "uri")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(curi))
+		var o any
+		if opts != nil {
+			o = opts
+		}
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptCStr(name, "name", func(cn *C.char) error {
+			return withOptCStr(kind, "kind", func(ck *C.char) error {
+				return withOptJSON(o, "opts", func(co *C.char) error {
+					if v2 {
+						rc = C.tendril_endpoint_pair_v2_uri(h, curi, cn, ck, co, &out)
+					} else {
+						rc = C.tendril_endpoint_pair_uri(h, curi, cn, ck, co, &out)
+					}
+					return nil
+				})
+			})
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return decodeOut(out, &res)
+	})
+	return res, err
+}
+
+// PairURI pairs through a pairing URI over Wire v1: the URI hints race and the first success
+// commits. An empty name or kind keeps the runtime default. A nil opts keeps every default.
+func (ep *Endpoint) PairURI(uri, name, kind string, opts *PairURIOptions) (PairURIResult, error) {
+	return ep.pairURI(false, uri, name, kind, opts)
+}
+
+// PairV2URI pairs through a pairing URI over Wire v2, trying one hint at a time.
+func (ep *Endpoint) PairV2URI(uri, name, kind string, opts *PairURIOptions) (PairURIResult, error) {
+	return ep.pairURI(true, uri, name, kind, opts)
+}
+
+// ConnectOptions tunes Endpoint.ConnectWithOptions. Zero values keep defaults.
+type ConnectOptions struct {
+	// Wire is 1 (default) or 2.
+	Wire uint8 `json:"wire,omitempty"`
+	// Grant is a grant JSON object.
+	Grant json.RawMessage `json:"grant,omitempty"`
+	// Endpoint is dialed alone as an operator endpoint; empty dials the stored routes.
+	Endpoint string `json:"endpoint,omitempty"`
+	// RelayHost is the expected relay host of an explicit Endpoint, or the Iroh relay mode for
+	// an iroh:// Endpoint. It is ignored without Endpoint.
+	RelayHost string `json:"relay_host,omitempty"`
+	// RecoveryURI is a signed pairing URI whose routes are tried and, when newer, applied.
+	RecoveryURI   string `json:"recovery_uri,omitempty"`
+	ReplaceRoutes bool   `json:"replace_routes,omitempty"`
+	// RoutePolicy is "all_signed", "committed_only" or "none".
+	RoutePolicy string `json:"route_policy,omitempty"`
+}
+
+// ConnectWithOptions opens a session toward targetHostID, dialing its stored routes unless
+// opts.Endpoint is set. A nil opts connects over Wire v1 without a grant.
+func (ep *Endpoint) ConnectWithOptions(targetHostID string, opts *ConnectOptions) (*Session, error) {
+	var sess *Session
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		ctarget, err := toCStr(targetHostID, "targetHostID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(ctarget))
+		var o any
+		if opts != nil {
+			o = opts
+		}
+		var raw *C.TendrilSession
+		if err := withOptJSON(o, "opts", func(co *C.char) error {
+			raw = C.tendril_session_connect_with_options(h, ctarget, co)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if raw == nil {
+			return fmt.Errorf("tendril_session_connect_with_options failed: %s", lastError())
+		}
+		sess = newSession(raw)
+		return nil
+	})
+	return sess, err
+}
+
+// RouteMeta is the provenance of a peer's signed routes.
+type RouteMeta struct {
+	Seq      uint64 `json:"seq"`
+	IssuedAt uint64 `json:"issued_at"`
+	// Origin is how the routes arrived, for example "uri", "session" or "approved".
+	Origin string `json:"origin"`
+}
+
+// RouteSetOutcome is the last route set a session delivered for a peer.
+type RouteSetOutcome struct {
+	Outcome string `json:"outcome"`
+	Seq     uint64 `json:"seq"`
+}
+
+// PeerRoutes is the stored routing view of one peer.
+type PeerRoutes struct {
+	Routes []Route `json:"routes"`
+	// RouteMeta is nil until signed routes were stored.
+	RouteMeta *RouteMeta `json:"route_meta"`
+	// LastRouteSet is nil until a route set arrived.
+	LastRouteSet *RouteSetOutcome `json:"last_route_set"`
+}
+
+// SetPeerRoutes replaces peerID's operator routes with routes (at most six). One invalid entry
+// rejects the whole list and nothing is written.
+func (ep *Endpoint) SetPeerRoutes(peerID string, routes []string) error {
+	return ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cpeer, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cpeer))
+		if routes == nil {
+			routes = []string{}
+		}
+		raw, err := json.Marshal(routes)
+		if err != nil {
+			return err
+		}
+		croutes, err := toCStr(string(raw), "routes")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(croutes))
+		if rc := C.tendril_endpoint_set_peer_routes(h, cpeer, croutes); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return nil
+	})
+}
+
+// PeerRoutes returns the stored routes and route provenance of peerID.
+func (ep *Endpoint) PeerRoutes(peerID string) (PeerRoutes, error) {
+	var res PeerRoutes
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cpeer, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cpeer))
+		var out *C.char
+		if rc := C.tendril_endpoint_peer_routes(h, cpeer, &out); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return decodeOut(out, &res)
+	})
+	return res, err
+}
+
+// ClearPeerRoutes removes peerID's routes of one source: "operator" (the default for an empty
+// source), "signed", "committed" or "all". The route provenance is kept.
+func (ep *Endpoint) ClearPeerRoutes(peerID, source string) error {
+	return ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cpeer, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cpeer))
+		return withOptCStr(source, "source", func(cs *C.char) error {
+			if rc := C.tendril_endpoint_clear_peer_routes(h, cpeer, cs); rc != C.TENDRIL_OK {
+				return ffiErr(rc)
+			}
+			return nil
+		})
+	})
+}
+
+// ApplyRouteURIOptions tunes Endpoint.ApplyRouteURI. Zero values keep defaults.
+type ApplyRouteURIOptions struct {
+	// ReplaceRoutes approves replacing the stored signed routes when the URI is not newer.
+	ReplaceRoutes bool `json:"replace_routes,omitempty"`
+	// RoutePolicy is "all_signed", "committed_only" or "none".
+	RoutePolicy string `json:"route_policy,omitempty"`
+}
+
+// ApplyRouteURIResult is the outcome of Endpoint.ApplyRouteURI.
+type ApplyRouteURIResult struct {
+	PeerID  string `json:"peer_id"`
+	Applied bool   `json:"applied"`
+	// Reason names why the URI was not applied (for example "stale_route_seq"); empty when applied.
+	Reason   string  `json:"reason"`
+	RouteSeq *uint64 `json:"route_seq"`
+}
+
+// ApplyRouteURI applies a fresh host-signed pairing URI offline to the paired host whose keys it
+// carries. A nil opts keeps every default.
+func (ep *Endpoint) ApplyRouteURI(uri string, opts *ApplyRouteURIOptions) (ApplyRouteURIResult, error) {
+	var res ApplyRouteURIResult
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		curi, err := toCStr(uri, "uri")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(curi))
+		var o any
+		if opts != nil {
+			o = opts
+		}
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptJSON(o, "opts", func(co *C.char) error {
+			rc = C.tendril_endpoint_apply_route_uri(h, curi, co, &out)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return decodeOut(out, &res)
+	})
+	return res, err
+}
+
+// Network is one network of a NetworkSnapshot.
+type Network struct {
+	ID      string `json:"id"`
+	Iface   string `json:"iface"`
+	IfIndex uint32 `json:"if_index"`
+	// Transports lists "wifi", "ethernet", "cellular", "vpn" or "other".
+	Transports []string `json:"transports"`
+	Addrs      []string `json:"addrs"`
+}
+
+// NetworkSnapshot is the complete current network state, never a delta.
+type NetworkSnapshot struct {
+	Networks []Network `json:"networks"`
+}
+
+// normalized returns a copy whose nil slices are empty, since the C ABI rejects JSON null lists.
+func (s *NetworkSnapshot) normalized() NetworkSnapshot {
+	out := NetworkSnapshot{Networks: make([]Network, len(s.Networks))}
+	for i, n := range s.Networks {
+		if n.Transports == nil {
+			n.Transports = []string{}
+		}
+		if n.Addrs == nil {
+			n.Addrs = []string{}
+		}
+		out.Networks[i] = n
+	}
+	return out
+}
+
+// RefreshRoutesResult is the outcome of Endpoint.RefreshRoutes.
+type RefreshRoutesResult struct {
+	RouteSeq uint64 `json:"route_seq"`
+	Changed  bool   `json:"changed"`
+}
+
+// RefreshRoutes re-scans the host's addresses and announces a new route set when they changed.
+// A nil snapshot lets the runtime enumerate natively (or reuse the retained snapshot).
+func (ep *Endpoint) RefreshRoutes(snapshot *NetworkSnapshot) (RefreshRoutesResult, error) {
+	var res RefreshRoutesResult
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		var s any
+		if snapshot != nil {
+			s = snapshot.normalized()
+		}
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptJSON(s, "snapshot", func(cs *C.char) error {
+			rc = C.tendril_endpoint_refresh_routes(h, cs, &out)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return decodeOut(out, &res)
+	})
+	return res, err
 }

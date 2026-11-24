@@ -3,15 +3,22 @@ package tendril_test
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdh"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1564,5 +1571,1062 @@ func TestRevokePeerRacesPollEventAndAuthorize(t *testing.T) {
 	}
 	if entry := parseRoster(t, disk).Entries[acc.DeviceID]; entry.State != "revoked" {
 		t.Fatalf("disk roster resurrected revoked peer: %+v", entry)
+	}
+}
+
+func hexBytes(t *testing.T, m map[string]any, key string) []byte {
+	t.Helper()
+	s, ok := m[key].(string)
+	if !ok {
+		t.Fatalf("vector key %q missing", key)
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("vector key %q: %v", key, err)
+	}
+	return b
+}
+
+// TestRoutesVectors checks spec/vectors/routes.json byte for byte with the Go standard library.
+// The Ed25519 half of each signature, the URI bytes and the key material are verified here; the
+// ML-DSA half and the 0x0C codec are core-only and covered by the Rust vector tests.
+func TestRoutesVectors(t *testing.T) {
+	doc := readJSONFile(t, "routes.json")
+	keys := doc["route_set"].(map[string]any)
+
+	seed := hexBytes(t, keys, "signing_seed_hex")
+	signingPub := hexBytes(t, keys, "signing_pub_hex")
+	edKey := ed25519.NewKeyFromSeed(seed)
+	edPub := edKey.Public().(ed25519.PublicKey)
+	if !bytes.Equal(edPub, signingPub[:ed25519.PublicKeySize]) {
+		t.Fatalf("Ed25519 half of signing_pub_hex does not derive from signing_seed_hex")
+	}
+	sh := sha256.Sum256(signingPub)
+	if !bytes.Equal(sh[:], hexBytes(t, keys, "sh_hex")) {
+		t.Fatalf("sh_hex is not SHA-256 of signing_pub_hex")
+	}
+	staticPriv, err := ecdh.X25519().NewPrivateKey(hexBytes(t, keys, "static_scalar_hex"))
+	if err != nil {
+		t.Fatalf("static scalar: %v", err)
+	}
+	if !bytes.Equal(staticPriv.PublicKey().Bytes(), hexBytes(t, keys, "static_pub_hex")) {
+		t.Fatalf("static_pub_hex does not derive from static_scalar_hex")
+	}
+
+	// Pairing URI route statement (rs): exact input bytes, deterministic Ed25519 signature, URI text.
+	rs := doc["pairing_route_statement"].(map[string]any)
+	if !bytes.Equal(hexBytes(t, rs, "ed25519_pub_hex"), edPub) {
+		t.Fatalf("ed25519_pub_hex mismatch")
+	}
+	domain := hexBytes(t, rs, "domain_hex")
+	if string(domain) != "tendril-pairing-routes-v1\x00" {
+		t.Fatalf("unexpected rs domain %q", domain)
+	}
+	prefix := rs["uri_bytes_before_rs"].(string)
+	input := append(append([]byte{}, domain...), prefix...)
+	if !bytes.Equal(input, hexBytes(t, rs, "rs_input_hex")) {
+		t.Fatalf("rs_input_hex mismatch")
+	}
+	sig := ed25519.Sign(edKey, input)
+	if !bytes.Equal(sig, hexBytes(t, rs, "rs_hex")) {
+		t.Fatalf("rs signature mismatch: %x", sig)
+	}
+	if !ed25519.Verify(edPub, input, sig) {
+		t.Fatalf("rs does not verify")
+	}
+	uri := rs["uri"].(string)
+	if want := prefix + "&rs=" + base64.RawURLEncoding.EncodeToString(sig); uri != want {
+		t.Fatalf("uri mismatch:\n got %s\nwant %s", uri, want)
+	}
+	hints := rs["hints"].([]any)
+	var escaped []string
+	for _, h := range hints {
+		escaped = append(escaped, url.QueryEscape(h.(string)))
+	}
+	if !strings.Contains(uri, "&ep="+strings.Join(escaped, ",")+"&rq=") {
+		t.Fatalf("uri ep does not carry the vector hints in order")
+	}
+	if want := "&rq=" + strconv.FormatUint(uint64(rs["route_seq"].(float64)), 10); !strings.HasSuffix(prefix, want) {
+		t.Fatalf("uri prefix does not end with %s", want)
+	}
+
+	// The same URI is host-signed for a key this endpoint does not know: the FFI parses it and
+	// reports an unknown host rather than a malformed URI.
+	ep, err := tendril.NewEndpoint("", "go-vector-ep")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer ep.Close()
+	if _, err := ep.ApplyRouteURI(uri, nil); err == nil || !strings.Contains(err.Error(), "(-2)") {
+		t.Fatalf("expected not-found for the vector host, got %v", err)
+	}
+
+	// Route set: signed bytes are domain || body, the wire payload is body || sig, and the
+	// Ed25519 half of the hybrid signature is deterministic.
+	setDomain := hexBytes(t, keys, "domain_hex")
+	if string(setDomain) != "tendril-route-set-v1\x00" {
+		t.Fatalf("unexpected route set domain %q", setDomain)
+	}
+	cases := keys["sign_deterministic"].([]any)
+	if len(cases) < 2 {
+		t.Fatalf("expected at least two sign_deterministic cases")
+	}
+	for _, c := range cases {
+		cm := c.(map[string]any)
+		name := cm["name"].(string)
+		body := hexBytes(t, cm, "body_hex")
+		hsig := hexBytes(t, cm, "sig_hex")
+		if len(hsig) != 3373 {
+			t.Fatalf("%s: hybrid signature length %d", name, len(hsig))
+		}
+		signed := append(append([]byte{}, setDomain...), body...)
+		if !bytes.Equal(signed, hexBytes(t, cm, "signed_bytes_hex")) {
+			t.Fatalf("%s: signed_bytes_hex mismatch", name)
+		}
+		if got := ed25519.Sign(edKey, signed); !bytes.Equal(got, hsig[:ed25519.SignatureSize]) {
+			t.Fatalf("%s: Ed25519 half mismatch", name)
+		}
+		if !ed25519.Verify(edPub, signed, hsig[:ed25519.SignatureSize]) {
+			t.Fatalf("%s: Ed25519 half does not verify", name)
+		}
+		if !bytes.Contains(body, hexBytes(t, keys, "static_pub_hex")) || !bytes.Contains(body, hexBytes(t, keys, "sh_hex")) {
+			t.Fatalf("%s: body lacks host static key or signing hash", name)
+		}
+		for _, r := range cm["routes"].([]any) {
+			if !bytes.Contains(body, []byte(r.(string))) {
+				t.Fatalf("%s: body lacks route %v", name, r)
+			}
+		}
+	}
+	// Fixture shape check only: the decoder rejections themselves are asserted by the Rust tests.
+	for _, c := range keys["decode_rejections"].([]any) {
+		cm := c.(map[string]any)
+		hexBytes(t, cm, "body_hex")
+		if cm["zero_filler_len"].(float64) < 0 {
+			t.Fatalf("%s: negative filler", cm["name"])
+		}
+	}
+
+	hello := doc["session_hello_route_seq"].(map[string]any)
+	var parsed struct {
+		DeviceID string `json:"device_id"`
+		RouteSeq uint64 `json:"route_seq"`
+	}
+	if err := json.Unmarshal([]byte(hello["json"].(string)), &parsed); err != nil {
+		t.Fatalf("session hello json: %v", err)
+	}
+	if float64(parsed.RouteSeq) != hello["route_seq"].(float64) {
+		t.Fatalf("session hello route_seq mismatch")
+	}
+}
+
+type routesHost struct {
+	ep       *tendril.Endpoint
+	hostID   string
+	listen   string
+	clientEp *tendril.Endpoint
+	deviceID string
+	grant    string
+}
+
+func hostIDOf(t *testing.T, ep *tendril.Endpoint) string {
+	t.Helper()
+	info, err := ep.Info()
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	return info.HostID
+}
+
+// acceptPairing waits for one real pairing on ep. A foreign loopback probe fails its handshake
+// without consuming the code, so failures are retried until the deadline.
+func acceptPairing(ep *tendril.Endpoint, v2 bool) (tendril.PairAcceptResult, error) {
+	deadline := time.Now().Add(20 * time.Second)
+	var last error
+	for time.Now().Before(deadline) {
+		var res tendril.PairAcceptResult
+		var err error
+		if v2 {
+			res, err = ep.PairV2Accept(5000)
+		} else {
+			res, err = ep.PairAccept(5000)
+		}
+		if err == nil {
+			return res, nil
+		}
+		last = err
+		if strings.Contains(err.Error(), "closed") {
+			break
+		}
+	}
+	return tendril.PairAcceptResult{}, last
+}
+
+// pairThroughURI pairs client with host through uri and confirms on the host.
+func pairThroughURI(t *testing.T, host, client *tendril.Endpoint, uri string, v2 bool, opts *tendril.PairURIOptions) tendril.PairURIResult {
+	t.Helper()
+	type accepted struct {
+		res tendril.PairAcceptResult
+		err error
+	}
+	ch := make(chan accepted, 1)
+	go func() {
+		res, err := acceptPairing(host, v2)
+		ch <- accepted{res, err}
+	}()
+	var res tendril.PairURIResult
+	var err error
+	if v2 {
+		res, err = client.PairV2URI(uri, "go-client", "go", opts)
+	} else {
+		res, err = client.PairURI(uri, "go-client", "go", opts)
+	}
+	if err != nil {
+		t.Fatalf("pair (v2=%v): %v", v2, err)
+	}
+	acc := <-ch
+	if acc.err != nil {
+		t.Fatalf("pair accept: %v", acc.err)
+	}
+	if acc.res.SAS != res.SAS {
+		t.Fatalf("SAS mismatch: %s vs %s", acc.res.SAS, res.SAS)
+	}
+	if err := host.ConfirmPeer(acc.res.DeviceID, acc.res.SAS); err != nil {
+		t.Fatalf("host ConfirmPeer: %v", err)
+	}
+	return res
+}
+
+// connectPair connects client with connect while host accepts, retrying the accept past foreign probes.
+// The accept loop stops when connect fails, when connect succeeds but the host returns no session
+// within acceptGrace, and at a hard deadline, so a stuck handshake cannot hang the test.
+func connectPair(t *testing.T, host *tendril.Endpoint, v2 bool, connect func() (*tendril.Session, error)) (*tendril.Session, *tendril.Session, error) {
+	t.Helper()
+	const acceptGrace = 15 * time.Second
+	type accepted struct {
+		sess *tendril.Session
+		err  error
+	}
+	ch := make(chan accepted, 1)
+	stop := make(chan struct{})
+	deadline := time.Now().Add(60 * time.Second)
+	go func() {
+		for {
+			var s *tendril.Session
+			var err error
+			if v2 {
+				s, err = host.AcceptV2(3000)
+			} else {
+				s, err = host.AcceptSession(3000)
+			}
+			if err == nil {
+				ch <- accepted{s, nil}
+				return
+			}
+			select {
+			case <-stop:
+				ch <- accepted{nil, err}
+				return
+			default:
+			}
+			if time.Now().After(deadline) {
+				ch <- accepted{nil, err}
+				return
+			}
+		}
+	}()
+	cs, cerr := connect()
+	if cerr != nil {
+		close(stop)
+		if a := <-ch; a.sess != nil {
+			_ = a.sess.Close()
+		}
+		return nil, nil, cerr
+	}
+	var a accepted
+	select {
+	case a = <-ch:
+	case <-time.After(acceptGrace):
+		close(stop)
+		a = <-ch
+	}
+	if a.err != nil {
+		_ = cs.Close()
+		return nil, nil, a.err
+	}
+	t.Cleanup(func() { _ = cs.Close(); _ = a.sess.Close() })
+	return cs, a.sess, nil
+}
+
+func expectData(t *testing.T, s *tendril.Session, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		ev, err := s.PollEvent(500)
+		if errors.Is(err, tendril.ErrWouldBlock) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("PollEvent: %v", err)
+		}
+		if ev.Event == "data" {
+			got, _ := base64.RawURLEncoding.DecodeString(ev.DataB64)
+			if string(got) != want {
+				t.Fatalf("data %q, want %q", got, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("no data event for %q", want)
+}
+
+func newRoutesHost(t *testing.T, stateDir string, v2 bool) routesHost {
+	t.Helper()
+	host, err := tendril.NewEndpoint(stateDir, "go-routes-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint host: %v", err)
+	}
+	t.Cleanup(func() { _ = host.Close() })
+	client, err := tendril.NewEndpoint("", "")
+	if err != nil {
+		t.Fatalf("NewEndpoint client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	listen, err := host.ServeDirect("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	issued, err := host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("IssuePairingURI: %v", err)
+	}
+	if !strings.Contains(issued.URI, "&rs=") {
+		t.Fatalf("issued URI must be host-signed by default: %s", issued.URI)
+	}
+	res := pairThroughURI(t, host, client, issued.URI, v2, nil)
+	grant, err := host.MintGrant(res.DeviceID, []string{"fs.read"}, 3600)
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+	return routesHost{ep: host, hostID: hostIDOf(t, host), listen: listen, clientEp: client, deviceID: res.DeviceID, grant: grant}
+}
+
+func routesOf(t *testing.T, ep *tendril.Endpoint, peer, source string) []string {
+	t.Helper()
+	view, err := ep.PeerRoutes(peer)
+	if err != nil {
+		t.Fatalf("PeerRoutes: %v", err)
+	}
+	out := []string{}
+	for _, r := range view.Routes {
+		if r.Source == source {
+			out = append(out, r.Hint)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestIssueAndPairURIPersistsSignedRoutes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state func(*testing.T) string
+	}{
+		{"state_dir", func(t *testing.T) string { return t.TempDir() }},
+		{"ephemeral", func(*testing.T) string { return "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host, err := tendril.NewEndpoint(tc.state(t), "go-uri-host")
+			if err != nil {
+				t.Fatalf("NewEndpoint: %v", err)
+			}
+			defer host.Close()
+			client, err := tendril.NewEndpoint("", "")
+			if err != nil {
+				t.Fatalf("NewEndpoint client: %v", err)
+			}
+			defer client.Close()
+			listen, err := host.ServeDirect("127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("ServeDirect: %v", err)
+			}
+
+			issued, err := host.IssuePairingURI(nil)
+			if err != nil {
+				t.Fatalf("IssuePairingURI: %v", err)
+			}
+			if !strings.Contains(issued.URI, "&rq=") || !strings.Contains(issued.URI, "&rs=") {
+				t.Fatalf("expected a signed URI: %s", issued.URI)
+			}
+			if issued.CodeKind != "lan" || issued.URILen != len(issued.URI) || issued.QRVersionM < 1 {
+				t.Fatalf("unexpected issue result: %+v", issued)
+			}
+			if issued.RouteSeq == nil || *issued.RouteSeq < 1 || issued.Dropped == nil {
+				t.Fatalf("unexpected route_seq or dropped: %+v", issued)
+			}
+
+			res := pairThroughURI(t, host, client, issued.URI, false, nil)
+			hostID := hostIDOf(t, host)
+			if res.HostID != hostID || res.Status != "active" || !res.HostConfirmed || !res.Committed {
+				t.Fatalf("unexpected pair result: %+v", res)
+			}
+			if res.RouteCheck != "verified" || res.Provider != "direct" || res.Endpoint != "direct:"+listen {
+				t.Fatalf("unexpected route result: %+v", res)
+			}
+			wantRoutes := []tendril.Route{{Hint: "direct:" + listen, Source: "signed"}}
+			if !reflect.DeepEqual(res.RoutesPersisted, wantRoutes) || len(res.Skipped) != 0 {
+				t.Fatalf("routes_persisted=%+v skipped=%+v", res.RoutesPersisted, res.Skipped)
+			}
+			if res.RoutesReason != "" {
+				t.Fatalf("routes_reason = %q for a verified pairing", res.RoutesReason)
+			}
+
+			view, err := client.PeerRoutes(hostID)
+			if err != nil {
+				t.Fatalf("PeerRoutes: %v", err)
+			}
+			if !reflect.DeepEqual(view.Routes, wantRoutes) || view.LastRouteSet != nil {
+				t.Fatalf("unexpected view: %+v", view)
+			}
+			if view.RouteMeta == nil || view.RouteMeta.Seq != *issued.RouteSeq || view.RouteMeta.Origin != "uri" {
+				t.Fatalf("unexpected route_meta: %+v", view.RouteMeta)
+			}
+
+			grant, err := host.MintGrant(res.DeviceID, []string{"fs.read"}, 3600)
+			if err != nil {
+				t.Fatalf("MintGrant: %v", err)
+			}
+			cs, hs, err := connectPair(t, host, false, func() (*tendril.Session, error) {
+				return client.Connect("", "", hostID, grant)
+			})
+			if err != nil {
+				t.Fatalf("endpoint-free Connect: %v", err)
+			}
+			if err := cs.SendData([]byte("over stored route")); err != nil {
+				t.Fatalf("SendData: %v", err)
+			}
+			expectData(t, hs, "over stored route")
+		})
+	}
+}
+
+func TestV2URIPairingAndEndpointFreeConnectV2(t *testing.T) {
+	p := newRoutesHost(t, t.TempDir(), true)
+	if got := routesOf(t, p.clientEp, p.hostID, "signed"); !reflect.DeepEqual(got, []string{"direct:" + p.listen}) {
+		t.Fatalf("signed routes after v2 pairing: %v", got)
+	}
+	cs, hs, err := connectPair(t, p.ep, true, func() (*tendril.Session, error) {
+		return p.clientEp.ConnectV2("", "", p.hostID, p.grant)
+	})
+	if err != nil {
+		t.Fatalf("endpoint-free ConnectV2: %v", err)
+	}
+	if err := cs.SendData([]byte("v2 stored")); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
+	expectData(t, hs, "v2 stored")
+}
+
+func TestIssueAndPairOptions(t *testing.T) {
+	host, err := tendril.NewEndpoint(t.TempDir(), "go-opt-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer host.Close()
+	listen, err := host.ServeDirect("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+
+	remote, err := host.IssuePairingURI(&tendril.IssuePairingURIOptions{Kind: "remote", HostName: "Studio"})
+	if err != nil {
+		t.Fatalf("remote issue: %v", err)
+	}
+	if remote.CodeKind != "remote" || !strings.Contains(remote.URI, "Studio") {
+		t.Fatalf("unexpected remote issue: %+v", remote)
+	}
+	if _, err := host.IssuePairingURI(&tendril.IssuePairingURIOptions{Kind: "bluetooth"}); err == nil {
+		t.Fatalf("expected an unknown kind to be rejected")
+	}
+
+	unsigned := false
+	issued, err := host.IssuePairingURI(&tendril.IssuePairingURIOptions{SignRoutes: &unsigned})
+	if err != nil {
+		t.Fatalf("unsigned issue: %v", err)
+	}
+	if strings.Contains(issued.URI, "&rs=") {
+		t.Fatalf("sign_routes=false must not sign: %s", issued.URI)
+	}
+	client, err := tendril.NewEndpoint("", "")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer client.Close()
+	res := pairThroughURI(t, host, client, issued.URI, false, nil)
+	if res.RouteCheck != "unsigned" || len(res.RoutesPersisted) != 0 {
+		t.Fatalf("unsigned URI must persist nothing by default: %+v", res)
+	}
+	if res.RoutesReason != "unsigned_uri" {
+		t.Fatalf("routes_reason = %q, want unsigned_uri", res.RoutesReason)
+	}
+
+	issued, err = host.IssuePairingURI(&tendril.IssuePairingURIOptions{SignRoutes: &unsigned})
+	if err != nil {
+		t.Fatalf("unsigned issue: %v", err)
+	}
+	client2, err := tendril.NewEndpoint("", "")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer client2.Close()
+	res = pairThroughURI(t, host, client2, issued.URI, false, &tendril.PairURIOptions{SaveRoute: true})
+	if want := []tendril.Route{{Hint: "direct:" + listen, Source: "committed"}}; !reflect.DeepEqual(res.RoutesPersisted, want) {
+		t.Fatalf("save_route persisted %+v", res.RoutesPersisted)
+	}
+
+	issued, err = host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("signed issue: %v", err)
+	}
+	client3, err := tendril.NewEndpoint("", "")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer client3.Close()
+	res = pairThroughURI(t, host, client3, issued.URI, false, &tendril.PairURIOptions{Endpoint: listen, RoutePolicy: "none"})
+	if want := []tendril.Route{{Hint: "direct:" + listen, Source: "operator"}}; !reflect.DeepEqual(res.RoutesPersisted, want) {
+		t.Fatalf("endpoint option persisted %+v", res.RoutesPersisted)
+	}
+
+	if _, err := client.PairURI("tendril://nope", "", "", nil); err == nil {
+		t.Fatalf("expected a malformed URI to be rejected")
+	}
+	if _, err := client.PairURI(issued.URI, "", "", &tendril.PairURIOptions{RoutePolicy: "sometimes"}); err == nil {
+		t.Fatalf("expected an unknown route policy to be rejected")
+	}
+	if _, err := client.PairURI("tendril://pair\x00", "", "", nil); err == nil || !strings.Contains(err.Error(), "NUL") {
+		t.Fatalf("expected NUL rejection, got %v", err)
+	}
+}
+
+func strs(v ...string) *[]string { return &v }
+
+func TestRouteConfigKeys(t *testing.T) {
+	ep, err := tendril.NewEndpoint("", "go-config-ep")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer ep.Close()
+	unsigned := false
+	if err := ep.ConfigureRoutes(tendril.RouteConfig{
+		RelayAuthOrigins:    strs("wss://relay.example", "ws://127.0.0.1:8080/"),
+		AdvertisedEndpoints: strs("192.168.1.5:7000"),
+		Advertise:           "explicit",
+		RoutePolicy:         "committed_only",
+		SignRoutes:          &unsigned,
+	}); err != nil {
+		t.Fatalf("ConfigureRoutes: %v", err)
+	}
+	for _, bad := range []tendril.RouteConfig{
+		{RelayAuthOrigins: strs("relay.example")},
+		{RelayAuthOrigins: strs("wss://relay.example/path")},
+		{RelayAuthOrigins: strs("wss://user@relay.example")},
+		{RoutePolicy: "sometimes"},
+		{Advertise: "loud"},
+	} {
+		if err := ep.ConfigureRoutes(bad); err == nil {
+			t.Fatalf("expected %+v to be rejected", bad)
+		}
+	}
+}
+
+func TestConfigureRoutesKeepsRelayTicket(t *testing.T) {
+	issuer, err := tendril.NewEndpoint("", "go-routes-issuer")
+	if err != nil {
+		t.Fatalf("NewEndpoint issuer: %v", err)
+	}
+	defer issuer.Close()
+	info, err := issuer.Info()
+	if err != nil {
+		t.Fatalf("issuer Info: %v", err)
+	}
+	v1URL, _ := spawnRelay(t, nil, "--issuer-pub", info.RelayPub, "--auth-scope", "all")
+	regTicket, err := issuer.MintRelayTicket("127.0.0.1", "register", "*", 300)
+	if err != nil {
+		t.Fatalf("MintRelayTicket: %v", err)
+	}
+	host, err := tendril.NewEndpoint("", "go-routes-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint host: %v", err)
+	}
+	defer host.Close()
+	if err := host.ConfigureTransportsJSON(`{"relay_ticket":` + regTicket + `}`); err != nil {
+		t.Fatalf("ConfigureTransportsJSON ticket: %v", err)
+	}
+	if err := host.ConfigureRoutes(tendril.RouteConfig{RoutePolicy: "committed_only"}); err != nil {
+		t.Fatalf("ConfigureRoutes: %v", err)
+	}
+	if _, err := host.ServeRelay(v1URL, "127.0.0.1"); err != nil {
+		t.Fatalf("authenticated relay dial after ConfigureRoutes lost the ticket: %v", err)
+	}
+
+	// A full replacement through ConfigureTransportsJSON updates the cache, so a later
+	// ConfigureRoutes does not resurrect the replaced ticket.
+	if err := host.ConfigureTransportsJSON("{}"); err != nil {
+		t.Fatalf("ConfigureTransportsJSON empty: %v", err)
+	}
+	if err := host.ConfigureRoutes(tendril.RouteConfig{RoutePolicy: "all_signed"}); err != nil {
+		t.Fatalf("ConfigureRoutes after reset: %v", err)
+	}
+	if _, err := host.ServeRelay(v1URL, "127.0.0.1"); err == nil {
+		t.Fatalf("ServeRelay succeeded without a ticket after the config was replaced")
+	}
+}
+
+func TestConfigureRoutesClearsLists(t *testing.T) {
+	host, err := tendril.NewEndpoint(t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer host.Close()
+	unsigned := false
+	if err := host.ConfigureRoutes(tendril.RouteConfig{
+		Advertise:           "explicit",
+		AdvertisedEndpoints: strs("192.168.1.5:7000"),
+		SignRoutes:          &unsigned,
+	}); err != nil {
+		t.Fatalf("ConfigureRoutes: %v", err)
+	}
+	if _, err := host.ServeDirect("0.0.0.0:0"); err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	// nil leaves the list unchanged.
+	if err := host.ConfigureRoutes(tendril.RouteConfig{RoutePolicy: "all_signed"}); err != nil {
+		t.Fatalf("ConfigureRoutes: %v", err)
+	}
+	issued, err := host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("IssuePairingURI: %v", err)
+	}
+	if !strings.Contains(issued.URI, "192.168.1.5") {
+		t.Fatalf("nil list must keep the advertised hint: %s", issued.URI)
+	}
+	// A pointer to an empty slice clears it.
+	if err := host.ConfigureRoutes(tendril.RouteConfig{AdvertisedEndpoints: strs()}); err != nil {
+		t.Fatalf("ConfigureRoutes clear: %v", err)
+	}
+	issued, err = host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("IssuePairingURI after clear: %v", err)
+	}
+	if strings.Contains(issued.URI, "192.168.1.5") {
+		t.Fatalf("empty list must clear the advertised hint: %s", issued.URI)
+	}
+}
+
+func TestExplicitAdvertisingDefaultsToUnsignedWhenConfigured(t *testing.T) {
+	host, err := tendril.NewEndpoint(t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer host.Close()
+	unsigned := false
+	if err := host.ConfigureRoutes(tendril.RouteConfig{
+		Advertise:           "explicit",
+		AdvertisedEndpoints: strs("192.168.1.5:7000"),
+		SignRoutes:          &unsigned,
+	}); err != nil {
+		t.Fatalf("ConfigureRoutes: %v", err)
+	}
+	if _, err := host.ServeDirect("0.0.0.0:0"); err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	issued, err := host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("IssuePairingURI: %v", err)
+	}
+	if strings.Contains(issued.URI, "&rs=") || !strings.Contains(issued.URI, "192.168.1.5") {
+		t.Fatalf("expected an unsigned URI with the advertised hint: %s", issued.URI)
+	}
+	found := false
+	for _, d := range issued.Dropped {
+		if d.Reason == "unspecified_bind" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("explicit mode must report the dropped unspecified bind: %+v", issued.Dropped)
+	}
+}
+
+func TestPeerRouteSettersAndStoredConnect(t *testing.T) {
+	p := newRoutesHost(t, t.TempDir(), false)
+	client, hostID := p.clientEp, p.hostID
+	signed := []string{"direct:" + p.listen}
+
+	if err := client.SetPeerRoutes(hostID, []string{"127.0.0.1:1", "127.0.0.1:2"}); err != nil {
+		t.Fatalf("SetPeerRoutes: %v", err)
+	}
+	if err := client.SetPeerRoutes(hostID, []string{"127.0.0.1:3"}); err != nil {
+		t.Fatalf("SetPeerRoutes replace: %v", err)
+	}
+	if got := routesOf(t, client, hostID, "operator"); !reflect.DeepEqual(got, []string{"direct:127.0.0.1:3"}) {
+		t.Fatalf("operator routes: %v", got)
+	}
+	if got := routesOf(t, client, hostID, "signed"); !reflect.DeepEqual(got, signed) {
+		t.Fatalf("signed routes disturbed: %v", got)
+	}
+
+	for _, bad := range [][]string{
+		{"127.0.0.1:4", "host#frag"},
+		{"a:1", "a:2", "a:3", "a:4", "a:5", "a:6", "a:7"},
+	} {
+		if err := client.SetPeerRoutes(hostID, bad); err == nil {
+			t.Fatalf("expected %v to be rejected", bad)
+		}
+	}
+	if got := routesOf(t, client, hostID, "operator"); !reflect.DeepEqual(got, []string{"direct:127.0.0.1:3"}) {
+		t.Fatalf("a rejected list must change nothing: %v", got)
+	}
+	if err := client.SetPeerRoutes("dev_unknown", []string{"127.0.0.1:5"}); err == nil || !strings.Contains(err.Error(), "(-2)") {
+		t.Fatalf("expected not-found for an unknown peer, got %v", err)
+	}
+	if _, err := client.PeerRoutes("dev_unknown"); err == nil || !strings.Contains(err.Error(), "(-2)") {
+		t.Fatalf("expected not-found for an unknown peer, got %v", err)
+	}
+
+	if err := client.ClearPeerRoutes(hostID, ""); err != nil {
+		t.Fatalf("ClearPeerRoutes default: %v", err)
+	}
+	if got := routesOf(t, client, hostID, "operator"); len(got) != 0 {
+		t.Fatalf("operator routes after clear: %v", got)
+	}
+	if got := routesOf(t, client, hostID, "signed"); !reflect.DeepEqual(got, signed) {
+		t.Fatalf("a default clear must keep signed routes: %v", got)
+	}
+	if err := client.ClearPeerRoutes(hostID, "bogus"); err == nil {
+		t.Fatalf("expected an unknown source to be rejected")
+	}
+	if err := client.ClearPeerRoutes(hostID, "signed"); err != nil {
+		t.Fatalf("ClearPeerRoutes signed: %v", err)
+	}
+	view, err := client.PeerRoutes(hostID)
+	if err != nil {
+		t.Fatalf("PeerRoutes: %v", err)
+	}
+	if len(view.Routes) != 0 || view.RouteMeta == nil {
+		t.Fatalf("route_meta must outlive the routes: %+v", view)
+	}
+
+	_, _, err = connectPair(t, p.ep, false, func() (*tendril.Session, error) {
+		return client.Connect("", "", hostID, p.grant)
+	})
+	if err == nil || !strings.Contains(err.Error(), "no dialable stored routes") {
+		t.Fatalf("expected no dialable stored routes, got %v", err)
+	}
+
+	if err := client.SetPeerRoutes(hostID, []string{p.listen}); err != nil {
+		t.Fatalf("SetPeerRoutes: %v", err)
+	}
+	cs, hs, err := connectPair(t, p.ep, false, func() (*tendril.Session, error) {
+		return client.Connect("", "", hostID, p.grant)
+	})
+	if err != nil {
+		t.Fatalf("operator route connect: %v", err)
+	}
+	if err := cs.SendData([]byte("operator")); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
+	expectData(t, hs, "operator")
+}
+
+func TestApplyRouteURIOffline(t *testing.T) {
+	p := newRoutesHost(t, t.TempDir(), false)
+	host, client, hostID := p.ep, p.clientEp, p.hostID
+	view, err := client.PeerRoutes(hostID)
+	if err != nil || view.RouteMeta == nil {
+		t.Fatalf("PeerRoutes: %+v %v", view, err)
+	}
+	first := view.RouteMeta.Seq
+	stale, err := host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("issue stale: %v", err)
+	}
+
+	second, err := host.ServeDirect("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	fresh, err := host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("issue fresh: %v", err)
+	}
+	if fresh.RouteSeq == nil || *fresh.RouteSeq != first+1 {
+		t.Fatalf("fresh seq %v, want %d", fresh.RouteSeq, first+1)
+	}
+
+	res, err := client.ApplyRouteURI(fresh.URI, nil)
+	if err != nil {
+		t.Fatalf("apply fresh: %v", err)
+	}
+	if res.PeerID != hostID || !res.Applied || res.Reason != "" || res.RouteSeq == nil || *res.RouteSeq != first+1 {
+		t.Fatalf("unexpected apply result: %+v", res)
+	}
+	want := []string{"direct:" + p.listen, "direct:" + second}
+	sort.Strings(want)
+	if got := routesOf(t, client, hostID, "signed"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("signed routes %v, want %v", got, want)
+	}
+
+	res, err = client.ApplyRouteURI(stale.URI, nil)
+	if err != nil || res.Applied || res.Reason != "stale_route_seq" {
+		t.Fatalf("stale apply: %+v %v", res, err)
+	}
+	res, err = client.ApplyRouteURI(stale.URI, &tendril.ApplyRouteURIOptions{ReplaceRoutes: true})
+	if err != nil || !res.Applied {
+		t.Fatalf("approved apply: %+v %v", res, err)
+	}
+	if got := routesOf(t, client, hostID, "signed"); !reflect.DeepEqual(got, []string{"direct:" + p.listen}) {
+		t.Fatalf("approved replacement: %v", got)
+	}
+	if view, _ := client.PeerRoutes(hostID); view.RouteMeta == nil || view.RouteMeta.Origin != "approved" {
+		t.Fatalf("expected approved origin: %+v", view.RouteMeta)
+	}
+
+	res, err = client.ApplyRouteURI(fresh.URI, &tendril.ApplyRouteURIOptions{RoutePolicy: "committed_only"})
+	if err != nil || res.Applied || res.Reason != "route_policy" {
+		t.Fatalf("policy apply: %+v %v", res, err)
+	}
+
+	unsigned := false
+	plain, err := host.IssuePairingURI(&tendril.IssuePairingURIOptions{SignRoutes: &unsigned})
+	if err != nil {
+		t.Fatalf("issue unsigned: %v", err)
+	}
+	if _, err := client.ApplyRouteURI(plain.URI, nil); err == nil || !strings.Contains(err.Error(), "not host-signed") {
+		t.Fatalf("expected an unsigned URI to be refused, got %v", err)
+	}
+	if _, err := client.ApplyRouteURI("not a uri", nil); err == nil || !strings.Contains(err.Error(), "(-1)") {
+		t.Fatalf("expected an invalid-argument error, got %v", err)
+	}
+}
+
+func TestConnectWithOptionsTakesRelayHost(t *testing.T) {
+	p := newRoutesHost(t, t.TempDir(), false)
+	_, err := p.clientEp.ConnectWithOptions(p.hostID, &tendril.ConnectOptions{
+		Grant:     json.RawMessage(p.grant),
+		Endpoint:  "iroh://peer",
+		RelayHost: "not-a-relay-mode",
+	})
+	if err == nil || strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("relay_host must reach the dialer config and fail its parser, got %v", err)
+	}
+}
+
+func TestConnectWithOptionsUsesAndAppliesRecoveryURI(t *testing.T) {
+	p := newRoutesHost(t, t.TempDir(), false)
+	host, client, hostID := p.ep, p.clientEp, p.hostID
+	if err := client.ClearPeerRoutes(hostID, "all"); err != nil {
+		t.Fatalf("ClearPeerRoutes: %v", err)
+	}
+	if _, _, err := connectPair(t, host, false, func() (*tendril.Session, error) {
+		return client.Connect("", "", hostID, p.grant)
+	}); err == nil {
+		t.Fatalf("expected no stored routes to fail")
+	}
+
+	same, err := host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	opts := &tendril.ConnectOptions{Wire: 1, Grant: json.RawMessage(p.grant), RecoveryURI: same.URI}
+	cs, hs, err := connectPair(t, host, false, func() (*tendril.Session, error) {
+		return client.ConnectWithOptions(hostID, opts)
+	})
+	if err != nil {
+		t.Fatalf("recovery connect: %v", err)
+	}
+	if err := cs.SendData([]byte("recovered")); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
+	expectData(t, hs, "recovered")
+	if view, _ := client.PeerRoutes(hostID); len(view.Routes) != 0 {
+		t.Fatalf("an equal rq must not touch stored routes: %+v", view.Routes)
+	}
+
+	if _, err := host.ServeDirect("127.0.0.1:0"); err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	newer, err := host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("issue newer: %v", err)
+	}
+	opts = &tendril.ConnectOptions{Grant: json.RawMessage(p.grant), RecoveryURI: newer.URI}
+	if _, _, err := connectPair(t, host, false, func() (*tendril.Session, error) {
+		return client.ConnectWithOptions(hostID, opts)
+	}); err != nil {
+		t.Fatalf("newer recovery connect: %v", err)
+	}
+	view, err := client.PeerRoutes(hostID)
+	if err != nil {
+		t.Fatalf("PeerRoutes: %v", err)
+	}
+	if len(routesOf(t, client, hostID, "signed")) != 2 || view.RouteMeta == nil || newer.RouteSeq == nil || view.RouteMeta.Seq != *newer.RouteSeq {
+		t.Fatalf("a newer rq must replace the signed routes: %+v", view)
+	}
+
+	opts = &tendril.ConnectOptions{Grant: json.RawMessage(p.grant), Endpoint: p.listen, RecoveryURI: newer.URI}
+	if _, _, err := connectPair(t, host, false, func() (*tendril.Session, error) {
+		return client.ConnectWithOptions(hostID, opts)
+	}); err != nil {
+		t.Fatalf("explicit endpoint with recovery URI: %v", err)
+	}
+
+	stranger, err := tendril.NewEndpoint("", "")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer stranger.Close()
+	if _, err := stranger.ServeDirect("127.0.0.1:0"); err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	foreign, err := stranger.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("issue foreign: %v", err)
+	}
+	if s, err := client.ConnectWithOptions(hostID, &tendril.ConnectOptions{Grant: json.RawMessage(p.grant), RecoveryURI: foreign.URI}); err == nil {
+		_ = s.Close()
+		t.Fatalf("a recovery URI of another host must be refused")
+	}
+	if s, err := client.ConnectWithOptions(hostID, &tendril.ConnectOptions{Wire: 3}); err == nil {
+		_ = s.Close()
+		t.Fatalf("wire 3 must be rejected")
+	}
+}
+
+func snapshotOf(addr string) *tendril.NetworkSnapshot {
+	return &tendril.NetworkSnapshot{Networks: []tendril.Network{{
+		ID: "net-1", Iface: "wlan0", IfIndex: 3, Transports: []string{"wifi"}, Addrs: []string{addr},
+	}}}
+}
+
+func waitRouteSet(t *testing.T, client *tendril.Endpoint, sess *tendril.Session, hostID string, seq uint64) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		ev, err := sess.PollEvent(250)
+		if err == nil {
+			t.Fatalf("route sets never reach the event stream: %+v", ev)
+		}
+		if !errors.Is(err, tendril.ErrWouldBlock) {
+			t.Fatalf("PollEvent: %v", err)
+		}
+		view, err := client.PeerRoutes(hostID)
+		if err != nil {
+			t.Fatalf("PeerRoutes: %v", err)
+		}
+		if view.LastRouteSet != nil && view.LastRouteSet.Outcome == "applied" && view.LastRouteSet.Seq == seq {
+			if view.RouteMeta == nil || view.RouteMeta.Origin != "session" || view.RouteMeta.Seq != seq {
+				t.Fatalf("unexpected route_meta: %+v", view.RouteMeta)
+			}
+			return
+		}
+	}
+	t.Fatalf("route set %d not applied", seq)
+}
+
+func TestRefreshRoutesDeliversRouteSetToLiveSession(t *testing.T) {
+	host, err := tendril.NewEndpoint(t.TempDir(), "go-refresh-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer host.Close()
+	client, err := tendril.NewEndpoint("", "")
+	if err != nil {
+		t.Fatalf("NewEndpoint client: %v", err)
+	}
+	defer client.Close()
+	loopback, err := host.ServeDirect("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	anyAddr, err := host.ServeDirect("0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("ServeDirect any: %v", err)
+	}
+	lanPort := anyAddr[strings.LastIndex(anyAddr, ":")+1:]
+
+	first, err := host.RefreshRoutes(snapshotOf("10.255.77.20"))
+	if err != nil {
+		t.Fatalf("RefreshRoutes: %v", err)
+	}
+	issued, err := host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("IssuePairingURI: %v", err)
+	}
+	if issued.RouteSeq == nil || *issued.RouteSeq != first.RouteSeq || !strings.Contains(issued.URI, "10.255.77.20") {
+		t.Fatalf("issue must carry the refreshed set: %+v first=%+v", issued, first)
+	}
+	res := pairThroughURI(t, host, client, issued.URI, false, nil)
+	hostID := hostIDOf(t, host)
+	lanA := "direct:10.255.77.20:" + lanPort
+	want := []string{"direct:" + loopback, lanA}
+	sort.Strings(want)
+	if got := routesOf(t, client, hostID, "signed"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("signed routes %v, want %v", got, want)
+	}
+	grant, err := host.MintGrant(res.DeviceID, []string{"fs.read"}, 3600)
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+	connect := func() (*tendril.Session, *tendril.Session) {
+		cs, hs, err := connectPair(t, host, false, func() (*tendril.Session, error) {
+			return client.Connect("", "", hostID, grant)
+		})
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		return cs, hs
+	}
+
+	// A URI-paired client sends route_seq 0, so the current set is the first frame of its first session.
+	cs, hs := connect()
+	waitRouteSet(t, client, cs, hostID, first.RouteSeq)
+	_ = cs.Close()
+	_ = hs.Close()
+
+	cs, hs = connect()
+	again, err := host.RefreshRoutes(snapshotOf("10.255.77.20"))
+	if err != nil || again.Changed || again.RouteSeq != first.RouteSeq {
+		t.Fatalf("an unchanged snapshot must not bump: %+v %v", again, err)
+	}
+	moved, err := host.RefreshRoutes(snapshotOf("10.255.77.30"))
+	if err != nil || !moved.Changed || moved.RouteSeq != first.RouteSeq+1 {
+		t.Fatalf("a moved address must bump once: %+v %v", moved, err)
+	}
+	waitRouteSet(t, client, cs, hostID, moved.RouteSeq)
+	signed := routesOf(t, client, hostID, "signed")
+	lanB := "direct:10.255.77.30:" + lanPort
+	has := func(h string) bool {
+		for _, s := range signed {
+			if s == h {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(lanB) || has(lanA) || !has("direct:"+loopback) {
+		t.Fatalf("signed routes after refresh: %v", signed)
+	}
+	if err := hs.SendData([]byte("still open")); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
+	expectData(t, cs, "still open")
+
+	if _, err := host.RefreshRoutes(&tendril.NetworkSnapshot{}); err != nil {
+		t.Fatalf("an empty snapshot is a valid snapshot: %v", err)
+	}
+	if _, err := host.RefreshRoutes(nil); err != nil {
+		t.Fatalf("native refresh: %v", err)
 	}
 }
