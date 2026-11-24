@@ -289,6 +289,8 @@ test("custom ?relay= URI refuses bearer auth before touching the network", async
   const host = new Endpoint(null, "relay-host");
   const cli = new Endpoint(null, "relay-cli");
   try {
+    // Day-2 connects read the pinned peer before dialing, so pair first.
+    await pairV2(host, cli, await host.serveDirect("127.0.0.1:0"), "relay-host");
     const p2pAddr = await host.serveP2p("disabled");
     const endpointId = p2pAddr.split("://")[1].split("?")[0];
     const uri = `iroh://${endpointId}?relay=http://127.0.0.1:9/`;
