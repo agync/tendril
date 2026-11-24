@@ -13,8 +13,8 @@ name = "tendril_node"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "2", default-features = false, features = ["napi8", "serde-json", "tokio_rt"] }
-napi-derive = "2"
+napi = { version = "3", default-features = false, features = ["napi8", "serde-json", "tokio_rt"] }
+napi-derive = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tendril-core = { path = "../../crates/tendril-core" }
@@ -30,7 +30,9 @@ p2p-iroh-services = ["tendril-runtime/p2p-iroh-services"]
 napi-build = "2"
 
 [lints.rust]
-unsafe_code = "forbid"
+# napi-derive 3 registers exports with code marked allow(unsafe_code),
+# which forbid would reject. deny still rejects unsafe in this crate.
+unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
