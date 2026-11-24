@@ -4,9 +4,21 @@ import Foundation
 import CryptoKit
 import Security
 #endif
+#if canImport(CoreImage) && canImport(Vision) && os(macOS)
+import CoreImage
+import Vision
+#endif
 import Testing
 import CTendril
 @testable import Tendril
+
+/// Runs the blocking peer side of a test on its own thread. A synchronous test body holds a
+/// Swift concurrency cooperative thread while it waits, and the pool has one thread per CPU:
+/// once every one is blocked, `DispatchQueue.global()` work is not started, so the peer never
+/// answers and the test times out.
+private func onDedicatedThread(_ body: @escaping @Sendable () -> Void) {
+  Thread(block: body).start()
+}
 
 private final class SendableBox<T>: @unchecked Sendable {
   private let lock = NSLock()
@@ -667,7 +679,7 @@ struct TendrilConformanceTests {
     let logBox = SendableBox<String>("")
     let sem = DispatchSemaphore(value: 0)
 
-    DispatchQueue.global().async {
+    onDedicatedThread {
       while true {
         let data = handle.availableData
         if data.isEmpty { break }
@@ -698,6 +710,37 @@ struct TendrilConformanceTests {
     }
     let v2Url = String(v1Url.dropLast("/v1/relay".count)) + "/v2/relay"
     return (proc, v1Url, v2Url)
+  }
+
+  @Test
+  func configureRoutesKeepsRelayTicket() throws {
+    let issuer = try TendrilEndpoint(stateDir: nil, hostId: "swift-routes-issuer")
+    defer { issuer.close() }
+    let issuerInfo = try JSONSerialization.jsonObject(with: Data(issuer.infoJson().utf8)) as! [String: Any]
+    let issuerPub = try #require(issuerInfo["relay_pub"] as? String)
+    let regTicket = try issuer.mintRelayTicket(
+      relayHost: "127.0.0.1", role: "register", targetPubOrWildcard: "*", ttlSecs: 300)
+    let (relayProc, v1Url, _) = try startRelay(args: ["--issuer-pub", issuerPub, "--auth-scope", "all"])
+    defer {
+      relayProc.terminate()
+      relayProc.waitUntilExit()
+    }
+    let host = try TendrilEndpoint(stateDir: nil, hostId: "swift-routes-ticket-host")
+    defer { host.close() }
+    try host.configureTransportsJSON("{\"relay_ticket\":\(regTicket)}")
+    try host.configureRoutes(routePolicy: "committed_only")
+    _ = try host.serveRelay(relayUrl: v1Url, expectedHost: "127.0.0.1")
+
+    // A no-argument call re-sends the cached configuration instead of resetting it.
+    try host.configureRoutes()
+    _ = try host.serveRelay(relayUrl: v1Url, expectedHost: "127.0.0.1")
+
+    // A full replacement updates the cache, so a later configureRoutes does not restore the ticket.
+    try host.configureTransportsJSON("{}")
+    try host.configureRoutes(routePolicy: "all_signed")
+    #expect(throws: Error.self) {
+      _ = try host.serveRelay(relayUrl: v1Url, expectedHost: "127.0.0.1")
+    }
   }
 
   @Test
@@ -739,7 +782,7 @@ struct TendrilConformanceTests {
 
     let accBox = SendableBox<String?>(nil)
     let accSem = DispatchSemaphore(value: 0)
-    DispatchQueue.global().async {
+    onDedicatedThread {
       accBox.set(try? host.pairV2Accept(timeoutMs: 5000))
       accSem.signal()
     }
@@ -767,7 +810,7 @@ struct TendrilConformanceTests {
 
     let hostSessBox = SendableBox<TendrilSession?>(nil)
     let sessSem = DispatchSemaphore(value: 0)
-    DispatchQueue.global().async {
+    onDedicatedThread {
       hostSessBox.set(try? host.acceptV2(timeoutMs: 5000))
       sessSem.signal()
     }
@@ -822,7 +865,7 @@ struct TendrilConformanceTests {
 
     let tAccBox = SendableBox<String?>(nil)
     let tAccSem = DispatchSemaphore(value: 0)
-    DispatchQueue.global().async {
+    onDedicatedThread {
       tAccBox.set(try? tHost.pairV2Accept(timeoutMs: 5000))
       tAccSem.signal()
     }
@@ -844,7 +887,7 @@ struct TendrilConformanceTests {
     let tv2Ep = try tHost.serveRelayV2(relayUrl: tv2Url, expectedHost: "127.0.0.1")
     let tHostSessBox = SendableBox<TendrilSession?>(nil)
     let tSessSem = DispatchSemaphore(value: 0)
-    DispatchQueue.global().async {
+    onDedicatedThread {
       tHostSessBox.set(try? tHost.acceptV2(timeoutMs: 5000))
       tSessSem.signal()
     }
@@ -1032,3 +1075,576 @@ struct TendrilConformanceTests {
   #endif
   #endif
 }
+
+// MARK: Pairing URIs and routes
+
+#if os(macOS) || os(Linux)
+@Suite
+struct TendrilRouteTests {
+  private func obj(_ json: String) throws -> [String: Any] {
+    try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+  }
+
+  private func routes(_ client: TendrilEndpoint, _ host: String, source: String) throws -> [String] {
+    let view = try obj(client.peerRoutes(peerId: host))
+    return (view["routes"] as! [[String: Any]])
+      .filter { $0["source"] as? String == source }
+      .map { $0["hint"] as! String }
+  }
+
+  private func portOf(_ endpoint: String) -> String {
+    String(endpoint.split(separator: ":").last!)
+  }
+
+  /// Pairs `client` with `host` from `uri`, confirms on the host and returns the client result
+  /// and the host's device-side result.
+  private func pair(
+    host: TendrilEndpoint,
+    client: TendrilEndpoint,
+    uri: String,
+    wire: Int = 1,
+    saveRoute: Bool? = nil,
+    routePolicy: String? = nil,
+    endpoint: String? = nil
+  ) throws -> (client: [String: Any], host: [String: Any]) {
+    let hostBox = SendableBox<String>("")
+    let sem = DispatchSemaphore(value: 0)
+    onDedicatedThread {
+      hostBox.set(
+        (try? (wire == 2 ? host.pairV2Accept(timeoutMs: 15_000) : host.pairAccept(timeoutMs: 15_000))) ?? ""
+      )
+      sem.signal()
+    }
+    let res =
+      wire == 2
+      ? try client.pairV2Uri(
+        uri, name: "swift-phone", routePolicy: routePolicy, saveRoute: saveRoute, endpoint: endpoint)
+      : try client.pairUri(
+        uri, name: "swift-phone", routePolicy: routePolicy, saveRoute: saveRoute, endpoint: endpoint)
+    #expect(sem.wait(timeout: .now() + 15.0) == .success)
+    let hostRes = try obj(hostBox.get())
+    let clientRes = try obj(res)
+    #expect(clientRes["sas"] as? String == hostRes["sas"] as? String)
+    try host.confirmPeer(peerId: hostRes["device_id"] as! String, sas: hostRes["sas"] as? String)
+    return (clientRes, hostRes)
+  }
+
+  private func accepting<T>(
+    host: TendrilEndpoint, wire: Int = 1, _ connect: () throws -> T
+  ) throws -> (T, TendrilSession) {
+    let box = SendableBox<TendrilSession?>(nil)
+    let sem = DispatchSemaphore(value: 0)
+    onDedicatedThread {
+      box.set(try? (wire == 2 ? host.acceptV2(timeoutMs: 8000) : host.acceptSession(timeoutMs: 8000)))
+      sem.signal()
+    }
+    let client: T
+    do {
+      client = try connect()
+    } catch {
+      _ = sem.wait(timeout: .now() + 9.0)
+      box.get()?.free()
+      throw error
+    }
+    #expect(sem.wait(timeout: .now() + 9.0) == .success)
+    return (client, try #require(box.get()))
+  }
+
+  private func roundTrip(_ client: TendrilSession, _ host: TendrilSession, _ text: String) throws {
+    try client.sendData(Data(text.utf8))
+    let ev = try obj(host.pollEvent(timeoutMs: 3000))
+    #expect(ev["event"] as? String == "data")
+  }
+
+  private struct Paired {
+    let host: TendrilEndpoint
+    let client: TendrilEndpoint
+    let hostId: String
+    let listen: String
+    let grant: String
+    let pair: [String: Any]
+    let issued: [String: Any]
+  }
+
+  private func paired(wire: Int = 1) throws -> Paired {
+    let host = try TendrilEndpoint(hostId: "swift-routes-host")
+    let client = try TendrilEndpoint(hostId: "swift-routes-client")
+    let listen = try host.serveDirect(listenAddr: "127.0.0.1:0")
+    let issued = try obj(host.issuePairingUri())
+    let res = try pair(host: host, client: client, uri: issued["uri"] as! String, wire: wire)
+    let grant = try host.mintGrant(
+      peerId: res.host["device_id"] as! String, capsJson: "[\"fs.read\"]", ttlSecs: 3600)
+    return Paired(
+      host: host, client: client, hostId: "swift-routes-host", listen: listen, grant: grant,
+      pair: res.client, issued: issued)
+  }
+
+  @Test
+  func signedPairingPersistsAllRoutesAndConnectsWithoutEndpoint() throws {
+    let p = try paired()
+    defer {
+      p.host.close()
+      p.client.close()
+    }
+    let uri = p.issued["uri"] as! String
+    #expect(uri.contains("&rq=") && uri.contains("&rs="))
+    #expect(p.issued["code_kind"] as? String == "lan")
+    #expect(p.issued["uri_len"] as? Int == uri.utf8.count)
+    #expect(URL(string: uri)?.absoluteString == uri)
+    #expect(p.pair["route_check"] as? String == "verified")
+    #expect(p.pair["committed"] as? Bool == true)
+    #expect(p.pair["provider"] as? String == "direct")
+    #expect(try routes(p.client, p.hostId, source: "signed") == ["direct:\(p.listen)"])
+    let view = try obj(p.client.peerRoutes(peerId: p.hostId))
+    #expect((view["route_meta"] as! [String: Any])["origin"] as? String == "uri")
+
+    let (cli, srv) = try accepting(host: p.host) {
+      try p.client.connect(targetHostId: p.hostId, grantJson: p.grant)
+    }
+    defer {
+      cli.free()
+      srv.free()
+    }
+    try roundTrip(cli, srv, "over stored route")
+  }
+
+  @Test
+  func wireV2UriPairingAndEndpointFreeConnect() throws {
+    let p = try paired(wire: 2)
+    defer {
+      p.host.close()
+      p.client.close()
+    }
+    #expect(p.pair["route_check"] as? String == "verified")
+    let (cli, srv) = try accepting(host: p.host, wire: 2) {
+      try p.client.connectV2(targetHostId: p.hostId, grantJson: p.grant)
+    }
+    defer {
+      cli.free()
+      srv.free()
+    }
+    try roundTrip(cli, srv, "v2 stored")
+  }
+
+  @Test
+  func issueAndPairOptions() throws {
+    let host = try TendrilEndpoint(hostId: "swift-opt-host")
+    let client = try TendrilEndpoint(hostId: "swift-opt-client")
+    let client2 = try TendrilEndpoint(hostId: "swift-opt-client2")
+    defer {
+      host.close()
+      client.close()
+      client2.close()
+    }
+    let listen = try host.serveDirect(listenAddr: "127.0.0.1:0")
+    let remote = try obj(host.issuePairingUri(kind: "remote", hostName: "Studio"))
+    #expect(remote["code_kind"] as? String == "remote")
+    #expect((remote["uri"] as! String).contains("Studio"))
+    #expect(throws: Error.self) { _ = try host.issuePairingUri(kind: "bluetooth") }
+
+    let unsigned = try obj(host.issuePairingUri(signRoutes: false))
+    let uri = unsigned["uri"] as! String
+    #expect(!uri.contains("&rs="))
+    let res = try pair(host: host, client: client, uri: uri).client
+    #expect(res["route_check"] as? String == "unsigned")
+    #expect((res["routes_persisted"] as! [Any]).isEmpty)
+
+    let again = try obj(host.issuePairingUri(signRoutes: false))["uri"] as! String
+    let saved = try pair(host: host, client: client2, uri: again, saveRoute: true).client
+    let persisted = saved["routes_persisted"] as! [[String: Any]]
+    #expect(persisted.map { $0["hint"] as? String } == ["direct:\(listen)"])
+    #expect(persisted.map { $0["source"] as? String } == ["committed"])
+
+    #expect(throws: Error.self) { _ = try client.pairUri("tendril://nope") }
+    #expect(throws: Error.self) { _ = try client.pairUri(uri, routePolicy: "sometimes") }
+    #expect(throws: Error.self) { _ = try client.pairUri("a\u{0}b") }
+  }
+
+  @Test
+  func peerRouteSetterReplacesOperatorRoutesAtomically() throws {
+    let p = try paired()
+    defer {
+      p.host.close()
+      p.client.close()
+    }
+    try p.client.setPeerRoutes(peerId: p.hostId, routes: ["direct:127.0.0.1:41001"])
+    try p.client.setPeerRoutes(peerId: p.hostId, routes: ["direct:127.0.0.1:41002", "direct:127.0.0.1:41003"])
+    #expect(
+      try routes(p.client, p.hostId, source: "operator")
+        == ["direct:127.0.0.1:41002", "direct:127.0.0.1:41003"])
+    #expect(try routes(p.client, p.hostId, source: "signed") == ["direct:\(p.listen)"])
+
+    #expect(throws: Error.self) {
+      try p.client.setPeerRoutes(peerId: p.hostId, routes: ["direct:127.0.0.1:41004", "bogus://"])
+    }
+    #expect(
+      try routes(p.client, p.hostId, source: "operator")
+        == ["direct:127.0.0.1:41002", "direct:127.0.0.1:41003"])
+    #expect(throws: Error.self) { try p.client.setPeerRoutes(peerId: p.hostId, routes: ["a\u{0}b"]) }
+    #expect(throws: Error.self) { try p.client.setPeerRoutes(peerId: "dev_unknown", routes: []) }
+
+    try p.client.clearPeerRoutes(peerId: p.hostId)
+    #expect(try routes(p.client, p.hostId, source: "operator").isEmpty)
+    #expect(try routes(p.client, p.hostId, source: "signed").count == 1)
+    try p.client.clearPeerRoutes(peerId: p.hostId, source: "all")
+    #expect((try obj(p.client.peerRoutes(peerId: p.hostId))["routes"] as! [Any]).isEmpty)
+  }
+
+  @Test
+  func applyRouteUriOffline() throws {
+    let p = try paired()
+    defer {
+      p.host.close()
+      p.client.close()
+    }
+    let first = (try obj(p.client.peerRoutes(peerId: p.hostId))["route_meta"] as! [String: Any])["seq"] as! Int
+    let stale = try obj(p.host.issuePairingUri())["uri"] as! String
+    let second = try p.host.serveDirect(listenAddr: "127.0.0.1:0")
+    let fresh = try obj(p.host.issuePairingUri())
+    #expect(fresh["route_seq"] as? Int == first + 1)
+
+    var res = try obj(p.client.applyRouteUri(fresh["uri"] as! String))
+    #expect(res["applied"] as? Bool == true)
+    #expect(res["route_seq"] as? Int == first + 1)
+    #expect(
+      Set(try routes(p.client, p.hostId, source: "signed")) == ["direct:\(p.listen)", "direct:\(second)"])
+
+    res = try obj(p.client.applyRouteUri(stale))
+    #expect(res["applied"] as? Bool == false)
+    #expect(res["reason"] as? String == "stale_route_seq")
+    res = try obj(p.client.applyRouteUri(stale, replaceRoutes: true))
+    #expect(res["applied"] as? Bool == true)
+    #expect(try routes(p.client, p.hostId, source: "signed") == ["direct:\(p.listen)"])
+    res = try obj(p.client.applyRouteUri(fresh["uri"] as! String, routePolicy: "committed_only"))
+    #expect(res["applied"] as? Bool == false)
+    #expect(res["reason"] as? String == "route_policy")
+    #expect(throws: Error.self) { _ = try p.client.applyRouteUri("not a uri") }
+  }
+
+  @Test
+  func connectWithOptionsUsesRecoveryUri() throws {
+    let p = try paired()
+    defer {
+      p.host.close()
+      p.client.close()
+    }
+    try p.client.clearPeerRoutes(peerId: p.hostId, source: "all")
+    #expect(throws: Error.self) { _ = try p.client.connect(targetHostId: p.hostId, grantJson: p.grant) }
+
+    let recovery = try obj(p.host.issuePairingUri())["uri"] as! String
+    let (cli, srv) = try accepting(host: p.host) {
+      try p.client.connectWithOptions(
+        targetHostId: p.hostId, grantJson: p.grant, recoveryUri: recovery)
+    }
+    try roundTrip(cli, srv, "recovered")
+    cli.free()
+    srv.free()
+
+    let stranger = try TendrilEndpoint(hostId: "swift-stranger")
+    defer { stranger.close() }
+    _ = try stranger.serveDirect(listenAddr: "127.0.0.1:0")
+    let foreign = try obj(stranger.issuePairingUri())["uri"] as! String
+    #expect(throws: Error.self) {
+      _ = try p.client.connectWithOptions(
+        targetHostId: p.hostId, grantJson: p.grant, recoveryUri: foreign)
+    }
+    #expect(throws: Error.self) { _ = try p.client.connectWithOptions(targetHostId: p.hostId, wire: 3) }
+    #expect(throws: Error.self) {
+      _ = try p.client.connectWithOptions(targetHostId: p.hostId, grantJson: "{not json")
+    }
+  }
+
+  private func snapshot(_ networks: [(id: String, iface: String, index: Int, transports: [String], addrs: [String])])
+    throws -> String
+  {
+    let list = networks.map { n -> [String: Any] in
+      ["id": n.id, "iface": n.iface, "if_index": n.index, "transports": n.transports, "addrs": n.addrs]
+    }
+    let data = try JSONSerialization.data(withJSONObject: ["networks": list])
+    return String(decoding: data, as: UTF8.self)
+  }
+
+  /// Drives `cli` until `client` records an applied route set `seq` from `hostId`.
+  private func waitRouteSet(_ client: TendrilEndpoint, _ cli: TendrilSession, _ hostId: String, seq: Int) throws {
+    let deadline = Date().addingTimeInterval(15)
+    while Date() < deadline {
+      do {
+        _ = try cli.pollEvent(timeoutMs: 250)
+        Issue.record("route sets never reach the event stream")
+        return
+      } catch TendrilError.wouldBlock {
+      }
+      let view = try obj(client.peerRoutes(peerId: hostId))
+      if let last = view["last_route_set"] as? [String: Any],
+        last["outcome"] as? String == "applied", last["seq"] as? Int == seq
+      {
+        #expect((view["route_meta"] as! [String: Any])["origin"] as? String == "session")
+        return
+      }
+    }
+    Issue.record("route set \(seq) not applied")
+  }
+
+  @Test
+  func refreshRoutesDeliversRouteSetAndReconnects() throws {
+    let host = try TendrilEndpoint(hostId: "swift-refresh-host")
+    let client = try TendrilEndpoint(hostId: "swift-refresh-client")
+    defer {
+      host.close()
+      client.close()
+    }
+    let loopback = try host.serveDirect(listenAddr: "127.0.0.1:0")
+    let any = try host.serveDirect(listenAddr: "0.0.0.0:0")
+    let lanPort = portOf(any)
+    func net(_ addr: String) throws -> String {
+      try snapshot([(id: "net-1", iface: "en0", index: 3, transports: ["wifi"], addrs: [addr])])
+    }
+
+    let seq0 = try obj(host.refreshRoutes(snapshotJson: net("10.255.77.20")))["route_seq"] as! Int
+    let issued = try obj(host.issuePairingUri())
+    #expect(issued["route_seq"] as? Int == seq0)
+    let uri = issued["uri"] as! String
+    #expect(uri.contains("10.255.77.20"))
+    let res = try pair(host: host, client: client, uri: uri)
+    let grant = try host.mintGrant(
+      peerId: res.host["device_id"] as! String, capsJson: "[\"fs.read\"]", ttlSecs: 3600)
+    let hostId = "swift-refresh-host"
+    #expect(
+      Set(try routes(client, hostId, source: "signed"))
+        == ["direct:\(loopback)", "direct:10.255.77.20:\(lanPort)"])
+
+    var (cli, srv) = try accepting(host: host) {
+      try client.connect(targetHostId: hostId, grantJson: grant)
+    }
+    try waitRouteSet(client, cli, hostId, seq: seq0)
+    cli.free()
+    srv.free()
+
+    (cli, srv) = try accepting(host: host) {
+      try client.connect(targetHostId: hostId, grantJson: grant)
+    }
+    defer {
+      cli.free()
+      srv.free()
+    }
+    let same = try obj(host.refreshRoutes(snapshotJson: net("10.255.77.20")))
+    #expect(same["changed"] as? Bool == false)
+    #expect(same["route_seq"] as? Int == seq0)
+    let moved = try obj(host.refreshRoutes(snapshotJson: net("10.255.77.30")))
+    #expect(moved["changed"] as? Bool == true)
+    #expect(moved["route_seq"] as? Int == seq0 + 1)
+    try waitRouteSet(client, cli, hostId, seq: seq0 + 1)
+    let signed = try routes(client, hostId, source: "signed")
+    #expect(signed.contains("direct:10.255.77.30:\(lanPort)"))
+    #expect(!signed.contains("direct:10.255.77.20:\(lanPort)"))
+    #expect(signed.contains("direct:\(loopback)"))
+    try srv.sendData(Data("still open".utf8))
+
+    // The next endpoint-free connect uses the updated routes without any prompt.
+    let (cli2, srv2) = try accepting(host: host) {
+      try client.connect(targetHostId: hostId, grantJson: grant)
+    }
+    defer {
+      cli2.free()
+      srv2.free()
+    }
+    try roundTrip(cli2, srv2, "after address change")
+
+    #expect(throws: Error.self) { _ = try host.refreshRoutes(snapshotJson: "{\"networks\": 1}") }
+    _ = try host.refreshRoutes()
+  }
+
+  #if canImport(Network)
+  @Test
+  func pathUpdateRefreshesRoutes() throws {
+    let host = try TendrilEndpoint(hostId: "swift-monitor-host")
+    defer { host.close() }
+    _ = try host.serveDirect(listenAddr: "0.0.0.0:0")
+    #expect(!host.isPathMonitoring)
+    let queue = DispatchQueue(label: "tendril.swift.test-path")
+    try host.startPathMonitoring(queue: queue)
+    #expect(host.isPathMonitoring)
+    // An NWPathMonitor update reaches refreshRoutes(): a snapshot-free refresh succeeds and the
+    // endpoint then publishes a route set. The real monitor may also report its initial path.
+    let before = host.pathRefreshCount
+    host.firePathUpdate()
+    #expect(host.pathRefreshCount >= before + 1)
+    let issued = try obj(host.issuePairingUri())
+    #expect((issued["route_seq"] as? Int ?? 0) >= 1)
+    host.stopPathMonitoring()
+    #expect(!host.isPathMonitoring)
+    queue.sync {}
+    let stopped = host.pathRefreshCount
+    host.firePathUpdate()
+    #expect(host.pathRefreshCount == stopped)
+    try host.startPathMonitoring()
+    host.close()
+    #expect(!host.isPathMonitoring)
+  }
+
+  @Test
+  func pathMonitorNeverSurvivesCloseOrLosesToStop() throws {
+    // Start after close throws and installs nothing.
+    let closed = try TendrilEndpoint(hostId: "swift-monitor-closed")
+    closed.close()
+    #expect(throws: TendrilError.closed) { try closed.startPathMonitoring() }
+    #expect(!closed.isPathMonitoring)
+
+    // A monitor cancelled before it starts refuses to start.
+    let cancelledMonitor = TendrilPathMonitor(queue: DispatchQueue(label: "tendril.swift.test-cancelled")) {}
+    cancelledMonitor.cancel()
+    #expect(!cancelledMonitor.start())
+    let liveMonitor = TendrilPathMonitor(queue: DispatchQueue(label: "tendril.swift.test-live")) {}
+    #expect(liveMonitor.start())
+    liveMonitor.cancel()
+
+    // Concurrent start, stop and close: no monitor outlives close.
+    for round in 0..<20 {
+      let host = try TendrilEndpoint(hostId: "swift-monitor-race-\(round)")
+      let group = DispatchGroup()
+      for i in 0..<6 {
+        DispatchQueue.global().async(group: group) {
+          switch i % 3 {
+          case 0: try? host.startPathMonitoring()
+          case 1: host.stopPathMonitoring()
+          default: host.close()
+          }
+        }
+      }
+      group.wait()
+      host.close()
+      #expect(!host.isPathMonitoring, "round \(round)")
+    }
+
+    // Concurrent start and stop: a monitor left installed is a live one, never a cancelled one.
+    let host = try TendrilEndpoint(hostId: "swift-monitor-live")
+    defer { host.close() }
+    for round in 0..<50 {
+      let group = DispatchGroup()
+      for i in 0..<4 {
+        DispatchQueue.global().async(group: group) {
+          if i % 2 == 0 { try? host.startPathMonitoring() } else { host.stopPathMonitoring() }
+        }
+      }
+      group.wait()
+      #expect(!host.pathMonitorIsCancelled, "round \(round)")
+    }
+  }
+
+  #endif
+
+  @Test
+  func closeClearsCachedTransportConfig() throws {
+    let host = try TendrilEndpoint(hostId: "swift-cache-close")
+    try host.configureTransportsJSON("{\"route_policy\":\"committed_only\"}")
+    #expect(host.cachedTransportKeyCount == 1)
+    #expect(throws: Error.self) { try host.configureRoutes(routePolicy: "sometimes") }
+    #expect(host.cachedTransportKeyCount == 1)
+    host.close()
+    #expect(host.cachedTransportKeyCount == 0)
+  }
+
+  @Test
+  func multiNetworkSnapshotAdvertisesLanAndOverlayOnly() throws {
+    let host = try TendrilEndpoint(hostId: "swift-multinet-host")
+    defer { host.close() }
+    let any = try host.serveDirect(listenAddr: "0.0.0.0:0")
+    let port = portOf(any)
+    let snap = try snapshot([
+      (id: "wifi", iface: "en0", index: 4, transports: ["wifi"], addrs: ["192.168.50.7"]),
+      (id: "vpn", iface: "utun3", index: 9, transports: ["vpn"], addrs: ["100.101.1.2"]),
+      (id: "cell", iface: "pdp_ip0", index: 6, transports: ["cellular"], addrs: ["100.72.0.5"]),
+    ])
+    _ = try host.refreshRoutes(snapshotJson: snap)
+    // A LAN code carries the LAN hint only, a remote code the LAN and overlay hints; the
+    // cellular CGNAT address is in neither.
+    func hints(_ kind: String) throws -> String {
+      let uri = try obj(host.issuePairingUri(kind: kind))["uri"] as! String
+      #expect(URL(string: uri)?.absoluteString == uri)
+      return uri.removingPercentEncoding ?? uri
+    }
+    let lan = try hints("lan")
+    let remote = try hints("remote")
+    #expect(lan.contains("direct:192.168.50.7:\(port)"), "\(lan)")
+    #expect(!lan.contains("100.101.1.2"), "\(lan)")
+    #expect(remote.contains("overlay://100.101.1.2:\(port)"), "\(remote)")
+    #expect(remote.contains("direct:192.168.50.7:\(port)"), "\(remote)")
+    #expect(!lan.contains("100.72.0.5") && !remote.contains("100.72.0.5"))
+  }
+
+  @Test
+  func configureRoutesKeys() throws {
+    let ep = try TendrilEndpoint(hostId: "swift-cfg-routes")
+    defer { ep.close() }
+    try ep.configureRoutes(
+      advertisedEndpoints: ["192.168.40.1:4100"],
+      relayAuthOrigins: ["https://relay.example.com"],
+      advertise: "explicit",
+      routePolicy: "committed_only",
+      signRoutes: true)
+    #expect(throws: Error.self) { try ep.configureRoutes(advertise: "sometimes") }
+    #expect(throws: Error.self) { try ep.configureRoutes(relayAuthOrigins: ["not an origin"]) }
+    #expect(throws: Error.self) { try ep.configureRoutes(routePolicy: "a\u{0}b") }
+    let uri = try obj(ep.issuePairingUri())["uri"] as! String
+    #expect(uri.contains("192.168.40.1"))
+  }
+
+  #if canImport(CryptoKit) && canImport(Security)
+  @Test
+  func sealedRouteSeqSurvivesRestart() throws {
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("tendril-swift-seq-\(UUID().uuidString)")
+    defer { try? fm.removeItem(at: dir) }
+    let key = SymmetricKey(size: .bits256)
+    let kc = TendrilKeychainStore(service: "dev.tendril.state.test", account: "seq") { key }
+
+    func seq(_ ep: TendrilEndpoint, _ hint: String) throws -> Int {
+      try ep.configureRoutes(advertisedEndpoints: [hint], advertise: "explicit")
+      return try obj(ep.issuePairingUri())["route_seq"] as! Int
+    }
+    var host = try TendrilEndpoint(stateDir: dir.path, keychainStore: kc)
+    let a = try seq(host, "192.168.40.1:4100")
+    let b = try seq(host, "192.168.40.1:4101")
+    #expect(b == a + 1)
+    host.close()
+
+    host = try TendrilEndpoint(stateDir: dir.path, keychainStore: kc)
+    defer { host.close() }
+    #expect(try seq(host, "192.168.40.1:4101") == b)
+    #expect(try seq(host, "192.168.40.1:4102") == b + 1)
+  }
+  #endif
+
+  #if os(macOS) && canImport(CoreImage) && canImport(Vision)
+  @Test
+  func scannerPassthroughDecodesBuilderOutputByteForByte() throws {
+    let host = try TendrilEndpoint(hostId: "swift-scan-host")
+    let client = try TendrilEndpoint(hostId: "swift-scan-client")
+    defer {
+      host.close()
+      client.close()
+    }
+    _ = try host.serveDirect(listenAddr: "127.0.0.1:0")
+    let uri = try obj(host.issuePairingUri())["uri"] as! String
+
+    let filter = try #require(CIFilter(name: "CIQRCodeGenerator"))
+    filter.setValue(Data(uri.utf8), forKey: "inputMessage")
+    filter.setValue("M", forKey: "inputCorrectionLevel")
+    let qr = try #require(filter.outputImage).transformed(by: CGAffineTransform(scaleX: 8, y: 8))
+    let page = qr.extent.insetBy(dx: -64, dy: -64)
+    let white = CIImage(color: .white).cropped(to: page)
+    let image = qr.composited(over: white)
+    let cg = try #require(CIContext().createCGImage(image, from: page))
+
+    let request = VNDetectBarcodesRequest()
+    request.symbologies = [.qr]
+    try VNImageRequestHandler(cgImage: cg, options: [:]).perform([request])
+    let decoded = try #require(request.results?.first?.payloadStringValue)
+    #expect(Array(decoded.utf8) == Array(uri.utf8))
+
+    let res = try pair(host: host, client: client, uri: decoded).client
+    #expect(res["route_check"] as? String == "verified")
+  }
+  #endif
+}
+#endif
