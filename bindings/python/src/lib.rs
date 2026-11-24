@@ -24,15 +24,32 @@ use tendril_core::identity::{
     EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
 };
 use tendril_core::pairing::{
-    EnrollmentPolicy, PairAction, PairOutcome, PairingCodeKind, PairingConfig, PairingManager,
-    PinnedHost, mint_enrollment_token as core_mint_enrollment_token,
+    EnrollmentPolicy, IssueOptions, PairAction, PairOutcome, PairingCodeKind, PairingConfig,
+    PairingManager, PairingUri, PersistOpts, PinnedHost, RoutePolicy,
+    mint_enrollment_token as core_mint_enrollment_token,
 };
-use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket};
-use tendril_core::roster::{AnchorState, PeerState, Roster};
-use tendril_core::session::check_peer_allows_wire_v1;
+use tendril_core::policy::ProviderId;
+use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket, origin_allowed};
+use tendril_core::roster::{AnchorState, PeerState, Roster, RouteSource, StoredRoute};
 use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
+use tendril_runtime::advertise::{AdvertiseInputs, AdvertiseMode, NetworkSnapshot, ServedListener};
+use tendril_runtime::announce::{
+    AddressSource, DEFAULT_ROUTE_REFRESH_INTERVAL, RosterAccess, RouteAnnouncer, RouteSetSink,
+    unix_ms,
+};
+use tendril_runtime::driver::{
+    AttemptError, ConnectOpts, PairPolicyOptions, PairPolicyResult,
+    drive_pair_initiator_with_policy,
+};
+use tendril_runtime::providers::SkippedHint;
+use tendril_runtime::providers::hints::{
+    HintDialerConfig, HintDialers, RouteApplyOpts, apply_signed_route_uri, clear_peer_routes,
+    peer_routes, set_peer_routes,
+};
+use tendril_runtime::redact::{redact_error, redact_hint, redact_json_error, redact_text};
+use tendril_runtime::v2_driver::drive_v2_pair_initiator_with_policy;
 use tendril_runtime::{
     BroadcastReport, BrokerDialer, ConcurrentSession, ConcurrentV2Session,
     DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, GroupEvent,
@@ -41,7 +58,7 @@ use tendril_runtime::{
     P2pRelayAuth, P2pRelayMode, PathDialer, PathListener, PathStream, RelayClientAuth, RelayDialer,
     RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError,
     SessionDriver, SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind,
-    WakeDialOptions, WakeSecret, WakeTarget, dial_endpoint_with_auth,
+    WakeProvider, WakeSecret, WakeTarget, dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_store,
     drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
     drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_store,
@@ -50,15 +67,33 @@ use tendril_runtime::{
     group_create as rt_group_create, group_ingest_manifest as rt_group_ingest_manifest,
     group_remove_member as rt_group_remove_member, handle_session_group_frame,
     pairing_path_kind_for_provider, parse_p2p_relay_mode, parse_p2p_relay_modes,
-    pinned_pairing_floor, wake_and_dial_v2,
+    pinned_pairing_floor,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 fn py_err(err: impl fmt::Display) -> PyErr {
-    PyRuntimeError::new_err(err.to_string())
+    PyRuntimeError::new_err(redact_text(&err.to_string()))
+}
+
+fn value_err(err: impl fmt::Display) -> PyErr {
+    PyValueError::new_err(redact_text(&err.to_string()))
+}
+
+fn rt_err(err: RuntimeError) -> PyErr {
+    PyRuntimeError::new_err(redact_error(&err))
+}
+
+fn rt_value_err(err: RuntimeError) -> PyErr {
+    PyValueError::new_err(redact_error(&err))
+}
+
+/// A `ValueError` naming the JSON error's category and position, never its input.
+fn json_err(what: &str, err: &serde_json::Error) -> PyErr {
+    PyValueError::new_err(format!("invalid {what}: {}", redact_json_error(err)))
 }
 
 fn lock_roster(roster: &StdMutex<Roster>) -> std::sync::MutexGuard<'_, Roster> {
@@ -69,17 +104,18 @@ fn lock_roster(roster: &StdMutex<Roster>) -> std::sync::MutexGuard<'_, Roster> {
 
 /// Applies `f` to the latest on-disk roster and publishes the committed result to memory.
 ///
-/// Callers must hold `store_lock`; the in-memory roster lock is taken second and is never held
-/// across an `.await`.
+/// Callers must hold `store_lock`. Lock order (`tendril_runtime::announce`): store lock, roster
+/// file lock, pairing manager, in-memory roster mutex. The mutex is therefore taken only inside
+/// the file-lock transaction, for the pure callback, and again to publish after it; it is never
+/// held while waiting for the file lock or across an `.await`.
 fn commit_roster<T>(
     store: &StateStore,
     roster: &StdMutex<Roster>,
     identity: &EndpointIdentity,
     f: impl FnOnce(&mut Roster, &Roster) -> Result<T, RuntimeError>,
 ) -> Result<T, RuntimeError> {
-    let mut mem = lock_roster(roster);
-    let (out, disk, _) = store.update_roster_with_state(|disk| f(disk, &mem))?;
-    publish_roster(&mut mem, disk, identity);
+    let (out, disk, _) = store.update_roster_with_state(|disk| f(disk, &lock_roster(roster)))?;
+    publish_roster(&mut lock_roster(roster), disk, identity);
     Ok(out)
 }
 
@@ -88,9 +124,8 @@ fn reload_roster(
     roster: &StdMutex<Roster>,
     identity: &EndpointIdentity,
 ) -> Result<(), RuntimeError> {
-    let mut mem = lock_roster(roster);
     let disk = store.load_roster()?;
-    publish_roster(&mut mem, disk, identity);
+    publish_roster(&mut lock_roster(roster), disk, identity);
     Ok(())
 }
 
@@ -100,23 +135,6 @@ fn publish_roster(mem: &mut Roster, disk: Roster, identity: &EndpointIdentity) {
     let mut next = disk;
     merge_session_state(&mut next, mem, identity);
     *mem = next;
-}
-
-/// Applies the rotation chain verified during a v1 connect to the disk roster.
-fn apply_learned_rotation(
-    disk: &mut Roster,
-    learned: &Roster,
-    target: &str,
-    chain: &[RotationRecord],
-) {
-    if chain.is_empty() {
-        return;
-    }
-    if let Some(entry) = learned.get(target)
-        && let Some(signing) = entry.signing_pub.as_ref()
-    {
-        let _ = disk.apply_verified_rotation(target, chain, &entry.static_pub, signing);
-    }
 }
 
 /// Folds revocations and CRLs learned in memory by a live session into the on-disk roster
@@ -145,11 +163,13 @@ fn merge_session_state(disk: &mut Roster, mem: &Roster, identity: &EndpointIdent
         let issuer_pub = if issuer == identity.host_id() {
             Some(identity.signing_key().public_key().clone())
         } else {
-            disk.lookup_active_signing_key(&issuer).or_else(|| {
-                disk.get(&issuer)
-                    .filter(|e| e.state != PeerState::Pending)
-                    .and_then(|e| e.signing_pub.clone())
-            })
+            disk.lookup_active_signing_key(&issuer)
+                .or_else(|| disk.lookup_active_anchor_key(&issuer))
+                .or_else(|| {
+                    disk.get(&issuer)
+                        .filter(|e| e.state != PeerState::Pending)
+                        .and_then(|e| e.signing_pub.clone())
+                })
         };
         if let Some(pk) = issuer_pub {
             let _ = disk.ingest_crl(crl, &issuer, &pk);
@@ -184,29 +204,6 @@ fn sync_roster_blocking(
     if let Some(store) = store {
         let _guard = store_lock.blocking_lock();
         reload_roster(store, roster, identity).map_err(py_err)?;
-    }
-    Ok(())
-}
-
-/// Commits what a v1 connect learned in its private working roster: revocations, CRLs, and the
-/// verified rotation chain.
-fn commit_connect_blocking(
-    store: Option<&Arc<StateStore>>,
-    store_lock: &AsyncMutex<()>,
-    roster: &StdMutex<Roster>,
-    identity: &EndpointIdentity,
-    learned: &Roster,
-    target: &str,
-    chain: &[RotationRecord],
-) -> PyResult<()> {
-    if let Some(store) = store {
-        let _guard = store_lock.blocking_lock();
-        commit_roster(store, roster, identity, |disk, _| {
-            apply_learned_rotation(disk, learned, target, chain);
-            merge_session_state(disk, learned, identity);
-            Ok(())
-        })
-        .map_err(py_err)?;
     }
     Ok(())
 }
@@ -271,8 +268,7 @@ fn parse_hybrid_signing_pub(bytes: &[u8], name: &str) -> PyResult<HybridSigningP
             "{name} must be exactly {HYBRID_SIGNING_PUB_LEN} bytes"
         )));
     }
-    HybridSigningPublicKey::from_bytes(bytes)
-        .map_err(|e| PyValueError::new_err(format!("invalid {name}: {e}")))
+    HybridSigningPublicKey::from_bytes(bytes).map_err(|e| value_err(format!("invalid {name}: {e}")))
 }
 
 fn parse_signing_pin(bytes: &[u8], name: &str) -> PyResult<SigningKeyPin> {
@@ -337,6 +333,16 @@ struct TransportConfigInput {
     wake_max_attempts: Option<usize>,
     #[zeroize(skip)]
     wake_timeout_ms: Option<u64>,
+    #[zeroize(skip)]
+    relay_auth_origins: Option<Vec<String>>,
+    #[zeroize(skip)]
+    advertise: Option<String>,
+    #[zeroize(skip)]
+    advertised_endpoints: Option<Vec<String>>,
+    #[zeroize(skip)]
+    route_policy: Option<String>,
+    #[zeroize(skip)]
+    sign_routes: Option<bool>,
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -364,7 +370,7 @@ impl fmt::Debug for WakeTransportConfig {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct EndpointTransportConfig {
     relay_auth: RelayClientAuth,
     p2p_relay_mode: Option<P2pRelayMode>,
@@ -373,6 +379,30 @@ struct EndpointTransportConfig {
     p2p_allow_private_addrs: Option<bool>,
     p2p_relay_auth: Option<P2pRelayAuth>,
     wake: Option<WakeTransportConfig>,
+    relay_auth_origins: Vec<String>,
+    advertise: AdvertiseMode,
+    advertised_endpoints: Vec<String>,
+    route_policy: RoutePolicy,
+    sign_routes: bool,
+}
+
+impl Default for EndpointTransportConfig {
+    fn default() -> Self {
+        Self {
+            relay_auth: RelayClientAuth::default(),
+            p2p_relay_mode: None,
+            p2p_pkarr: None,
+            p2p_advertise_direct_addrs: None,
+            p2p_allow_private_addrs: None,
+            p2p_relay_auth: None,
+            wake: None,
+            relay_auth_origins: Vec::new(),
+            advertise: AdvertiseMode::Auto,
+            advertised_endpoints: Vec::new(),
+            route_policy: RoutePolicy::AllSigned,
+            sign_routes: true,
+        }
+    }
 }
 
 impl fmt::Debug for EndpointTransportConfig {
@@ -388,6 +418,11 @@ impl fmt::Debug for EndpointTransportConfig {
             .field("p2p_allow_private_addrs", &self.p2p_allow_private_addrs)
             .field("p2p_relay_auth", &self.p2p_relay_auth)
             .field("wake", &self.wake)
+            .field("relay_auth_origins", &self.relay_auth_origins)
+            .field("advertise", &self.advertise)
+            .field("advertised_endpoints", &self.advertised_endpoints)
+            .field("route_policy", &self.route_policy)
+            .field("sign_routes", &self.sign_routes)
             .finish()
     }
 }
@@ -427,8 +462,7 @@ impl EndpointTransportConfig {
                 .map_err(|_| PyValueError::new_err("invalid relay_auth_secret"))?;
             RelayClientAuth::HmacSecret(parsed)
         } else if let Some(ticket) = input.relay_ticket.take() {
-            canonical_relay_host(&ticket.relay_host)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            canonical_relay_host(&ticket.relay_host).map_err(value_err)?;
             if ticket.issuer_pub.is_empty() || ticket.target_pub.is_empty() || ticket.sig.is_empty()
             {
                 return Err(PyValueError::new_err(
@@ -441,12 +475,9 @@ impl EndpointTransportConfig {
         };
 
         let p2p_relay_mode = if let Some(ref mode_s) = input.p2p_relay_mode {
-            Some(
-                parse_p2p_relay_mode(Some(mode_s))
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            )
+            Some(parse_p2p_relay_mode(Some(mode_s)).map_err(value_err)?)
         } else if let Some(ref urls) = input.p2p_relay_urls {
-            Some(parse_p2p_relay_modes(urls).map_err(|e| PyValueError::new_err(e.to_string()))?)
+            Some(parse_p2p_relay_modes(urls).map_err(value_err)?)
         } else {
             None
         };
@@ -484,8 +515,7 @@ impl EndpointTransportConfig {
 
         let wake = if let Some(url) = input.wake_url.take() {
             let adapter = input.wake_adapter.unwrap_or(WakeAdapterKind::Webhook);
-            let mut target =
-                WakeTarget::new(adapter, &url).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let mut target = WakeTarget::new(adapter, &url).map_err(value_err)?;
             if let Some(tok) = input.wake_auth_token.take().map(Zeroizing::new) {
                 target = target
                     .with_auth_token(tok.as_str())
@@ -523,6 +553,32 @@ impl EndpointTransportConfig {
             None
         };
 
+        let relay_auth_origins = input.relay_auth_origins.take().unwrap_or_default();
+        if let Some(index) = relay_auth_origins
+            .iter()
+            .position(|o| !origin_allowed(o, std::slice::from_ref(o)))
+        {
+            return Err(PyValueError::new_err(format!(
+                "invalid relay_auth_origins entry #{index}: expected scheme://host[:port]"
+            )));
+        }
+        let advertise = match input.advertise.as_deref() {
+            None | Some("auto") => AdvertiseMode::Auto,
+            Some("explicit") => AdvertiseMode::Explicit,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "invalid advertise '{other}': expected 'auto' or 'explicit'"
+                )));
+            }
+        };
+        let route_policy = input
+            .route_policy
+            .as_deref()
+            .map(str::parse::<RoutePolicy>)
+            .transpose()
+            .map_err(value_err)?
+            .unwrap_or_default();
+
         Ok(Self {
             relay_auth,
             p2p_relay_mode,
@@ -531,7 +587,39 @@ impl EndpointTransportConfig {
             p2p_allow_private_addrs: input.p2p_allow_private_addrs,
             p2p_relay_auth,
             wake,
+            relay_auth_origins,
+            advertise,
+            advertised_endpoints: input.advertised_endpoints.take().unwrap_or_default(),
+            route_policy,
+            sign_routes: input.sign_routes.unwrap_or(true),
         })
+    }
+
+    /// The dialer set behind policy pairing and Day-2 connects. `relay_host` is the expected
+    /// relay challenge host for an explicit operator relay endpoint; for an explicit `iroh://`
+    /// endpoint it also selects the Iroh relay mode when none is configured.
+    fn hint_dialers(
+        &self,
+        relay_host: Option<&str>,
+        operator_endpoint: Option<&str>,
+    ) -> Result<Arc<HintDialers>, RuntimeError> {
+        let host = relay_host.map(str::trim).filter(|s| !s.is_empty());
+        let mut p2p_relay_mode = self.p2p_relay_mode.clone();
+        if p2p_relay_mode.is_none() && operator_endpoint.is_some_and(|e| e.starts_with("iroh://")) {
+            if let Some(spec) = host {
+                p2p_relay_mode = Some(parse_p2p_relay_mode(Some(spec))?);
+            } else if std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1") {
+                p2p_relay_mode = Some(P2pRelayMode::Disabled);
+            }
+        }
+        Ok(Arc::new(HintDialers::new(HintDialerConfig {
+            relay_auth: self.relay_auth.clone(),
+            relay_expected_host: host.map(ToOwned::to_owned),
+            p2p_relay_mode,
+            p2p_relay_auth: self.p2p_relay_auth.clone(),
+            p2p_allow_private_addrs: self.p2p_allow_private_addrs.unwrap_or(false),
+            p2p_pkarr: self.p2p_pkarr,
+        })))
     }
 
     fn build_p2p_listener_options(
@@ -722,43 +810,6 @@ async fn dial_endpoint_v2_with_options(
     dial_endpoint_with_auth(endpoint, normalized_host, cfg.relay_auth.clone()).await
 }
 
-async fn build_dialer_with_options(
-    endpoint: &str,
-    relay_host: Option<&str>,
-    cfg: &EndpointTransportConfig,
-    v2_mailbox_secret: Option<[u8; 32]>,
-) -> Result<Box<dyn PathDialer>, RuntimeError> {
-    let normalized_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
-    if endpoint.starts_with("iroh://") {
-        let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host)?;
-        return Ok(Box::new(P2pDialer::bind_with_options(opts).await?));
-    }
-    if endpoint.starts_with("overlay://") {
-        return Ok(Box::new(OverlayDialer::new()));
-    }
-    if endpoint.starts_with("broker+ws://") || endpoint.starts_with("broker+wss://") {
-        return Ok(Box::new(BrokerDialer::new()));
-    }
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        if let Some(secret) = v2_mailbox_secret {
-            let mut dialer = RelayV2Dialer::new(secret).with_auth(cfg.relay_auth.clone());
-            if let Some(host) = normalized_host {
-                dialer = dialer.with_expected_host(host);
-            }
-            return Ok(Box::new(dialer));
-        }
-        let mut dialer = RelayDialer::new().with_auth(cfg.relay_auth.clone());
-        if let Some(host) = normalized_host {
-            dialer = dialer.with_expected_host(host);
-        }
-        return Ok(Box::new(dialer));
-    }
-    if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
-        return Ok(Box::new(LocalDialer::new()));
-    }
-    Ok(Box::new(DirectDialer::new()))
-}
-
 async fn drive_v1_pair_initiator_with_roster_floors(
     stream: &mut dyn PathStream,
     identity: &EndpointIdentity,
@@ -856,7 +907,7 @@ fn compute_code_mac(py: Python<'_>, code: &str, handshake_hash: &[u8]) -> PyResu
     let code_owned = code.to_owned();
     let mac = py
         .detach(move || core_compute_code_mac(&code_owned, &hh))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(py_err)?;
     Ok(PyBytes::new(py, &mac).unbind())
 }
 
@@ -869,18 +920,13 @@ fn verify_rotation_chain_json(
     cur_static_b64: &str,
     cur_signing_b64: &str,
 ) -> PyResult<u64> {
-    let psig = HybridSigningPublicKey::from_b64url(pinned_signing_b64)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let pstat = b64url_decode_array::<32>(pinned_static_b64)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let cstat = b64url_decode_array::<32>(cur_static_b64)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let csig = HybridSigningPublicKey::from_b64url(cur_signing_b64)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let psig = HybridSigningPublicKey::from_b64url(pinned_signing_b64).map_err(value_err)?;
+    let pstat = b64url_decode_array::<32>(pinned_static_b64).map_err(value_err)?;
+    let cstat = b64url_decode_array::<32>(cur_static_b64).map_err(value_err)?;
+    let csig = HybridSigningPublicKey::from_b64url(cur_signing_b64).map_err(value_err)?;
     let chain: Vec<RotationRecord> =
-        serde_json::from_str(chain_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    verify_rotation_chain(&psig, &pstat, pinned_seq, &chain, &cstat, &csig)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        serde_json::from_str(chain_json).map_err(|e| json_err("chain_json", &e))?;
+    verify_rotation_chain(&psig, &pstat, pinned_seq, &chain, &cstat, &csig).map_err(py_err)
 }
 
 #[pyfunction]
@@ -894,19 +940,18 @@ fn verify_grant_json(
     now_unix_secs: u64,
     crl_json: Option<&str>,
 ) -> PyResult<bool> {
-    let grant: Grant =
-        serde_json::from_str(grant_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let grant: Grant = serde_json::from_str(grant_json).map_err(|e| json_err("grant_json", &e))?;
     let key_map_raw: HashMap<String, String> =
-        serde_json::from_str(issuer_keys_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        serde_json::from_str(issuer_keys_json).map_err(|e| json_err("issuer_keys_json", &e))?;
     let mut key_map = HashMap::with_capacity(key_map_raw.len());
     for (id, b64) in key_map_raw {
         let k = HybridSigningPublicKey::from_b64url(&b64)
-            .map_err(|e| PyValueError::new_err(format!("invalid key for {id}: {e}")))?;
+            .map_err(|e| value_err(format!("invalid key for {id}: {e}")))?;
         key_map.insert(id, k);
     }
     let crl: Option<RevocationList> = match crl_json {
         Some(s) if !s.is_empty() => {
-            Some(serde_json::from_str(s).map_err(|e| PyValueError::new_err(e.to_string()))?)
+            Some(serde_json::from_str(s).map_err(|e| json_err("crl_json", &e))?)
         }
         _ => None,
     };
@@ -922,12 +967,412 @@ fn verify_grant_json(
     Ok(res.is_ok())
 }
 
+/// Arguments of one Day-2 connect.
+#[derive(Default)]
+struct ConnectArgs {
+    wire: u8,
+    endpoint: Option<String>,
+    grant: Option<Grant>,
+    recovery_uri: Option<String>,
+    replace_routes: bool,
+    policy: Option<RoutePolicy>,
+    relay_host: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ConnectOptionsInput {
+    wire: Option<u8>,
+    grant: Option<Grant>,
+    endpoint: Option<String>,
+    recovery_uri: Option<String>,
+    replace_routes: Option<bool>,
+    route_policy: Option<String>,
+    relay_host: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct IssueUriOptions {
+    kind: Option<String>,
+    host_name: Option<String>,
+    sign_routes: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct PairUriOptions {
+    route_policy: Option<String>,
+    save_route: Option<bool>,
+    endpoint: Option<String>,
+    code: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ApplyRouteOptions {
+    replace_routes: Option<bool>,
+    route_policy: Option<String>,
+}
+
+/// Parses an optional JSON options object; `None` and `""` mean all defaults.
+fn parse_options<T: serde::de::DeserializeOwned + Default>(
+    raw: Option<&str>,
+    name: &str,
+) -> PyResult<T> {
+    match raw.filter(|s| !s.trim().is_empty()) {
+        None => Ok(T::default()),
+        Some(s) => serde_json::from_str(s).map_err(|e| json_err(name, &e)),
+    }
+}
+
+fn parse_grant(grant_json: Option<&str>) -> PyResult<Option<Grant>> {
+    match grant_json {
+        Some(s) if !s.is_empty() => Ok(Some(
+            serde_json::from_str(s).map_err(|e| json_err("grant_json", &e))?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn parse_route_policy(raw: Option<&str>, default: RoutePolicy) -> PyResult<RoutePolicy> {
+    raw.filter(|s| !s.is_empty())
+        .map_or(Ok(default), str::parse::<RoutePolicy>)
+        .map_err(value_err)
+}
+
+const fn code_kind_name(kind: PairingCodeKind) -> &'static str {
+    match kind {
+        PairingCodeKind::Lan2Group => "lan",
+        PairingCodeKind::Remote3Group => "remote",
+    }
+}
+
+const fn provider_name(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Local => "local",
+        ProviderId::Direct => "direct",
+        ProviderId::Overlay => "overlay",
+        ProviderId::P2p => "p2p",
+        ProviderId::Relay => "relay",
+        ProviderId::Broker => "broker",
+    }
+}
+
+fn routes_json_array(routes: &[StoredRoute]) -> serde_json::Value {
+    routes
+        .iter()
+        .map(|r| serde_json::json!({ "hint": r.hint, "source": r.source.as_str() }))
+        .collect()
+}
+
+/// One policy connect over the chosen wire.
+async fn policy_connect(
+    wire: u8,
+    identity: &Arc<EndpointIdentity>,
+    target: &str,
+    access: &RosterAccess,
+    opts: ConnectOpts,
+) -> Result<SessionBackend, AttemptError> {
+    if wire == 2 {
+        V2SessionDriver::connect_with_policy_and_store(Arc::clone(identity), target, access, opts)
+            .await
+            .map(|r| SessionBackend::V2(Arc::new(r.session.into_concurrent())))
+    } else {
+        SessionDriver::connect_with_policy_and_store(Arc::clone(identity), target, access, opts)
+            .await
+            .map(|r| SessionBackend::V1(Arc::new(r.session.into_concurrent())))
+    }
+}
+
+/// Sends the best-effort epoch-blinded wake hint and waits for the provider at most
+/// `timeout_ms`; its outcome never fails the connect.
+async fn notify_wake(wake: &WakeTransportConfig) {
+    let provider = HttpWakeProvider::new()
+        .with_cooldown_secs(0)
+        .with_timeout(Duration::from_millis(wake.timeout_ms));
+    let now = now_unix();
+    let tag = wake.secret.derive_tag(now);
+    let _ = timeout(
+        Duration::from_millis(wake.timeout_ms),
+        provider.notify_best_effort(&wake.target, &tag, now),
+    )
+    .await;
+}
+
+/// The wake flow around a whole policy connect. With
+/// `pre_wake` the wake hint goes first, then the connect runs with up to `max_attempts` tries
+/// `retry_delay_ms` apart. Without it one connect runs first; only a transient pre-commit
+/// miss ([`AttemptError::is_wakeable_miss`]) sends the wake hint and retries the same
+/// way. Any other failure is final and never wakes the host.
+async fn connect_with_wake<F, Fut>(
+    wake: &WakeTransportConfig,
+    mut connect: F,
+) -> Result<SessionBackend, AttemptError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<SessionBackend, AttemptError>>,
+{
+    if !wake.pre_wake {
+        match connect().await {
+            Err(err) if err.is_wakeable_miss() => {}
+            done => return done,
+        }
+    }
+    notify_wake(wake).await;
+    let attempts = wake.max_attempts.max(1);
+    let mut attempt = 1;
+    loop {
+        match connect().await {
+            Err(err) if attempt < attempts && err.is_wakeable_miss() => {
+                tokio::time::sleep(Duration::from_millis(wake.retry_delay_ms)).await;
+                attempt += 1;
+            }
+            done => return done,
+        }
+    }
+}
+
+/// Folds an exhausted attempt into one error: the most severe cause, then the hints that were
+/// never dialed and each candidate's failure. `committed` means the pairing code may be spent.
+fn attempt_err(err: AttemptError) -> PyErr {
+    use std::fmt::Write as _;
+    let mut msg = redact_error(&err.error);
+    if err.committed {
+        msg.push_str("; committed: the pairing code may be spent");
+    }
+    if !err.skipped.is_empty() {
+        let list: Vec<String> = err
+            .skipped
+            .iter()
+            .map(|s| format!("{} ({})", redact_hint(&s.hint), skip_reason_name(s)))
+            .collect();
+        let _ = write!(msg, "; skipped: {}", list.join(", "));
+    }
+    if !err.failures.is_empty() {
+        let list: Vec<String> = err
+            .failures
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} [{}]: {}",
+                    redact_hint(&f.hint),
+                    provider_name(f.provider),
+                    redact_error(&f.error)
+                )
+            })
+            .collect();
+        let _ = write!(msg, "; candidates: {}", list.join("; "));
+    }
+    py_err(msg)
+}
+
+fn skip_reason_name(skipped: &SkippedHint) -> String {
+    serde_json::to_value(skipped.reason)
+        .ok()
+        .and_then(|v| v.as_str().map(ToOwned::to_owned))
+        .unwrap_or_default()
+}
+
+/// The identity fields of a Wire v1 pairing outcome, or the rejection text.
+fn pair_outcome_json_v1(outcome: &PairOutcome) -> Result<serde_json::Value, String> {
+    match outcome {
+        PairOutcome::InitiatorPending {
+            device_id,
+            host_id,
+            pairing_sas,
+            host_pin_verified,
+            ..
+        } => Ok(serde_json::json!({
+            "device_id": device_id,
+            "host_id": host_id,
+            "sas": pairing_sas,
+            "status": if *host_pin_verified { "active" } else { "pending" },
+            "host_confirmed": host_pin_verified,
+        })),
+        PairOutcome::Rejected { error } => Err(error.clone()),
+        _ => Err("unexpected pairing outcome".to_owned()),
+    }
+}
+
+/// The identity fields of a Wire v2 pairing outcome, or the rejection text.
+fn pair_outcome_json_v2(outcome: &V2PairOutcome) -> Result<serde_json::Value, String> {
+    match outcome {
+        V2PairOutcome::InitiatorPending {
+            device_id,
+            host_id,
+            pairing_sas,
+            host_pin_verified,
+            ..
+        } => Ok(serde_json::json!({
+            "device_id": device_id,
+            "host_id": host_id,
+            "sas": pairing_sas,
+            "status": if *host_pin_verified { "active" } else { "pending" },
+            "host_confirmed": host_pin_verified,
+        })),
+        V2PairOutcome::Rejected { error } => Err(error.clone()),
+        V2PairOutcome::ResponderPending { .. } => Err("unexpected responder outcome".to_owned()),
+    }
+}
+
+/// The route report of a policy pairing, shared by both wires.
+struct PairReport {
+    provider: &'static str,
+    endpoint: String,
+    committed: bool,
+    route_check: &'static str,
+    routes_persisted: Vec<StoredRoute>,
+    routes_reason: Option<&'static str>,
+    skipped: Vec<SkippedHint>,
+}
+
+impl PairReport {
+    fn from_result<D>(res: &PairPolicyResult<D>) -> Self {
+        Self {
+            provider: provider_name(res.route.provider),
+            endpoint: res.route.addr.clone(),
+            committed: res.committed,
+            route_check: res.route_check.as_str(),
+            routes_persisted: res.routes_persisted.clone(),
+            routes_reason: res.routes_reason,
+            skipped: res.skipped.clone(),
+        }
+    }
+
+    fn merge_into(self, json: &mut serde_json::Value) {
+        json["provider"] = serde_json::json!(self.provider);
+        json["endpoint"] = serde_json::json!(self.endpoint);
+        json["committed"] = serde_json::json!(self.committed);
+        json["route_check"] = serde_json::json!(self.route_check);
+        json["routes_persisted"] = routes_json_array(&self.routes_persisted);
+        json["routes_reason"] = serde_json::json!(self.routes_reason);
+        json["skipped"] = serde_json::json!(self.skipped);
+    }
+}
+
 fn refresh_m2m_flags(self_m2m: &AtomicBool, m2m: &AtomicBool, roster: &Roster) {
     let enabled = self_m2m.load(Ordering::Acquire)
         || roster
             .trust_anchors()
             .any(|(_, a)| a.state == AnchorState::Active);
     m2m.store(enabled, Ordering::Release);
+}
+
+/// What a hosting endpoint advertises and the `RouteAnnouncer` built from it (created on first
+/// use: pairing URI issuance, a route refresh, or an accepted session whose client opted in).
+struct AnnouncerSlot {
+    rt: Arc<Runtime>,
+    identity: Arc<EndpointIdentity>,
+    access: RosterAccess,
+    transport_cfg: Arc<StdMutex<EndpointTransportConfig>>,
+    served_endpoints: StdMutex<Vec<String>>,
+    served_listeners: StdMutex<Vec<ServedListener>>,
+    announcer: StdMutex<AnnouncerState>,
+}
+
+/// The announcer slot's life cycle. `Closed` is terminal: closing the endpoint ends the timer
+/// and nothing (an accept that raced the close, a later refresh) can start another one.
+enum AnnouncerState {
+    Idle,
+    Running(Arc<RouteAnnouncer>, JoinHandle<()>),
+    Closed,
+}
+
+impl AnnouncerSlot {
+    fn inputs(&self) -> AdvertiseInputs {
+        let cfg = self
+            .transport_cfg
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        AdvertiseInputs {
+            mode: cfg.advertise,
+            served_endpoints: self
+                .served_endpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            listeners: self
+                .served_listeners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            advertised_endpoints: cfg.advertised_endpoints.clone(),
+        }
+    }
+
+    fn existing(&self) -> Option<Arc<RouteAnnouncer>> {
+        match &*self
+            .announcer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            AnnouncerState::Running(announcer, _) => Some(Arc::clone(announcer)),
+            AnnouncerState::Idle | AnnouncerState::Closed => None,
+        }
+    }
+
+    /// The live announcer, created on first use; fails once the endpoint is closed.
+    fn announcer(&self) -> PyResult<Arc<RouteAnnouncer>> {
+        let mut guard = self
+            .announcer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*guard {
+            AnnouncerState::Running(announcer, _) => return Ok(Arc::clone(announcer)),
+            AnnouncerState::Closed => {
+                return Err(PyRuntimeError::new_err("endpoint is closed"));
+            }
+            AnnouncerState::Idle => {}
+        }
+        let announcer = Arc::new(RouteAnnouncer::new(
+            (*self.identity).clone(),
+            self.access.clone(),
+            self.inputs(),
+            AddressSource::platform_default(),
+        ));
+        let _enter = self.rt.enter();
+        let timer = announcer.spawn(Some(DEFAULT_ROUTE_REFRESH_INTERVAL));
+        *guard = AnnouncerState::Running(Arc::clone(&announcer), timer);
+        Ok(announcer)
+    }
+
+    /// Re-reads the advertising inputs into a live announcer and publishes them.
+    fn inputs_changed(&self) {
+        if let Some(announcer) = self.existing() {
+            announcer.set_inputs(self.inputs());
+            // A failed publish (for example an exhausted sequence) surfaces on the next issuance.
+            let _ = announcer.publish(unix_ms());
+        }
+    }
+
+    fn record_served(&self, endpoint: &str, listener: Option<ServedListener>) {
+        self.served_endpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(endpoint.to_owned());
+        if let Some(l) = listener {
+            self.served_listeners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(l);
+        }
+        self.inputs_changed();
+    }
+
+    /// Ends the timer for good: the slot never creates another announcer.
+    fn stop(&self) {
+        let previous = std::mem::replace(
+            &mut *self
+                .announcer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            AnnouncerState::Closed,
+        );
+        if let AnnouncerState::Running(_, timer) = previous {
+            timer.abort();
+        }
+    }
 }
 
 #[pyclass(frozen)]
@@ -946,6 +1391,11 @@ struct Endpoint {
     groups: StdMutex<Vec<Weak<GroupPool>>>,
     /// URLs bound by `serve_relay`, so a group pool never displaces their identity mailbox.
     served_v1_relays: Arc<StdMutex<Vec<String>>>,
+    /// Store-or-memory roster handle shared by the policy drivers, the route setter and the
+    /// announcer. With a state directory it keeps its own in-memory copy, so a driver write never
+    /// replaces the roster live sessions share; `sync_roster_blocking` reloads that one.
+    access: RosterAccess,
+    announce: Arc<AnnouncerSlot>,
 }
 
 impl Endpoint {
@@ -958,6 +1408,157 @@ impl Endpoint {
             roster: Arc::clone(&self.roster),
             session: Arc::new(backend),
         }
+    }
+
+    /// Wraps an accepted responder session and, when the client opted in with `route_seq`,
+    /// registers it with the announcer so it receives the host's signed route sets.
+    ///
+    /// A registration that fails (the route set cannot be loaded or signed) or an endpoint that
+    /// closed meanwhile fails the accept and closes the session, so no accepted session ever
+    /// skips its initial route set. A sealed route set the peer cannot take (no padding bucket
+    /// fits) stays the announcer's non-fatal outcome.
+    fn accepted_session(&self, py: Python<'_>, backend: SessionBackend) -> PyResult<Session> {
+        if let Some(peer_seq) = backend.peer_route_seq() {
+            let sink = backend.route_sink();
+            let rt = Arc::clone(&self.rt);
+            let announce = Arc::clone(&self.announce);
+            let registered = py.detach(move || {
+                let announcer = announce.announcer()?;
+                rt.block_on(announcer.on_session_established(&sink, Some(peer_seq), unix_ms()))
+                    .map_err(py_err)
+            });
+            if let Err(err) = registered {
+                let rt = Arc::clone(&self.rt);
+                let closing = Arc::new(backend);
+                py.detach(move || {
+                    // The accept already failed; a close that cannot be sent changes nothing.
+                    let _ = rt.block_on(closing.send_close(1011, "route registration failed"));
+                });
+                return Err(err);
+            }
+        }
+        Ok(self.new_session(backend))
+    }
+
+    /// Day-2 connect through the runtime policy drivers.
+    fn connect_policy(
+        &self,
+        py: Python<'_>,
+        target_host_id: &str,
+        args: ConnectArgs,
+    ) -> PyResult<Session> {
+        let cfg = self.snapshot_transport_cfg();
+        let dialers = cfg
+            .hint_dialers(args.relay_host.as_deref(), args.endpoint.as_deref())
+            .map_err(py_err)?;
+        let mut opts = ConnectOpts::new(dialers);
+        opts.grant = args.grant;
+        opts.recovery_uri = args.recovery_uri;
+        opts.replace_routes = args.replace_routes;
+        opts.policy = args.policy.unwrap_or(cfg.route_policy);
+        opts.operator_endpoint = args.endpoint;
+        opts.relay_auth_origins = cfg.relay_auth_origins.clone();
+        let rt = Arc::clone(&self.rt);
+        let identity = Arc::clone(&self.identity);
+        let roster = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let access = self.access.clone();
+        let target = target_host_id.to_owned();
+        let wire = args.wire;
+        // A configured wake target applies to an explicit Wire v2 endpoint, with or without a
+        // recovery URI: `wake_pre_wake` decides whether the wake hint or the first connect goes first.
+        let wake = (wire == 2 && opts.operator_endpoint.is_some())
+            .then(|| cfg.wake.clone())
+            .flatten();
+
+        let backend = py.detach(move || {
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
+            let res = rt.block_on(async {
+                let connect = || policy_connect(wire, &identity, &target, &access, opts.clone());
+                match &wake {
+                    Some(w) => connect_with_wake(w, connect).await,
+                    None => connect().await,
+                }
+            });
+            let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity);
+            let backend = res.map_err(attempt_err)?;
+            synced?;
+            Ok::<_, PyErr>(backend)
+        })?;
+        Ok(self.new_session(backend))
+    }
+
+    /// Pairing from a scanned URI through the runtime policy drivers.
+    fn pair_uri_impl(
+        &self,
+        py: Python<'_>,
+        v2: bool,
+        pairing_uri: &str,
+        name: Option<&str>,
+        kind: Option<&str>,
+        options_json: Option<&str>,
+    ) -> PyResult<String> {
+        let opts_in: PairUriOptions = parse_options(options_json, "options_json")?;
+        let uri = PairingUri::parse(pairing_uri).map_err(value_err)?;
+        let cfg = self.snapshot_transport_cfg();
+        let policy = parse_route_policy(opts_in.route_policy.as_deref(), cfg.route_policy)?;
+        let endpoint = opts_in.endpoint.filter(|e| !e.is_empty());
+        let dialers = cfg
+            .hint_dialers(None, endpoint.as_deref())
+            .map_err(py_err)?;
+        // An explicit empty code is rejected before any dial; it never falls back to the URI code.
+        let code = opts_in.code.unwrap_or_else(|| uri.code.clone());
+        let mut opts = PairPolicyOptions::new(
+            name.unwrap_or("py-device"),
+            kind.unwrap_or("python"),
+            code,
+            dialers,
+        );
+        opts.uri = Some(uri);
+        opts.operator_endpoint = endpoint;
+        opts.persist = PersistOpts {
+            operator_endpoint: None,
+            policy,
+            save_committed: opts_in.save_route.unwrap_or(false),
+        };
+        opts.relay_auth_origins = cfg.relay_auth_origins.clone();
+        let rt = Arc::clone(&self.rt);
+        let identity = Arc::clone(&self.identity);
+        let roster = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let access = self.access.clone();
+
+        py.detach(move || {
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
+            let res = rt.block_on(async {
+                if v2 {
+                    drive_v2_pair_initiator_with_policy(Arc::clone(&identity), &access, opts)
+                        .await
+                        .map(|r| {
+                            let outcome = pair_outcome_json_v2(&r.drive.outcome);
+                            (outcome, PairReport::from_result(&r))
+                        })
+                } else {
+                    drive_pair_initiator_with_policy(Arc::clone(&identity), &access, opts)
+                        .await
+                        .map(|r| {
+                            let outcome = pair_outcome_json_v1(&r.drive.outcome);
+                            (outcome, PairReport::from_result(&r))
+                        })
+                }
+            });
+            let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity);
+            let (outcome, report) = res.map_err(attempt_err)?;
+            synced?;
+            let mut json = outcome.map_err(py_err)?;
+            if v2 {
+                json["wire_version"] = serde_json::json!(2);
+            }
+            report.merge_into(&mut json);
+            Ok(json.to_string())
+        })
     }
 
     fn group_store(&self) -> PyResult<Arc<StateStore>> {
@@ -986,23 +1587,17 @@ impl Endpoint {
                 tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                    .map_err(py_err)?,
             );
             let (store, identity, roster) = if let Some(dir) = dir_owned {
-                let store = Arc::new(
-                    StateStore::open_or_create(dir)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                );
+                let store = Arc::new(StateStore::open_or_create(dir).map_err(py_err)?);
                 let identity = store
                     .load_or_generate_identity(host_owned.as_deref())
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let roster = store
-                    .load_roster()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    .map_err(py_err)?;
+                let roster = store.load_roster().map_err(py_err)?;
                 (Some(store), identity, roster)
             } else {
-                let mut identity = EndpointIdentity::generate()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let mut identity = EndpointIdentity::generate().map_err(py_err)?;
                 if let Some(h) = host_owned.as_deref()
                     && !h.is_empty()
                 {
@@ -1014,20 +1609,40 @@ impl Endpoint {
             let has_active_anchor = roster
                 .trust_anchors()
                 .any(|(_, a)| a.state == AnchorState::Active);
+            let identity = Arc::new(identity);
+            let roster = Arc::new(StdMutex::new(roster));
+            let access_roster = if store.is_some() {
+                Arc::new(StdMutex::new(lock_roster(&roster).clone()))
+            } else {
+                Arc::clone(&roster)
+            };
+            let access = RosterAccess::new(store.clone(), access_roster);
+            let transport_cfg = Arc::new(StdMutex::new(EndpointTransportConfig::default()));
+            let announce = Arc::new(AnnouncerSlot {
+                rt: Arc::clone(&rt),
+                identity: Arc::clone(&identity),
+                access: access.clone(),
+                transport_cfg: Arc::clone(&transport_cfg),
+                served_endpoints: StdMutex::new(Vec::new()),
+                served_listeners: StdMutex::new(Vec::new()),
+                announcer: StdMutex::new(AnnouncerState::Idle),
+            });
             Ok(Self {
                 rt,
                 store,
                 store_lock: Arc::new(AsyncMutex::new(())),
-                identity: Arc::new(identity),
-                roster: Arc::new(StdMutex::new(roster)),
+                identity,
+                roster,
                 pair_mgr: Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default()))),
                 router: Arc::new(InboundRouter::new()),
                 v2_state: Arc::new(V2ResponderState::default()),
-                transport_cfg: Arc::new(StdMutex::new(EndpointTransportConfig::default())),
+                transport_cfg,
                 self_m2m_enabled: Arc::new(AtomicBool::new(false)),
                 m2m_enabled: Arc::new(AtomicBool::new(has_active_anchor)),
                 groups: StdMutex::new(Vec::new()),
                 served_v1_relays: Arc::new(StdMutex::new(Vec::new())),
+                access,
+                announce,
             })
         })
     }
@@ -1132,7 +1747,7 @@ impl Endpoint {
             .filter(|s| !s.is_empty())
             .map(|s| {
                 s.parse()
-                    .map_err(|e| PyValueError::new_err(format!("invalid address: {e}")))
+                    .map_err(|e| value_err(format!("invalid address: {e}")))
             })
             .transpose()?;
         py.detach(move || {
@@ -1194,22 +1809,21 @@ impl Endpoint {
         .to_string()
     }
 
-    fn configure_transports_json(&self, transport_config_json: &str) -> PyResult<()> {
-        let input: TransportConfigInput =
-            serde_json::from_str(transport_config_json).map_err(|e| {
-                PyValueError::new_err(format!(
-                    "invalid transport_config_json: {:?} at line {} column {}",
-                    e.classify(),
-                    e.line(),
-                    e.column()
-                ))
-            })?;
+    fn configure_transports_json(
+        &self,
+        py: Python<'_>,
+        transport_config_json: &str,
+    ) -> PyResult<()> {
+        let input: TransportConfigInput = serde_json::from_str(transport_config_json)
+            .map_err(|e| json_err("transport_config_json", &e))?;
         let parsed = EndpointTransportConfig::from_input(input)?;
-        let mut guard = self
+        *self
             .transport_cfg
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = parsed;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = parsed;
+        // Publishing waits on the state directory lock; other Python threads keep running.
+        let announce = Arc::clone(&self.announce);
+        py.detach(move || announce.inputs_changed());
         Ok(())
     }
 
@@ -1242,10 +1856,8 @@ impl Endpoint {
         py.detach(move || {
             let ticket = identity
                 .mint_relay_ticket(&host_s, role_enum, &target_s, now_unix(), ttl)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let json = Zeroizing::new(
-                canonical_json(&ticket).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-            );
+                .map_err(value_err)?;
+            let json = Zeroizing::new(canonical_json(&ticket).map_err(py_err)?);
             Ok((*json).clone())
         })
     }
@@ -1254,15 +1866,18 @@ impl Endpoint {
     fn serve_direct(&self, py: Python<'_>, listen_addr: &str) -> PyResult<String> {
         let addr: SocketAddr = listen_addr
             .parse()
-            .map_err(|e| PyValueError::new_err(format!("invalid address: {e}")))?;
+            .map_err(|e| value_err(format!("invalid address: {e}")))?;
         let rt = Arc::clone(&self.rt);
         let router = Arc::clone(&self.router);
+        let announce = Arc::clone(&self.announce);
         py.detach(move || {
             let listener = rt
                 .block_on(DirectListener::bind(addr, None))
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(py_err)?;
             let ep = listener.local_endpoint();
+            let served = ServedListener::from_listener(listener.tcp_listener()).map_err(py_err)?;
             router.spawn_listener(rt.handle(), Box::new(listener));
+            announce.record_served(&ep, Some(served));
             Ok(ep)
         })
     }
@@ -1281,6 +1896,7 @@ impl Endpoint {
         let key = self.identity.signing_key().ed25519_signing_key();
         let cfg = self.snapshot_transport_cfg();
         let served = Arc::clone(&self.served_v1_relays);
+        let announce = Arc::clone(&self.announce);
         py.detach(move || {
             let listener = rt
                 .block_on(RelayListener::bind_with_auth(
@@ -1290,13 +1906,14 @@ impl Endpoint {
                     DEFAULT_WRITE_TIMEOUT,
                     cfg.relay_auth.clone(),
                 ))
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(py_err)?;
             let ep = listener.local_endpoint();
             router.spawn_listener(rt.handle(), Box::new(listener));
             served
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(url);
+            announce.record_served(&ep, None);
             Ok(ep)
         })
     }
@@ -1342,6 +1959,7 @@ impl Endpoint {
         let router = Arc::clone(&self.router);
         let url_s = relay_url.to_owned();
         let exp_host = expected_host.map(ToOwned::to_owned);
+        let announce = Arc::clone(&self.announce);
         py.detach(move || {
             let mut bound_listeners = Vec::with_capacity(secrets.len());
             for secret in secrets {
@@ -1359,11 +1977,12 @@ impl Endpoint {
                         secret,
                         lcfg,
                     ))
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    .map_err(py_err)?;
                 bound_listeners.push(listener);
             }
             let first_ep = bound_listeners.first().map(|l| l.local_endpoint());
             for listener in bound_listeners {
+                announce.record_served(&listener.local_endpoint(), None);
                 router.spawn_listener(rt.handle(), Box::new(listener));
             }
             Ok(first_ep.unwrap_or(url_s))
@@ -1375,37 +1994,33 @@ impl Endpoint {
         let cfg = self.snapshot_transport_cfg();
         let opts = cfg
             .build_p2p_listener_options(relay_mode)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(value_err)?;
         let seed = self.identity.derive_p2p_identity_seed();
         let rt = Arc::clone(&self.rt);
         let router = Arc::clone(&self.router);
+        let announce = Arc::clone(&self.announce);
         py.detach(move || {
             let listener = rt
                 .block_on(P2pListener::bind_with_options(opts, Some(seed)))
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(py_err)?;
             let ep = listener.local_endpoint();
             router.spawn_listener(rt.handle(), Box::new(listener));
+            announce.record_served(&ep, None);
             Ok(ep)
         })
     }
 
     #[pyo3(signature = (kind="lan"))]
     fn issue_code(&self, py: Python<'_>, kind: &str) -> PyResult<String> {
-        let pk = match kind {
-            "" | "lan" => PairingCodeKind::Lan2Group,
-            "remote" => PairingCodeKind::Remote3Group,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "invalid pairing code kind '{other}'"
-                )));
-            }
+        let pk = if kind.is_empty() {
+            PairingCodeKind::Lan2Group
+        } else {
+            kind.parse::<PairingCodeKind>().map_err(value_err)?
         };
         let mgr = Arc::clone(&self.pair_mgr);
         py.detach(move || {
             let mut guard = mgr.lock().expect("pair_mgr mutex poisoned");
-            guard
-                .issue_code(pk, now_unix())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            guard.issue_code(pk, now_unix()).map_err(py_err)
         })
     }
 
@@ -1438,7 +2053,7 @@ impl Endpoint {
             let v2_secret = if is_v2_relay_endpoint(&ep_s) {
                 Some(
                     lookup_v2_mailbox_secret_for_pair(&roster_snapshot, None, &ep_s, now_unix())
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                        .map_err(py_err)?,
                 )
             } else {
                 None
@@ -1448,7 +2063,7 @@ impl Endpoint {
                 let mut stream =
                     dial_endpoint_v2_with_options(&ep_s, rh_s.as_deref(), &cfg, v2_secret)
                         .await
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        .map_err(py_err)?;
                 let pair_res = if let Some(ref s) = store_for_pair {
                     drive_pair_initiator_with_store(
                         stream.as_mut(),
@@ -1473,7 +2088,7 @@ impl Endpoint {
                     )
                     .await
                 }
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                .map_err(py_err);
                 let _ = stream.close().await;
                 pair_res
             })?;
@@ -1530,7 +2145,7 @@ impl Endpoint {
                     })
                     .to_string())
                 }
-                PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
+                PairOutcome::Rejected { error } => Err(py_err(error)),
                 PairOutcome::ResponderPending { .. } | PairOutcome::ResponderEnrolled { .. } => {
                     Err(PyRuntimeError::new_err("unexpected responder outcome"))
                 }
@@ -1637,7 +2252,7 @@ impl Endpoint {
                     "kind": kind,
                 })
                 .to_string()),
-                PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
+                PairOutcome::Rejected { error } => Err(py_err(error)),
                 PairOutcome::InitiatorPending { .. } | PairOutcome::InitiatorEnrolled { .. } => {
                     Err(PyRuntimeError::new_err("unexpected initiator outcome"))
                 }
@@ -1683,7 +2298,7 @@ impl Endpoint {
         let store_lock = Arc::clone(&self.store_lock);
         let pid = peer_id.to_owned();
         py.detach(move || {
-            let nonce = random_bytes::<16>().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let nonce = random_bytes::<16>().map_err(py_err)?;
             let grant = update_roster_blocking(
                 store.as_ref(),
                 &store_lock,
@@ -1703,7 +2318,7 @@ impl Endpoint {
                         .map_err(RuntimeError::from)
                 },
             )?;
-            serde_json::to_string(&grant).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            serde_json::to_string(&grant).map_err(py_err)
         })
     }
 
@@ -1799,7 +2414,7 @@ impl Endpoint {
         let m2m = Arc::clone(&self.m2m_enabled);
         let router = Arc::clone(&self.router);
         py.detach(move || {
-            let nonce = random_bytes::<16>().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let nonce = random_bytes::<16>().map_err(py_err)?;
             let token = core_mint_enrollment_token(
                 &identity,
                 &target_s,
@@ -1808,14 +2423,14 @@ impl Endpoint {
                 ttl_secs,
                 nonce,
             )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(value_err)?;
             if target_s == identity.host_id() {
                 let roster = roster_arc.lock().expect("roster mutex poisoned");
                 self_m2m.store(true, Ordering::Release);
                 refresh_m2m_flags(&self_m2m, &m2m, &roster);
                 router.set_pair_enabled(true);
             }
-            serde_json::to_string(&token).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            serde_json::to_string(&token).map_err(py_err)
         })
     }
 
@@ -1837,8 +2452,8 @@ impl Endpoint {
         let identity_sync = Arc::clone(&self.identity);
         let static_pub = as_32(host_static_pub, "host_static_pub")?;
         let signing_pin = parse_signing_pin(host_signing_pub, "host_signing_pub")?;
-        let token: Grant = serde_json::from_str(token_json)
-            .map_err(|e| PyValueError::new_err(format!("invalid token_json: {e}")))?;
+        let token: Grant =
+            serde_json::from_str(token_json).map_err(|e| json_err("token_json", &e))?;
         let pinned_host = PinnedHost {
             host_id: Some(host_id.to_owned()),
             static_pub,
@@ -1863,7 +2478,7 @@ impl Endpoint {
             let res = rt.block_on(async move {
                 let mut stream = dial_endpoint_v2_with_options(&ep_s, rh_s.as_deref(), &cfg, None)
                     .await
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    .map_err(py_err)?;
                 let pair_res = if let Some(ref s) = store_for_enroll {
                     drive_m2m_enroll_initiator_with_store(
                         stream.as_mut(),
@@ -1889,7 +2504,7 @@ impl Endpoint {
                     )
                     .await
                 }
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                .map_err(py_err);
                 let _ = stream.close().await;
                 pair_res
             })?;
@@ -1931,7 +2546,7 @@ impl Endpoint {
                     })
                     .to_string())
                 }
-                PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
+                PairOutcome::Rejected { error } => Err(py_err(error)),
                 PairOutcome::InitiatorPending { .. } => {
                     Err(PyRuntimeError::new_err("unexpected human pending outcome"))
                 }
@@ -1976,16 +2591,10 @@ impl Endpoint {
 
             let v2_pinned = match pinned_opt {
                 Some(raw) => {
-                    let pin_in: PyPinnedHostInput = serde_json::from_str(&raw).map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "invalid pinned_host_json: {:?} at line {} column {}",
-                            e.classify(),
-                            e.line(),
-                            e.column()
-                        ))
-                    })?;
-                    let static_pub = b64url_decode_array::<32>(&pin_in.static_pub_b64)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let pin_in: PyPinnedHostInput =
+                        serde_json::from_str(&raw).map_err(|e| json_err("pinned_host_json", &e))?;
+                    let static_pub =
+                        b64url_decode_array::<32>(&pin_in.static_pub_b64).map_err(value_err)?;
                     let signing_pin = parse_signing_pin_b64(&pin_in.signing_pin_b64)
                         .map_err(PyValueError::new_err)?;
                     let pinned = PinnedHost {
@@ -1998,10 +2607,7 @@ impl Endpoint {
                     let floor = pin_in
                         .min_wire_version
                         .map_or(base_floor, |v| base_floor.max(v));
-                    Some(
-                        V2PinnedHost::new(pinned, floor)
-                            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                    )
+                    Some(V2PinnedHost::new(pinned, floor).map_err(value_err)?)
                 }
                 None => None,
             };
@@ -2014,7 +2620,7 @@ impl Endpoint {
                         &ep_s,
                         now_unix(),
                     )
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                    .map_err(py_err)?,
                 )
             } else {
                 None
@@ -2025,7 +2631,7 @@ impl Endpoint {
                 let mut stream =
                     dial_endpoint_v2_with_options(&ep_s, rh_s.as_deref(), &cfg, v2_secret)
                         .await
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        .map_err(py_err)?;
                 let res = if let Some(ref s) = store_for_pair {
                     drive_v2_pake_pair_initiator_with_store(
                         stream.as_mut(),
@@ -2052,7 +2658,7 @@ impl Endpoint {
                     )
                     .await
                 }
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                .map_err(py_err);
                 let _ = stream.close().await;
                 res
             })?;
@@ -2085,7 +2691,7 @@ impl Endpoint {
                                 h_id.clone(),
                                 Vec::new(),
                             )
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                            .map_err(py_err)?;
                     }
                     Ok(serde_json::json!({
                         "device_id": dev_id,
@@ -2097,7 +2703,7 @@ impl Endpoint {
                     })
                     .to_string())
                 }
-                V2PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
+                V2PairOutcome::Rejected { error } => Err(py_err(error)),
                 V2PairOutcome::ResponderPending { .. } => {
                     Err(PyRuntimeError::new_err("unexpected responder outcome"))
                 }
@@ -2179,7 +2785,7 @@ impl Endpoint {
                     "wire_version": 2,
                 })
                 .to_string()),
-                V2PairOutcome::Rejected { error } => Err(PyRuntimeError::new_err(error)),
+                V2PairOutcome::Rejected { error } => Err(py_err(error)),
                 V2PairOutcome::InitiatorPending { .. } => {
                     Err(PyRuntimeError::new_err("unexpected initiator outcome"))
                 }
@@ -2187,203 +2793,310 @@ impl Endpoint {
         })
     }
 
+    /// Wire v1 Day-2 connect. An empty or `None` `endpoint` dials the stored routes of the target.
+    /// A non-empty one is normalized and dialed alone.
     #[pyo3(signature = (endpoint, target_host_id, grant_json=None, relay_host=None))]
     fn connect(
         &self,
         py: Python<'_>,
-        endpoint: &str,
+        endpoint: Option<&str>,
         target_host_id: &str,
         grant_json: Option<&str>,
         relay_host: Option<&str>,
     ) -> PyResult<Session> {
-        let grant: Option<Grant> = match grant_json {
-            Some(s) if !s.is_empty() => {
-                Some(serde_json::from_str(s).map_err(|e| PyValueError::new_err(e.to_string()))?)
-            }
-            _ => None,
+        let args = ConnectArgs {
+            wire: 1,
+            endpoint: endpoint.filter(|e| !e.is_empty()).map(ToOwned::to_owned),
+            grant: parse_grant(grant_json)?,
+            relay_host: relay_host.map(ToOwned::to_owned),
+            ..ConnectArgs::default()
         };
-        let rt = Arc::clone(&self.rt);
-        let identity = Arc::clone(&self.identity);
-        let roster = Arc::clone(&self.roster);
-        let store = self.store.clone();
-        let store_lock = Arc::clone(&self.store_lock);
-        let cfg = self.snapshot_transport_cfg();
-        let ep_s = endpoint.to_owned();
-        let rh_s = relay_host.map(ToOwned::to_owned);
-        let target_s = target_host_id.to_owned();
-
-        let driver = py.detach(move || {
-            sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
-            let (v2_secret, working) = {
-                let guard = lock_roster(&roster);
-                check_peer_allows_wire_v1(&guard, &target_s).map_err(py_err)?;
-                let sec = if is_v2_relay_endpoint(&ep_s) {
-                    Some(lookup_v2_mailbox_secret_for_target(&guard, &target_s)?)
-                } else {
-                    None
-                };
-                (sec, Arc::new(StdMutex::new(guard.clone())))
-            };
-            let roster_in = if store.is_some() {
-                Arc::clone(&working)
-            } else {
-                Arc::clone(&roster)
-            };
-            let identity_in = Arc::clone(&identity);
-            let target_commit = target_s.clone();
-            let res = rt.block_on(async move {
-                let stream = dial_endpoint_v2_with_options(&ep_s, rh_s.as_deref(), &cfg, v2_secret)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                SessionDriver::connect_locked(
-                    stream,
-                    &identity,
-                    &target_s,
-                    grant,
-                    &roster_in,
-                    now_unix(),
-                )
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            });
-            let persisted = if store.is_some() {
-                let chain = res
-                    .as_ref()
-                    .map(|d| d.applied_rotation().to_vec())
-                    .unwrap_or_default();
-                let learned = lock_roster(&working).clone();
-                commit_connect_blocking(
-                    store.as_ref(),
-                    &store_lock,
-                    &roster,
-                    &identity_in,
-                    &learned,
-                    &target_commit,
-                    &chain,
-                )
-            } else {
-                Ok(())
-            };
-            match res {
-                Ok(drv) => {
-                    persisted?;
-                    Ok(drv)
-                }
-                Err(err) => {
-                    if let Err(pe) = persisted {
-                        Err(PyRuntimeError::new_err(format!(
-                            "{err} (roster persist error: {pe})"
-                        )))
-                    } else {
-                        Err(err)
-                    }
-                }
-            }
-        })?;
-
-        Ok(self.new_session(SessionBackend::V1(driver.into_concurrent())))
+        self.connect_policy(py, target_host_id, args)
     }
 
+    /// Wire v2 Day-2 connect; `endpoint` as in [`Self::connect`]. A configured wake target with an
+    /// explicit endpoint wakes the host first, then connects through the same policy path.
     #[pyo3(signature = (endpoint, target_host_id, grant_json=None, relay_host=None))]
     fn connect_v2(
         &self,
         py: Python<'_>,
-        endpoint: &str,
+        endpoint: Option<&str>,
         target_host_id: &str,
         grant_json: Option<&str>,
         relay_host: Option<&str>,
     ) -> PyResult<Session> {
-        let identity_sync = Arc::clone(&self.identity);
-        let grant: Option<Grant> = match grant_json {
-            Some(s) if !s.is_empty() => {
-                Some(serde_json::from_str(s).map_err(|e| PyValueError::new_err(e.to_string()))?)
-            }
-            _ => None,
+        let endpoint = endpoint.filter(|e| !e.is_empty());
+        let args = ConnectArgs {
+            wire: 2,
+            endpoint: endpoint.map(ToOwned::to_owned),
+            grant: parse_grant(grant_json)?,
+            relay_host: relay_host.map(ToOwned::to_owned),
+            ..ConnectArgs::default()
         };
-        let rt = Arc::clone(&self.rt);
-        let identity = Arc::clone(&self.identity);
-        let roster = Arc::clone(&self.roster);
+        self.connect_policy(py, target_host_id, args)
+    }
+
+    /// Day-2 connect with every option in one JSON object: `wire` (`1` or `2`),
+    /// `grant` (object), `endpoint`, `recovery_uri`, `replace_routes`, `route_policy` and
+    /// `relay_host` (the expected relay challenge host of an explicit relay endpoint).
+    fn connect_with_options(
+        &self,
+        py: Python<'_>,
+        target_host_id: &str,
+        options_json: &str,
+    ) -> PyResult<Session> {
+        let opts: ConnectOptionsInput = parse_options(Some(options_json), "options_json")?;
+        let wire = opts.wire.unwrap_or(1);
+        if wire != 1 && wire != 2 {
+            return Err(PyValueError::new_err("wire must be 1 or 2"));
+        }
+        let policy = parse_route_policy(
+            opts.route_policy.as_deref(),
+            self.snapshot_transport_cfg().route_policy,
+        )?;
+        let args = ConnectArgs {
+            wire,
+            endpoint: opts.endpoint.filter(|e| !e.is_empty()),
+            grant: opts.grant,
+            recovery_uri: opts.recovery_uri.filter(|u| !u.is_empty()),
+            replace_routes: opts.replace_routes.unwrap_or(false),
+            policy: Some(policy),
+            relay_host: opts.relay_host,
+        };
+        self.connect_policy(py, target_host_id, args)
+    }
+
+    /// Issues a pairing URI from the current announced route set.
+    /// Options `{"kind": "auto"|"lan"|"remote", "host_name": str, "sign_routes": bool}`.
+    #[pyo3(signature = (options_json=None))]
+    fn issue_pairing_uri(&self, py: Python<'_>, options_json: Option<&str>) -> PyResult<String> {
+        let opts: IssueUriOptions = parse_options(options_json, "options_json")?;
+        let requested_kind = match opts.kind.as_deref() {
+            None | Some("") => None,
+            Some(k) if k.eq_ignore_ascii_case("auto") => None,
+            Some(k) => Some(k.parse::<PairingCodeKind>().map_err(value_err)?),
+        };
+        let sign_routes = opts
+            .sign_routes
+            .unwrap_or(self.snapshot_transport_cfg().sign_routes);
+        let host_name = opts
+            .host_name
+            .unwrap_or_else(|| self.identity.host_id().to_owned());
+        let announce = Arc::clone(&self.announce);
+        let mgr = Arc::clone(&self.pair_mgr);
+        py.detach(move || {
+            let announcer = announce.announcer()?;
+            // The announcer publishes before it takes the manager (runtime lock order); this
+            // call must not hold the manager.
+            let issued = announcer
+                .issue_pairing_uri(
+                    &mgr,
+                    &host_name,
+                    IssueOptions {
+                        requested_kind,
+                        sign_routes,
+                    },
+                    unix_ms(),
+                )
+                .map_err(rt_err)?;
+            let dropped: Vec<serde_json::Value> = issued
+                .dropped
+                .iter()
+                .map(|d| serde_json::json!({ "hint": d.redacted_hint(), "reason": d.reason }))
+                .collect();
+            Ok(serde_json::json!({
+                "uri": issued.uri,
+                "code_kind": code_kind_name(issued.code_kind),
+                "dropped": dropped,
+                "uri_len": issued.uri_len,
+                "qr_version_m": issued.qr_version_m,
+                "route_seq": issued.route_seq,
+            })
+            .to_string())
+        })
+    }
+
+    /// Pairs over Wire v1 from a scanned pairing URI: races its hints (or only
+    /// `options.endpoint`) and persists the routes `options.route_policy` allows.
+    /// Options `{"route_policy", "save_route", "endpoint", "code"}`.
+    #[pyo3(signature = (pairing_uri, name=None, kind=None, options_json=None))]
+    fn pair_uri(
+        &self,
+        py: Python<'_>,
+        pairing_uri: &str,
+        name: Option<&str>,
+        kind: Option<&str>,
+        options_json: Option<&str>,
+    ) -> PyResult<String> {
+        self.pair_uri_impl(py, false, pairing_uri, name, kind, options_json)
+    }
+
+    /// As [`Self::pair_uri`] over Wire v2 PAKE, one rung at a time.
+    #[pyo3(signature = (pairing_uri, name=None, kind=None, options_json=None))]
+    fn pair_v2_uri(
+        &self,
+        py: Python<'_>,
+        pairing_uri: &str,
+        name: Option<&str>,
+        kind: Option<&str>,
+        options_json: Option<&str>,
+    ) -> PyResult<String> {
+        self.pair_uri_impl(py, true, pairing_uri, name, kind, options_json)
+    }
+
+    /// Replaces the peer's `operator` routes. `routes_json` is a JSON array of endpoint strings
+    /// (at most six; an empty array clears them). Returns the peer's full route list.
+    fn set_peer_routes(
+        &self,
+        py: Python<'_>,
+        peer_id: &str,
+        routes_json: &str,
+    ) -> PyResult<String> {
+        let raw: Vec<String> = serde_json::from_str(routes_json)
+            .map_err(|e| json_err("routes_json (expected an array of strings)", &e))?;
         let store = self.store.clone();
         let store_lock = Arc::clone(&self.store_lock);
-        let cfg = self.snapshot_transport_cfg();
-        let ep_s = endpoint.to_owned();
-        let rh_s = relay_host.map(ToOwned::to_owned);
-        let target_s = target_host_id.to_owned();
+        let roster = Arc::clone(&self.roster);
+        let identity = Arc::clone(&self.identity);
+        let peer = peer_id.to_owned();
+        py.detach(move || {
+            let routes = update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster,
+                &identity,
+                |roster| set_peer_routes(roster, &peer, &raw),
+            )?;
+            Ok(routes_json_array(&routes).to_string())
+        })
+    }
 
-        let driver = py.detach(move || {
+    /// `{"routes": [{"hint", "source"}], "route_meta": {"seq", "issued_at", "origin"} | null,
+    /// "last_route_set": {"outcome", "seq"} | null}` for one peer.
+    fn peer_routes(&self, py: Python<'_>, peer_id: &str) -> PyResult<String> {
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let roster = Arc::clone(&self.roster);
+        let identity = Arc::clone(&self.identity);
+        let access = self.access.clone();
+        let peer = peer_id.to_owned();
+        py.detach(move || {
             sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
-            let v2_secret = if is_v2_relay_endpoint(&ep_s) {
-                let guard = lock_roster(&roster);
-                Some(lookup_v2_mailbox_secret_for_target(&guard, &target_s)?)
-            } else {
-                None
-            };
-            let roster_in = Arc::clone(&roster);
-            let store_in = store.clone();
-            let store_lock_in = Arc::clone(&store_lock);
-            let res = rt.block_on(async move {
-                let stream = if let Some(ref wake_cfg) = cfg.wake {
-                    let dialer = build_dialer_with_options(&ep_s, rh_s.as_deref(), &cfg, v2_secret)
-                        .await
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let http_wake = Arc::new(
-                        HttpWakeProvider::new()
-                            .with_cooldown_secs(0)
-                            .with_timeout(Duration::from_millis(wake_cfg.timeout_ms)),
-                    );
-                    let wake_opts = WakeDialOptions::new(
-                        http_wake,
-                        wake_cfg.target.clone(),
-                        wake_cfg.secret.clone(),
-                    )
-                    .with_pre_wake(wake_cfg.pre_wake)
-                    .with_retry_delay(Duration::from_millis(wake_cfg.retry_delay_ms))
-                    .with_max_attempts(wake_cfg.max_attempts)
-                    .with_wake_timeout(Duration::from_millis(wake_cfg.timeout_ms));
-                    wake_and_dial_v2(&*dialer, &ep_s, &wake_opts, now_unix())
-                        .await
-                        .map(|(stream, _)| stream)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                } else {
-                    dial_endpoint_v2_with_options(&ep_s, rh_s.as_deref(), &cfg, v2_secret)
-                        .await
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                };
-                if let Some(ref s) = store_in {
-                    V2SessionDriver::connect_with_store(
-                        stream,
-                        &identity,
-                        &target_s,
-                        grant,
-                        s,
-                        &store_lock_in,
-                        now_unix(),
-                    )
-                    .await
-                } else {
-                    V2SessionDriver::connect_locked(
-                        stream,
-                        &identity,
-                        &target_s,
-                        grant,
-                        &roster_in,
-                        now_unix(),
-                    )
-                    .await
-                }
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            });
-            let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity_sync);
-            match res {
-                Ok(drv) => {
-                    synced?;
-                    Ok(drv)
-                }
-                Err(err) => Err(err),
-            }
-        })?;
+            let last = access.last_route_set(&peer);
+            let view = peer_routes(&lock_roster(&roster), &peer, last).map_err(py_err)?;
+            Ok(serde_json::json!({
+                "routes": routes_json_array(&view.routes),
+                "route_meta": view.route_meta.map(|m| serde_json::json!({
+                    "seq": m.seq,
+                    "issued_at": m.issued_at,
+                    "origin": m.origin,
+                })),
+                "last_route_set": view.last_route_set.map(|l| serde_json::json!({
+                    "outcome": l.outcome,
+                    "seq": l.seq,
+                })),
+            })
+            .to_string())
+        })
+    }
 
-        Ok(self.new_session(SessionBackend::V2(driver.into_concurrent())))
+    /// Removes the peer's routes of `source` (`"operator"` when omitted, `"signed"`,
+    /// `"committed"` or `"all"`).
+    #[pyo3(signature = (peer_id, source=None))]
+    fn clear_peer_routes(
+        &self,
+        py: Python<'_>,
+        peer_id: &str,
+        source: Option<&str>,
+    ) -> PyResult<()> {
+        let source = match source {
+            None | Some("" | "operator") => Some(RouteSource::Operator),
+            Some("signed") => Some(RouteSource::Signed),
+            Some("committed") => Some(RouteSource::Committed),
+            Some("all") => None,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "invalid route source '{other}'"
+                )));
+            }
+        };
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let roster = Arc::clone(&self.roster);
+        let identity = Arc::clone(&self.identity);
+        let peer = peer_id.to_owned();
+        py.detach(move || {
+            update_roster_blocking(store.as_ref(), &store_lock, &roster, &identity, |roster| {
+                clear_peer_routes(roster, &peer, source)
+            })
+        })
+    }
+
+    /// Applies a fresh signed pairing URI to the matching paired host offline. Options
+    /// `{"replace_routes", "route_policy"}`. Returns `{"peer_id", "applied", "reason",
+    /// "route_seq"}`.
+    #[pyo3(signature = (pairing_uri, options_json=None))]
+    fn apply_route_uri(
+        &self,
+        py: Python<'_>,
+        pairing_uri: &str,
+        options_json: Option<&str>,
+    ) -> PyResult<String> {
+        let opts: ApplyRouteOptions = parse_options(options_json, "options_json")?;
+        let policy = parse_route_policy(
+            opts.route_policy.as_deref(),
+            self.snapshot_transport_cfg().route_policy,
+        )?;
+        let uri = PairingUri::parse(pairing_uri).map_err(value_err)?;
+        let apply = RouteApplyOpts {
+            policy,
+            replace_routes: opts.replace_routes.unwrap_or(false),
+        };
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let roster = Arc::clone(&self.roster);
+        let identity = Arc::clone(&self.identity);
+        py.detach(move || {
+            let res = update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster,
+                &identity,
+                |roster| apply_signed_route_uri(roster, &uri, apply),
+            )?;
+            Ok(serde_json::json!({
+                "peer_id": res.peer_id,
+                "applied": res.applied,
+                "reason": res.reason,
+                "route_seq": res.route_meta.map(|m| m.seq),
+            })
+            .to_string())
+        })
+    }
+
+    /// Re-scans the host's addresses and publishes the announced route set. `snapshot_json` is
+    /// the complete current network snapshot `{"networks": [{"id", "iface", "if_index",
+    /// "transports", "addrs"}]}`; `None` re-enumerates natively (or reuses the retained
+    /// snapshot after one was passed). Returns `{"route_seq", "changed"}`.
+    #[pyo3(signature = (snapshot_json=None))]
+    fn refresh_routes(&self, py: Python<'_>, snapshot_json: Option<&str>) -> PyResult<String> {
+        let snapshot = snapshot_json
+            .filter(|s| !s.is_empty())
+            .map(NetworkSnapshot::from_json)
+            .transpose()
+            .map_err(rt_value_err)?;
+        let announce = Arc::clone(&self.announce);
+        py.detach(move || {
+            let out = announce
+                .announcer()?
+                .refresh(unix_ms(), snapshot)
+                .map_err(py_err)?;
+            Ok(serde_json::json!({
+                "route_seq": out.route_seq(),
+                "changed": out.changed,
+            })
+            .to_string())
+        })
     }
 
     #[pyo3(signature = (timeout_ms=5000))]
@@ -2425,7 +3138,7 @@ impl Endpoint {
             })
         })?;
 
-        Ok(self.new_session(SessionBackend::V1(driver.into_concurrent())))
+        self.accepted_session(py, SessionBackend::V1(Arc::new(driver.into_concurrent())))
     }
 
     #[pyo3(signature = (timeout_ms=5000))]
@@ -2478,7 +3191,7 @@ impl Endpoint {
                     )
                     .await
                 }
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                .map_err(py_err)
             });
             let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity_sync);
             match res {
@@ -2490,7 +3203,7 @@ impl Endpoint {
             }
         })?;
 
-        Ok(self.new_session(SessionBackend::V2(driver.into_concurrent())))
+        self.accepted_session(py, SessionBackend::V2(Arc::new(driver.into_concurrent())))
     }
 
     fn close(&self, py: Python<'_>) {
@@ -2503,7 +3216,9 @@ impl Endpoint {
             .drain(..)
             .filter_map(|w| w.upgrade())
             .collect();
+        let announce = Arc::clone(&self.announce);
         py.detach(move || {
+            announce.stop();
             router.close();
             let _guard = rt.enter();
             for pool in pools {
@@ -2514,8 +3229,8 @@ impl Endpoint {
 }
 
 enum SessionBackend {
-    V1(ConcurrentSession),
-    V2(ConcurrentV2Session),
+    V1(Arc<ConcurrentSession>),
+    V2(Arc<ConcurrentV2Session>),
 }
 
 impl SessionBackend {
@@ -2528,6 +3243,21 @@ impl SessionBackend {
 
     fn is_v2(&self) -> bool {
         matches!(self, Self::V2(_))
+    }
+
+    /// The `route_seq` the client sent in `SessionHello` (responder sessions).
+    fn peer_route_seq(&self) -> Option<u64> {
+        match self {
+            Self::V1(s) => s.peer_route_seq(),
+            Self::V2(s) => s.peer_route_seq(),
+        }
+    }
+
+    fn route_sink(&self) -> Arc<dyn RouteSetSink> {
+        match self {
+            Self::V1(s) => Arc::clone(s) as Arc<dyn RouteSetSink>,
+            Self::V2(s) => Arc::clone(s) as Arc<dyn RouteSetSink>,
+        }
     }
 
     async fn send_data(&self, payload: &[u8]) -> Result<(), RuntimeError> {
@@ -2590,13 +3320,7 @@ impl Session {
         let data = payload.to_vec();
         let rt = Arc::clone(&self.rt);
         let sess = Arc::clone(&self.session);
-        py.detach(move || {
-            rt.block_on(async move {
-                sess.send_data(&data)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            })
-        })
+        py.detach(move || rt.block_on(async move { sess.send_data(&data).await.map_err(py_err) }))
     }
 
     #[pyo3(signature = (timeout_ms=5000))]
@@ -2685,14 +3409,14 @@ impl Session {
                             let _ =
                                 sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
                                     .await;
-                            Err(PyRuntimeError::new_err(e.to_string()))
+                            Err(py_err(e))
                         } else if let Err(pe) =
                             commit_session_async(store.as_ref(), &store_lock, &roster, &identity)
                                 .await
                         {
-                            Err(PyRuntimeError::new_err(format!("{e} ({pe})")))
+                            Err(PyRuntimeError::new_err(redact_text(&format!("{e} ({pe})"))))
                         } else {
-                            Err(PyRuntimeError::new_err(e.to_string()))
+                            Err(py_err(e))
                         }
                     }
                     Err(_) => Ok(serde_json::json!({ "status": "would_block" }).to_string()),
@@ -2711,13 +3435,7 @@ impl Session {
     fn rekey(&self, py: Python<'_>) -> PyResult<()> {
         let rt = Arc::clone(&self.rt);
         let sess = Arc::clone(&self.session);
-        py.detach(move || {
-            rt.block_on(async move {
-                sess.send_rekey()
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            })
-        })
+        py.detach(move || rt.block_on(async move { sess.send_rekey().await.map_err(py_err) }))
     }
 
     #[pyo3(signature = (code=1000, reason="normal"))]
@@ -2726,11 +3444,7 @@ impl Session {
         let sess = Arc::clone(&self.session);
         let reason_s = reason.to_owned();
         py.detach(move || {
-            rt.block_on(async move {
-                sess.send_close(code, &reason_s)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            })
+            rt.block_on(async move { sess.send_close(code, &reason_s).await.map_err(py_err) })
         })
     }
 }
@@ -2963,4 +3677,39 @@ fn _tendril(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Session>()?;
     m.add_class::<Group>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publish_roster_keeps_anchor_signed_crl() {
+        use tendril_core::crypto::SigningKeypair;
+        use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+
+        let identity = EndpointIdentity::generate().unwrap();
+        let anchor = SigningKeypair::generate().unwrap();
+        let anchor_id = "anchor-a".to_owned();
+        let mut disk = Roster::default();
+        disk.add_trust_anchor(anchor_id.clone(), anchor.public_key().clone())
+            .unwrap();
+        let mut mem = disk.clone();
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: anchor_id.clone(),
+                seq: 1,
+                revoked_devices: vec!["dev-gone".to_owned()],
+                revoked_nonces: Vec::new(),
+                ts: "2026-01-01T00:00:00Z".to_owned(),
+            },
+            &anchor,
+        )
+        .unwrap();
+        mem.ingest_crl(crl, &anchor_id, anchor.public_key())
+            .unwrap();
+        publish_roster(&mut mem, disk, &identity);
+        assert!(mem.crl(&anchor_id).is_some(), "anchor CRL dropped on merge");
+    }
 }
