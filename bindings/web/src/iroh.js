@@ -238,6 +238,7 @@ export async function dialIrohStream({
   p2pRelayUrls = null,
   p2pRelayAuthToken = null,
   p2pApiSecret = null,
+  hint = false,
   timeoutMs = 15000,
 }) {
   if (p2pApiSecret) {
@@ -284,8 +285,14 @@ export async function dialIrohStream({
   let timedOut = false;
   const useOptions = relayUrlsJson !== null || authTokenStr !== null;
   const dialPromise = (useOptions
-    ? mod.WasmIrohStream.dial_with_options(endpoint, relayUrlsJson, authTokenStr, timeoutMs)
-    : mod.WasmIrohStream.dial(endpoint, trimmedRelayOverride || null, timeoutMs)
+    ? mod.WasmIrohStream.dial_with_options(
+        endpoint,
+        relayUrlsJson,
+        authTokenStr,
+        timeoutMs,
+        Boolean(hint)
+      )
+    : mod.WasmIrohStream.dial(endpoint, trimmedRelayOverride || null, timeoutMs, Boolean(hint))
   )
     .then(async (stream) => {
       if (timedOut) {

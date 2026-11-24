@@ -7,6 +7,7 @@ import initWasm, {
   WasmV2PakePairInitiator,
   WasmV2SessionInitiator,
   canonical_relay_host,
+  classify_pairing_code,
   compute_code_mac,
   compute_code_mac_bytes,
   compute_relay_auth_hmac_b64,
@@ -16,6 +17,7 @@ import initWasm, {
   fingerprint_host,
   pairing_sas,
   parse_pairing_uri_json,
+  relay_auth_origin_allowed,
   v2_epoch_within_skew,
   verify_grant_json,
   verify_rotation_chain_json,
@@ -27,9 +29,11 @@ import {
   RelayStream,
   dialRelayStream,
   dialRelayV2Stream,
+  isLoopbackHost,
   validateRelayWsUrl,
 } from "./relay.js";
 import { TendrilWebGroup } from "./group.js";
+import { redactHint } from "./redact.js";
 import { createIndexedDbVault, openTendrilVault } from "./vault.js";
 
 export {
@@ -58,6 +62,16 @@ export async function parseP2pEndpoint(endpoint) {
 export async function dialIrohStream(options) {
   const { dialIrohStream: dial } = await import("./iroh.js");
   return dial(options);
+}
+
+/** Resolves true when the opt-in `pkg-p2p` module loads, so `iroh://` hints are dialable. */
+export async function hasP2pSupport() {
+  try {
+    await initTendrilP2p();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const SESSION_TOKEN = Symbol("TendrilWebSession");
@@ -108,6 +122,7 @@ async function dialWebStream({
   useRelayV2 = false,
   deriveV2Dial = null,
   allowInsecureWs = false,
+  irohHint = false,
   timeoutMs,
 }) {
   if (p2pApiSecret) {
@@ -123,6 +138,7 @@ async function dialWebStream({
       p2pRelayUrls,
       p2pRelayAuthToken,
       p2pApiSecret,
+      hint: irohHint,
       timeoutMs,
     });
   }
@@ -154,6 +170,281 @@ function remainingBudgetMs(deadlineMs, label) {
     throw new Error(label);
   }
   return remaining;
+}
+
+const PROVIDER_RANK = { local: 0, direct: 1, overlay: 2, p2p: 3, relay: 4, broker: 5 };
+const RUNG_BUDGET_MS = 4000;
+const ROSTER_LOCK_WARN_MS = 5000;
+const CLIENT_ROUTE_SET_INTERVAL_MS = 10000;
+const NO_BROWSER_ENDPOINTS =
+  "pairing URI contains no browser-compatible endpoints (need iroh:// or wss://)";
+const DAY2_RECOVERY_GUIDANCE =
+  "advertise a configured relay as a stable route, or scan a fresh signed pairing URI and apply it or connect with it as a recovery URI";
+const PAIR_V2_RELAY_REJECTED =
+  "/v2/relay is not used for pairing; pair over another route, then use connectV2";
+const RELAY_OFFLINE_ROTATED =
+  "relay mailbox offline for pinned key; host may have rotated: reconnect over another route or supply a fresh pairing URI";
+const ROUTE_POLICIES = {
+  allSigned: "all_signed",
+  all_signed: "all_signed",
+  committedOnly: "committed_only",
+  committed_only: "committed_only",
+  none: "none",
+};
+
+function toError(err) {
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+function errorText(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function noop() {}
+
+function bytesEqual(a, b) {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function normalizeRoutePolicy(policy) {
+  if (policy === null || policy === undefined) {
+    return "all_signed";
+  }
+  const value = ROUTE_POLICIES[policy];
+  if (!value) {
+    throw new Error(`invalid routePolicy '${policy}': expected allSigned, committedOnly or none`);
+  }
+  return value;
+}
+
+function normalizeOrigins(origins) {
+  if (origins === null || origins === undefined) {
+    return [];
+  }
+  if (!Array.isArray(origins) || origins.some((o) => typeof o !== "string")) {
+    throw new TypeError("relayAuthOrigins must be an array of origin strings");
+  }
+  return origins;
+}
+
+/** `ws://` or `wss://` in any letter case (URL schemes are case-insensitive). */
+function isWsUrl(url) {
+  return /^wss?:\/\//i.test(url);
+}
+
+function isV2RelayUrl(url) {
+  try {
+    return new URL(url).pathname === "/v2/relay";
+  } catch {
+    return false;
+  }
+}
+
+function isIrohHint(hint) {
+  return typeof hint === "string" && (hint.startsWith("iroh://") || hint.startsWith("p2p:iroh://"));
+}
+
+function stripIrohRelayParams(endpoint) {
+  const q = endpoint.indexOf("?");
+  if (q < 0) {
+    return endpoint;
+  }
+  const kept = endpoint
+    .slice(q + 1)
+    .split("&")
+    .filter((pair) => pair && !pair.startsWith("relay="));
+  return kept.length > 0 ? `${endpoint.slice(0, q)}?${kept.join("&")}` : endpoint.slice(0, q);
+}
+
+/**
+ * Splits a relay `URL#<key>` into the URL, with its scheme lower-cased, and the operator relay key
+ * (none for `/v2/relay`).
+ */
+function splitRelayKey(url) {
+  if (typeof url !== "string" || !isWsUrl(url)) {
+    return { url, relayKey: null };
+  }
+  url = url.replace(/^wss?/i, (scheme) => scheme.toLowerCase());
+  if (!url.includes("#")) {
+    return { url, relayKey: null };
+  }
+  const idx = url.indexOf("#");
+  const base = url.slice(0, idx);
+  if (isV2RelayUrl(base)) {
+    return { url: base, relayKey: null };
+  }
+  const key = url.slice(idx + 1);
+  if (!/^[A-Za-z0-9_-]{43}$/.test(key)) {
+    throw new Error("invalid relay key in endpoint fragment");
+  }
+  return { url: base, relayKey: key };
+}
+
+function copySecret(secret) {
+  return secret instanceof Uint8Array ? new Uint8Array(secret) : secret;
+}
+
+/** An Error with a stable `code`: a WASM core code or one of this binding's own. */
+function codedError(code, message, options) {
+  const err = new Error(message, options);
+  if (code) {
+    err.code = code;
+  }
+  return err;
+}
+
+/** Severity by stable error code; uncoded errors rank last. */
+const ERROR_SEVERITY = {
+  rotation_fork_detected: 6,
+  peer_revoked: 5,
+  version_downgrade: 4,
+  host_key_unverified: 3,
+  invalid_pairing_uri: 2,
+};
+
+function errorSeverity(err) {
+  return ERROR_SEVERITY[err?.code] ?? 1;
+}
+
+/** The most severe error, the earliest among equals. */
+function mostSevere(errors) {
+  let best = null;
+  for (const err of errors) {
+    if (best === null || errorSeverity(err) > errorSeverity(best)) {
+      best = err;
+    }
+  }
+  return best;
+}
+
+function attemptError(err, { committed = false, skipped = [], failures = [] } = {}) {
+  const out = toError(err);
+  out.committed = committed;
+  out.skipped = skipped;
+  out.failures = failures;
+  return out;
+}
+
+class FatalAttemptError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/**
+ * Splits pairing URI hints into the candidates a browser can dial, in provider order, and the
+ * skipped rest. `iroh://` needs `p2p` (see `hasP2pSupport()`) and loses its `relay=`
+ * parameters; `wss://` is kept, `ws://` only on loopback or with `allowInsecureWs`. IPC,
+ * `direct:`, `overlay://`, `broker+ws(s)://` and every `/v2/relay` hint are skipped.
+ */
+export function filterWebCompatibleEndpoints(
+  endpoints,
+  { p2p = false, allowInsecureWs = false } = {}
+) {
+  if (!Array.isArray(endpoints)) {
+    throw new TypeError("endpoints must be an array of strings");
+  }
+  const candidates = [];
+  const skipped = [];
+  const skip = (hint, reason) => skipped.push({ hint: String(hint), reason });
+  for (const hint of endpoints) {
+    if (typeof hint !== "string" || hint.length === 0 || hint.includes("#")) {
+      skip(hint, "invalid");
+      continue;
+    }
+    if (hint.startsWith("local:") || hint.startsWith("unix://")) {
+      skip(hint, "ipc_from_uri");
+      continue;
+    }
+    let bare = hint;
+    if (hint.startsWith("p2p:")) {
+      bare = hint.slice(4);
+    } else if (hint.startsWith("relay:")) {
+      bare = hint.slice(6);
+    }
+    if (bare.startsWith("iroh://")) {
+      if (!p2p) {
+        skip(hint, "p2p_feature_disabled");
+        continue;
+      }
+      candidates.push({ hint, endpoint: stripIrohRelayParams(bare), provider: "p2p" });
+      continue;
+    }
+    if (bare.startsWith("wss://") || bare.startsWith("ws://")) {
+      if (isV2RelayUrl(bare)) {
+        skip(hint, "relay_v2_not_authorized");
+        continue;
+      }
+      let checked;
+      try {
+        checked = validateRelayWsUrl(bare, true);
+      } catch (err) {
+        skip(hint, /metadata|link-local/.test(errorText(err)) ? "blocked_address" : "invalid");
+        continue;
+      }
+      if (bare.startsWith("ws://") && !allowInsecureWs && !isLoopbackHost(checked.bareHost)) {
+        skip(hint, "insecure_ws");
+        continue;
+      }
+      candidates.push({ hint, endpoint: bare, provider: "relay" });
+      continue;
+    }
+    skip(hint, "browser_unsupported");
+  }
+  candidates.sort((a, b) => PROVIDER_RANK[a.provider] - PROVIDER_RANK[b.provider]);
+  if (candidates.length === 0) {
+    throw attemptError(new Error(NO_BROWSER_ENDPOINTS), { skipped });
+  }
+  return { candidates, skipped };
+}
+
+/** Classifies a pairing code: `lan2_group` or `remote3_group`; a malformed code throws. */
+export function classifyPairingCode(code) {
+  try {
+    return classify_pairing_code(String(code));
+  } catch (err) {
+    throw toError(err);
+  }
+}
+
+/** Whether relay admission material may be sent to `url`. */
+export function relayAuthOriginAllowed(url, origins) {
+  try {
+    return relay_auth_origin_allowed(String(url), JSON.stringify(normalizeOrigins(origins)));
+  } catch (err) {
+    throw toError(err);
+  }
+}
+
+function relayCredsFor(url, explicitUrl, origins, ticket, secret) {
+  if (ticket === null && secret === null) {
+    return { relayAuthTicket: null, relayAuthSecret: null };
+  }
+  const allowed =
+    (explicitUrl !== null && url === explicitUrl) ||
+    (origins.length > 0 && relayAuthOriginAllowed(url, origins));
+  if (!allowed) {
+    return { relayAuthTicket: null, relayAuthSecret: null, withheld: true };
+  }
+  return { relayAuthTicket: ticket, relayAuthSecret: copySecret(secret) };
+}
+
+/** A relay that demanded credentials the origin rule withheld fails `relay_auth_unconfigured`. */
+function candidateError(err, creds) {
+  const out = toError(err);
+  if (creds && creds.withheld && /relay requires dial authentication/.test(out.message)) {
+    return codedError("relay_auth_unconfigured", `relay_auth_unconfigured: ${out.message}`);
+  }
+  return out;
 }
 
 export function b64urlEncode(bytes) {
@@ -332,7 +623,11 @@ export function verifyGrantJson(
 }
 
 export function parsePairingUri(uri) {
-  return JSON.parse(parse_pairing_uri_json(uri));
+  try {
+    return JSON.parse(parse_pairing_uri_json(uri));
+  } catch (err) {
+    throw toError(err);
+  }
 }
 
 export function computeRelayAuthHmacB64(secretBytes, op, relayHost, nonce, pubOrTarget) {
@@ -376,6 +671,10 @@ export class TendrilWebClient {
   #holders = 0;
   #activeSessions = new Set();
   #persistChain = Promise.resolve();
+  #rosterLock = Promise.resolve();
+  #rosterPending = 0;
+  #inPersistCallback = 0;
+  #rosterFailedErr = null;
 
   constructor(
     token,
@@ -552,6 +851,48 @@ export class TendrilWebClient {
     return this.#roster.to_json_bytes();
   }
 
+  /**
+   * Locks the client after authenticated evidence could not be persisted: every later roster
+   * section and group call fails, and every open session fails and closes, since each one
+   * authorizes against the unpersisted roster.
+   */
+  #lockClient(persistErr) {
+    if (this.#rosterFailedErr) {
+      return;
+    }
+    this.#rosterFailedErr = persistErr;
+    for (const sess of [...this.#activeSessions]) {
+      sess._failFromClientLock(persistErr);
+    }
+  }
+
+  #lockedError() {
+    return new Error(
+      `client locked after roster persistence failure: ${errorText(this.#rosterFailedErr)}`,
+      { cause: this.#rosterFailedErr }
+    );
+  }
+
+  #ensureUnlocked() {
+    this.#ensureOpen();
+    if (this.#rosterFailedErr) {
+      throw this.#lockedError();
+    }
+  }
+
+  /** `true` when the roster no longer serializes to `prev` (null: nothing to compare, no). */
+  #rosterChangedSince(prev) {
+    if (!prev) {
+      return false;
+    }
+    const now = this.#roster.to_json_bytes();
+    try {
+      return !bytesEqual(prev, now);
+    } finally {
+      now.fill(0);
+    }
+  }
+
   #hasPersistCallback() {
     return (
       typeof this.#onPersistRosterBytes === "function" ||
@@ -571,86 +912,193 @@ export class TendrilWebClient {
     }
   }
 
+  /**
+   * Runs one roster critical section behind the FIFO roster lock: an optional rollback snapshot,
+   * the synchronous WASM mutation(s) in `fn`, and `await tx.persist()`. Nothing else may run
+   * inside: no socket I/O, no stream reads, no group hooks, no application callbacks other than
+   * the persist callback. A client call made from inside a persist callback is queued behind the
+   * current holder; awaiting it from the callback deadlocks, so a debug warning is logged when a
+   * waiter has waited 5 s while the holder is inside a persist callback.
+   */
+  #withRoster(fn, { readOnly = false, snapshot = true } = {}) {
+    const busy = this.#rosterPending > 0;
+    this.#rosterPending += 1;
+    let acquired = false;
+    let warnTimer = null;
+    const armWarning = () => {
+      warnTimer = setTimeout(() => {
+        if (acquired) {
+          return;
+        }
+        if (this.#inPersistCallback > 0) {
+          console.warn(
+            "TendrilWebClient: roster lock wait exceeded 5 s while a persist callback holds it; persist callbacks must not await client methods"
+          );
+          return;
+        }
+        armWarning();
+      }, ROSTER_LOCK_WARN_MS);
+      if (warnTimer && typeof warnTimer.unref === "function") {
+        warnTimer.unref();
+      }
+    };
+    if (busy) {
+      armWarning();
+    }
+    const run = this.#rosterLock.then(() => {
+      acquired = true;
+      if (warnTimer !== null) {
+        clearTimeout(warnTimer);
+      }
+      return this.#rosterCritical(fn, readOnly, snapshot);
+    });
+    this.#rosterLock = run.then(noop, noop).then(() => {
+      this.#rosterPending -= 1;
+    });
+    return run;
+  }
+
+  async #rosterCritical(fn, readOnly, snapshot) {
+    if (this.#wasmFreed) {
+      throw new Error("TendrilWebClient has been freed");
+    }
+    if (this.#rosterFailedErr) {
+      throw this.#lockedError();
+    }
+    if (readOnly) {
+      return fn();
+    }
+    const prev = snapshot ? this.#snapshotRosterBytes() : null;
+    // Evidence persisted with `rollback: false` stays in memory even when `fn` then throws.
+    let keep = false;
+    let restored = false;
+    const restore = () => {
+      if (!restored && !keep) {
+        restored = true;
+        this.#restoreRosterBytes(prev);
+      }
+    };
+    const tx = {
+      persist: async ({ rollback = true } = {}) => {
+        if (!rollback) {
+          keep = true;
+        }
+        try {
+          await this.#persistRoster();
+        } catch (err) {
+          if (rollback) {
+            restore();
+          }
+          throw err;
+        }
+      },
+    };
+    try {
+      return await fn(tx);
+    } catch (err) {
+      if (prev) {
+        restore();
+      }
+      throw err;
+    } finally {
+      if (prev) {
+        prev.fill(0);
+      }
+    }
+  }
+
+  /** One rollback-protected roster mutation plus its persist. */
+  #mutateRoster(mutate, changed = () => true) {
+    return this.#withHold(() =>
+      this.#withRoster(async (tx) => {
+        let result;
+        try {
+          result = mutate();
+        } catch (err) {
+          throw toError(err);
+        }
+        if (changed(result)) {
+          await tx.persist();
+        }
+        return result;
+      })
+    );
+  }
+
   getPeer(peerId) {
     this.#ensureOpen();
     const raw = this.#roster.get_peer_json(peerId);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) {
+      return null;
+    }
+    const peer = JSON.parse(raw);
+    peer.routes = peer.routes ?? [];
+    peer.route_meta = peer.route_meta ?? null;
+    return peer;
   }
 
   async confirmPeer(peerId, sas = null) {
-    return this.#withHold(async () => {
-      const prevRoster = this.#snapshotRosterBytes();
-      try {
-        this.#roster.confirm_peer(peerId, sas);
-        try {
-          await this.#persistRoster();
-        } catch (err) {
-          this.#restoreRosterBytes(prevRoster);
-          throw err;
-        }
-      } finally {
-        if (prevRoster) {
-          prevRoster.fill(0);
-        }
-      }
-    });
+    await this.#mutateRoster(() => this.#roster.confirm_peer(peerId, sas));
   }
 
   async removePendingPeer(peerId) {
-    return this.#withHold(async () => {
-      const prevRoster = this.#snapshotRosterBytes();
-      try {
-        this.#roster.remove_pending_peer(peerId);
-        try {
-          await this.#persistRoster();
-        } catch (err) {
-          this.#restoreRosterBytes(prevRoster);
-          throw err;
-        }
-      } finally {
-        if (prevRoster) {
-          prevRoster.fill(0);
-        }
-      }
-    });
+    await this.#mutateRoster(() => this.#roster.remove_pending_peer(peerId));
   }
 
   async addTrustAnchor(anchorId, signingPubB64) {
-    return this.#withHold(async () => {
-      const prevRoster = this.#snapshotRosterBytes();
-      try {
-        this.#roster.add_trust_anchor(anchorId, signingPubB64);
-        try {
-          await this.#persistRoster();
-        } catch (err) {
-          this.#restoreRosterBytes(prevRoster);
-          throw err;
-        }
-      } finally {
-        if (prevRoster) {
-          prevRoster.fill(0);
-        }
-      }
-    });
+    await this.#mutateRoster(() => this.#roster.add_trust_anchor(anchorId, signingPubB64));
   }
 
   async revokeTrustAnchor(anchorId) {
-    return this.#withHold(async () => {
-      const prevRoster = this.#snapshotRosterBytes();
-      try {
-        this.#roster.revoke_trust_anchor(anchorId);
-        try {
-          await this.#persistRoster();
-        } catch (err) {
-          this.#restoreRosterBytes(prevRoster);
-          throw err;
-        }
-      } finally {
-        if (prevRoster) {
-          prevRoster.fill(0);
-        }
-      }
-    });
+    await this.#mutateRoster(() => this.#roster.revoke_trust_anchor(anchorId));
+  }
+
+  /** The routes, route metadata and legacy relay hints stored for `peerId`. */
+  peerRoutes(peerId) {
+    const peer = this.getPeer(peerId);
+    if (!peer) {
+      throw new Error(`peer not found in roster: ${peerId}`);
+    }
+    return {
+      peer_id: peerId,
+      routes: peer.routes,
+      route_meta: peer.route_meta,
+      legacy_relay_hints: peer.relay_hints ?? [],
+    };
+  }
+
+  /** Replaces the `operator` routes of an active peer (at most six; empty clears them). */
+  async setPeerRoutes(peerId, routes) {
+    if (!Array.isArray(routes) || routes.some((r) => typeof r !== "string")) {
+      throw new TypeError("routes must be an array of endpoint strings");
+    }
+    return this.#mutateRoster(() =>
+      JSON.parse(this.#roster.set_routes(peerId, JSON.stringify(routes)))
+    );
+  }
+
+  /** Removes the routes of one source (`operator` by default, `signed`, `committed`), or `all`. */
+  async clearPeerRoutes(peerId, source = null) {
+    await this.#mutateRoster(() => this.#roster.clear_routes(peerId, source ?? undefined));
+  }
+
+  /**
+   * Applies a fresh host-signed pairing URI to the matching paired host offline: no network, no
+   * code use. Signed routes replace older ones under `allSigned`; `replaceRoutes` approves an
+   * equal or older route set explicitly.
+   */
+  async applyRouteUri(uri, { routePolicy = "allSigned", replaceRoutes = false } = {}) {
+    const policy = normalizeRoutePolicy(routePolicy);
+    return this.#mutateRoster(
+      () =>
+        JSON.parse(
+          this.#roster.apply_signed_route_uri(
+            uri,
+            JSON.stringify({ route_policy: policy, replace_routes: Boolean(replaceRoutes) })
+          )
+        ),
+      (result) => result.applied
+    );
   }
 
   mintEnrollmentToken({ targetHostId, subject = null, ttlSecs = 900 }) {
@@ -752,6 +1200,9 @@ export class TendrilWebClient {
     if (this.#wasmFreed) {
       throw new Error("TendrilWebClient has been freed");
     }
+    if (this.#rosterFailedErr) {
+      throw this.#lockedError();
+    }
     const prev = this.#snapshotGroupBytes();
     try {
       const result = fn();
@@ -783,7 +1234,7 @@ export class TendrilWebClient {
   }
 
   groupAuthorizePeer(groupId, peerId, cap) {
-    this.#ensureOpen();
+    this.#ensureUnlocked();
     this.#groups.authorize_peer(this.#roster, groupId, peerId, cap, nowUnixSecs());
     return true;
   }
@@ -795,6 +1246,7 @@ export class TendrilWebClient {
    */
   async ingestGroupManifest(manifestOrEvent, session) {
     return this.#withHold(async () => {
+      this.#ensureUnlocked();
       const sender = session?.peerDeviceId;
       if (typeof sender !== "string" || sender.length === 0) {
         throw new Error("manifest must arrive on an established authenticated session");
@@ -821,18 +1273,25 @@ export class TendrilWebClient {
 
   /** Opens fan-out and inbound delivery for a group whose manifest is already ingested. */
   openGroup(groupId, options = {}) {
-    this.#ensureOpen();
+    this.#ensureUnlocked();
     this.#groups.check_local_member(this.#roster, groupId);
     const roster = this.#roster;
     const book = this.#groups;
-    const targets = (cap) =>
-      JSON.parse(book.broadcast_targets(roster, groupId, cap ?? null, nowUnixSecs()));
+    const targets = (cap) => {
+      this.#ensureUnlocked();
+      return JSON.parse(book.broadcast_targets(roster, groupId, cap ?? null, nowUnixSecs()));
+    };
     const backend = {
       members: () => this.groupMembers(groupId),
       authorize: (peerId, cap) => this.groupAuthorizePeer(groupId, peerId, cap),
-      authorizeInbound: (peerId, cap) =>
-        book.authorize_inbound(roster, groupId, peerId, cap, nowUnixSecs()),
-      checkLocal: () => book.check_local_member(roster, groupId),
+      authorizeInbound: (peerId, cap) => {
+        this.#ensureUnlocked();
+        return book.authorize_inbound(roster, groupId, peerId, cap, nowUnixSecs());
+      },
+      checkLocal: () => {
+        this.#ensureUnlocked();
+        return book.check_local_member(roster, groupId);
+      },
       localDeviceId: () => book.local_device_id(),
       targets,
       canSend: (peerId, cap) => {
@@ -850,11 +1309,12 @@ export class TendrilWebClient {
   }
 
   async #applyGroupRendezvous(wasmSession) {
-    return this.#withHold(() =>
-      this.#mutateGroupBook(() =>
+    return this.#withHold(() => {
+      this.#ensureUnlocked();
+      return this.#mutateGroupBook(() =>
         JSON.parse(wasmSession.apply_group_rendezvous(this.#groups, this.#roster, nowUnixSecs()))
-      )
-    );
+      );
+    });
   }
 
   #groupHook() {
@@ -891,16 +1351,20 @@ export class TendrilWebClient {
       await warmTargetTransport(endpoint, relayUrl);
       this.#ensureOpen();
       const deadlineMs = performance.now() + timeoutMs;
-      const initiator = WasmPairInitiator.new_m2m_with_roster(
-        this.#identity,
-        deviceName,
-        deviceKind,
-        hostId,
-        hostStaticPubB64,
-        hostSigningPubB64,
-        hostRotationSeq,
-        tokenJson,
-        this.#roster
+      const initiator = await this.#withRoster(
+        () =>
+          WasmPairInitiator.new_m2m_with_roster(
+            this.#identity,
+            deviceName,
+            deviceKind,
+            hostId,
+            hostStaticPubB64,
+            hostSigningPubB64,
+            hostRotationSeq,
+            tokenJson,
+            this.#roster
+          ),
+        { readOnly: true }
       );
       let stream = null;
       try {
@@ -937,38 +1401,30 @@ export class TendrilWebClient {
           if (frame.status === "eof") {
             throw new Error("m2m enrollment stream closed before completion");
           }
-          const prevRoster = this.#snapshotRosterBytes();
-          let res;
-          try {
-            res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
-            if (res.write_b64) {
-              await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+          const res = await this.#withRoster(async (tx) => {
+            const step = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
+            if (step.outcome && step.outcome.status === "active") {
+              await tx.persist();
             }
-            if (res.outcome) {
-              if (res.outcome.status === "active") {
-                try {
-                  await this.#persistRoster();
-                } catch (err) {
-                  this.#restoreRosterBytes(prevRoster);
-                  throw err;
-                }
-                return {
-                  device_id: res.outcome.device_id,
-                  host_id: res.outcome.host_id,
-                  status: "active",
-                  host_rotation_seq: res.outcome.host_rotation_seq,
-                  token_nonce: res.outcome.token_nonce,
-                };
-              }
-              if (res.outcome.status === "rejected") {
-                throw new Error(`m2m enrollment rejected: ${res.outcome.error}`);
-              }
-              throw new Error(`unexpected enrollment outcome: ${JSON.stringify(res.outcome)}`);
+            return step;
+          });
+          if (res.write_b64) {
+            await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+          }
+          if (res.outcome) {
+            if (res.outcome.status === "active") {
+              return {
+                device_id: res.outcome.device_id,
+                host_id: res.outcome.host_id,
+                status: "active",
+                host_rotation_seq: res.outcome.host_rotation_seq,
+                token_nonce: res.outcome.token_nonce,
+              };
             }
-          } finally {
-            if (prevRoster) {
-              prevRoster.fill(0);
+            if (res.outcome.status === "rejected") {
+              throw new Error(`m2m enrollment rejected: ${res.outcome.error}`);
             }
+            throw new Error(`unexpected enrollment outcome: ${JSON.stringify(res.outcome)}`);
           }
         }
       } finally {
@@ -990,556 +1446,1196 @@ export class TendrilWebClient {
       if (this.#wasmFreed) {
         throw new Error("TendrilWebClient has been freed");
       }
-      if (typeof fnBytes === "function") {
-        const bytes = this.#roster.to_json_bytes();
-        try {
-          await fnBytes(bytes);
-        } finally {
-          bytes.fill(0);
+      this.#inPersistCallback += 1;
+      try {
+        if (typeof fnBytes === "function") {
+          const bytes = this.#roster.to_json_bytes();
+          try {
+            await fnBytes(bytes);
+          } finally {
+            bytes.fill(0);
+          }
+          return;
         }
-        return;
+        await fnStr(this.#roster.to_json());
+      } finally {
+        this.#inPersistCallback -= 1;
       }
-      await fnStr(this.#roster.to_json());
     });
     this.#persistChain = run.catch(() => {});
     return run;
   }
 
-  async pair({
-    endpoint = null,
-    relayUrl = null,
-    targetPub = null,
-    expectedHost = null,
-    relayUrlOverride = null,
-    p2pRelayUrls = null,
-    p2pRelayAuthToken = null,
-    p2pApiSecret = null,
-    relayAuthTicket = null,
-    relayAuthSecret = null,
-    allowInsecureWs = false,
-    code = "",
-    pairingUri = null,
-    deviceName = "web-device",
-    deviceKind = "web",
-    timeoutMs = 15000,
-  }) {
-    if (p2pApiSecret) {
+  async pair(options = {}) {
+    if (options.p2pApiSecret) {
       throw new Error(
         "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
       );
     }
-    return this.#withHold(async () => {
-      let pairCode = code;
-      let hostStaticPin = null;
-      let hostSigningPin = null;
-      let hostIdPin = null;
-      let hostRotationSeqPin = null;
-      if (pairingUri) {
-        const parsed = parsePairingUri(pairingUri);
-        pairCode = parsed.code;
-        hostStaticPin = parsed.host_static_pub_b64;
-        hostSigningPin = parsed.host_signing_pub_hash_b64;
-        hostIdPin = parsed.host_id ?? null;
-        hostRotationSeqPin = parsed.rotation_seq ?? null;
+    return this.#withHold(() => this.#pairWithPolicy(1, options));
+  }
+
+  async pairV2(options = {}) {
+    if (options.p2pApiSecret) {
+      throw new Error(
+        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+      );
+    }
+    return this.#withHold(() => this.#pairWithPolicy(2, options));
+  }
+
+  /**
+   * Multi-route pairing: classify the code before any dial,
+   * try the candidates one at a time in provider order with a deferred claim, check `rp` and
+   * `rs` on the verified `msg2`, commit `msg3` on exactly one stream, and persist the outcome
+   * with its route plan in one roster critical section.
+   */
+  async #pairWithPolicy(wire, opts) {
+    const {
+      endpoint = null,
+      relayUrl = null,
+      targetPub = null,
+      expectedHost = null,
+      relayUrlOverride = null,
+      p2pRelayUrls = null,
+      p2pRelayAuthToken = null,
+      relayAuthTicket = null,
+      relayAuthSecret = null,
+      relayAuthOrigins = null,
+      allowInsecureWs = false,
+      code = "",
+      pairingUri = null,
+      pinnedHost = null,
+      deviceName = "web-device",
+      deviceKind = "web",
+      timeoutMs = 15000,
+      routePolicy = "allSigned",
+      saveRoute = false,
+    } = opts;
+    const label = wire === 2 ? "v2 pairing" : "pairing";
+    const secretMaster = copySecret(relayAuthSecret);
+    const tokenMaster = copySecret(p2pRelayAuthToken);
+    let codeBytes = null;
+    try {
+      const origins = normalizeOrigins(relayAuthOrigins);
+      const policy = normalizeRoutePolicy(routePolicy);
+      if (saveRoute && policy === "none") {
+        throw new Error("saveRoute conflicts with routePolicy none");
       }
-      if (!pairCode) {
+      const parsed = pairingUri ? parsePairingUri(pairingUri) : null;
+      const explicitCode = code instanceof Uint8Array ? code.length > 0 : Boolean(code);
+      let codeStr;
+      if (explicitCode && code instanceof Uint8Array) {
+        if (wire !== 2) {
+          throw new TypeError("pair() takes a string code; use pairV2() for a byte code");
+        }
+        codeBytes = new Uint8Array(code);
+        code.fill(0);
+        codeStr = new TextDecoder().decode(codeBytes);
+      } else if (explicitCode) {
+        codeStr = String(code);
+      } else if (parsed) {
+        codeStr = parsed.code;
+      } else {
         throw new Error("pairing code or pairingUri is required");
       }
+      if (wire === 2 && codeBytes === null) {
+        codeBytes = encoder.encode(codeStr);
+      }
+      if (classifyPairingCode(codeStr) === "lan2_group") {
+        throw codedError(
+          "pairing_path_disallowed",
+          "pairing path disallowed: 2-group code disallowed on remote path"
+        );
+      }
 
-      await warmTargetTransport(endpoint, relayUrl);
-      this.#ensureOpen();
-      const deadlineMs = performance.now() + timeoutMs;
-      const initiator = WasmPairInitiator.new_with_roster(
-        this.#identity,
+      // An operator relay `URL#key` dials the URL with the key as the mailbox; `/v2/relay` is
+      // never a pairing route.
+      const { url: explicitUrl, relayKey: explicitKey } = splitRelayKey(
+        endpoint || relayUrl || null
+      );
+      if (explicitUrl && isWsUrl(explicitUrl) && isV2RelayUrl(explicitUrl)) {
+        throw new Error(PAIR_V2_RELAY_REJECTED);
+      }
+      const explicitTargetPub = explicitKey ?? targetPub ?? parsed?.relay_pub_b64 ?? null;
+      let candidates;
+      let skipped = [];
+      if (explicitUrl) {
+        candidates = [
+          {
+            hint: null,
+            endpoint: explicitUrl,
+            provider: explicitUrl.startsWith("iroh://") ? "p2p" : "relay",
+            explicit: true,
+          },
+        ];
+      } else if (parsed) {
+        const p2p = parsed.endpoints.some(isIrohHint) ? await hasP2pSupport() : false;
+        ({ candidates, skipped } = filterWebCompatibleEndpoints(parsed.endpoints, {
+          p2p,
+          allowInsecureWs,
+        }));
+      } else {
+        throw new Error("endpoint, relayUrl or pairingUri is required");
+      }
+
+      let operatorEndpoint = null;
+      if (explicitUrl) {
+        operatorEndpoint =
+          explicitTargetPub && isWsUrl(explicitUrl)
+            ? `${explicitUrl}#${explicitTargetPub}`
+            : explicitUrl;
+      }
+      let pinnedJson = null;
+      if (wire === 2) {
+        if (parsed) {
+          pinnedJson = JSON.stringify({
+            host_id: parsed.host_id ?? null,
+            static_pub_b64: parsed.host_static_pub_b64,
+            signing_pub_b64: parsed.host_signing_pub_hash_b64,
+            rotation_seq: parsed.rotation_seq ?? 0,
+            min_wire_version: 2,
+          });
+        } else if (pinnedHost) {
+          pinnedJson = typeof pinnedHost === "string" ? pinnedHost : JSON.stringify(pinnedHost);
+        }
+      }
+      const ctx = {
+        wire,
+        label,
+        codeStr,
+        codeBytes,
+        parsed,
+        pairingUri,
+        pinnedJson,
         deviceName,
         deviceKind,
-        pairCode,
-        hostStaticPin,
-        hostSigningPin,
-        hostIdPin,
-        hostRotationSeqPin,
-        this.#roster
-      );
-      let stream = null;
-      try {
-        stream = await dialWebStream({
-          endpoint,
-          relayUrl,
-          targetPub,
-          expectedHost,
-          relayUrlOverride,
+        persistOptions: {
+          route_policy: policy,
+          operator_endpoint: operatorEndpoint,
+          save_committed: Boolean(saveRoute),
+        },
+        dial: {
+          explicitUrl,
+          targetPub: explicitUrl ? explicitTargetPub : parsed?.relay_pub_b64,
+          expectedHost: explicitUrl ? expectedHost : null,
+          relayUrlOverride: explicitUrl ? relayUrlOverride : null,
           p2pRelayUrls,
-          p2pRelayAuthToken,
-          p2pApiSecret,
+          tokenMaster,
           relayAuthTicket,
-          relayAuthSecret,
+          secretMaster,
+          origins,
           allowInsecureWs,
-          timeoutMs: remainingBudgetMs(deadlineMs, "pairing timed out connecting to transport"),
-        });
-        this.#ensureOpen();
-        const startBytes = initiator.start();
-        await sendProtocolBytes(stream, startBytes);
-        while (true) {
-          const waitMs = remainingBudgetMs(
-            deadlineMs,
-            "pairing timed out waiting for host response"
-          );
-          const frame = await stream.recv(waitMs);
-          this.#ensureOpen();
-          if (frame.status === "would_block") {
-            throw new Error("pairing timed out waiting for host response");
-          }
-          if (frame.status === "eof") {
-            throw new Error("pairing stream closed before completion");
-          }
-          const prevRoster = this.#snapshotRosterBytes();
-          try {
-            const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
-            if (res.write_b64) {
-              await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
-            }
-            if (res.outcome) {
-              if (res.outcome.status === "pending") {
-                try {
-                  await this.#persistRoster();
-                } catch (err) {
-                  this.#restoreRosterBytes(prevRoster);
-                  throw err;
-                }
-                return {
-                  device_id: res.outcome.device_id,
-                  host_id: res.outcome.host_id,
-                  sas: res.outcome.sas,
-                  host_confirmed: Boolean(res.outcome.host_confirmed),
-                };
-              }
-              if (res.outcome.status === "rejected") {
-                throw new Error(`pairing rejected: ${res.outcome.error}`);
-              }
-              throw new Error(`unexpected pairing outcome: ${JSON.stringify(res.outcome)}`);
-            }
-          } finally {
-            if (prevRoster) {
-              prevRoster.fill(0);
-            }
-          }
-        }
-      } finally {
-        initiator.free();
-        if (stream) {
-          await stream.close();
-        }
-      }
-    });
-  }
+        },
+      };
 
-  async pairV2({
-    endpoint = null,
-    relayUrl = null,
-    targetPub = null,
-    expectedHost = null,
-    relayUrlOverride = null,
-    p2pRelayUrls = null,
-    p2pRelayAuthToken = null,
-    p2pApiSecret = null,
-    relayAuthTicket = null,
-    relayAuthSecret = null,
-    allowInsecureWs = false,
-    code = "",
-    pairingUri = null,
-    pinnedHost = null,
-    deviceName = "web-device",
-    deviceKind = "web",
-    timeoutMs = 15000,
-  }) {
-    if (p2pApiSecret) {
-      throw new Error(
-        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
-      );
-    }
-    return this.#withHold(async () => {
-      let pairCode = code;
-      let pinnedJson = null;
-      if (pairingUri) {
-        const parsed = parsePairingUri(pairingUri);
-        pairCode = parsed.code;
-        pinnedJson = JSON.stringify({
-          host_id: parsed.host_id ?? null,
-          static_pub_b64: parsed.host_static_pub_b64,
-          signing_pub_b64: parsed.host_signing_pub_hash_b64,
-          rotation_seq: parsed.rotation_seq ?? 0,
-          min_wire_version: 2,
-        });
-      } else if (pinnedHost) {
-        pinnedJson = typeof pinnedHost === "string" ? pinnedHost : JSON.stringify(pinnedHost);
+      if (candidates.some((c) => c.provider === "p2p")) {
+        await initTendrilP2p();
       }
-      if (!pairCode || (pairCode instanceof Uint8Array && pairCode.length === 0)) {
-        throw new Error("pairing code or pairingUri is required");
-      }
-
-      await warmTargetTransport(endpoint, relayUrl);
       this.#ensureOpen();
       const deadlineMs = performance.now() + timeoutMs;
-      const codeBytes =
-        pairCode instanceof Uint8Array ? pairCode : encoder.encode(String(pairCode));
-      let initiator;
-      try {
-        initiator = WasmV2PakePairInitiator.new_bytes(
-          this.#identity,
-          deviceName,
-          deviceKind,
-          codeBytes,
-          pinnedJson
+      const failures = [];
+      const errors = [];
+      for (let i = 0; i < candidates.length; i += 1) {
+        const cand = candidates[i];
+        const remaining = deadlineMs - performance.now();
+        if (remaining <= 0) {
+          errors.push(new Error(`${label} timed out`));
+          failures.push({
+            hint: cand.hint ?? cand.endpoint,
+            provider: cand.provider,
+            error: `${label} timed out`,
+          });
+          break;
+        }
+        const rungMs =
+          i === candidates.length - 1 ? remaining : Math.min(remaining, RUNG_BUDGET_MS);
+        const outcome = await this.#pairCandidate(
+          ctx,
+          cand,
+          performance.now() + rungMs,
+          deadlineMs
         );
-      } finally {
+        if (outcome.result) {
+          return { ...outcome.result, skipped, failures };
+        }
+        if (outcome.committed || outcome.fatal) {
+          throw attemptError(outcome.error, { committed: outcome.committed, skipped, failures });
+        }
+        errors.push(outcome.error);
+        failures.push({
+          hint: cand.hint ?? cand.endpoint,
+          provider: cand.provider,
+          error: errorText(outcome.error),
+        });
+      }
+      throw attemptError(
+        mostSevere(errors) ?? new Error(`${label} failed: all candidates exhausted`),
+        {
+          skipped,
+          failures,
+        }
+      );
+    } finally {
+      if (codeBytes) {
         codeBytes.fill(0);
       }
-      let stream = null;
-      try {
-        stream = await dialWebStream({
+      if (secretMaster instanceof Uint8Array) {
+        secretMaster.fill(0);
+      }
+      if (tokenMaster instanceof Uint8Array) {
+        tokenMaster.fill(0);
+      }
+      if (relayAuthSecret instanceof Uint8Array) {
+        relayAuthSecret.fill(0);
+      }
+      if (p2pRelayAuthToken instanceof Uint8Array) {
+        p2pRelayAuthToken.fill(0);
+      }
+    }
+  }
+
+  /** Dials one pairing candidate. Returns `{result}`, or `{error, committed, fatal}`. */
+  async #pairCandidate(ctx, cand, rungDeadlineMs, deadlineMs) {
+    const { wire, label } = ctx;
+    let initiator = null;
+    let scratch = null;
+    let stream = null;
+    let committed = false;
+    let creds = null;
+    let rungDeadline = rungDeadlineMs;
+    try {
+      ({ initiator, scratch } = await this.#withRoster(
+        () => {
+          const scratchRoster = this.#roster.clone_roster();
+          try {
+            let machine;
+            if (wire === 2) {
+              machine = WasmV2PakePairInitiator.new_bytes(
+                this.#identity,
+                ctx.deviceName,
+                ctx.deviceKind,
+                new Uint8Array(ctx.codeBytes),
+                ctx.pinnedJson
+              );
+            } else {
+              machine = WasmPairInitiator.new_with_roster(
+                this.#identity,
+                ctx.deviceName,
+                ctx.deviceKind,
+                ctx.codeStr,
+                ctx.parsed?.host_static_pub_b64 ?? null,
+                ctx.parsed?.host_signing_pub_hash_b64 ?? null,
+                ctx.parsed?.host_id ?? null,
+                ctx.parsed?.rotation_seq ?? null,
+                this.#roster
+              );
+            }
+            return { initiator: machine, scratch: scratchRoster };
+          } catch (err) {
+            scratchRoster.free();
+            throw err;
+          }
+        },
+        { readOnly: true }
+      ));
+      initiator.enable_deferred_claim();
+      if (ctx.pairingUri) {
+        initiator.set_pairing_uri(ctx.pairingUri);
+      }
+      initiator.set_persist_options(
+        JSON.stringify({ ...ctx.persistOptions, winner_hint: cand.hint ?? null })
+      );
+      const d = ctx.dial;
+      creds =
+        cand.provider === "relay"
+          ? relayCredsFor(
+              cand.endpoint,
+              d.explicitUrl,
+              d.origins,
+              d.relayAuthTicket,
+              d.secretMaster
+            )
+          : { relayAuthTicket: null, relayAuthSecret: null };
+      stream = await dialWebStream({
+        endpoint: cand.provider === "p2p" ? cand.endpoint : null,
+        relayUrl: cand.provider === "relay" ? cand.endpoint : null,
+        targetPub: d.targetPub,
+        expectedHost: d.expectedHost,
+        relayUrlOverride: d.relayUrlOverride,
+        p2pRelayUrls: d.p2pRelayUrls,
+        p2pRelayAuthToken: copySecret(d.tokenMaster),
+        relayAuthTicket: creds.relayAuthTicket,
+        relayAuthSecret: creds.relayAuthSecret,
+        allowInsecureWs: d.allowInsecureWs,
+        irohHint: !cand.explicit,
+        timeoutMs: remainingBudgetMs(rungDeadline, `${label} timed out connecting to transport`),
+      });
+      this.#ensureOpen();
+      const startedAt = performance.now();
+      const startBytes = initiator.start();
+      rungDeadline += performance.now() - startedAt;
+      await sendProtocolBytes(stream, startBytes);
+      let verified = null;
+      while (verified === null) {
+        const frame = await stream.recv(
+          remainingBudgetMs(rungDeadline, `${label} timed out waiting for host response`)
+        );
+        this.#ensureOpen();
+        if (frame.status === "would_block") {
+          throw new Error(`${label} timed out waiting for host response`);
+        }
+        if (frame.status === "eof") {
+          throw new Error(`${label} stream closed before completion`);
+        }
+        const res = JSON.parse(initiator.feed_bytes(frame.bytes, scratch));
+        if (res.host_verified) {
+          verified = res;
+          break;
+        }
+        if (res.write_b64) {
+          await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+        }
+        if (res.outcome) {
+          if (res.outcome.status === "rejected") {
+            throw new Error(`${label} rejected: ${res.outcome.error}`);
+          }
+          throw new Error(`unexpected ${label} outcome: ${JSON.stringify(res.outcome)}`);
+        }
+      }
+      if (!verified.relay_pub_ok) {
+        throw codedError(
+          "host_key_unverified",
+          "relay key does not match the verified host signing key"
+        );
+      }
+      if (verified.route_check === "invalid") {
+        throw new FatalAttemptError(
+          "invalid_pairing_uri",
+          "invalid pairing URI: route statement does not verify"
+        );
+      }
+      const claim = initiator.commit_claim();
+      committed = true;
+      await sendProtocolBytes(stream, claim);
+      while (true) {
+        const frame = await stream.recv(
+          remainingBudgetMs(deadlineMs, `${label} timed out waiting for host response`)
+        );
+        this.#ensureOpen();
+        if (frame.status === "would_block") {
+          throw new Error(`${label} timed out waiting for host response`);
+        }
+        if (frame.status === "eof") {
+          throw new Error(`${label} stream closed before completion`);
+        }
+        const res = await this.#withRoster(async (tx) => {
+          const step = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
+          if (step.outcome && step.outcome.status === "pending") {
+            await tx.persist();
+          }
+          return step;
+        });
+        if (res.write_b64) {
+          await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
+        }
+        if (res.outcome) {
+          if (res.outcome.status === "pending") {
+            return {
+              result: {
+                device_id: res.outcome.device_id,
+                host_id: res.outcome.host_id,
+                sas: res.outcome.sas,
+                host_confirmed: Boolean(res.outcome.host_confirmed),
+                route_check: res.outcome.route_check ?? verified.route_check,
+                routes_persisted: res.outcome.routes ?? [],
+                routes_reason: res.outcome.routes_reason ?? null,
+                route: { hint: cand.hint, endpoint: cand.endpoint, provider: cand.provider },
+              },
+            };
+          }
+          if (res.outcome.status === "rejected") {
+            throw new Error(`${label} rejected: ${res.outcome.error}`);
+          }
+          throw new Error(`unexpected ${label} outcome: ${JSON.stringify(res.outcome)}`);
+        }
+      }
+    } catch (err) {
+      const fatal = err instanceof FatalAttemptError || this.#freed || this.#wasmFreed;
+      return {
+        error:
+          err instanceof FatalAttemptError
+            ? codedError(err.code, err.message)
+            : candidateError(err, creds),
+        committed,
+        fatal,
+      };
+    } finally {
+      if (initiator) {
+        initiator.free();
+      }
+      if (scratch) {
+        scratch.free();
+      }
+      if (stream) {
+        try {
+          await stream.close();
+        } catch {}
+      }
+    }
+  }
+
+  async connect(options = {}) {
+    if (options.p2pApiSecret) {
+      throw new Error(
+        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+      );
+    }
+    return this.#withHold(() => this.#connectWithPolicy(1, options));
+  }
+
+  async connectV2(options = {}) {
+    if (options.p2pApiSecret) {
+      throw new Error(
+        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
+      );
+    }
+    return this.#withHold(() => this.#connectWithPolicy(2, options));
+  }
+
+  async #connectWithPolicy(wire, opts) {
+    const {
+      endpoint = null,
+      relayUrl = null,
+      targetPub = null,
+      expectedHost = null,
+      relayUrlOverride = null,
+      p2pRelayUrls = null,
+      p2pRelayAuthToken = null,
+      relayAuthTicket = null,
+      relayAuthSecret = null,
+      relayAuthOrigins = null,
+      useRelayV2 = false,
+      allowInsecureWs = false,
+      targetHostId,
+      grantJson = null,
+      crlSeq = null,
+      timeoutMs = 15000,
+      recoveryUri = null,
+      replaceRoutes = false,
+      routePolicy = "allSigned",
+    } = opts;
+    const secretMaster = copySecret(relayAuthSecret);
+    const tokenMaster = copySecret(p2pRelayAuthToken);
+    try {
+      const ctx = {
+        wire,
+        base: wire === 2 ? "v2 session" : "session",
+        peer: targetHostId,
+        grantJson,
+        crlSeq,
+        timeoutMs,
+        recoveryUri: recoveryUri || null,
+        replaceRoutes: Boolean(replaceRoutes),
+        policy: normalizeRoutePolicy(routePolicy),
+        origins: normalizeOrigins(relayAuthOrigins),
+        p2pRelayUrls,
+        tokenMaster,
+        relayAuthTicket,
+        secretMaster,
+        allowInsecureWs,
+      };
+      if (endpoint || relayUrl) {
+        return await this.#connectExplicit(ctx, {
           endpoint,
           relayUrl,
           targetPub,
           expectedHost,
           relayUrlOverride,
-          p2pRelayUrls,
-          p2pRelayAuthToken,
-          p2pApiSecret,
-          relayAuthTicket,
-          relayAuthSecret,
-          allowInsecureWs,
-          timeoutMs: remainingBudgetMs(deadlineMs, "v2 pairing timed out connecting to transport"),
+          useRelayV2: wire === 2 && Boolean(useRelayV2),
         });
-        this.#ensureOpen();
-        const startBytes = initiator.start();
-        await sendProtocolBytes(stream, startBytes);
-        while (true) {
-          const waitMs = remainingBudgetMs(
-            deadlineMs,
-            "v2 pairing timed out waiting for host response"
+      }
+      return await this.#connectStored(ctx);
+    } finally {
+      if (secretMaster instanceof Uint8Array) {
+        secretMaster.fill(0);
+      }
+      if (tokenMaster instanceof Uint8Array) {
+        tokenMaster.fill(0);
+      }
+      if (relayAuthSecret instanceof Uint8Array) {
+        relayAuthSecret.fill(0);
+      }
+      if (p2pRelayAuthToken instanceof Uint8Array) {
+        p2pRelayAuthToken.fill(0);
+      }
+    }
+  }
+
+  /** `SessionHello.route_seq` for a stored peer under `policy`, or null. */
+  #helloRouteSeq(peer, wire, policy) {
+    try {
+      const plan = JSON.parse(
+        this.#roster.session_candidates(peer, JSON.stringify({ wire, route_policy: policy }))
+      );
+      return plan.route_seq ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  #newSession(ctx, roster, routeSeq, operatorKey) {
+    const seq = ctx.crlSeq ?? roster.crl_seq(ctx.peer);
+    const session =
+      ctx.wire === 2
+        ? new WasmV2SessionInitiator(this.#identity, ctx.peer, roster, ctx.grantJson, seq ?? null)
+        : WasmSessionClient.new_with_roster(
+            this.#identity,
+            ctx.peer,
+            roster,
+            ctx.grantJson,
+            seq ?? null
           );
-          const frame = await stream.recv(waitMs);
-          this.#ensureOpen();
-          if (frame.status === "would_block") {
-            throw new Error("v2 pairing timed out waiting for host response");
-          }
-          if (frame.status === "eof") {
-            throw new Error("v2 pairing stream closed before completion");
-          }
-          const prevRoster = this.#snapshotRosterBytes();
-          try {
-            const res = JSON.parse(initiator.feed_bytes(frame.bytes, this.#roster));
-            if (res.write_b64) {
-              await sendProtocolBytes(stream, b64urlDecode(res.write_b64));
-            }
-            if (res.outcome) {
-              if (res.outcome.status === "pending") {
-                try {
-                  await this.#persistRoster();
-                } catch (err) {
-                  this.#restoreRosterBytes(prevRoster);
-                  throw err;
-                }
-                return {
-                  device_id: res.outcome.device_id,
-                  host_id: res.outcome.host_id,
-                  sas: res.outcome.sas,
-                  host_confirmed: Boolean(res.outcome.host_confirmed),
-                };
-              }
-              if (res.outcome.status === "rejected") {
-                throw new Error(`v2 pairing rejected: ${res.outcome.error}`);
-              }
-              throw new Error(`unexpected v2 pairing outcome: ${JSON.stringify(res.outcome)}`);
-            }
-          } finally {
-            if (prevRoster) {
-              prevRoster.fill(0);
-            }
-          }
+    try {
+      if (routeSeq !== null && routeSeq !== undefined) {
+        session.with_route_seq(routeSeq);
+      }
+      if (ctx.recoveryUri || operatorKey) {
+        session.with_route_expectation(ctx.peer, ctx.recoveryUri, operatorKey ?? null);
+      }
+    } catch (err) {
+      session.free();
+      throw err;
+    }
+    return session;
+  }
+
+  /**
+   * Runs the session handshake on `stream`, feeding `roster`. With `locked`, `roster` is the
+   * client roster and each feed is one roster critical section that persists any evidence it
+   * changed, whether the feed failed, established or closed; a failed evidence persist locks the
+   * client. Writes happen after the section releases.
+   */
+  async #driveHandshake(ctx, session, stream, roster, deadlineMs, startedMs, locked) {
+    const { wire, base } = ctx;
+    const m1 = wire === 2 ? session.start(nowUnixSecs()) : session.start();
+    await sendProtocolBytes(stream, m1);
+    while (true) {
+      const frame = await stream.recv(remainingBudgetMs(deadlineMs, `${base} handshake timed out`));
+      this.#ensureOpen();
+      if (frame.status === "would_block") {
+        throw new Error(`${base} handshake timed out`);
+      }
+      if (frame.status === "eof") {
+        throw new Error(`${base} stream closed during handshake`);
+      }
+      const elapsedMs = Math.max(0, Math.floor(performance.now() - startedMs));
+      const feed = () => {
+        const step = JSON.parse(session.feed_bytes(frame.bytes, nowUnixSecs(), elapsedMs, roster));
+        if (wire === 2) {
+          return {
+            step,
+            out: session.poll_write(),
+            events: JSON.parse(session.drain_events_json()),
+          };
         }
-      } finally {
-        initiator.free();
+        return {
+          step,
+          out: step.write_b64 ? b64urlDecode(step.write_b64) : null,
+          events: step.events || [],
+        };
+      };
+      let res;
+      if (locked) {
+        res = await this.#withRoster(
+          async (tx) => {
+            const prev = this.#snapshotRosterBytes();
+            try {
+              let r;
+              try {
+                r = feed();
+              } catch (err) {
+                if (this.#rosterChangedSince(prev)) {
+                  try {
+                    await tx.persist({ rollback: false });
+                  } catch (persistErr) {
+                    this.#lockClient(persistErr);
+                    throw codedError(
+                      toError(err).code,
+                      `${base} handshake failed (${errorText(err)}); failed to persist roster update: ${errorText(persistErr)}`,
+                      { cause: persistErr }
+                    );
+                  }
+                }
+                throw err;
+              }
+              if (this.#rosterChangedSince(prev)) {
+                try {
+                  await tx.persist({ rollback: false });
+                } catch (persistErr) {
+                  this.#lockClient(persistErr);
+                  throw new Error(`failed to persist roster update: ${errorText(persistErr)}`, {
+                    cause: persistErr,
+                  });
+                }
+              }
+              return r;
+            } finally {
+              if (prev) {
+                prev.fill(0);
+              }
+            }
+          },
+          { snapshot: false }
+        );
+      } else {
+        res = feed();
+      }
+      if (res.out && res.out.length > 0) {
+        await sendProtocolBytes(stream, res.out);
+      }
+      if (res.step.established) {
+        return res.events;
+      }
+    }
+  }
+
+  /** Final authorization of a winner, inside a roster critical section. */
+  #checkWinner(ctx, session, applyRotation) {
+    if (applyRotation) {
+      const rotation = session.presented_rotation_json();
+      if (rotation && rotation !== "[]") {
+        this.#roster.apply_verified_rotation_json(ctx.peer, rotation);
+      }
+    }
+    const keysRaw = session.presented_host_keys_json();
+    if (!keysRaw) {
+      throw codedError(
+        "host_key_unverified",
+        "host key could not be verified against pin or rotation chain"
+      );
+    }
+    const keys = JSON.parse(keysRaw);
+    this.#roster.check_established_session(
+      ctx.peer,
+      keys.static_pub_b64,
+      keys.signing_pub_b64,
+      ctx.wire
+    );
+  }
+
+  /** Applies a verified recovery URI's routes; only after the final checkpassed. */
+  #applyRecoveryRoutes(ctx, session) {
+    if (!ctx.recoveryUri || !session.verified_recovery_statement_json()) {
+      return null;
+    }
+    try {
+      return JSON.parse(
+        this.#roster.apply_signed_route_uri(
+          ctx.recoveryUri,
+          JSON.stringify({ route_policy: ctx.policy, replace_routes: ctx.replaceRoutes })
+        )
+      );
+    } catch (err) {
+      return { applied: false, reason: "invalid_routes", error: errorText(err) };
+    }
+  }
+
+  #handOff(ctx, session, stream, startedMs, initialEvents, recoveryRoutes) {
+    let releaseSession = null;
+    const webSession = new TendrilWebSession(
+      SESSION_TOKEN,
+      session,
+      stream,
+      this.#roster,
+      startedMs,
+      {
+        withRoster: (fn, options) => this.#withRoster(fn, options),
+        lockClient: (persistErr) => this.#lockClient(persistErr),
+        snapshotRoster: () => this.#snapshotRosterBytes(),
+        rosterChangedSince: (prev) => this.#rosterChangedSince(prev),
+        peerId: ctx.peer,
+        routePolicy: ctx.policy,
+        recoveryRoutes: recoveryRoutes ?? null,
+      },
+      initialEvents,
+      () => {
+        if (releaseSession) {
+          releaseSession();
+          releaseSession = null;
+        }
+      },
+      ctx.wire === 2,
+      this.#groupHook()
+    );
+    releaseSession = this.#attachSession(webSession);
+    return webSession;
+  }
+
+  async #connectExplicit(ctx, t) {
+    const { wire, base, peer } = ctx;
+    const relaySplit = splitRelayKey(t.relayUrl);
+    const endpointSplit = splitRelayKey(t.endpoint);
+    const endpoint = endpointSplit.url;
+    const relayUrl = relaySplit.url;
+    const operatorKey = relaySplit.relayKey ?? endpointSplit.relayKey;
+    // The mailbox key is the expectation's relay key: the operator `URL#key`, else the recovery
+    // URI's `rp` (a conflict between them fails pre-dial in `with_route_expectation`), else the
+    // caller's `targetPub`.
+    const recoveryRp = ctx.recoveryUri
+      ? (parsePairingUri(ctx.recoveryUri).relay_pub_b64 ?? null)
+      : null;
+    const targetPub = operatorKey ?? recoveryRp ?? t.targetPub;
+    await warmTargetTransport(endpoint, relayUrl);
+    this.#ensureOpen();
+    const deadlineMs = performance.now() + ctx.timeoutMs;
+    const session = await this.#withRoster(
+      () =>
+        this.#newSession(
+          ctx,
+          this.#roster,
+          this.#helloRouteSeq(peer, wire, ctx.policy),
+          operatorKey
+        ),
+      { readOnly: true }
+    );
+    let stream = null;
+    let handedOff = false;
+    try {
+      const target = endpoint || relayUrl;
+      const { relayAuthTicket: ticket, relayAuthSecret: secret } = relayCredsFor(
+        target,
+        target,
+        ctx.origins,
+        ctx.relayAuthTicket,
+        ctx.secretMaster
+      );
+      const explicitCreds = { relayAuthTicket: ticket, relayAuthSecret: secret };
+      const deriveV2Dial = t.useRelayV2
+        ? ({ relayHost, nonceBytes, connIdBytes }) =>
+            JSON.parse(
+              this.#roster.derive_v2_relay_dial_for_peer_json(
+                peer,
+                relayHost,
+                nowUnixSecs(),
+                nonceBytes,
+                connIdBytes
+              )
+            )
+        : null;
+      stream = await dialWebStream({
+        endpoint,
+        relayUrl,
+        targetPub,
+        expectedHost: t.expectedHost,
+        relayUrlOverride: t.relayUrlOverride,
+        p2pRelayUrls: ctx.p2pRelayUrls,
+        p2pRelayAuthToken: copySecret(ctx.tokenMaster),
+        ...explicitCreds,
+        useRelayV2: t.useRelayV2,
+        deriveV2Dial,
+        allowInsecureWs: ctx.allowInsecureWs,
+        timeoutMs: remainingBudgetMs(
+          deadlineMs,
+          `${base} handshake timed out connecting to transport`
+        ),
+      });
+      this.#ensureOpen();
+      const startedMs = performance.now();
+      const initialEvents = await this.#driveHandshake(
+        ctx,
+        session,
+        stream,
+        this.#roster,
+        deadlineMs,
+        startedMs,
+        true
+      );
+      let recoveryRoutes = null;
+      if (ctx.recoveryUri) {
+        // A route-only change: a failed persist rolls it back to the snapshot.
+        recoveryRoutes = await this.#withRoster(async (tx) => {
+          this.#checkWinner(ctx, session, false);
+          const applied = this.#applyRecoveryRoutes(ctx, session);
+          if (applied && applied.applied) {
+            try {
+              await tx.persist();
+            } catch (persistErr) {
+              throw new Error(`failed to persist recovery routes: ${errorText(persistErr)}`, {
+                cause: persistErr,
+              });
+            }
+          }
+          return applied;
+        });
+      }
+      this.#ensureUnlocked();
+      const webSession = this.#handOff(
+        ctx,
+        session,
+        stream,
+        startedMs,
+        initialEvents,
+        recoveryRoutes
+      );
+      handedOff = true;
+      return webSession;
+    } catch (err) {
+      if (!handedOff) {
+        session.free();
         if (stream) {
           await stream.close();
         }
       }
-    });
+      throw err;
+    }
   }
 
-  async connect({
-    endpoint = null,
-    relayUrl = null,
-    targetPub = null,
-    expectedHost = null,
-    relayUrlOverride = null,
-    p2pRelayUrls = null,
-    p2pRelayAuthToken = null,
-    p2pApiSecret = null,
-    relayAuthTicket = null,
-    relayAuthSecret = null,
-    allowInsecureWs = false,
-    targetHostId,
-    grantJson = null,
-    crlSeq = null,
-    timeoutMs = 15000,
-  }) {
-    if (p2pApiSecret) {
-      throw new Error(
-        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
-      );
+  /**
+   * Endpoint-free Day-2 connect: plan under a read-only roster
+   * section, dial each stored or recovery candidate against its own roster clone, reconcile the
+   * evidence and run the final check in one roster section, then hand the winner over.
+   */
+  async #connectStored(ctx) {
+    const { wire, peer, base } = ctx;
+    let p2p = false;
+    const view = this.getPeer(peer);
+    let recoveryHasIroh = false;
+    if (ctx.recoveryUri) {
+      recoveryHasIroh = parsePairingUri(ctx.recoveryUri).endpoints.some(isIrohHint);
     }
-    return this.#withHold(async () => {
-      await warmTargetTransport(endpoint, relayUrl);
-      this.#ensureOpen();
-      const deadlineMs = performance.now() + timeoutMs;
-      const seq = crlSeq ?? this.#roster.crl_seq(targetHostId);
-      const session = WasmSessionClient.new_with_roster(
-        this.#identity,
-        targetHostId,
-        this.#roster,
-        grantJson,
-        seq ?? null
-      );
-      let stream = null;
-      let handedOff = false;
-      try {
-        stream = await dialWebStream({
-          endpoint,
-          relayUrl,
-          targetPub,
-          expectedHost,
-          relayUrlOverride,
-          p2pRelayUrls,
-          p2pRelayAuthToken,
-          p2pApiSecret,
-          relayAuthTicket,
-          relayAuthSecret,
-          allowInsecureWs,
-          timeoutMs: remainingBudgetMs(
-            deadlineMs,
-            "session handshake timed out connecting to transport"
-          ),
-        });
-        this.#ensureOpen();
-        const startedMs = performance.now();
-        const m1 = session.start();
-        await sendProtocolBytes(stream, m1);
-        let initialEvents = [];
-        while (!session.is_established()) {
-          const waitMs = remainingBudgetMs(deadlineMs, "session handshake timed out");
-          const frame = await stream.recv(waitMs);
-          this.#ensureOpen();
-          if (frame.status === "would_block") {
-            throw new Error("session handshake timed out");
+    if (recoveryHasIroh || (view && view.routes.some((r) => isIrohHint(r.hint)))) {
+      p2p = await hasP2pSupport();
+    }
+    this.#ensureOpen();
+    const deadlineMs = performance.now() + ctx.timeoutMs;
+    let plan;
+    try {
+      plan = await this.#withRoster(
+        () => {
+          if (wire === 1) {
+            this.#roster.check_allows_wire_v1(peer);
           }
-          if (frame.status === "eof") {
-            throw new Error("session stream closed during handshake");
-          }
-          const elapsedMs = Math.max(0, Math.floor(performance.now() - startedMs));
-          let step;
+          const snap = this.#roster.pin_snapshot(peer);
           try {
-            step = JSON.parse(
-              session.feed_bytes(frame.bytes, nowUnixSecs(), elapsedMs, this.#roster)
+            const cands = JSON.parse(
+              this.#roster.session_candidates(
+                peer,
+                JSON.stringify({
+                  recovery_uri: ctx.recoveryUri,
+                  wire,
+                  route_policy: ctx.policy,
+                  p2p,
+                })
+              )
             );
+            return { snap, snapBytes: this.#roster.to_json_bytes(), cands };
           } catch (err) {
-            try {
-              await this.#persistRoster();
-            } catch (persistErr) {
-              throw new Error(
-                `session handshake failed (${err.message || err}); failed to persist roster update: ${persistErr.message || persistErr}`,
-                { cause: persistErr }
-              );
-            }
+            snap.free();
             throw err;
           }
-          if (step.write_b64) {
-            await sendProtocolBytes(stream, b64urlDecode(step.write_b64));
-          }
-          if (step.established) {
-            initialEvents = step.events || [];
-            break;
-          }
+        },
+        { readOnly: true }
+      );
+    } catch (err) {
+      throw toError(err);
+    }
+    const { snap, snapBytes, cands } = plan;
+    const skipped = cands.skipped ?? [];
+    try {
+      if (cands.candidates.length === 0) {
+        let msg = `no dialable stored routes for ${peer}`;
+        if (skipped.length > 0) {
+          const reasons = skipped.map((s) => `${redactHint(s.hint)} [${s.reason}]`);
+          msg += ` (skipped: ${reasons.join(", ")})`;
         }
-        await this.#persistRoster();
-        this.#ensureOpen();
-        let releaseSession = null;
-        const webSession = new TendrilWebSession(
-          SESSION_TOKEN,
-          session,
-          stream,
-          this.#roster,
-          startedMs,
-          () => this.#persistRoster(),
-          initialEvents,
-          () => {
-            if (releaseSession) {
-              releaseSession();
-              releaseSession = null;
-            }
-          },
-          false,
-          this.#groupHook()
+        if (cands.legacy_relay_hints) {
+          msg +=
+            "; legacy relay hints are never dialed automatically: re-pair, apply a fresh signed pairing URI, or connect with an explicit endpoint";
+        }
+        msg += `; ${DAY2_RECOVERY_GUIDANCE}`;
+        throw attemptError(new Error(msg), { skipped });
+      }
+      if (cands.candidates.some((c) => c.provider === "p2p")) {
+        await initTendrilP2p();
+      }
+      const evidence = { records: [], recordKeys: new Set(), crls: [] };
+      const failures = [];
+      const errors = [];
+      let winner = null;
+      for (let i = 0; i < cands.candidates.length; i += 1) {
+        const cand = cands.candidates[i];
+        const remaining = deadlineMs - performance.now();
+        if (remaining <= 0) {
+          errors.push(new Error(`${base} handshake timed out`));
+          failures.push({
+            hint: cand.hint,
+            provider: cand.provider,
+            error: `${base} handshake timed out`,
+          });
+          break;
+        }
+        const rungMs =
+          i === cands.candidates.length - 1 ? remaining : Math.min(remaining, RUNG_BUDGET_MS);
+        const res = await this.#connectCandidate(
+          ctx,
+          cands,
+          cand,
+          snapBytes,
+          performance.now() + rungMs,
+          evidence
         );
-        releaseSession = this.#attachSession(webSession);
-        handedOff = true;
-        return webSession;
-      } catch (err) {
-        if (!handedOff) {
-          session.free();
-          if (stream) {
-            await stream.close();
-          }
+        if (res.winner) {
+          winner = res.winner;
+          break;
         }
+        if (this.#freed || this.#wasmFreed) {
+          throw res.error;
+        }
+        errors.push(res.error);
+        failures.push({ hint: cand.hint, provider: cand.provider, error: errorText(res.error) });
+      }
+      let fin;
+      try {
+        fin = await this.#finalizeConnect(ctx, snap, evidence, winner);
+      } catch (err) {
+        fin = { error: toError(err) };
+      }
+      if (fin.error) {
+        if (winner) {
+          await this.#discardWinner(winner);
+        }
+        throw attemptError(fin.error, { skipped, failures });
+      }
+      if (!winner) {
+        const relayOffline =
+          !ctx.recoveryUri &&
+          failures.length > 0 &&
+          failures.every((f) => f.provider === "relay" && f.error.includes("offline"));
+        const err = relayOffline
+          ? new Error(RELAY_OFFLINE_ROTATED)
+          : (mostSevere(errors) ?? new Error("all candidates exhausted"));
+        throw attemptError(err, { skipped, failures });
+      }
+      try {
+        this.#ensureUnlocked();
+      } catch (err) {
+        await this.#discardWinner(winner);
         throw err;
       }
-    });
+      winner.clone.free();
+      const webSession = this.#handOff(
+        ctx,
+        winner.session,
+        winner.stream,
+        winner.startedMs,
+        winner.initialEvents,
+        fin.recovery
+      );
+      webSession.route = {
+        hint: winner.cand.hint,
+        endpoint: winner.cand.endpoint,
+        provider: winner.cand.provider,
+      };
+      webSession.skipped = skipped;
+      webSession.failures = failures;
+      return webSession;
+    } finally {
+      snap.free();
+      snapBytes.fill(0);
+    }
   }
 
-  async connectV2({
-    endpoint = null,
-    relayUrl = null,
-    targetPub = null,
-    expectedHost = null,
-    relayUrlOverride = null,
-    p2pRelayUrls = null,
-    p2pRelayAuthToken = null,
-    p2pApiSecret = null,
-    relayAuthTicket = null,
-    relayAuthSecret = null,
-    useRelayV2 = false,
-    allowInsecureWs = false,
-    targetHostId,
-    grantJson = null,
-    crlSeq = null,
-    timeoutMs = 15000,
-  }) {
-    if (p2pApiSecret) {
-      throw new Error(
-        "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
-      );
-    }
-    return this.#withHold(async () => {
-      await warmTargetTransport(endpoint, relayUrl);
-      this.#ensureOpen();
-      const deadlineMs = performance.now() + timeoutMs;
-      const seq = crlSeq ?? this.#roster.crl_seq(targetHostId);
-      const session = new WasmV2SessionInitiator(
-        this.#identity,
-        targetHostId,
-        this.#roster,
-        grantJson,
-        seq ?? null
-      );
-      let stream = null;
-      let handedOff = false;
-      try {
-        const deriveV2Dial = useRelayV2
+  /** Dials one Day-2 candidate against its own roster clone and records its evidence. */
+  async #connectCandidate(ctx, cands, cand, snapBytes, rungDeadline, evidence) {
+    const { peer, base } = ctx;
+    let clone = null;
+    let session = null;
+    let stream = null;
+    let won = false;
+    let creds = null;
+    try {
+      clone = WasmRoster.from_json_bytes(snapBytes.slice());
+      session = this.#newSession(ctx, clone, cands.route_seq, null);
+      const isRelay = cand.provider === "relay";
+      const v2Relay = isRelay && isV2RelayUrl(cand.endpoint);
+      const dialClone = clone;
+      creds = isRelay
+        ? relayCredsFor(cand.endpoint, null, ctx.origins, ctx.relayAuthTicket, ctx.secretMaster)
+        : { relayAuthTicket: null, relayAuthSecret: null };
+      stream = await dialWebStream({
+        endpoint: cand.provider === "p2p" ? cand.endpoint : null,
+        relayUrl: isRelay ? cand.endpoint : null,
+        targetPub: cands.relay_key_b64,
+        p2pRelayUrls: ctx.p2pRelayUrls,
+        p2pRelayAuthToken: copySecret(ctx.tokenMaster),
+        relayAuthTicket: creds.relayAuthTicket,
+        relayAuthSecret: creds.relayAuthSecret,
+        useRelayV2: v2Relay,
+        deriveV2Dial: v2Relay
           ? ({ relayHost, nonceBytes, connIdBytes }) =>
               JSON.parse(
-                this.#roster.derive_v2_relay_dial_for_peer_json(
-                  targetHostId,
+                dialClone.derive_v2_relay_dial_for_peer_json(
+                  peer,
                   relayHost,
                   nowUnixSecs(),
                   nonceBytes,
                   connIdBytes
                 )
               )
-          : null;
-        stream = await dialWebStream({
-          endpoint,
-          relayUrl,
-          targetPub,
-          expectedHost,
-          relayUrlOverride,
-          p2pRelayUrls,
-          p2pRelayAuthToken,
-          p2pApiSecret,
-          relayAuthTicket,
-          relayAuthSecret,
-          useRelayV2,
-          deriveV2Dial,
-          allowInsecureWs,
-          timeoutMs: remainingBudgetMs(
-            deadlineMs,
-            "v2 session handshake timed out connecting to transport"
-          ),
-        });
-        this.#ensureOpen();
-        const startedMs = performance.now();
-        const m1 = session.start(nowUnixSecs());
-        await sendProtocolBytes(stream, m1);
-        let initialEvents = [];
-        while (!session.is_established()) {
-          const waitMs = remainingBudgetMs(deadlineMs, "v2 session handshake timed out");
-          const frame = await stream.recv(waitMs);
-          this.#ensureOpen();
-          if (frame.status === "would_block") {
-            throw new Error("v2 session handshake timed out");
-          }
-          if (frame.status === "eof") {
-            throw new Error("v2 session stream closed during handshake");
-          }
-          const elapsedMs = Math.max(0, Math.floor(performance.now() - startedMs));
-          let step;
-          try {
-            step = JSON.parse(
-              session.feed_bytes(frame.bytes, nowUnixSecs(), elapsedMs, this.#roster)
-            );
-          } catch (err) {
-            try {
-              await this.#persistRoster();
-            } catch (persistErr) {
-              throw new Error(
-                `v2 session handshake failed (${err.message || err}); failed to persist roster update: ${persistErr.message || persistErr}`,
-                { cause: persistErr }
-              );
+          : null,
+        allowInsecureWs: ctx.allowInsecureWs,
+        irohHint: cand.source !== "operator",
+        timeoutMs: remainingBudgetMs(
+          rungDeadline,
+          `${base} handshake timed out connecting to transport`
+        ),
+      });
+      this.#ensureOpen();
+      const startedMs = performance.now();
+      const initialEvents = await this.#driveHandshake(
+        ctx,
+        session,
+        stream,
+        clone,
+        rungDeadline,
+        startedMs,
+        false
+      );
+      won = true;
+      return { winner: { session, stream, clone, startedMs, initialEvents, cand } };
+    } catch (err) {
+      return { error: candidateError(err, creds) };
+    } finally {
+      if (session) {
+        try {
+          for (const record of JSON.parse(session.presented_rotation_json())) {
+            const key = JSON.stringify(record);
+            if (!evidence.recordKeys.has(key)) {
+              evidence.recordKeys.add(key);
+              evidence.records.push(record);
             }
-            throw err;
           }
-          const outBytes = session.poll_write();
-          if (outBytes && outBytes.length > 0) {
-            await sendProtocolBytes(stream, outBytes);
-          }
-          const events = JSON.parse(session.drain_events_json());
-          if (step.established) {
-            initialEvents = events;
-            break;
-          }
-        }
-        await this.#persistRoster();
-        this.#ensureOpen();
-        let releaseSession = null;
-        const webSession = new TendrilWebSession(
-          SESSION_TOKEN,
-          session,
-          stream,
-          this.#roster,
-          startedMs,
-          () => this.#persistRoster(),
-          initialEvents,
-          () => {
-            if (releaseSession) {
-              releaseSession();
-              releaseSession = null;
-            }
-          },
-          true,
-          this.#groupHook()
-        );
-        releaseSession = this.#attachSession(webSession);
-        handedOff = true;
-        return webSession;
-      } catch (err) {
-        if (!handedOff) {
-          session.free();
-          if (stream) {
-            await stream.close();
-          }
-        }
-        throw err;
+        } catch {}
       }
-    });
+      if (clone) {
+        try {
+          evidence.crls.push(...JSON.parse(clone.export_crls_json()));
+        } catch {}
+      }
+      if (!won) {
+        if (session) {
+          session.free();
+        }
+        if (clone) {
+          clone.free();
+        }
+        if (stream) {
+          try {
+            await stream.close();
+          } catch {}
+        }
+      }
+    }
+  }
+
+  async #discardWinner(winner) {
+    winner.session.free();
+    winner.clone.free();
+    try {
+      await winner.stream.close();
+    } catch {}
+  }
+
+  /**
+   * The final checks in one roster critical section: merge candidate CRLs, reconcile
+   * every presented rotation against the snapshot (a fork revokes and is persisted first), then
+   * for a winner apply its rotation, run the final check, and only then apply recovery routes.
+   * Changed evidence is persisted whatever the outcome and a failed evidence persist locks the
+   * client; an unchanged roster is not persisted. Recovery routes are a route-only change: a
+   * failed persist rolls them back and fails the connect without locking the client.
+   */
+  async #finalizeConnect(ctx, snap, evidence, winner) {
+    const { peer } = ctx;
+    return this.#withRoster(
+      async (tx) => {
+        const before = this.#snapshotRosterBytes();
+        let afterEvidence = null;
+        try {
+          const persistEvidence = async () => {
+            if (!this.#rosterChangedSince(before)) {
+              return null;
+            }
+            try {
+              await tx.persist({ rollback: false });
+              return null;
+            } catch (persistErr) {
+              this.#lockClient(persistErr);
+              return persistErr;
+            }
+          };
+          const withCause = (err, persistErr) =>
+            persistErr ? codedError(err.code, errorText(err), { cause: persistErr }) : err;
+          this.#roster.merge_crl_evidence(JSON.stringify(evidence.crls));
+          try {
+            this.#roster.reconcile_rotation_evidence(peer, snap, JSON.stringify(evidence.records));
+          } catch (forkErr) {
+            return { error: withCause(toError(forkErr), await persistEvidence()) };
+          }
+          if (!winner) {
+            const persistErr = await persistEvidence();
+            if (persistErr) {
+              return {
+                error: new Error(`failed to persist connect evidence: ${errorText(persistErr)}`, {
+                  cause: persistErr,
+                }),
+              };
+            }
+            return { error: null };
+          }
+          let finalErr = null;
+          try {
+            this.#checkWinner(ctx, winner.session, true);
+          } catch (err) {
+            finalErr = toError(err);
+          }
+          if (finalErr) {
+            return { error: withCause(finalErr, await persistEvidence()) };
+          }
+          const persistErr = await persistEvidence();
+          if (persistErr) {
+            return {
+              error: new Error(`failed to persist roster update: ${errorText(persistErr)}`, {
+                cause: persistErr,
+              }),
+            };
+          }
+          afterEvidence = this.#snapshotRosterBytes();
+          const recovery = this.#applyRecoveryRoutes(ctx, winner.session);
+          if (this.#rosterChangedSince(afterEvidence)) {
+            try {
+              await tx.persist({ rollback: false });
+            } catch (routesErr) {
+              this.#restoreRosterBytes(afterEvidence);
+              return {
+                error: new Error(`failed to persist recovery routes: ${errorText(routesErr)}`, {
+                  cause: routesErr,
+                }),
+              };
+            }
+          }
+          return { error: null, recovery };
+        } finally {
+          if (before) {
+            before.fill(0);
+          }
+          if (afterEvidence) {
+            afterEvidence.fill(0);
+          }
+        }
+      },
+      { snapshot: false }
+    );
   }
 
   free() {
@@ -1562,7 +2658,15 @@ export class TendrilWebSession {
   #stream;
   #roster;
   #startedMs;
-  #persist;
+  #withRoster;
+  #lockClient;
+  #snapshotRoster;
+  #rosterChangedSince;
+  #peerId;
+  #routePolicy;
+  #recoveryRoutes;
+  #lastRouteSet = null;
+  #lastRouteSetMs = null;
   #onRelease;
   #queue;
   #isV2;
@@ -1574,6 +2678,7 @@ export class TendrilWebSession {
   #freed = false;
   #closePromise = null;
   #persistFailedErr = null;
+  #failureClosed = false;
 
   constructor(
     token,
@@ -1581,7 +2686,7 @@ export class TendrilWebSession {
     stream,
     roster,
     startedMs,
-    persistFn,
+    rosterOps,
     initialEvents = [],
     onRelease = null,
     isV2 = false,
@@ -1594,7 +2699,13 @@ export class TendrilWebSession {
     this.#stream = stream;
     this.#roster = roster;
     this.#startedMs = startedMs;
-    this.#persist = persistFn;
+    this.#withRoster = rosterOps.withRoster;
+    this.#lockClient = rosterOps.lockClient ?? noop;
+    this.#snapshotRoster = rosterOps.snapshotRoster ?? (() => null);
+    this.#rosterChangedSince = rosterOps.rosterChangedSince ?? (() => false);
+    this.#peerId = rosterOps.peerId;
+    this.#routePolicy = rosterOps.routePolicy ?? "all_signed";
+    this.#recoveryRoutes = rosterOps.recoveryRoutes ?? null;
     this.#onRelease = onRelease;
     this.#queue = [...initialEvents];
     this.#isV2 = Boolean(isV2);
@@ -1606,6 +2717,96 @@ export class TendrilWebSession {
   /** Device id derived from the static key authenticated by the handshake. */
   get peerDeviceId() {
     return this.#peerDeviceId;
+  }
+
+  /** What a recovery URI given to `connect` did to the stored routes, or null. */
+  get recoveryRoutes() {
+    return this.#recoveryRoutes;
+  }
+
+  /** Outcome of the last host route set (`0x0C`) this session received, or null. */
+  get lastRouteSet() {
+    return this.#lastRouteSet;
+  }
+
+  /**
+   * One roster critical section on the client lock. An evidence persist failure inside marks the
+   * session and the client failed there; the stream is closed only after the section released.
+   */
+  async #rosterSection(fn, { snapshot = false, readOnly = false } = {}) {
+    try {
+      return await this.#withRoster(fn, { snapshot, readOnly });
+    } finally {
+      if (this.#persistFailedErr && !this.#failureClosed) {
+        this.#failureClosed = true;
+        try {
+          void Promise.resolve(this.#stream.close()).catch(() => {});
+        } catch {}
+      }
+    }
+  }
+
+  /** Authenticated evidence could not be persisted: fail this session and lock the client. */
+  #markPersistFailed(persistErr) {
+    this.#persistFailedErr = persistErr;
+    this.#closing = true;
+    this.#lockClient(persistErr);
+  }
+
+  #drainRouteSets() {
+    try {
+      return JSON.parse(this.#session.take_route_sets());
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Applies host route sets under `allSigned`, at most one per 10 s per session. A set is a
+   * route-only change: a failed persist rolls it back and reports `persist_failed`; the session
+   * and the client stay usable.
+   */
+  async #ingestRouteSets(sets) {
+    if (!sets || sets.length === 0 || this.#routePolicy !== "all_signed") {
+      return;
+    }
+    for (const payloadB64 of sets) {
+      // Checked and stamped inside the critical section: time spent waiting for the lock never
+      // counts toward the interval.
+      this.#lastRouteSet = await this.#rosterSection(
+        async (tx) => {
+          const nowMs = performance.now();
+          if (
+            this.#lastRouteSetMs !== null &&
+            nowMs < this.#lastRouteSetMs + CLIENT_ROUTE_SET_INTERVAL_MS
+          ) {
+            return { outcome: "ignored", reason: "rate_limited" };
+          }
+          this.#lastRouteSetMs = nowMs;
+          let res;
+          try {
+            res = JSON.parse(
+              this.#roster.apply_route_announcement(
+                this.#peerId,
+                b64urlDecode(payloadB64),
+                nowUnixSecs()
+              )
+            );
+          } catch (err) {
+            return { outcome: "ignored", reason: errorText(err) };
+          }
+          if (res.outcome === "applied") {
+            try {
+              await tx.persist();
+            } catch {
+              return { outcome: "ignored", reason: "persist_failed" };
+            }
+          }
+          return res;
+        },
+        { snapshot: true }
+      );
+    }
   }
 
   async #applyGroupEvents(events) {
@@ -1660,6 +2861,15 @@ export class TendrilWebSession {
     try {
       void this.#stream.close();
     } catch {}
+  }
+
+  /** The client locked on a roster persist failure: fail this session and close it. */
+  _failFromClientLock(persistErr) {
+    if (!this.#persistFailedErr) {
+      this.#persistFailedErr = persistErr;
+    }
+    this.#closing = true;
+    void this.close(1011, "roster persistence failure").catch(() => {});
   }
 
   _abortFromClientFree() {
@@ -1729,25 +2939,11 @@ export class TendrilWebSession {
     this.#ensureOpen();
     return this.#enqueueSend(async () => {
       this.#ensureOpen();
-      let out;
-      let tickErr = null;
-      try {
-        out = this.#session.tick(nowUnixSecs(), this.#elapsedMs(), this.#roster);
-      } catch (err) {
-        tickErr = err;
-      }
-      if (tickErr) {
-        try {
-          await this.#persist();
-        } catch (persistErr) {
-          this.#failPersistAndClose(persistErr);
-          throw new Error(
-            `session tick failed (${tickErr.message || tickErr}); failed to persist roster update: ${persistErr.message || persistErr}`,
-            { cause: persistErr }
-          );
-        }
-        throw tickErr;
-      }
+      // `tick` reads the roster and never changes it.
+      const out = await this.#rosterSection(
+        () => this.#session.tick(nowUnixSecs(), this.#elapsedMs(), this.#roster),
+        { readOnly: true }
+      );
       await sendProtocolBytes(this.#stream, out);
     });
   }
@@ -1812,68 +3008,61 @@ export class TendrilWebSession {
         if (this.#closing || this.#freed) {
           return { eof: true };
         }
-        let step;
-        let feedErr = null;
-        try {
-          step = JSON.parse(
-            this.#session.feed_bytes(frame.bytes, nowUnixSecs(), this.#elapsedMs(), this.#roster)
-          );
-        } catch (err) {
-          feedErr = err;
-        }
-        if (feedErr) {
+        const step = await this.#rosterSection(async (tx) => {
+          let res;
+          const prev = this.#snapshotRoster();
           try {
-            await this.#persist();
-          } catch (persistErr) {
-            this.#failPersistAndClose(persistErr);
-            throw new Error(
-              `protocol error (${feedErr.message || feedErr}); failed to persist roster update: ${persistErr.message || persistErr}`,
-              { cause: persistErr }
+            res = JSON.parse(
+              this.#session.feed_bytes(frame.bytes, nowUnixSecs(), this.#elapsedMs(), this.#roster)
             );
-          }
-          throw feedErr;
-        }
-        if (this.#isV2) {
-          const outBytes = this.#session.poll_write();
-          if (outBytes && outBytes.length > 0) {
-            await sendProtocolBytes(this.#stream, outBytes);
-          }
-          const events = JSON.parse(this.#session.drain_events_json());
-          if (events && events.length > 0) {
-            await this.#applyGroupEvents(events);
-            if (events.some((ev) => ev.event === "revocation_updated")) {
-              try {
-                await this.#persist();
-              } catch (persistErr) {
-                this.#failPersistAndClose(persistErr);
-                throw new Error(
-                  `failed to persist revocation update: ${persistErr.message || persistErr}`,
-                  { cause: persistErr }
-                );
-              }
+          } catch (feedErr) {
+            const changed = this.#rosterChangedSince(prev);
+            prev?.fill(0);
+            if (!changed) {
+              throw feedErr;
             }
-            this.#queue.push(...events);
-          }
-          return { eof: Boolean(step.closed && this.#queue.length === 0) };
-        }
-        if (step.write_b64) {
-          await sendProtocolBytes(this.#stream, b64urlDecode(step.write_b64));
-        }
-        if (step.events && step.events.length > 0) {
-          await this.#applyGroupEvents(step.events);
-          if (step.events.some((ev) => ev.event === "revocation_updated")) {
             try {
-              await this.#persist();
+              await tx.persist({ rollback: false });
             } catch (persistErr) {
-              this.#failPersistAndClose(persistErr);
+              this.#markPersistFailed(persistErr);
               throw new Error(
-                `failed to persist revocation update: ${persistErr.message || persistErr}`,
+                `protocol error (${errorText(feedErr)}); failed to persist roster update: ${errorText(persistErr)}`,
                 { cause: persistErr }
               );
             }
+            throw feedErr;
           }
+          prev?.fill(0);
+          let out;
+          let events;
+          if (this.#isV2) {
+            out = this.#session.poll_write();
+            events = JSON.parse(this.#session.drain_events_json()) || [];
+          } else {
+            out = res.write_b64 ? b64urlDecode(res.write_b64) : null;
+            events = res.events || [];
+          }
+          const routeSets = this.#drainRouteSets();
+          if (events.some((ev) => ev.event === "revocation_updated")) {
+            try {
+              await tx.persist({ rollback: false });
+            } catch (persistErr) {
+              this.#markPersistFailed(persistErr);
+              throw new Error(`failed to persist revocation update: ${errorText(persistErr)}`, {
+                cause: persistErr,
+              });
+            }
+          }
+          return { closed: Boolean(res.closed), out, events, routeSets };
+        });
+        if (step.out && step.out.length > 0) {
+          await sendProtocolBytes(this.#stream, step.out);
+        }
+        if (step.events.length > 0) {
+          await this.#applyGroupEvents(step.events);
           this.#queue.push(...step.events);
         }
+        await this.#ingestRouteSets(step.routeSets);
         return { eof: Boolean(step.closed && this.#queue.length === 0) };
       });
       if (outcome.eof) {
@@ -1890,7 +3079,7 @@ export class TendrilWebSession {
     this.#closePromise = (async () => {
       try {
         await this.#enqueueSend(async () => {
-          if (!this.#freed && !this.#session.is_closed()) {
+          if (!this.#persistFailedErr && !this.#freed && !this.#session.is_closed()) {
             const out = this.#isV2
               ? this.#session.close(code, reason, this.#elapsedMs())
               : this.#session.send_close(code, reason);

@@ -12,9 +12,94 @@ export interface ParsedPairingUri {
   host_static_pub_b64: string;
   host_signing_pub_hash_b64: string;
   endpoints: string[];
+  /** Provider of each endpoint, in `endpoints` order. */
+  providers: ProviderName[];
   host_id?: string | null;
   rotation_seq?: number | null;
+  /** `rp`: the host relay key selecting its `/v1/relay` mailbox (checked after `msg2`). */
+  relay_pub_b64?: string | null;
+  /** `rq`: the route sequence of a signed URI. */
+  route_seq?: number | null;
+  /** Whether the URI carries a route statement (`rs`); verified only against the host key. */
+  route_signed: boolean;
 }
+
+export type ProviderName = "local" | "direct" | "overlay" | "p2p" | "relay" | "broker";
+
+/** Client route policy; `allSigned` is the default. */
+export type RoutePolicy = "allSigned" | "committedOnly" | "none";
+
+export type RouteSource = "operator" | "signed" | "committed";
+
+export interface StoredRoute {
+  hint: string;
+  source: RouteSource;
+}
+
+export interface RouteMeta {
+  seq: number;
+  issued_at?: number | null;
+  origin: string;
+}
+
+export interface SkippedHint {
+  hint: string;
+  /** Snake-case reason, for example `browser_unsupported`, `ipc_from_uri`, `insecure_ws`. */
+  reason: string;
+}
+
+export interface CandidateFailure {
+  hint: string;
+  provider: ProviderName;
+  error: string;
+}
+
+export interface WebCandidate {
+  /** Original URI or stored hint (null for an explicit endpoint). */
+  hint: string | null;
+  /** What is dialed: prefixes stripped, `iroh://` without `relay=` parameters. */
+  endpoint: string;
+  provider: ProviderName;
+}
+
+/**
+ * Error thrown by multi-route `pair`, `pairV2`, `connect` and `connectV2`. `committed` is true
+ * once a `msg3` byte may have been written: the code may be spent and no other route was tried.
+ * `code` is the stable error code (for example `host_key_unverified`, `peer_revoked`,
+ * `invalid_pairing_uri`) when the failure has one; errors are ranked by it, never by message.
+ */
+export interface TendrilAttemptError extends Error {
+  code?: string;
+  committed?: boolean;
+  skipped?: SkippedHint[];
+  failures?: CandidateFailure[];
+}
+
+export interface PeerRoutes {
+  peer_id: string;
+  routes: StoredRoute[];
+  route_meta: RouteMeta | null;
+  /** Hints saved by older pairings; never dialed automatically. */
+  legacy_relay_hints: string[];
+}
+
+export interface RouteApplyResult {
+  peer_id: string;
+  applied: boolean;
+  /** Why nothing changed: `stale_route_seq`, `route_policy`, or `invalid_routes`. */
+  reason: string | null;
+  routes?: StoredRoute[];
+  route_meta?: RouteMeta | null;
+  error?: string;
+}
+
+/**
+ * A host route set (`0x0C`). `ignored` with `persist_failed` means the set applied but its
+ * persist failed, so the routes were rolled back; the session and the client stay usable.
+ */
+export type RouteSetStatus =
+  | { outcome: "applied"; added: string[]; removed: string[] }
+  | { outcome: "ignored"; reason: string };
 
 export interface ParsedP2pEndpoint {
   endpoint_id: string;
@@ -48,6 +133,16 @@ export interface PairResult {
   host_id: string;
   sas: string;
   host_confirmed: boolean;
+  /** `verified`, `unsigned`, `route_key_rotated` (an `invalid` statement aborts before commit). */
+  route_check?: string;
+  /** Routes this pairing stored, with their source. */
+  routes_persisted?: StoredRoute[];
+  /** Why fewer routes were stored, for example `unsigned_uri` or `stale_route_seq`. */
+  routes_reason?: string | null;
+  /** The candidate that carried the commit. */
+  route?: WebCandidate;
+  skipped?: SkippedHint[];
+  failures?: CandidateFailure[];
 }
 
 export interface EnrollResult {
@@ -142,6 +237,22 @@ export type WasmInitInput =
 export function initTendril(wasmUrl?: WasmInitInput): Promise<void>;
 export function initTendrilP2p(wasmUrl?: WasmInitInput): Promise<void>;
 export function parseP2pEndpoint(endpoint: string): Promise<ParsedP2pEndpoint>;
+/** Resolves true when the opt-in `pkg-p2p` module loads, so `iroh://` hints are dialable. */
+export function hasP2pSupport(): Promise<boolean>;
+/**
+ * Splits pairing URI hints into browser-dialable candidates (provider order) and skipped hints.
+ * Keeps `iroh://` only with `p2p` (its `relay=` parameters are stripped), `wss://`, and `ws://`
+ * on loopback or with `allowInsecureWs`. Throws `pairing URI contains no browser-compatible
+ * endpoints (need iroh:// or wss://)` when nothing is left.
+ */
+export function filterWebCompatibleEndpoints(
+  endpoints: string[],
+  options?: { p2p?: boolean; allowInsecureWs?: boolean }
+): { candidates: WebCandidate[]; skipped: SkippedHint[] };
+/** `lan2_group` or `remote3_group`; throws `pairing code invalid` for a malformed code. */
+export function classifyPairingCode(code: string): "lan2_group" | "remote3_group";
+/** The core rule: admission material goes only to a byte-equal configured origin. */
+export function relayAuthOriginAllowed(url: string, origins: string[]): boolean;
 export const MAX_RELAY_FRAME_LEN: number;
 export const MAX_QUEUED_BYTES: number;
 export const MAX_QUEUED_FRAMES: number;
@@ -187,6 +298,11 @@ export function dialIrohStream(options: {
   p2pRelayUrls?: string[] | null;
   p2pRelayAuthToken?: string | Uint8Array | null;
   p2pApiSecret?: never | null;
+  /**
+   * Dial a URI hint or a stored non-operator route: no address lookup, through `p2pRelayUrls`
+   * or the Default relay map.
+   */
+  hint?: boolean;
   timeoutMs?: number;
 }): Promise<TendrilStream>;
 
@@ -387,7 +503,12 @@ export interface TendrilWebClientOptions {
 }
 
 export interface WebTransportDialOptions {
+  /** Explicit operator endpoint. Omit it and `relayUrl` on connect to dial stored routes. */
   endpoint?: string | null;
+  /**
+   * Explicit relay URL; a `URL#<relay key>` form dials the mailbox of that key and also checks
+   * the host key before `msg3`. Pairing rejects a `/v2/relay` URL before dialing.
+   */
   relayUrl?: string | null;
   targetPub?: string | null;
   expectedHost?: string | null;
@@ -397,10 +518,41 @@ export interface WebTransportDialOptions {
   p2pApiSecret?: never | null;
   relayAuthTicket?: string | Record<string, unknown> | null;
   relayAuthSecret?: string | Uint8Array | null;
+  /**
+   * Origins (`scheme://host:port`) that may receive `relayAuthTicket`/`relayAuthSecret`. Relays
+   * learned from a URI, a stored route or an announcement get credentials only when listed; the
+   * explicit `relayUrl`/`endpoint` of the call always does.
+   */
+  relayAuthOrigins?: string[] | null;
   allowInsecureWs?: boolean;
   timeoutMs?: number;
 }
 
+export interface PairingPolicyOptions {
+  /** Which routes a pairing stores; default `allSigned`. */
+  routePolicy?: RoutePolicy;
+  /** Store the committed route of an unsigned pairing (conflicts with `routePolicy: "none"`). */
+  saveRoute?: boolean;
+}
+
+export interface ConnectPolicyOptions {
+  /** A fresh pairing URI for this paired host: its code is ignored, its keys are checked. */
+  recoveryUri?: string | null;
+  /** Approve the recovery URI's routes even when not newer than the stored ones. */
+  replaceRoutes?: boolean;
+  /** Policy for recovery routes and host route announcements; default `allSigned`. */
+  routePolicy?: RoutePolicy;
+}
+
+/**
+ * Roster persistence contract: each mutation runs in a FIFO critical section that holds the
+ * roster lock while `onPersistRoster`/`onPersistRosterBytes` runs. A persist callback may call
+ * client methods without awaiting them (they run after the current section); it must not await
+ * them, which deadlocks (a warning is logged after 5 s). Use one client per roster storage.
+ * A failed persist of a route-only change rolls it back. A failed persist of authenticated
+ * evidence (CRLs, rotations, revocations, wire floors) locks the client: every later roster
+ * operation throws. A connect that changed nothing persists nothing.
+ */
 export class TendrilWebClient {
   private constructor();
   static create(options?: TendrilWebClientOptions): Promise<TendrilWebClient>;
@@ -409,7 +561,20 @@ export class TendrilWebClient {
   exportIdentityBytes(): Uint8Array;
   exportRosterJson(): string;
   exportRosterBytes(): Uint8Array;
-  getPeer(peerId: string): unknown | null;
+  /** The roster entry, including `routes` and `route_meta`, or null. */
+  getPeer(
+    peerId: string
+  ): ({ routes: StoredRoute[]; route_meta: RouteMeta | null } & Record<string, unknown>) | null;
+  peerRoutes(peerId: string): PeerRoutes;
+  /** Replaces the `operator` routes of an active peer (at most six; an empty array clears). */
+  setPeerRoutes(peerId: string, routes: string[]): Promise<StoredRoute[]>;
+  /** Removes the routes of one source (`operator` when omitted), or every route with `"all"`. */
+  clearPeerRoutes(peerId: string, source?: RouteSource | "all" | null): Promise<void>;
+  /** Applies a fresh host-signed pairing URI offline: no network, no code use. */
+  applyRouteUri(
+    uri: string,
+    options?: { routePolicy?: RoutePolicy; replaceRoutes?: boolean }
+  ): Promise<RouteApplyResult>;
   confirmPeer(peerId: string, sas?: string | null): Promise<void>;
   removePendingPeer(peerId: string): Promise<void>;
   addTrustAnchor(anchorId: string, signingPubB64: string): Promise<void>;
@@ -458,37 +623,49 @@ export class TendrilWebClient {
       deviceKind?: string;
     }
   ): Promise<EnrollResult>;
+  /**
+   * Pairs over an explicit endpoint or the browser-compatible hints of `pairingUri`, one route
+   * at a time, committing on exactly one. Throws `TendrilAttemptError`.
+   */
   pair(
-    options: WebTransportDialOptions & {
-      code?: string;
-      pairingUri?: string | null;
-      deviceName?: string;
-      deviceKind?: string;
-    }
+    options: WebTransportDialOptions &
+      PairingPolicyOptions & {
+        code?: string;
+        pairingUri?: string | null;
+        deviceName?: string;
+        deviceKind?: string;
+      }
   ): Promise<PairResult>;
   pairV2(
-    options: WebTransportDialOptions & {
-      code?: string | Uint8Array;
-      pairingUri?: string | null;
-      pinnedHost?: string | V2PinnedHostInput | null;
-      deviceName?: string;
-      deviceKind?: string;
-    }
+    options: WebTransportDialOptions &
+      PairingPolicyOptions & {
+        code?: string | Uint8Array;
+        pairingUri?: string | null;
+        pinnedHost?: string | V2PinnedHostInput | null;
+        deviceName?: string;
+        deviceKind?: string;
+      }
   ): Promise<PairResult>;
+  /**
+   * Connects over an explicit endpoint, or, with neither `endpoint` nor `relayUrl`, over the
+   * peer's stored routes (and a signed `recoveryUri`'s hints). Throws `TendrilAttemptError`.
+   */
   connect(
-    options: WebTransportDialOptions & {
-      targetHostId: string;
-      grantJson?: string | null;
-      crlSeq?: number | null;
-    }
+    options: WebTransportDialOptions &
+      ConnectPolicyOptions & {
+        targetHostId: string;
+        grantJson?: string | null;
+        crlSeq?: number | null;
+      }
   ): Promise<TendrilWebSession>;
   connectV2(
-    options: WebTransportDialOptions & {
-      useRelayV2?: boolean;
-      targetHostId: string;
-      grantJson?: string | null;
-      crlSeq?: number | null;
-    }
+    options: WebTransportDialOptions &
+      ConnectPolicyOptions & {
+        useRelayV2?: boolean;
+        targetHostId: string;
+        grantJson?: string | null;
+        crlSeq?: number | null;
+      }
   ): Promise<TendrilWebSession>;
   free(): void;
 }
@@ -497,6 +674,14 @@ export class TendrilWebSession {
   private constructor();
   /** Device id derived from the static key authenticated by the handshake. */
   readonly peerDeviceId: string | null;
+  /** What a `recoveryUri` given to `connect` did to the stored routes, or null. */
+  readonly recoveryRoutes: RouteApplyResult | null;
+  /** Outcome of the last host route set this session received, or null. */
+  readonly lastRouteSet: RouteSetStatus | null;
+  /** Endpoint-free connects: the winning route, skipped hints and failed candidates. */
+  route?: WebCandidate;
+  skipped?: SkippedHint[];
+  failures?: CandidateFailure[];
   isEstablished(): boolean;
   isClosed(): boolean;
   sendData(payload: Uint8Array | string): Promise<void>;
