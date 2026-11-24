@@ -145,6 +145,57 @@ jobs:
           name: dist-bin-${{ matrix.label }}
           path: dist-bin/*
 
+  build-node:
+    name: node addon (${{ matrix.label }})
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            label: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            libname: libtendril_node.so
+          - runner: ubuntu-24.04-arm
+            label: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            libname: libtendril_node.so
+          - runner: macos-15
+            label: darwin-arm64
+            target: aarch64-apple-darwin
+            libname: libtendril_node.dylib
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build Node.js N-API tarball
+        env:
+          TARGET: ${{ matrix.target }}
+          LABEL: ${{ matrix.label }}
+          LIBNAME: ${{ matrix.libname }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path bindings/node/Cargo.toml --locked --release --target "$TARGET"
+          mkdir -p dist-node stage-node/package
+          cp "bindings/node/target/${TARGET}/release/${LIBNAME}" stage-node/package/index.node
+          cp bindings/node/index.js bindings/node/index.d.ts bindings/node/package.json bindings/node/README.md LICENSE stage-node/package/
+          tar -czf "dist-node/tendril-node-${VERSION}-${LABEL}.tar.gz" -C stage-node package
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-node-${{ matrix.label }}
+          path: dist-node/*
+
   build-python-wheels:
     name: python wheels (${{ matrix.label }})
     needs: plan
@@ -335,6 +386,7 @@ jobs:
     needs:
       - plan
       - build-binaries
+      - build-node
       - build-python-wheels
       - build-web
       - build-android
@@ -358,6 +410,11 @@ jobs:
           cd release-assets
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
+      - name: Attest SLSA build provenance
+        if: needs.plan.outputs.tag != '' && !github.event.repository.private
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-assets/*
       - name: Install Cosign
         if: needs.plan.outputs.tag != '' && !github.event.repository.private
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
@@ -365,6 +422,7 @@ jobs:
         if: needs.plan.outputs.tag != '' && !github.event.repository.private
         run: |
           set -euo pipefail
+          cosign version
           cd release-assets
           for f in *; do
             case "$f" in
@@ -372,11 +430,6 @@ jobs:
             esac
             cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
           done
-      - name: Attest SLSA build provenance
-        if: needs.plan.outputs.tag != '' && !github.event.repository.private
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: release-assets/*
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signed-release-assets
@@ -470,7 +523,10 @@ jobs:
         if: '!github.event.repository.private'
         env:
           DIGEST: ${{ steps.manifest.outputs.digest }}
-        run: cosign sign --yes "${OCI_IMAGE}@${DIGEST}"
+        run: |
+          set -euo pipefail
+          cosign version
+          cosign sign --yes "${OCI_IMAGE}@${DIGEST}"
       - name: Attest OCI provenance
         if: '!github.event.repository.private'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -592,7 +648,6 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-          registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
