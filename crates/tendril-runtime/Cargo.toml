@@ -16,6 +16,8 @@ categories.workspace = true
 default = []
 p2p-iroh = ["dep:iroh"]
 p2p-iroh-services = ["p2p-iroh", "dep:iroh-services", "dep:data-encoding"]
+# Native interface enumeration for `advertise: auto` hosts (not used on Android).
+auto-advertise = ["dep:netdev"]
 
 [dependencies]
 async-trait.workspace = true
@@ -27,6 +29,7 @@ iroh-services = { workspace = true, optional = true }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+socket2 = "0.6"
 subtle.workspace = true
 tendril-core.workspace = true
 tendril-relay.workspace = true
@@ -36,6 +39,9 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 url.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(not(any(target_os = "android", target_arch = "wasm32")))'.dependencies]
+netdev = { version = "0.47", default-features = false, optional = true }
 
 # std `File::lock` is unsupported on Android; the state store takes its `flock` through rustix there.
 [target.'cfg(target_os = "android")'.dependencies]

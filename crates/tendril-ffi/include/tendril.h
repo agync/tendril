@@ -155,7 +155,79 @@ int32_t tendril_endpoint_enroll_initiate(
     char **out_json
 );
 
-/* Session lifecycle and polled queue API (independent of TendrilEndpoint lifetime once opened). */
+/*
+ * Pairing URIs and routes. Every out_json string is freed with tendril_string_free.
+ *
+ * tendril_endpoint_configure_transports_json also accepts advertised_endpoints (array of
+ * strings), relay_auth_origins (array of "scheme://host[:port]"; relay admission material is
+ * attached only to these origins or to the explicit endpoint of a call), advertise ("auto",
+ * default, or "explicit"), route_policy ("all_signed", default, "committed_only" or "none") and
+ * sign_routes (default true).
+ */
+/* options_json_opt: NULL or {"kind": "auto"|"lan"|"remote", "host_name": str, "sign_routes": bool}.
+ * out_json: {"uri", "code_kind", "dropped", "uri_len", "qr_version_m", "route_seq"}. */
+int32_t tendril_endpoint_issue_pairing_uri(
+    TendrilEndpoint *ep,
+    const char *options_json_opt,
+    char **out_json
+);
+/* options_json_opt: NULL or {"route_policy", "save_route", "endpoint", "code"}; an empty "code"
+ * is rejected before any dial.
+ * out_json: {"device_id", "host_id", "sas", "status", "host_confirmed", "provider", "endpoint",
+ * "committed", "route_check", "routes_persisted", "routes_reason", "skipped"}. "routes_reason" is
+ * null, or "unsigned_uri", "route_key_rotated" or "stale_route_seq" when no routes were written. */
+int32_t tendril_endpoint_pair_uri(
+    TendrilEndpoint *ep,
+    const char *pairing_uri,
+    const char *name_opt,
+    const char *device_kind_opt,
+    const char *options_json_opt,
+    char **out_json
+);
+int32_t tendril_endpoint_pair_v2_uri(
+    TendrilEndpoint *ep,
+    const char *pairing_uri,
+    const char *name_opt,
+    const char *device_kind_opt,
+    const char *options_json_opt,
+    char **out_json
+);
+/* routes_json: JSON array of endpoint strings replacing the operator routes. Returns 0,
+ * TENDRIL_ERR_INVALID_ARG for a bad list (nothing is written), TENDRIL_ERR_NOT_FOUND for an
+ * unknown peer, or TENDRIL_ERR_PROTOCOL for a pending or revoked one. */
+int32_t tendril_endpoint_set_peer_routes(
+    TendrilEndpoint *ep,
+    const char *peer_id,
+    const char *routes_json
+);
+/* out_json: {"routes": [{"hint", "source"}], "route_meta": {"seq", "issued_at", "origin"} | null,
+ * "last_route_set": {"outcome", "seq"} | null}. */
+int32_t tendril_endpoint_peer_routes(TendrilEndpoint *ep, const char *peer_id, char **out_json);
+/* source_opt: NULL or "operator", "signed", "committed", "all". */
+int32_t tendril_endpoint_clear_peer_routes(
+    TendrilEndpoint *ep,
+    const char *peer_id,
+    const char *source_opt
+);
+/* Offline application of a fresh signed pairing URI. options_json_opt: NULL or
+ * {"replace_routes", "route_policy"}. out_json: {"peer_id", "applied", "reason", "route_seq"}. */
+int32_t tendril_endpoint_apply_route_uri(
+    TendrilEndpoint *ep,
+    const char *pairing_uri,
+    const char *options_json_opt,
+    char **out_json
+);
+/* Host re-scan. snapshot_json_opt: NULL or the complete network snapshot
+ * {"networks": [{"id", "iface", "if_index", "transports", "addrs"}]}. out_json may be NULL;
+ * otherwise {"route_seq", "changed"}. */
+int32_t tendril_endpoint_refresh_routes(
+    TendrilEndpoint *ep,
+    const char *snapshot_json_opt,
+    char **out_json
+);
+
+/* Session lifecycle and polled queue API (independent of TendrilEndpoint lifetime once opened).
+ * A NULL or "" endpoint connects over the peer's stored routes. */
 TendrilSession *tendril_session_connect(
     TendrilEndpoint *ep,
     const char *endpoint,
@@ -164,6 +236,15 @@ TendrilSession *tendril_session_connect(
     const char *grant_json
 );
 TendrilSession *tendril_session_accept(TendrilEndpoint *ep, uint64_t timeout_ms);
+/* options_json: NULL or {"wire": 1|2, "grant": obj, "endpoint": str, "relay_host": str,
+ * "recovery_uri": str, "replace_routes": bool, "route_policy": str}. "relay_host" is the expected
+ * relay host of an explicit "endpoint" (the Iroh relay mode for iroh://), as in
+ * tendril_session_connect. */
+TendrilSession *tendril_session_connect_with_options(
+    TendrilEndpoint *ep,
+    const char *target_host_id,
+    const char *options_json
+);
 int32_t tendril_session_shutdown(TendrilSession *sess);
 int32_t tendril_session_export_roster_json(const TendrilSession *sess, char **out_json);
 void tendril_session_free(TendrilSession *sess);

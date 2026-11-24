@@ -1,20 +1,35 @@
 //! Async Tokio runtime, pluggable untrusted path providers, rate limiters, and persistence.
 
+pub mod advertise;
+pub mod announce;
 pub mod driver;
 pub mod error;
 pub mod group;
 pub mod provider;
 pub mod providers;
 pub mod rate_limit;
+pub mod redact;
 pub mod router;
 pub mod store;
 pub mod v2_driver;
 pub mod wake;
 
+pub use advertise::{
+    AdvertiseInputs, AdvertiseMode, ListAddrSource, LocalAddr, LocalAddrSource, NativeAddrSource,
+    NetworkSnapshot, ServedListener, SnapshotNetwork, Transport, auto_endpoints,
+};
+pub use announce::{
+    AddressSource, AnnounceEvent, CLIENT_ROUTE_SET_INTERVAL_MS, DEFAULT_ROUTE_REFRESH_INTERVAL,
+    EMPTY_SNAPSHOT_DEBOUNCE_MS, HOST_ROUTE_SET_DEBOUNCE_MS, HOST_ROUTE_SET_INTERVAL_MS,
+    IngestIgnored, IngestOutcome, LastRouteSet, RefreshOutcome, RosterAccess, RouteAnnouncer,
+    RouteSetLimiter, RouteSetSink, ingest_route_sets,
+};
 pub use driver::{
-    ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT, PairDriveResult, SessionDriver, SessionEvent,
-    dial_with_policy, dial_with_policy_verified, drive_m2m_enroll_initiator_with_floor,
-    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_floor,
+    AttemptError, CandidateFailure, ConcurrentSession, ConnectOpts, ConnectResult,
+    DEFAULT_PRE_AUTH_TIMEOUT, PairDriveResult, PairPolicyOptions, PairPolicyResult, RecoveryRoutes,
+    SessionDriver, SessionEvent, dial_with_policy, dial_with_policy_verified,
+    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_store,
+    drive_pair_initiator_with_floor, drive_pair_initiator_with_policy,
     drive_pair_initiator_with_store, drive_pair_responder, drive_pair_responder_with_options,
     drive_pair_responder_with_policy, drive_pair_responder_with_policy_and_store,
     drive_pair_responder_with_store, pairing_path_kind_for_provider, pinned_pairing_floor,
@@ -24,7 +39,7 @@ pub use driver::{
     drive_m2m_enroll_initiator, drive_m2m_enroll_initiator_with_timeout, drive_pair_initiator,
     drive_pair_initiator_with_timeout,
 };
-pub use error::RuntimeError;
+pub use error::{RelayOffline, RuntimeError};
 pub use group::{
     ADMIN_SESSION_IDLE_TIMEOUT, BOOTSTRAP_COMMIT_TIMEOUT, BroadcastReport,
     DEFAULT_GROUP_DIAL_BUDGET, GroupEvent, GroupFrameKind, GroupFrameOutcome, GroupHub, GroupPool,
@@ -58,12 +73,14 @@ pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
 pub use store::{RosterStamp, StateStore, deserialize_identity_json, serialize_identity_json};
 pub use v2_driver::{
     ConcurrentV2Session, DEFAULT_ARGON2_ACQUIRE_TIMEOUT, DEFAULT_ARGON2_CONCURRENCY,
-    V2PairDriveResult, V2ResponderConfig, V2ResponderState, V2SessionDriver, WakeDialOptions,
-    drive_v2_pake_pair_initiator, drive_v2_pake_pair_initiator_with_store,
-    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder,
-    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
-    drive_v2_session_initiator, drive_v2_session_responder, wake_and_connect_v2_session,
-    wake_and_dial_v2,
+    DEFAULT_INITIATOR_ARGON2_PERMITS, V2_RUNG_BUDGET_FAR, V2_RUNG_BUDGET_NEAR, V2PairDriveResult,
+    V2ResponderConfig, V2ResponderState, V2SessionDriver, WakeDialOptions,
+    drive_v2_pair_initiator_with_policy, drive_v2_pake_pair_initiator,
+    drive_v2_pake_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_timeout,
+    drive_v2_pake_pair_responder, drive_v2_pake_pair_responder_with_options,
+    drive_v2_pake_pair_responder_with_store, drive_v2_session_initiator,
+    drive_v2_session_responder, initiator_argon2_available, initiator_argon2_peak,
+    set_initiator_argon2_permits, wake_and_connect_v2_session, wake_and_dial_v2,
 };
 pub use wake::{
     ApnsAps, ApnsPayload, DEFAULT_WAKE_COALESCE_INTERVAL_SECS, DEFAULT_WAKE_TIMEOUT,

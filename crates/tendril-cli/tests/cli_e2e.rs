@@ -1548,26 +1548,43 @@ fn cli_v1_pairing_rejects_v2_floored_host_with_zero_wire_bytes_sent() {
         .unwrap();
 
     let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    tcp.set_nonblocking(true).unwrap();
     let addr = tcp.local_addr().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_c = std::sync::Arc::clone(&stop);
+    // The policy driver checks the floor before any dial, so no connection is expected. A local
+    // service may probe new loopback listeners with `GET /`; those requests are not counted.
     let accept_thread = std::thread::spawn(move || {
-        let (mut sock, _) = tcp.accept().unwrap();
-        sock.set_read_timeout(Some(Duration::from_millis(250)))
-            .unwrap();
         let mut received = Vec::new();
-        let _ = sock.read_to_end(&mut received);
+        while !stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+            match tcp.accept() {
+                Ok((mut sock, _)) => {
+                    sock.set_nonblocking(false).unwrap();
+                    sock.set_read_timeout(Some(Duration::from_millis(250)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let _ = sock.read_to_end(&mut bytes);
+                    if !bytes.starts_with(b"GET / ") {
+                        received.extend_from_slice(&bytes);
+                    }
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
         received
     });
 
-    let uri = PairingUri {
-        host_name: "v2-floored-host".to_owned(),
-        code: "TND-1234-5678".to_owned(),
-        host_static_pub: *host_identity.static_key().public_bytes(),
-        host_signing_pub_hash: host_identity.signing_key().public_key().sha256_hash(),
-        endpoints: vec![format!("direct:{addr}")],
-        host_id: Some(host_identity.host_id().to_owned()),
-        rotation_seq: Some(host_identity.rotation_seq()),
-    }
-    .encode();
+    let uri = PairingUri::new(
+        "v2-floored-host",
+        "TND-1234-5678",
+        *host_identity.static_key().public_bytes(),
+        host_identity.signing_key().public_key().sha256_hash(),
+        vec![format!("direct:{addr}")],
+        Some(host_identity.host_id().to_owned()),
+        Some(host_identity.rotation_seq()),
+    )
+    .try_encode()
+    .unwrap();
 
     let pair_out = run_tendril(cli_dir.path(), &["pair", "--pairing-uri", &uri]);
     assert!(
@@ -1580,6 +1597,8 @@ fn cli_v1_pairing_rejects_v2_floored_host_with_zero_wire_bytes_sent() {
         "unexpected stderr: {stderr}"
     );
 
+    std::thread::sleep(Duration::from_millis(100));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let wire_bytes = accept_thread.join().unwrap();
     assert!(
         wire_bytes.is_empty(),
@@ -3492,4 +3511,429 @@ async fn sec03_v2_dial_persists_revoked_state_on_key_mismatch() {
         PeerState::Revoked,
         "SEC-03: subsequent v2 dial must preserve PeerState::Revoked on disk without clobbering"
     );
+}
+
+fn spawn_serve(
+    state_dir: &std::path::Path,
+    args: &[&str],
+) -> (
+    KillOnDrop,
+    BufReader<std::process::ChildStdout>,
+    serde_json::Value,
+) {
+    let mut serve = KillOnDrop(
+        Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(state_dir)
+            .arg("serve")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve"),
+    );
+    let mut stdout = BufReader::new(serve.0.stdout.take().expect("serve stdout"));
+    let listening = read_json_line(&mut stdout);
+    assert_eq!(listening["event"], "listening", "{listening}");
+    (serve, stdout, listening)
+}
+
+fn init_pair_dirs(host_id: &str) -> (TempDir, TempDir, String) {
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", host_id])
+            .status
+            .success()
+    );
+    let init_cli = run_tendril(client_dir.path(), &["init"]);
+    assert!(init_cli.status.success());
+    let cli_info: serde_json::Value = serde_json::from_slice(&init_cli.stdout).expect("cli init");
+    let cli_dev_id = cli_info["device_id"].as_str().expect("dev id").to_owned();
+    (host_dir, client_dir, cli_dev_id)
+}
+
+fn json_out(out: &std::process::Output) -> serde_json::Value {
+    assert!(
+        out.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("stdout json")
+}
+
+#[test]
+fn cli_e2e_signed_uri_pair_persists_routes_and_dials_without_endpoint() {
+    let (host_dir, client_dir, cli_dev_id) = init_pair_dirs("host-uri");
+    let (_serve, mut stdout, listening) = spawn_serve(
+        host_dir.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--embedded-relay",
+            "--relay-host",
+            "127.0.0.1",
+            "--advertise-endpoint",
+            "overlay://127.0.0.1:9",
+            "--issue-code",
+            "auto",
+        ],
+    );
+    let uri = listening["pairing_uri"].as_str().expect("pairing_uri");
+    assert!(uri.contains("&rq=") && uri.contains("&rs="), "{uri}");
+    assert!(listening["route_seq"].as_u64().unwrap() >= 1);
+    assert_eq!(listening["uri_len"].as_u64().unwrap(), uri.len() as u64);
+    assert!(listening["qr_version_m"].as_u64().unwrap() >= 1);
+    let direct = format!(
+        "direct:{}",
+        listening["direct_endpoint"].as_str().expect("direct")
+    );
+    let relay_url = listening["embedded_relay_url"].as_str().expect("relay url");
+    let advertised: Vec<&str> = listening["advertised_endpoints"]
+        .as_array()
+        .expect("advertised_endpoints")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(advertised.contains(&direct.as_str()), "{advertised:?}");
+    assert!(advertised.contains(&relay_url), "{advertised:?}");
+    assert!(
+        advertised.contains(&"overlay://127.0.0.1:9"),
+        "{advertised:?}"
+    );
+    assert!(listening["dropped_endpoints"].is_array());
+    let code = listening["pairing_code"].as_str().expect("code");
+    assert!(uri.contains(code));
+
+    let paired = json_out(&run_tendril(
+        client_dir.path(),
+        &["pair", "--pairing-uri", uri],
+    ));
+    assert_eq!(paired["route_check"], "verified");
+    assert_eq!(paired["committed"], true);
+    assert_eq!(paired["provider"], "Direct");
+    assert_eq!(paired["endpoint"], direct.as_str());
+    let persisted = paired["routes_persisted"].as_array().expect("routes");
+    assert_eq!(persisted.len(), advertised.len(), "{paired}");
+    assert!(
+        persisted.iter().all(|r| r["source"] == "signed"),
+        "{paired}"
+    );
+    let sas = paired["sas"].as_str().expect("sas").to_owned();
+    assert_eq!(read_json_line(&mut stdout)["event"], "paired");
+
+    assert_eq!(paired["status"], "active", "the URI pin confirms the host");
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", &sas])
+            .status
+            .success()
+    );
+    let grant = String::from_utf8(json_mint(host_dir.path(), &cli_dev_id)).unwrap();
+
+    let dialed = json_out(&run_tendril(
+        client_dir.path(),
+        &[
+            "dial",
+            "--target",
+            "host-uri",
+            "--grant",
+            grant.trim(),
+            "--message",
+            "hello-endpoint-free",
+        ],
+    ));
+    assert_eq!(dialed["provider"], "Direct");
+    assert_eq!(dialed["endpoint"], direct.as_str());
+    assert_eq!(read_json_line(&mut stdout)["event"], "session_established");
+    let data = read_json_line(&mut stdout);
+    assert_eq!(data["utf8"], "hello-endpoint-free");
+}
+
+fn json_mint(host_dir: &std::path::Path, peer: &str) -> Vec<u8> {
+    let mint = run_tendril(host_dir, &["mint", peer, "--cap", "fs.read"]);
+    assert!(mint.status.success());
+    mint.stdout
+}
+
+#[test]
+fn cli_e2e_unsigned_uri_persists_nothing_and_dial_needs_reapproval() {
+    let (host_dir, client_dir, cli_dev_id) = init_pair_dirs("host-unsigned");
+    let (_serve, mut stdout, listening) = spawn_serve(
+        host_dir.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--issue-code",
+            "auto",
+            "--no-route-signature",
+        ],
+    );
+    let uri = listening["pairing_uri"].as_str().expect("pairing_uri");
+    assert!(!uri.contains("&rs="), "{uri}");
+    assert!(listening["route_seq"].is_null());
+
+    let conflict = run_tendril(
+        client_dir.path(),
+        &[
+            "pair",
+            "--pairing-uri",
+            uri,
+            "--save-route",
+            "--route-policy",
+            "none",
+        ],
+    );
+    assert!(!conflict.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr)
+            .contains("--save-route conflicts with --route-policy none")
+    );
+
+    let paired = json_out(&run_tendril(
+        client_dir.path(),
+        &["pair", "--pairing-uri", uri],
+    ));
+    assert_eq!(paired["route_check"], "unsigned");
+    assert_eq!(paired["routes_persisted"], serde_json::json!([]));
+    assert_eq!(paired["routes_reason"], "unsigned_uri");
+    let sas = paired["sas"].as_str().expect("sas").to_owned();
+    assert_eq!(read_json_line(&mut stdout)["event"], "paired");
+    assert_eq!(paired["status"], "active", "the URI pin confirms the host");
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", &sas])
+            .status
+            .success()
+    );
+
+    let dial = run_tendril(client_dir.path(), &["dial", "--target", "host-unsigned"]);
+    assert!(!dial.status.success());
+    let stderr = String::from_utf8_lossy(&dial.stderr);
+    assert!(
+        stderr.contains("no dialable stored routes for host-unsigned"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn cli_e2e_serve_redacts_pairing_uri() {
+    let (host_dir, _client_dir, _) = init_pair_dirs("host-redact");
+    let (_serve, _stdout, listening) = spawn_serve(
+        host_dir.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--issue-code",
+            "auto",
+            "--redact-logs",
+        ],
+    );
+    assert_eq!(listening["pairing_uri"], "<redacted>");
+    assert_eq!(listening["pairing_code"], "<redacted>");
+    assert!(listening["route_seq"].as_u64().is_some());
+}
+
+#[test]
+fn cli_e2e_issue_code_lan_with_relay_issues_lan_only_uri() {
+    use tendril_core::pairing::{PairingCodeKind, PairingUri};
+
+    let (host_dir, _client_dir, _) = init_pair_dirs("host-lan");
+    let (_serve, _stdout, listening) = spawn_serve(
+        host_dir.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--embedded-relay",
+            "--issue-code",
+            "lan",
+        ],
+    );
+    let uri = PairingUri::parse(listening["pairing_uri"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        PairingCodeKind::from_code(uri.code.as_str()).unwrap(),
+        PairingCodeKind::Lan2Group
+    );
+    assert!(
+        uri.endpoints.iter().all(|h| h.starts_with("direct:")),
+        "{:?}",
+        uri.endpoints
+    );
+    let relay_url = listening["embedded_relay_url"].as_str().unwrap();
+    // Dropped hints are printed redacted (scheme://host[:port]).
+    let dropped = listening["dropped_endpoints"].as_array().unwrap();
+    assert!(
+        dropped.iter().any(
+            |d| d["hint"] == tendril_runtime::redact::redact_hint(relay_url)
+                && d["reason"] == "lan_code_remote_hint"
+        ),
+        "{dropped:?}"
+    );
+}
+
+#[test]
+fn cli_e2e_pair_rejects_relay_v2_and_malformed_origins() {
+    let client_dir = TempDir::new().expect("client dir");
+    assert!(run_tendril(client_dir.path(), &["init"]).status.success());
+    for args in [
+        vec![
+            "pair",
+            "--endpoint",
+            "127.0.0.1:1",
+            "--code",
+            "TND-ABCD-EFGH",
+            "--wire-v2",
+            "--relay-v2",
+        ],
+        vec![
+            "pair",
+            "--endpoint",
+            "ws://127.0.0.1:1/v2/relay",
+            "--code",
+            "TND-ABCD-EFGH",
+            "--wire-v2",
+        ],
+    ] {
+        let out = run_tendril(client_dir.path(), &args);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(
+                "/v2/relay is not used for pairing; pair over another route, then use dial --relay-v2"
+            ),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = run_tendril(
+        client_dir.path(),
+        &[
+            "pair",
+            "--endpoint",
+            "127.0.0.1:1",
+            "--code",
+            "TND-ABCD-EFGH",
+            "--relay-auth-origin",
+            "ws://127.0.0.1:1/v1/relay",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid --relay-auth-origin"));
+}
+
+#[tokio::test]
+async fn cli_e2e_relay_auth_origin_gates_uri_relay_credentials() {
+    use tendril_core::relay_auth::RelayAuthScope;
+    use zeroize::Zeroizing;
+
+    let relay = RelayServer::bind(RelayConfig {
+        host: "127.0.0.1".to_owned(),
+        auth_secret: Some(Zeroizing::new(b"cli-origin-hmac-secret".to_vec())),
+        auth_scope: RelayAuthScope::All,
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind relay");
+    let relay_handle = relay.spawn();
+    let relay_url = relay_handle.ws_url();
+    let origin = relay_url.trim_end_matches("/v1/relay").to_owned();
+
+    tokio::task::spawn_blocking(move || {
+        let (host_dir, client_dir, _) = init_pair_dirs("host-origin");
+        let secret_file = host_dir.path().join("relay-secret.txt");
+        write_mode_0600(&secret_file, "cli-origin-hmac-secret\n");
+        let client_secret = client_dir.path().join("relay-secret.txt");
+        write_mode_0600(&client_secret, "cli-origin-hmac-secret\n");
+        let secret = secret_file.to_str().unwrap();
+        // The unspecified direct bind is not advertised, so the URI carries only the relay.
+        let (_serve, mut stdout, listening) = spawn_serve(
+            host_dir.path(),
+            &[
+                "--listen",
+                "0.0.0.0:0",
+                "--relay",
+                &relay_url,
+                "--relay-host",
+                "127.0.0.1",
+                "--relay-auth-secret-file",
+                secret,
+                "--issue-code",
+                "auto",
+            ],
+        );
+        let uri = listening["pairing_uri"].as_str().unwrap().to_owned();
+        assert_eq!(
+            listening["advertised_endpoints"],
+            serde_json::json!([relay_url])
+        );
+        let client_secret = client_secret.to_str().unwrap();
+
+        let withheld = run_tendril(
+            client_dir.path(),
+            &[
+                "pair",
+                "--pairing-uri",
+                &uri,
+                "--relay-auth-secret-file",
+                client_secret,
+            ],
+        );
+        assert!(!withheld.status.success());
+        let stderr = String::from_utf8_lossy(&withheld.stderr);
+        assert!(stderr.contains("relay_auth_unconfigured"), "{stderr}");
+
+        let paired = json_out(&run_tendril(
+            client_dir.path(),
+            &[
+                "pair",
+                "--pairing-uri",
+                &uri,
+                "--relay-auth-secret-file",
+                client_secret,
+                "--relay-auth-origin",
+                &origin,
+            ],
+        ));
+        assert_eq!(paired["provider"], "Relay");
+        assert_eq!(paired["endpoint"], relay_url.as_str());
+        assert_eq!(read_json_line(&mut stdout)["event"], "paired");
+    })
+    .await
+    .expect("spawn_blocking");
+}
+
+#[test]
+fn cli_e2e_lan_code_on_remote_uri_is_path_disallowed_without_dialing() {
+    use tendril_core::identity::EndpointIdentity;
+    use tendril_core::pairing::PairingUri;
+
+    let client_dir = TempDir::new().expect("client dir");
+    assert!(run_tendril(client_dir.path(), &["init"]).status.success());
+    let host = EndpointIdentity::generate().unwrap();
+    // A TEST-NET-1 destination is Remote; a dial attempt would hang instead of failing fast.
+    let uri = PairingUri::new(
+        "remote-host",
+        "TND-ABCD-EFGH-JKLM",
+        *host.static_key().public_bytes(),
+        host.signing_key().public_key().sha256_hash(),
+        vec!["direct:192.0.2.1:9".to_owned()],
+        Some(host.host_id().to_owned()),
+        Some(host.rotation_seq()),
+    )
+    .try_encode()
+    .unwrap();
+    let started = std::time::Instant::now();
+    let out = run_tendril(
+        client_dir.path(),
+        &["pair", "--pairing-uri", &uri, "--code", "TND-ABCD-EFGH"],
+    );
+    assert!(!out.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = stderr
+        .lines()
+        .find_map(|l| serde_json::from_str(l).ok())
+        .expect("attempt_failed json line");
+    assert_eq!(report["event"], "attempt_failed");
+    assert_eq!(report["error_code"], "path_disallowed", "{stderr}");
+    assert_eq!(report["committed"], false);
+    assert_eq!(report["failures"], serde_json::json!([]));
+    assert_eq!(report["skipped"][0]["reason"], "lan_code_remote_hint");
 }

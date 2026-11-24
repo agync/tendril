@@ -127,7 +127,8 @@ Before transmitting `msg3`, the initiator:
 1. Decrypts `msg2` with `Noise_XXhfs`, recording `h_pre` immediately prior to payload decryption.
 2. Derives `hello_seal_key` from `reconnect_secret` and `rendezvous_nonce`, decrypts `sealed_envelope` (`nonce = 0x00^12`, `aad = h_pre`), verifies trailing zero padding in constant time, and parses `HostHello`.
 3. Verifies `proto_version == 2`, `host_id == target_host_id`, `signing_pub`, `remote_static`, and any `rotation` chain against the stored `Roster` pin. If verification fails, the initiator aborts immediately without writing `msg3`.
-4. Encodes `SessionHello` into a padded `msg3` payload (`uint16_be(len) || session_hello_json || 0x00...`) rounded up to the smallest bucket in `[512, 1024, 2048, 4096, 8192, 16384, 32768, 63488]`.
+   When the connect carries a recovery URI or an operator relay key, the initiator also runs the session route checks (`spec/pairing-v1.md` Section 6.5) here, after the rotation chain verifies and before applying the rotation. The relay key check compares the operator `URL#key` (and any URI `rp`) with the Ed25519 component of the authenticated `HostHello.signing_pub`, even when no URI is supplied. A failure aborts without writing `msg3`.
+4. Encodes `SessionHello` (which may carry `route_seq`, `spec/wire-v1.md` Section 5.2.2) into a padded `msg3` payload (`uint16_be(len) || session_hello_json || 0x00...`) rounded up to the smallest bucket in `[512, 1024, 2048, 4096, 8192, 16384, 32768, 63488]`.
 
 On `msg3`, the responder MUST verify that `peer_static` matches the exact `RosterEntry` whose `reconnect_secret` authenticated `msg1`, enforce `PeerState::Active`, CRLs, `SessionHello.device_id == device_id(peer_static)`, and any presented `Grant`.
 
@@ -173,13 +174,24 @@ pake_context_tag  = HKDF-SHA256(ikm = pake_prologue_key, salt = channel_salt, in
      - `sealed_host_hello = ChaCha20Poly1305(key = pake_hello_key, nonce = 0x00^12, aad = h_pre, pt = host_hello_json)` (`proto_version == 2`).
      - `resp_confirm_mac = HMAC-SHA256(pake_confirm_key, "tendril-v2-pake-resp\0" || h_pre || sealed_host_hello)` (`32` B).
      - `msg2` payload = `uint16_be(len(sealed_host_hello)) || sealed_host_hello || resp_confirm_mac (32 B) || 0x00...` padded to `bucket`.
-   Initiator verifies Noise AEAD, constant-time zero padding, and `resp_confirm_mac`, unseals `HostHello`, verifies `proto_version == 2` and any `PinnedHost`, and computes `pairing_sas(post_msg2_hash)`. On any failure, initiator aborts with `PairingAuthFailed` before emitting `msg3`.
+   Initiator verifies Noise AEAD, constant-time zero padding, and `resp_confirm_mac`, unseals `HostHello`, verifies `proto_version == 2` and any `PinnedHost`, and computes `pairing_sas(post_msg2_hash)`. On any failure, initiator aborts with `PairingAuthFailed` before emitting `msg3`. An initiator pairing from a multi-route URI, or from an explicit operator `/v1/relay` endpoint with `#key` and no URI, then runs the relay key check (`rp` or operator `URL#key`), and for a URI the `rs` check, of `spec/pairing-v1.md` Sections 6.4 and 6.5 and computes `init_confirm_mac` only when it commits (Section 3.2.3).
 4. **`msg3` (Initiator -> Responder):** Initiator encodes `PairClaim` JSON (`code_mac` omitted; `signing_pub` and `enroll_proof` set per `pairing-v1.md` Section 4.1 with `h = post_msg2_hash`) and computes:
    - `init_confirm_mac = HMAC-SHA256(pake_confirm_key, "tendril-v2-pake-init\0" || post_msg2_hash || claim_json)` (`32` B).
    - `msg3` payload = `init_confirm_mac (32 B) || uint16_be(len(claim_json)) || claim_json || 0x00...` padded to the smallest `V2_HANDSHAKE_BUCKETS` size that fits `32 + 2 + len(claim_json)`, so `msg3` length does not reveal the `PairClaim` size.
    Responder verifies Noise AEAD, a bucket-sized payload, constant-time zero padding, and `init_confirm_mac` over `claim_json` in constant time, rejecting invalid `msg3` (`PairingAuthFailed`) without charging or burning live pairing codes (replaying a captured `msg1` hits the `(channel_salt, init_mac)` replay cache and is routed to the decoy path).
    **Size note:** a keyless claim pads to the `4096` bucket and a keyed claim (about 7.2 KB) to `16384`. While pre-change and new initiators coexist, a passive observer can tell them apart by `msg3` size; it learns nothing else.
 5. **Completion:** Responder rejects a claim carrying exactly one of `signing_pub` and `enroll_proof` (`protocol_error`), burns the matched pairing code, verifies the signing key claim when present (`pairing-v1.md` Section 4.1; failures keep the code burned and the roster unchanged), records the peer per the `pairing-v1.md` Section 4.1 recording rules (a new entry, or an `active` entry the claim adds a key to, becomes `Pending`; any other accepted claim keeps the entry's state) with `min_wire_version = 2` and exported `(reconnect_secret, mailbox_secret)` persisted immediately, and sends the encrypted `PairResponse` over transport mode before closing. Every `PairResponse` (`Success` and `Error`) is encoded as `uint16_be(len(json)) || json || 0x00...` padded to the smallest `V2_HANDSHAKE_BUCKETS` size (`[4096, 16384, 32768, 63488]`, minimum `4096`), so success (which embeds the hybrid `host_signing_pub`) and failure responses have identical wire length; the initiator rejects a response whose length is not a bucket or whose padding is non-zero. The responder holds at most `MAX_LIVE_PAIRING_CODES = 4` concurrently live pairing codes (`CoreError::ProtocolViolation` when `>= 4` unexpired codes exist), preserving the constant-time 4-pass Argon2id padding envelope.
+
+#### 3.2.3 Multi-Rung Initiators
+
+A pairing URI can list several endpoint hints (`spec/pairing-v1.md` Section 6). Every rung that receives `msg1` receives `channel_salt` and `init_mac`, from which a code guess can be tested offline at one `Argon2id` evaluation per guess (the note in Section 3.2.1). A v2 PAKE initiator therefore:
+
+1. MUST try rungs **one at a time**, in provider order, never in parallel, so the oracle reaches only rungs reached after earlier ones failed. Each rung uses a fresh `channel_salt` and a fresh ephemeral key. The default per-rung budget is `2,000 ms` for `Local`, `Direct` and `Overlay` rungs and `4,000 ms` for `P2p`, `Relay` and `Broker` rungs, covering transport, `msg1` and `msg2`. The budget excludes the initiator's `Argon2id` time, which is added on top.
+2. MUST advance to the next rung on any failure before commit (dial, timeout, decoy `msg2`, pin mismatch, `rp` mismatch), except an `Invalid` route statement (`spec/pairing-v1.md` Section 6.5), which ends the attempt.
+3. MUST NOT write `msg3` before `msg2` verifies and the `rp` and `rs` checks pass. It writes `msg3` on at most one rung, built from that rung's `h_post`. After that write begins, every outcome ends the attempt and no other rung is dialed (`spec/pairing-v1.md` Section 6.6).
+4. MUST classify the effective code first and write `msg1` only on a path its kind allows: a malformed code fails with zero dials, and a `Lan2Group` code is sent only on `Lan`-class paths (`spec/pairing-v1.md` Section 6.3).
+5. MUST NOT dial `/v2/relay` hints during pairing. `/v1/relay` hints are dialed with `rp`, and PAKE pairing runs over the identity mailbox.
+6. Applies the embedder's bound on concurrent `Argon2id` derivations (Section 3.2.1) across rungs and attempts alike: a cancelled attempt keeps its slot until its derivation finishes.
 
 ---
 
@@ -197,11 +209,12 @@ Inside Noise transport mode, each outer AEAD frame decrypts to a plaintext paylo
 
 | `frame_type` | Name | Availability | Payload Layout | Semantics |
 |---|---|---|---|---|
-| `0x01`..`0x07` | v1 types | v1 and optional v2 rx | See `spec/wire-v1.md` Section 5 | Legacy unpadded frames; the v2 legacy receive path accepts only this range, so a bare `0x0A` or `0x0B` on v2 is `UnknownInnerFrameType` under every padding policy, including a disabled one |
+| `0x01`..`0x07` | v1 types | v1 and optional v2 rx | See `spec/wire-v1.md` Section 5 | Legacy unpadded frames; the v2 legacy receive path accepts only this range, so a bare `0x0A`, `0x0B` or `0x0C` on v2 is `UnknownInnerFrameType` under every padding policy, including a disabled one |
 | `0x08` | `PADDING` | v2 only | `0..(MAX_TRANSPORT_PLAINTEXT - 1)` zero bytes (`0x00`) | Pure cover traffic; silently discarded after AEAD decrypt and nonce advance |
-| `0x09` | `PADDED` | v2 only | `inner_type (1 B) || real_len (2 B uint16_be) || real_payload || zero_padding` | Length-hidden envelope enclosing one inner frame of type `0x01..=0x03`, `0x05..=0x07`, `0x0A..=0x0B`, or `0x04` via `seal_rekey()` |
+| `0x09` | `PADDED` | v2 only | `inner_type (1 B) || real_len (2 B uint16_be) || real_payload || zero_padding` | Length-hidden envelope enclosing one inner frame of type `0x01..=0x03`, `0x05..=0x07`, `0x0A..=0x0C`, or `0x04` via `seal_rekey()` |
 | `0x0A` | `GROUP_MANIFEST` | v1 and v2 | Compact JSON `GroupManifest`, `<= 32768 B` | Group manifest push or gossip (`spec/groups-v1.md`); sealed inside `0x09 PADDED` on v2 sessions |
 | `0x0B` | `GROUP_RENDEZVOUS` | v1 and v2 | Exactly `60 B` (`group_id || seq || key`) | Group rendezvous key delivery (`spec/groups-v1.md` Section 7); sealed inside `0x09 PADDED` on v2 sessions |
+| `0x0C` | `ROUTE_SET` | v1 and v2 | `route_set_body \|\| sig`, `3455..=5003 B` (`spec/wire-v1.md` Section 5.2) | Host-signed route announcement, responder to initiator only; sealed inside `0x09 PADDED` on v2 sessions. A v2 session with padding disabled neither sends nor receives it |
 
 Receivers MUST reject `0x08` and `0x09` on v1 (`0x01`) sessions (`UnknownInnerFrameType`). Direct application `seal()` calls MUST reject `0x04 REKEY`, `0x08 PADDING`, and `0x09 PADDED` (callers use `seal_rekey()` and `seal_dummy_cover()`).
 
@@ -213,16 +226,16 @@ Standard bucket sizes for total inner plaintext length (before adding the 16-byt
 [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65503]
 ```
 
-- When sealing an inner frame of type `kind in 0x01..=0x07` or `0x0A..=0x0B` with `real_payload`:
+- When sealing an inner frame of type `kind in 0x01..=0x07` or `0x0A..=0x0C` with `real_payload`:
   - `real_payload.len()` MUST satisfy `real_payload.len() <= 65499` (`MAX_TRANSPORT_PLAINTEXT - 4`). Oversized or invalid payloads MUST fail closed BEFORE advancing the TX cipher state, calling `seal_rekey()`, or incrementing TX nonces.
   - Select the smallest bucket `B >= 4 + real_payload.len()`.
   - Emit `0x09 || (kind as u8) || uint16_be(real_payload.len()) || real_payload || 0x00^(B - 4 - real_payload.len())`.
 - When receiving `0x09` `PADDED`:
   - Require `plaintext.len() >= 4`.
-  - Require `inner_type` is in `0x01..=0x07` or `0x0A..=0x0B` (nested `0x08` or `0x09` MUST be rejected).
+  - Require `inner_type` is in `0x01..=0x07` or `0x0A..=0x0C` (nested `0x08` or `0x09` MUST be rejected).
   - Require `real_len <= plaintext.len() - 4`.
   - Verify every trailing padding byte in `plaintext[4 + real_len..]` equals `0x00` in constant time (`subtle::ConstantTimeEq`); reject any non-zero padding byte (`InvalidInnerFramePayload`).
-  - Validate per-type inner payload rules (e.g., `REKEY` empty, `PING`/`PONG` 8 bytes, `CLOSE >= 2` bytes, `GROUP_MANIFEST <= 32768` bytes, `GROUP_RENDEZVOUS` exactly 60 bytes).
+  - Validate per-type inner payload rules (e.g., `REKEY` empty, `PING`/`PONG` 8 bytes, `CLOSE >= 2` bytes, `GROUP_MANIFEST <= 32768` bytes, `GROUP_RENDEZVOUS` exactly 60 bytes, `ROUTE_SET` per the receive-check order of `spec/wire-v1.md` Section 5.2.3).
 - When receiving `0x08` `PADDING` (dummy cover frame):
   - Verify every byte in `plaintext[1..]` equals `0x00` in constant time; reject any non-zero byte.
   - Advance the Noise RX nonce as normal for AEAD decryption and discard the frame without emitting application data.

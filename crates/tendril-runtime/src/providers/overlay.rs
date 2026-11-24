@@ -232,6 +232,33 @@ impl OverlayDialer {
     }
 }
 
+impl OverlayDialer {
+    /// Connects to the first reachable address of a comma-separated list of checked socket
+    /// addresses. Entries must be literals (no lookup happens here), and the connect deadline is
+    /// shared: each attempt gets an equal share of the time left.
+    async fn connect_checked_list(&self, list: &str) -> Result<TcpStream, RuntimeError> {
+        let addrs = list
+            .split(',')
+            .map(str::parse::<SocketAddr>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                RuntimeError::Protocol("overlay address list holds a non-literal entry".to_owned())
+            })?;
+        let deadline = Instant::now() + self.connect_timeout;
+        let mut last = RuntimeError::Timeout("overlay tcp connect timed out");
+        for (i, addr) in addrs.iter().enumerate() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let share = remaining / u32::try_from(addrs.len() - i).unwrap_or(1);
+            match timeout(share, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(err)) => last = err.into(),
+                Err(_) => {}
+            }
+        }
+        Err(last)
+    }
+}
+
 #[async_trait]
 impl PathDialer for OverlayDialer {
     fn provider_id(&self) -> ProviderId {
@@ -240,9 +267,13 @@ impl PathDialer for OverlayDialer {
 
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
         let target = endpoint.strip_prefix("overlay://").unwrap_or(endpoint);
-        let stream = timeout(self.connect_timeout, TcpStream::connect(target))
-            .await
-            .map_err(|_| RuntimeError::Timeout("overlay tcp connect timed out"))??;
+        let stream = if target.contains(',') {
+            self.connect_checked_list(target).await?
+        } else {
+            timeout(self.connect_timeout, TcpStream::connect(target))
+                .await
+                .map_err(|_| RuntimeError::Timeout("overlay tcp connect timed out"))??
+        };
         let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
         let _ = stream.set_nodelay(true);
         Ok(Box::new(IoPathStream::new(

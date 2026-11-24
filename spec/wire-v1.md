@@ -73,7 +73,8 @@ SessionHello = {
   "device_id": string,              // "dev_" + hex_lower(SHA-256(static_pub)[..8])
   "grant"?: Grant,                  // optional grant presented at connect
   "crl_seq"?: uint64,               // highest CRL sequence already cached by initiator
-  "groups"?: [{ "group_id": string, "seq": uint64 }]  // group gossip summary (groups-v1 Section 9), 1..=16 entries, omitted when empty
+  "groups"?: [{ "group_id": string, "seq": uint64 }],  // group gossip summary (groups-v1 Section 9), 1..=16 entries, omitted when empty
+  "route_seq"?: uint64              // 0..=2^53-1; opt-in to 0x0C ROUTE_SET announcements (Section 5.2), omitted otherwise
 }
 
 // msg3 payload, intent = pair (initiator -> responder)
@@ -116,6 +117,7 @@ For human pairing, confirming the peer (`pair.confirm`) and minting capabilities
 1. Decrypt `msg2` and decode `HostHello`; verify `proto_version == 1` and decode `HostHello.signing_pub` as a valid `1984`-byte hybrid signing key (`current_signing`).
 2. For `intent = session`: verify responder static `s` (`current_static`) and `current_signing` against the stored pin `(pinned_signing, pinned_static, pinned_seq)` (where `pinned_signing` may be a full `1984`-byte key or a `32`-byte `SHA-256` hash pin): either `current_static == pinned_static` AND `pinned_signing` matches `current_signing`, OR `HostHello.rotation` is a valid, contiguous `RotationRecord` chain linking `(pinned_signing, pinned_static)` at `pinned_seq` to `(current_signing, current_static)` (where `current_static == rotation.last().new_static_pub` and `current_signing == rotation.last().new_signing_pub`). If neither holds, MUST abort immediately (`HostKeyUnverified`) before sending `msg3` so the initiator's static key is never disclosed to an unverified peer.
 3. For `intent = pair`: if a pinned host key was supplied out of band (for example via QR URI `sh=` hash pin or mandatory M2M enrollment configuration), apply the same check as step 2 before sending `msg3` (and persist the newly resolved full `1984`-byte `current_signing` key when verified from a hash pin). M2M enrollment MUST NOT use unpinned TOFU. On manual human pairing with no pin, proceed using the post-`msg2` handshake hash `h` to bind `code_mac` and verify the transcript SAS.
+4. When the pin comes from a pairing URI that carries `rp`, `rq` or `rs`, or the connect supplies an operator relay key (`URL#key`), run the relay key check (`spec/pairing-v1.md` Section 6.4) against the authenticated `HostHello.signing_pub` and then the route statement check (Section 6.5), in that order and after step 3, before sending `msg3`. For `intent = session` with a recovery URI or an operator relay key, run the session variant of those checks (`spec/pairing-v1.md` Section 6.5): the relay key check applies to the operator `URL#key` even when no URI is supplied, and runs after the rotation chain verifies and before applying the rotation or sending `msg3`. A failure aborts without writing `msg3`.
 
 **Responder:**
 
@@ -171,9 +173,9 @@ Inside Noise transport mode, each outer AEAD frame decrypts to a plaintext paylo
 inner_frame = frame_type (1 byte) || payload (0..=65502 bytes)
 ```
 
-Receivers MUST close the session immediately on a 0-byte transport plaintext or any unrecognized `frame_type`. A `0x0A` payload above `32768` bytes or a `0x0B` payload that is not exactly `60` bytes MUST be rejected (`GroupManifestTooLarge`, `InvalidInnerFramePayload`).
+Receivers MUST close the session immediately on a 0-byte transport plaintext or any unrecognized `frame_type`. A `0x0A` payload above `32768` bytes or a `0x0B` payload that is not exactly `60` bytes MUST be rejected (`GroupManifestTooLarge`, `InvalidInnerFramePayload`). The `0x0C` receive rule is Section 5.2.3 alone: it decides direction, negotiation, drop and close for that tag, and no rule of this section adds a rejection to it.
 
-`SessionHello` is sent by the initiator only. Peers built before the optional `groups` field reject it as an unknown field (`deny_unknown_fields`); initiators therefore omit `groups` when they hold no groups, and this incompatibility is accepted before 1.0.
+`SessionHello` is sent by the initiator only. Peers built before the optional `groups` field reject it as an unknown field (`deny_unknown_fields`); initiators therefore omit `groups` when they hold no groups, and this incompatibility is accepted before 1.0. The optional `route_seq` field follows the same rule (Section 5.2).
 
 | `frame_type` | Name | Payload Layout | Semantics |
 |---|---|---|---|
@@ -186,9 +188,67 @@ Receivers MUST close the session immediately on a 0-byte transport plaintext or 
 | `0x07` | `CLOSE` | `2 B` big-endian `u16` reason code + optional UTF-8 text | Graceful session close (`payload.len() >= 2`) |
 | `0x0A` | `GROUP_MANIFEST` | Compact UTF-8 JSON `GroupManifest`, `<= 32768 B` | Pushes or gossips a signed group manifest (`spec/groups-v1.md`); surfaced to the caller, never auto-ingested |
 | `0x0B` | `GROUP_RENDEZVOUS` | `20 B` ASCII `group_id` `\|\|` `8 B` big-endian `u64` `seq` `\|\|` `32 B` key, exactly `60 B` | Delivers a group rendezvous key from an admin to a member (`spec/groups-v1.md` Section 7) |
+| `0x0C` | `ROUTE_SET` | `route_set_body \|\| sig`, `3455..=5003 B` (Section 5.2) | Host-signed route announcement, responder to initiator only (`spec/pairing-v1.md` Section 6.11) |
 
 ### 5.1 Noise Rekey Mechanics
 
 - A sender initiates rekeying by encrypting and sending an empty `0x04 REKEY` frame under the current outgoing cipher state, and MUST immediately call `rekey_outgoing()` afterwards so the next sent frame uses the rotated key.
 - A receiver decrypts `0x04 REKEY` under the current incoming cipher state, MUST assert its payload is empty, MUST immediately call `rekey_incoming()`, and MUST re-check active session grants against the latest `RevocationList`.
 - Peers SHOULD initiate `0x04 REKEY` automatically every `1_048_576` (`2^20`) sent frames or every `15` minutes of session lifetime, whichever occurs first.
+
+### 5.2 Route Set Announcement (`0x0C ROUTE_SET`)
+
+A responder (host) tells a paired initiator (client) which routes it currently advertises. The statement is signed by the host's hybrid signing key, so a relay or on-path attacker cannot forge or reorder it. Acceptance, persistence and replay rules are in `spec/pairing-v1.md` Section 6.11.
+
+#### 5.2.1 Exact Signed Bytes and Payload
+
+```text
+route_set_body =
+  version     ( 1 B)  0x01
+  static_pub  (32 B)  host Noise static public key (current)
+  sh          (32 B)  SHA-256 of the host's current 1984-byte hybrid signing public key
+  seq         ( 8 B)  uint64_be, 1..=2^53-1
+  issued_at   ( 8 B)  uint64_be, Unix seconds
+  count       ( 1 B)  0..=6
+  routes      (var)   count times: len (2 B uint16_be, 1..=256) || hint (len bytes UTF-8)
+
+route_set_signed_bytes = "tendril-route-set-v1\0" (21 B) || route_set_body
+sig      (3373 B) = hybrid Ed25519 || ML-DSA-65 signature over route_set_signed_bytes (ML-DSA-65 context "tendril-hybrid-v1")
+0x0C payload       = route_set_body || sig
+```
+
+- Bounds: `route_set_body` is `82..=1630` bytes; the payload is `3455..=5003` bytes (`MAX_ROUTE_SET_PAYLOAD = 5003`); the signed bytes are at most `1651` bytes.
+- Each hint passes the pairing endpoint hint syntax (`spec/pairing-v1.md` Section 6.1), contains no `#`, is not `local:` or `unix://`, and appears once. Hints appear in announced-set order (`spec/pairing-v1.md` Section 6.11.1). `count = 0` is valid: the host currently advertises nothing.
+- The Ed25519 half is produced by the same Ed25519 identity key that signs the pairing URI route statement; the ML-DSA-65 half makes the in-session statement post-quantum, like rotation records. Verification requires both halves strictly.
+- Deterministic test vectors are in `spec/vectors/routes.json`.
+
+#### 5.2.2 Negotiation and Direction
+
+| Item | Rule |
+|---|---|
+| Direction | Responder to initiator only. A responder that receives `0x0C` MUST close the session (`InvalidInnerFramePayload("route set from initiator")`). |
+| Opt-in | The initiator sets `SessionHello.route_seq` (`0..=2^53-1`) to signal that it understands `0x0C` and applies announcements. The value is the stored route sequence when that sequence came from an announcement or an approved replacement, else `0` (a sequence learned only from a URI, so the host's equal-sequence set may still add hints the QR trimmed). It is fixed before `msg3` is built. |
+| When an initiator sends it | Only when the effective route policy is `all_signed` and the target entry has route metadata (it once verified a signed URI or announcement from this host). Under `committed_only` or `none`, or without metadata, the field is omitted. |
+| When the host sends | (a) Once right after the session is established, before any other host-initiated frame, iff the client sent `route_seq` and the host's current `seq > route_seq`. (b) Mid-session after a change of its advertised set, to every live session whose client sent `route_seq`. |
+| Host rate limit | Per session: changes are debounced `2 s` and coalesced (the latest set wins); at most one `0x0C` per `30 s` after the first. |
+| Client rate limit | Per session: at most one `0x0C` processed per `10 s`; extra frames inside the window are dropped before signature verification. |
+| Wire v2 | `0x0C` travels only inside `0x09 PADDED` (`spec/wire-v2.md` Section 5.1). A session with padding disabled neither sends nor receives it. Before sealing, the host checks that the session's padding policy has a bucket of at least `4 + payload_len` bytes; if not, it does not send `0x0C` on that session (the failure is recorded locally) and keeps the session open. The default buckets always fit. |
+
+#### 5.2.3 Receive-Check Order
+
+After AEAD decryption and (Wire v2) `0x09` unpadding, receivers run these checks in order:
+
+1. **Tag.** `0x0C` is a known inner frame type. Only the generic `MAX_TRANSPORT_PLAINTEXT` bound applies at this step; there is no per-type length check here.
+2. **Direction.** A responder closes the session (`InvalidInnerFramePayload("route set from initiator")`).
+3. **Negotiation.** An initiator that did not send `route_seq` drops the frame here, before any payload byte is parsed: no decode, no close, no queue.
+4. **Structure.** A payload outside `3455..=5003` bytes, a bad length prefix, `count > 6`, a hint length of `0` or over `256`, a hint that fails the rules above (syntax, `#`, `local:` or `unix://`, duplicates), a `seq` of `0` or above `2^53-1`, a `version` other than `0x01`, or trailing bytes closes the session (`InvalidInnerFramePayload("route set")`), matching `0x0A` and `0x0B`.
+5. **Queue.** At most `4` decoded sets are queued for the application layer; older entries are dropped. `0x0C` payloads are never delivered to the application stream.
+6. **Semantics.** The rate limit, then the acceptance rules of `spec/pairing-v1.md` Section 6.11.3 (signature, key binding, sequence, issue time, policy).
+
+Semantic rejections (rate-limit drops, bad signature, key mismatch, stale sequence, future issue time, policy) never close the session; the receiver records the reason locally. Structural failures (step 4) close the session, but only for an initiator that sent `route_seq`: an initiator that omitted it has already dropped the frame at step 3, so a malformed `0x0C` never reaches step 4 on that session and is neither parsed nor rejected. Apart from that negotiation drop (step 3), no structural failure is ignored and no semantic failure closes.
+
+#### 5.2.4 Compatibility
+
+- Hosts built before this frame reject `SessionHello.route_seq` as an unknown field (`deny_unknown_fields`). A client sends it only to a host that already signed a route set, which only new hosts do, so the only break is a host downgraded after signing; this is accepted before 1.0, as for `SessionHello.groups`.
+- Clients built before this frame never send `route_seq`, so a conforming host never sends them `0x0C` and their close-on-unknown-frame rule is never triggered.
+- A new client that receives `0x0C` without having sent `route_seq` drops it at step 3 without closing and without parsing, well-formed or malformed.

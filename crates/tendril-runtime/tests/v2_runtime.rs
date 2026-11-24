@@ -1563,7 +1563,7 @@ async fn relay_v2_listener_drop_closes_control_sockets_and_dialer_sees_offline()
         let mut got_offline = false;
         for _ in 0..40 {
             match dialer.connect_for_epoch(&relay_v2_url, target_epoch).await {
-                Err(RuntimeError::Protocol(msg)) if msg.contains("offline") => {
+                Err(err) if err.is_relay_offline() => {
                     got_offline = true;
                     break;
                 }

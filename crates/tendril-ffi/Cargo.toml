@@ -16,7 +16,8 @@ categories.workspace = true
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = ["p2p-iroh"]
+default = ["p2p-iroh", "auto-advertise"]
+auto-advertise = ["tendril-runtime/auto-advertise"]
 p2p-iroh = ["tendril-runtime/p2p-iroh"]
 p2p-iroh-services = ["p2p-iroh", "tendril-runtime/p2p-iroh-services"]
 

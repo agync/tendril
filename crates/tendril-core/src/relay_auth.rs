@@ -462,6 +462,100 @@ pub fn verify_relay_ticket(
     Ok(issuer_bytes)
 }
 
+/// A URL origin `(scheme, host, port)` with the scheme's default port made explicit.
+#[derive(Debug, PartialEq, Eq)]
+struct Origin<'a> {
+    scheme: &'a str,
+    host: &'a str,
+    port: u16,
+}
+
+const fn default_port(scheme: &[u8]) -> Option<u16> {
+    match scheme {
+        b"ws" | b"http" => Some(80),
+        b"wss" | b"https" => Some(443),
+        _ => None,
+    }
+}
+
+fn parse_port(port: &str) -> Option<u16> {
+    if port.is_empty()
+        || port.len() > 5
+        || port.starts_with('0')
+        || !port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    port.parse().ok().filter(|&p| p != 0)
+}
+
+fn split_host_port(authority: &str) -> Option<(&str, Option<&str>)> {
+    if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let inner = &authority[1..close];
+        if inner.is_empty()
+            || !inner
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return None;
+        }
+        let (host, rest) = authority.split_at(close + 1);
+        return match rest {
+            "" => Some((host, None)),
+            _ => Some((host, Some(rest.strip_prefix(':')?))),
+        };
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return None;
+    }
+    Some((host, port))
+}
+
+/// Parses the origin of `url`. With `origin_only`, anything after the authority other than a
+/// single `/` is rejected. Userinfo, percent-encoding and unknown schemes are rejected.
+fn parse_origin(url: &str, origin_only: bool) -> Option<Origin<'_>> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default = default_port(scheme.as_bytes())?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    if origin_only && !(tail.is_empty() || tail == "/") {
+        return None;
+    }
+    let (host, port) = split_host_port(authority)?;
+    let port = match port {
+        Some(port) => parse_port(port)?,
+        None => default,
+    };
+    Some(Origin { scheme, host, port })
+}
+
+/// Reports whether relay admission material may be attached to a dial of `dial_url`.
+///
+/// True only when the dial URL's origin `(scheme, host, port)`, with the default port of `ws`,
+/// `wss`, `http` or `https` made explicit, is byte-equal to the origin of one entry of `origins`
+/// (each written `scheme://host[:port]`, optionally with a trailing `/`). Hosts are compared
+/// without case folding. A URL with userinfo, percent-encoding in the host, an unknown scheme
+/// or a malformed port never matches, and malformed `origins` entries are ignored.
+#[must_use]
+pub fn origin_allowed<S: AsRef<str>>(dial_url: &str, origins: &[S]) -> bool {
+    let Some(dial) = parse_origin(dial_url, false) else {
+        return false;
+    };
+    origins
+        .iter()
+        .filter_map(|o| parse_origin(o.as_ref(), true))
+        .any(|o| o == dial)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

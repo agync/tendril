@@ -15,6 +15,7 @@ use tendril_core::state_seal::{StateKey, StateKind};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::RuntimeError;
+use crate::redact::redact_json_error;
 
 mod sealed;
 
@@ -83,8 +84,12 @@ pub fn serialize_identity_json(
 
 /// Deserializes and validates a versioned [`EndpointIdentity`] JSON document.
 pub fn deserialize_identity_json(raw: &str) -> Result<EndpointIdentity, RuntimeError> {
-    let disk: PersistedIdentity = serde_json::from_str(raw)
-        .map_err(|err| RuntimeError::Storage(format!("invalid identity json: {err}")))?;
+    let disk: PersistedIdentity = serde_json::from_str(raw).map_err(|err| {
+        RuntimeError::Storage(format!(
+            "invalid identity json: {}",
+            redact_json_error(&err)
+        ))
+    })?;
     if disk.version != 1 {
         return Err(RuntimeError::Storage(format!(
             "unsupported identity version {}",
@@ -485,7 +490,17 @@ impl StateStore {
         Ok(file)
     }
 
-    fn load_roster_unlocked(&self) -> Result<Roster, RuntimeError> {
+    /// Runs `f` under the exclusive roster file lock, the first lock of the global order
+    /// (`crate::announce` module docs); `f` reads and writes through the `*_unlocked` helpers.
+    pub(crate) fn with_roster_lock<T>(
+        &self,
+        f: impl FnOnce(&Self) -> Result<T, RuntimeError>,
+    ) -> Result<T, RuntimeError> {
+        let _lock = self.lock_roster_file(true)?;
+        f(self)
+    }
+
+    pub(crate) fn load_roster_unlocked(&self) -> Result<Roster, RuntimeError> {
         let path = self.roster_path();
         match fs::symlink_metadata(&path) {
             Ok(_) => verify_private_file_0600(&path)?,
@@ -495,14 +510,18 @@ impl StateStore {
         match &self.codec {
             Codec::Plain => {
                 let raw = Zeroizing::new(fs::read_to_string(&path)?);
-                serde_json::from_str(&raw)
-                    .map_err(|err| RuntimeError::Storage(format!("invalid roster json: {err}")))
+                serde_json::from_str(&raw).map_err(|err| {
+                    RuntimeError::Storage(format!(
+                        "invalid roster json: {}",
+                        redact_json_error(&err)
+                    ))
+                })
             }
             Codec::Sealed(key) => sealed::load(key, StateKind::Roster, &path),
         }
     }
 
-    fn save_roster_unlocked(&self, roster: &Roster) -> Result<(), RuntimeError> {
+    pub(crate) fn save_roster_unlocked(&self, roster: &Roster) -> Result<(), RuntimeError> {
         let bytes = match &self.codec {
             Codec::Plain => {
                 let mut json = Zeroizing::new(Vec::new());

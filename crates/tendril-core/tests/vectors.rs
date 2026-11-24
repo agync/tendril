@@ -1959,3 +1959,165 @@ mod group_vectors {
         );
     }
 }
+
+mod route_vectors {
+    use super::{decode_hex_array, vectors_dir};
+    use std::fs;
+
+    use serde_json::Value;
+    use tendril_core::crypto::{
+        HYBRID_SIG_LEN, HybridSigningPublicKey, SigningKeypair, StaticKeypair,
+    };
+    use tendril_core::error::CoreError;
+    use tendril_core::identity::EndpointIdentity;
+    use tendril_core::routes::{ROUTE_SET_DOMAIN, RouteSet};
+    use tendril_core::wire::{
+        InnerFrameType, SessionHello, decode_inner_frame, encode_inner_frame,
+    };
+
+    fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
+        v[key].as_str().unwrap_or_else(|| panic!("missing {key}"))
+    }
+
+    fn hex_of(v: &Value, key: &str) -> Vec<u8> {
+        hex::decode(str_of(v, key)).unwrap()
+    }
+
+    #[test]
+    fn route_set_vectors_match_byte_for_byte() {
+        let text = fs::read_to_string(vectors_dir().join("routes.json")).unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        let v = &doc["route_set"];
+
+        assert_eq!(hex_of(v, "domain_hex"), ROUTE_SET_DOMAIN);
+        let id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar(decode_hex_array(str_of(v, "static_scalar_hex"))),
+            SigningKeypair::from_seeds(
+                decode_hex_array(str_of(v, "signing_seed_hex")),
+                decode_hex_array(str_of(v, "signing_mldsa_seed_hex")),
+            ),
+        );
+        assert_eq!(
+            hex_of(v, "static_pub_hex"),
+            id.static_key().public_bytes().to_vec()
+        );
+        let signing_pub =
+            HybridSigningPublicKey::from_bytes(&hex_of(v, "signing_pub_hex")).unwrap();
+        assert_eq!(&signing_pub, id.signing_key().public_key());
+        assert_eq!(hex_of(v, "sh_hex"), signing_pub.sha256_hash().to_vec());
+
+        let cases = v["sign_deterministic"].as_array().unwrap();
+        assert!(cases.len() >= 2);
+        for case in cases {
+            let name = str_of(case, "name");
+            let routes: Vec<String> = case["routes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r.as_str().unwrap().to_owned())
+                .collect();
+            let set = RouteSet::sign_deterministic(
+                &id,
+                case["seq"].as_u64().unwrap(),
+                case["issued_at"].as_u64().unwrap(),
+                routes.clone(),
+            )
+            .unwrap();
+            let body = hex_of(case, "body_hex");
+            let sig = hex_of(case, "sig_hex");
+            assert_eq!(sig.len(), HYBRID_SIG_LEN, "{name}");
+            let mut signed = ROUTE_SET_DOMAIN.to_vec();
+            signed.extend_from_slice(&body);
+            assert_eq!(hex_of(case, "signed_bytes_hex"), signed, "{name}");
+            assert_eq!(set.signed_bytes(), signed, "{name}");
+            let mut payload = body.clone();
+            payload.extend_from_slice(&sig);
+            assert_eq!(set.encode(), payload, "{name}");
+
+            let decoded = RouteSet::decode(&payload).unwrap();
+            assert_eq!(decoded, set, "{name}");
+            assert_eq!(decoded.routes, routes, "{name}");
+            decoded.verify(&signing_pub).unwrap();
+
+            let inner = encode_inner_frame(InnerFrameType::RouteSet, &payload).unwrap();
+            assert_eq!(inner[0], 0x0C);
+            let (kind, inner_payload) = decode_inner_frame(&inner).unwrap();
+            assert_eq!(kind, InnerFrameType::RouteSet);
+            assert_eq!(inner_payload, &payload[..]);
+        }
+
+        let rejections = v["decode_rejections"].as_array().unwrap();
+        assert!(!rejections.is_empty());
+        for case in rejections {
+            let mut payload = hex_of(case, "body_hex");
+            let filler = usize::try_from(case["zero_filler_len"].as_u64().unwrap()).unwrap();
+            payload.resize(payload.len() + filler, 0);
+            assert_eq!(
+                RouteSet::decode(&payload),
+                Err(CoreError::InvalidInnerFramePayload("route set")),
+                "{}",
+                str_of(case, "name")
+            );
+        }
+
+        let hello_vec = &doc["session_hello_route_seq"];
+        let hello: SessionHello = serde_json::from_str(str_of(hello_vec, "json")).unwrap();
+        assert_eq!(hello.route_seq, hello_vec["route_seq"].as_u64());
+        assert_eq!(
+            serde_json::to_string(&hello).unwrap(),
+            str_of(hello_vec, "json")
+        );
+    }
+
+    #[test]
+    fn pairing_route_statement_vector_matches_byte_for_byte() {
+        use tendril_core::crypto::b64url_encode;
+        use tendril_core::pairing::{
+            PAIRING_ROUTES_DOMAIN, PairingUri, RouteCheck, route_statement_input,
+            sign_route_statement,
+        };
+
+        let text = fs::read_to_string(vectors_dir().join("routes.json")).unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        let keys = &doc["route_set"];
+        let id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar(decode_hex_array(str_of(keys, "static_scalar_hex"))),
+            SigningKeypair::from_seeds(
+                decode_hex_array(str_of(keys, "signing_seed_hex")),
+                decode_hex_array(str_of(keys, "signing_mldsa_seed_hex")),
+            ),
+        );
+        let v = &doc["pairing_route_statement"];
+        assert_eq!(hex_of(v, "domain_hex"), PAIRING_ROUTES_DOMAIN);
+        assert_eq!(
+            hex_of(v, "ed25519_pub_hex"),
+            id.signing_key().ed25519_public_bytes().to_vec()
+        );
+
+        let prefix = str_of(v, "uri_bytes_before_rs");
+        let input = route_statement_input(prefix);
+        assert_eq!(input, hex_of(v, "rs_input_hex"));
+        assert!(input.starts_with(PAIRING_ROUTES_DOMAIN));
+        let sig = sign_route_statement(&id, prefix);
+        assert_eq!(sig.to_vec(), hex_of(v, "rs_hex"));
+
+        let uri = str_of(v, "uri");
+        assert_eq!(uri, format!("{prefix}&rs={}", b64url_encode(&sig)));
+        let parsed = PairingUri::parse(uri).unwrap();
+        assert_eq!(parsed.try_encode().unwrap(), uri);
+        assert_eq!(parsed.route_seq(), v["route_seq"].as_u64());
+        let RouteCheck::Verified(statement) =
+            parsed.verify_route_statement(id.signing_key().public_key())
+        else {
+            panic!("vector route statement must verify");
+        };
+        let hints: Vec<String> = v["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(statement.hints(), hints.as_slice());
+        assert_eq!(Some(statement.route_seq()), v["route_seq"].as_u64());
+    }
+}

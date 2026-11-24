@@ -29,7 +29,11 @@ pub(super) fn load<T: DeserializeOwned>(
         )),
     })?;
     serde_json::from_slice(&plain).map_err(|err| {
-        RuntimeError::Storage(format!("invalid sealed {} state: {err}", kind.label()))
+        RuntimeError::Storage(format!(
+            "invalid sealed {} state: {}",
+            kind.label(),
+            crate::redact::redact_json_error(&err)
+        ))
     })
 }
 

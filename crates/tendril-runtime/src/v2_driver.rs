@@ -1,9 +1,11 @@
 //! Async Wire v2 (`0x02`) handshake, PAKE pairing, padded session, and `WakeProvider` drivers.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::HybridSigningPublicKey;
 use tendril_core::error::CoreError;
@@ -13,10 +15,13 @@ use tendril_core::grants::{
 };
 use tendril_core::group::{GroupManifest, GroupSeq, V2GroupSecrets, decode_group_rendezvous_frame};
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
-use tendril_core::pairing::{PairingManager, PairingPathKind};
-use tendril_core::policy::{CandidateEndpoint, PathPolicyConfig, ProviderId};
+use tendril_core::pairing::{
+    PairingManager, PairingPathKind, RouteCheck, RoutePolicy, VerifiedRouteStatement,
+};
+use tendril_core::policy::{CandidateEndpoint, PathPlanner, PathPolicyConfig, ProviderId};
 use tendril_core::roster::{PeerState, Roster, V2PeerSecrets};
-use tendril_core::session::RekeyDirection;
+use tendril_core::routes::RouteSet;
+use tendril_core::session::{MAX_QUEUED_ROUTE_SETS, RekeyDirection, RouteExpectation};
 use tendril_core::v2::{
     PaddingPolicy, PakeArgon2Params, RekeyStatus, RekeyThresholds, RendezvousReplayCache,
     ScheduleJitterPolicy, SealedSession, V2InnerFrame, V2PairAction, V2PairOutcome,
@@ -27,19 +32,27 @@ use tendril_core::wire::{
     FLAG_PAKE_PAIR, InnerFrameType, Intent, PREAMBLE_FLAG_NONE, Preamble, ResumableFrameReader,
     WIRE_VERSION_V2, encode_frame,
 };
-use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
 use zeroize::Zeroizing;
 
+use crate::announce::{RosterAccess, RouteSetSink};
 use crate::driver::{
-    DEFAULT_PRE_AUTH_TIMEOUT, SessionEvent, current_unix_secs, dial_with_policy_verified,
-    has_complete_outer_frame, write_protocol_bytes, write_protocol_chunks,
+    AttemptError, CandidateError, CandidateFailure, ConnectOpts, ConnectPlan, ConnectResult,
+    DEFAULT_PRE_AUTH_TIMEOUT, IngestSlot, PairPolicyOptions, PairPolicyResult, PairingPlan,
+    RaceEnd, RouteIngest, SessionEvent, SharedEvidence, WinnerFacts, check_candidate_routes,
+    collect_failures, committed_error, connect_exhausted, current_unix_secs, day2_candidate_error,
+    dial_with_policy_verified, finalize_connect, has_complete_outer_frame, pairing_persist_plan,
+    plan_connect, plan_pairing, race_verified, record_evidence, write_protocol_bytes,
+    write_protocol_chunks,
 };
 use crate::error::RuntimeError;
 use crate::provider::{
     DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, PathWriter,
     recv_tendril_frame,
 };
+use crate::providers::egress::SkippedHint;
+use crate::providers::hints::DialWire;
 use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
 use crate::store::StateStore;
 use crate::wake::{DEFAULT_WAKE_TIMEOUT, WakeOutcome, WakeProvider, WakeSecret, WakeTarget};
@@ -133,6 +146,91 @@ impl V2ResponderState {
     }
 }
 
+/// Default process-wide bound on concurrent initiator Argon2id derivations (`2`).
+pub const DEFAULT_INITIATOR_ARGON2_PERMITS: usize = 2;
+
+static INITIATOR_ARGON2: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static INITIATOR_ARGON2_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static INITIATOR_ARGON2_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the process-wide bound on concurrent Wire v2 initiator Argon2id derivations.
+///
+/// The first call (or first derivation, which installs [`DEFAULT_INITIATOR_ARGON2_PERMITS`])
+/// wins; returns `false` when the bound was already set. "Process-wide" means per loaded copy of
+/// `tendril-runtime`.
+pub fn set_initiator_argon2_permits(permits: usize) -> bool {
+    INITIATOR_ARGON2
+        .set(Arc::new(Semaphore::new(permits.max(1))))
+        .is_ok()
+}
+
+fn initiator_argon2() -> Arc<Semaphore> {
+    Arc::clone(
+        INITIATOR_ARGON2.get_or_init(|| Arc::new(Semaphore::new(DEFAULT_INITIATOR_ARGON2_PERMITS))),
+    )
+}
+
+/// Highest number of initiator Argon2id derivations that ran at once in this process.
+#[must_use]
+pub fn initiator_argon2_peak() -> usize {
+    INITIATOR_ARGON2_PEAK.load(Ordering::SeqCst)
+}
+
+/// Free initiator Argon2id permits right now (the configured bound minus running or reserved
+/// derivations).
+#[must_use]
+pub fn initiator_argon2_available() -> usize {
+    initiator_argon2().available_permits()
+}
+
+/// Waits at most `wait` for a process-wide initiator Argon2id permit. The wait is its own budget:
+/// it never counts as derivation time, and dropping the future while queued takes nothing.
+async fn acquire_initiator_argon2(wait: Duration) -> Result<OwnedSemaphorePermit, RuntimeError> {
+    match timeout(wait, initiator_argon2().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(RuntimeError::Protocol(
+            "argon2id permit pool closed".to_owned(),
+        )),
+        Err(_) => Err(RuntimeError::Timeout("argon2id permit wait timed out")),
+    }
+}
+
+/// One running derivation in `active` (and the high-water mark `peak`), counted until drop,
+/// so a derivation that panics never leaves the count raised.
+struct ActiveCount<'a>(&'a AtomicUsize);
+
+impl<'a> ActiveCount<'a> {
+    fn enter(active: &'a AtomicUsize, peak: &AtomicUsize) -> Self {
+        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        Self(active)
+    }
+}
+
+impl Drop for ActiveCount<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Runs the initiator's blocking `start()` derivation under `permit`. The permit is moved into
+/// the blocking closure, so a cancelled attempt holds it until the derivation ends.
+async fn start_v2_pake_initiator(
+    machine: V2PakePairInitiator,
+    permit: OwnedSemaphorePermit,
+) -> Result<(V2PakePairInitiator, Vec<V2PairAction>), RuntimeError> {
+    let res = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _active = ActiveCount::enter(&INITIATOR_ARGON2_ACTIVE, &INITIATOR_ARGON2_PEAK);
+        let mut m = machine;
+        let actions = m.start();
+        actions.map(|a| (m, a))
+    })
+    .await
+    .map_err(|err| RuntimeError::Protocol(format!("argon2id start task failed: {err}")))?;
+    Ok(res?)
+}
+
 /// Completed outcome from an async Wire v2 PAKE pairing exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2PairDriveResult {
@@ -175,6 +273,9 @@ pub async fn drive_v2_pake_pair_initiator(
 }
 
 /// Drives a Wire v2 PAKE pairing initiator over `stream` within `handshake_timeout`.
+///
+/// The derivation runs under the process-wide initiator permit; the wait for it is bounded by
+/// `handshake_timeout` too, as a separate budget before the handshake budget starts.
 pub async fn drive_v2_pake_pair_initiator_with_timeout(
     stream: &mut dyn PathStream,
     identity: &EndpointIdentity,
@@ -192,16 +293,9 @@ pub async fn drive_v2_pake_pair_initiator_with_timeout(
         pinned_host,
         PakeArgon2Params::production(),
     )?;
+    let permit = acquire_initiator_argon2(handshake_timeout).await?;
     let deadline = TokioInstant::now() + handshake_timeout;
-
-    let start_res = tokio::task::spawn_blocking(move || {
-        let mut m = machine;
-        let actions = m.start()?;
-        Ok::<_, CoreError>((m, actions))
-    })
-    .await
-    .map_err(|err| RuntimeError::Protocol(format!("argon2id start task failed: {err}")))?;
-    let (mut machine, init_actions) = start_res?;
+    let (mut machine, init_actions) = start_v2_pake_initiator(machine, permit).await?;
 
     let mut observed_sas = None;
     if let Some(outcome) = await_deadline!(
@@ -657,6 +751,12 @@ struct V2TransportCore {
     closed: bool,
     /// A frame unsealed by [`V2SessionDriver::stage_commit_frame`], handled first by the next read.
     staged: Option<V2InnerFrame>,
+    /// Initiator: `SessionHello.route_seq` was sent, so `0x0C` frames are decoded and queued.
+    route_seq_sent: bool,
+    /// Responder: the client's `SessionHello.route_seq`.
+    peer_route_seq: Option<u64>,
+    /// Decoded, not yet verified route sets (at most [`MAX_QUEUED_ROUTE_SETS`]).
+    route_sets: Vec<RouteSet>,
 }
 
 /// Outcome of [`V2SessionDriver::stage_commit_frame`].
@@ -856,6 +956,27 @@ impl V2TransportCore {
         Ok((writes, rekeyed))
     }
 
+    /// Seals a `0x0C ROUTE_SET` payload for a client that sent `route_seq`. Fails without state
+    /// change with `NotReady("peer did not negotiate route sets")`, `FrameTooLarge` (no padding
+    /// bucket fits) or `UnknownInnerFrameType` (padding disabled).
+    fn seal_route_set(
+        &mut self,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<(Vec<Vec<u8>>, bool), CoreError> {
+        if self.closed {
+            return Err(CoreError::NotReady("v2 session closed"));
+        }
+        if !matches!(self.role, SessionRole::Responder { .. }) {
+            return Err(CoreError::NotReady("only a responder sends route sets"));
+        }
+        if self.peer_route_seq.is_none() {
+            return Err(CoreError::NotReady("peer did not negotiate route sets"));
+        }
+        RouteSet::decode(payload)?;
+        self.seal_frame(InnerFrameType::RouteSet, payload, now_ms)
+    }
+
     fn seal_dummy_cover(
         &mut self,
         bucket: usize,
@@ -1052,6 +1173,22 @@ impl V2TransportCore {
                     let frame = decode_group_rendezvous_frame(&payload)?;
                     events.push(SessionEvent::GroupRendezvousReceived(frame));
                 }
+                InnerFrameType::RouteSet => match self.role {
+                    SessionRole::Responder { .. } => {
+                        return Err(CoreError::InvalidInnerFramePayload(
+                            "route set from initiator",
+                        ));
+                    }
+                    SessionRole::Initiator { .. } => {
+                        if self.route_seq_sent {
+                            let set = RouteSet::decode(&payload)?;
+                            if self.route_sets.len() >= MAX_QUEUED_ROUTE_SETS {
+                                self.route_sets.remove(0);
+                            }
+                            self.route_sets.push(set);
+                        }
+                    }
+                },
                 InnerFrameType::Padding | InnerFrameType::Padded => {
                     return Err(CoreError::UnknownInnerFrameType(kind as u8));
                 }
@@ -1211,6 +1348,8 @@ pub struct V2SessionDriver {
     jitter: ScheduleJitterPolicy,
     store: Option<StateStore>,
     _half_open: Option<HalfOpenGuard>,
+    verified_recovery: Option<Box<VerifiedRouteStatement>>,
+    route_ingest: IngestSlot,
 }
 
 /// Persists a peer revocation observed while a v2 connect failed, before the error surfaces.
@@ -1280,6 +1419,7 @@ impl V2SessionDriver {
             V2RosterRef::Direct(roster),
             now_unix,
             Vec::new(),
+            V2RouteInit::default(),
         )
         .await
     }
@@ -1309,6 +1449,7 @@ impl V2SessionDriver {
             V2RosterRef::Direct(roster),
             now_unix,
             Vec::new(),
+            V2RouteInit::default(),
         )
         .await
     }
@@ -1343,6 +1484,7 @@ impl V2SessionDriver {
             V2RosterRef::Locked(roster),
             now_unix,
             Vec::new(),
+            V2RouteInit::default(),
         )
         .await
     }
@@ -1372,6 +1514,7 @@ impl V2SessionDriver {
             V2RosterRef::Locked(roster),
             now_unix,
             groups,
+            V2RouteInit::default(),
         )
         .await
     }
@@ -1512,6 +1655,7 @@ impl V2SessionDriver {
         mut roster: V2RosterRef<'_>,
         now_unix: u64,
         groups: Vec<GroupSeq>,
+        route: V2RouteInit,
     ) -> Result<Self, RuntimeError> {
         let started_at = Instant::now();
         let mut machine = V2SessionInitiator::new(
@@ -1522,66 +1666,101 @@ impl V2SessionDriver {
             crl_seq,
         )?
         .with_padding_policy(padding);
+        if let Some(expectation) = route.expectation {
+            machine = machine.with_route_expectation(expectation)?;
+        }
+        let mut machine = machine.with_route_seq(route.route_seq)?;
         machine.set_local_groups(groups)?;
         let deadline = TokioInstant::now() + DEFAULT_PRE_AUTH_TIMEOUT;
-        let start_actions = machine.start(now_unix)?;
-        for action in start_actions {
-            if let V2SessionAction::WriteBytes(bytes) = action {
-                await_deadline!(
+        let mut frame_reader = ResumableFrameReader::new();
+        let mut peer_static_pub = None;
+        // A failed handshake closes the stream gracefully before the error is returned.
+        let handshake = async {
+            let start_actions = machine.start(now_unix)?;
+            for action in start_actions {
+                if let V2SessionAction::WriteBytes(bytes) = action {
+                    await_deadline!(
+                        deadline,
+                        stream,
+                        "pre-auth v2 session handshake timed out",
+                        write_protocol_bytes_timed(stream.as_mut(), &bytes)
+                    );
+                }
+            }
+
+            while !machine.is_established() {
+                if machine.is_closed() {
+                    return Err(RuntimeError::Closed);
+                }
+                let body = await_deadline!(
                     deadline,
                     stream,
                     "pre-auth v2 session handshake timed out",
-                    write_protocol_bytes_timed(stream.as_mut(), &bytes)
+                    recv_tendril_frame(stream.as_mut(), &mut frame_reader)
                 );
+                let framed = encode_frame(&body)?;
+                let now_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let fed = match &mut roster {
+                    V2RosterRef::Direct(r) => {
+                        let fed = machine.feed_bytes(&framed, now_unix, now_ms, r);
+                        if let Some((evidence, crl_before)) = &route.evidence {
+                            record_evidence(
+                                evidence,
+                                machine.presented_rotation(),
+                                r,
+                                target_host_id,
+                                *crl_before,
+                            );
+                        }
+                        fed
+                    }
+                    V2RosterRef::Locked(m) => {
+                        let mut guard = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let fed = machine.feed_bytes(&framed, now_unix, now_ms, &mut guard);
+                        if let Some((evidence, crl_before)) = &route.evidence {
+                            record_evidence(
+                                evidence,
+                                machine.presented_rotation(),
+                                &guard,
+                                target_host_id,
+                                *crl_before,
+                            );
+                        }
+                        fed
+                    }
+                };
+                for action in fed? {
+                    match action {
+                        V2SessionAction::WriteBytes(bytes) => {
+                            await_deadline!(
+                                deadline,
+                                stream,
+                                "pre-auth v2 session handshake timed out",
+                                write_protocol_bytes_timed(stream.as_mut(), &bytes)
+                            );
+                        }
+                        V2SessionAction::Established {
+                            peer_static_pub: p_pub,
+                            ..
+                        } => {
+                            peer_static_pub = Some(p_pub);
+                        }
+                        _ => {}
+                    }
+                }
             }
+            Ok::<(), RuntimeError>(())
         }
-
-        let mut frame_reader = ResumableFrameReader::new();
-        let mut peer_static_pub = None;
-
-        while !machine.is_established() {
-            if machine.is_closed() {
-                return Err(RuntimeError::Closed);
-            }
-            let body = await_deadline!(
-                deadline,
-                stream,
-                "pre-auth v2 session handshake timed out",
-                recv_tendril_frame(stream.as_mut(), &mut frame_reader)
-            );
-            let framed = encode_frame(&body)?;
-            let now_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let actions = match &mut roster {
-                V2RosterRef::Direct(r) => machine.feed_bytes(&framed, now_unix, now_ms, r)?,
-                V2RosterRef::Locked(m) => {
-                    let mut guard = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    machine.feed_bytes(&framed, now_unix, now_ms, &mut guard)?
-                }
-            };
-            for action in actions {
-                match action {
-                    V2SessionAction::WriteBytes(bytes) => {
-                        await_deadline!(
-                            deadline,
-                            stream,
-                            "pre-auth v2 session handshake timed out",
-                            write_protocol_bytes_timed(stream.as_mut(), &bytes)
-                        );
-                    }
-                    V2SessionAction::Established {
-                        peer_static_pub: p_pub,
-                        ..
-                    } => {
-                        peer_static_pub = Some(p_pub);
-                    }
-                    _ => {}
-                }
-            }
+        .await;
+        if let Err(err) = handshake {
+            let _ = stream.close().await;
+            return Err(err);
         }
 
         let applied_rotation = machine.applied_rotation().to_vec();
         let active_grant = machine.active_grant().cloned();
         let exported_secrets = machine.exported_v2_secrets().cloned();
+        let verified_recovery = machine.verified_recovery_statement().cloned().map(Box::new);
         let sealed = machine.into_sealed_session()?;
         let peer_static = peer_static_pub.ok_or(RuntimeError::Protocol(
             "missing peer static key after v2 establish".to_owned(),
@@ -1598,6 +1777,9 @@ impl V2SessionDriver {
                 active_grant,
                 closed: false,
                 staged: None,
+                route_seq_sent: route.route_seq.is_some(),
+                peer_route_seq: None,
+                route_sets: Vec::new(),
             },
             frame_reader,
             pending_events: VecDeque::new(),
@@ -1611,6 +1793,8 @@ impl V2SessionDriver {
             jitter: ScheduleJitterPolicy::default(),
             store: None,
             _half_open: None,
+            verified_recovery,
+            route_ingest: IngestSlot::default(),
         })
     }
 
@@ -1949,6 +2133,7 @@ impl V2SessionDriver {
             RuntimeError::Protocol("missing peer static key after v2 establish".to_owned())
         })?;
         let peer_crl_seq = machine.peer_crl_seq();
+        let peer_route_seq = machine.peer_route_seq();
         let peer_groups = machine.peer_groups().map(<[GroupSeq]>::to_vec);
         let active_grant = machine.active_grant().cloned();
         let exported_secrets = machine.exported_v2_secrets().cloned();
@@ -1970,6 +2155,9 @@ impl V2SessionDriver {
                 active_grant,
                 closed: false,
                 staged: None,
+                route_seq_sent: false,
+                peer_route_seq,
+                route_sets: Vec::new(),
             },
             frame_reader,
             pending_events: VecDeque::new(),
@@ -1983,6 +2171,8 @@ impl V2SessionDriver {
             jitter: state.config.jitter,
             store: disk_store,
             _half_open: half_open,
+            verified_recovery: None,
+            route_ingest: IngestSlot::default(),
         })
     }
 
@@ -2397,26 +2587,40 @@ impl V2SessionDriver {
                     if post_verify_err.is_none() {
                         self.pending_events.extend(events);
                     }
+                    if let Some((crl, issuer, _)) = ingested_crl.as_ref() {
+                        self.route_ingest
+                            .note_crls(vec![(issuer.clone(), crl.clone())]);
+                    }
                     if let Err(err) =
                         persist_ingested_crl_if_stored(self.store.as_ref(), ingested_crl).await
                     {
                         self.core.closed = true;
                         let _ = self.stream.close().await;
+                        self.route_ingest.run(Vec::new()).await;
                         return Err(err);
                     }
-                    self.write_wire_frames(&writes).await?;
+                    if let Err(err) = self.write_wire_frames(&writes).await {
+                        self.route_ingest.run(Vec::new()).await;
+                        return Err(err);
+                    }
                     if let Some(err) = post_verify_err {
                         self.core.closed = true;
                         let _ = self.stream.close().await;
+                        // A CRL that revoked the peer or this device is persisted before the
+                        // session ends.
+                        self.route_ingest.run(Vec::new()).await;
                         return Err(err.into());
                     }
                     if should_close {
                         let _ = self.stream.close().await;
                     }
+                    let sets = std::mem::take(&mut self.core.route_sets);
+                    self.route_ingest.run(sets).await;
                 }
                 Err(err) => {
                     self.core.closed = true;
                     let _ = self.stream.close().await;
+                    self.route_ingest.run(Vec::new()).await;
                     return Err(err.into());
                 }
             }
@@ -2450,11 +2654,42 @@ impl V2SessionDriver {
             jitter: self.jitter,
             store: self.store,
             _half_open: self._half_open,
+            route_ingest: self.route_ingest,
         }
     }
 
     fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Routes every `0x0C` route set this initiator session receives to
+    /// [`crate::announce::ingest_route_sets`] for its peer under `policy`. Sets arrive only when
+    /// the session sent `SessionHello.route_seq`; they never reach the event stream.
+    pub fn set_route_ingest(&mut self, access: RosterAccess, policy: RoutePolicy) {
+        let peer = self.core.peer_device_id().to_owned();
+        self.route_ingest
+            .set(RouteIngest::new(access, peer, policy));
+    }
+
+    /// The `route_seq` the client sent in `SessionHello` (responder sessions).
+    #[must_use]
+    pub const fn peer_route_seq(&self) -> Option<u64> {
+        self.core.peer_route_seq
+    }
+
+    /// Sends one `0x0C ROUTE_SET` payload inside `0x09 PADDED` (responder, to a client that sent
+    /// `route_seq`). Core errors are returned unchanged and leave the session open when they mean
+    /// the frame cannot be sent (`FrameTooLarge`, `UnknownInnerFrameType`, not negotiated).
+    pub async fn send_route_set(&mut self, payload: &[u8]) -> Result<(), RuntimeError> {
+        let now_ms = self.elapsed_ms();
+        let (writes, rekeyed) = self.core.seal_route_set(payload, now_ms)?;
+        self.write_wire_frames(&writes).await?;
+        if rekeyed {
+            self.pending_events.push_back(SessionEvent::Rekeyed {
+                direction: RekeyDirection::Outgoing,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2476,6 +2711,8 @@ struct V2SessionReadHalf {
 ///
 /// Locks follow a strict total order: `reader` -> `writer` -> `core` -> `roster` ->
 /// `pending_events`. Neither `core`, `roster`, nor `pending_events` is held across `.await`.
+/// The client route ingest is never taken while `core` or `roster` is held (see
+/// `driver::IngestSlot`).
 pub struct ConcurrentV2Session {
     core: Mutex<V2TransportCore>,
     reader: AsyncMutex<V2SessionReadHalf>,
@@ -2491,6 +2728,7 @@ pub struct ConcurrentV2Session {
     jitter: ScheduleJitterPolicy,
     store: Option<StateStore>,
     _half_open: Option<HalfOpenGuard>,
+    route_ingest: IngestSlot,
 }
 
 impl ConcurrentV2Session {
@@ -2798,7 +3036,7 @@ impl ConcurrentV2Session {
 
             let now_unix = now_fn();
             let now_ms = self.elapsed_ms();
-            let feed_res = {
+            let (feed_res, route_sets) = {
                 let mut core = self
                     .core
                     .lock()
@@ -2806,10 +3044,11 @@ impl ConcurrentV2Session {
                 let mut roster_guard = roster
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match staged {
+                let res = match staged {
                     Some(frame) => core.handle_decoded(frame, now_unix, now_ms, &mut roster_guard),
                     None => core.handle_wire_body(&body, now_unix, now_ms, &mut roster_guard),
-                }
+                };
+                (res, std::mem::take(&mut core.route_sets))
             };
             match feed_res {
                 Ok(WireHandleOutcome {
@@ -2819,6 +3058,10 @@ impl ConcurrentV2Session {
                     ingested_crl,
                     post_verify_err,
                 }) => {
+                    if let Some((crl, issuer, _)) = ingested_crl.as_ref() {
+                        self.route_ingest
+                            .note_crls(vec![(issuer.clone(), crl.clone())]);
+                    }
                     if let Err(err) =
                         persist_ingested_crl_if_stored(self.store.as_ref(), ingested_crl).await
                     {
@@ -2828,7 +3071,9 @@ impl ConcurrentV2Session {
                             .closed = true;
                         let mut writer = self.writer.lock().await;
                         let _ = writer.close().await;
+                        drop(writer);
                         self.event_notify.notify_waiters();
+                        self.route_ingest.run(Vec::new()).await;
                         return Err(err);
                     }
                     if !writes.is_empty() || should_close || post_verify_err.is_some() {
@@ -2841,7 +3086,9 @@ impl ConcurrentV2Session {
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .closed = true;
                                 let _ = writer.close().await;
+                                drop(writer);
                                 self.event_notify.notify_waiters();
+                                self.route_ingest.run(Vec::new()).await;
                                 return Err(err);
                             }
                         }
@@ -2855,9 +3102,13 @@ impl ConcurrentV2Session {
                         }
                     }
                     if let Some(err) = post_verify_err {
+                        // A CRL that revoked the peer or this device is persisted before the
+                        // session ends.
+                        self.route_ingest.run(Vec::new()).await;
                         return Err(err.into());
                     }
                     self.push_pending_events(events);
+                    self.route_ingest.run(route_sets).await;
                 }
                 Err(err) => {
                     self.core
@@ -2866,7 +3117,9 @@ impl ConcurrentV2Session {
                         .closed = true;
                     let mut writer = self.writer.lock().await;
                     let _ = writer.close().await;
+                    drop(writer);
                     self.event_notify.notify_waiters();
+                    self.route_ingest.run(Vec::new()).await;
                     return Err(err.into());
                 }
             }
@@ -2933,6 +3186,25 @@ impl ConcurrentV2Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front()
+    }
+
+    /// The `route_seq` the client sent in `SessionHello` (responder sessions).
+    #[must_use]
+    pub fn peer_route_seq(&self) -> Option<u64> {
+        self.core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .peer_route_seq
+    }
+
+    /// Routes received `0x0C` route sets to the client ingest; see
+    /// [`V2SessionDriver::set_route_ingest`].
+    pub fn set_route_ingest(&self, access: RosterAccess, policy: RoutePolicy) {
+        self.route_ingest.set(RouteIngest::new(
+            access,
+            self.peer_device_id.clone(),
+            policy,
+        ));
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -3078,6 +3350,20 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn active_derivation_count_drops_on_panic() {
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let res = std::panic::catch_unwind(|| {
+            let _outer = ActiveCount::enter(&active, &peak);
+            let _inner = ActiveCount::enter(&active, &peak);
+            panic!("derivation failed");
+        });
+        assert!(res.is_err());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
     fn seed_store() -> (tempfile::TempDir, StateStore, Roster) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = StateStore::open_or_create(dir.path()).expect("store");
@@ -3130,5 +3416,460 @@ mod tests {
             store.load_roster().unwrap().get("host").unwrap().state,
             PeerState::Active
         );
+    }
+}
+
+/// Responder sessions carry host route announcements, sealed inside `0x09 PADDED`. Core errors
+/// pass through unchanged, so `FrameTooLarge`, `UnknownInnerFrameType` and `NotReady("peer did
+/// not negotiate route sets")` leave the session open.
+#[async_trait]
+impl RouteSetSink for ConcurrentV2Session {
+    fn peer_id(&self) -> String {
+        self.peer_device_id.clone()
+    }
+
+    async fn send_route_set(&self, payload: &[u8]) -> Result<(), RuntimeError> {
+        self.run_write_op(|core, now_ms| core.seal_route_set(payload, now_ms))
+            .await
+    }
+}
+
+/// Route options of one Wire v2 session initiator.
+#[derive(Default)]
+struct V2RouteInit {
+    expectation: Option<RouteExpectation>,
+    route_seq: Option<u64>,
+    /// Day-2 evidence sink and the CRL sequence the snapshot held.
+    evidence: Option<(SharedEvidence, Option<u64>)>,
+}
+
+/// Wire v2 pairing rung budget for `Local`, `Direct` and `Overlay` candidates (transport plus
+/// `msg1`/`msg2`; the initiator Argon2id time comes on top).
+pub const V2_RUNG_BUDGET_NEAR: Duration = Duration::from_millis(2_000);
+/// Wire v2 pairing rung budget for `P2p`, `Relay` and `Broker` candidates.
+pub const V2_RUNG_BUDGET_FAR: Duration = Duration::from_millis(4_000);
+
+const fn v2_rung_budget(provider: ProviderId) -> Duration {
+    match provider {
+        ProviderId::Local | ProviderId::Direct | ProviderId::Overlay => V2_RUNG_BUDGET_NEAR,
+        ProviderId::P2p | ProviderId::Relay | ProviderId::Broker => V2_RUNG_BUDGET_FAR,
+    }
+}
+
+/// A rung that verified the sealed `HostHello`, `rp` and route statement.
+struct V2PendingCommit {
+    stream: Box<dyn PathStream>,
+    machine: V2PakePairInitiator,
+    sas: Option<String>,
+    route_check: RouteCheck,
+}
+
+/// Runs one rung up to the deferred claim: permit, dial, derive, `msg1`, then `msg2` until the
+/// machine awaits the commit.
+///
+/// The permit is taken before the dial, so a queued rung holds no connection. The wait for it
+/// is bounded by its own budget (the rung budget again), and the rung deadline (transport plus
+/// `msg1`/`msg2`) starts after it and excludes the derivation time.
+#[allow(clippy::too_many_arguments)]
+async fn v2_pairing_rung(
+    dialer: &Arc<dyn PathDialer>,
+    cand: &CandidateEndpoint,
+    identity: &EndpointIdentity,
+    opts: &PairPolicyOptions,
+    pinned: Option<V2PinnedHost>,
+    operator_relay_key: Option<&[u8; 32]>,
+) -> Result<V2PendingCommit, CandidateError> {
+    let budget = v2_rung_budget(cand.provider);
+    let permit = acquire_initiator_argon2(budget).await?;
+    let mut deadline = TokioInstant::now() + budget;
+    let mut stream = match timeout_at(deadline, dialer.dial(&cand.addr)).await {
+        Ok(res) => res?,
+        Err(_) => return Err(RuntimeError::Timeout("v2 pairing rung dial timed out").into()),
+    };
+    let machine = V2PakePairInitiator::new(
+        identity,
+        opts.device_name.clone(),
+        opts.device_kind.clone(),
+        opts.code.clone(),
+        pinned,
+        PakeArgon2Params::production(),
+    )
+    .map_err(|err| CandidateError::fatal(err.into()))?
+    .with_deferred_claim();
+    let kdf_started = TokioInstant::now();
+    let (mut machine, init_actions) = match start_v2_pake_initiator(machine, permit).await {
+        Ok(started) => started,
+        Err(err) => {
+            let _ = stream.close().await;
+            return Err(err.into());
+        }
+    };
+    deadline += kdf_started.elapsed();
+    let mut sas = None;
+    let res = async {
+        if let Some(outcome) = await_deadline!(
+            deadline,
+            stream,
+            "v2 pairing rung timed out",
+            dispatch_v2_pair_actions(stream.as_mut(), init_actions, &mut sas)
+        ) {
+            return Err(RuntimeError::Protocol(format!(
+                "v2 pairing completed before commit: {outcome:?}"
+            )));
+        }
+        let mut buf = vec![0u8; MAX_OUTER_FRAME_LEN];
+        while !machine.is_awaiting_commit() {
+            let n = await_deadline!(
+                deadline,
+                stream,
+                "v2 pairing rung timed out",
+                stream.recv_chunk(&mut buf)
+            );
+            if n == 0 {
+                return Err(RuntimeError::Closed);
+            }
+            let actions = machine.feed_bytes(&buf[..n])?;
+            if let Some(outcome) = await_deadline!(
+                deadline,
+                stream,
+                "v2 pairing rung timed out",
+                dispatch_v2_pair_actions(stream.as_mut(), actions, &mut sas)
+            ) {
+                return Err(RuntimeError::Protocol(format!(
+                    "v2 pairing completed before commit: {outcome:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(err) = res {
+        let _ = stream.close().await;
+        return Err(err.into());
+    }
+    let host = machine
+        .verified_host()
+        .ok_or(CoreError::HostKeyUnverified)?;
+    let route_check =
+        match check_candidate_routes(opts.uri.as_ref(), operator_relay_key, &host.signing_pub) {
+            Ok(check) => check,
+            Err(err) => {
+                let _ = stream.close().await;
+                return Err(err);
+            }
+        };
+    Ok(V2PendingCommit {
+        stream,
+        machine,
+        sas,
+        route_check,
+    })
+}
+
+/// Wire v2 PAKE pairing over the hints of a pairing URI (or one explicit operator endpoint),
+/// one rung at a time.
+///
+/// Every rung that receives `msg1` receives `init_mac`, an offline code-guess oracle, so rungs
+/// are tried sequentially in path-planner order with a per-rung budget
+/// ([`V2_RUNG_BUDGET_NEAR`], [`V2_RUNG_BUDGET_FAR`]) plus the initiator Argon2id time, each with
+/// a fresh `channel_salt` and ephemeral key, every derivation under the process-wide permit
+/// ([`set_initiator_argon2_permits`]). Before commit any failure advances to the next rung,
+/// except an invalid route statement, which ends the attempt. The commit is irrevocable as in
+/// [`crate::driver::drive_pair_initiator_with_policy`]; persistence merges the plan into the
+/// latest roster with `apply_v2_pair_initiator_outcome_with_plan`.
+pub async fn drive_v2_pair_initiator_with_policy(
+    identity: Arc<EndpointIdentity>,
+    store: &RosterAccess,
+    opts: PairPolicyOptions,
+) -> Result<PairPolicyResult<V2PairDriveResult>, AttemptError> {
+    let plan = plan_pairing(store, &opts, DialWire::V2).await?;
+    let PairingPlan {
+        set,
+        pinned,
+        floor,
+        persist,
+        operator_relay_key,
+        ..
+    } = plan;
+    let v2_pin = pinned
+        .map(|pin| V2PinnedHost::new(pin, floor.max(tendril_core::WIRE_VERSION)))
+        .transpose()?;
+    let mut skipped = set.skipped.clone();
+    let ordered = PathPlanner::new(opts.policy_config, set.candidates.clone())
+        .candidates()
+        .to_vec();
+    let mut raw_failures: Vec<(CandidateEndpoint, RuntimeError)> = Vec::new();
+    let mut won = None;
+    for cand in ordered {
+        let Some(dialer) = set.dialer_for(cand.provider) else {
+            raw_failures.push((cand, RuntimeError::Protocol("missing dialer".to_owned())));
+            continue;
+        };
+        match v2_pairing_rung(
+            &dialer,
+            &cand,
+            &identity,
+            &opts,
+            v2_pin.clone(),
+            operator_relay_key.as_ref(),
+        )
+        .await
+        {
+            Ok(pending) => {
+                won = Some((cand, pending));
+                break;
+            }
+            Err(CandidateError { error, fatal: true }) => {
+                let failures = collect_failures(raw_failures, &mut skipped);
+                return Err(AttemptError {
+                    error,
+                    committed: false,
+                    skipped,
+                    failures,
+                });
+            }
+            Err(CandidateError { error, .. }) => raw_failures.push((cand, error)),
+        }
+    }
+    let failures = collect_failures(raw_failures, &mut skipped);
+    let Some((route, pending)) = won else {
+        return Err(exhausted(failures, skipped));
+    };
+    let V2PendingCommit {
+        mut stream,
+        mut machine,
+        mut sas,
+        route_check,
+    } = pending;
+    let claim = match machine.commit_claim() {
+        Ok(actions) => actions,
+        Err(err) => {
+            let _ = stream.close().await;
+            return Err(AttemptError {
+                error: err.into(),
+                committed: false,
+                skipped,
+                failures,
+            });
+        }
+    };
+    // Irrevocable from here: the claim write may deliver any prefix of `msg3`.
+    let deadline = TokioInstant::now() + opts.handshake_timeout;
+    let committed = async {
+        if let Some(outcome) = await_deadline!(
+            deadline,
+            stream,
+            "pre-auth v2 pairing handshake timed out",
+            dispatch_v2_pair_actions(stream.as_mut(), claim, &mut sas)
+        ) {
+            return Ok(outcome);
+        }
+        let mut buf = vec![0u8; MAX_OUTER_FRAME_LEN];
+        loop {
+            let n = await_deadline!(
+                deadline,
+                stream,
+                "pre-auth v2 pairing handshake timed out",
+                stream.recv_chunk(&mut buf)
+            );
+            if n == 0 {
+                return Err(RuntimeError::Closed);
+            }
+            let actions = machine.feed_bytes(&buf[..n])?;
+            if let Some(outcome) = await_deadline!(
+                deadline,
+                stream,
+                "pre-auth v2 pairing handshake timed out",
+                dispatch_v2_pair_actions(stream.as_mut(), actions, &mut sas)
+            ) {
+                return Ok(outcome);
+            }
+        }
+    }
+    .await;
+    let _ = stream.close().await;
+    let outcome = match committed {
+        Ok(outcome) => outcome,
+        Err(err) => return Err(committed_error(err, skipped, failures)),
+    };
+    let (plan, winner_source) =
+        pairing_persist_plan(&route_check, &opts.code, &set, &route, &persist);
+    let mut routes_persisted = Vec::new();
+    let mut routes_reason = plan.reason;
+    if let V2PairOutcome::InitiatorPending { host_id, .. } = &outcome {
+        let name = opts
+            .host_name
+            .clone()
+            .or_else(|| opts.uri.as_ref().map(|u| u.host_name.clone()))
+            .unwrap_or_else(|| host_id.clone());
+        match store.update(|roster| {
+            roster
+                .apply_v2_pair_initiator_outcome_with_plan(&outcome, name, &plan)
+                .map_err(Into::into)
+        }) {
+            Ok((_, merge)) => {
+                routes_persisted = merge.persisted;
+                routes_reason = merge.reason;
+            }
+            Err(err) => return Err(committed_error(err, skipped, failures)),
+        }
+    }
+    Ok(PairPolicyResult {
+        drive: V2PairDriveResult { outcome, sas },
+        route,
+        winner_source,
+        committed: true,
+        route_check,
+        routes_persisted,
+        routes_reason,
+        skipped,
+    })
+}
+
+fn exhausted(failures: Vec<CandidateFailure>, skipped: Vec<SkippedHint>) -> AttemptError {
+    connect_exhausted(failures, skipped, true)
+}
+
+impl V2SessionDriver {
+    /// The endpoint-free Day-2 connect, Wire v2.
+    ///
+    /// As [`crate::driver::SessionDriver::connect_with_policy_and_store`], with the stored
+    /// `/v2/relay` gate: a `/v2/relay` route is a candidate only for this entry's `operator` or
+    /// `signed` routes while the entry is `Active`, not CRL-revoked and holds `v2_secrets`. The
+    /// winner's Wire v2 floor and retained secrets are persisted with the final check.
+    pub async fn connect_with_policy_and_store(
+        identity: Arc<EndpointIdentity>,
+        target: &str,
+        store: &RosterAccess,
+        opts: ConnectOpts,
+    ) -> Result<ConnectResult<Self>, AttemptError> {
+        let plan = plan_connect(store, target, &opts, DialWire::V2).await?;
+        let ConnectPlan {
+            set,
+            roster,
+            snapshot,
+            expectation,
+            route_seq,
+            crl_seq,
+        } = plan;
+        let mut skipped = set.skipped.clone();
+        let evidence = SharedEvidence::default();
+        let roster = Arc::new(roster);
+        let target_owned = target.to_owned();
+        let grant = opts.grant.clone();
+        let ev = Arc::clone(&evidence);
+        let race = race_verified(
+            &set.dialers,
+            opts.policy_config,
+            set.candidates.clone(),
+            move |_cand, stream| {
+                let identity = Arc::clone(&identity);
+                let mut roster = (*roster).clone();
+                let (target, grant, expectation) =
+                    (target_owned.clone(), grant.clone(), expectation.clone());
+                let ev = Arc::clone(&ev);
+                async move {
+                    let res = async {
+                        let secret = extract_v2_reconnect_secret(&roster, &target)?;
+                        let driver = Self::connect_with_roster_ref(
+                            stream,
+                            &identity,
+                            &target,
+                            secret,
+                            grant,
+                            crl_seq,
+                            PaddingPolicy::v2_default(),
+                            V2RosterRef::Direct(&mut roster),
+                            current_unix_secs(),
+                            Vec::new(),
+                            V2RouteInit {
+                                expectation,
+                                route_seq,
+                                evidence: Some((Arc::clone(&ev), crl_seq)),
+                            },
+                        )
+                        .await?;
+                        Ok::<_, RuntimeError>(driver)
+                    }
+                    .await;
+                    res.map(|driver| (driver, roster))
+                        .map_err(day2_candidate_error)
+                }
+            },
+        )
+        .await;
+        let failures = collect_failures(race.failures, &mut skipped);
+        let (route, (mut driver, clone)) = match race.outcome {
+            Ok(won) => won,
+            Err(end) => {
+                if let Err(err) | Ok(Err(err)) = finalize_connect(
+                    store,
+                    target,
+                    &snapshot,
+                    &evidence,
+                    None,
+                    opts.policy,
+                    opts.replace_routes,
+                ) {
+                    return Err(AttemptError {
+                        error: err,
+                        committed: false,
+                        skipped,
+                        failures,
+                    });
+                }
+                return Err(match end {
+                    RaceEnd::Fatal(err) => AttemptError {
+                        error: err,
+                        committed: false,
+                        skipped,
+                        failures,
+                    },
+                    _ => connect_exhausted(failures, skipped, opts.recovery_uri.is_some()),
+                });
+            }
+        };
+        let Some(signing_pub) = clone.get(target).and_then(|e| e.signing_pub.clone()) else {
+            let _ = driver.stream.close().await;
+            return Err(committed_error(
+                CoreError::IncompletePin(target.to_owned()),
+                skipped,
+                failures,
+            ));
+        };
+        let facts = WinnerFacts {
+            static_pub: driver.peer_static_pub,
+            signing_pub,
+            applied_rotation: driver.applied_rotation.clone(),
+            recovery: driver.verified_recovery.take().map(|s| *s),
+            wire: WIRE_VERSION_V2,
+        };
+        let recovery_routes = match finalize_connect(
+            store,
+            target,
+            &snapshot,
+            &evidence,
+            Some(&facts),
+            opts.policy,
+            opts.replace_routes,
+        ) {
+            Ok(Ok(recovery)) => recovery,
+            Ok(Err(err)) | Err(err) => {
+                driver.core.closed = true;
+                let _ = driver.stream.close().await;
+                return Err(committed_error(err, skipped, failures));
+            }
+        };
+        driver.store = store.store().map(|s| (**s).clone());
+        // Route sets arrive only when `route_seq` was sent; CRLs the session accepts reach
+        // `store` either way.
+        driver.set_route_ingest(store.clone(), opts.policy);
+        Ok(ConnectResult {
+            route,
+            session: driver,
+            skipped,
+            failures,
+            recovery_routes,
+        })
     }
 }
