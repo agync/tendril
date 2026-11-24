@@ -113,6 +113,27 @@ final class TendrilNative {
       String name,
       String kind);
 
+  public static native String endpointIssuePairingUri(long ptr, String optionsJson);
+
+  public static native String endpointPairUri(
+      long ptr, String pairingUri, String name, String kind, String optionsJson);
+
+  public static native String endpointPairV2Uri(
+      long ptr, String pairingUri, String name, String kind, String optionsJson);
+
+  public static native void endpointSetPeerRoutes(long ptr, String peerId, String routesJson);
+
+  public static native String endpointPeerRoutes(long ptr, String peerId);
+
+  public static native void endpointClearPeerRoutes(long ptr, String peerId, String source);
+
+  public static native String endpointApplyRouteUri(long ptr, String pairingUri, String optionsJson);
+
+  public static native String endpointRefreshRoutes(long ptr, String snapshotJson);
+
+  public static native long sessionConnectWithOptions(
+      long epPtr, String targetHostId, String optionsJson);
+
   public static native long sessionConnect(
       long epPtr, String endpoint, String relayHost, String targetHostId, String grantJson);
 
