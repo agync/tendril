@@ -1,5 +1,8 @@
 import CTendril
 import Foundation
+#if canImport(Network)
+import Network
+#endif
 
 public enum TendrilError: Error, Equatable {
   case wouldBlock
@@ -364,6 +367,20 @@ public final class TendrilEndpoint {
   private var handle: OpaquePointer?
   private var activeCalls: Int = 0
   private var closing: Bool = false
+  /// Guards `pathMonitor`, `pathRefreshes` and `monitorClosed`. A monitor is swapped in or out
+  /// with this lock held, and `start()` and `cancel()` run outside it. `close()` sets
+  /// `monitorClosed` under it, so no monitor survives a close, and a monitor that was cancelled
+  /// before it started refuses to start.
+  private let monitorLock = NSLock()
+  private var pathMonitor: TendrilPathMonitor?
+  private var pathRefreshes = 0
+  private var monitorClosed = false
+  /// Last full transport configuration sent, as top-level JSON values. The C ABI replaces the
+  /// whole configuration per call, so `configureRoutes` merges into this cache. Held across the
+  /// FFI call to serialize configuration. The cache holds relay tickets and secrets, so
+  /// `close()` clears it; Swift cannot zeroize the freed strings, so they linger until reused.
+  private let configLock = NSLock()
+  private var transportConfig: [String: Any] = [:]
 
   #if canImport(CryptoKit) && canImport(Security)
   public init(
@@ -458,6 +475,10 @@ public final class TendrilEndpoint {
   }
 
   public func close() {
+    closePathMonitoring()
+    configLock.lock()
+    transportConfig = [:]
+    configLock.unlock()
     cond.lock()
     guard let h = handle else {
       cond.unlock()
@@ -549,7 +570,15 @@ public final class TendrilEndpoint {
     }
   }
 
+  /// Replaces the whole transport configuration. `configureRoutes` merges into the last one sent.
   public func configureTransportsJSON(_ transportConfigJson: String) throws {
+    configLock.lock()
+    defer { configLock.unlock() }
+    try configureTransportsLocked(transportConfigJson)
+  }
+
+  /// Sends `transportConfigJson` and caches it on success. `configLock` must be held.
+  private func configureTransportsLocked(_ transportConfigJson: String) throws {
     try withHandle { h in
       let rc = try withValidatedCString(transportConfigJson, name: "transportConfigJson") { cCfg in
         tendril_endpoint_configure_transports_json(h, cCfg)
@@ -558,6 +587,8 @@ public final class TendrilEndpoint {
         throw ffiError(rc, fallback: "tendril_endpoint_configure_transports_json failed")
       }
     }
+    let parsed = try? JSONSerialization.jsonObject(with: Data(transportConfigJson.utf8))
+    transportConfig = parsed as? [String: Any] ?? [:]
   }
 
   public func mintRelayTicket(
@@ -857,14 +888,16 @@ public final class TendrilEndpoint {
     }
   }
 
+  /// Opens a Wire v1 session. A `nil` or empty `endpoint` dials the peer's stored routes; a
+  /// non-empty one is an explicit operator endpoint, dialed alone.
   public func connect(
-    endpoint: String,
+    endpoint: String? = nil,
     relayHost: String? = nil,
     targetHostId: String,
     grantJson: String? = nil
   ) throws -> TendrilSession {
     try withHandle { h in
-      let raw = try withValidatedCString(endpoint, name: "endpoint") { cEp in
+      let raw = try withOptionalValidatedCString(endpoint, name: "endpoint") { cEp in
         try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
           try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
             try withOptionalValidatedCString(grantJson, name: "grantJson") { cGrant in
@@ -880,6 +913,360 @@ public final class TendrilEndpoint {
     }
   }
 
+  // MARK: Pairing URIs and routes
+
+  /// Issues a single-use pairing URI built from the announced route set. Hints come only from
+  /// the announced set (served listeners, `advertisedEndpoints` and, with `advertise: auto`,
+  /// enumerated addresses). Returns `{"uri", "code_kind", "dropped", "uri_len", "qr_version_m",
+  /// "route_seq"}` as JSON.
+  public func issuePairingUri(
+    kind: String? = nil,
+    hostName: String? = nil,
+    signRoutes: Bool? = nil
+  ) throws -> String {
+    let options = try routeOptionsJSON([
+      "kind": kind, "host_name": hostName, "sign_routes": signRoutes,
+    ])
+    return try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withOptionalValidatedCString(options, name: "options") { cOpts in
+        tendril_endpoint_issue_pairing_uri(h, cOpts, &out)
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_issue_pairing_uri failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// Pairs from a scanned Wire v1 pairing URI by racing its hints. `routePolicy` is
+  /// `"all_signed"` (default), `"committed_only"` or `"none"`; `saveRoute` stores the committed
+  /// route of an unsigned URI; `endpoint` is dialed alone and stored as an operator route.
+  public func pairUri(
+    _ pairingUri: String,
+    name: String? = nil,
+    deviceKind: String? = "ios",
+    routePolicy: String? = nil,
+    saveRoute: Bool? = nil,
+    endpoint: String? = nil,
+    code: String? = nil
+  ) throws -> String {
+    try pairUriCall(
+      "tendril_endpoint_pair_uri", tendril_endpoint_pair_uri, pairingUri, name, deviceKind,
+      routePolicy, saveRoute, endpoint, code)
+  }
+
+  /// Pairs from a scanned pairing URI over Wire v2, one rung at a time. Options as `pairUri`.
+  public func pairV2Uri(
+    _ pairingUri: String,
+    name: String? = nil,
+    deviceKind: String? = "ios",
+    routePolicy: String? = nil,
+    saveRoute: Bool? = nil,
+    endpoint: String? = nil,
+    code: String? = nil
+  ) throws -> String {
+    try pairUriCall(
+      "tendril_endpoint_pair_v2_uri", tendril_endpoint_pair_v2_uri, pairingUri, name, deviceKind,
+      routePolicy, saveRoute, endpoint, code)
+  }
+
+  private typealias PairUriFn = (
+    OpaquePointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+  ) -> Int32
+
+  private func pairUriCall(
+    _ fnName: String,
+    _ fn: PairUriFn,
+    _ pairingUri: String,
+    _ name: String?,
+    _ deviceKind: String?,
+    _ routePolicy: String?,
+    _ saveRoute: Bool?,
+    _ endpoint: String?,
+    _ code: String?
+  ) throws -> String {
+    let options = try routeOptionsJSON([
+      "route_policy": routePolicy, "save_route": saveRoute, "endpoint": endpoint, "code": code,
+    ])
+    return try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withValidatedCString(pairingUri, name: "pairingUri") { cUri in
+        try withOptionalValidatedCString(name, name: "name") { cName in
+          try withOptionalValidatedCString(deviceKind, name: "deviceKind") { cKind in
+            try withOptionalValidatedCString(options, name: "options") { cOpts in
+              fn(h, cUri, cName, cKind, cOpts, &out)
+            }
+          }
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "\(fnName) failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// Opens a session with options. `wire` is 1 or 2; a `nil` `endpoint` dials the stored routes;
+  /// a `recoveryUri` (fresh pairing URI of the peer) has its keys checked before `msg3`, and a
+  /// signed one replaces the signed routes when newer or with `replaceRoutes`. `relayHost` is the
+  /// expected relay host of an explicit `endpoint` (the Iroh relay mode for `iroh://`).
+  public func connectWithOptions(
+    targetHostId: String,
+    wire: Int = 1,
+    grantJson: String? = nil,
+    endpoint: String? = nil,
+    recoveryUri: String? = nil,
+    replaceRoutes: Bool? = nil,
+    routePolicy: String? = nil,
+    relayHost: String? = nil
+  ) throws -> TendrilSession {
+    var fields: [String: Any?] = [
+      "wire": wire, "endpoint": endpoint, "recovery_uri": recoveryUri,
+      "replace_routes": replaceRoutes, "route_policy": routePolicy, "relay_host": relayHost,
+    ]
+    if let grantJson {
+      guard let obj = try? JSONSerialization.jsonObject(with: Data(grantJson.utf8)) else {
+        throw TendrilError.invalidArgument("grantJson is not valid JSON")
+      }
+      fields["grant"] = obj
+    }
+    let options = try routeOptionsJSON(fields)
+    return try withHandle { h in
+      let raw = try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
+        try withOptionalValidatedCString(options, name: "options") { cOpts in
+          tendril_session_connect_with_options(h, cTarget, cOpts)
+        }
+      }
+      guard let raw else {
+        throw ffiError(
+          TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect_with_options failed")
+      }
+      return TendrilSession(handle: raw)
+    }
+  }
+
+  /// Replaces the operator routes of `peerId` with `routes` (at most six endpoint strings). One
+  /// bad entry rejects the list and nothing is written.
+  public func setPeerRoutes(peerId: String, routes: [String]) throws {
+    for route in routes where route.utf8.contains(0) {
+      throw TendrilError.invalidArgument("routes contains interior NUL byte")
+    }
+    let data = try JSONSerialization.data(withJSONObject: routes)
+    let json = String(decoding: data, as: UTF8.self)
+    try withHandle { h in
+      let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+        try withValidatedCString(json, name: "routes") { cRoutes in
+          tendril_endpoint_set_peer_routes(h, cPeer, cRoutes)
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_set_peer_routes failed")
+      }
+    }
+  }
+
+  /// Stored routes of `peerId` as JSON: `{"routes": [{"hint", "source"}], "route_meta":
+  /// {"seq", "issued_at", "origin"} | null, "last_route_set": {"outcome", "seq"} | null}`.
+  public func peerRoutes(peerId: String) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+        tendril_endpoint_peer_routes(h, cPeer, &out)
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_peer_routes failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// Clears stored routes of `peerId`. `source` is `nil` or `"operator"` (operator routes),
+  /// `"signed"`, `"committed"` or `"all"`. The route metadata is kept.
+  public func clearPeerRoutes(peerId: String, source: String? = nil) throws {
+    try withHandle { h in
+      let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+        try withOptionalValidatedCString(source, name: "source") { cSource in
+          tendril_endpoint_clear_peer_routes(h, cPeer, cSource)
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_clear_peer_routes failed")
+      }
+    }
+  }
+
+  /// Applies a fresh signed pairing URI to the paired host whose keys it carries, offline.
+  /// Returns `{"peer_id", "applied", "reason", "route_seq"}` as JSON.
+  public func applyRouteUri(
+    _ pairingUri: String,
+    replaceRoutes: Bool? = nil,
+    routePolicy: String? = nil
+  ) throws -> String {
+    let options = try routeOptionsJSON(["replace_routes": replaceRoutes, "route_policy": routePolicy])
+    return try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withValidatedCString(pairingUri, name: "pairingUri") { cUri in
+        try withOptionalValidatedCString(options, name: "options") { cOpts in
+          tendril_endpoint_apply_route_uri(h, cUri, cOpts, &out)
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_apply_route_uri failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// Re-scans the host's addresses and republishes the announced route set. `nil` enumerates
+  /// the interfaces natively; a snapshot is the complete network list
+  /// `{"networks": [{"id", "iface", "if_index", "transports", "addrs"}]}`. Returns
+  /// `{"route_seq", "changed"}` as JSON.
+  @discardableResult
+  public func refreshRoutes(snapshotJson: String? = nil) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withOptionalValidatedCString(snapshotJson, name: "snapshotJson") { cSnap in
+        tendril_endpoint_refresh_routes(h, cSnap, &out)
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_refresh_routes failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
+  /// Sets the route keys of the transport configuration. `advertise` is `"auto"` or
+  /// `"explicit"`, `routePolicy` is `"all_signed"`, `"committed_only"` or `"none"`, and
+  /// `relayAuthOrigins` are `scheme://host[:port]` origins that may receive relay admission
+  /// material. Only the arguments passed change; every other key of the last transport
+  /// configuration sent (relay credentials, P2P, wake) is kept.
+  public func configureRoutes(
+    advertisedEndpoints: [String]? = nil,
+    relayAuthOrigins: [String]? = nil,
+    advertise: String? = nil,
+    routePolicy: String? = nil,
+    signRoutes: Bool? = nil
+  ) throws {
+    let routes = try routeOptions([
+      "advertised_endpoints": advertisedEndpoints, "relay_auth_origins": relayAuthOrigins,
+      "advertise": advertise, "route_policy": routePolicy, "sign_routes": signRoutes,
+    ])
+    configLock.lock()
+    defer { configLock.unlock() }
+    let merged = transportConfig.merging(routes) { _, new in new }
+    let data = try JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])
+    try configureTransportsLocked(String(decoding: data, as: UTF8.self))
+  }
+
+  private func routeOptions(_ fields: [String: Any?]) throws -> [String: Any] {
+    var obj: [String: Any] = [:]
+    for (key, value) in fields {
+      guard let value else { continue }
+      if let s = value as? String, s.utf8.contains(0) {
+        throw TendrilError.invalidArgument("\(key) contains interior NUL byte")
+      }
+      if let list = value as? [String], list.contains(where: { $0.utf8.contains(0) }) {
+        throw TendrilError.invalidArgument("\(key) contains interior NUL byte")
+      }
+      obj[key] = value
+    }
+    return obj
+  }
+
+  private func routeOptionsJSON(_ fields: [String: Any?]) throws -> String? {
+    let obj = try routeOptions(fields)
+    if obj.isEmpty {
+      return nil
+    }
+    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+    return String(decoding: data, as: UTF8.self)
+  }
+
+  // MARK: Path monitoring
+
+  /// Starts an `NWPathMonitor` that calls `refreshRoutes()` on every path update, so the
+  /// announced route set follows the host's network changes. Calling it again replaces the
+  /// monitor. `close()` stops it. The first update marks the endpoint as a route host.
+  /// Throws `TendrilError.closed` on a closed endpoint. On platforms without `Network` this is a
+  /// documented no-op, and `isPathMonitoring` stays false.
+  public func startPathMonitoring(queue: DispatchQueue = DispatchQueue(label: "dev.tendril.path")) throws {
+    #if canImport(Network)
+    let monitor = TendrilPathMonitor(queue: queue) { [weak self] in
+      guard let self, (try? self.refreshRoutes()) != nil else { return }
+      self.monitorLock.lock()
+      self.pathRefreshes += 1
+      self.monitorLock.unlock()
+    }
+    monitorLock.lock()
+    guard !monitorClosed else {
+      monitorLock.unlock()
+      throw TendrilError.closed
+    }
+    let previous = pathMonitor
+    pathMonitor = monitor
+    monitorLock.unlock()
+    // Started and cancelled outside the lock; a monitor cancelled meanwhile refuses to start.
+    monitor.start()
+    previous?.cancel()
+    #endif
+  }
+
+  public func stopPathMonitoring() {
+    monitorLock.lock()
+    let monitor = pathMonitor
+    pathMonitor = nil
+    monitorLock.unlock()
+    monitor?.cancel()
+  }
+
+  /// Marks the monitor lifecycle closed and cancels the running monitor.
+  private func closePathMonitoring() {
+    monitorLock.lock()
+    monitorClosed = true
+    let monitor = pathMonitor
+    pathMonitor = nil
+    monitorLock.unlock()
+    monitor?.cancel()
+  }
+
+  /// Runs the monitor's path-update handler once, as an `NWPathMonitor` update would.
+  internal func firePathUpdate() {
+    monitorLock.lock()
+    let monitor = pathMonitor
+    monitorLock.unlock()
+    monitor?.fire()
+  }
+
+  /// Path updates that refreshed the routes so far.
+  internal var pathRefreshCount: Int {
+    monitorLock.lock()
+    defer { monitorLock.unlock() }
+    return pathRefreshes
+  }
+
+  /// True when the installed monitor, if any, has been cancelled.
+  internal var pathMonitorIsCancelled: Bool {
+    monitorLock.lock()
+    defer { monitorLock.unlock() }
+    return pathMonitor?.isCancelled ?? false
+  }
+
+  /// Number of cached transport configuration keys; zero after `close()`.
+  internal var cachedTransportKeyCount: Int {
+    configLock.lock()
+    defer { configLock.unlock() }
+    return transportConfig.count
+  }
+
+  /// True while a path monitor is running.
+  public var isPathMonitoring: Bool {
+    monitorLock.lock()
+    defer { monitorLock.unlock() }
+    return pathMonitor != nil
+  }
+
   public func acceptSession(timeoutMs: UInt64) throws -> TendrilSession {
     try withHandle { h in
       guard let raw = tendril_session_accept(h, timeoutMs) else {
@@ -889,14 +1276,15 @@ public final class TendrilEndpoint {
     }
   }
 
+  /// Opens a Wire v2 session. A `nil` or empty `endpoint` dials the peer's stored routes.
   public func connectV2(
-    endpoint: String,
+    endpoint: String? = nil,
     relayHost: String? = nil,
     targetHostId: String,
     grantJson: String? = nil
   ) throws -> TendrilSession {
     try withHandle { h in
-      let raw = try withValidatedCString(endpoint, name: "endpoint") { cEp in
+      let raw = try withOptionalValidatedCString(endpoint, name: "endpoint") { cEp in
         try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
           try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
             try withOptionalValidatedCString(grantJson, name: "grantJson") { cGrant in
@@ -919,6 +1307,63 @@ public final class TendrilEndpoint {
       }
       return TendrilSession(handle: raw)
     }
+  }
+}
+
+/// Calls `onChange` for every `NWPathMonitor` path update, on `queue`.
+internal final class TendrilPathMonitor {
+  #if canImport(Network)
+  private let monitor = NWPathMonitor()
+  #endif
+  private let queue: DispatchQueue
+  private let onChange: () -> Void
+  private let lock = NSLock()
+  private var cancelled = false
+
+  init(queue: DispatchQueue, onChange: @escaping () -> Void) {
+    self.queue = queue
+    self.onChange = onChange
+  }
+
+  /// Starts the monitor unless it was cancelled first. Returns whether it started.
+  @discardableResult
+  func start() -> Bool {
+    #if canImport(Network)
+    if isCancelled {
+      return false
+    }
+    monitor.pathUpdateHandler = { [weak self] _ in
+      self?.fire()
+    }
+    monitor.start(queue: queue)
+    return true
+    #else
+    return false
+    #endif
+  }
+
+  var isCancelled: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return cancelled
+  }
+
+  func fire() {
+    lock.lock()
+    let live = !cancelled
+    lock.unlock()
+    if live {
+      onChange()
+    }
+  }
+
+  func cancel() {
+    lock.lock()
+    cancelled = true
+    lock.unlock()
+    #if canImport(Network)
+    monitor.cancel()
+    #endif
   }
 }
 
