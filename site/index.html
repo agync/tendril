@@ -134,7 +134,7 @@
           </div>
           <div class="pane" data-step="1" hidden>
             <span class="pane-title">Checking the host</span>
-            <span class="muted small">The QR code carries the host's key, so an impostor is turned away early.</span>
+            <span class="muted small">The QR code carries the host's key and its signed routes, so an impostor is turned away early.</span>
           </div>
           <div class="pane" data-step="2" hidden>
             <span class="pane-title">Does the other screen show</span>
@@ -177,9 +177,50 @@
     <li><span class="n">03</span><h3>Where keys live</h3><p>Files only your user account can read on desktops and servers, wiped from memory after use. Keychain and Android Keystore adapters for mobile.</p></li>
     <li><span class="n">04</span><h3>Revoking a lost device</h3><p>Each device is pending, active or revoked. Signed revocation lists also reach sessions that are already open.</p></li>
     <li><span class="n">05</span><h3>What the link may do</h3><p>Nothing, until a signed grant (a permission) says so. Grants expire. They can be passed on, but only narrower, and at most four times.</p></li>
-    <li><span class="n">06</span><h3>When the network changes</h3><p>The pairing belongs to the devices, not the path. A new path needs a new handshake, never a new pairing.</p></li>
+    <li><span class="n">06</span><h3>When the network changes</h3><p>The pairing belongs to the devices, not the path. The host signs every route it can be reached on and sends a new list when they change. A new path needs a new handshake, never a new pairing.</p></li>
   </ol>
   <a class="more" href="/docs/overview.html">How each one works</a>
+</section>
+
+<section id="routes" class="band wrap" aria-labelledby="h-routes">
+  <h2 id="h-routes">One scan finds the host at home and away.</h2>
+  <p class="sub">A host's QR code carries every route it can be reached on, such as its home network address, its address on a VPN like a tailnet, and a relay, all signed by the host. Later connects try them nearest first, with nothing to type or approve.</p>
+  <figure class="rl">
+    <div class="rl-body">
+      <div class="rl-qr">
+        <p class="rl-qr-h">laptop QR code<span>3 routes</span></p>
+        <ol class="rl-list" aria-label="Routes in the QR code">
+          <li><span class="rl-k">LAN, home Wi-Fi</span><code>direct:192.168.1.20:7000</code></li>
+          <li><span class="rl-k">VPN, here a tailnet</span><code>overlay://100.101.7.20:7000</code></li>
+          <li><span class="rl-k">relay</span><code>wss://relay.example/v1/relay</code></li>
+        </ol>
+        <p class="rl-sig"><i></i><span>Signed by the laptop. The phone keeps all three with the pairing.</span></p>
+      </div>
+      <table class="rl-table">
+        <caption>Later, the phone connects with no address</caption>
+        <thead>
+          <tr><td></td><th scope="col">LAN<span>starts at 0 ms</span></th><th scope="col">VPN<span>about 250 ms</span></th><th scope="col">relay<span>about 500 ms</span></th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">At home</th><td class="is-win"><i></i>wins</td><td class="is-skip"><i></i>not needed</td><td class="is-skip"><i></i>not needed</td></tr>
+          <tr><th scope="row">Away, VPN on</th><td class="is-miss"><i></i>no answer</td><td class="is-win"><i></i>wins</td><td class="is-skip"><i></i>not needed</td></tr>
+          <tr><th scope="row">Away, VPN off</th><td class="is-miss"><i></i>no answer</td><td class="is-miss"><i></i>no answer</td><td class="is-win"><i></i>wins</td></tr>
+        </tbody>
+      </table>
+      <div class="rl-after">
+        <div>
+          <p class="rl-after-h">The laptop's address changes</p>
+          <p>It signs a new route list and sends it to each paired device, at once if connected, otherwise on its next connection. The next connect dials the new address.</p>
+        </div>
+        <div>
+          <p class="rl-after-h">No stored route answers</p>
+          <p>A relay in the list stays put while home and VPN addresses change. Without one, scan a fresh QR code. The routes update and the pairing stays.</p>
+        </div>
+      </div>
+    </div>
+    <figcaption class="rl-cap">Illustrative addresses. Start times follow the defaults. A route that fails early lets the next one start at once.</figcaption>
+  </figure>
+  <p class="more-row"><a class="more" href="/how-it-works#routes">How the routes stay current</a><a class="more" href="/docs/usage/seamless-pairing.html">Seamless pairing guide</a></p>
 </section>
 
 <section id="uses" class="band wrap" aria-labelledby="h-uses">
@@ -454,6 +495,7 @@ tendril --state-dir ./mac-mini-state mint &lt;device_id&gt; --cap backup.write</
       <dl class="rows">
         <div><dt>Hybrid handshake</dt><dd><code class="mono small">Noise_XXhfs_25519+<wbr>MLKEM768_ChaChaPoly_SHA256</code>, in our own Noise code. Checked against a separate Go version</dd></div>
         <div><dt>Code proof</dt><dd>Works only on the connection it was made for</dd></div>
+        <div><dt>Signed routes</dt><dd>The host signs the addresses in its QR code and every later update. A route only says where to dial. The handshake still has to prove the host</dd></div>
         <div><dt>Confirm, then grant</dt><dd>Approving a device and granting it anything are separate steps</dd></div>
         <div><dt>Grants</dt><dd>Default deny. Exact names or a prefix, no patterns</dd></div>
         <div><dt>Revocation</dt><dd>Signed lists that only move forward, pushed into live sessions</dd></div>
