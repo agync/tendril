@@ -291,6 +291,8 @@ class RosterRaceTests(unittest.TestCase):
         host = tendril.Endpoint(None, "relay-host")
         cli = tendril.Endpoint(None, "relay-cli")
         try:
+            # Day-2 connects read the pinned peer before dialing, so pair first.
+            pair_v2(host, cli, host.serve_direct("127.0.0.1:0"), "relay-host")
             p2p_addr = host.serve_p2p("disabled")
             endpoint_id = p2p_addr.split("://", 1)[1].split("?", 1)[0]
             uri = f"iroh://{endpoint_id}?relay=http://127.0.0.1:9/"
