@@ -56,6 +56,9 @@ updates:
     cooldown:
       default-days: 7
     groups:
+      # napi and napi-derive must share a major version; bump them together.
+      napi:
+        patterns: ["napi", "napi-*"]
       node-crates:
         patterns: ["*"]
         update-types: [minor, patch]
