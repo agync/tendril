@@ -448,6 +448,27 @@ async function main() {
     const browserPair = await chromePairEval;
     assert.equal(browserPair.sas, peerPair.sas);
     assert.equal(browserPair.host_confirmed, false);
+    // The explicit relay endpoint of a pairing call is stored as an operator route.
+    const proxiedRelay = `ws://127.0.0.1:${server.port}/v1/relay`;
+    assert.deepEqual(browserPair.routes_persisted, [{ hint: proxiedRelay, source: "operator" }]);
+    const browserChecks = await cdp.evalAsync(`
+      const sdk = window.__e2eSdk;
+      const filtered = sdk.filterWebCompatibleEndpoints([
+        'direct:192.0.2.1:7000',
+        'wss://relay.example/v1/relay',
+        'wss://relay.example/v2/relay',
+      ]);
+      return {
+        candidates: filtered.candidates.map((c) => c.endpoint),
+        skipped: filtered.skipped.map((s) => s.reason),
+        kind: sdk.classifyPairingCode(${JSON.stringify(pairCode)}),
+        routes: window.__e2eClient.peerRoutes('web-e2e-host').routes,
+      };
+    `);
+    assert.deepEqual(browserChecks.candidates, ["wss://relay.example/v1/relay"]);
+    assert.deepEqual(browserChecks.skipped, ["browser_unsupported", "relay_v2_not_authorized"]);
+    assert.equal(browserChecks.kind, "remote3_group");
+    assert.deepEqual(browserChecks.routes, [{ hint: proxiedRelay, source: "operator" }]);
 
     await peer.call({ op: "confirm", peer_id: peerPair.device_id, sas: peerPair.sas });
     const grantObj = (
@@ -477,15 +498,14 @@ async function main() {
       await window.__e2eClient.confirmPeer('web-e2e-host', ${JSON.stringify(browserPair.sas)});
     `);
 
+    // Endpoint-free Day-2 connect over the stored operator route.
     const chromeConnEval = cdp.evalAsync(`
       window.__e2eSession = await window.__e2eClient.connect({
-        relayUrl: 'ws://127.0.0.1:${server.port}/v1/relay',
-        targetPub: ${JSON.stringify(peerInit.relay_pub)},
-        expectedHost: '127.0.0.1',
         targetHostId: 'web-e2e-host',
         grantJson: ${JSON.stringify(JSON.stringify(grantObj))},
       });
       return {
+        route: window.__e2eSession.route,
         established: window.__e2eSession.isEstablished(),
         allowRead: window.__e2eSession.authorize('fs.read'),
         denyExec: window.__e2eSession.authorize('shell.exec'),
@@ -493,6 +513,11 @@ async function main() {
     `);
     await peer.call({ op: "connect" });
     const connState = await chromeConnEval;
+    assert.deepEqual(connState.route, {
+      hint: proxiedRelay,
+      endpoint: proxiedRelay,
+      provider: "relay",
+    });
     assert.equal(connState.established, true);
     assert.equal(connState.allowRead, true);
     assert.equal(connState.denyExec, false);
@@ -619,11 +644,12 @@ async function main() {
         const bareP2p = listening.p2p_endpoint.split("?")[0];
         assert.ok(bareP2p.startsWith("iroh://"), `missing iroh endpoint: ${listening.p2p_endpoint}`);
 
+        assert.ok(listening.pairing_uri, "tendril serve --issue-code remote printed no pairing URI");
+        // The URI's iroh:// hint is a hint dial: no address lookup, Default relay map.
         const p2pPairPromise = cdp.evalAsync(`
           window.__p2pClient = await window.__e2eSdk.TendrilWebClient.create({ hostId: 'chrome-p2p' });
           return await window.__p2pClient.pair({
-            endpoint: ${JSON.stringify(bareP2p)},
-            code: ${JSON.stringify(listening.pairing_code)},
+            pairingUri: ${JSON.stringify(listening.pairing_uri)},
             deviceName: 'chrome-iroh',
             deviceKind: 'web',
             timeoutMs: 25000,
@@ -635,6 +661,9 @@ async function main() {
         ]);
         assert.equal(p2pServerPair.event, "paired");
         assert.equal(p2pBrowserPair.sas, p2pServerPair.sas);
+        assert.equal(p2pBrowserPair.route.provider, "p2p");
+        // The URI pins the host key, so the browser records the host as confirmed.
+        assert.equal(p2pBrowserPair.host_confirmed, true);
 
         execFileSync(
           CLI_BIN,
@@ -648,7 +677,6 @@ async function main() {
         ).trim();
 
         const connInfo = await cdp.evalAsync(`
-          await window.__p2pClient.confirmPeer('web-p2p-host', ${JSON.stringify(p2pBrowserPair.sas)});
           const sess = await window.__p2pClient.connect({
             endpoint: ${JSON.stringify(bareP2p)},
             targetHostId: 'web-p2p-host',

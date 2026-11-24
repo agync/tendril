@@ -99,9 +99,11 @@ bindings/wasm-p2p: ## Build opt-in p2p-iroh browser WASM module into bindings/we
 
 bindings/web: bindings/wasm bindings/wasm-p2p ## Run Web SDK security tests, conformance, and live relay E2E tests
 	cargo build -p tendril-relay --bin tendril-relay
-	cargo build -p tendril-cli --bin tendril-conformance-peer
+	cargo build -p tendril-cli --bin tendril-conformance-peer --bin tendril
 	node --test bindings/web/test/security.test.mjs
 	node --test bindings/web/test/group.test.mjs
+	node --test bindings/web/test/pairing_uri.test.mjs
+	node --test bindings/web/test/connect_lock.test.mjs
 	node bindings/web/test/browser_e2e.mjs
 
 bindings/jni: ## Build tendril_jni shared library and run host JVM conformance tests

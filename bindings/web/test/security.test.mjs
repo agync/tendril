@@ -560,18 +560,41 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
     }
     assert.equal(gotPong, true);
 
-    // SEC-22: roster persistence error during pollEvent() error path locks session fail-closed.
+    // SEC-22: a pollEvent() error path that changed the roster persists it; a persistence error
+    // there locks the session and the client fail-closed.
+    const { WasmIdentity, WasmSessionClient } = await import("../pkg/tendril_wasm.js");
+    const evidenceId = WasmIdentity.generate("sec-22-evidence");
+    const evidencePub = JSON.parse(evidenceId.info_json()).signing_pub;
+    evidenceId.free();
+    const realFeed = WasmSessionClient.prototype.feed_bytes;
+    // Stands in for authenticated evidence the failing frame left in the roster.
+    WasmSessionClient.prototype.feed_bytes = function (bytes, now, elapsed, roster) {
+      roster.add_trust_anchor("sec-22-evidence", evidencePub);
+      return realFeed.call(this, bytes, now, elapsed, roster);
+    };
     failPersist = true;
     activeMitm.upstream.unpipe(activeMitm.clientSock);
     // Unmasked server->client RFC 6455 binary frame carrying bogus ciphertext bytes.
     activeMitm.clientSock.write(Buffer.from([0x82, 0x06, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef]));
-    await assert.rejects(() => session1.pollEvent(2000), /failed to persist roster update/);
+    try {
+      await assert.rejects(() => session1.pollEvent(2000), /failed to persist roster update/);
+    } finally {
+      WasmSessionClient.prototype.feed_bytes = realFeed;
+    }
     assert.throws(() => session1.authorize("fs.read"), /session locked after roster persistence failure/);
     assert.throws(() => session1.sendData("late"), /session locked after roster persistence failure/);
     await session1.close(1000, "locked");
+    await assert.rejects(
+      () => client.setPeerRoutes("sec-host", []),
+      /client locked after roster persistence failure/
+    );
+    // The unpersisted evidence stays in memory for an export; it is never rolled back.
+    const anchorsAfterLock = JSON.parse(client.exportRosterJson()).trust_anchors;
+    assert.ok(Object.keys(anchorsAfterLock).includes("sec-22-evidence"));
+    client.free();
 
     // SEC-33: client.free() while a session is active never traps WASM with null pointer passed to rust.
-    failPersist = false;
+    const client2 = await TendrilWebClient.create({ hostId: "sec-client-2" });
     const peer2 = spawnPeer();
     try {
       const init2 = await peer2.call({ op: "init", host_id: "sec-host-2" });
@@ -582,20 +605,20 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
       });
       const c2 = (await peer2.call({ op: "issue_code", kind: "remote" })).code;
       const pp2 = peer2.call({ op: "pair" });
-      const b2 = await client.pair({
+      const b2 = await client2.pair({
         relayUrl: relay.wsUrl,
         targetPub: init2.relay_pub,
         expectedHost: "127.0.0.1",
         code: c2,
       });
       const hp2 = await pp2;
-      await client.confirmPeer("sec-host-2", b2.sas);
+      await client2.confirmPeer("sec-host-2", b2.sas);
       await peer2.call({ op: "confirm", peer_id: hp2.device_id, sas: hp2.sas });
       const g2 = (
         await peer2.call({ op: "mint", peer_id: hp2.device_id, caps: ["fs.read"] })
       ).grant;
       const cp2 = peer2.call({ op: "connect" });
-      const sess2 = await client.connect({
+      const sess2 = await client2.connect({
         relayUrl: relay.wsUrl,
         targetPub: init2.relay_pub,
         expectedHost: "127.0.0.1",
@@ -605,7 +628,7 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
       await cp2;
 
       const pendingPoll = sess2.pollEvent(5000);
-      client.free();
+      client2.free();
       assert.equal(sess2.isClosed(), true);
       assert.throws(() => sess2.authorize("fs.read"), (e) => !/null pointer/i.test(e.message));
       assert.throws(() => sess2.tick(), (e) => !/null pointer/i.test(e.message));
@@ -613,7 +636,7 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
       assert.throws(() => sess2.pollEvent(10), (e) => !/null pointer/i.test(e.message));
       const polled = await pendingPoll;
       assert.equal(polled.status, "eof");
-      assert.throws(() => client.info(), /freed/);
+      assert.throws(() => client2.info(), /freed/);
     } finally {
       peer2.close();
     }
