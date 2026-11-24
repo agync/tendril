@@ -14,3 +14,8 @@ Entries from November 2026.
 - [Groups on sealed Kotlin and Swift endpoints](23-groups-on-sealed-kotlin-and-swift.md)
 - [ffi: group hub serves /v2/relay sibling links](23-ffi-group-hub-serves-v2-relay.md)
 - [Loopback test listeners: held dead ports and foreign requests ignored](23-loopback-test-listeners-held-dead-ports.md)
+- [pairing: multi-route URIs, signed routes and automatic fallback](23-pairing-multi-route-uris-signed-routes.md)
+- [ffi: pairing URIs, endpoint-free connect and route announcements](23-ffi-pairing-uris-endpoint-free-connect.md)
+- [swift: pairing URIs, endpoint-free connect and route refresh](23-swift-pairing-uris-endpoint-free-connect.md)
+- [kotlin: pairing URIs, endpoint-free connect and the multi-network snapshot](23-kotlin-pairing-uris-endpoint-free-connect.md)
+- [pairing: security and reliability fixes](23-pairing-security-and-reliability-fixes.md)

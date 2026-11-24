@@ -21,6 +21,7 @@ Every language binding and independent implementation must match all canonical v
 | `spec/vectors/handshake.json` | Full deterministic `pair` and `session` `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256` transcripts, `DATA`, and `REKEY` | Unverified `msg2` host key or pin mismatch abort before `msg3` |
 | `spec/vectors/m2m_enrollment.json` | Signed single-use `pair.enroll` token, 3373-byte hybrid `enroll_proof`, M2M `PairClaim` and `PairResponse` | Single-use replay rejection and session-grant purpose-separation rejection |
 | `spec/vectors/wire_v2.json` | Wire `0x02` preamble binding, PAKE `Argon2id` + HKDF derivation, pseudonymous rendezvous MAC, `/v2/relay` epoch `mailbox_id`/`dial_token`, `0x09 PADDED` buckets | Stale/replayed rendezvous rejection, downgrade floor rejection, and invalid padding rejection |
+| `spec/vectors/routes.json` | `0x0C ROUTE_SET` body and signed bytes, deterministic 3373-byte hybrid signatures, `SessionHello.route_seq`, and the pairing URI route statement `rs` (`pairing_route_statement`) | Structurally invalid route sets (`decode_rejections`: trailing byte, truncation, bad version, count over 6, empty hint, sequence bounds, duplicate, fragment and IPC hints) rejected by every decoder |
 
 ## Verification commands
 
