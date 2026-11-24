@@ -120,7 +120,7 @@
         <div class="see-text">
           <p class="see-n">01</p>
           <h3>Type or scan a code</h3>
-          <p>The laptop shows a code. Scan it with your phone, or type it. It works once, for 15 minutes.</p>
+          <p>The laptop shows a code. Scan it with your phone, or type it. It works once, for 15 minutes. A scanned code also tells your phone every way to reach the laptop.</p>
         </div>
         <div class="see-pair">
           <div class="device">
@@ -193,10 +193,18 @@
     <figcaption>Example screens. Each app draws its own.</figcaption>
   </figure>
   <p class="callout"><strong>Why compare?</strong> If the strings differ, someone is between your devices. Cancel, and that device gets no access.</p>
+  <p class="part-lead">After that, there is nothing more to do. Your phone finds the laptop on its own, and you are not asked which way to connect.</p>
+  <ul class="gains" aria-label="After pairing">
+    <li>At home, directly over your Wi-Fi.</li>
+    <li>Away, through your VPN if you use one.</li>
+    <li>Anywhere else, through a relay that cannot read what it passes on.</li>
+    <li>If the laptop's address changes, it tells your phone.</li>
+  </ul>
   <details class="more">
     <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
     <div class="more-body">
       <p><strong>The code.</strong> It is bound to this one handshake and never crosses the network itself. The QR code also carries the laptop's key, so the phone turns away an impostor before it says anything. Pairing across the internet uses a longer code, <code>TND-XXXX-XXXX-XXXX</code>.</p>
+      <p><strong>The addresses.</strong> A QR code also carries the laptop's addresses, signed by the laptop, and your phone keeps them. Anyone who photographs the code sees those addresses until it expires. If your phone ever cannot reach the laptop at all, the app may ask you to scan a fresh code. That updates the addresses and keeps the pairing.</p>
       <p><strong>The string.</strong> Both devices work it out from the handshake they just ran. A device in the middle would have run a different handshake with each side, so the two screens would not match.</p>
       <p><strong>After pairing.</strong> The new device can open a sealed connection and nothing else, until the app grants it something.</p>
       <p class="more-link">Read more: <a href="/how-it-works#pairing">Pairing</a> on How it works</p>

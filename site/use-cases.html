@@ -83,7 +83,7 @@
   <h2 id="h-desktop">Reach your desktop app from your phone</h2>
   <p class="part-moment">You are out, and the agent at home needs a yes.</p>
   <p class="part-lead"><span class="lab">The problem.</span> A coding agent on the Mac mini stops to ask before it acts, and you have only your phone. The usual fixes are an open port, a VPN, or a cloud dashboard that sees your code.</p>
-  <p class="part-lead"><span class="lab">With Tendril.</span> The app on the Mac mini pairs with your phone once: scan a code, compare a check string. After that the phone reaches the Mac mini directly at home, or through hole punching or a relay when away, and it can do only what you granted.</p>
+  <p class="part-lead"><span class="lab">With Tendril.</span> The app on the Mac mini pairs with your phone once: scan a code, compare a check string. The code carries every route the Mac mini signed, so after that the phone reaches it directly at home, over your VPN or through a relay when away, with no prompt, and it can do only what you granted.</p>
   <figure class="fig">
     <div class="grants">
       <div class="grant">
@@ -113,6 +113,7 @@
       <p class="for-h">For the person using it</p>
       <ul>
         <li>No account to make and no port to open.</li>
+        <li>One scan. Leaving home needs no new code.</li>
         <li>The phone can approve and read logs. It can never run a shell.</li>
         <li>Phone lost? Revoke it on the Mac mini.</li>
       </ul>
@@ -129,8 +130,8 @@
   <details class="more">
     <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
     <div class="more-body">
-      <p><strong>Paths.</strong> On the same network the phone can use the direct path. Away from home it can use the p2p path, hole punching through iroh, or a relay that forwards sealed frames it cannot read. In Rust, <code>dial_with_policy</code> tries the paths nearest first and keeps the first one that proves the Mac mini. The other bindings and the CLI dial the one address you give them today.</p>
-      <p><strong>Changing networks.</strong> Reconnecting is up to your app. When the phone leaves Wi-Fi, the app dials again, the devices run a new handshake on another path, and the pairing and grants carry over. Phones suspend background sockets while asleep, so the phone reaches the Mac mini again when it wakes.</p>
+      <p><strong>Paths.</strong> On the same network the phone can use the direct path. Away from home it can use the p2p path, hole punching through iroh, or a relay that forwards sealed frames it cannot read. <code>dial_with_policy</code> in the Rust runtime tries the paths nearest first and keeps the first one that proves the Mac mini. Connect without an address and every binding and the CLI do the same over the routes stored at pairing.</p>
+      <p><strong>Changing networks.</strong> When the phone leaves Wi-Fi, the app connects again and Tendril tries the stored routes in order. The devices run a new handshake on another path, and the pairing and grants carry over. If the Mac mini's addresses change, it signs a new route list and sends it to the phone. Phones suspend background sockets while asleep, so the phone reaches the Mac mini again when it wakes.</p>
       <p><strong>A phone asleep.</strong> With Wire v2, the Mac mini can send a sleeping phone a wake hint through a push service, such as FCM or an APNs gateway, then dial it once it is back. The hint carries a tag that changes every hour, and no data.</p>
       <p><strong>Checks.</strong> The Mac mini checks the grant when a session opens, on every rekey and on every <code>authorize</code> call. Plain checks treat a resource as an opaque string. For file paths, the Rust core's <code>authorize_path</code> cleans the path first and matches only at <code>/</code> boundaries.</p>
       <p><strong>Revoking.</strong> Once the Mac mini marks the phone revoked, its next request is denied, even in a session that is already open, and it cannot open a new one.</p>
@@ -188,7 +189,7 @@
   <details class="more">
     <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
     <div class="more-body">
-      <p><strong>No internet needed.</strong> A pairing QR code carries the laptop's key and its address on the local network, so the phone can pair and connect over the direct path with no outside server.</p>
+      <p><strong>No internet needed.</strong> A pairing QR code carries the laptop's key and its signed addresses, such as its local network address, so the phone can pair and connect over the direct path with no outside server. The laptop signs a new list when its addresses change.</p>
       <p><strong>The browser.</strong> A browser joins only as a client, over WebSockets, through a Tendril relay or, with the opt-in p2p build, an iroh relay. It cannot open UDP sockets, so it cannot hole punch, or hold a connection while the browser suspends the tab. Pairing across the internet uses the long code, <code>TND-XXXX-XXXX-XXXX</code>, with 12 random characters. By default, hosts reject the short form on remote paths.</p>
       <p><strong>Grants that end.</strong> The host sets a lifetime each time it grants something. In Python, for example, <code>host.mint_grant(tab, ["notes.read"], ttl_secs=28800)</code> grants reading for 8 hours.</p>
       <p><strong>Merging edits.</strong> Tendril carries the bytes and checks the grant. Merging notes edited on two devices is a job for a sync library such as Automerge or Yjs, run over the session in chunks of at most 65,499 bytes, with no second network stack.</p>
@@ -247,7 +248,7 @@
     <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
     <div class="more-body">
       <p><strong>Pairing needs a screen.</strong> The host shows the code and the check string, so pairing by eye fits a box with a small display. A machine with no screen enrolls with a token instead, as in case 04.</p>
-      <p><strong>Moving relays.</strong> Moving from one relay to another changes only the relay address each device keeps on its roster. Keys, pairing and grants stay as they are. A relay can be public, one you run, or one embedded in your app, all on the same protocol.</p>
+      <p><strong>Moving relays.</strong> Moving from one relay to another changes only the routes. The box signs a new route list that names the new relay and sends it to each phone when it next connects. A phone that cannot reach the box on any stored route gets the new list by scanning a fresh code from the box, without pairing again. Keys, pairing and grants stay as they are. A relay can be public, one you run, or one embedded in your app, all on the same protocol.</p>
       <p><strong>Who may use the relay.</strong> The maker can run <code>tendril-relay</code> so that it admits only its own devices, with a shared secret or with short-lived tickets it signs. With admission on, the relay checks a device before it says whether a mailbox is online. An owner who moves to their own relay sets their own rule.</p>
       <p><strong>Peer-to-peer.</strong> The p2p path uses iroh, which by default finds peers through the free public relay and discovery servers run by n0. You can point it at an iroh relay you run or a hosted one, pass it a token, or turn discovery off.</p>
       <p><strong>Guests.</strong> The box grants a friend's phone one album with an end time, after the friend's phone has paired with it. Revoking the friend's phone ends it sooner.</p>
@@ -348,6 +349,7 @@
     <li><a href="/docs/usage/cli-demo.html">CLI demo</a><span>Pair two devices on your own machine</span></li>
     <li><a href="/docs/design/grants.html">Grants design</a><span>Names, delegation, revocation</span></li>
     <li><a href="/docs/design/m2m-enrollment.html">Machine enrollment</a><span>Tokens, pinning, the burn log</span></li>
+    <li><a href="/docs/usage/seamless-pairing.html">Seamless pairing</a><span>One QR code, signed routes, route updates</span></li>
     <li><a href="/docs/overview.html">Scope and limits</a><span>What v1 covers, and what it does not</span></li>
     <li><a href="https://github.com/agync/tendril">Source on GitHub</a><span>Apache-2.0, specs in <code>spec/</code></span></li>
   </ul>

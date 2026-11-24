@@ -297,6 +297,57 @@ ul, ol { list-style: none; }
 }
 @media (max-width: 960px) { .lane-d { display: none; } }
 
+/* Route ladder. One signed QR code on the left, and on the right which stored route wins as the
+   phone moves away from home. The accent marks winning cells only, so the wins step down and to
+   the right like rungs. A miss is a hollow red square, a route never started is a short rule. */
+.rl { margin: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+.rl-body { padding: clamp(16px, 3vw, 32px); display: grid; grid-template-columns: minmax(0, 300px) minmax(0, 1fr); gap: 28px clamp(24px, 4vw, 56px); align-items: start; }
+.rl-qr { min-width: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); }
+.rl-qr-h { padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; font: 13px var(--mono); color: var(--text); }
+.rl-qr-h span { color: var(--text-4); }
+.rl-list { position: relative; padding: 14px 40px 14px 14px; display: grid; gap: 12px; }
+.rl-list::after { content: ""; position: absolute; top: 20px; bottom: 20px; right: 16px; width: 9px; border: 1.5px solid var(--accent); border-left: 0; }
+.rl-list li { min-width: 0; display: grid; gap: 1px; }
+.rl-k { font: 12px var(--sans); color: var(--text-4); }
+.rl-list code { font: 13px/1.45 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+.rl-sig { margin: 0 14px; padding: 12px 0 14px; border-top: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; font-size: 13px; line-height: 1.45; color: var(--text-3); }
+.rl-sig i { flex: none; width: 7px; height: 7px; background: var(--accent); }
+.rl-sig code { font: 12.5px var(--mono); color: var(--text); }
+
+.rl-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.rl-table caption { padding-bottom: 12px; text-align: left; font: 500 13px var(--sans); color: var(--text-4); }
+.rl-table th, .rl-table td { padding: 13px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.rl-table thead th { padding-top: 0; border-bottom-color: var(--line-strong); font: 500 13px var(--mono); color: var(--text); }
+.rl-table thead th span { display: block; margin-top: 2px; font: 12px var(--sans); color: var(--text-4); }
+.rl-table thead td { padding: 0; border-bottom-color: var(--line-strong); }
+.rl-table tbody th { width: 30%; padding-left: 0; font: 500 14px/1.4 var(--sans); color: var(--text); }
+.rl-table td { color: var(--text-4); white-space: nowrap; }
+.rl-table td i { display: inline-block; width: 7px; height: 7px; margin-right: 8px; vertical-align: 1px; }
+.rl-table .is-win { background: var(--accent-soft); box-shadow: inset 0 2px 0 var(--accent); color: var(--accent-text); font-weight: 600; }
+.rl-table .is-win i { background: var(--accent); }
+.rl-table .is-miss { color: var(--text-3); }
+.rl-table .is-miss i { border: 1px solid var(--crit); }
+.rl-table .is-skip i { height: 0; border-top: 1px solid var(--line-strong); }
+
+.rl-after { grid-column: 1 / -1; padding-top: 22px; border-top: 1px solid var(--line); display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 18px 56px; }
+.rl-after-h { margin-bottom: 4px; font: 500 16px/1.4 var(--sans); color: var(--text); }
+.rl-after p + p { font-size: 15px; color: var(--text-3); max-width: 52ch; }
+.rl-cap { padding: 10px 18px 14px; border-top: 1px solid var(--line); font-size: 13px; color: var(--text-4); }
+
+/* Inside a how-it-works figure the panel is already drawn, so the ladder drops its own frame. */
+.rl-in .rl-body { padding: 0; grid-template-columns: minmax(0, 1fr); }
+.rl-in .rl-qr { background: var(--surface); }
+
+@media (max-width: 760px) {
+  .rl-body { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 420px) {
+  .rl-table th, .rl-table td { padding: 11px 6px; }
+  .rl-table tbody th { width: 26%; font-size: 13px; }
+  .rl-table td { font-size: 13px; white-space: normal; }
+  .rl-table td i { margin-right: 5px; }
+}
+
 /* Bands */
 .band { padding-top: var(--band); padding-bottom: var(--band); border-bottom: 1px solid var(--line); }
 .band h2, .end h2 { font: 600 clamp(30px, 3.8vw, 48px)/1.08 var(--sans); letter-spacing: -0.025em; max-width: 24ch; margin-bottom: 16px; }

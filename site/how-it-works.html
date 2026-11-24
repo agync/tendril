@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>How Tendril works</title>
-<meta name="description" content="How Tendril links two devices: keys made on each device, pairing with a code and a check string, default-deny grants, revocation, groups of up to 32 devices, a hybrid post-quantum handshake, enrolling machines with no screen, six network paths, blind relays, and the limits of what it protects.">
+<meta name="description" content="How Tendril links two devices: keys made on each device, pairing with a code and a check string, default-deny grants, revocation, groups of up to 32 devices, a hybrid post-quantum handshake, enrolling machines with no screen, six network paths, one QR code with signed routes, blind relays, and the limits of what it protects.">
 <link rel="canonical" href="{{SITE_URL}}/how-it-works">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Tendril">
@@ -116,8 +116,8 @@
     <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
     <div class="more-body">
       <p>Every path is an untrusted byte pipe below the session. TLS, WireGuard, QUIC or a secure WebSocket around it count as plumbing. Only the inner Noise session, <code>Noise_XXhfs_25519+<wbr>MLKEM768_ChaChaPoly_SHA256</code>, proves who the other device is and carries its grants.</p>
-      <p>A pairing link can carry endpoint hints (<code>ep</code>). They say where to dial and never grant anything. The key the peer-to-peer path uses for routing is derived from the device's own key and is routing metadata only.</p>
-      <p>Reconnecting after a network change is up to your app. It dials again, and the pairing and grants carry over unchanged.</p>
+      <p>A pairing link can carry up to six route hints (<code>ep</code>). They say where to dial and never grant anything. A host signs them by default, so the device keeps every route the host signed. The key the peer-to-peer path uses for routing is derived from the device's own key and is routing metadata only.</p>
+      <p>After a network change the app connects again with no address. Tendril dials the stored routes nearest first, and the pairing and grants carry over unchanged. When the host's addresses change, it signs a new route list and sends it to every paired device that asked for updates. <a href="#routes">One QR code, every route</a> shows how.</p>
       <p class="more-link">Why every path is treated as hostile: <a href="/docs/adr/0001-one-core-hostile-paths.html">One core, hostile paths</a></p>
     </div>
   </details>
@@ -277,7 +277,7 @@
           <tr><td>3, to the host</td><td>The joining device's key, its name, its 1984 byte signing key with a 3373 byte signature that ties that key to this handshake, and the code proof, encrypted</td><td>64 B + claim</td></tr>
         </tbody>
       </table>
-      <p>In version 1, the default, the whole handshake is about 12 KiB, most of it the two signing keys and the joining device's signature. A pairing link or QR code (<code>tendril://pair?...</code>) carries the host's X25519 key and a 32 byte hash of its signing key, which keeps the QR code small. The joining device checks both on message 2 and stops before message 3 if they differ, so its own key is never shown to the wrong host.</p>
+      <p>In version 1, the default, the whole handshake is about 12 KiB, most of it the two signing keys and the joining device's signature. A pairing link or QR code (<code>tendril://pair?...</code>) carries the host's X25519 key, a 32 byte hash of its signing key, up to six route hints and an Ed25519 signature over them, which keeps the QR code near 700 bytes. The joining device checks both on message 2 and stops before message 3 if they differ, so its own key is never shown to the wrong host.</p>
       <p><strong>The code proof.</strong> <code>K = Argon2id(code, salt = first 16 bytes of h)</code> with 64 MiB of memory, 3 passes and 1 lane, where <code>h</code> is the handshake hash after message 2. The proof is <code>HMAC-SHA256(K, "tendril-pair-v1" || h)</code>, compared in constant time. Argon2id makes each guess slow and memory hungry. Binding to <code>h</code> ties the proof to this one handshake.</p>
       <p><strong>Wire v2 pairing.</strong> When both devices turn on Wire v2, the joining device proves it has the code in message 1 instead, with Argon2id at 19 MiB and 2 passes. The host then shows its identity only to a device that has the code. Anyone else gets a decoy reply of the same size, and no code is used up. The check string and the pending step stay the same.</p>
       <p><strong>The check string.</strong> The first 16 characters of the lowercase base32 SHA-256 of <code>"tendril-sas-v1" || h</code>, in groups of four.</p>
@@ -445,6 +445,7 @@
       <p><strong>Rekeying.</strong> Every 15 minutes or 2<sup>20</sup> frames, whichever comes first, a session switches to fresh keys. With Wire v2, each switch comes at a random point between 75 and 100 percent of those limits. The receiving side then checks its active grants again against the latest list.</p>
       <p><strong>Key rotation.</strong> A host can replace its keys by signing a numbered rotation record with the old key. Peers follow the chain of records one number at a time. Two valid records with the same number mean someone else may hold the key. The peer is then marked revoked, its grants are cleared, and the check returns an error.</p>
       <p><strong>Offline devices.</strong> Revocation is not instant for a device that is offline. It learns of it only when it reconnects or rekeys.</p>
+      <p><strong>Evidence is kept.</strong> A revocation list a session receives is written along with any route update or other roster change, so no write drops it, and a connect refused because of it saves the list before it fails. If a write fails, the list stays queued for the next one.</p>
       <p class="more-link">Read more: <a href="/docs/design/grants.html">Grants design</a></p>
     </div>
   </details>
@@ -530,11 +531,84 @@
         </tbody>
       </table>
       <p><strong>Staggered dialling.</strong> Dials start nearest first, 250 ms apart, like Happy Eyeballs, the method browsers use to try two kinds of address side by side. Peer-to-peer starts no sooner than 500 ms after the first other dial, because finding a peer takes longer and should not hold up a nearer path. The first path to finish the handshake wins and the rest are cancelled.</p>
-      <p><strong>Where this runs.</strong> Ranking and racing run in the Rust runtime (<code>dial_with_policy</code>). The other bindings and the CLI dial the one address you give them today.</p>
-      <p><strong>Peer-to-peer.</strong> The p2p path uses iroh. By default it uses the free public relay and discovery servers run by n0, which are rate limited and carry no uptime guarantee. You can point it at any iroh relay instead: one you run, or a <a href="https://www.iroh.computer/pricing">hosted one from n0</a>. Tendril takes up to eight relay URLs and can pass them a token, for relays that admit only your devices. You can also turn discovery off. These relays carry only the p2p path. The <code>relay</code> path below is Tendril's own.</p>
+      <p><strong>Where this runs.</strong> Ranking and racing run in the Rust runtime (<code>dial_with_policy</code>). The CLI and every binding use it when you connect without an address, over the routes stored at pairing or sent later by the host. An address you give explicitly is dialed alone.</p>
+      <p><strong>Peer-to-peer.</strong> The p2p path uses iroh. By default it uses the free public relay and discovery servers run by n0, which are rate limited and carry no uptime guarantee. You can point it at any iroh relay instead: one you run, or a <a href="https://www.iroh.computer/pricing">hosted one from n0</a>. Tendril takes up to eight relay URLs and can pass them a token, for relays that admit only your devices. You can also turn discovery off. For an iroh endpoint you give explicitly, relay host names are looked up once, screened and pinned for the dial, so a changed DNS answer cannot steer it. These relays carry only the p2p path. The <code>relay</code> path below is Tendril's own.</p>
       <p class="more-link">Read more: <a href="/docs/design/providers-and-relay-ladder.html">Paths and the relay ladder</a></p>
     </div>
   </details>
+  <div class="sub-part" id="routes">
+    <h3>One QR code, every route</h3>
+    <p class="part-lead">A phone that pairs at home still has to find the laptop once it leaves. So the laptop puts every route it can be reached on into its QR code, signs them, and the phone keeps them all with the pairing. Later the app connects with no address, and Tendril dials the stored routes nearest first.</p>
+    <figure class="fig rl-in">
+      <div class="rl-body">
+        <div class="rl-qr">
+          <p class="rl-qr-h">laptop QR code<span>3 routes</span></p>
+          <ol class="rl-list" aria-label="Routes in the QR code">
+            <li><span class="rl-k">LAN, home Wi-Fi</span><code>direct:192.168.1.20:7000</code></li>
+            <li><span class="rl-k">VPN, here a tailnet</span><code>overlay://100.101.7.20:7000</code></li>
+            <li><span class="rl-k">relay</span><code>wss://relay.example/v1/relay</code></li>
+          </ol>
+          <p class="rl-sig"><i></i><span><code>rs</code>, the laptop's signature over every byte of the link before it</span></p>
+        </div>
+        <table class="rl-table">
+          <caption>Later, the phone connects with no address</caption>
+          <thead>
+            <tr><td></td><th scope="col">LAN<span>starts at 0 ms</span></th><th scope="col">VPN<span>about 250 ms</span></th><th scope="col">relay<span>about 500 ms</span></th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">At home</th><td class="is-win"><i></i>wins</td><td class="is-skip"><i></i>not needed</td><td class="is-skip"><i></i>not needed</td></tr>
+            <tr><th scope="row">Away, VPN on</th><td class="is-miss"><i></i>no answer</td><td class="is-win"><i></i>wins</td><td class="is-skip"><i></i>not needed</td></tr>
+            <tr><th scope="row">Away, VPN off</th><td class="is-miss"><i></i>no answer</td><td class="is-miss"><i></i>no answer</td><td class="is-win"><i></i>wins</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <figcaption>Illustrative addresses. Start times follow the defaults. A route that fails early lets the next one start at once.</figcaption>
+    </figure>
+    <p class="part-lead">Addresses change. When the laptop's do, it signs a new route list with a higher number and sends it inside the session, so the phone follows without a new QR code.</p>
+    <figure class="fig">
+      <svg class="dia" viewBox="0 0 400 282" role="img" aria-label="The laptop shows a QR code with route list 1, signed, holding LAN, VPN and relay routes. The phone connects with no address and the VPN route wins. The laptop's address changes. It sends route list 2, signed, inside the session. The phone's next connect dials the new address.">
+        <rect class="b" x="4" y="4" width="136" height="40"/>
+        <text class="t-s t-strong" x="72" y="21" text-anchor="middle">phone</text>
+        <text class="t-xs t-mut" x="72" y="36" text-anchor="middle">keeps signed routes</text>
+        <rect class="b" x="260" y="4" width="136" height="40"/>
+        <text class="t-s t-strong" x="328" y="21" text-anchor="middle">laptop</text>
+        <text class="t-xs t-mut" x="328" y="36" text-anchor="middle">host</text>
+        <path class="w w-life" d="M72 44V274M328 44V274"/>
+        <path class="w w-dash" d="M322 80H78"/><path class="w" d="M84 76 78 80 84 84"/>
+        <text class="t-s" x="200" y="72" text-anchor="middle">QR code · route list 1</text>
+        <text class="t-xs t-mut" x="200" y="96" text-anchor="middle">LAN, VPN and relay, signed</text>
+        <path class="w" d="M78 132H322M316 128 322 132 316 136"/>
+        <text class="t-s" x="200" y="124" text-anchor="middle">connect, no address</text>
+        <text class="t-xs t-mut" x="200" y="148" text-anchor="middle">away from home, the VPN route wins</text>
+        <rect class="b b-dash" x="276" y="164" width="104" height="22"/>
+        <text class="t-xs" x="328" y="179" text-anchor="middle">new address</text>
+        <path class="w-acc" d="M322 216H78M84 212 78 216 84 220"/>
+        <text class="t-s t-acc" x="200" y="208" text-anchor="middle">route list 2, signed</text>
+        <text class="t-xs t-mut" x="200" y="232" text-anchor="middle">sent inside the session</text>
+        <path class="w" d="M78 268H322M316 264 322 268 316 272"/>
+        <text class="t-s" x="200" y="260" text-anchor="middle">next connect, new address</text>
+      </svg>
+      <figcaption>Illustrative. A device that was offline gets the new list on its next connection.</figcaption>
+    </figure>
+    <ul class="gains" aria-label="What this means">
+      <li>One scan covers home, a VPN and a relay, with no prompt to pick one.</li>
+      <li>The laptop keeps its devices current when its addresses change.</li>
+      <li>A route only says where to dial. The handshake still has to prove the laptop.</li>
+    </ul>
+    <details class="more">
+      <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
+      <div class="more-body">
+        <p><strong>The link.</strong> A pairing link holds up to six route hints (<code>ep</code>), a route sequence number (<code>rq</code>) and an Ed25519 signature by the host over every byte before it (<code>rs</code>). A hybrid signature would not fit in a QR code. A forged signature could change only where the phone dials, never the session keys, because the handshake must still prove the pinned host. With six hints a link is about 700 bytes.</p>
+        <p><strong>What a host lists.</strong> SDK hosts list their LAN and VPN addresses on their own, and never loopback, link-local or mobile-data addresses. A public address is listed only if you add it. The CLI lists only the addresses you give it. An app that must not show its local addresses lists them explicitly instead.</p>
+        <p><strong>What the phone keeps.</strong> By default (<code>allSigned</code>), every route the host signed. An app can keep only the route that carried the pairing (<code>committedOnly</code>), or none (<code>none</code>). A link with no valid signature stores nothing, so a copied link with a swapped relay cannot plant a lasting route. Routes the app sets itself are never replaced by the host's.</p>
+        <p><strong>Route updates.</strong> The host signs a new list with Ed25519 and ML-DSA-65 together and a higher sequence number when a listener starts or stops, or its addresses or relay settings change. SDK hosts also check every 60 seconds and when the platform reports a network change. The list travels inside the session as its own frame type, only to devices that asked for updates, at most once every 30 seconds per session. A list with a bad signature, the wrong host or an older number is recorded and ignored, and the session carries on.</p>
+        <p><strong>Relay credentials.</strong> A relay ticket or secret goes only to relay addresses the app configured, or to the one address a connect was given. A relay learned from a QR code or a route update never receives one.</p>
+        <p><strong>Recovery.</strong> If every stored route is dead and there is no relay, the phone cannot hear from the host. Scanning a fresh QR code, without pairing again, replaces the routes when its number is newer. An older or equal one is used for that one connect, unless you approve the replacement.</p>
+        <p><strong>Error text.</strong> Errors from the CLI and every binding show a route as <code>scheme://host:port</code> or <code>&lt;redacted&gt;</code>, never the codes, tokens or credentials a route can carry.</p>
+        <p class="more-link">Read more: <a href="/docs/usage/seamless-pairing.html">Seamless pairing defaults</a> and <a href="/docs/design/wire-and-pairing.html">Wire and pairing design</a></p>
+      </div>
+    </details>
+  </div>
 </section>
 
 <section id="relays" class="part" aria-labelledby="h-relays">
@@ -581,9 +655,9 @@
           <tr><td>A signed ticket</td><td>Signed by a key you choose, valid for a day at most, and can be limited to dialing one mailbox</td></tr>
         </tbody>
       </table>
-      <p>With a secret or tickets, the relay checks a device that dials before it says whether the mailbox is online, so a stranger cannot even learn that. Treat a ticket like a password while it is valid.</p>
+      <p>With a secret or tickets, the relay checks a device that dials before it says whether the mailbox is online, so a stranger cannot even learn that. Treat a ticket like a password while it is valid. Tendril sends one only to relays your app configured or dials by name, never to a relay it learned from a QR code.</p>
       <p><strong>What it may keep.</strong> A relay must not log application data, device names or pairing codes. It does see IP addresses, when devices connect, how many frames they send and how large they are, and the mailbox key.</p>
-      <p><strong>Moving relays.</strong> Moving from a public relay to your own, or to one embedded in your app, changes only the relay hints on the roster. Keys, pairing and grants stay as they are.</p>
+      <p><strong>Moving relays.</strong> Moving from a public relay to your own, or to one embedded in your app, changes only the routes. The host signs a new route list that names the new relay and sends it to its devices. Keys, pairing and grants stay as they are.</p>
       <p class="more-link">Read more: <a href="/docs/design/relay-and-runtime.html">Relay and runtime design</a></p>
     </div>
   </details>
@@ -612,6 +686,7 @@
           <div><dt>A hostile operating system</dt><dd>Malware on the device sees what your app sees.</dd></div>
           <div><dt>Approving the wrong device</dt><dd>If a person confirms without comparing the check string, Tendril cannot tell.</dd></div>
           <div><dt>Metadata</dt><dd>Relays, tailnets and networks still see addresses, timing and sizes. Wire v2, which is opt-in, pads sizes and varies keepalive timing, but cannot hide when or how much you send.</dd></div>
+          <div><dt>A photographed QR code</dt><dd>Until the code expires, it shows the host's listed addresses and its relay mailbox key. Apps that must not show them list addresses explicitly.</dd></div>
           <div><dt>Being traced</dt><dd>It is not an anonymity network and does not hide who talks to whom.</dd></div>
           <div><dt>Quantum computers, in two places</dt><dd>Relay mailbox proofs use Ed25519 only. The iroh transport under the peer-to-peer path is not post-quantum, though the session inside it is.</dd></div>
           <div><dt>Unreviewed code</dt><dd>There has been no third-party audit yet, including of the new post-quantum code.</dd></div>
@@ -623,7 +698,7 @@
     <summary><svg class="chev" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5"/></svg>The details</summary>
     <div class="more-body">
       <p>A revoked device that is offline learns of it only when it reconnects or rekeys. Browser tabs run over WebSockets, through a Tendril relay or, with the opt-in p2p build, an iroh relay. They cannot open UDP sockets or hold a connection while the browser suspends them. Phones suspend background sockets while asleep, so a phone reaches its peer again when it wakes.</p>
-      <p><strong>Waking a peer.</strong> With Wire v2, a device that dials a sleeping peer can first send it a wake hint through a push service the app sets up, such as UnifiedPush, FCM or an APNs gateway. The hint carries only a tag that changes every hour: no data, no names, no keys and no permission. If a hint is lost, nothing breaks: the peer comes back when it next wakes on its own.</p>
+      <p><strong>Waking a peer.</strong> With Wire v2, a device that dials a sleeping peer can first send it a wake hint through a push service the app sets up, such as UnifiedPush, FCM or an APNs gateway. The hint carries only a tag that changes every hour: no data, no names, no keys and no permission. The app can send it first, or only after a connect misses in a way a wake can fix: the peer is unreachable or its relay reports it offline. A wrong key or a refused permission never sends a hint. The woken connect needs an explicit endpoint, which replaces the stored routes. It still negotiates route updates, applies route lists and accepts a recovery link. If a hint is lost, nothing breaks: the peer comes back when it next wakes on its own.</p>
       <p><strong>What is post-quantum.</strong> The session key exchange (X25519 with ML-KEM-768), and the signatures on grants, key rotation, revocation lists and enrollment (Ed25519 with ML-DSA-65). <strong>What is not.</strong> Relay mailbox proofs, which use Ed25519 alone, and the iroh transport below the peer-to-peer path. Data inside the session is still covered on every path. The Noise code is Tendril's own and is checked against a separate Go implementation. A peer without the hybrid handshake is rejected, so every device must run a current version.</p>
       <p><strong>Metadata.</strong> Tendril hides your data, not who talks to whom. Wire v2 is an opt-in mode that narrows what the default, version 1 of the wire format, gives away.</p>
       <table class="spec spec-v2">
@@ -635,7 +710,7 @@
           <tr><td>A stranger who probes a host</td><td>Learns its id and keys</td><td>Gets a decoy reply of the same size</td></tr>
         </tbody>
       </table>
-      <p>Wire v2 still leaves IP addresses, when devices send and roughly how much in view. Both devices must turn it on. A host with it on still answers version 1 for older peers, so a stranger can still learn its id that way. Two devices that have used Wire v2 refuse to fall back. Padding frames that hide idle time exist, but your app has to send them. <code>tendril serve --redact-logs</code> keeps pairing codes, payloads and token nonces out of the CLI's own logs.</p>
+      <p>Wire v2 still leaves IP addresses, when devices send and roughly how much in view. Both devices must turn it on. A host with it on still answers version 1 for older peers, so a stranger can still learn its id that way. Two devices that have used Wire v2 refuse to fall back. Padding frames that hide idle time exist, but your app has to send them. <code>tendril serve --redact-logs</code> keeps pairing codes, payloads and token nonces out of the CLI's own logs, and error text never echoes codes, tokens or full route addresses.</p>
       <p>Hosted accounts and replacing TLS for the web are out of scope for v1. So is group encryption, where one key seals messages for a whole group, as in MLS. A <a href="#groups">group</a> of up to 32 devices gives each pair of members its own session instead.</p>
       <p class="more-link">Read more: <a href="/docs/overview.html">Scope and explicit limits</a>, <a href="/docs/adr/0004-hybrid-post-quantum-v1.html">the hybrid post-quantum decision</a>, <a href="/docs/design/wire-v2-privacy.html">Wire v2 privacy</a> and <a href="/docs/design/wake-providers.html">wake hints</a>. Found a problem? <a href="https://github.com/agync/tendril/security">Report it privately</a> on GitHub.</p>
     </div>
@@ -687,6 +762,7 @@
     <li><a href="/docs/design/wire-and-pairing.html">Pairing design</a><span>Handshake, code proof, check string</span></li>
     <li><a href="/docs/design/grants.html">Grants design</a><span>Names, delegation, revocation</span></li>
     <li><a href="/docs/design/m2m-enrollment.html">Machine enrollment</a><span>Tokens, pinning, the burn log</span></li>
+    <li><a href="/docs/usage/seamless-pairing.html">Seamless pairing</a><span>One QR code, signed routes, route updates</span></li>
     <li><a href="/docs/design/providers-and-relay-ladder.html">Paths design</a><span>Six paths and the relay ladder</span></li>
     <li><a href="/docs/adr/0004-hybrid-post-quantum-v1.html">Hybrid post-quantum</a><span>Why the handshake and signatures are hybrid</span></li>
     <li><a href="https://github.com/agync/tendril">Source on GitHub</a><span>Apache-2.0, specs in <code>spec/</code></span></li>
