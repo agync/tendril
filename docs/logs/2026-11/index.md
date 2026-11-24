@@ -19,3 +19,4 @@ Entries from November 2026.
 - [swift: pairing URIs, endpoint-free connect and route refresh](23-swift-pairing-uris-endpoint-free-connect.md)
 - [kotlin: pairing URIs, endpoint-free connect and the multi-network snapshot](23-kotlin-pairing-uris-endpoint-free-connect.md)
 - [pairing: security and reliability fixes](23-pairing-security-and-reliability-fixes.md)
+- [Prepare v0.1.0 release workflow, package metadata, and install docs](24-prepare-v0-1-0-release-workflow.md)
