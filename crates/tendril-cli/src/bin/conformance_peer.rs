@@ -239,7 +239,7 @@ impl PeerTransportConfig {
             P2pOptions::for_endpoint(endpoint, explicit_mode, allow_private)
                 .map_err(|e| e.to_string())?
         } else {
-            let mode = explicit_mode.unwrap_or(P2pRelayMode::Default);
+            let mode = explicit_mode.unwrap_or(P2pRelayMode::N0Public);
             P2pOptions::for_dialer(mode).with_allow_private_addrs(allow_private)
         };
         opts = opts

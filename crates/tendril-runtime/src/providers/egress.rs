@@ -473,9 +473,9 @@ pub struct EgressContext {
     pub kind: EgressKind,
     /// Origins allowed to receive relay admission material.
     pub relay_auth_origins: Vec<String>,
-    /// Configured Iroh relay mode of the hint dialer; `None` means the default relays.
+    /// Configured Iroh relay mode of the hint dialer ([`P2pRelayMode::N0Public`] by default).
     #[cfg(feature = "p2p-iroh")]
-    pub iroh_relay_mode: Option<P2pRelayMode>,
+    pub iroh_relay_mode: P2pRelayMode,
     /// Resolver for `overlay://` and WebSocket host names.
     pub resolver: Arc<dyn HostResolver>,
 }
@@ -492,14 +492,14 @@ impl fmt::Debug for EgressContext {
 }
 
 impl EgressContext {
-    /// Context with the system resolver, no relay origins and the default Iroh relays.
+    /// Context with the system resolver, no relay origins and the default n0 public Iroh relays.
     #[must_use]
     pub fn new(kind: EgressKind) -> Self {
         Self {
             kind,
             relay_auth_origins: Vec::new(),
             #[cfg(feature = "p2p-iroh")]
-            iroh_relay_mode: None,
+            iroh_relay_mode: P2pRelayMode::default(),
             resolver: Arc::new(SystemResolver),
         }
     }
@@ -518,7 +518,7 @@ impl EgressContext {
 
     #[cfg(feature = "p2p-iroh")]
     #[must_use]
-    pub fn with_iroh_relay_mode(mut self, mode: Option<P2pRelayMode>) -> Self {
+    pub fn with_iroh_relay_mode(mut self, mode: P2pRelayMode) -> Self {
         self.iroh_relay_mode = mode;
         self
     }
@@ -782,8 +782,7 @@ pub async fn check_hint(
                     checked.dial_endpoint = endpoint;
                     checked.relay_pins = pins;
                 } else {
-                    let mode = ctx.iroh_relay_mode.clone().unwrap_or_default();
-                    let filtered = filter_p2p_hint(stripped, &mode).map_err(skip)?;
+                    let filtered = filter_p2p_hint(stripped, &ctx.iroh_relay_mode).map_err(skip)?;
                     checked.dial_endpoint = filtered.endpoint;
                     checked.dropped_relays = filtered.dropped_relays;
                     checked.p2p_hint_dialer = true;

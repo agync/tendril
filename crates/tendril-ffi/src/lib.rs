@@ -657,13 +657,17 @@ impl EndpointTransportConfig {
             relay_auth: self.relay_auth.clone(),
             relay_expected_host: relay_host.filter(|_| !iroh_operator).map(ToOwned::to_owned),
             #[cfg(feature = "p2p-iroh")]
-            p2p_relay_mode,
+            p2p_relay_mode: p2p_relay_mode.unwrap_or(P2pRelayMode::N0Public),
             #[cfg(feature = "p2p-iroh")]
             p2p_relay_auth: self.p2p_relay_auth.clone(),
             #[cfg(feature = "p2p-iroh")]
             p2p_allow_private_addrs: self.p2p_allow_private_addrs.unwrap_or(false),
             #[cfg(feature = "p2p-iroh")]
             p2p_pkarr: self.p2p_pkarr,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_port_mapping: true,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_bind_addrs: tendril_runtime::P2pBindAddrs::AllInterfaces,
         };
         Ok(Arc::new(HintDialers::new(config)))
     }
@@ -675,7 +679,10 @@ impl EndpointTransportConfig {
     ) -> Result<P2pOptions, RuntimeError> {
         let mode = match relay_mode_override.map(str::trim).filter(|s| !s.is_empty()) {
             Some(raw) => parse_p2p_relay_mode(Some(raw))?,
-            None => self.p2p_relay_mode.clone().unwrap_or(P2pRelayMode::Default),
+            None => self
+                .p2p_relay_mode
+                .clone()
+                .unwrap_or(P2pRelayMode::N0Public),
         };
         let mut opts = P2pOptions::for_listener(mode);
         if let Some(pkarr) = self.p2p_pkarr {
@@ -6065,7 +6072,7 @@ mod p2p_dialer_option_tests {
 
         let plain = format!("iroh://{BASEPOINT_ID}");
         let opts = cfg.build_p2p_dialer_options(&plain, None).expect("options");
-        assert!(matches!(opts.relay_mode, P2pRelayMode::Default));
+        assert!(matches!(opts.relay_mode, P2pRelayMode::N0Public));
         assert!(opts.resolve_pkarr);
     }
 

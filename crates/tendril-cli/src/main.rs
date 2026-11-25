@@ -680,7 +680,7 @@ fn validate_explicit_p2p_args(args: &P2pTransportArgs) -> Result<(), Box<dyn std
 }
 
 fn resolve_pkarr_enabled(mode: &P2pRelayMode, p2p_pkarr: bool, no_pkarr: bool) -> bool {
-    if matches!(mode, P2pRelayMode::Default) {
+    if matches!(mode, P2pRelayMode::N0Public) {
         !no_pkarr
     } else {
         p2p_pkarr && !no_pkarr
@@ -739,10 +739,8 @@ fn resolve_p2p_relay_mode(
     args: &P2pTransportArgs,
     relay_host_fallback: Option<&str>,
 ) -> Result<P2pRelayMode, Box<dyn std::error::Error>> {
-    Ok(
-        resolve_explicit_p2p_relay_mode(args, relay_host_fallback)?
-            .unwrap_or(P2pRelayMode::Default),
-    )
+    Ok(resolve_explicit_p2p_relay_mode(args, relay_host_fallback)?
+        .unwrap_or(P2pRelayMode::N0Public))
 }
 
 fn ws_path(endpoint: &str) -> &str {
@@ -829,10 +827,12 @@ fn build_hint_dialers(
     Ok(Arc::new(HintDialers::new(HintDialerConfig {
         relay_auth,
         relay_expected_host: relay_host.map(ToOwned::to_owned),
-        p2p_relay_mode,
+        p2p_relay_mode: p2p_relay_mode.unwrap_or(P2pRelayMode::N0Public),
         p2p_relay_auth: resolve_p2p_relay_auth(p2p_args)?,
         p2p_allow_private_addrs,
         p2p_pkarr: pkarr_override(p2p_args),
+        p2p_port_mapping: true,
+        p2p_bind_addrs: tendril_runtime::P2pBindAddrs::AllInterfaces,
     })))
 }
 
@@ -1034,7 +1034,7 @@ fn build_p2p_dialer_options(
     let mut opts = if endpoint.starts_with("iroh://") || endpoint.starts_with("p2p:iroh://") {
         P2pOptions::for_endpoint(endpoint, explicit_mode, allow_private_addrs)?
     } else {
-        let mode = explicit_mode.unwrap_or(P2pRelayMode::Default);
+        let mode = explicit_mode.unwrap_or(P2pRelayMode::N0Public);
         let is_disabled = matches!(mode, P2pRelayMode::Disabled);
         P2pOptions::for_dialer(mode).with_allow_private_addrs(allow_private_addrs || is_disabled)
     };

@@ -615,10 +615,12 @@ impl EndpointTransportConfig {
         Ok(Arc::new(HintDialers::new(HintDialerConfig {
             relay_auth: self.relay_auth.clone(),
             relay_expected_host: host.map(ToOwned::to_owned),
-            p2p_relay_mode,
+            p2p_relay_mode: p2p_relay_mode.unwrap_or(P2pRelayMode::N0Public),
             p2p_relay_auth: self.p2p_relay_auth.clone(),
             p2p_allow_private_addrs: self.p2p_allow_private_addrs.unwrap_or(false),
             p2p_pkarr: self.p2p_pkarr,
+            p2p_port_mapping: true,
+            p2p_bind_addrs: tendril_runtime::P2pBindAddrs::AllInterfaces,
         })))
     }
 
@@ -628,7 +630,10 @@ impl EndpointTransportConfig {
     ) -> Result<P2pOptions, RuntimeError> {
         let mode = match relay_mode_override.map(str::trim).filter(|s| !s.is_empty()) {
             Some(raw) => parse_p2p_relay_mode(Some(raw))?,
-            None => self.p2p_relay_mode.clone().unwrap_or(P2pRelayMode::Default),
+            None => self
+                .p2p_relay_mode
+                .clone()
+                .unwrap_or(P2pRelayMode::N0Public),
         };
         let mut opts = P2pOptions::for_listener(mode);
         if let Some(pkarr) = self.p2p_pkarr {
