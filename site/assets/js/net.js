@@ -23,7 +23,8 @@
       dev: "phone", net: "home Wi-Fi", steps: ["other machine", "win"],
       then: { net: "mobile data", steps: ["other machine", "drop", "no tailnet", "win"] },
     },
-    { dev: "browser", net: "any network", steps: [NO, NO, NO, "via iroh relay", "win", NO] },
+    // A browser races the relay, the broker (broker+wss://) and opt-in p2p; the relay wins here.
+    { dev: "browser", net: "any network", steps: [NO, NO, NO, "via iroh relay", "win"] },
   ];
   var P2P = 3;
   var WAIT = 1400;
