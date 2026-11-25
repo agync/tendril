@@ -990,16 +990,25 @@ pub struct TendrilEndpoint {
     route_access: RosterAccess,
     /// Keeps paired clients' `signed` routes current.
     announcer: Arc<RouteAnnouncer>,
-    /// The announcer's timer task, aborted by `tendril_endpoint_close`.
-    announcer_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Set once the endpoint serves a listener, issues a pairing URI or refreshes its routes;
-    /// from then on advertising input changes publish and the announcer timer runs.
-    hosting: AtomicBool,
+    /// Hosting lifecycle: running once the endpoint serves a listener, issues a pairing URI or
+    /// refreshes its routes (advertising input changes then publish and the announcer timer
+    /// runs), and terminally closed by `tendril_endpoint_close`. A leaf lock: never held across
+    /// announcer, roster or pairing manager calls.
+    hosting: StdMutex<HostingState>,
     /// Endpoint strings of every listener served through this handle, including unspecified
     /// binds (used only by auto enumeration).
     served_endpoints: StdMutex<Vec<String>>,
     /// Pairing-capable TCP listeners (`tendril_endpoint_serve_direct`) for auto enumeration.
     served_listeners: StdMutex<Vec<ServedListener>>,
+}
+
+/// Hosting lifecycle of an endpoint: `Idle -> Running -> Closed`, with `Closed` terminal.
+#[derive(Debug)]
+enum HostingState {
+    Idle,
+    /// Holds the announcer's timer task, aborted on close.
+    Running(tokio::task::JoinHandle<()>),
+    Closed,
 }
 
 impl TendrilEndpoint {
@@ -1022,17 +1031,49 @@ impl TendrilEndpoint {
     }
 
     /// Marks the endpoint as a host and starts the announcer timer (scheduled sends, the empty
-    /// snapshot debounce and the periodic re-enumeration) once.
-    fn start_hosting(&self) {
-        if !self.hosting.swap(true, Ordering::AcqRel) {
-            let _guard = self.rt.enter();
-            let task = self
-                .announcer
-                .spawn(Some(tendril_runtime::DEFAULT_ROUTE_REFRESH_INTERVAL));
-            *self
-                .announcer_task
+    /// snapshot debounce and the periodic re-enumeration) once. A closed endpoint never hosts.
+    fn start_hosting(&self) -> Result<(), (i32, String)> {
+        let mut state = self
+            .hosting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            HostingState::Closed => Err((TENDRIL_ERR_CLOSED, "endpoint is closed".to_owned())),
+            HostingState::Running(_) => Ok(()),
+            HostingState::Idle => {
+                let _guard = self.rt.enter();
+                let task = self
+                    .announcer
+                    .spawn(Some(tendril_runtime::DEFAULT_ROUTE_REFRESH_INTERVAL));
+                *state = HostingState::Running(task);
+                Ok(())
+            }
+        }
+    }
+
+    /// True while the endpoint hosts; a closed endpoint publishes nothing.
+    fn is_hosting(&self) -> bool {
+        matches!(
+            &*self
+                .hosting
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            HostingState::Running(_)
+        )
+    }
+
+    /// Moves the endpoint to the terminal `Closed` state and aborts the timer task, if any. The
+    /// abort runs after the lock is released.
+    fn stop_hosting(&self) {
+        let previous = std::mem::replace(
+            &mut *self
+                .hosting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            HostingState::Closed,
+        );
+        if let HostingState::Running(task) = previous {
+            task.abort();
         }
     }
 
@@ -1041,7 +1082,7 @@ impl TendrilEndpoint {
     /// reported by the next issuance or refresh.
     fn sync_advertising(&self) {
         self.announcer.set_inputs(self.advertise_inputs());
-        if self.hosting.load(Ordering::Acquire) {
+        if self.is_hosting() {
             let _ = self.announcer.publish(unix_ms());
         }
     }
@@ -1063,7 +1104,7 @@ impl TendrilEndpoint {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(l);
         }
-        self.start_hosting();
+        let _ = self.start_hosting();
         self.sync_advertising();
     }
 
@@ -1379,8 +1420,7 @@ fn build_endpoint_handle(
         served_v1_relays: StdMutex::new(Vec::new()),
         route_access,
         announcer,
-        announcer_task: StdMutex::new(None),
-        hosting: AtomicBool::new(false),
+        hosting: StdMutex::new(HostingState::Idle),
         served_endpoints: StdMutex::new(Vec::new()),
         served_listeners: StdMutex::new(Vec::new()),
     }))
@@ -2161,14 +2201,7 @@ pub unsafe extern "C" fn tendril_endpoint_close(ep: *mut TendrilEndpoint) -> i32
         if let Some(groups) = ep.group_runtime() {
             groups.shutdown();
         }
-        if let Some(task) = ep
-            .announcer_task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            task.abort();
-        }
+        ep.stop_hosting();
         TENDRIL_OK
     })
 }
@@ -4692,7 +4725,10 @@ pub unsafe extern "C" fn tendril_endpoint_issue_pairing_uri(
             requested_kind,
             sign_routes: opts.sign_routes.unwrap_or_else(|| cfg.sign_routes()),
         };
-        ep.start_hosting();
+        if let Err((rc, msg)) = ep.start_hosting() {
+            set_last_error(msg);
+            return rc;
+        }
         ep.announcer.set_inputs(ep.advertise_inputs());
         // The announcer publishes (roster file lock) before it takes the pairing manager, the
         // order a concurrent pairing claim uses; the manager is never held across the call.
@@ -5288,7 +5324,10 @@ pub unsafe extern "C" fn tendril_endpoint_refresh_routes(
             None => None,
         };
         let ep = unsafe { &*ep };
-        ep.start_hosting();
+        if let Err((rc, msg)) = ep.start_hosting() {
+            set_last_error(msg);
+            return rc;
+        }
         ep.announcer.set_inputs(ep.advertise_inputs());
         match ep.announcer.refresh(unix_ms(), snapshot) {
             Ok(outcome) => {
@@ -6825,19 +6864,15 @@ mod route_state_tests {
             last_err()
         );
         drop(unsafe { take(out) });
-        let running = |ep: &Ep| {
-            ep.get()
-                .announcer_task
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|h| !h.is_finished())
+        let timer = match &*ep.get().hosting.lock().unwrap() {
+            HostingState::Running(h) => h.abort_handle(),
+            other => panic!("hosting must start the timer task, got {other:?}"),
         };
-        assert_eq!(running(&ep), Some(true), "hosting starts the timer task");
+        assert!(!timer.is_finished(), "hosting starts the timer task");
 
         assert_eq!(unsafe { tendril_endpoint_close(ep.0) }, TENDRIL_OK);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while running(&ep) != Some(false) {
+        while !timer.is_finished() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "close left the refresh task running"
@@ -6849,5 +6884,149 @@ mod route_state_tests {
             TENDRIL_OK,
             "close is idempotent"
         );
+    }
+
+    fn serve_loopback(ep: &Ep) {
+        let addr = cs("127.0.0.1:0");
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_serve_direct(ep.0, addr.as_ptr(), &raw mut out) },
+            TENDRIL_OK,
+            "{}",
+            last_err()
+        );
+        drop(unsafe { take(out) });
+    }
+
+    #[test]
+    fn close_blocks_every_start_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = Ep::new(dir.path(), Some("closed-host"));
+        assert_eq!(unsafe { tendril_endpoint_close(ep.0) }, TENDRIL_OK);
+        let closed = |ep: &Ep| matches!(&*ep.get().hosting.lock().unwrap(), HostingState::Closed);
+        assert!(closed(&ep), "close from Idle is terminal");
+
+        let err = ep.get().start_hosting().unwrap_err();
+        assert_eq!(err.0, TENDRIL_ERR_CLOSED);
+        assert!(err.1.contains("closed"), "{}", err.1);
+        assert!(closed(&ep), "start_hosting does not leave Closed");
+
+        ep.get().record_served("127.0.0.1:1".to_owned(), None);
+        assert!(closed(&ep), "record_served does not revive hosting");
+        assert!(!ep.get().is_hosting());
+    }
+
+    /// One C ABI call that starts hosting: issue or refresh. Returns the code, with the output
+    /// freed; any non-OK result must leave the output null.
+    fn hosting_call(ep: *mut TendrilEndpoint, pick: u32) -> i32 {
+        let mut out = ptr::null_mut();
+        let rc = if pick.is_multiple_of(2) {
+            unsafe { tendril_endpoint_issue_pairing_uri(ep, ptr::null(), &raw mut out) }
+        } else {
+            unsafe { tendril_endpoint_refresh_routes(ep, ptr::null(), &raw mut out) }
+        };
+        if rc == TENDRIL_OK {
+            if !out.is_null() {
+                drop(unsafe { take(out) });
+            }
+        } else {
+            assert!(out.is_null(), "output set on error {rc}");
+        }
+        rc
+    }
+
+    #[test]
+    fn close_racing_issue_and_refresh_leaves_no_timer() {
+        use std::sync::Barrier;
+
+        for round in 0..20_u32 {
+            // Even rounds start Idle, so the Idle -> Running spawn races the close; odd rounds
+            // start Running with a timer task to watch.
+            let idle_start = round.is_multiple_of(2);
+            let dir = tempfile::tempdir().unwrap();
+            let ep = Ep::new(dir.path(), Some("race-host"));
+            let timer = if idle_start {
+                None
+            } else {
+                serve_loopback(&ep);
+                match &*ep.get().hosting.lock().unwrap() {
+                    HostingState::Running(h) => Some(h.abort_handle()),
+                    other => panic!("serving must start hosting, got {other:?}"),
+                }
+            };
+            let addr = ep.0 as usize;
+            let barrier = Barrier::new(5);
+            thread::scope(|scope| {
+                let workers: Vec<_> = (0..4_u32)
+                    .map(|n| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            let ep = addr as *mut TendrilEndpoint;
+                            barrier.wait();
+                            if idle_start && n == 0 {
+                                let a = cs("127.0.0.1:0");
+                                let mut out = ptr::null_mut();
+                                let rc = unsafe {
+                                    tendril_endpoint_serve_direct(ep, a.as_ptr(), &raw mut out)
+                                };
+                                assert_eq!(rc, TENDRIL_OK, "{}", last_err());
+                                if !out.is_null() {
+                                    drop(unsafe { take(out) });
+                                }
+                            }
+                            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                            for i in 0.. {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "worker never observed the close"
+                                );
+                                match hosting_call(ep, i + n) {
+                                    TENDRIL_OK => {}
+                                    TENDRIL_ERR_PROTOCOL => assert!(
+                                        last_err().contains("too many live pairing codes"),
+                                        "{}",
+                                        last_err()
+                                    ),
+                                    TENDRIL_ERR_CLOSED => {
+                                        assert!(last_err().contains("closed"), "{}", last_err());
+                                        for j in 0..3_u32 {
+                                            assert_eq!(
+                                                hosting_call(ep, j + n),
+                                                TENDRIL_ERR_CLOSED,
+                                                "closed is terminal"
+                                            );
+                                        }
+                                        return;
+                                    }
+                                    rc => panic!("unexpected rc {rc}: {}", last_err()),
+                                }
+                            }
+                            unreachable!();
+                        })
+                    })
+                    .collect();
+                barrier.wait();
+                thread::yield_now();
+                assert_eq!(unsafe { tendril_endpoint_close(ep.0) }, TENDRIL_OK);
+                for w in workers {
+                    w.join().unwrap();
+                }
+            });
+            assert!(
+                matches!(&*ep.get().hosting.lock().unwrap(), HostingState::Closed),
+                "round {round}: state must be Closed"
+            );
+            if let Some(timer) = timer {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !timer.is_finished() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "round {round}: timer task still running after close"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            assert_eq!(hosting_call(ep.0, 0), TENDRIL_ERR_CLOSED);
+        }
     }
 }
