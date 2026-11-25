@@ -29,6 +29,7 @@
 <script src="/assets/js/tour.js" defer></script>
 <script src="/assets/js/code.js" defer></script>
 <script src="/assets/js/net.js" defer></script>
+<script src="/assets/js/group.js" defer></script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -225,14 +226,163 @@
 
 <section id="uses" class="band wrap" aria-labelledby="h-uses">
   <h2 id="h-uses">Where it fits.</h2>
-  <p class="sub">Apps that link devices one person or one team already owns.</p>
+  <p class="sub">Apps that link devices one person or one team already owns. The pairing is trusted. The path it takes never is.</p>
+  <svg class="net-defs" aria-hidden="true" focusable="false">
+    <symbol id="gi-mini" viewBox="0 0 32 32"><path d="M4.5 11.5h23v9h-23zM4.5 23.5h23M14 16h4"/></symbol>
+    <symbol id="gi-nas" viewBox="0 0 32 32"><path d="M8.5 3.5h15v25h-15zM11.5 8.5h9M11.5 12.5h9M11.5 16.5h9M18.5 24h2"/></symbol>
+    <symbol id="gi-server" viewBox="0 0 32 32"><path d="M5.5 5.5h21v9h-21zM5.5 17.5h21v9h-21zM9 10h2M9 22h2"/></symbol>
+    <symbol id="gi-runner" viewBox="0 0 32 32"><path d="M5.5 6.5h21v19h-21zM13.5 12l6 4-6 4z"/></symbol>
+  </svg>
+  <p class="uses-key" aria-hidden="true"><span><i></i>pairing: keys and grants</span><span><i class="key-path"></i>path: only where to dial</span></p>
   <ul class="uses">
-    <li><p class="uses-dev">Mac mini and phone</p><h3><a href="/use-cases#desktop">Reach your desktop app from your phone</a></h3><p>No open port, no cloud dashboard. The phone gets only what you grant.</p></li>
-    <li><p class="uses-dev">laptop, phone, browser</p><h3><a href="/use-cases#sync">Sync your own devices, with no account</a></h3><p>Directly on home Wi-Fi, with no internet needed.</p></li>
-    <li><p class="uses-dev">NAS and phone</p><h3><a href="/use-cases#appliances">Appliances without the maker's cloud</a></h3><p>The maker runs at most a relay that cannot read what it carries.</p></li>
-    <li><p class="uses-dev">server and CI runner</p><h3><a href="/use-cases#machines">Machines with no screen</a></h3><p>A token that works once, instead of a key that lasts for months.</p></li>
+    <li>
+      <p class="uses-dev">Mac mini and phone</p>
+      <div class="uses-fig">
+        <svg class="fd" viewBox="0 0 200 96" role="img" aria-label="Mac mini and phone, QR + check string, over LAN or VPN or relay. Grant agent.approve.">
+          <use class="fd-ic" href="#gi-mini" x="4" y="12" width="34" height="34"/>
+          <use class="fd-ic" href="#ni-phone" x="162" y="12" width="34" height="34"/>
+          <text class="t-xs t-mut" x="21" y="62" text-anchor="middle">Mac mini</text>
+          <text class="t-xs t-mut" x="179" y="62" text-anchor="middle">phone</text>
+          <text class="t-xs t-acc" x="100" y="20" text-anchor="middle">QR + check string</text>
+          <path class="w-acc" d="M44 28H156"/>
+          <path class="w w-dash" d="M44 48H156"/>
+          <rect class="b-gap" x="48" y="40" width="104" height="16"/>
+          <text class="t-xs" x="100" y="52" text-anchor="middle">LAN · VPN · relay</text>
+          <text class="t-xs t-m t-mut" x="100" y="86" text-anchor="middle">agent.approve</text>
+        </svg>
+      </div>
+      <h3><a href="/use-cases#desktop">Reach your desktop app from your phone</a></h3><p>No open port, no cloud dashboard. The phone gets only what you grant.</p>
+    </li>
+    <li>
+      <p class="uses-dev">laptop, phone, browser</p>
+      <div class="uses-fig">
+        <svg class="fd" viewBox="0 0 200 96" role="img" aria-label="laptop and phone, QR + check string, over home Wi-Fi. Grant notes.sync.">
+          <use class="fd-ic" href="#ni-laptop" x="4" y="12" width="34" height="34"/>
+          <use class="fd-ic" href="#ni-phone" x="162" y="12" width="34" height="34"/>
+          <text class="t-xs t-mut" x="21" y="62" text-anchor="middle">laptop</text>
+          <text class="t-xs t-mut" x="179" y="62" text-anchor="middle">phone</text>
+          <text class="t-xs t-acc" x="100" y="20" text-anchor="middle">QR + check string</text>
+          <path class="w-acc" d="M44 28H156"/>
+          <path class="w w-dash" d="M44 48H156"/>
+          <rect class="b-gap" x="54" y="40" width="92" height="16"/>
+          <text class="t-xs" x="100" y="52" text-anchor="middle">home Wi-Fi</text>
+          <text class="t-xs t-m t-mut" x="100" y="86" text-anchor="middle">notes.sync</text>
+        </svg>
+      </div>
+      <p class="uses-extra">+ a browser tab, over a relay or a broker</p>
+      <h3><a href="/use-cases#sync">Sync your own devices, with no account</a></h3><p>Directly on home Wi-Fi, with no internet needed.</p>
+    </li>
+    <li>
+      <p class="uses-dev">NAS and phone</p>
+      <div class="uses-fig">
+        <svg class="fd" viewBox="0 0 200 96" role="img" aria-label="NAS and phone, QR at setup, over LAN or relay.example. Grant photos.read:/albums/trip/*.">
+          <use class="fd-ic" href="#gi-nas" x="4" y="12" width="34" height="34"/>
+          <use class="fd-ic" href="#ni-phone" x="162" y="12" width="34" height="34"/>
+          <text class="t-xs t-mut" x="21" y="62" text-anchor="middle">NAS</text>
+          <text class="t-xs t-mut" x="179" y="62" text-anchor="middle">phone</text>
+          <text class="t-xs t-acc" x="100" y="20" text-anchor="middle">QR at setup</text>
+          <path class="w-acc" d="M44 28H156"/>
+          <path class="w w-dash" d="M44 48H156"/>
+          <rect class="b-gap" x="42" y="40" width="116" height="16"/>
+          <text class="t-xs" x="100" y="52" text-anchor="middle">LAN · relay.example</text>
+          <text class="t-xs t-m t-mut" x="100" y="86" text-anchor="middle">photos.read:/albums/trip/*</text>
+        </svg>
+      </div>
+      <h3><a href="/use-cases#appliances">Appliances without the maker's cloud</a></h3><p>The maker runs at most a relay that cannot read what it carries.</p>
+    </li>
+    <li>
+      <p class="uses-dev">server and CI runner</p>
+      <div class="uses-fig">
+        <svg class="fd" viewBox="0 0 200 96" role="img" aria-label="server and CI runner, single-use token, over VPN or 100.x. Grant deploy.push:/srv/app/*.">
+          <use class="fd-ic" href="#gi-server" x="4" y="12" width="34" height="34"/>
+          <use class="fd-ic" href="#gi-runner" x="162" y="12" width="34" height="34"/>
+          <text class="t-xs t-mut" x="21" y="62" text-anchor="middle">server</text>
+          <text class="t-xs t-mut" x="179" y="62" text-anchor="middle">CI runner</text>
+          <text class="t-xs t-acc" x="100" y="20" text-anchor="middle">single-use token</text>
+          <path class="w-acc" d="M44 28H156"/>
+          <path class="w w-dash" d="M44 48H156"/>
+          <rect class="b-gap" x="58" y="40" width="84" height="16"/>
+          <text class="t-xs" x="100" y="52" text-anchor="middle">VPN · 100.x</text>
+          <text class="t-xs t-m t-mut" x="100" y="86" text-anchor="middle">deploy.push:/srv/app/*</text>
+        </svg>
+      </div>
+      <h3><a href="/use-cases#machines">Machines with no screen</a></h3><p>A token that works once, instead of a key that lasts for months.</p>
+    </li>
   </ul>
   <a class="more" href="/use-cases">See the use cases</a>
+</section>
+
+<section id="groups" class="band wrap" aria-labelledby="h-groups">
+  <h2 id="h-groups">Up to 32 devices, each paired once.</h2>
+  <p class="sub">One device roots the group and signs a list of who is in and what each may do. Members check each other against it and link directly, each pair with its own keys.</p>
+  <figure class="grp" data-grp>
+    <div class="grp-stage">
+      <p class="grp-status" aria-hidden="true"><span class="grp-n" data-grp-n>04</span><span class="grp-l" data-grp-l>one is removed</span><span class="grp-s" data-grp-s>server cut off from every member</span></p>
+      <svg class="fd grp-svg" viewBox="0 0 360 240" role="img" aria-label="A group of five devices. The Mac mini is the root. The phone, laptop, NAS and server each paired once with it, and hold the list it signed. The members link to each other directly, the phone to the NAS through a relay. The server has been removed: the root signed list version 2, and every link to the server is cut.">
+        <g>
+          <path class="gl is-quiet" data-l="s0" d="M168 46 56 96"/>
+          <path class="gl is-quiet" data-l="s1" d="M192 46 304 96"/>
+          <path class="gl is-quiet" data-l="s2" d="M174 46 84 190"/>
+          <path class="gl is-cut" data-l="s3" d="M186 46 276 190"/>
+          <path class="gl is-win" data-l="m0" d="M104 116H256"/>
+          <path class="gl is-win" data-l="m1" d="M256 130 104 196"/>
+          <path class="gl is-win gl-relay" data-l="m2" d="M56 136V190"/>
+          <path class="gl is-cut" data-l="m3" d="M104 210H256"/>
+          <path class="gl is-cut" data-l="m4" d="M304 136V190"/>
+          <path class="gl is-cut" data-l="m5" d="M104 130 256 196"/>
+        </g>
+        <g data-grp-pk></g>
+        <g class="grp-relay" data-grp-relay><rect class="b-gap" x="26" y="155" width="60" height="16"/><text class="t-xs" x="56" y="167" text-anchor="middle">relay</text></g>
+        <g class="grp-pill" data-grp-pill><rect class="b-gap" x="124" y="64" width="112" height="18"/><text class="t-xs t-acc" x="180" y="77" text-anchor="middle" data-grp-pilltext>list v2 · signed</text></g>
+        <g class="gd" data-d="root">
+          <rect class="b b-acc" x="132" y="6" width="96" height="40"/>
+          <text class="t-s t-strong" x="180" y="23" text-anchor="middle">Mac mini</text>
+          <text class="t-xs t-acc" x="180" y="38" text-anchor="middle">root · signs</text>
+          <rect class="sq gm" x="218" y="10" width="6" height="6"/>
+        </g>
+        <g class="gd" data-d="phone">
+          <rect class="b" x="8" y="96" width="96" height="40"/>
+          <text class="t-s t-strong" x="56" y="113" text-anchor="middle">phone</text>
+          <text class="t-xs t-mut" x="56" y="128" text-anchor="middle" data-r>member · away</text>
+          <rect class="sq gm" x="94" y="100" width="6" height="6"/>
+        </g>
+        <g class="gd" data-d="laptop">
+          <rect class="b" x="256" y="96" width="96" height="40"/>
+          <text class="t-s t-strong" x="304" y="113" text-anchor="middle">laptop</text>
+          <text class="t-xs t-mut" x="304" y="128" text-anchor="middle" data-r>member</text>
+          <rect class="sq gm" x="342" y="100" width="6" height="6"/>
+        </g>
+        <g class="gd" data-d="nas">
+          <rect class="b" x="8" y="190" width="96" height="40"/>
+          <text class="t-s t-strong" x="56" y="207" text-anchor="middle">NAS</text>
+          <text class="t-xs t-mut" x="56" y="222" text-anchor="middle" data-r>member</text>
+          <rect class="sq gm" x="94" y="194" width="6" height="6"/>
+        </g>
+        <g class="gd is-gone" data-d="server">
+          <rect class="b" x="256" y="190" width="96" height="40"/>
+          <text class="t-s t-strong" x="304" y="207" text-anchor="middle">server</text>
+          <text class="t-xs t-mut" x="304" y="222" text-anchor="middle" data-r>removed</text>
+          <rect class="sq gm" x="342" y="194" width="6" height="6"/>
+        </g>
+      </svg>
+      <ol class="grp-phases" aria-label="What the diagram shows">
+        <li data-p="1"><span class="n">01</span>Each device pairs once, with the root</li>
+        <li data-p="2"><span class="n">02</span>The root signs the list. It lands on every member</li>
+        <li data-p="3"><span class="n">03</span>Members link directly, the phone to the NAS through a relay</li>
+        <li data-p="4" class="is-now"><span class="n">04</span>The server is removed. A new list cuts its links everywhere</li>
+      </ol>
+    </div>
+    <div class="grp-foot">
+      <p class="caption faint grp-note"><span>Illustrative. Links open when there is something to send, over any path.</span><span class="grp-key" aria-hidden="true"><i></i>handshake<i class="key-list"></i>signed list<i class="key-pk"></i>sealed data</span></p>
+      <button class="play grp-play" type="button" data-grp-play hidden>Pause</button>
+    </div>
+    <div class="grp-after">
+      <div><p class="grp-after-h"><span class="grp-big">31</span> pairings, not <span class="grp-big">496</span></p><p>At 32 devices, each pairs once with the root, not with every other member.</p></div>
+      <div><p class="grp-after-h">No group key</p><p>Each pair runs its own handshake. A relay learns nothing about the group.</p></div>
+      <div><p class="grp-after-h">Lists only move forward</p><p>Each new list carries a higher number. A removed device cannot come back.</p></div>
+    </div>
+  </figure>
+  <a class="more" href="/how-it-works#groups">How groups work</a>
 </section>
 
 <section id="paths" class="band wrap" aria-labelledby="h-paths">
@@ -299,12 +449,12 @@
           <p class="vh">A phone on home Wi-Fi uses the direct path to the laptop. The phone moves to mobile data and the direct path drops. The devices handshake again, and the peer-to-peer path is now in use. The pairing is the same, with no new pairing needed.</p>
         </div>
         <div class="net-cap" id="np-web">
-          <p><span class="net-cap-k">In a browser. </span>A browser tab joins only as a client and cannot hole punch, so it always goes through a relay.</p>
+          <p><span class="net-cap-k">In a browser. </span>A browser tab joins only as a client. It races the routes a browser can dial, a relay, a broker or p2p through an iroh relay, and here the relay wins.</p>
           <dl class="net-sees">
             <div><dt>The relay sees</dt><dd>IP addresses, timing, sizes, a mailbox key</dd></div>
             <div><dt>It cannot see</dt><dd>Your data, grants, device names, the pairing code</dd></div>
           </dl>
-          <p class="vh">A browser tab reaches the laptop through the relay path, which is in use. Local, direct, overlay and broker are not available in a browser. With the opt-in p2p build, a tab can also take the p2p path, but only through an iroh relay, as a browser cannot open UDP sockets.</p>
+          <p class="vh">A browser tab reaches the laptop through the relay path, which is in use. Local, direct and overlay are not available in a browser. The broker path is available, through a secure WebSocket, but not needed here. With the opt-in p2p build, a tab can also take the p2p path, but only through an iroh relay, as a browser cannot open UDP sockets.</p>
         </div>
       </div>
       <button class="play net-play" type="button" data-net-play hidden>Pause</button>
@@ -473,7 +623,7 @@ tendril --state-dir ./nas-state enroll --endpoint 192.168.1.20:7000 --host-id ma
 tendril --state-dir ./mac-mini-state mint &lt;device_id&gt; --cap backup.write</code></pre>
 </div>
   </div>
-  <p class="small muted code-foot">Events are polled, not called back, so nothing re-enters your event loop. In the browser, install <code>@tendril-sdk/web</code> from npm to join as a client through a relay. Prebuilt <code>tendril-node</code> tarballs, <code>tendril-ffi</code> archives for Go, and <code>TendrilFFI.xcframework</code> for Apple ship on <a href="https://github.com/agync/tendril/releases">GitHub Releases</a>; <code>dev.agync:tendril-android</code> is published on GitHub Packages Maven.</p>
+  <p class="small muted code-foot">Events are polled, not called back, so nothing re-enters your event loop. In the browser, install <code>@tendril-sdk/web</code> from npm to join as a client through a relay or a broker. Prebuilt <code>tendril-node</code> tarballs, <code>tendril-ffi</code> archives for Go, and <code>TendrilFFI.xcframework</code> for Apple ship on <a href="https://github.com/agync/tendril/releases">GitHub Releases</a>; <code>dev.agync:tendril-android</code> is published on GitHub Packages Maven.</p>
 </section>
 
 <section id="trust" class="band wrap" aria-labelledby="h-trust">
