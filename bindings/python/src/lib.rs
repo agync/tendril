@@ -3316,6 +3316,15 @@ struct Session {
 
 #[pymethods]
 impl Session {
+    #[getter]
+    fn peer_id(&self, py: Python<'_>) -> PyResult<String> {
+        let sess = Arc::clone(&self.session);
+        py.detach(move || {
+            sess.peer_device_id()
+                .ok_or_else(|| PyRuntimeError::new_err("session peer is not authenticated"))
+        })
+    }
+
     fn send_data(&self, py: Python<'_>, payload: &[u8]) -> PyResult<()> {
         let data = payload.to_vec();
         let rt = Arc::clone(&self.rt);

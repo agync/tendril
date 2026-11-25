@@ -127,4 +127,13 @@ class TendrilClientUnitTest {
       assertTrue("missing TendrilNative.$name", nativeMethods.contains(name))
     }
   }
+
+  @Test
+  fun tendrilSessionAndNativeExposePeerId() {
+    val sessionMethods = TendrilSession::class.java.declaredMethods.map { it.name }.toSet()
+    assertTrue("missing TendrilSession.peerId", sessionMethods.contains("peerId"))
+
+    val nativeMethods = TendrilNative::class.java.declaredMethods.map { it.name }.toSet()
+    assertTrue("missing TendrilNative.sessionPeerId", nativeMethods.contains("sessionPeerId"))
+  }
 }

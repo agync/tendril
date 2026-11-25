@@ -3551,6 +3551,38 @@ pub unsafe extern "C" fn tendril_session_export_roster_json(
     })
 }
 
+/// Writes the authenticated roster peer identifier of `sess` into `out_peer_id`.
+///
+/// On responder sessions (`tendril_session_accept` / `tendril_session_accept_v2`) this is the
+/// canonical peer `device_id` verified against the Noise static key and active roster pin. On
+/// initiator sessions (`tendril_session_connect*`) this is the pinned `target_host_id`.
+/// Callers must still evaluate capability grants with [`tendril_session_authorize`].
+///
+/// # Safety
+/// `sess` must be a valid session pointer and `out_peer_id` must be non-null; free result with
+/// [`tendril_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_session_peer_id(
+    sess: *const TendrilSession,
+    out_peer_id: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if !out_peer_id.is_null() {
+            unsafe { *out_peer_id = ptr::null_mut() };
+        }
+        if sess.is_null() || out_peer_id.is_null() {
+            set_last_error("null session or out_peer_id");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let sess = unsafe { &*sess };
+        let Some(peer_id) = sess.session.peer_device_id() else {
+            set_last_error("session peer is not authenticated");
+            return TENDRIL_ERR_PROTOCOL;
+        };
+        unsafe { write_out_cstring(out_peer_id, &peer_id) }
+    })
+}
+
 /// Frees a [`TendrilSession`] returned by `tendril_session_connect` or `tendril_session_accept`.
 ///
 /// # Safety

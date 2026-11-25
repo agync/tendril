@@ -274,6 +274,7 @@ test("Node N-API bidirectional async interop with Rust tendril-conformance-peer"
       }),
     ]);
     assert.equal(cliConn.ok, true);
+    assert.equal(hostSess.peerId, accepted.device_id);
     assert.equal(await hostSess.authorize("fs.read"), true);
     assert.equal(await hostSess.authorize("shell.exec"), false);
 
@@ -294,6 +295,7 @@ test("Node N-API bidirectional async interop with Rust tendril-conformance-peer"
 
     hostEp.revokePeer(accepted.device_id);
     assert.equal(await hostSess.authorize("fs.read"), false);
+    assert.equal(hostSess.peerId, accepted.device_id);
 
     await hostSess.close(1000, "done");
     await peer.call({ op: "shutdown" });
@@ -337,6 +339,7 @@ test("Node N-API bidirectional async interop with Rust tendril-conformance-peer"
       peer2.call({ op: "connect" }),
     ]);
     assert.equal(hostConn.ok, true);
+    assert.equal(cliSess.peerId, "rust-host");
 
     await cliSess.sendData(Buffer.from("hello-from-node-client", "utf8"));
     const hostRecv = await peer2.call({ op: "recv", timeout_ms: 2000 });
@@ -533,6 +536,8 @@ test("Node binding validates safe integers and runs full-duplex session ops conc
     await new Promise((r) => setTimeout(r, 60));
     const t0 = Date.now();
     assert.equal(await hostSess.authorize("fs.read"), true);
+    assert.equal(hostSess.peerId, acc.device_id);
+    assert.equal(cliSess.peerId, "node-sec07-host");
     await hostSess.sendData(Buffer.from("node-duplex-reply", "utf8"));
     const cliEv = JSON.parse(await cliSess.pollEvent(2000));
     assert.equal(cliEv.event, "data");
@@ -623,6 +628,8 @@ test("Node M2M enrollment, single-use replay, and anchor revocation", async () =
     ]);
     assert.equal(await hostSess.authorize("fs.read"), true);
     assert.equal(await hostSess.authorize("shell.exec"), false);
+    assert.equal(cliSess.peerId, "node-m2m-host");
+    assert.equal(hostSess.peerId, initRes.device_id);
     await cliSess.close(1000, "done");
 
     hostEp.revokeTrustAnchor("node-m2m-anchor");
@@ -793,6 +800,8 @@ test("Node binding enforces mintRelayTicket and relay auth across /v1/relay and 
       cliEp.connectV2(relay.v2Url, "node-relay-host", grantJson, "127.0.0.1"),
       hostEp.acceptV2(5000),
     ]);
+    assert.equal(cliSess.peerId, "node-relay-host");
+    assert.equal(hostSess.peerId, v2Acc.device_id);
     await cliSess.sendData(Buffer.from("v2-gated-relay-ok", "utf8"));
     const ev = JSON.parse(await hostSess.pollEvent(3000));
     assert.equal(ev.event, "data");
@@ -862,6 +871,7 @@ test("Node binding runs Wire v2 PAKE pairing, session ops, and wrong-code reject
       }),
     ]);
     assert.equal(peerConn.ok, true);
+    assert.equal(hostSess.peerId, acc.device_id);
     assert.equal(await hostSess.authorize("fs.read"), true);
     assert.equal(await hostSess.authorize("shell.exec"), false);
 
@@ -882,6 +892,7 @@ test("Node binding runs Wire v2 PAKE pairing, session ops, and wrong-code reject
 
     hostEp.revokePeer(acc.device_id);
     assert.equal(await hostSess.authorize("fs.read"), false);
+    assert.equal(hostSess.peerId, acc.device_id);
 
     await hostSess.close(1000, "done");
     await peer.call({ op: "shutdown" });
@@ -911,6 +922,7 @@ test("Node binding runs Wire v2 PAKE pairing, session ops, and wrong-code reject
         peer2.call({ op: "accept_v2", timeout_ms: 5000 }),
       ]);
       assert.equal(hostConn2.ok, true);
+      assert.equal(cliSess2.peerId, "rust-v2-host");
       await cliSess2.sendData(Buffer.from("v2-node-to-rust", "utf8"));
       const r2 = await peer2.call({ op: "recv", timeout_ms: 2000 });
       assert.equal(r2.data_utf8, "v2-node-to-rust");

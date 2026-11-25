@@ -148,6 +148,8 @@ final class TendrilNative {
 
   public static native String sessionExportRosterJson(long ptr);
 
+  public static native String sessionPeerId(long ptr);
+
   public static native void sessionFree(long ptr);
 
   public static native void sessionSendData(long ptr, byte[] data);

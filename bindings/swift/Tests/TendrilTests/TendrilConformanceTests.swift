@@ -218,6 +218,8 @@ struct TendrilConformanceTests {
       srvSess.free()
     }
 
+    #expect(try cliSess.peerId() == "swift-host")
+    #expect(try srvSess.peerId() == devId)
     #expect(try srvSess.authorize("fs.read"))
     #expect(!(try srvSess.authorize("shell.exec")))
     try cliSess.sendData(Data("hello-swift".utf8))
@@ -225,8 +227,11 @@ struct TendrilConformanceTests {
     let evObj = try JSONSerialization.jsonObject(with: Data(evJson.utf8)) as! [String: Any]
     #expect(evObj["event"] as? String == "data")
     try host.revokePeer(peerId: devId)
+    #expect(try srvSess.peerId() == devId)
     #expect(!(try srvSess.authorize("fs.read")))
     try cliSess.close(code: 1000, reason: "done")
+    cliSess.free()
+    #expect(throws: TendrilError.closed) { _ = try cliSess.peerId() }
   }
 
   @Test
@@ -316,6 +321,25 @@ struct TendrilConformanceTests {
       )
     }
     #expect(repSem.wait(timeout: .now() + 5.0) == .success)
+
+    let clientDevId = try #require(initObj["device_id"] as? String)
+    let grantJson = try host.mintGrant(peerId: clientDevId, capsJson: "[\"fs.read\"]", ttlSecs: 3600)
+    let sessSem = DispatchSemaphore(value: 0)
+    let hostSessBox = SendableBox<TendrilSession?>(nil)
+    queue.async {
+      hostSessBox.set(try? host.acceptSession(timeoutMs: 5000))
+      sessSem.signal()
+    }
+    let cliSess = try client.connect(endpoint: addr, targetHostId: "swift-m2m-host", grantJson: grantJson)
+    defer { cliSess.free() }
+    #expect(sessSem.wait(timeout: .now() + 5.0) == .success)
+    let hostSess = try #require(hostSessBox.get())
+    defer { hostSess.free() }
+    #expect(try hostSess.authorize("fs.read"))
+    #expect(try !hostSess.authorize("shell.exec"))
+    #expect(try cliSess.peerId() == "swift-m2m-host")
+    #expect(try hostSess.peerId() == clientDevId)
+    try cliSess.close()
   }
 
   @Test
@@ -983,6 +1007,7 @@ struct TendrilConformanceTests {
     let sess = try cli.connectV2(endpoint: ep, targetHostId: "rust-swift-v2", grantJson: grantJson)
     defer { sess.free() }
     #expect(try recv()["ok"] as? Bool == true)
+    #expect(try sess.peerId() == "rust-swift-v2")
 
     try sess.sendData(Data("swift-v2-hello".utf8))
     let ev = try call(["op": "recv", "timeout_ms": 2000])
@@ -1160,6 +1185,7 @@ struct TendrilRouteTests {
     let host: TendrilEndpoint
     let client: TendrilEndpoint
     let hostId: String
+    let peerId: String
     let listen: String
     let grant: String
     let pair: [String: Any]
@@ -1172,11 +1198,12 @@ struct TendrilRouteTests {
     let listen = try host.serveDirect(listenAddr: "127.0.0.1:0")
     let issued = try obj(host.issuePairingUri())
     let res = try pair(host: host, client: client, uri: issued["uri"] as! String, wire: wire)
+    let peerId = res.host["device_id"] as! String
     let grant = try host.mintGrant(
-      peerId: res.host["device_id"] as! String, capsJson: "[\"fs.read\"]", ttlSecs: 3600)
+      peerId: peerId, capsJson: "[\"fs.read\"]", ttlSecs: 3600)
     return Paired(
-      host: host, client: client, hostId: "swift-routes-host", listen: listen, grant: grant,
-      pair: res.client, issued: issued)
+      host: host, client: client, hostId: "swift-routes-host", peerId: peerId, listen: listen,
+      grant: grant, pair: res.client, issued: issued)
   }
 
   @Test
@@ -1223,6 +1250,8 @@ struct TendrilRouteTests {
       cli.free()
       srv.free()
     }
+    #expect(try cli.peerId() == p.hostId)
+    #expect(try srv.peerId() == p.peerId)
     try roundTrip(cli, srv, "v2 stored")
   }
 

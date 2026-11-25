@@ -213,6 +213,8 @@ class TendrilPythonTests(unittest.TestCase):
         cli_sess = cli_ep.connect(addr, "py-host", grant)
         t2.join(timeout=5)
         host_sess = sess_holder["sess"]
+        self.assertEqual(cli_sess.peer_id, "py-host")
+        self.assertEqual(host_sess.peer_id, accepted_holder["res"]["device_id"])
         self.assertTrue(host_sess.authorize("fs.read"))
         self.assertFalse(host_sess.authorize("shell.exec"))
         cli_sess.send_data(b"hello-gil-free")
@@ -220,6 +222,7 @@ class TendrilPythonTests(unittest.TestCase):
         self.assertEqual(ev["event"], "data")
         host_ep.revoke_peer(accepted_holder["res"]["device_id"])
         self.assertFalse(host_sess.authorize("fs.read"))
+        self.assertEqual(host_sess.peer_id, accepted_holder["res"]["device_id"])
         cli_sess.close()
         host_ep.close()
         cli_ep.close()
@@ -253,6 +256,7 @@ class TendrilPythonTests(unittest.TestCase):
             peer.send({"op": "connect"})
             s = py_cli.connect(ep, "rust-host", json.dumps(grant_obj))
             self.assertTrue(peer.recv()["ok"])
+            self.assertEqual(s.peer_id, "rust-host")
             self.assertTrue(peer.call({"op": "authorize", "cap": "fs.read"})["allowed"])
             self.assertFalse(peer.call({"op": "authorize", "cap": "shell.exec"})["allowed"])
 
@@ -314,6 +318,7 @@ class TendrilPythonTests(unittest.TestCase):
             )
             py_host_sess = py_host.accept_session(5000)
             self.assertTrue(peer2.recv()["ok"])
+            self.assertEqual(py_host_sess.peer_id, acc["device_id"])
             self.assertTrue(py_host_sess.authorize("fs.read"))
             self.assertFalse(py_host_sess.authorize("shell.exec"))
 
@@ -338,6 +343,7 @@ class TendrilPythonTests(unittest.TestCase):
 
             py_host.revoke_peer(acc["device_id"])
             self.assertFalse(py_host_sess.authorize("fs.read"))
+            self.assertEqual(py_host_sess.peer_id, acc["device_id"])
 
             py_host_sess.close()
             peer2.call({"op": "shutdown"})
@@ -477,6 +483,8 @@ class TendrilPythonTests(unittest.TestCase):
 
             t0 = time.monotonic()
             self.assertTrue(host_sess.authorize("fs.read"))
+            self.assertEqual(host_sess.peer_id, cli_pair["device_id"])
+            self.assertEqual(cli_sess.peer_id, "py-sec17-host")
             host_sess.send_data(b"py-duplex-reply")
             cli_ev = json.loads(cli_sess.poll_event(2000))
             self.assertEqual(cli_ev["event"], "data")
@@ -593,6 +601,8 @@ class TendrilPythonTests(unittest.TestCase):
             host_sess = sess_holder["sess"]
             self.assertTrue(host_sess.authorize("fs.read"))
             self.assertFalse(host_sess.authorize("shell.exec"))
+            self.assertEqual(cli_sess.peer_id, "py-m2m-host")
+            self.assertEqual(host_sess.peer_id, init_res["device_id"])
             cli_sess.close()
 
             # Revoking the sole trust anchor disables M2M policy -> unauthorized.
@@ -860,6 +870,8 @@ class TendrilPythonTests(unittest.TestCase):
                     t_v2s.start()
                     c2 = cli_ep.connect_v2(v2_ep, "py-gated-host", g2, relay_host="localhost")
                     t_v2s.join(timeout=5)
+                    self.assertEqual(c2.peer_id, "py-gated-host")
+                    self.assertEqual(v2_sh["s"].peer_id, v2_acc["res"]["device_id"])
                     c2.send_data(b"v2-gated-ok")
                     ev2 = json.loads(v2_sh["s"].poll_event(2000))
                     self.assertEqual(ev2["event"], "data")
@@ -950,6 +962,7 @@ class TendrilPythonTests(unittest.TestCase):
                     v2_ep, "rust-v2-host", json.dumps(grant_obj), relay_host="localhost"
                 )
                 self.assertTrue(peer.recv()["ok"])
+                self.assertEqual(sess.peer_id, "rust-v2-host")
                 self.assertTrue(peer.call({"op": "authorize", "cap": "fs.read"})["allowed"])
                 self.assertFalse(peer.call({"op": "authorize", "cap": "shell.exec"})["allowed"])
 

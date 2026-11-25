@@ -247,6 +247,7 @@ TendrilSession *tendril_session_connect_with_options(
 );
 int32_t tendril_session_shutdown(TendrilSession *sess);
 int32_t tendril_session_export_roster_json(const TendrilSession *sess, char **out_json);
+int32_t tendril_session_peer_id(const TendrilSession *sess, char **out_peer_id);
 void tendril_session_free(TendrilSession *sess);
 
 int32_t tendril_session_send_data(TendrilSession *sess, const uint8_t *data, size_t len);
