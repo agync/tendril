@@ -6,9 +6,11 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use tendril_core::crypto::{HYBRID_SIG_LEN, SigningKeypair, StaticKeypair, b64url_encode};
+use tendril_core::error::CoreError;
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::pairing::{
-    PAIRING_ROUTES_DOMAIN, PairingUri, route_statement_input, sign_route_statement,
+    PAIRING_ROUTES_DOMAIN, PairRouteBinding, PairingUri, route_statement_input,
+    sign_route_statement,
 };
 use tendril_core::routes::{MAX_ROUTE_SEQ, ROUTE_SET_DOMAIN, RouteSet};
 use tendril_core::wire::SessionHello;
@@ -82,6 +84,116 @@ fn pairing_route_statement(id: &EndpointIdentity) -> Result<Value, Box<dyn std::
         "rs_input_hex": hex::encode(route_statement_input(&prefix)),
         "rs_hex": hex::encode(sig),
         "uri": full,
+    }))
+}
+
+fn signed_uri(signer: &EndpointIdentity, uri: &PairingUri) -> Result<String, CoreError> {
+    let prefix = format!("{}&rq={RS_ROUTE_SEQ}", uri.try_encode()?);
+    let sig = sign_route_statement(signer, &prefix);
+    Ok(format!("{prefix}&rs={}", b64url_encode(&sig)))
+}
+
+const URI_STATIC_SCALAR: [u8; 32] = [0x64; 32];
+const URI_SIGNING_SEED: [u8; 32] = [0x65; 32];
+const URI_SIGNING_MLDSA_SEED: [u8; 32] = [0x66; 32];
+
+/// Pre-`msg3` checks of a URI-bound initiator (spec 6.5 steps 1-3). The responder always
+/// presents the fixed host key: as the URI's own key, as a key rotated once from the URI's key
+/// (`URI_*` seeds, rotated at `ISSUED_AT`), or as an unrelated key with no chain to it.
+fn pairing_route_check(id: &EndpointIdentity) -> Result<Value, Box<dyn std::error::Error>> {
+    let old = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar(URI_STATIC_SCALAR),
+        SigningKeypair::from_seeds(URI_SIGNING_SEED, URI_SIGNING_MLDSA_SEED),
+    );
+    let uri_of = |key: &EndpointIdentity, hints: &[&str], rp: Option<&EndpointIdentity>| {
+        let mut uri = PairingUri::new(
+            "Studio Host",
+            "TND-ABCD-EFGH-JKLM",
+            *key.static_key().public_bytes(),
+            key.signing_key().signing_pub_hash(),
+            hints.iter().map(|h| (*h).to_owned()).collect(),
+            Some(key.host_id().to_owned()),
+            Some(0),
+        );
+        uri.relay_pub = rp.map(|r| *r.signing_key().ed25519_public_bytes());
+        uri
+    };
+    let tamper = |uri: &str| uri.replacen("192.168.1.20", "192.168.1.21", 1);
+    let relayed = [
+        "direct:192.168.1.20:9100",
+        "wss://relay.example.com/v1/relay",
+    ];
+    let direct = ["direct:192.168.1.20:9100"];
+    let verified = signed_uri(id, &uri_of(id, &relayed, Some(id)))?;
+    let rp_mismatch = signed_uri(id, &uri_of(id, &relayed, Some(&old)))?;
+    let by_old = signed_uri(&old, &uri_of(&old, &direct, None))?;
+    let old_ed = *old.signing_key().ed25519_public_bytes();
+    let (own, rotated, unrelated) = ("uri_key", "rotated_from_uri_key", "unrelated_key");
+    let cases: Vec<(&str, String, &str, Option<[u8; 32]>)> = vec![
+        ("verified", verified.clone(), own, None),
+        (
+            "unsigned",
+            uri_of(id, &relayed, Some(id)).try_encode()?,
+            own,
+            None,
+        ),
+        ("route_key_rotated", by_old.clone(), rotated, None),
+        ("route_key_rotated_stale_rs", tamper(&by_old), rotated, None),
+        ("invalid_rs", tamper(&verified), own, None),
+        ("rp_mismatch", rp_mismatch.clone(), own, None),
+        (
+            "rp_mismatch_and_invalid_rs",
+            tamper(&rp_mismatch),
+            own,
+            None,
+        ),
+        (
+            "operator_key_mismatch",
+            signed_uri(id, &uri_of(id, &direct, None))?,
+            own,
+            Some(old_ed),
+        ),
+        ("unchained_key", by_old, unrelated, None),
+    ];
+    let key = id.signing_key().public_key();
+    let mut out = Vec::new();
+    for (name, uri, responder, operator) in cases {
+        let binding = PairRouteBinding::new(Some(PairingUri::parse(&uri)?), operator)?;
+        let pin_ok = responder != unrelated;
+        let verdict = pin_ok.then(|| binding.verdict(key));
+        let commit_error = match verdict.as_ref().map(|v| v.committable()) {
+            Some(Ok(_)) => Value::Null,
+            None | Some(Err(CoreError::HostKeyUnverified)) => json!("host_key_unverified"),
+            Some(Err(CoreError::InvalidPairingUri(_))) => json!("invalid_pairing_uri"),
+            Some(Err(other)) => return Err(other.into()),
+        };
+        let mut case = json!({
+            "name": name,
+            "uri": uri,
+            "responder": responder,
+            "presented_static_pub_hex": hex::encode(id.static_key().public_bytes()),
+            "presented_ed25519_pub_hex": hex::encode(key.ed25519_bytes()),
+            "presented_signing_pub_sha256_hex": hex::encode(key.sha256_hash()),
+            "presented_rotation_seq": u64::from(responder == rotated),
+            "pin_ok": pin_ok,
+            "relay_pub_ok": verdict.as_ref().map(|v| v.relay_pub_ok()),
+            "route_check": verdict.as_ref().map(|v| v.route_check().as_str()),
+            "commit_error": commit_error,
+            "wires": ["v1", "v2"],
+        });
+        if let Some(op) = operator {
+            case["operator_relay_key_hex"] = json!(hex::encode(op));
+        }
+        out.push(case);
+    }
+    Ok(json!({
+        "uri_identity": {
+            "static_scalar_hex": hex::encode(URI_STATIC_SCALAR),
+            "signing_seed_hex": hex::encode(URI_SIGNING_SEED),
+            "signing_mldsa_seed_hex": hex::encode(URI_SIGNING_MLDSA_SEED),
+            "rotated_at": ISSUED_AT,
+        },
+        "cases": out,
     }))
 }
 
@@ -184,6 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "json": serde_json::to_string(&hello)?,
         },
         "pairing_route_statement": pairing_route_statement(&id)?,
+        "pairing_route_check": pairing_route_check(&id)?,
     });
 
     let mut text = serde_json::to_string_pretty(&doc)?;

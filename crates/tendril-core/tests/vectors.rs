@@ -2120,4 +2120,255 @@ mod route_vectors {
         assert_eq!(statement.hints(), hints.as_slice());
         assert_eq!(Some(statement.route_seq()), v["route_seq"].as_u64());
     }
+
+    fn error_code(err: &CoreError) -> &'static str {
+        match err {
+            CoreError::HostKeyUnverified => "host_key_unverified",
+            CoreError::InvalidPairingUri(_) => "invalid_pairing_uri",
+            other => panic!("unexpected refusal {other:?}"),
+        }
+    }
+
+    /// The verdict of a URI-bound v1 initiator (none when the host pin fails) and whether it
+    /// wrote `msg3` (from `msg2`, or from `commit_claim` when deferred) or refused.
+    fn v1_replay(
+        host: &EndpointIdentity,
+        binding: &tendril_core::pairing::PairRouteBinding,
+        deferred: bool,
+    ) -> (
+        Option<tendril_core::pairing::PairRouteVerdict>,
+        Result<bool, CoreError>,
+    ) {
+        use tendril_core::pairing::{
+            PairAction, PairingCodeKind, PairingConfig, PairingInitiator, PairingManager,
+            PairingPathKind, PairingResponder,
+        };
+        let writes = |actions: &[PairAction]| {
+            actions
+                .iter()
+                .any(|a| matches!(a, PairAction::WriteBytes(b) if !b.is_empty()))
+        };
+        let bytes = |actions: Vec<PairAction>| -> Vec<u8> {
+            actions
+                .into_iter()
+                .filter_map(|a| match a {
+                    PairAction::WriteBytes(b) => Some(b),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+        let cli = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x71; 32]),
+            SigningKeypair::from_seed([0x72; 32]),
+        );
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr
+            .issue_code(PairingCodeKind::Remote3Group, PAIR_NOW)
+            .unwrap();
+        let mut init = PairingInitiator::new(&cli, "Cli", "cli", &code, None, None)
+            .unwrap()
+            .with_route_binding(binding.clone());
+        if deferred {
+            init = init.with_deferred_claim();
+        }
+        let mut resp = PairingResponder::new(host, PairingPathKind::Remote, None).unwrap();
+        let mut roster = tendril_core::roster::Roster::new();
+        let m1 = bytes(init.start().unwrap());
+        let m2 = bytes(
+            resp.feed_bytes(&m1, PAIR_NOW, &mut mgr, &mut roster)
+                .unwrap(),
+        );
+        let result = match init.feed_bytes(&m2) {
+            Ok(actions) if deferred => {
+                assert!(!writes(&actions), "no msg3 before commit");
+                init.commit_claim()
+            }
+            fed => fed,
+        };
+        assert_eq!(mgr.live_code_count(PAIR_NOW), 1);
+        (init.route_verdict().cloned(), result.map(|a| writes(&a)))
+    }
+
+    fn v2_replay(
+        host: &EndpointIdentity,
+        binding: &tendril_core::pairing::PairRouteBinding,
+        deferred: bool,
+    ) -> (
+        Option<tendril_core::pairing::PairRouteVerdict>,
+        Result<bool, CoreError>,
+    ) {
+        use tendril_core::pairing::{
+            PairingCodeKind, PairingConfig, PairingManager, PairingPathKind,
+        };
+        use tendril_core::v2::{
+            PakeArgon2Params, V2PairAction, V2PakePairInitiator, V2PakePairResponder,
+        };
+        let writes = |actions: &[V2PairAction]| {
+            actions
+                .iter()
+                .any(|a| matches!(a, V2PairAction::WriteBytes(b) if !b.is_empty()))
+        };
+        let bytes = |actions: Vec<V2PairAction>| -> Vec<u8> {
+            actions
+                .into_iter()
+                .filter_map(|a| match a {
+                    V2PairAction::WriteBytes(b) => Some(b),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+        let cli = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x71; 32]),
+            SigningKeypair::from_seed([0x72; 32]),
+        );
+        let params = PakeArgon2Params::production();
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr
+            .issue_code(PairingCodeKind::Remote3Group, PAIR_NOW)
+            .unwrap();
+        let mut init = V2PakePairInitiator::new(&cli, "Cli", "cli", &code, None, params)
+            .unwrap()
+            .with_route_binding(binding.clone());
+        if deferred {
+            init = init.with_deferred_claim();
+        }
+        let mut resp = V2PakePairResponder::new(host, PairingPathKind::Remote, params).unwrap();
+        let mut roster = tendril_core::roster::Roster::new();
+        let m1 = bytes(init.start().unwrap());
+        let m2 = bytes(
+            resp.feed_bytes(&m1, PAIR_NOW, &mut mgr, &mut roster)
+                .unwrap(),
+        );
+        let result = match init.feed_bytes(&m2) {
+            Ok(actions) if deferred => {
+                assert!(!writes(&actions), "no msg3 before commit");
+                init.commit_claim()
+            }
+            fed => fed,
+        };
+        assert_eq!(mgr.live_code_count(PAIR_NOW), 1);
+        (init.route_verdict().cloned(), result.map(|a| writes(&a)))
+    }
+
+    const PAIR_NOW: u64 = 1_795_564_800;
+
+    #[test]
+    fn pairing_route_check_vectors_replay_on_both_wires() {
+        use tendril_core::pairing::{PairRouteBinding, PairingUri};
+
+        let text = fs::read_to_string(vectors_dir().join("routes.json")).unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        let keys_of = |v: &Value| {
+            (
+                StaticKeypair::from_scalar(decode_hex_array(str_of(v, "static_scalar_hex"))),
+                SigningKeypair::from_seeds(
+                    decode_hex_array(str_of(v, "signing_seed_hex")),
+                    decode_hex_array(str_of(v, "signing_mldsa_seed_hex")),
+                ),
+            )
+        };
+        let keys = &doc["route_set"];
+        let (static_key, signing_key) = keys_of(keys);
+        let host = EndpointIdentity::from_keys(static_key, signing_key);
+        let v = &doc["pairing_route_check"];
+        let (old_static, old_signing) = keys_of(&v["uri_identity"]);
+        let mut rotated = EndpointIdentity::from_keys(old_static, old_signing);
+        let (static_key, signing_key) = keys_of(keys);
+        rotated
+            .rotate(
+                static_key,
+                signing_key,
+                v["uri_identity"]["rotated_at"].as_u64().unwrap(),
+            )
+            .unwrap();
+        let key = host.signing_key().public_key();
+        assert_eq!(rotated.signing_key().public_key(), key);
+        let cases = v["cases"].as_array().unwrap();
+        let names: Vec<&str> = cases.iter().map(|c| str_of(c, "name")).collect();
+        assert_eq!(
+            names,
+            [
+                "verified",
+                "unsigned",
+                "route_key_rotated",
+                "route_key_rotated_stale_rs",
+                "invalid_rs",
+                "rp_mismatch",
+                "rp_mismatch_and_invalid_rs",
+                "operator_key_mismatch",
+                "unchained_key",
+            ]
+        );
+        for case in cases {
+            let name = str_of(case, "name");
+            assert_eq!(
+                hex_of(case, "presented_static_pub_hex"),
+                host.static_key().public_bytes().to_vec()
+            );
+            assert_eq!(
+                hex_of(case, "presented_ed25519_pub_hex"),
+                key.ed25519_bytes().to_vec()
+            );
+            assert_eq!(
+                hex_of(case, "presented_signing_pub_sha256_hex"),
+                key.sha256_hash().to_vec()
+            );
+            let wires: Vec<&str> = case["wires"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w.as_str().unwrap())
+                .collect();
+            assert_eq!(wires, ["v1", "v2"], "{name}");
+            let responder = match str_of(case, "responder") {
+                "uri_key" | "unrelated_key" => &host,
+                "rotated_from_uri_key" => &rotated,
+                other => panic!("{name}: unknown responder {other}"),
+            };
+            assert_eq!(
+                case["presented_rotation_seq"].as_u64(),
+                Some(responder.rotation_chain().len() as u64),
+                "{name}"
+            );
+            let operator = case
+                .get("operator_relay_key_hex")
+                .and_then(Value::as_str)
+                .map(decode_hex_array::<32>);
+            let uri = PairingUri::parse(str_of(case, "uri")).unwrap();
+            let binding = PairRouteBinding::new(Some(uri), operator).unwrap();
+            let pin_ok = case["pin_ok"].as_bool().unwrap();
+            let relay_pub_ok = case["relay_pub_ok"].as_bool();
+            let route_check = case["route_check"].as_str();
+            let commit_error = case["commit_error"].as_str();
+            for deferred in [true, false] {
+                for (wire, (verdict, result)) in [
+                    ("v1", v1_replay(responder, &binding, deferred)),
+                    ("v2", v2_replay(responder, &binding, deferred)),
+                ] {
+                    let at = format!("{name} {wire} deferred={deferred}");
+                    assert_eq!(verdict.is_some(), pin_ok, "{at}");
+                    if let Some(verdict) = &verdict {
+                        assert_eq!(verdict, &binding.verdict(key), "{at}");
+                    }
+                    assert_eq!(
+                        verdict.as_ref().map(|v| v.relay_pub_ok()),
+                        relay_pub_ok,
+                        "{at}"
+                    );
+                    assert_eq!(
+                        verdict.as_ref().map(|v| v.route_check().as_str()),
+                        route_check,
+                        "{at}"
+                    );
+                    match (commit_error, result) {
+                        (None, Ok(true)) => {}
+                        (Some(code), Err(err)) => assert_eq!(error_code(&err), code, "{at}"),
+                        (want, got) => panic!("{at}: want {want:?}, got {got:?}"),
+                    }
+                }
+            }
+        }
+    }
 }

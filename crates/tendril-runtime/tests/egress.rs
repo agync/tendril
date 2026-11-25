@@ -478,8 +478,7 @@ async fn ipv6_forms_embedding_blocked_ipv4_are_blocked_literals() {
     let resolver = Arc::new(StubResolver::default());
     let ctx = session(&resolver);
     for hint in [
-        "direct:[64:ff9b::a9fe:a9fe]:9",
-        "direct:[64:ff9b:1::1]:9",
+        "direct:[64:ff9b::f000:1]:9",
         "direct:[::f000:1]:9",
         "direct:[2002:f000:1::1]:9",
         "direct:[fec0::1]:9",
@@ -492,14 +491,20 @@ async fn ipv6_forms_embedding_blocked_ipv4_are_blocked_literals() {
             );
         }
     }
-    // URL hints embedding a blocked IPv4 are already refused by the parser.
-    let nat64 = "wss://[64:ff9b::a9fe:a9fe]/v1/relay";
-    for source in [HintSource::Uri, HintSource::Operator] {
-        assert_eq!(
-            skipped(nat64, source, &ctx).await,
-            SkipReason::Invalid,
-            "{nat64} {source:?}"
-        );
+    // Hints embedding a link-local IPv4, local-use NAT64 and Teredo are refused by the parser.
+    for nat64 in [
+        "wss://[64:ff9b::a9fe:a9fe]/v1/relay",
+        "direct:[64:ff9b::a9fe:a9fe]:9",
+        "direct:[64:ff9b:1::1]:9",
+        "direct:[2001::1]:9",
+    ] {
+        for source in [HintSource::Uri, HintSource::Operator] {
+            assert_eq!(
+                skipped(nat64, source, &ctx).await,
+                SkipReason::Invalid,
+                "{nat64} {source:?}"
+            );
+        }
     }
     let public = checked("direct:[64:ff9b::cb00:7107]:9", HintSource::Uri, &ctx).await;
     assert_eq!(public.path_class, PairingPathKind::Remote);
@@ -855,7 +860,7 @@ mod iroh_hints {
         let id = node_id();
         let ctx = session(&resolver).with_iroh_relay_mode(P2pRelayMode::Disabled);
         let hint = format!(
-            "iroh://{id}?addr=240.0.0.1:4433&addr=192.168.1.4:4433&addr=[64:ff9b::a9fe:a9fe]:1\
+            "iroh://{id}?addr=240.0.0.1:4433&addr=192.168.1.4:4433&addr=[64:ff9b::f000:1]:1\
              &relay=https://0.0.0.7/&relay=https://relay.one.example/"
         );
         for source in [

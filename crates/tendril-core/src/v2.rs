@@ -40,8 +40,8 @@ use crate::noise::{MSG1_LEN, NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseT
 #[cfg(any(test, feature = "test-utils"))]
 use crate::pairing::KeyClaimTamper;
 use crate::pairing::{
-    PairingManager, PairingPathKind, PersistPlan, PinnedHost, VerifiedHost, VerifiedRouteStatement,
-    human_key_claim, verify_human_key_claim,
+    PairRouteBinding, PairRouteVerdict, PairingManager, PairingPathKind, PairingUri, PersistPlan,
+    PinnedHost, VerifiedHost, VerifiedRouteStatement, human_key_claim, verify_human_key_claim,
 };
 use crate::roster::{PairMergeOutcome, PeerState, Roster, V2PeerSecrets};
 use crate::routes::RouteSet;
@@ -2295,6 +2295,11 @@ impl V2SessionInitiator {
                 self.verified_recovery = verified.recovery_statement;
                 roster.set_peer_min_wire_version(&self.target_host_id, WIRE_VERSION_V2)?;
 
+                // `0x0C` arrives only inside `0x09 PADDED`: without padding there is no opt-in, and
+                // the receive gate reads the same stored value.
+                if !self.padding.is_enabled() {
+                    self.local_route_seq = None;
+                }
                 let hello = SessionHello {
                     device_id: self.local_device_id.clone(),
                     grant: self.initial_grant.clone(),
@@ -3986,6 +3991,8 @@ pub struct V2PakePairInitiator {
     pinned_host: Option<V2PinnedHost>,
     params: PakeArgon2Params,
     deferred_claim: bool,
+    route_binding: PairRouteBinding,
+    route_verdict: Option<PairRouteVerdict>,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_ephemeral: Option<[u8; 32]>,
     #[cfg(any(test, feature = "test-utils"))]
@@ -4048,6 +4055,8 @@ impl V2PakePairInitiator {
             pinned_host,
             params,
             deferred_claim: false,
+            route_binding: PairRouteBinding::default(),
+            route_verdict: None,
             #[cfg(any(test, feature = "test-utils"))]
             fixed_ephemeral: None,
             #[cfg(any(test, feature = "test-utils"))]
@@ -4089,6 +4098,43 @@ impl V2PakePairInitiator {
         self
     }
 
+    /// Binds the pairing URI and operator relay key whose `rp`, operator key and route statement
+    /// checks gate `msg3`. A bound URI's host pin is enforced at `msg2`: it is the pin when none
+    /// was given, and a different pinned host refuses `msg2` with `HostKeyUnverified`.
+    #[must_use]
+    pub fn with_route_binding(mut self, binding: PairRouteBinding) -> Self {
+        self.route_binding = binding;
+        self
+    }
+
+    /// Binds `uri` alone, as [`Self::with_route_binding`].
+    #[must_use]
+    pub fn with_pairing_uri(self, uri: &PairingUri) -> Self {
+        self.with_route_binding(PairRouteBinding::from_uri(uri))
+    }
+
+    /// Replaces the route binding. Fails with `NotReady` once `msg2` was accepted, and with
+    /// `InvalidPairingUri` when the URI's host pin differs from the pinned host.
+    pub fn set_route_binding(&mut self, binding: PairRouteBinding) -> Result<(), CoreError> {
+        if !matches!(
+            self.phase,
+            PakeInitPhase::Init | PakeInitPhase::AwaitMsg2 { .. }
+        ) {
+            return Err(CoreError::NotReady(
+                "pairing route binding is set before msg2",
+            ));
+        }
+        binding.check_pin(self.pinned_host.as_ref().map(|p| &p.pinned))?;
+        self.route_binding = binding;
+        Ok(())
+    }
+
+    /// The route verdict of the verified host, from `msg2` acceptance on.
+    #[must_use]
+    pub const fn route_verdict(&self) -> Option<&PairRouteVerdict> {
+        self.route_verdict.as_ref()
+    }
+
     /// Returns `true` while a verified `msg2` waits for [`Self::commit_claim`].
     #[must_use]
     pub const fn is_awaiting_commit(&self) -> bool {
@@ -4127,7 +4173,8 @@ impl V2PakePairInitiator {
     /// Builds and returns the `msg3` claim (`init_confirm_mac` and key claim) of a deferred
     /// initiator from this handshake's `h`.
     ///
-    /// Fails with `NotReady` before a verified `msg2` or when called twice.
+    /// Fails with `NotReady` before a verified `msg2` or when called twice. A failed route
+    /// verdict returns its error and closes the initiator without `msg3`.
     pub fn commit_claim(&mut self) -> Result<Vec<V2PairAction>, CoreError> {
         if !self.is_awaiting_commit() {
             return Err(CoreError::NotReady(
@@ -4141,6 +4188,10 @@ impl V2PakePairInitiator {
                 "v2 PAKE initiator is not awaiting commit",
             ));
         };
+        self.route_verdict
+            .as_ref()
+            .ok_or(CoreError::HostKeyUnverified)?
+            .committable()?;
         let mut actions = Vec::new();
         self.write_claim(hs, &keys, host, &mut actions)?;
         Ok(actions)
@@ -4187,7 +4238,7 @@ impl V2PakePairInitiator {
             verified_seq: host.verified_seq,
             presented_rotation: host.presented_rotation,
             pairing_sas: host.pairing_sas,
-            host_pin_verified: self.pinned_host.is_some(),
+            host_pin_verified: host.verified_seq.is_some(),
         };
         Ok(())
     }
@@ -4327,8 +4378,10 @@ impl V2PakePairInitiator {
                 }
 
                 let mut verified_seq = None;
-                if let Some(ref v2_pin) = self.pinned_host {
-                    let pin = &v2_pin.pinned;
+                let pin = self
+                    .route_binding
+                    .host_pin(self.pinned_host.as_ref().map(|p| &p.pinned))?;
+                if let Some(ref pin) = pin {
                     if let Some(ref exp_id) = pin.host_id
                         && exp_id != &host_hello.host_id
                     {
@@ -4381,9 +4434,15 @@ impl V2PakePairInitiator {
                     presented_rotation: host_hello.rotation,
                     pairing_sas: sas,
                 };
+                let verdict = self.route_binding.verdict(&host.verified_host_signing_pub);
+                let refusal = verdict.committable().err();
+                self.route_verdict = Some(verdict);
                 if self.deferred_claim {
                     self.phase = PakeInitPhase::AwaitCommit { hs, keys, host };
                     return Ok(());
+                }
+                if let Some(err) = refusal {
+                    return Err(err);
                 }
                 self.write_claim(hs, &keys, host, actions)
             }

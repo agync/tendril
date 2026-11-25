@@ -5,10 +5,11 @@ use tendril_core::error::CoreError;
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::pairing::{
     DropReason, DroppedHint, IssueOptions, LocalRouteState, MAX_PAIRING_URI_LEN,
-    PAIRING_ROUTES_DOMAIN, PairAction, PairOutcome, PairingCodeKind, PairingConfig,
-    PairingInitiator, PairingManager, PairingPathKind, PairingResponder, PairingUri, PersistOpts,
-    PersistPlan, RouteCheck, RoutePolicy, UnsignedReason, classify_endpoint_hint,
-    is_valid_pairing_endpoint_hint, persistable_routes, qr_version_m, sign_route_statement,
+    PAIRING_ROUTES_DOMAIN, PairAction, PairOutcome, PairRouteBinding, PairingCodeKind,
+    PairingConfig, PairingInitiator, PairingManager, PairingPathKind, PairingResponder, PairingUri,
+    PersistOpts, PersistPlan, PinnedHost, RouteCheck, RoutePolicy, UnsignedReason,
+    classify_endpoint_hint, is_valid_pairing_endpoint_hint, mint_enrollment_token,
+    persistable_routes, qr_version_m, sign_route_statement,
 };
 use tendril_core::policy::ProviderId;
 use tendril_core::roster::Roster;
@@ -807,38 +808,14 @@ fn route_policy_and_reason_spellings() {
 }
 
 #[test]
-fn verified_statement_ignores_mutated_public_fields() {
+fn route_statement_rejects_mutated_public_fields() {
     let id = identity(0x71);
-    let mut uri = PairingUri::parse(&signed_fixture(&id)).unwrap();
-    let original = owned(&SIGNED_HINTS);
-    uri.endpoints = vec!["wss://evil.example/v1/relay".into()];
-    let RouteCheck::Verified(s) = uri.verify_route_statement(id.signing_key().public_key()) else {
-        panic!("statement must verify from the signed bytes");
-    };
-    assert_eq!(s.hints(), original.as_slice());
-    let check = RouteCheck::Verified(s);
-    let plan = persistable_routes(&check, CODE3, None, &PersistOpts::default());
-    assert_eq!(plan.signed(), original);
-    assert_eq!(plan.route_seq(), Some(5));
-    assert_eq!(
-        uri.try_encode(),
-        Err(CoreError::InvalidPairingUri(
-            "signed pairing URI fields were modified".into()
-        ))
-    );
-
-    let mut recoded = PairingUri::parse(&signed_fixture(&id)).unwrap();
-    recoded.code = "TND-WXYZ-WXYZ-WXYZ".into();
-    let check = recoded.verify_route_statement(id.signing_key().public_key());
-    assert_eq!(check.statement().unwrap().code(), CODE3);
-    let plan = persistable_routes(&check, &recoded.code, None, &PersistOpts::default());
-    assert!(plan.signed().is_empty());
-    assert_eq!(plan.reason, Some("unsigned_uri"));
-    assert!(recoded.try_encode().is_err());
-    assert_eq!(recoded.route_seq(), Some(5));
-
+    let key = id.signing_key().public_key();
     for mutate in [
-        (|u: &mut PairingUri| u.host_name.push('x')) as fn(&mut PairingUri),
+        (|u: &mut PairingUri| u.endpoints = vec!["wss://evil.example/v1/relay".into()])
+            as fn(&mut PairingUri),
+        |u| u.code = "TND-WXYZ-WXYZ-WXYZ".into(),
+        |u| u.host_name.push('x'),
         |u| u.host_static_pub[0] ^= 1,
         |u| u.host_signing_pub_hash[0] ^= 1,
         |u| u.host_id = None,
@@ -846,13 +823,32 @@ fn verified_statement_ignores_mutated_public_fields() {
         |u| u.relay_pub = None,
     ] {
         let mut u = PairingUri::parse(&signed_fixture(&id)).unwrap();
-        mutate(&mut u);
-        assert!(u.try_encode().is_err());
         assert!(matches!(
-            u.verify_route_statement(id.signing_key().public_key()),
+            u.verify_route_statement(key),
             RouteCheck::Verified(_)
         ));
+        mutate(&mut u);
+        assert_eq!(
+            u.try_encode(),
+            Err(CoreError::InvalidPairingUri(
+                "signed pairing URI fields were modified".into()
+            ))
+        );
+        assert_eq!(u.verify_route_statement(key), RouteCheck::Invalid);
+        assert_eq!(
+            u.verify_route_statement_for_session(key),
+            RouteCheck::Invalid
+        );
+        assert_eq!(u.route_seq(), Some(5));
     }
+
+    let check = PairingUri::parse(&signed_fixture(&id))
+        .unwrap()
+        .verify_route_statement(key);
+    assert_eq!(check.statement().unwrap().code(), CODE3);
+    let plan = persistable_routes(&check, "TND-WXYZ-WXYZ-WXYZ", None, &PersistOpts::default());
+    assert!(plan.signed().is_empty());
+    assert_eq!(plan.reason, Some("unsigned_uri"));
 }
 
 #[test]
@@ -1370,6 +1366,486 @@ fn deferred_initiator_rejects_frames_before_commit() {
     assert!(init.feed_bytes(&[0, 2, 0xAA, 0xBB]).is_err());
     assert!(!init.is_awaiting_commit());
     assert!(init.commit_claim().is_err());
+    assert_eq!(mgr.live_code_count(NOW_UNIX), 1);
+}
+
+/// A v1 pairing bound to a URI, run until the initiator has `msg2` in hand.
+struct BoundV1 {
+    init: PairingInitiator,
+    resp: PairingResponder,
+    mgr: PairingManager,
+    roster: Roster,
+    m2: Vec<u8>,
+}
+
+fn bound_v1(host: &EndpointIdentity, uri: &str, deferred: bool) -> BoundV1 {
+    let dev = identity(0xC3);
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Remote3Group, NOW_UNIX)
+        .unwrap();
+    let uri = PairingUri::parse(uri).unwrap();
+    let mut init = PairingInitiator::new(&dev, "Phone", "mobile", &code, None, None)
+        .unwrap()
+        .with_pairing_uri(&uri);
+    if deferred {
+        init = init.with_deferred_claim();
+    }
+    let mut resp = PairingResponder::new(host, PairingPathKind::Remote, None).unwrap();
+    let mut roster = Roster::new();
+    let m1 = write_bytes(&init.start().unwrap());
+    let m2 = write_bytes(
+        &resp
+            .feed_bytes(&m1, NOW_UNIX, &mut mgr, &mut roster)
+            .unwrap(),
+    );
+    BoundV1 {
+        init,
+        resp,
+        mgr,
+        roster,
+        m2,
+    }
+}
+
+fn rp_mismatch_uri(host: &EndpointIdentity) -> String {
+    let mut uri = base_uri(host, CODE3, &["wss://relay.example.com/v1/relay"]);
+    uri.relay_pub = Some(*identity(0xC5).signing_key().ed25519_public_bytes());
+    uri.try_encode().unwrap()
+}
+
+fn tampered_rs_uri(host: &EndpointIdentity) -> String {
+    signed_fixture(host).replacen("192.168.1.20", "192.168.1.21", 1)
+}
+
+const NOT_AWAITING: CoreError = CoreError::NotReady("pairing initiator is not awaiting commit");
+
+fn assert_refused(p: &mut BoundV1, expected: &CoreError) {
+    assert_eq!(p.init.feed_bytes(&p.m2).as_ref().err(), Some(expected));
+    assert!(p.init.route_verdict().is_some());
+    assert!(!p.init.is_awaiting_commit());
+    assert_eq!(p.init.commit_claim(), Err(NOT_AWAITING));
+    assert!(matches!(
+        p.init.feed_bytes(&p.m2),
+        Err(CoreError::SessionClosed { .. })
+    ));
+    assert_eq!(p.mgr.live_code_count(NOW_UNIX), 1);
+}
+
+#[test]
+fn v1_uri_bound_initiator_refuses_msg3_on_rp_mismatch() {
+    let host = identity(0xC1);
+    let uri = rp_mismatch_uri(&host);
+
+    let mut p = bound_v1(&host, &uri, true);
+    let actions = p.init.feed_bytes(&p.m2).unwrap();
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(actions[0], PairAction::SasReady { .. }));
+    assert!(p.init.is_awaiting_commit());
+    assert!(p.init.verified_host().is_some());
+    let verdict = p.init.route_verdict().unwrap();
+    assert!(!verdict.relay_pub_ok());
+    assert_eq!(verdict.committable(), Err(CoreError::HostKeyUnverified));
+    assert_eq!(p.init.commit_claim(), Err(CoreError::HostKeyUnverified));
+    assert!(!p.init.is_awaiting_commit());
+    assert_eq!(p.init.commit_claim(), Err(NOT_AWAITING));
+    assert_eq!(p.mgr.live_code_count(NOW_UNIX), 1);
+
+    let mut p = bound_v1(&host, &uri, false);
+    assert_refused(&mut p, &CoreError::HostKeyUnverified);
+}
+
+#[test]
+fn v1_uri_bound_initiator_refuses_msg3_on_invalid_rs() {
+    let host = identity(0xC1);
+    let uri = tampered_rs_uri(&host);
+    let invalid = CoreError::InvalidPairingUri("route statement does not verify".into());
+
+    let mut p = bound_v1(&host, &uri, true);
+    p.init.feed_bytes(&p.m2).unwrap();
+    assert!(p.init.is_awaiting_commit());
+    let verdict = p.init.route_verdict().unwrap();
+    assert!(verdict.relay_pub_ok());
+    assert_eq!(verdict.route_check(), &RouteCheck::Invalid);
+    assert_eq!(p.init.commit_claim(), Err(invalid.clone()));
+    assert!(!p.init.is_awaiting_commit());
+    assert_eq!(p.init.commit_claim(), Err(NOT_AWAITING));
+    assert_eq!(p.mgr.live_code_count(NOW_UNIX), 1);
+
+    let mut p = bound_v1(&host, &uri, false);
+    assert_refused(&mut p, &invalid);
+}
+
+#[test]
+fn v1_uri_bound_initiator_commits_on_verified_and_rotated() {
+    let host = identity(0xC1);
+    let mut rotated_host = identity(0xC7);
+    let rotated = sign(
+        &rotated_host,
+        &base_uri(&rotated_host, CODE3, &["direct:192.168.1.20:9100"]),
+        5,
+    );
+    rotated_host
+        .rotate(
+            StaticKeypair::from_scalar([0xCB; 32]),
+            SigningKeypair::from_seed([0xCC; 32]),
+            NOW_UNIX,
+        )
+        .unwrap();
+    for (responder, uri, label) in [
+        (&host, signed_fixture(&host), "verified"),
+        (&rotated_host, rotated, "route_key_rotated"),
+    ] {
+        for deferred in [true, false] {
+            let mut p = bound_v1(responder, &uri, deferred);
+            let mut actions = p.init.feed_bytes(&p.m2).unwrap();
+            let verdict = p.init.route_verdict().unwrap();
+            assert!(verdict.relay_pub_ok(), "{label}");
+            assert_eq!(verdict.route_check().as_str(), label);
+            assert_eq!(verdict.committable(), Ok(verdict.route_check()));
+            if deferred {
+                actions = p.init.commit_claim().unwrap();
+            }
+            let resp_actions = p
+                .resp
+                .feed_bytes(&write_bytes(&actions), NOW_UNIX, &mut p.mgr, &mut p.roster)
+                .unwrap();
+            let done = p.init.feed_bytes(&write_bytes(&resp_actions)).unwrap();
+            assert!(
+                done.iter().any(|a| matches!(
+                    a,
+                    PairAction::Completed(PairOutcome::InitiatorPending { .. })
+                )),
+                "{label} deferred={deferred}"
+            );
+            assert_eq!(
+                p.init.route_verdict().unwrap().route_check().as_str(),
+                label
+            );
+        }
+    }
+}
+
+#[test]
+fn route_binding_rejects_disagreeing_operator_key() {
+    let host = identity(0xC1);
+    let other = *identity(0xC5).signing_key().ed25519_public_bytes();
+    let own = *host.signing_key().ed25519_public_bytes();
+    let uri = PairingUri::parse(&signed_fixture(&host)).unwrap();
+    assert_eq!(
+        PairRouteBinding::new(Some(uri.clone()), Some(other)).err(),
+        Some(CoreError::InvalidPairingUri(
+            "operator relay key does not match the URI rp".into()
+        ))
+    );
+    let agreeing = PairRouteBinding::new(Some(uri.clone()), Some(own)).unwrap();
+    assert_eq!(agreeing.uri(), Some(&uri));
+    let key = host.signing_key().public_key();
+    assert!(agreeing.verdict(key).relay_pub_ok());
+    assert!(matches!(
+        agreeing.verdict(key).route_check(),
+        RouteCheck::Verified(_)
+    ));
+
+    let operator_only = PairRouteBinding::new(None, Some(other)).unwrap();
+    let verdict = operator_only.verdict(key);
+    assert!(!verdict.relay_pub_ok());
+    assert_eq!(
+        verdict.route_check(),
+        &RouteCheck::Unsigned(UnsignedReason::Absent)
+    );
+    assert_eq!(verdict.committable(), Err(CoreError::HostKeyUnverified));
+
+    let unbound = PairRouteBinding::default().verdict(key);
+    assert!(unbound.relay_pub_ok());
+    assert_eq!(
+        unbound.committable(),
+        Ok(&RouteCheck::Unsigned(UnsignedReason::Absent))
+    );
+
+    let mut p = bound_v1(&host, &signed_fixture(&host), true);
+    p.init
+        .set_route_binding(PairRouteBinding::new(None, Some(other)).unwrap())
+        .unwrap();
+    p.init.feed_bytes(&p.m2).unwrap();
+    assert_eq!(p.init.commit_claim(), Err(CoreError::HostKeyUnverified));
+}
+
+#[test]
+fn set_route_binding_after_msg2_is_not_ready() {
+    let host = identity(0xC1);
+    let late = CoreError::NotReady("pairing route binding is set before msg2");
+    let mut p = bound_v1(&host, &rp_mismatch_uri(&host), true);
+    p.init
+        .set_route_binding(PairRouteBinding::default())
+        .unwrap();
+    p.init.feed_bytes(&p.m2).unwrap();
+    assert!(p.init.route_verdict().unwrap().relay_pub_ok());
+    assert_eq!(
+        p.init.set_route_binding(PairRouteBinding::default()),
+        Err(late.clone())
+    );
+    let uri = PairingUri::parse(&rp_mismatch_uri(&host)).unwrap();
+    assert_eq!(
+        p.init
+            .set_route_binding(PairRouteBinding::new(Some(uri), None).unwrap()),
+        Err(late)
+    );
+    assert!(p.init.route_verdict().unwrap().relay_pub_ok());
+    assert!(p.init.commit_claim().is_ok());
+}
+
+#[test]
+fn v1_uri_binding_enforces_the_uri_host_pin() {
+    let host = identity(0xC1);
+    let unrelated = identity(0xC9);
+    for uri in [
+        signed_fixture(&unrelated),
+        base_uri(&unrelated, CODE3, &["direct:192.168.1.20:9100"])
+            .try_encode()
+            .unwrap(),
+    ] {
+        for deferred in [true, false] {
+            let mut p = bound_v1(&host, &uri, deferred);
+            assert_eq!(
+                p.init.feed_bytes(&p.m2).err(),
+                Some(CoreError::HostKeyUnverified),
+                "deferred={deferred}"
+            );
+            assert!(p.init.route_verdict().is_none());
+            assert_eq!(p.init.commit_claim(), Err(NOT_AWAITING));
+            assert_eq!(p.mgr.live_code_count(NOW_UNIX), 1);
+        }
+    }
+
+    let mut p = bound_v1(&host, &signed_fixture(&host), false);
+    let actions = p.init.feed_bytes(&p.m2).unwrap();
+    let resp_actions = p
+        .resp
+        .feed_bytes(&write_bytes(&actions), NOW_UNIX, &mut p.mgr, &mut p.roster)
+        .unwrap();
+    let done = p.init.feed_bytes(&write_bytes(&resp_actions)).unwrap();
+    assert!(done.iter().any(|a| matches!(
+        a,
+        PairAction::Completed(PairOutcome::InitiatorPending {
+            host_pin_verified: true,
+            ..
+        })
+    )));
+}
+
+/// Runs a URI-bound, non-deferred v1 pairing with `pin` to completion and returns whether the
+/// outcome reports a verified host pin.
+fn pair_with_pin(host: &EndpointIdentity, pin: Option<PinnedHost>, uri: &PairingUri) -> bool {
+    let dev = identity(0xC3);
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Remote3Group, NOW_UNIX)
+        .unwrap();
+    let mut init = PairingInitiator::new(&dev, "Phone", "mobile", &code, pin, None)
+        .unwrap()
+        .with_pairing_uri(uri);
+    let mut resp = PairingResponder::new(host, PairingPathKind::Remote, None).unwrap();
+    let mut roster = Roster::new();
+    let m1 = write_bytes(&init.start().unwrap());
+    let m2 = write_bytes(
+        &resp
+            .feed_bytes(&m1, NOW_UNIX, &mut mgr, &mut roster)
+            .unwrap(),
+    );
+    let m3 = write_bytes(&init.feed_bytes(&m2).unwrap());
+    let m4 = write_bytes(
+        &resp
+            .feed_bytes(&m3, NOW_UNIX, &mut mgr, &mut roster)
+            .unwrap(),
+    );
+    init.feed_bytes(&m4).unwrap().iter().any(|a| {
+        matches!(
+            a,
+            PairAction::Completed(PairOutcome::InitiatorPending {
+                host_pin_verified: true,
+                ..
+            })
+        )
+    })
+}
+
+fn full_pin(host: &EndpointIdentity, host_id: Option<&str>, seq: u64) -> PinnedHost {
+    PinnedHost::with_full_key(
+        host_id.map(ToOwned::to_owned),
+        *host.static_key().public_bytes(),
+        host.signing_key().public_key().clone(),
+        seq,
+    )
+}
+
+#[test]
+fn v1_uri_binding_agrees_with_an_equivalent_pin() {
+    let host = identity(0xC1);
+    let uri = PairingUri::parse(&signed_fixture(&host)).unwrap();
+    assert!(pair_with_pin(
+        &host,
+        Some(full_pin(&host, Some(host.host_id()), 0)),
+        &uri
+    ));
+    assert!(pair_with_pin(&host, Some(full_pin(&host, None, 0)), &uri));
+    let mut no_id = base_uri(&host, CODE3, &SIGNED_HINTS);
+    no_id.host_id = None;
+    let no_id = PairingUri::parse(&sign(&host, &no_id, 5)).unwrap();
+    assert!(pair_with_pin(
+        &host,
+        Some(full_pin(&host, Some(host.host_id()), 0)),
+        &no_id
+    ));
+
+    // A legacy URI without `seq` issued after one rotation, and a caller pin at `seq = 1`.
+    let mut rotated = identity(0xD5);
+    rotated
+        .rotate(
+            StaticKeypair::from_scalar([0xD7; 32]),
+            SigningKeypair::from_seed([0xD8; 32]),
+            NOW_UNIX,
+        )
+        .unwrap();
+    let legacy = PairingUri::new(
+        "Studio",
+        CODE3,
+        *rotated.static_key().public_bytes(),
+        rotated.signing_key().signing_pub_hash(),
+        owned(&["direct:192.168.1.20:9100"]),
+        Some(rotated.host_id().to_owned()),
+        None,
+    );
+    let legacy = PairingUri::parse(&legacy.try_encode().unwrap()).unwrap();
+    assert!(pair_with_pin(
+        &rotated,
+        Some(full_pin(&rotated, Some(rotated.host_id()), 1)),
+        &legacy
+    ));
+
+    let dev = identity(0xC3);
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Remote3Group, NOW_UNIX)
+        .unwrap();
+    let other = identity(0xC9);
+    let refused = [
+        full_pin(&other, Some(host.host_id()), 0),
+        PinnedHost {
+            static_pub: *other.static_key().public_bytes(),
+            ..full_pin(&host, None, 0)
+        },
+        PinnedHost::with_hash(
+            None,
+            *host.static_key().public_bytes(),
+            other.signing_key().signing_pub_hash(),
+            0,
+        ),
+        full_pin(&host, Some("another-host"), 0),
+        full_pin(&host, Some(host.host_id()), 1),
+    ];
+    for pin in refused {
+        let mut init =
+            PairingInitiator::new(&dev, "Phone", "mobile", &code, Some(pin.clone()), None).unwrap();
+        assert_eq!(
+            init.set_route_binding(PairRouteBinding::new(Some(uri.clone()), None).unwrap()),
+            Err(CoreError::InvalidPairingUri(
+                "pairing URI does not match the pinned host".into()
+            )),
+            "{pin:?}"
+        );
+    }
+}
+
+#[test]
+fn m2m_uri_binding_agrees_with_its_full_key_pin() {
+    let host = identity(0xC1);
+    let dev = identity(0xC3);
+    let uri = PairingUri::parse(&signed_fixture(&host)).unwrap();
+    let token = mint_enrollment_token(
+        &host,
+        host.host_id(),
+        Some(&dev.device_id()),
+        NOW_UNIX,
+        900,
+        [0xA1; 16],
+    )
+    .unwrap();
+    let mut init = PairingInitiator::new_m2m(
+        &dev,
+        "runner",
+        "machine",
+        token,
+        full_pin(&host, Some(host.host_id()), 0),
+        None,
+    )
+    .unwrap();
+    init.set_route_binding(PairRouteBinding::new(Some(uri), None).unwrap())
+        .unwrap();
+    let other = PairingUri::parse(&signed_fixture(&identity(0xC9))).unwrap();
+    assert_eq!(
+        init.set_route_binding(PairRouteBinding::new(Some(other), None).unwrap()),
+        Err(CoreError::InvalidPairingUri(
+            "pairing URI does not match the pinned host".into()
+        ))
+    );
+}
+
+#[test]
+fn v1_uri_binding_refuses_a_disagreeing_pin() {
+    let host = identity(0xC1);
+    let unrelated = identity(0xC9);
+    let dev = identity(0xC3);
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code(PairingCodeKind::Remote3Group, NOW_UNIX)
+        .unwrap();
+    let host_uri = PairingUri::parse(&signed_fixture(&host)).unwrap();
+    let other_uri = PairingUri::parse(&signed_fixture(&unrelated)).unwrap();
+    let pinned = || {
+        PairingInitiator::new(
+            &dev,
+            "Phone",
+            "mobile",
+            &code,
+            Some(host_uri.to_pinned_host()),
+            None,
+        )
+        .unwrap()
+    };
+
+    let mut agreeing = pinned();
+    agreeing
+        .set_route_binding(PairRouteBinding::new(Some(host_uri.clone()), None).unwrap())
+        .unwrap();
+    let mut setter = pinned();
+    assert_eq!(
+        setter.set_route_binding(PairRouteBinding::new(Some(other_uri.clone()), None).unwrap()),
+        Err(CoreError::InvalidPairingUri(
+            "pairing URI does not match the pinned host".into()
+        ))
+    );
+
+    for deferred in [true, false] {
+        let mut init = pinned().with_pairing_uri(&other_uri);
+        if deferred {
+            init = init.with_deferred_claim();
+        }
+        let mut resp = PairingResponder::new(&host, PairingPathKind::Remote, None).unwrap();
+        let mut roster = Roster::new();
+        let m1 = write_bytes(&init.start().unwrap());
+        let m2 = write_bytes(
+            &resp
+                .feed_bytes(&m1, NOW_UNIX, &mut mgr, &mut roster)
+                .unwrap(),
+        );
+        assert_eq!(
+            init.feed_bytes(&m2).err(),
+            Some(CoreError::HostKeyUnverified),
+            "deferred={deferred}"
+        );
+        assert!(init.route_verdict().is_none());
+    }
     assert_eq!(mgr.live_code_count(NOW_UNIX), 1);
 }
 
