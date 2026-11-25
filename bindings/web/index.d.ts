@@ -194,6 +194,7 @@ export interface PollEvent {
   code?: number;
   reason?: string;
   peer_device_id?: string;
+  upgrade?: PathUpgradeMessage;
   /** `group_manifest_unverified` and `group_rendezvous_unverified` events. */
   group_id?: string;
   /** Strict wire JSON of an unverified manifest; never trusted until the group book verifies it. */
@@ -260,6 +261,41 @@ export const MAX_QUEUED_BYTES: number;
 export const MAX_QUEUED_FRAMES: number;
 export const MAX_WT_FRAME_LEN: number;
 export const MAX_WT_QUEUED_BYTES: number;
+export const MAX_WEBRTC_FRAME_LEN: number;
+export const MAX_WEBRTC_QUEUED_BYTES: number;
+
+export function hasWebRtcSupport(): boolean;
+
+export class WebRtcStream implements TendrilStream {
+  constructor(pc: RTCPeerConnection, dc: RTCDataChannel);
+  readonly provider: "p2p";
+  readonly fastOpenSent: boolean;
+  maxFrame(): number;
+  send(bytes: Uint8Array): Promise<void>;
+  recv(timeoutMs?: number): Promise<WebStreamRecvResult>;
+  close(): Promise<void>;
+}
+
+export interface WebRtcUpgradeOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal | null;
+  iceServers?: RTCIceServer[];
+  rtcPeerConnectionImpl?: typeof RTCPeerConnection;
+}
+
+export interface WebRtcUpgradeResult {
+  upgraded: boolean;
+  reason?: string;
+  route: WebCandidate | null;
+}
+
+export interface PathUpgradeMessage {
+  type: "offer" | "answer" | "reject";
+  upgrade_id: number;
+  protocol?: string;
+  sdp?: string;
+  reason?: string;
+}
 
 export interface WtStreamOptions {
   timeoutMs?: number;
@@ -534,6 +570,10 @@ export class WasmV2SessionInitiator {
     grant_json?: string | null,
     crl_seq?: number | null
   );
+  with_upgrade_caps(caps_json: string): void;
+  negotiated_upgrade_caps_json(): string;
+  can_send_path_upgrade(): boolean;
+  send_path_upgrade(msg_json: string, now_ms: number): Uint8Array;
   start(now_unix: number): Uint8Array;
   feed_bytes(chunk: Uint8Array, now_unix: number, now_ms: number, roster: unknown): string;
   poll_write(): Uint8Array;
@@ -612,6 +652,12 @@ export interface ConnectPolicyOptions {
   replaceRoutes?: boolean;
   /** Policy for recovery routes and host route announcements; default `allSigned`. */
   routePolicy?: RoutePolicy;
+  /** Advertise `"webrtc/v1"` upgrade capability on non-direct connects; default `true`. */
+  webrtcUpgrade?: boolean;
+  /** Automatically upgrade to WebRTC when negotiated on non-direct connects; default `false`. */
+  autoUpgradeWebRtc?: boolean;
+  /** Optional ICE server list passed to `RTCPeerConnection` during upgrade; default `[]`. */
+  iceServers?: RTCIceServer[];
 }
 
 /**
@@ -768,5 +814,8 @@ export class TendrilWebSession {
   ping(cookie?: number): Promise<void>;
   tick(): Promise<void>;
   authorize(requestedCap: string): boolean;
+  negotiatedUpgradeCaps(): string[];
+  canSendPathUpgrade(): boolean;
+  upgradeToWebRtc(options?: WebRtcUpgradeOptions): Promise<WebRtcUpgradeResult>;
   close(code?: number, reason?: string): Promise<void>;
 }

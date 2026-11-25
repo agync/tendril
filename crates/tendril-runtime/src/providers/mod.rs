@@ -10,6 +10,8 @@ pub mod overlay;
 pub mod p2p;
 pub mod relay;
 pub mod relay_v2;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
 #[cfg(feature = "webtransport")]
 pub mod webtransport;
 
@@ -64,6 +66,12 @@ pub use p2p::{
 };
 pub use relay::{EmbeddedRelay, RelayClientAuth, RelayDialer, RelayListener};
 pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};
+#[cfg(feature = "webrtc")]
+pub use webrtc::{
+    MAX_WEBRTC_QUEUED_BYTES, MAX_WEBRTC_SESSIONS, WEBRTC_HANDSHAKE_TIMEOUT, WebRtcActiveDialer,
+    WebRtcReadHalf, WebRtcStream, WebRtcUpgradeEndpoint, WebRtcUpgradeHandle,
+    WebRtcUpgradeListener, WebRtcWriteHalf,
+};
 #[cfg(feature = "webtransport")]
 pub use webtransport::{WtDialer, WtListener};
 

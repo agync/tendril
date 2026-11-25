@@ -19,6 +19,7 @@ p2p-iroh-services = ["p2p-iroh", "dep:iroh-services", "dep:data-encoding"]
 # Native interface enumeration for `advertise: auto` hosts (not used on Android).
 auto-advertise = ["dep:netdev"]
 webtransport = ["dep:wtransport"]
+webrtc = ["dep:str0m", "dep:str0m-rust-crypto"]
 
 [dependencies]
 async-trait.workspace = true
@@ -31,6 +32,8 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 socket2 = "0.6"
+str0m = { workspace = true, optional = true }
+str0m-rust-crypto = { workspace = true, optional = true }
 subtle.workspace = true
 tendril-core.workspace = true
 tendril-relay.workspace = true

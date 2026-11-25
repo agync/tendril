@@ -45,21 +45,32 @@ import {
   dialWtStream,
   validateWtUrl,
 } from "./webtransport.js";
+import {
+  MAX_WEBRTC_FRAME_LEN,
+  MAX_WEBRTC_QUEUED_BYTES,
+  WebRtcStream,
+  dialWebRtcUpgrade,
+  hasWebRtcSupport,
+} from "./webrtc.js";
 
 export {
   MAX_QUEUED_BYTES,
   MAX_QUEUED_FRAMES,
   MAX_RELAY_FRAME_LEN,
+  MAX_WEBRTC_FRAME_LEN,
+  MAX_WEBRTC_QUEUED_BYTES,
   MAX_WT_FRAME_LEN,
   MAX_WT_QUEUED_BYTES,
   RelayStream,
   TendrilWebGroup,
+  WebRtcStream,
   WtStream,
   createIndexedDbVault,
   dialBrokerStream,
   dialRelayStream,
   dialRelayV2Stream,
   dialWtStream,
+  hasWebRtcSupport,
   openTendrilVault,
   validateBrokerWsUrl,
   validateRelayWsUrl,
@@ -363,6 +374,31 @@ function codedError(code, message, options) {
     err.code = code;
   }
   return err;
+}
+
+function isFatalUpgradeError(err, persistFailedErr = null) {
+  if (persistFailedErr) {
+    return true;
+  }
+  if (!err) {
+    return false;
+  }
+  if (err.name === "AbortError" || err instanceof TypeError || err instanceof RangeError) {
+    return true;
+  }
+  const code = err.code;
+  if (
+    code === "rotation_fork_detected" ||
+    code === "peer_revoked" ||
+    code === "version_downgrade" ||
+    code === "host_key_unverified" ||
+    code === "crl_revoked"
+  ) {
+    return true;
+  }
+  return /locked after roster persistence failure|failed to persist|host key could not be verified|rotation_fork_detected|peer_revoked/i.test(
+    errorText(err)
+  );
 }
 
 /** Severity by stable error code; uncoded errors rank last. */
@@ -2162,7 +2198,13 @@ export class TendrilWebClient {
       recoveryUri = null,
       replaceRoutes = false,
       routePolicy = "allSigned",
+      webrtcUpgrade = true,
+      autoUpgradeWebRtc = false,
+      iceServers = [],
     } = opts;
+    if (!Array.isArray(iceServers)) {
+      throw new TypeError("iceServers must be an array");
+    }
     const secretMaster = copySecret(relayAuthSecret);
     const tokenMaster = copySecret(p2pRelayAuthToken);
     try {
@@ -2182,6 +2224,9 @@ export class TendrilWebClient {
         relayAuthTicket,
         secretMaster,
         allowInsecureWs,
+        webrtcUpgrade: Boolean(webrtcUpgrade),
+        autoUpgradeWebRtc: Boolean(autoUpgradeWebRtc),
+        iceServers: [...iceServers],
       };
       if (endpoint || relayUrl) {
         return await this.#connectExplicit(ctx, {
@@ -2222,7 +2267,7 @@ export class TendrilWebClient {
     }
   }
 
-  #newSession(ctx, roster, routeSeq, operatorKey) {
+  #newSession(ctx, roster, routeSeq, operatorKey, upgradeCaps = null) {
     const seq = ctx.crlSeq ?? roster.crl_seq(ctx.peer);
     const session =
       ctx.wire === 2
@@ -2240,6 +2285,9 @@ export class TendrilWebClient {
       }
       if (ctx.recoveryUri || operatorKey) {
         session.with_route_expectation(ctx.peer, ctx.recoveryUri, operatorKey ?? null);
+      }
+      if (Array.isArray(upgradeCaps) && upgradeCaps.length > 0) {
+        session.with_upgrade_caps(JSON.stringify(upgradeCaps));
       }
     } catch (err) {
       session.free();
@@ -2381,7 +2429,7 @@ export class TendrilWebClient {
     }
   }
 
-  #handOff(ctx, session, stream, startedMs, initialEvents, recoveryRoutes) {
+  #handOff(ctx, session, stream, startedMs, initialEvents, recoveryRoutes, routeProvider = null) {
     let releaseSession = null;
     const webSession = new TendrilWebSession(
       SESSION_TOKEN,
@@ -2397,6 +2445,89 @@ export class TendrilWebClient {
         peerId: ctx.peer,
         routePolicy: ctx.policy,
         recoveryRoutes: recoveryRoutes ?? null,
+        routeProvider,
+        grantJson: ctx.grantJson ?? null,
+        dialUpgradeSession: async (newStream, deadlineMs, expectedPeerDeviceId) => {
+          this.#ensureOpen();
+          const upgradeCtx = {
+            ...ctx,
+            crlSeq: null,
+            recoveryUri: null,
+            grantJson: webSession._currentGrantJson(),
+            webrtcUpgrade: false,
+          };
+          const newSession = await this.#withRoster(
+            () => this.#newSession(upgradeCtx, this.#roster, null, null, null),
+            { readOnly: true }
+          );
+          let committed = false;
+          try {
+            const newStartedMs = performance.now();
+            const newInitialEvents = await this.#driveHandshake(
+              upgradeCtx,
+              newSession,
+              newStream,
+              this.#roster,
+              deadlineMs,
+              newStartedMs,
+              true,
+              null
+            );
+            await this.#withRoster(
+              async (tx) => {
+                const prev = this.#snapshotRosterBytes();
+                let checkErr = null;
+                try {
+                  this.#checkWinner(upgradeCtx, newSession, true);
+                  const newPeerDevId =
+                    typeof newSession.peer_device_id === "function"
+                      ? (newSession.peer_device_id() ?? null)
+                      : null;
+                  if (
+                    typeof expectedPeerDeviceId !== "string" ||
+                    expectedPeerDeviceId.length === 0 ||
+                    typeof newPeerDevId !== "string" ||
+                    newPeerDevId.length === 0 ||
+                    newPeerDevId !== expectedPeerDeviceId
+                  ) {
+                    throw codedError(
+                      "host_key_unverified",
+                      "upgraded WebRTC peer device identity mismatch"
+                    );
+                  }
+                } catch (err) {
+                  checkErr = err;
+                }
+                if (this.#rosterChangedSince(prev)) {
+                  try {
+                    await tx.persist({ rollback: false });
+                  } catch (persistErr) {
+                    this.#lockClient(persistErr);
+                    prev?.fill(0);
+                    throw codedError(
+                      checkErr?.code,
+                      checkErr
+                        ? `${errorText(checkErr)}; failed to persist roster update: ${errorText(persistErr)}`
+                        : `failed to persist roster update: ${errorText(persistErr)}`,
+                      { cause: persistErr }
+                    );
+                  }
+                }
+                prev?.fill(0);
+                if (checkErr) {
+                  throw checkErr;
+                }
+              },
+              { snapshot: false }
+            );
+            committed = true;
+            return { newSession, newStartedMs, newInitialEvents };
+          } finally {
+            if (!committed) {
+              newSession.free();
+            }
+          }
+        },
       },
       initialEvents,
       () => {
@@ -2428,6 +2559,22 @@ export class TendrilWebClient {
     const targetPub = operatorKey ?? recoveryRp ?? t.targetPub;
     await warmTargetTransport(endpoint, relayUrl);
     this.#ensureOpen();
+    const target = endpoint || relayUrl;
+    const isRelay = isRelayTarget(target);
+    const explicitProvider = isRelay
+      ? "relay"
+      : target?.startsWith("wt://")
+        ? "direct"
+        : target?.startsWith("iroh://")
+          ? "p2p"
+          : "broker";
+    const upgradeCaps =
+      ctx.webrtcUpgrade &&
+      hasWebRtcSupport() &&
+      explicitProvider !== "p2p" &&
+      explicitProvider !== "direct"
+        ? ["webrtc/v1"]
+        : null;
     const deadlineMs = performance.now() + ctx.timeoutMs;
     const session = await this.#withRoster(
       () =>
@@ -2435,14 +2582,14 @@ export class TendrilWebClient {
           ctx,
           this.#roster,
           this.#helloRouteSeq(peer, wire, ctx.policy),
-          operatorKey
+          operatorKey,
+          upgradeCaps
         ),
       { readOnly: true }
     );
     let stream = null;
     let handedOff = false;
     try {
-      const target = endpoint || relayUrl;
       const { relayAuthTicket: ticket, relayAuthSecret: secret } = relayCredsFor(
         target,
         target,
@@ -2524,9 +2671,29 @@ export class TendrilWebClient {
         stream,
         startedMs,
         initialEvents,
-        recoveryRoutes
+        recoveryRoutes,
+        explicitProvider
       );
       handedOff = true;
+      if (
+        ctx.autoUpgradeWebRtc &&
+        explicitProvider !== "p2p" &&
+        explicitProvider !== "direct" &&
+        webSession.canSendPathUpgrade() &&
+        webSession.negotiatedUpgradeCaps().includes("webrtc/v1")
+      ) {
+        try {
+          await webSession.upgradeToWebRtc({
+            iceServers: ctx.iceServers,
+            timeoutMs: remainingBudgetMs(deadlineMs, `${base} upgrade timed out`),
+          });
+        } catch (upgradeErr) {
+          if (isFatalUpgradeError(upgradeErr)) {
+            await webSession.close().catch(() => {});
+            throw upgradeErr;
+          }
+        }
+      }
       return webSession;
     } catch (err) {
       if (!handedOff) {
@@ -2903,7 +3070,8 @@ export class TendrilWebClient {
         winner.stream,
         winner.startedMs,
         winner.initialEvents,
-        fin.recovery
+        fin.recovery,
+        winner.cand.provider
       );
       webSession.route = {
         hint: winner.cand.hint,
@@ -2912,6 +3080,25 @@ export class TendrilWebClient {
       };
       webSession.skipped = skipped;
       webSession.failures = failures;
+      if (
+        ctx.autoUpgradeWebRtc &&
+        winner.cand.provider !== "p2p" &&
+        winner.cand.provider !== "direct" &&
+        webSession.canSendPathUpgrade() &&
+        webSession.negotiatedUpgradeCaps().includes("webrtc/v1")
+      ) {
+        try {
+          await webSession.upgradeToWebRtc({
+            iceServers: ctx.iceServers,
+            timeoutMs: ctx.timeoutMs,
+          });
+        } catch (upgradeErr) {
+          if (isFatalUpgradeError(upgradeErr)) {
+            await webSession.close().catch(() => {});
+            throw upgradeErr;
+          }
+        }
+      }
       return webSession;
     } finally {
       snap.free();
@@ -2940,7 +3127,14 @@ export class TendrilWebClient {
         throw makeAbortError(signal);
       }
       clone = WasmRoster.from_json_bytes(snapBytes.slice());
-      session = this.#newSession(ctx, clone, cands.route_seq, null);
+      const upgradeCaps =
+        ctx.webrtcUpgrade &&
+        hasWebRtcSupport() &&
+        cand.provider !== "p2p" &&
+        cand.provider !== "direct"
+          ? ["webrtc/v1"]
+          : null;
+      session = this.#newSession(ctx, clone, cands.route_seq, null, upgradeCaps);
       const isRelay = cand.provider === "relay";
       const v2Relay = isRelay && isV2RelayUrl(cand.endpoint);
       const dialClone = clone;
@@ -3166,6 +3360,13 @@ export class TendrilWebClient {
   }
 }
 
+class UpgradeDeclinedError extends Error {
+  constructor(reason) {
+    super(`webrtc upgrade declined: ${reason}`);
+    this.reason = reason;
+  }
+}
+
 export class TendrilWebSession {
   #session;
   #stream;
@@ -3178,6 +3379,9 @@ export class TendrilWebSession {
   #peerId;
   #routePolicy;
   #recoveryRoutes;
+  #routeProvider;
+  #dialUpgradeSession;
+  #grantJson;
   #lastRouteSet = null;
   #lastRouteSetMs = null;
   #onRelease;
@@ -3187,6 +3391,10 @@ export class TendrilWebSession {
   #groupHook;
   #sendChain = Promise.resolve();
   #recvChain = Promise.resolve();
+  #epoch = 0;
+  #nextUpgradeId = 0;
+  #upgradePromise = null;
+  #pendingUpgrade = null;
   #closing = false;
   #freed = false;
   #closePromise = null;
@@ -3219,6 +3427,9 @@ export class TendrilWebSession {
     this.#peerId = rosterOps.peerId;
     this.#routePolicy = rosterOps.routePolicy ?? "all_signed";
     this.#recoveryRoutes = rosterOps.recoveryRoutes ?? null;
+    this.#routeProvider = rosterOps.routeProvider ?? null;
+    this.#dialUpgradeSession = rosterOps.dialUpgradeSession ?? null;
+    this.#grantJson = rosterOps.grantJson ?? null;
     this.#onRelease = onRelease;
     this.#queue = [...initialEvents];
     this.#isV2 = Boolean(isV2);
@@ -3259,10 +3470,23 @@ export class TendrilWebSession {
     }
   }
 
+  _currentGrantJson() {
+    return this.#grantJson;
+  }
+
+  #rejectPendingUpgrade(err) {
+    if (this.#pendingUpgrade) {
+      const pu = this.#pendingUpgrade;
+      this.#pendingUpgrade = null;
+      pu.reject(err);
+    }
+  }
+
   /** Authenticated evidence could not be persisted: fail this session and lock the client. */
   #markPersistFailed(persistErr) {
     this.#persistFailedErr = persistErr;
     this.#closing = true;
+    this.#rejectPendingUpgrade(persistErr);
     this.#lockClient(persistErr);
   }
 
@@ -3466,6 +3690,305 @@ export class TendrilWebSession {
     return this.#session.authorize(requestedCap, nowUnixSecs(), this.#roster);
   }
 
+  negotiatedUpgradeCaps() {
+    if (this.#closing || this.#freed || this.#session.is_closed()) {
+      return [];
+    }
+    try {
+      const caps = JSON.parse(this.#session.negotiated_upgrade_caps_json());
+      return Array.isArray(caps) ? caps : [];
+    } catch {
+      return [];
+    }
+  }
+
+  canSendPathUpgrade() {
+    if (this.#closing || this.#freed || this.#session.is_closed()) {
+      return false;
+    }
+    if (typeof this.#session.can_send_path_upgrade === "function") {
+      return Boolean(this.#session.can_send_path_upgrade());
+    }
+    return this.negotiatedUpgradeCaps().length > 0;
+  }
+
+  upgradeToWebRtc(options = {}) {
+    if (this.#upgradePromise) {
+      return this.#upgradePromise;
+    }
+    const run = this.#upgradeToWebRtcImpl(options).finally(() => {
+      if (this.#upgradePromise === run) {
+        this.#upgradePromise = null;
+      }
+    });
+    this.#upgradePromise = run;
+    return run;
+  }
+
+  async #upgradeToWebRtcImpl(options = {}) {
+    this.#ensureOpen();
+    const {
+      timeoutMs = 15000,
+      signal = null,
+      iceServers = [],
+      rtcPeerConnectionImpl = globalThis.RTCPeerConnection,
+    } = options ?? {};
+
+    if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError("upgradeToWebRtc timeoutMs must be a positive finite number");
+    }
+    if (!Array.isArray(iceServers)) {
+      throw new TypeError("iceServers must be an array");
+    }
+    if (signal?.aborted) {
+      throw makeAbortError(signal);
+    }
+
+    const currentRoute = this.route ?? null;
+    const currentProvider = currentRoute?.provider ?? this.#routeProvider;
+    if (currentProvider === "p2p" || currentProvider === "direct") {
+      return { upgraded: false, reason: "already_direct", route: currentRoute };
+    }
+    if (!this.negotiatedUpgradeCaps().includes("webrtc/v1") || !this.canSendPathUpgrade()) {
+      return { upgraded: false, reason: "not_negotiated", route: currentRoute };
+    }
+    if (typeof rtcPeerConnectionImpl !== "function") {
+      return { upgraded: false, reason: "webrtc_unsupported", route: currentRoute };
+    }
+    if (typeof this.#dialUpgradeSession !== "function") {
+      return { upgraded: false, reason: "upgrade_unavailable", route: currentRoute };
+    }
+    if (this.#nextUpgradeId >= 4) {
+      return { upgraded: false, reason: "upgrade_limit_reached", route: currentRoute };
+    }
+
+    const deadlineMs = performance.now() + timeoutMs;
+    const remaining = () => Math.max(0, Math.ceil(deadlineMs - performance.now()));
+
+    let upgradeSettled = false;
+    let pumpLoop = null;
+    const sendOfferAndWaitAnswer = async (offerSdp, budgetMs, offerSignal = null) => {
+      let upgradeId = null;
+      let timer = null;
+      let onAbort = null;
+      let resolveAnswer;
+      let rejectAnswer;
+      const answerPromise = new Promise((resolve, reject) => {
+        resolveAnswer = resolve;
+        rejectAnswer = reject;
+      });
+      answerPromise.catch(() => {});
+      const linkSignal = offerSignal ?? signal;
+      const settle = (fn, val) => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (linkSignal && onAbort) {
+          linkSignal.removeEventListener("abort", onAbort);
+          onAbort = null;
+        }
+        if (upgradeId !== null && this.#pendingUpgrade?.upgradeId === upgradeId) {
+          this.#pendingUpgrade = null;
+        }
+        fn(val);
+      };
+      if (linkSignal) {
+        if (linkSignal.aborted) {
+          throw makeAbortError(linkSignal);
+        }
+        onAbort = () => settle(rejectAnswer, makeAbortError(linkSignal));
+        linkSignal.addEventListener("abort", onAbort, { once: true });
+      }
+      const waitMs = Math.max(1, Math.min(budgetMs, remaining() || 1));
+      timer = setTimeout(() => {
+        settle(rejectAnswer, new UpgradeDeclinedError("upgrade_timeout"));
+      }, waitMs);
+
+      try {
+        await this.#enqueueSend(async () => {
+          this.#ensureOpen();
+          if (!this.canSendPathUpgrade()) {
+            throw new UpgradeDeclinedError("not_negotiated");
+          }
+          if (this.#nextUpgradeId >= 4) {
+            throw new UpgradeDeclinedError("upgrade_limit_reached");
+          }
+          if (linkSignal?.aborted) {
+            throw makeAbortError(linkSignal);
+          }
+          const candidateId = this.#nextUpgradeId + 1;
+          const offerMsg = {
+            type: "offer",
+            upgrade_id: candidateId,
+            protocol: "webrtc/v1",
+            sdp: offerSdp,
+          };
+          const out = this.#session.send_path_upgrade(
+            JSON.stringify(offerMsg),
+            this.#elapsedMs()
+          );
+          this.#nextUpgradeId = candidateId;
+          upgradeId = candidateId;
+          this.#pendingUpgrade = {
+            upgradeId,
+            resolve: (msg) => settle(resolveAnswer, msg),
+            reject: (err) => settle(rejectAnswer, err),
+          };
+          await sendProtocolBytes(this.#stream, out);
+        });
+
+        pumpLoop = (async () => {
+          while (!upgradeSettled && !this.#closing && !this.#freed && remaining() > 0) {
+            const sliceMs = Math.max(1, Math.min(200, remaining()));
+            const run = this.#recvChain.then(
+              () =>
+                this.#pollEventImpl(sliceMs, {
+                  upgradePump: true,
+                  isSettled: () => upgradeSettled,
+                }),
+              () =>
+                this.#pollEventImpl(sliceMs, {
+                  upgradePump: true,
+                  isSettled: () => upgradeSettled,
+                })
+            );
+            this.#recvChain = run.catch(() => {});
+            const stepRes = await run.catch(() => ({ status: "eof" }));
+            if (upgradeSettled || stepRes?.status === "eof") {
+              break;
+            }
+          }
+        })().catch(() => {});
+
+        const msg = await answerPromise;
+        if (msg?.type === "answer" && typeof msg.sdp === "string" && msg.sdp.length > 0) {
+          return msg.sdp;
+        }
+        if (msg?.type === "reject") {
+          throw new UpgradeDeclinedError(msg.reason || "rejected");
+        }
+        throw new UpgradeDeclinedError("invalid_upgrade_response");
+      } finally {
+        upgradeSettled = true;
+        if (timer !== null) {
+          clearTimeout(timer);
+        }
+        if (linkSignal && onAbort) {
+          linkSignal.removeEventListener("abort", onAbort);
+        }
+        if (upgradeId !== null && this.#pendingUpgrade?.upgradeId === upgradeId) {
+          this.#pendingUpgrade = null;
+        }
+      }
+    };
+
+    let newStream = null;
+    try {
+      const dialTimeoutMs = Math.max(1, remaining());
+      newStream = await dialWebRtcUpgrade({
+        signal,
+        timeoutMs: dialTimeoutMs,
+        iceServers,
+        rtcPeerConnectionImpl,
+        sendOfferAndWaitAnswer,
+      });
+    } catch (err) {
+      if (
+        this.#persistFailedErr ||
+        this.#closing ||
+        this.#freed ||
+        signal?.aborted ||
+        isFatalUpgradeError(err, this.#persistFailedErr)
+      ) {
+        throw signal?.aborted ? makeAbortError(signal) : err;
+      }
+      const reason =
+        err instanceof UpgradeDeclinedError
+          ? err.reason
+          : err?.code || errorText(err) || "webrtc_dial_failed";
+      return { upgraded: false, reason, route: this.route ?? null };
+    }
+
+    let handoff;
+    try {
+      const handshakeBudgetMs = Math.max(1, remaining());
+      handoff = await this.#dialUpgradeSession(
+        newStream,
+        performance.now() + handshakeBudgetMs,
+        this.#peerDeviceId
+      );
+    } catch (err) {
+      try {
+        await newStream.close();
+      } catch {}
+      if (
+        this.#persistFailedErr ||
+        this.#closing ||
+        this.#freed ||
+        signal?.aborted ||
+        isFatalUpgradeError(err, this.#persistFailedErr)
+      ) {
+        throw signal?.aborted ? makeAbortError(signal) : err;
+      }
+      const reason = err?.code || errorText(err) || "webrtc_handshake_failed";
+      return { upgraded: false, reason, route: this.route ?? null };
+    }
+
+    let cutoverDone = false;
+    let oldStream = null;
+    let oldSession = null;
+    try {
+      await this.#enqueueSend(async () => {
+        this.#ensureOpen();
+        oldStream = this.#stream;
+        oldSession = this.#session;
+        const oldElapsedMs = this.#elapsedMs();
+        this.#epoch += 1;
+        this.#session = handoff.newSession;
+        this.#stream = newStream;
+        this.#startedMs = handoff.newStartedMs;
+        this.#routeProvider = "p2p";
+        const filteredEvents = (handoff.newInitialEvents ?? []).filter(
+          (ev) => ev?.event !== "established"
+        );
+        if (filteredEvents.length > 0) {
+          this.#queue.push(...filteredEvents);
+        }
+        this.route = { hint: null, endpoint: "webrtc://tendril/v1", provider: "p2p" };
+        cutoverDone = true;
+        try {
+          const closeOut = this.#isV2
+            ? oldSession.close(1000, "path_upgrade", oldElapsedMs)
+            : oldSession.send_close(1000, "path_upgrade");
+          if (closeOut && closeOut.length > 0) {
+            await sendProtocolBytes(oldStream, closeOut);
+          }
+        } catch {}
+      });
+      return { upgraded: true, route: this.route };
+    } finally {
+      if (oldStream) {
+        try {
+          await oldStream.close();
+        } catch {}
+      }
+      if (oldSession) {
+        try {
+          oldSession.free();
+        } catch {}
+      }
+      if (!cutoverDone) {
+        try {
+          handoff.newSession.free();
+        } catch {}
+        try {
+          await newStream.close();
+        } catch {}
+      }
+    }
+  }
+
   poll(timeoutMs = 5000) {
     return this.pollEvent(timeoutMs);
   }
@@ -3480,22 +4003,46 @@ export class TendrilWebSession {
     return run;
   }
 
-  async #pollEventImpl(timeoutMs) {
+  async #pollEventImpl(timeoutMs, opts = null) {
+    const upgradePump = Boolean(opts?.upgradePump);
+    const isSettled = opts?.isSettled ?? null;
     while (true) {
+      if (upgradePump && isSettled?.()) {
+        return { status: "would_block" };
+      }
       if (this.#persistFailedErr) {
         throw new Error(
           `session locked after roster persistence failure: ${this.#persistFailedErr.message || this.#persistFailedErr}`,
           { cause: this.#persistFailedErr }
         );
       }
-      if (this.#queue.length > 0) {
+      if (!upgradePump && this.#queue.length > 0) {
         const ev = this.#queue.shift();
         return { status: "event", ...ev };
       }
       if (this.#closing || this.#freed || this.#session.is_closed()) {
+        this.#rejectPendingUpgrade(new Error("session closed before upgrade response"));
         return { status: "eof" };
       }
-      const frame = await this.#stream.recv(timeoutMs);
+      const pollEpoch = this.#epoch;
+      let frame;
+      try {
+        frame = await this.#stream.recv(timeoutMs);
+      } catch (recvErr) {
+        if (!upgradePump && this.#upgradePromise) {
+          try {
+            await this.#upgradePromise;
+          } catch {}
+        }
+        if (this.#epoch !== pollEpoch) {
+          if (upgradePump) {
+            return { status: "would_block" };
+          }
+          continue;
+        }
+        this.#rejectPendingUpgrade(recvErr);
+        throw recvErr;
+      }
       if (this.#persistFailedErr) {
         throw new Error(
           `session locked after roster persistence failure: ${this.#persistFailedErr.message || this.#persistFailedErr}`,
@@ -3503,12 +4050,28 @@ export class TendrilWebSession {
         );
       }
       if (this.#closing || this.#freed) {
+        this.#rejectPendingUpgrade(new Error("session closed before upgrade response"));
         return { status: "eof" };
+      }
+      if (this.#epoch !== pollEpoch) {
+        if (upgradePump) {
+          return { status: "would_block" };
+        }
+        continue;
       }
       if (frame.status === "would_block") {
         return { status: "would_block" };
       }
       if (frame.status === "eof") {
+        if (!upgradePump && this.#upgradePromise) {
+          try {
+            await this.#upgradePromise;
+          } catch {}
+          if (!this.#closing && !this.#freed && this.#epoch !== pollEpoch) {
+            continue;
+          }
+        }
+        this.#rejectPendingUpgrade(new Error("stream reached EOF before upgrade response"));
         return { status: "eof" };
       }
       const outcome = await this.#enqueueSend(async () => {
@@ -3520,6 +4083,9 @@ export class TendrilWebSession {
         }
         if (this.#closing || this.#freed) {
           return { eof: true };
+        }
+        if (this.#epoch !== pollEpoch) {
+          return { epochChanged: true };
         }
         const step = await this.#rosterSection(async (tx) => {
           let res;
@@ -3571,15 +4137,58 @@ export class TendrilWebSession {
         if (step.out && step.out.length > 0) {
           await sendProtocolBytes(this.#stream, step.out);
         }
-        if (step.events.length > 0) {
-          await this.#applyGroupEvents(step.events);
-          this.#queue.push(...step.events);
+        const keptEvents = [];
+        let matchedUpgradeMsg = null;
+        for (const ev of step.events) {
+          if (ev.event === "grant_updated" && ev.grant) {
+            try {
+              this.#grantJson = JSON.stringify(ev.grant);
+            } catch {}
+          }
+          const upgradePayload = ev.upgrade ?? ev.msg;
+          if (
+            ev.event === "path_upgrade" &&
+            this.#pendingUpgrade &&
+            upgradePayload &&
+            upgradePayload.upgrade_id === this.#pendingUpgrade.upgradeId
+          ) {
+            matchedUpgradeMsg = upgradePayload;
+            continue;
+          }
+          keptEvents.push(ev);
+        }
+        if (matchedUpgradeMsg && this.#pendingUpgrade) {
+          const pu = this.#pendingUpgrade;
+          this.#pendingUpgrade = null;
+          pu.resolve(matchedUpgradeMsg);
+        }
+        if (keptEvents.length > 0) {
+          await this.#applyGroupEvents(keptEvents);
+          this.#queue.push(...keptEvents);
         }
         await this.#ingestRouteSets(step.routeSets);
         return { eof: Boolean(step.closed && this.#queue.length === 0) };
       });
+      if (outcome.epochChanged) {
+        if (upgradePump) {
+          return { status: "would_block" };
+        }
+        continue;
+      }
       if (outcome.eof) {
+        if (!upgradePump && this.#upgradePromise) {
+          try {
+            await this.#upgradePromise;
+          } catch {}
+          if (!this.#closing && !this.#freed && this.#epoch !== pollEpoch) {
+            continue;
+          }
+        }
+        this.#rejectPendingUpgrade(new Error("session closed before upgrade response"));
         return { status: "eof" };
+      }
+      if (upgradePump) {
+        return { status: "would_block" };
       }
     }
   }
@@ -3589,6 +4198,7 @@ export class TendrilWebSession {
       return this.#closePromise;
     }
     this.#closing = true;
+    this.#rejectPendingUpgrade(new Error("session closed before upgrade response"));
     this.#closePromise = (async () => {
       try {
         await this.#enqueueSend(async () => {

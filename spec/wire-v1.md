@@ -65,7 +65,8 @@ HostHello = {
   "host_id": string,                // stable host identifier
   "proto_version": 1,               // must equal 1
   "signing_pub": string,            // b64url 1984-byte hybrid Ed25519 || ML-DSA-65 public key
-  "rotation"?: [RotationRecord]     // present only when extending a pinned key
+  "rotation"?: [RotationRecord],    // present only when extending a pinned key
+  "upgrade"?: [string]              // responder's enabled upgrade capabilities (1..=4 items, each 1..=32 bytes matching [a-z0-9._/-]); omitted when empty and during pairing
 }
 
 // msg3 payload, intent = session (initiator -> responder)
@@ -74,7 +75,8 @@ SessionHello = {
   "grant"?: Grant,                  // optional grant presented at connect
   "crl_seq"?: uint64,               // highest CRL sequence already cached by initiator
   "groups"?: [{ "group_id": string, "seq": uint64 }],  // group gossip summary (groups-v1 Section 9), 1..=16 entries, omitted when empty
-  "route_seq"?: uint64              // 0..=2^53-1; opt-in to 0x0C ROUTE_SET announcements (Section 5.2), omitted otherwise
+  "route_seq"?: uint64,             // 0..=2^53-1; opt-in to 0x0C ROUTE_SET announcements (Section 5.2), omitted otherwise
+  "upgrade"?: [string]              // negotiated upgrade capabilities (local ∩ HostHello.upgrade, 1..=4 items); omitted when empty
 }
 
 // msg3 payload, intent = pair (initiator -> responder)
@@ -114,7 +116,7 @@ For human pairing, confirming the peer (`pair.confirm`) and minting capabilities
 
 **Initiator at `msg2` (before writing `msg3`):**
 
-1. Decrypt `msg2` and decode `HostHello`; verify `proto_version == 1` and decode `HostHello.signing_pub` as a valid `1984`-byte hybrid signing key (`current_signing`).
+1. Decrypt `msg2` and decode `HostHello`; verify `proto_version == 1` and decode `HostHello.signing_pub` as a valid `1984`-byte hybrid signing key (`current_signing`). If `intent == 0x02` (`pair`), `HostHello.upgrade` MUST be empty or omitted. For `intent = session`, validate `HostHello.upgrade` and compute `local ∩ HostHello.upgrade` to send in `SessionHello.upgrade` (omitting `upgrade` when empty).
 2. For `intent = session`: verify responder static `s` (`current_static`) and `current_signing` against the stored pin `(pinned_signing, pinned_static, pinned_seq)` (where `pinned_signing` may be a full `1984`-byte key or a `32`-byte `SHA-256` hash pin): either `current_static == pinned_static` AND `pinned_signing` matches `current_signing`, OR `HostHello.rotation` is a valid, contiguous `RotationRecord` chain linking `(pinned_signing, pinned_static)` at `pinned_seq` to `(current_signing, current_static)` (where `current_static == rotation.last().new_static_pub` and `current_signing == rotation.last().new_signing_pub`). If neither holds, MUST abort immediately (`HostKeyUnverified`) before sending `msg3` so the initiator's static key is never disclosed to an unverified peer.
 3. For `intent = pair`: if a pinned host key was supplied out of band (for example via QR URI `sh=` hash pin or mandatory M2M enrollment configuration), apply the same check as step 2 before sending `msg3` (and persist the newly resolved full `1984`-byte `current_signing` key when verified from a hash pin). M2M enrollment MUST NOT use unpinned TOFU. On manual human pairing with no pin, proceed using the post-`msg2` handshake hash `h` to bind `code_mac` and verify the transcript SAS.
 4. When the pin comes from a pairing URI that carries `rp`, `rq` or `rs`, or the connect supplies an operator relay key (`URL#key`), run the relay key check (`spec/pairing-v1.md` Section 6.4) against the authenticated `HostHello.signing_pub` and then the route statement check (Section 6.5), in that order and after step 3, before sending `msg3`. For `intent = session` with a recovery URI or an operator relay key, run the session variant of those checks (`spec/pairing-v1.md` Section 6.5): the relay key check applies to the operator `URL#key` even when no URI is supplied, and runs after the rotation chain verifies and before applying the rotation or sending `msg3`. A failure aborts without writing `msg3`.
@@ -123,7 +125,7 @@ For human pairing, confirming the peer (`pair.confirm`) and minting capabilities
 
 1. Validate the 6-byte preamble; drop and rate-limit on any invalid field.
 2. Execute Noise `msg1`..`msg3`. Any AEAD failure drops the connection before interpreting payload fields.
-3. For `intent = session`: verify the peer static key `s` from `msg3` belongs to an `active` roster entry and `SessionHello.device_id` equals the derived `device_id` of `s`. Reject `pending` or `revoked` peers.
+3. For `intent = session`: verify the peer static key `s` from `msg3` belongs to an `active` roster entry and `SessionHello.device_id` equals the derived `device_id` of `s`. Reject `pending` or `revoked` peers. Reject `SessionHello.upgrade` if it contains any capability not advertised in `HostHello.upgrade`.
 4. For `intent = pair`: enforce mutual exclusion between `code_mac` and `enrollment_token`. For human claims, verify `PairClaim.code_mac` per `pairing-v1.md`, then verify the signing key claim (`signing_pub`, `enroll_proof`) per `pairing-v1.md` Section 4.1 when present, and record the peer per the Section 4.1 recording rules (a new entry, or an `active` entry the claim adds a key to, becomes `pending`; any other accepted claim keeps the entry's state). A Wire v1 responder built before that section rejects a keyed human claim as `protocol_error`; initiators MUST NOT retry without the proof (pre-1.0 break). For M2M claims (only when M2M enrollment is enabled by responder policy), verify the trust-anchored enrollment token, CRL, single-use nonce burn, and channel-bound `enroll_proof` per `pairing-v1.md` Section 7, burn the nonce atomically, and register the peer as `active` with zero application grants. Send `PairResponse` and close.
 
 ---
@@ -189,6 +191,7 @@ Receivers MUST close the session immediately on a 0-byte transport plaintext or 
 | `0x0A` | `GROUP_MANIFEST` | Compact UTF-8 JSON `GroupManifest`, `<= 32768 B` | Pushes or gossips a signed group manifest (`spec/groups-v1.md`); surfaced to the caller, never auto-ingested |
 | `0x0B` | `GROUP_RENDEZVOUS` | `20 B` ASCII `group_id` `\|\|` `8 B` big-endian `u64` `seq` `\|\|` `32 B` key, exactly `60 B` | Delivers a group rendezvous key from an admin to a member (`spec/groups-v1.md` Section 7) |
 | `0x0C` | `ROUTE_SET` | `route_set_body \|\| sig`, `3455..=5003 B` (Section 5.2) | Host-signed route announcement, responder to initiator only (`spec/pairing-v1.md` Section 6.11) |
+| `0x0D` | `PATH_UPGRADE` | Compact UTF-8 JSON `PathUpgradeMsg`, `<= 16384 B` (Section 5.3) | In-band authenticated upgrade signaling (e.g. WebRTC SDP offer/answer/reject) |
 
 ### 5.1 Noise Rekey Mechanics
 
@@ -252,3 +255,13 @@ Semantic rejections (rate-limit drops, bad signature, key mismatch, stale sequen
 - Hosts built before this frame reject `SessionHello.route_seq` as an unknown field (`deny_unknown_fields`). A client sends it only to a host that already signed a route set, which only new hosts do, so the only break is a host downgraded after signing; this is accepted before 1.0, as for `SessionHello.groups`.
 - Clients built before this frame never send `route_seq`, so a conforming host never sends them `0x0C` and their close-on-unknown-frame rule is never triggered.
 - A new client that receives `0x0C` without having sent `route_seq` drops it at step 3 without closing and without parsing, well-formed or malformed.
+
+### 5.3 In-Band Direct Path Upgrade (`0x0D PATH_UPGRADE`)
+
+An initiator and responder connected over a non-direct path (such as a relay) may negotiate in-band direct upgrade signaling inside the authenticated Noise session (`UPGRADE_CAP_WEBRTC_V1 = "webrtc/v1"`):
+
+1. **Negotiation (`HostHello.upgrade` / `SessionHello.upgrade`):** The responder advertises its enabled upgrade capabilities (up to `MAX_UPGRADE_CAPS = 4` distinct ASCII strings, each `1..=32` bytes matching `[a-z0-9._/-]`) in `HostHello.upgrade`, omitting the field when empty (`intent = pair` MUST keep `HostHello.upgrade` empty/omitted). The initiator computes `local ∩ HostHello.upgrade` and sends the negotiated subset in `SessionHello.upgrade` (omitted when empty), and the responder MUST fail closed if `SessionHello.upgrade` contains any capability not offered in `HostHello.upgrade`. An explicit `"upgrade": []` JSON array is invalid and rejected by decoders (`upgrade` MUST be omitted when empty).
+2. **Framing and Limits:** `0x0D PATH_UPGRADE` carries a compact UTF-8 JSON `PathUpgradeMsg` (`type: "offer" | "answer" | "reject"`, `upgrade_id` in `1..=2^53-1`, `protocol` matching `[a-z0-9._/-]`, `sdp` `1..=MAX_PATH_UPGRADE_SDP_LEN` (`15360` bytes, no NUL bytes), or `reason` `1..=256` bytes without ASCII control characters) whose serialized JSON size is `1..=MAX_PATH_UPGRADE_LEN` (`16384` bytes).
+3. **Direction, Correlation, and Rate Limits:** `Offer` is initiator -> responder only; `Answer` and `Reject` are responder -> initiator only. An initiator MAY send at most `MAX_PATH_UPGRADE_OFFERS_PER_SESSION = 4` offers per session; peers correlate pending `(upgrade_id, protocol)` pairs (`Answer.protocol` MUST match the pending offer's `protocol`) and fail closed (`InvalidInnerFramePayload` or `ProtocolViolation`) on wrong-direction frames, unnegotiated or mismatched protocols, stale/unsolicited `upgrade_id` replies, or excess offers.
+4. **Cutover Security:** For `"webrtc/v1"`, the initiator opens an ordered binary DataChannel named `"tendril/v1"` (`WEBRTC_DATACHANNEL_LABEL`), then runs a fresh `Noise_XXhfs` session handshake against the same pinned peer identity over that DataChannel before cutting over traffic. ICE and DTLS alone never replace Tendril's end-to-end Noise identity and AEAD confidentiality.
+5. **Compatibility:** Because `HostHello` enforces `deny_unknown_fields`, enabling responder `upgrade` advertisement is opt-in and requires clients that recognize `HostHello.upgrade`. Conversely, upgrade-capable initiators remain backward-compatible with older hosts that omit `HostHello.upgrade`, because `SessionHello.upgrade` carries only the intersection and omits the field when empty.

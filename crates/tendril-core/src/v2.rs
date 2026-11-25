@@ -51,9 +51,10 @@ use crate::session::{
 };
 use crate::wire::{
     AEAD_TAG_LEN, FLAG_PAKE_PAIR, HostHello, InnerFrameType, Intent, MAX_FRAME_LEN,
-    MAX_TRANSPORT_PLAINTEXT, PREAMBLE_FLAG_NONE, PREAMBLE_LEN, PairClaim, PairResponse, Preamble,
-    ResumableFrameReader, SessionHello, WIRE_VERSION, WIRE_VERSION_V2, decode_inner_frame,
-    encode_frame, encode_inner_frame, validate_inner_payload,
+    MAX_TRANSPORT_PLAINTEXT, PREAMBLE_FLAG_NONE, PREAMBLE_LEN, PairClaim, PairResponse,
+    PathUpgradeMsg, PathUpgradeState, Preamble, ResumableFrameReader, SessionHello, WIRE_VERSION,
+    WIRE_VERSION_V2, decode_inner_frame, encode_frame, encode_inner_frame, validate_inner_payload,
+    validate_upgrade_caps,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -1063,7 +1064,10 @@ impl fmt::Debug for V2InnerFrame {
 const fn is_padded_only_frame(kind: InnerFrameType) -> bool {
     matches!(
         kind,
-        InnerFrameType::GroupManifest | InnerFrameType::GroupRendezvous | InnerFrameType::RouteSet
+        InnerFrameType::GroupManifest
+            | InnerFrameType::GroupRendezvous
+            | InnerFrameType::RouteSet
+            | InnerFrameType::PathUpgrade
     )
 }
 
@@ -1492,11 +1496,11 @@ impl SealedSession {
         })
     }
 
-    /// Seals one inner frame (`0x01..=0x03`, `0x05..=0x07`, or `0x0A..=0x0C` when padding is
+    /// Seals one inner frame (`0x01..=0x03`, `0x05..=0x07`, or `0x0A..=0x0D` when padding is
     /// enabled), applying `PaddingPolicy` when enabled.
     ///
     /// Rejects `Rekey`, `Padding`, and `Padded` (use [`Self::seal_rekey`] and
-    /// [`Self::seal_dummy_cover`]), the padded-only `0x0A..=0x0C` without padding, and a frame no
+    /// [`Self::seal_dummy_cover`]), the padded-only `0x0A..=0x0D` without padding, and a frame no
     /// bucket fits (`FrameTooLarge`); every failure leaves TX nonce and frame counters unchanged.
     pub fn seal(
         &mut self,
@@ -1946,6 +1950,8 @@ pub enum V2SessionAction {
     GroupManifestReceived(Box<GroupManifest>),
     /// Received `0x0B` rendezvous frame, not yet authorized or ingested.
     GroupRendezvousReceived(GroupRendezvousFrame),
+    /// Received `0x0D PATH_UPGRADE` signaling frame after directional and capability checks.
+    PathUpgradeReceived(PathUpgradeMsg),
     Rekeyed {
         direction: RekeyDirection,
     },
@@ -1990,6 +1996,9 @@ pub struct V2SessionInitiator {
     presented_rotation: Vec<RotationRecord>,
     verified_recovery: Option<VerifiedRouteStatement>,
     route_sets: Vec<RouteSet>,
+    local_upgrade_caps: Vec<String>,
+    peer_upgrade_caps: Vec<String>,
+    upgrade_state: PathUpgradeState,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_rendezvous_nonce: Option<[u8; 16]>,
 }
@@ -2040,6 +2049,9 @@ impl V2SessionInitiator {
             presented_rotation: Vec::new(),
             verified_recovery: None,
             route_sets: Vec::new(),
+            local_upgrade_caps: Vec::new(),
+            peer_upgrade_caps: Vec::new(),
+            upgrade_state: PathUpgradeState::new(true),
             #[cfg(any(test, feature = "test-utils"))]
             fixed_rendezvous_nonce: None,
         })
@@ -2127,6 +2139,41 @@ impl V2SessionInitiator {
     /// Drains the decoded, not yet verified `0x0C` route sets received so far.
     pub fn take_route_sets(&mut self) -> Vec<RouteSet> {
         std::mem::take(&mut self.route_sets)
+    }
+
+    /// Configures advertised upgrade capabilities before [`Self::start`].
+    pub fn with_upgrade_caps(mut self, caps: Vec<String>) -> Result<Self, CoreError> {
+        self.require_unstarted()?;
+        validate_upgrade_caps(&caps)?;
+        self.local_upgrade_caps = caps;
+        Ok(self)
+    }
+
+    /// Returns the negotiated path upgrade capabilities for this session.
+    #[must_use]
+    pub fn negotiated_upgrade_caps(&self) -> &[String] {
+        self.upgrade_state.negotiated_caps()
+    }
+
+    /// Returns the raw upgrade capabilities advertised by the host in `HostHello`.
+    #[must_use]
+    pub fn peer_upgrade_caps(&self) -> &[String] {
+        &self.peer_upgrade_caps
+    }
+
+    /// Seals an encrypted `0x0D PATH_UPGRADE` offer inside `0x09 PADDED`.
+    pub fn send_path_upgrade(
+        &mut self,
+        msg: &PathUpgradeMsg,
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        let payload = self.upgrade_state.prepare_send(msg)?;
+        let actions = seal_transport_action(sealed, InnerFrameType::PathUpgrade, &payload, now_ms)?;
+        self.upgrade_state.commit_send(msg);
+        Ok(actions)
     }
 
     /// Returns true once the v2 handshake has completed and entered [`SealedSession`] transport mode.
@@ -2299,13 +2346,24 @@ impl V2SessionInitiator {
                 // the receive gate reads the same stored value.
                 if !self.padding.is_enabled() {
                     self.local_route_seq = None;
+                    self.local_upgrade_caps.clear();
                 }
+                let negotiated_upgrade: Vec<String> = self
+                    .local_upgrade_caps
+                    .iter()
+                    .filter(|c| host_hello.upgrade.contains(c))
+                    .cloned()
+                    .collect();
+                self.peer_upgrade_caps = host_hello.upgrade;
+                self.upgrade_state
+                    .set_negotiated(negotiated_upgrade.clone());
                 let hello = SessionHello {
                     device_id: self.local_device_id.clone(),
                     grant: self.initial_grant.clone(),
                     crl_seq: self.initial_crl_seq,
                     groups: self.initial_groups.clone(),
                     route_seq: self.local_route_seq,
+                    upgrade: negotiated_upgrade,
                 };
                 let hello_bytes = Zeroizing::new(
                     serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -2439,6 +2497,10 @@ impl V2SessionInitiator {
                         &payload,
                         &mut self.route_sets,
                     )?,
+                    InnerFrameType::PathUpgrade => {
+                        let msg = self.upgrade_state.receive(&payload)?;
+                        actions.push(V2SessionAction::PathUpgradeReceived(msg));
+                    }
                     InnerFrameType::Padding | InnerFrameType::Padded => {
                         return Err(CoreError::UnknownInnerFrameType(kind as u8));
                     }
@@ -2746,6 +2808,9 @@ pub struct V2SessionResponder {
     active_grant: Option<Grant>,
     exported_secrets: Option<V2PeerSecrets>,
     matched_rendezvous_secret: Option<Zeroizing<[u8; 32]>>,
+    local_upgrade_caps: Vec<String>,
+    peer_upgrade_caps: Vec<String>,
+    upgrade_state: PathUpgradeState,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_ephemeral: Option<[u8; 32]>,
 }
@@ -2782,6 +2847,9 @@ impl V2SessionResponder {
             active_grant: None,
             exported_secrets: None,
             matched_rendezvous_secret: None,
+            local_upgrade_caps: Vec::new(),
+            peer_upgrade_caps: Vec::new(),
+            upgrade_state: PathUpgradeState::new(false),
             #[cfg(any(test, feature = "test-utils"))]
             fixed_ephemeral: None,
         })
@@ -2847,6 +2915,53 @@ impl V2SessionResponder {
         self.peer_route_seq
     }
 
+    /// Configures advertised upgrade capabilities before handshake begins.
+    pub fn with_upgrade_caps(mut self, caps: Vec<String>) -> Result<Self, CoreError> {
+        if !matches!(self.phase, V2RespPhase::AwaitPreamble) {
+            return Err(CoreError::NotReady(
+                "upgrade capabilities must be set before handshake starts",
+            ));
+        }
+        validate_upgrade_caps(&caps)?;
+        self.local_upgrade_caps = caps;
+        Ok(self)
+    }
+
+    fn effective_local_upgrade_caps(&self) -> &[String] {
+        if self.padding.is_enabled() {
+            &self.local_upgrade_caps
+        } else {
+            &[]
+        }
+    }
+
+    /// Returns the negotiated path upgrade capabilities for this session.
+    #[must_use]
+    pub fn negotiated_upgrade_caps(&self) -> &[String] {
+        self.upgrade_state.negotiated_caps()
+    }
+
+    /// Returns the raw upgrade capabilities sent by the initiator in `SessionHello`.
+    #[must_use]
+    pub fn peer_upgrade_caps(&self) -> &[String] {
+        &self.peer_upgrade_caps
+    }
+
+    /// Seals an encrypted `0x0D PATH_UPGRADE` answer or reject inside `0x09 PADDED`.
+    pub fn send_path_upgrade(
+        &mut self,
+        msg: &PathUpgradeMsg,
+        now_ms: u64,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        let V2RespPhase::Transport(ref mut sealed) = self.phase else {
+            return Err(CoreError::NotReady("v2 session not established"));
+        };
+        let payload = self.upgrade_state.prepare_send(msg)?;
+        let actions = seal_transport_action(sealed, InnerFrameType::PathUpgrade, &payload, now_ms)?;
+        self.upgrade_state.commit_send(msg);
+        Ok(actions)
+    }
+
     /// Seals a `0x0C ROUTE_SET` payload inside `0x09 PADDED` for an initiator that sent
     /// `SessionHello.route_seq`. The payload must decode as a [`RouteSet`].
     ///
@@ -2883,6 +2998,7 @@ impl V2SessionResponder {
             proto_version: WIRE_VERSION_V2,
             signing_pub: self.local_signing_pub.to_b64url(),
             rotation: self.local_rotation_chain.clone(),
+            upgrade: self.effective_local_upgrade_caps().to_vec(),
         };
         Ok(Zeroizing::new(
             serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -3108,6 +3224,12 @@ impl V2SessionResponder {
                         "SessionHello device_id does not match static key",
                     ));
                 }
+                let effective_caps = self.effective_local_upgrade_caps();
+                if hello.upgrade.iter().any(|c| !effective_caps.contains(c)) {
+                    return Err(CoreError::ProtocolViolation(
+                        "unoffered upgrade capability in session hello",
+                    ));
+                }
 
                 let peer_entry = roster.lookup_active_by_static(&peer_static)?;
                 check_wire_version(peer_entry.min_wire_version, WIRE_VERSION_V2)?;
@@ -3150,6 +3272,8 @@ impl V2SessionResponder {
                 self.peer_crl_seq = hello.crl_seq;
                 self.peer_groups = hello.groups;
                 self.peer_route_seq = hello.route_seq;
+                self.peer_upgrade_caps = hello.upgrade.clone();
+                self.upgrade_state.set_negotiated(hello.upgrade);
                 self.peer_device_id = Some(canonical_peer_id.clone());
                 self.peer_static_pub = Some(peer_static);
                 self.phase = V2RespPhase::Transport(Box::new(sealed));
@@ -3265,6 +3389,10 @@ impl V2SessionResponder {
                         return Err(CoreError::InvalidInnerFramePayload(
                             "route set from initiator",
                         ));
+                    }
+                    InnerFrameType::PathUpgrade => {
+                        let msg = self.upgrade_state.receive(&payload)?;
+                        actions.push(V2SessionAction::PathUpgradeReceived(msg));
                     }
                     InnerFrameType::Padding | InnerFrameType::Padded => {
                         return Err(CoreError::UnknownInnerFrameType(kind as u8));
@@ -4366,6 +4494,11 @@ impl V2PakePairInitiator {
                 if host_hello.host_id.is_empty() || has_control_chars(&host_hello.host_id) {
                     return Err(CoreError::ProtocolViolation("invalid host_id in HostHello"));
                 }
+                if !host_hello.upgrade.is_empty() {
+                    return Err(CoreError::ProtocolViolation(
+                        "upgrade capabilities not allowed in pairing",
+                    ));
+                }
                 let host_signing_pub = HybridSigningPublicKey::from_b64url(&host_hello.signing_pub)
                     .map_err(|_| {
                         CoreError::ProtocolViolation("invalid signing_pub in HostHello")
@@ -4663,6 +4796,7 @@ impl V2PakePairResponder {
                 proto_version: WIRE_VERSION_V2,
                 signing_pub: identity.signing_key().public_key().to_b64url(),
                 rotation: identity.rotation_chain().to_vec(),
+                upgrade: Vec::new(),
             },
             host_signing_pub: identity.signing_key().public_key().clone(),
             path,

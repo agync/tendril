@@ -277,6 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         crl_seq: None,
         groups: None,
         route_seq: Some(42),
+        upgrade: Vec::new(),
     };
 
     let doc = json!({

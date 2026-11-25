@@ -23,6 +23,9 @@ pub enum RuntimeError {
     #[error("pre-authentication rate limit exceeded: {0}")]
     RateLimited(&'static str),
 
+    #[error("capacity exceeded: {0}")]
+    CapacityExceeded(&'static str),
+
     #[error("transport stream closed")]
     Closed,
 

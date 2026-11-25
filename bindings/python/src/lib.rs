@@ -3408,6 +3408,11 @@ impl Session {
                             | SessionEvent::GroupRendezvousReceived(_)) => {
                                 group_frame_json(store.as_ref(), &identity, &sess, ev).await?
                             }
+                            SessionEvent::PathUpgrade(msg) => serde_json::json!({
+                                "status": "event",
+                                "event": "path_upgrade",
+                                "upgrade": msg,
+                            }),
                             SessionEvent::Closed { code, reason } => serde_json::json!({
                                 "status": "event",
                                 "event": "closed",

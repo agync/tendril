@@ -1039,6 +1039,241 @@ async function main() {
         fs.rmSync(p2pHostDir, { recursive: true, force: true });
       }
     }
+
+    // 5. Live Headless Chrome <-> str0m in-band WebRTC DataChannel upgrade & cutover E2E test.
+    const webrtcRelay = await spawnRelay();
+    const webrtcPeer = spawnPeer();
+    try {
+      const wInit = await webrtcPeer.call({ op: "init", host_id: "web-webrtc-e2e-host" });
+      const srRes = await webrtcPeer.call({
+        op: "serve_relay",
+        relay_url: webrtcRelay.wsUrl,
+        expected_host: "127.0.0.1",
+        webrtc_upgrade_bind: "127.0.0.1:0",
+      });
+      assert.ok(srRes.webrtc_upgrade_addr, "serve_relay must return webrtc_upgrade_addr");
+
+      const wPairCode = (await webrtcPeer.call({ op: "issue_code", kind: "remote" })).code;
+      const wPairPromise = webrtcPeer.call({ op: "pair" });
+      const browserPair = await cdp.evalAsync(`
+        window.__webrtcClient = await window.__e2eSdk.TendrilWebClient.create({ hostId: 'chrome-webrtc-client' });
+        return await window.__webrtcClient.pair({
+          relayUrl: ${JSON.stringify(webrtcRelay.wsUrl)},
+          targetPub: ${JSON.stringify(wInit.relay_pub)},
+          expectedHost: '127.0.0.1',
+          code: ${JSON.stringify(wPairCode)},
+          deviceName: 'chrome-webrtc',
+          deviceKind: 'web',
+          allowInsecureWs: true,
+        });
+      `);
+      const peerPair = await wPairPromise;
+      assert.equal(browserPair.sas, peerPair.sas);
+      await webrtcPeer.call({ op: "confirm", peer_id: peerPair.device_id, sas: peerPair.sas });
+      await cdp.evalAsync(`
+        await window.__webrtcClient.confirmPeer('web-webrtc-e2e-host', ${JSON.stringify(browserPair.sas)});
+      `);
+      const wGrant = (
+        await webrtcPeer.call({ op: "mint", peer_id: peerPair.device_id, caps: ["fs.read"] })
+      ).grant;
+
+      webrtcPeer.send({ op: "connect" });
+      const preUpgradeState = await cdp.evalAsync(`
+        window.__webrtcSession = await window.__webrtcClient.connect({
+          targetHostId: 'web-webrtc-e2e-host',
+          grantJson: ${JSON.stringify(JSON.stringify(wGrant))},
+          allowInsecureWs: true,
+        });
+        return {
+          route: window.__webrtcSession.route,
+          caps: window.__webrtcSession.negotiatedUpgradeCaps(),
+        };
+      `);
+      const connRes = await webrtcPeer.recv();
+      assert.equal(connRes.ok, true);
+      assert.equal(preUpgradeState.route?.provider, "relay");
+      assert.ok(
+        preUpgradeState.caps.includes("webrtc/v1"),
+        `expected webrtc/v1 capability, got ${JSON.stringify(preUpgradeState.caps)}`
+      );
+
+      // Trigger concurrent pollEvent on the old WS relay stream, upgrade in-band to WebRTC DataChannel,
+      // then kill the WS relay to prove encrypted traffic continues strictly over WebRTC UDP/SCTP.
+      webrtcPeer.send({ op: "accept_upgraded_session", timeout_ms: 15000 });
+      const upgradeRes = await cdp.evalAsync(`
+        window.__webrtcPendingPoll = window.__webrtcSession.pollEvent(15000);
+        const res = await window.__webrtcSession.upgradeToWebRtc({ timeoutMs: 15000 });
+        return {
+          res,
+          route: window.__webrtcSession.route,
+          allowRead: window.__webrtcSession.authorize('fs.read'),
+          denyExec: window.__webrtcSession.authorize('shell.exec'),
+        };
+      `);
+      const acceptRes = await webrtcPeer.recv(15000);
+      assert.equal(
+        upgradeRes.res.upgraded,
+        true,
+        `Chrome upgradeToWebRtc failed: ${JSON.stringify(upgradeRes)} (peer: ${JSON.stringify(acceptRes)})`
+      );
+      assert.equal(acceptRes.ok, true, `accept_upgraded_session failed: ${acceptRes.error}`);
+      assert.deepEqual(upgradeRes.route, {
+        hint: null,
+        endpoint: "webrtc://tendril/v1",
+        provider: "p2p",
+      });
+      assert.equal(upgradeRes.allowRead, true);
+      assert.equal(upgradeRes.denyExec, false);
+
+      // Sever the relay server completely so only direct Chrome <-> str0m WebRTC remains.
+      webrtcRelay.child.kill();
+
+      await webrtcPeer.call({ op: "send", data_utf8: "webrtc-host-to-chrome" });
+      const concurrentPollGot = await cdp.evalAsync(`
+        const ev = await window.__webrtcPendingPoll;
+        if (ev.status !== 'event' || ev.event !== 'data') {
+          throw new Error('concurrent pollEvent across cutover unexpected: ' + JSON.stringify(ev));
+        }
+        return new TextDecoder().decode(window.__e2eSdk.b64urlDecode(ev.data_b64));
+      `);
+      assert.equal(concurrentPollGot, "webrtc-host-to-chrome");
+
+      await cdp.evalAsync(`
+        await window.__webrtcSession.sendData('webrtc-chrome-to-host');
+        await window.__webrtcSession.rekey();
+        await window.__webrtcSession.ping(77);
+      `);
+      const evData = await webrtcPeer.call({ op: "recv", timeout_ms: 3000 });
+      assert.equal(evData.data_utf8, "webrtc-chrome-to-host");
+      const evRekey = await webrtcPeer.call({ op: "recv", timeout_ms: 3000 });
+      assert.equal(evRekey.event, "rekeyed");
+
+      const pongCheck = await cdp.evalAsync(`
+        const ev = await window.__webrtcSession.pollEvent(3000);
+        return ev;
+      `);
+      assert.equal(pongCheck.event, "pong");
+      assert.equal(pongCheck.cookie, 77);
+
+      await cdp.evalAsync(`
+        await window.__webrtcSession.close(1000, 'webrtc-done');
+        window.__webrtcClient.free();
+      `);
+      const evClosed = await webrtcPeer.call({ op: "recv", timeout_ms: 3000 });
+      assert.equal(evClosed.event, "closed");
+    } finally {
+      webrtcPeer.close();
+      webrtcRelay.child.kill();
+    }
+
+    // 6. Live Headless Chrome <-> str0m Wire v2 autoUpgradeWebRtc E2E test.
+    const webrtcV2Relay = await spawnRelay();
+    const webrtcV2Peer = spawnPeer();
+    try {
+      const w2Init = await webrtcV2Peer.call({ op: "init", host_id: "web-webrtc-v2-e2e-host" });
+      await webrtcV2Peer.call({
+        op: "serve_relay",
+        relay_url: webrtcV2Relay.wsUrl,
+        expected_host: "127.0.0.1",
+      });
+      await webrtcV2Peer.call({ op: "serve_webrtc", bind: "127.0.0.1:0" });
+
+      const w2PairCode = (await webrtcV2Peer.call({ op: "issue_code", kind: "remote" })).code;
+      const w2PairPromise = webrtcV2Peer.call({ op: "pair_v2_accept", timeout_ms: 10000 });
+      const w2BrowserPair = await cdp.evalAsync(`
+        window.__webrtcV2Client = await window.__e2eSdk.TendrilWebClient.create({ hostId: 'chrome-webrtc-v2-client' });
+        return await window.__webrtcV2Client.pairV2({
+          relayUrl: ${JSON.stringify(webrtcV2Relay.wsUrl)},
+          targetPub: ${JSON.stringify(w2Init.relay_pub)},
+          expectedHost: '127.0.0.1',
+          code: ${JSON.stringify(w2PairCode)},
+          deviceName: 'chrome-webrtc-v2',
+          deviceKind: 'web',
+          allowInsecureWs: true,
+        });
+      `);
+      const w2PeerPair = await w2PairPromise;
+      assert.equal(w2BrowserPair.sas, w2PeerPair.sas);
+      await webrtcV2Peer.call({ op: "confirm", peer_id: w2PeerPair.device_id, sas: w2PeerPair.sas });
+      await cdp.evalAsync(`
+        await window.__webrtcV2Client.confirmPeer('web-webrtc-v2-e2e-host', ${JSON.stringify(w2BrowserPair.sas)});
+      `);
+      const w2Grant = (
+        await webrtcV2Peer.call({ op: "mint", peer_id: w2PeerPair.device_id, caps: ["fs.read"] })
+      ).grant;
+
+      const v2RelayUrl = webrtcV2Relay.wsUrl.replace("/v1/relay", "/v2/relay");
+      await webrtcV2Peer.call({
+        op: "serve_relay_v2",
+        relay_url: v2RelayUrl,
+        expected_host: "127.0.0.1",
+        peer_id: w2PeerPair.device_id,
+      });
+
+      webrtcV2Peer.send({ op: "accept_v2", timeout_ms: 10000 });
+      const autoUpgradeEval = cdp.evalAsync(`
+        window.__webrtcV2Session = await window.__webrtcV2Client.connectV2({
+          relayUrl: ${JSON.stringify(v2RelayUrl)},
+          targetPub: ${JSON.stringify(w2Init.relay_pub)},
+          expectedHost: '127.0.0.1',
+          targetHostId: 'web-webrtc-v2-e2e-host',
+          grantJson: ${JSON.stringify(JSON.stringify(w2Grant))},
+          useRelayV2: true,
+          allowInsecureWs: true,
+          autoUpgradeWebRtc: true,
+        });
+        return {
+          route: window.__webrtcV2Session.route,
+          allowRead: window.__webrtcV2Session.authorize('fs.read'),
+          denyExec: window.__webrtcV2Session.authorize('shell.exec'),
+        };
+      `);
+      const w2Conn = await webrtcV2Peer.recv();
+      assert.equal(w2Conn.ok, true);
+      webrtcV2Peer.send({ op: "accept_upgraded_session", timeout_ms: 15000, v2: true });
+      const [v2AutoState, w2AcceptRes] = await Promise.all([
+        autoUpgradeEval,
+        webrtcV2Peer.recv(15000),
+      ]);
+      assert.equal(w2AcceptRes.ok, true, `v2 accept_upgraded_session failed: ${w2AcceptRes.error}`);
+      assert.equal(w2AcceptRes.wire_version, 2);
+      assert.deepEqual(v2AutoState.route, {
+        hint: null,
+        endpoint: "webrtc://tendril/v1",
+        provider: "p2p",
+      });
+      assert.equal(v2AutoState.allowRead, true);
+      assert.equal(v2AutoState.denyExec, false);
+
+      webrtcV2Relay.child.kill();
+      await webrtcV2Peer.call({ op: "send", data_utf8: "webrtc-v2-host-to-chrome" });
+      const v2Data = await cdp.evalAsync(`
+        const ev1 = await window.__webrtcV2Session.pollEvent(3000);
+        if (ev1.status !== 'event' || ev1.event !== 'established') {
+          throw new Error('expected single initial v2 established event, got: ' + JSON.stringify(ev1));
+        }
+        const ev2 = await window.__webrtcV2Session.pollEvent(3000);
+        if (ev2.status !== 'event' || ev2.event !== 'data') {
+          throw new Error('v2 post-cutover pollEvent unexpected (duplicate established?): ' + JSON.stringify(ev2));
+        }
+        await window.__webrtcV2Session.sendData('webrtc-v2-chrome-to-host');
+        return new TextDecoder().decode(window.__e2eSdk.b64urlDecode(ev2.data_b64));
+      `);
+      assert.equal(v2Data, "webrtc-v2-host-to-chrome");
+      const w2Ev = await webrtcV2Peer.call({ op: "recv", timeout_ms: 3000 });
+      assert.equal(w2Ev.data_utf8, "webrtc-v2-chrome-to-host");
+
+      await cdp.evalAsync(`
+        await window.__webrtcV2Session.close(1000, 'webrtc-v2-done');
+        window.__webrtcV2Client.free();
+      `);
+      const w2Closed = await webrtcV2Peer.call({ op: "recv", timeout_ms: 3000 });
+      assert.equal(w2Closed.event, "closed");
+      console.log("CHROME_LIVE_WEBRTC_UPGRADE_E2E_OK=true");
+    } finally {
+      webrtcV2Peer.close();
+      webrtcV2Relay.child.kill();
+    }
   } finally {
     if (cdp) {
       try {

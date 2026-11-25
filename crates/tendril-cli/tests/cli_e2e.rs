@@ -3397,6 +3397,7 @@ async fn sec03_v2_dial_persists_revoked_state_on_key_mismatch() {
         proto_version: WIRE_VERSION_V2,
         signing_pub: host_identity.signing_key().public_key().to_b64url(),
         rotation: vec![rec_a, rec_b],
+        upgrade: Vec::new(),
     };
     let hello_json = serde_json::to_vec(&hello).expect("serialize HostHello");
     let host_static_priv = *host_identity.static_key().secret_bytes();

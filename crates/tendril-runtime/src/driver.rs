@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+#[cfg(feature = "webrtc")]
+use tendril_core::UPGRADE_CAP_WEBRTC_V1;
 use tendril_core::crypto::HybridSigningPublicKey;
 use tendril_core::error::CoreError;
 use tendril_core::grants::{AuditEvent, Grant, RevocationList};
@@ -26,7 +28,7 @@ use tendril_core::routes::RouteSet;
 use tendril_core::session::{
     RekeyDirection, RouteExpectation, SessionAction, SessionMachine, check_peer_allows_wire_v1,
 };
-use tendril_core::wire::{Intent, Preamble};
+use tendril_core::wire::{Intent, PathUpgradeMsg, Preamble};
 use tendril_core::{MAX_FRAME_LEN, PREAMBLE_LEN};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::AbortHandle;
@@ -40,6 +42,8 @@ use crate::providers::hints::{
     CandidateSet, DialWire, HintDialers, HintInput, HintTarget, MultiDialOptions, RelayV2Gate,
     build_pairing_candidates, normalize_operator_endpoint, session_hint_inputs,
 };
+#[cfg(feature = "webrtc")]
+use crate::providers::webrtc::WebRtcUpgradeHandle;
 use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
 use crate::store::StateStore;
 
@@ -102,6 +106,10 @@ fn push_non_write_action(
             pending_events.push_back(SessionEvent::GroupRendezvousReceived(frame));
             (true, false)
         }
+        SessionAction::PathUpgradeReceived(msg) => {
+            pending_events.push_back(SessionEvent::PathUpgrade(msg));
+            (true, false)
+        }
     }
 }
 
@@ -137,6 +145,8 @@ pub enum SessionEvent {
     GroupManifestReceived(Box<GroupManifest>),
     /// Received `0x0B` rendezvous frame: neither authorized nor ingested.
     GroupRendezvousReceived(GroupRendezvousFrame),
+    /// Received `0x0D PATH_UPGRADE` signaling message.
+    PathUpgrade(PathUpgradeMsg),
     Closed {
         code: u16,
         reason: String,
@@ -786,6 +796,8 @@ pub struct SessionDriver {
     started_at: Instant,
     _half_open: Option<HalfOpenGuard>,
     route_ingest: IngestSlot,
+    #[cfg(feature = "webrtc")]
+    webrtc_upgrade_handle: Option<WebRtcUpgradeHandle>,
 }
 
 enum RosterRef<'a> {
@@ -803,6 +815,28 @@ impl SessionDriver {
         roster: &mut Roster,
         now_unix: u64,
     ) -> Result<Self, RuntimeError> {
+        Self::connect_with_upgrade_caps(
+            stream,
+            local_identity,
+            target_host_id,
+            initial_grant,
+            roster,
+            now_unix,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Initiates a Noise XX session handshake advertising `upgrade_caps` in `SessionHello.upgrade`.
+    pub async fn connect_with_upgrade_caps(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        initial_grant: Option<Grant>,
+        roster: &mut Roster,
+        now_unix: u64,
+        upgrade_caps: Vec<String>,
+    ) -> Result<Self, RuntimeError> {
         let crl_seq = roster.crl(target_host_id).map(|c| c.seq);
         Self::connect_with_roster(
             stream,
@@ -813,6 +847,7 @@ impl SessionDriver {
             RosterRef::Direct(roster),
             now_unix,
             Vec::new(),
+            upgrade_caps,
         )
         .await
     }
@@ -836,6 +871,7 @@ impl SessionDriver {
             RosterRef::Locked(roster),
             now_unix,
             groups,
+            Vec::new(),
         )
         .await
     }
@@ -849,6 +885,28 @@ impl SessionDriver {
         initial_grant: Option<Grant>,
         roster: &Mutex<Roster>,
         now_unix: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::connect_locked_with_upgrade_caps(
+            stream,
+            local_identity,
+            target_host_id,
+            initial_grant,
+            roster,
+            now_unix,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Initiates a Noise XX session handshake with a mutex-guarded roster advertising `upgrade_caps`.
+    pub async fn connect_locked_with_upgrade_caps(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        initial_grant: Option<Grant>,
+        roster: &Mutex<Roster>,
+        now_unix: u64,
+        upgrade_caps: Vec<String>,
     ) -> Result<Self, RuntimeError> {
         let crl_seq = roster
             .lock()
@@ -864,6 +922,7 @@ impl SessionDriver {
             RosterRef::Locked(roster),
             now_unix,
             Vec::new(),
+            upgrade_caps,
         )
         .await
     }
@@ -922,6 +981,7 @@ impl SessionDriver {
                     RosterRef::Locked(&roster_c),
                     now_unix,
                     Vec::new(),
+                    Vec::new(),
                 )
                 .await
             }
@@ -939,6 +999,7 @@ impl SessionDriver {
         roster: RosterRef<'_>,
         now_unix: u64,
         groups: Vec<GroupSeq>,
+        upgrade_caps: Vec<String>,
     ) -> Result<Self, RuntimeError> {
         Self::connect_with_source(
             StreamSource::Stream(stream),
@@ -949,6 +1010,7 @@ impl SessionDriver {
             roster,
             now_unix,
             groups,
+            upgrade_caps,
         )
         .await
     }
@@ -963,6 +1025,7 @@ impl SessionDriver {
         mut roster: RosterRef<'_>,
         now_unix: u64,
         groups: Vec<GroupSeq>,
+        upgrade_caps: Vec<String>,
     ) -> Result<Self, RuntimeError> {
         match &roster {
             RosterRef::Direct(r) => check_peer_allows_wire_v1(r, target_host_id)?,
@@ -979,6 +1042,12 @@ impl SessionDriver {
             None,
         )?;
         machine.set_local_groups(groups)?;
+        let upgrade_caps = if source.provider_id() == ProviderId::P2p {
+            Vec::new()
+        } else {
+            upgrade_caps
+        };
+        let mut machine = machine.with_upgrade_caps(upgrade_caps)?;
         let start_actions = machine.start()?;
         let init_bytes = match start_actions.as_slice() {
             [SessionAction::WriteBytes(bytes)] if !bytes.is_empty() => Some(bytes.as_slice()),
@@ -993,6 +1062,8 @@ impl SessionDriver {
             started_at: Instant::now(),
             _half_open: None,
             route_ingest: IngestSlot::default(),
+            #[cfg(feature = "webrtc")]
+            webrtc_upgrade_handle: None,
         };
         if !fast_open_sent {
             driver.apply_actions(start_actions).await?;
@@ -1034,6 +1105,31 @@ impl SessionDriver {
         existing_guard: Option<HalfOpenGuard>,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        Self::accept_with_upgrade_caps(
+            stream,
+            local_identity,
+            roster,
+            now_unix,
+            rate_limiter,
+            existing_guard,
+            handshake_timeout,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Accepts an inbound Noise XX session handshake advertising `upgrade_caps` in `HostHello.upgrade`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn accept_with_upgrade_caps(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        roster: &mut Roster,
+        now_unix: u64,
+        rate_limiter: Option<&PreAuthRateLimiter>,
+        existing_guard: Option<HalfOpenGuard>,
+        handshake_timeout: Duration,
+        upgrade_caps: Vec<String>,
+    ) -> Result<Self, RuntimeError> {
         Self::accept_with_roster(
             stream,
             local_identity,
@@ -1042,6 +1138,7 @@ impl SessionDriver {
             rate_limiter,
             existing_guard,
             handshake_timeout,
+            upgrade_caps,
         )
         .await
     }
@@ -1058,6 +1155,31 @@ impl SessionDriver {
         existing_guard: Option<HalfOpenGuard>,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        Self::accept_locked_with_upgrade_caps(
+            stream,
+            local_identity,
+            roster,
+            now_unix,
+            rate_limiter,
+            existing_guard,
+            handshake_timeout,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Accepts an inbound Noise XX session handshake with a mutex-guarded roster and `upgrade_caps`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn accept_locked_with_upgrade_caps(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        roster: &Mutex<Roster>,
+        now_unix: u64,
+        rate_limiter: Option<&PreAuthRateLimiter>,
+        existing_guard: Option<HalfOpenGuard>,
+        handshake_timeout: Duration,
+        upgrade_caps: Vec<String>,
+    ) -> Result<Self, RuntimeError> {
         Self::accept_with_roster(
             stream,
             local_identity,
@@ -1066,6 +1188,7 @@ impl SessionDriver {
             rate_limiter,
             existing_guard,
             handshake_timeout,
+            upgrade_caps,
         )
         .await
     }
@@ -1079,6 +1202,7 @@ impl SessionDriver {
         rate_limiter: Option<&PreAuthRateLimiter>,
         existing_guard: Option<HalfOpenGuard>,
         handshake_timeout: Duration,
+        upgrade_caps: Vec<String>,
     ) -> Result<Self, RuntimeError> {
         let half_open = match existing_guard {
             Some(g) => Some(g),
@@ -1092,7 +1216,13 @@ impl SessionDriver {
                 })
                 .transpose()?,
         };
-        let machine = SessionMachine::new_responder(local_identity, None)?;
+        let upgrade_caps = if stream.provider_id() == ProviderId::P2p {
+            Vec::new()
+        } else {
+            upgrade_caps
+        };
+        let machine =
+            SessionMachine::new_responder(local_identity, None)?.with_upgrade_caps(upgrade_caps)?;
         let mut driver = Self {
             stream,
             machine,
@@ -1101,6 +1231,8 @@ impl SessionDriver {
             started_at: Instant::now(),
             _half_open: half_open,
             route_ingest: IngestSlot::default(),
+            #[cfg(feature = "webrtc")]
+            webrtc_upgrade_handle: None,
         };
         driver
             .drive_until_established(now_unix, &mut roster, rate_limiter, Some(handshake_timeout))
@@ -1231,6 +1363,63 @@ impl SessionDriver {
         self.machine.applied_rotation()
     }
 
+    /// Returns the negotiated in-band path upgrade capabilities for this session.
+    #[must_use]
+    pub fn negotiated_upgrade_caps(&self) -> &[String] {
+        self.machine.negotiated_upgrade_caps()
+    }
+
+    /// Returns the peer's advertised upgrade capabilities from handshake hello.
+    #[must_use]
+    pub fn peer_upgrade_caps(&self) -> &[String] {
+        self.machine.peer_upgrade_caps()
+    }
+
+    /// Sends encrypted `0x0D PATH_UPGRADE` signaling after enforcing role, cap, and `upgrade_id` rules.
+    pub async fn send_path_upgrade(&mut self, msg: &PathUpgradeMsg) -> Result<(), RuntimeError> {
+        let now_ms = self.elapsed_ms();
+        let actions = self.machine.send_path_upgrade(msg, now_ms)?;
+        self.apply_actions(actions).await
+    }
+
+    /// Attaches a host-side [`WebRtcUpgradeHandle`] so inbound `webrtc/v1` offers are answered automatically.
+    #[cfg(feature = "webrtc")]
+    #[must_use]
+    pub fn with_webrtc_upgrade_handle(mut self, handle: WebRtcUpgradeHandle) -> Self {
+        self.webrtc_upgrade_handle = Some(handle);
+        self
+    }
+
+    /// Sets or clears the host-side [`WebRtcUpgradeHandle`] on an established [`SessionDriver`].
+    #[cfg(feature = "webrtc")]
+    pub fn set_webrtc_upgrade_handle(&mut self, handle: Option<WebRtcUpgradeHandle>) {
+        self.webrtc_upgrade_handle = handle;
+    }
+
+    #[cfg(feature = "webrtc")]
+    async fn maybe_auto_respond_offer(&mut self, upgrade_id: u64, protocol: &str, sdp: &str) {
+        let Some(ref handle) = self.webrtc_upgrade_handle else {
+            return;
+        };
+        if protocol != UPGRADE_CAP_WEBRTC_V1 {
+            return;
+        }
+        let reply = match handle.accept_offer(sdp).await {
+            Ok(answer_sdp) => PathUpgradeMsg::Answer {
+                upgrade_id,
+                protocol: protocol.to_owned(),
+                sdp: answer_sdp,
+            },
+            Err(err) => PathUpgradeMsg::Reject {
+                upgrade_id,
+                reason: webrtc_reject_reason(&err),
+            },
+        };
+        if let Err(err) = self.send_path_upgrade(&reply).await {
+            tracing::debug!(error = %err, "failed to send auto WebRTC path upgrade reply");
+        }
+    }
+
     /// Returns the provider ID backing the active stream.
     #[must_use]
     pub fn provider_id(&self) -> ProviderId {
@@ -1242,6 +1431,8 @@ impl SessionDriver {
     pub fn into_concurrent(self) -> ConcurrentSession {
         let provider_id = self.stream.provider_id();
         let is_closed = self.machine.is_closed();
+        let negotiated_upgrade_caps = self.machine.negotiated_upgrade_caps().to_vec();
+        let peer_upgrade_caps = self.machine.peer_upgrade_caps().to_vec();
         let (reader, writer) = self.stream.into_split();
         let (shutdown_tx, _) = tokio::sync::watch::channel(is_closed);
         ConcurrentSession {
@@ -1258,6 +1449,10 @@ impl SessionDriver {
             provider_id,
             _half_open: self._half_open,
             route_ingest: self.route_ingest,
+            negotiated_upgrade_caps,
+            peer_upgrade_caps,
+            #[cfg(feature = "webrtc")]
+            webrtc_upgrade_handle: Mutex::new(self.webrtc_upgrade_handle),
         }
     }
 
@@ -1325,6 +1520,16 @@ impl SessionDriver {
                     self.tick(now_unix, roster).await?;
                 }
                 if let Some(ev) = self.pending_events.pop_front() {
+                    #[cfg(feature = "webrtc")]
+                    if let SessionEvent::PathUpgrade(PathUpgradeMsg::Offer {
+                        upgrade_id,
+                        ref protocol,
+                        ref sdp,
+                    }) = ev
+                    {
+                        self.maybe_auto_respond_offer(upgrade_id, protocol, sdp)
+                            .await;
+                    }
                     return Ok(Some(ev));
                 }
             }
@@ -1365,6 +1570,16 @@ impl SessionDriver {
     ) -> Result<Option<SessionEvent>, RuntimeError> {
         loop {
             if let Some(ev) = self.pending_events.pop_front() {
+                #[cfg(feature = "webrtc")]
+                if let SessionEvent::PathUpgrade(PathUpgradeMsg::Offer {
+                    upgrade_id,
+                    ref protocol,
+                    ref sdp,
+                }) = ev
+                {
+                    self.maybe_auto_respond_offer(upgrade_id, protocol, sdp)
+                        .await;
+                }
                 return Ok(Some(ev));
             }
             if self.machine.is_closed() {
@@ -1539,6 +1754,10 @@ pub struct ConcurrentSession {
     provider_id: ProviderId,
     _half_open: Option<HalfOpenGuard>,
     route_ingest: IngestSlot,
+    negotiated_upgrade_caps: Vec<String>,
+    peer_upgrade_caps: Vec<String>,
+    #[cfg(feature = "webrtc")]
+    webrtc_upgrade_handle: Mutex<Option<WebRtcUpgradeHandle>>,
 }
 
 impl ConcurrentSession {
@@ -1621,6 +1840,63 @@ impl ConcurrentSession {
         let frame = secrets.to_rendezvous_frame(group_id)?;
         self.run_write_op(|machine, now_ms| machine.send_group_rendezvous(&frame[..], now_ms))
             .await
+    }
+
+    /// Returns the negotiated in-band path upgrade capabilities for this session.
+    #[must_use]
+    pub fn negotiated_upgrade_caps(&self) -> &[String] {
+        &self.negotiated_upgrade_caps
+    }
+
+    /// Returns the peer's advertised upgrade capabilities from handshake hello.
+    #[must_use]
+    pub fn peer_upgrade_caps(&self) -> &[String] {
+        &self.peer_upgrade_caps
+    }
+
+    /// Sends encrypted `0x0D PATH_UPGRADE` signaling concurrently with inbound polling.
+    pub async fn send_path_upgrade(&self, msg: &PathUpgradeMsg) -> Result<(), RuntimeError> {
+        self.run_write_op(|machine, now_ms| machine.send_path_upgrade(msg, now_ms))
+            .await
+    }
+
+    /// Sets or clears the host-side [`WebRtcUpgradeHandle`] on an established [`ConcurrentSession`].
+    #[cfg(feature = "webrtc")]
+    pub fn set_webrtc_upgrade_handle(&self, handle: Option<WebRtcUpgradeHandle>) {
+        *self
+            .webrtc_upgrade_handle
+            .lock()
+            .expect("webrtc handle mutex poisoned") = handle;
+    }
+
+    #[cfg(feature = "webrtc")]
+    async fn maybe_auto_respond_offer(&self, upgrade_id: u64, protocol: &str, sdp: &str) {
+        let handle = {
+            self.webrtc_upgrade_handle
+                .lock()
+                .expect("webrtc handle mutex poisoned")
+                .clone()
+        };
+        let Some(handle) = handle else {
+            return;
+        };
+        if protocol != UPGRADE_CAP_WEBRTC_V1 {
+            return;
+        }
+        let reply = match handle.accept_offer(sdp).await {
+            Ok(answer_sdp) => PathUpgradeMsg::Answer {
+                upgrade_id,
+                protocol: protocol.to_owned(),
+                sdp: answer_sdp,
+            },
+            Err(err) => PathUpgradeMsg::Reject {
+                upgrade_id,
+                reason: webrtc_reject_reason(&err),
+            },
+        };
+        if let Err(err) = self.send_path_upgrade(&reply).await {
+            tracing::debug!(error = %err, "failed to send auto WebRTC path upgrade reply");
+        }
     }
 
     /// Like [`Self::send_data`], but evaluates `authority` while holding the writer lock and
@@ -1777,6 +2053,16 @@ impl ConcurrentSession {
                 return Ok(None);
             }
             if let Some(ev) = self.pop_pending_event() {
+                #[cfg(feature = "webrtc")]
+                if let SessionEvent::PathUpgrade(PathUpgradeMsg::Offer {
+                    upgrade_id,
+                    ref protocol,
+                    ref sdp,
+                }) = ev
+                {
+                    self.maybe_auto_respond_offer(upgrade_id, protocol, sdp)
+                        .await;
+                }
                 return Ok(Some(ev));
             }
             if self
@@ -1943,6 +2229,24 @@ pub(crate) enum StreamSource<'a> {
         dialer: &'a dyn PathDialer,
         addr: &'a str,
     },
+}
+
+impl StreamSource<'_> {
+    pub(crate) fn provider_id(&self) -> ProviderId {
+        match self {
+            Self::Stream(stream) => stream.provider_id(),
+            Self::Dial { dialer, .. } => dialer.provider_id(),
+        }
+    }
+}
+
+#[cfg(feature = "webrtc")]
+pub(crate) fn webrtc_reject_reason(err: &RuntimeError) -> String {
+    if matches!(err, RuntimeError::CapacityExceeded(_)) {
+        "capacity_exceeded".to_owned()
+    } else {
+        "webrtc_offer_failed".to_owned()
+    }
 }
 
 pub(crate) async fn dial_source_with_init(
@@ -2344,6 +2648,7 @@ fn clone_runtime_error(err: &RuntimeError) -> RuntimeError {
             detail: detail.clone(),
         },
         RuntimeError::RelayOffline(kind) => RuntimeError::RelayOffline(*kind),
+        RuntimeError::CapacityExceeded(m) => RuntimeError::CapacityExceeded(m),
     }
 }
 
@@ -3511,6 +3816,8 @@ impl SessionDriver {
             started_at: Instant::now(),
             _half_open: None,
             route_ingest: IngestSlot::default(),
+            #[cfg(feature = "webrtc")]
+            webrtc_upgrade_handle: None,
         };
         let deadline = TokioInstant::now() + DEFAULT_PRE_AUTH_TIMEOUT;
         let now_unix = current_unix_secs();

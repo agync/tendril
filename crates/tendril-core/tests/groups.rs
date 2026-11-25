@@ -1328,6 +1328,7 @@ fn session_hello_groups_field_rules() {
         crl_seq: None,
         groups: None,
         route_seq: None,
+        upgrade: Vec::new(),
     };
     let json = serde_json::to_string(&base).unwrap();
     assert!(!json.contains("groups"));
@@ -1391,8 +1392,12 @@ fn inner_frame_codec_enforces_size_bounds() {
         InnerFrameType::RouteSet
     );
     assert_eq!(
-        InnerFrameType::try_from(0x0D),
-        Err(CoreError::UnknownInnerFrameType(0x0D))
+        InnerFrameType::try_from(0x0D).unwrap(),
+        InnerFrameType::PathUpgrade
+    );
+    assert_eq!(
+        InnerFrameType::try_from(0x0E),
+        Err(CoreError::UnknownInnerFrameType(0x0E))
     );
 
     let ok = vec![b'{'; MAX_GROUP_MANIFEST_LEN];

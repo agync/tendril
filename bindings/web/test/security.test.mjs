@@ -40,6 +40,7 @@ import {
   validateWtUrl,
 } from "../src/index.js";
 import { redactHint } from "../src/redact.js";
+import "./webrtc.test.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.resolve(__dirname, "..");

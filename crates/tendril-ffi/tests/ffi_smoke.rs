@@ -821,6 +821,7 @@ fn ffi_persists_host_rotation_and_fork_revocation_across_restart() {
                 proto_version: 1,
                 signing_pub: key_a_sig.public_key().to_b64url(),
                 rotation: vec![rec_2a, rec_2b],
+                upgrade: Vec::new(),
             })
             .unwrap();
             let mut ct = vec![0u8; MAX_FRAME_LEN];

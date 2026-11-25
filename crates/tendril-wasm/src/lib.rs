@@ -56,7 +56,7 @@ use tendril_core::v2::{
     epoch_within_skew, sign_v2_relay_dial, verify_v2_relay_accept as core_verify_v2_relay_accept,
     verify_v2_relay_register as core_verify_v2_relay_register,
 };
-use tendril_core::wire::WIRE_VERSION_V2;
+use tendril_core::wire::{PathUpgradeMsg, WIRE_VERSION_V2, validate_upgrade_caps};
 use wasm_bindgen::prelude::*;
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -2940,6 +2940,20 @@ fn route_sets_json(sets: &[RouteSet]) -> String {
     .to_string()
 }
 
+fn parse_upgrade_caps_json(caps_json: &str) -> Result<Vec<String>, WasmError> {
+    let caps: Vec<String> = serde_json::from_str(caps_json).map_err(WasmError::from)?;
+    validate_upgrade_caps(&caps).map_err(WasmError::from)?;
+    Ok(caps)
+}
+
+fn path_upgrade_event_json(msg: &PathUpgradeMsg) -> Result<serde_json::Value, WasmError> {
+    let upgrade = serde_json::to_value(msg).map_err(WasmError::from)?;
+    Ok(json!({
+        "event": "path_upgrade",
+        "upgrade": upgrade,
+    }))
+}
+
 /// Sans-I/O authenticated `Intent::Session` client state machine.
 #[wasm_bindgen]
 pub struct WasmSessionClient {
@@ -3037,6 +3051,18 @@ impl WasmSessionClient {
         Ok(())
     }
 
+    fn with_upgrade_caps_inner(&mut self, caps_json: &str) -> Result<(), WasmError> {
+        require_unstarted(self.started)?;
+        let caps = parse_upgrade_caps_json(caps_json)?;
+        tendril_core::validate_upgrade_caps(&caps).map_err(WasmError::from)?;
+        let machine = self
+            .inner
+            .take()
+            .ok_or_else(|| WasmError::from("session unavailable"))?;
+        self.inner = Some(machine.with_upgrade_caps(caps).map_err(WasmError::from)?);
+        Ok(())
+    }
+
     fn take_route_sets_json(&mut self) -> Result<String, WasmError> {
         let sets = self.machine_mut()?.take_route_sets();
         Ok(route_sets_json(&sets))
@@ -3111,6 +3137,9 @@ impl WasmSessionClient {
                     "event": "audit",
                     "audit": audit,
                 })),
+                SessionAction::PathUpgradeReceived(msg) => {
+                    events.push(path_upgrade_event_json(&msg)?);
+                }
                 SessionAction::CloseTransport { code, reason } => events.push(json!({
                     "event": "closed",
                     "code": code,
@@ -3307,6 +3336,44 @@ impl WasmSessionClient {
     #[wasm_bindgen]
     pub fn with_route_seq(&mut self, route_seq: Option<f64>) -> Result<(), JsValue> {
         self.with_route_seq_inner(route_seq).map_err(to_js_err)
+    }
+
+    /// Sets `SessionHello.upgrade` capability advertisements. Valid only before `start()`.
+    #[wasm_bindgen]
+    pub fn with_upgrade_caps(&mut self, caps_json: &str) -> Result<(), JsValue> {
+        self.with_upgrade_caps_inner(caps_json).map_err(to_js_err)
+    }
+
+    /// Returns the negotiated upgrade capability names as a JSON array string.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn negotiated_upgrade_caps_json(&self) -> String {
+        self.inner
+            .as_ref()
+            .and_then(|m| serde_json::to_string(m.negotiated_upgrade_caps()).ok())
+            .unwrap_or_else(|| "[]".to_owned())
+    }
+
+    /// Returns true once established with at least one negotiated upgrade capability.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn can_send_path_upgrade(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|m| m.is_established() && !m.negotiated_upgrade_caps().is_empty())
+    }
+
+    /// Encrypts and frames one `0x0D PATH_UPGRADE` JSON message.
+    #[wasm_bindgen]
+    pub fn send_path_upgrade(&mut self, msg_json: &str, now_ms: f64) -> Result<Vec<u8>, JsValue> {
+        let now_m = f64_to_u64(now_ms, "now_ms").map_err(to_js_err)?;
+        let msg: PathUpgradeMsg = serde_json::from_str(msg_json).map_err(to_js_err)?;
+        let actions = self
+            .machine_mut()
+            .map_err(to_js_err)?
+            .send_path_upgrade(&msg, now_m)
+            .map_err(to_js_err)?;
+        Ok(collect_session_writes(actions))
     }
 
     /// `HostHello.rotation` records the host presented (JSON array), kept on every outcome.
@@ -3762,6 +3829,22 @@ impl WasmV2SessionInitiator {
         Ok(())
     }
 
+    fn with_upgrade_caps_inner(&mut self, caps_json: &str) -> Result<(), WasmError> {
+        require_unstarted(self.started)?;
+        let caps = parse_upgrade_caps_json(caps_json)?;
+        tendril_core::validate_upgrade_caps(&caps).map_err(WasmError::from)?;
+        let V2WasmSessionPhase::Active(machine) =
+            std::mem::replace(&mut self.phase, V2WasmSessionPhase::Closed)
+        else {
+            return Err("v2 session closed".to_owned().into());
+        };
+        let machine = (*machine)
+            .with_upgrade_caps(caps)
+            .map_err(WasmError::from)?;
+        self.phase = V2WasmSessionPhase::Active(Box::new(machine));
+        Ok(())
+    }
+
     fn take_route_sets_json(&mut self) -> String {
         match self.phase {
             V2WasmSessionPhase::Active(ref mut machine) => {
@@ -3855,6 +3938,9 @@ impl WasmV2SessionInitiator {
                     "event": "audit",
                     "audit": audit,
                 }));
+            }
+            V2SessionAction::PathUpgradeReceived(msg) => {
+                self.pending_events.push(path_upgrade_event_json(&msg)?);
             }
             V2SessionAction::CloseTransport { code, reason } => {
                 self.pending_events.push(json!({
@@ -4128,6 +4214,49 @@ impl WasmV2SessionInitiator {
     #[wasm_bindgen]
     pub fn with_route_seq(&mut self, route_seq: Option<f64>) -> Result<(), JsValue> {
         self.with_route_seq_inner(route_seq).map_err(to_js_err)
+    }
+
+    /// Sets `SessionHello.upgrade` capability advertisements. Valid only before `start()`.
+    #[wasm_bindgen]
+    pub fn with_upgrade_caps(&mut self, caps_json: &str) -> Result<(), JsValue> {
+        self.with_upgrade_caps_inner(caps_json).map_err(to_js_err)
+    }
+
+    /// Returns the negotiated upgrade capability names as a JSON array string.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn negotiated_upgrade_caps_json(&self) -> String {
+        match self.phase {
+            V2WasmSessionPhase::Active(ref machine) => {
+                serde_json::to_string(machine.negotiated_upgrade_caps())
+                    .unwrap_or_else(|_| "[]".to_owned())
+            }
+            V2WasmSessionPhase::Closed => "[]".to_owned(),
+        }
+    }
+
+    /// Returns true once established with at least one negotiated upgrade capability.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn can_send_path_upgrade(&self) -> bool {
+        match self.phase {
+            V2WasmSessionPhase::Active(ref machine) => {
+                machine.is_established() && !machine.negotiated_upgrade_caps().is_empty()
+            }
+            V2WasmSessionPhase::Closed => false,
+        }
+    }
+
+    /// Encrypts and frames one `0x0D PATH_UPGRADE` JSON message wrapped in `0x09 PADDED`.
+    #[wasm_bindgen]
+    pub fn send_path_upgrade(&mut self, msg_json: &str, now_ms: f64) -> Result<Vec<u8>, JsValue> {
+        let now_m = f64_to_u64(now_ms, "now_ms").map_err(to_js_err)?;
+        let msg: PathUpgradeMsg = serde_json::from_str(msg_json).map_err(to_js_err)?;
+        let V2WasmSessionPhase::Active(ref mut machine) = self.phase else {
+            return Err(to_js_err("v2 session closed"));
+        };
+        let actions = machine.send_path_upgrade(&msg, now_m).map_err(to_js_err)?;
+        Ok(collect_v2_writes(actions))
     }
 
     /// `HostHello.rotation` records the host presented (JSON array), kept on every outcome.

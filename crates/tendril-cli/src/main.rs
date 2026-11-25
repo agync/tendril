@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use tendril_core::UPGRADE_CAP_WEBRTC_V1;
 use tendril_core::crypto::{
     HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, SigningKeypair,
     StaticKeypair, b64url_decode, b64url_decode_array, b64url_encode, random_bytes,
@@ -42,7 +43,8 @@ use tendril_runtime::{
     RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer,
     RouteSetSink, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
     V2SessionDriver, WakeAdapterKind, WakeDialOptions, WakeOutcome, WakeSecret, WakeTarget,
-    WtListener, dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
+    WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtListener,
+    dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_policy,
     drive_pair_responder_with_store, drive_v2_pair_initiator_with_policy,
     drive_v2_pake_pair_responder_with_store, parse_p2p_relay_mode, parse_p2p_relay_modes,
@@ -279,6 +281,8 @@ enum Command {
         broker: Option<SocketAddr>,
         #[arg(long)]
         webtransport: Option<SocketAddr>,
+        #[arg(long, value_name = "SOCKET_ADDR")]
+        webrtc_upgrade: Option<SocketAddr>,
         #[arg(long, value_enum)]
         issue_code: Option<PairKindArg>,
         /// Extra route to advertise in pairing URIs and route sets (repeatable).
@@ -1489,6 +1493,7 @@ async fn handle_v1_session(
     redact_logs: bool,
     groups: Arc<group::ServeGroups>,
     announcer: Arc<RouteAnnouncer>,
+    webrtc_handle: Option<WebRtcUpgradeHandle>,
 ) {
     let now = now_unix();
     let (mut roster, initial_stamp) = {
@@ -1501,7 +1506,13 @@ async fn handle_v1_session(
             }
         }
     };
-    let Ok(driver) = SessionDriver::accept_with_options(
+    let allow_upgrade = stream.provider_id() != ProviderId::P2p && webrtc_handle.is_some();
+    let upgrade_caps = if allow_upgrade {
+        vec![UPGRADE_CAP_WEBRTC_V1.to_owned()]
+    } else {
+        Vec::new()
+    };
+    let Ok(mut driver) = SessionDriver::accept_with_upgrade_caps(
         stream,
         &identity,
         &mut roster,
@@ -1509,12 +1520,16 @@ async fn handle_v1_session(
         Some(&rate_limiter),
         Some(pre_auth_guard),
         DEFAULT_PRE_AUTH_TIMEOUT,
+        upgrade_caps,
     )
     .await
     else {
         tracing::debug!("inbound session rejected");
         return;
     };
+    if allow_upgrade {
+        driver.set_webrtc_upgrade_handle(webrtc_handle);
+    }
     run_v1_session(
         driver,
         roster,
@@ -2422,6 +2437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             overlay_allow_non_tailnet,
             broker,
             webtransport,
+            webrtc_upgrade,
             issue_code,
             advertise_endpoints,
             no_route_signature,
@@ -2432,7 +2448,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let store_lock = Arc::new(AsyncMutex::new(()));
             let pair_mgr = Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default())));
             let router = Arc::new(InboundRouter::new());
-            let v2_state = Arc::new(V2ResponderState::new());
+            let (webrtc_handle, webrtc_listener, webrtc_addr) = if let Some(addr) = webrtc_upgrade {
+                let (wh, wl) = WebRtcUpgradeEndpoint::bind(addr).await?;
+                let bound = wl.local_addr();
+                (Some(wh), Some(wl), Some(bound))
+            } else {
+                (None, None, None)
+            };
+            let v2_state = Arc::new(V2ResponderState::with_config(
+                tendril_runtime::V2ResponderConfig {
+                    webrtc_upgrade_handle: webrtc_handle.clone(),
+                    ..Default::default()
+                },
+            ));
             let pair_enabled = issue_code.is_some() || allow_enroll;
             router.set_pair_enabled(pair_enabled);
             router.set_v2_pair_enabled(wire_v2 && pair_enabled);
@@ -2587,6 +2615,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            if let Some(wul) = webrtc_listener {
+                router.spawn_listener(&handle, Box::new(wul));
+            }
 
             // Explicit advertising only: concrete listener binds and
             // `--advertise-endpoint`; unspecified binds are dropped, never enumerated.
@@ -2666,6 +2697,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "overlay_endpoint": overlay_ep,
                 "broker_endpoint": broker_ep,
                 "wt_endpoint": wt_ep,
+                "webrtc_upgrade": webrtc_addr.map(|a| a.to_string()),
                 "pairing_code": pairing_code.as_deref(),
                 "pairing_uri": pairing_uri.as_deref(),
                 "advertised_endpoints": advertised,
@@ -2729,6 +2761,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let hub_c = Arc::clone(&group_hub);
                 let v2_c = Arc::clone(&v2_state);
                 let ann_c = Arc::clone(&announcer);
+                let webrtc_c = webrtc_handle.clone();
                 worker_handles.push(spawn_routed_worker(v1_sess_q, move |stream, guard| {
                     let s = Arc::clone(&store_c);
                     let l = Arc::clone(&lock_c);
@@ -2737,18 +2770,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let hub = Arc::clone(&hub_c);
                     let v2 = Arc::clone(&v2_c);
                     let ann = Arc::clone(&ann_c);
+                    let webrtc = webrtc_c.clone();
                     async move {
                         if !hub.refresh() {
-                            handle_v1_session(stream, guard, s, l, id, r, redact_logs, hub, ann)
-                                .await;
+                            handle_v1_session(
+                                stream,
+                                guard,
+                                s,
+                                l,
+                                id,
+                                r,
+                                redact_logs,
+                                hub,
+                                ann,
+                                webrtc,
+                            )
+                            .await;
                             return;
                         }
                         match hub.accept(stream, &v2, &r, guard).await {
                             Some(InboundSession::OrdinaryV1 {
-                                session,
+                                mut session,
                                 roster,
                                 stamp,
                             }) => {
+                                if session.provider_id() == ProviderId::P2p {
+                                    session.set_webrtc_upgrade_handle(None);
+                                } else if let Some(ref wh) = webrtc {
+                                    session.set_webrtc_upgrade_handle(Some(wh.clone()));
+                                }
                                 run_v1_session(
                                     session,
                                     roster,
@@ -2810,6 +2860,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let rl_c = router.v2_session_rate_limiter().clone();
                 let hub_c = Arc::clone(&group_hub);
                 let ann_c = Arc::clone(&announcer);
+                let webrtc_c = webrtc_handle.clone();
                 worker_handles.push(spawn_routed_worker(v2_sess_q, move |mut stream, guard| {
                     let s = Arc::clone(&store_c);
                     let l = Arc::clone(&lock_c);
@@ -2818,6 +2869,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let r = rl_c.clone();
                     let hub = Arc::clone(&hub_c);
                     let ann = Arc::clone(&ann_c);
+                    let webrtc = webrtc_c.clone();
                     async move {
                         if !wire_v2 {
                             let _ = stream.close().await;
@@ -2853,10 +2905,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                             }
                             Some(InboundSession::OrdinaryV1 {
-                                session,
+                                mut session,
                                 roster,
                                 stamp,
                             }) => {
+                                if session.provider_id() == ProviderId::P2p {
+                                    session.set_webrtc_upgrade_handle(None);
+                                } else if let Some(ref wh) = webrtc {
+                                    session.set_webrtc_upgrade_handle(Some(wh.clone()));
+                                }
                                 run_v1_session(
                                     session,
                                     roster,

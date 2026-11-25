@@ -927,6 +927,7 @@ fn adversarial_pairing_and_identity_faults() {
         proto_version: 1,
         signing_pub: mitm_id.signing_key().public_key().to_b64url(),
         rotation: vec![],
+        upgrade: vec![],
     })
     .unwrap();
     let msg2_c = mitm_to_client.write_message_vec(&mitm_hello).unwrap();
@@ -1303,6 +1304,7 @@ fn adversarial_grants_crl_and_rotation_forks() {
         proto_version: 1,
         signing_pub: host_id.signing_key().public_key().to_b64url(),
         rotation: forked_chain,
+        upgrade: vec![],
     })
     .unwrap();
     let fm2 = evil_resp.write_message_vec(&forked_hello).unwrap();
@@ -3252,6 +3254,7 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
         proto_version: 1,
         signing_pub: host.signing_key().public_key().to_b64url(),
         rotation: vec![],
+        upgrade: vec![],
     })
     .unwrap();
     let msg2 = raw_resp.write_message_vec(&hh).unwrap();
@@ -3596,6 +3599,7 @@ fn pq_hybrid_kem_and_half_tampered_signature_adversarial_suite() {
         proto_version: 1,
         signing_pub: rogue.signing_key().public_key().to_b64url(),
         rotation: vec![],
+        upgrade: vec![],
     })
     .unwrap();
     let bad_msg2 = raw_host.write_message_vec(&bad_hh).unwrap();
@@ -3631,6 +3635,7 @@ fn pq_hybrid_kem_and_half_tampered_signature_adversarial_suite() {
         proto_version: 1,
         signing_pub: host.signing_key().public_key().to_b64url(),
         rotation: vec![],
+        upgrade: vec![],
     })
     .unwrap();
     let ok_m2 = raw_host2.write_message_vec(&ok_hh).unwrap();
@@ -3837,6 +3842,7 @@ mod group_mesh {
             }
         }
         assert!(decode_inner_frame(&[0x0D, 0, 0]).is_err());
+        assert!(decode_inner_frame(&[0x0E, 0, 0]).is_err());
     }
 
     #[test]

@@ -22,8 +22,9 @@ use crate::pairing::{PairingUri, RouteCheck, VerifiedRouteStatement};
 use crate::roster::{PeerState, Roster};
 use crate::routes::{MAX_ROUTE_SEQ, RouteSet};
 use crate::wire::{
-    HostHello, InnerFrameType, Intent, Preamble, ResumableFrameReader, SessionHello, WIRE_VERSION,
-    decode_inner_frame, encode_frame, encode_inner_frame,
+    HostHello, InnerFrameType, Intent, PathUpgradeMsg, PathUpgradeState, Preamble,
+    ResumableFrameReader, SessionHello, WIRE_VERSION, decode_inner_frame, encode_frame,
+    encode_inner_frame, validate_upgrade_caps,
 };
 
 /// Maximum encrypted transport frames sent before triggering automatic `0x04 REKEY` (`2^20`).
@@ -80,6 +81,8 @@ pub enum SessionAction {
     GroupManifestReceived(Box<GroupManifest>),
     /// Received `0x0B` rendezvous frame, not yet authorized or ingested.
     GroupRendezvousReceived(GroupRendezvousFrame),
+    /// Received `0x0D PATH_UPGRADE` signaling frame after directional and capability checks.
+    PathUpgradeReceived(PathUpgradeMsg),
     Rekeyed {
         direction: RekeyDirection,
     },
@@ -397,6 +400,9 @@ pub struct SessionMachine {
     presented_rotation: Vec<RotationRecord>,
     verified_recovery: Option<Box<VerifiedRouteStatement>>,
     route_sets: Vec<RouteSet>,
+    local_upgrade_caps: Vec<String>,
+    peer_upgrade_caps: Vec<String>,
+    upgrade_state: PathUpgradeState,
 }
 
 impl fmt::Debug for SessionMachine {
@@ -448,6 +454,9 @@ impl SessionMachine {
             presented_rotation: Vec::new(),
             verified_recovery: None,
             route_sets: Vec::new(),
+            local_upgrade_caps: Vec::new(),
+            peer_upgrade_caps: Vec::new(),
+            upgrade_state: PathUpgradeState::new(true),
         })
     }
 
@@ -506,7 +515,52 @@ impl SessionMachine {
             presented_rotation: Vec::new(),
             verified_recovery: None,
             route_sets: Vec::new(),
+            local_upgrade_caps: Vec::new(),
+            peer_upgrade_caps: Vec::new(),
+            upgrade_state: PathUpgradeState::new(false),
         })
+    }
+
+    /// Configures advertised upgrade capabilities before handshake start (`HostHello` / `SessionHello`).
+    pub fn with_upgrade_caps(mut self, caps: Vec<String>) -> Result<Self, CoreError> {
+        if !matches!(
+            self.phase,
+            SessionPhase::Init(_) | SessionPhase::AwaitPreamble(_)
+        ) {
+            return Err(CoreError::NotReady(
+                "upgrade capabilities must be set before handshake starts",
+            ));
+        }
+        validate_upgrade_caps(&caps)?;
+        self.local_upgrade_caps = caps;
+        Ok(self)
+    }
+
+    /// Returns the negotiated path upgrade capabilities for this session.
+    #[must_use]
+    pub fn negotiated_upgrade_caps(&self) -> &[String] {
+        self.upgrade_state.negotiated_caps()
+    }
+
+    /// Returns the raw upgrade capabilities advertised by the peer during handshake.
+    #[must_use]
+    pub fn peer_upgrade_caps(&self) -> &[String] {
+        &self.peer_upgrade_caps
+    }
+
+    /// Sends an encrypted `0x0D PATH_UPGRADE` frame enforcing directional, capability, and offer limits.
+    pub fn send_path_upgrade(
+        &mut self,
+        msg: &PathUpgradeMsg,
+        now_ms: u64,
+    ) -> Result<Vec<SessionAction>, CoreError> {
+        if !self.is_established() {
+            return Err(CoreError::NotReady("session not in transport mode"));
+        }
+        let payload = self.upgrade_state.prepare_send(msg)?;
+        let actions = self.send_inner(InnerFrameType::PathUpgrade, &payload, now_ms)?;
+        self.upgrade_state.commit_send(msg);
+        Ok(actions)
     }
 
     /// Sets the route expectation checked against `HostHello` before `msg3` (initiator, before
@@ -1028,12 +1082,23 @@ impl SessionMachine {
                 }
                 self.verified_recovery = verified.recovery_statement.map(Box::new);
 
+                let negotiated_upgrade: Vec<String> = self
+                    .local_upgrade_caps
+                    .iter()
+                    .filter(|c| host_hello.upgrade.contains(c))
+                    .cloned()
+                    .collect();
+                self.peer_upgrade_caps = host_hello.upgrade;
+                self.upgrade_state
+                    .set_negotiated(negotiated_upgrade.clone());
+
                 let hello = SessionHello {
                     device_id: self.local_device_id.clone(),
                     grant: self.initial_grant.clone(),
                     crl_seq: self.initial_crl_seq,
                     groups: self.initial_groups.clone(),
                     route_seq: self.local_route_seq,
+                    upgrade: negotiated_upgrade,
                 };
                 let hello_json = Zeroizing::new(
                     serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -1067,6 +1132,7 @@ impl SessionMachine {
                     proto_version: 1,
                     signing_pub: self.local_signing_pub.to_b64url(),
                     rotation: self.local_rotation_chain.clone(),
+                    upgrade: self.local_upgrade_caps.clone(),
                 };
                 let hello_json = Zeroizing::new(
                     serde_json::to_vec(&hello).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -1091,6 +1157,15 @@ impl SessionMachine {
                 if hello.device_id != device_id(&peer_static) {
                     return Err(CoreError::ProtocolViolation(
                         "SessionHello device_id does not match static key",
+                    ));
+                }
+                if hello
+                    .upgrade
+                    .iter()
+                    .any(|c| !self.local_upgrade_caps.contains(c))
+                {
+                    return Err(CoreError::ProtocolViolation(
+                        "unoffered upgrade capability in session hello",
                     ));
                 }
 
@@ -1126,6 +1201,8 @@ impl SessionMachine {
                 self.peer_crl_seq = hello.crl_seq;
                 self.peer_groups = hello.groups;
                 self.peer_route_seq = hello.route_seq;
+                self.peer_upgrade_caps = hello.upgrade.clone();
+                self.upgrade_state.set_negotiated(hello.upgrade);
                 self.peer_device_id = Some(canonical_peer_id.clone());
                 self.peer_static_pub = Some(peer_static);
                 self.last_rekey_outgoing_ms = now_ms;
@@ -1220,6 +1297,10 @@ impl SessionMachine {
                         payload,
                         &mut self.route_sets,
                     )?,
+                    InnerFrameType::PathUpgrade => {
+                        let msg = self.upgrade_state.receive(payload)?;
+                        actions.push(SessionAction::PathUpgradeReceived(msg));
+                    }
                     InnerFrameType::Padding | InnerFrameType::Padded => {
                         return Err(CoreError::UnknownInnerFrameType(kind as u8));
                     }
