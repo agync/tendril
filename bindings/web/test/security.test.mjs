@@ -27,12 +27,14 @@ import {
   createIndexedDbVault,
   deriveV2RelayDial,
   dialIrohStream,
+  dialBrokerStream,
   dialRelayStream,
   dialRelayV2Stream,
   initTendril,
   initTendrilP2p,
   openTendrilVault,
   v2EpochWithinSkew,
+  validateBrokerWsUrl,
   validateRelayWsUrl,
 } from "../src/index.js";
 
@@ -215,6 +217,71 @@ test("SEC-14 validateRelayWsUrl enforces wss, SSRF, userinfo, fragment, and cont
     "ws://[::ffff:127.0.0.1]:8080/v1/relay",
   ]) {
     assert.ok(validateRelayWsUrl(loopback).url.startsWith("ws://"), loopback);
+  }
+});
+
+test("raw endpoint and relay URL errors never echo pairing codes or tokens", async () => {
+  await ensureWasm();
+  const leaks = ["tnd-", "AAAA-BBBB", "abcd-efgh", "code=", "s3cretTok"];
+  const check = (re) => (err) => {
+    assert.match(err.message, re);
+    for (const leak of leaks) {
+      assert.ok(!err.message.includes(leak), `leaked ${leak}: ${err.message}`);
+    }
+    return true;
+  };
+  for (const endpoint of [
+    "tendril://pair?code=tnd-AAAA-BBBB-CCCC",
+    "abcd-efgh",
+    "",
+    undefined,
+  ]) {
+    await assert.rejects(dialIrohStream({ endpoint }), check(/must start with iroh:\/\//));
+  }
+  for (const url of [
+    "tendril://pair?code=tnd-AAAA-BBBB-CCCC",
+    "http://abcd-efgh.example/",
+    "http://example.com/pair?token=s3cretTok",
+  ]) {
+    assert.throws(() => validateRelayWsUrl(url), check(/ws:\/\/ or wss:\/\//));
+    assert.throws(() => validateBrokerWsUrl(url), check(/ws:\/\/ or wss:\/\//));
+    assert.throws(
+      () => validateBrokerWsUrl(`broker+${url}`),
+      check(/broker\+ws\(s\):\/\/ or ws\(s\):\/\//)
+    );
+  }
+  assert.throws(
+    () => validateRelayWsUrl("not a url tnd-AAAA-BBBB-CCCC"),
+    check(/invalid relayUrl/)
+  );
+
+  const RealWebSocket = globalThis.WebSocket;
+  class FailingWebSocket extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    readyState = 0;
+    constructor() {
+      super();
+      setTimeout(() => this.dispatchEvent(new Event("error")), 0);
+    }
+    close() {}
+    send() {}
+  }
+  globalThis.WebSocket = FailingWebSocket;
+  try {
+    const secretUrl = "wss://relay.example/v1/relay?token=s3cretTok";
+    await assert.rejects(
+      dialBrokerStream({ url: secretUrl, timeoutMs: 1000 }),
+      check(/failed connecting to broker wss:\/\/relay\.example/)
+    );
+    await assert.rejects(
+      dialRelayStream({ relayUrl: secretUrl, targetPub: "AA", timeoutMs: 1000 }),
+      check(/failed connecting to relay wss:\/\/relay\.example/)
+    );
+  } finally {
+    globalThis.WebSocket = RealWebSocket;
   }
 });
 

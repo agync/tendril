@@ -322,6 +322,10 @@ export function dialRelayV2Stream(options: {
 
 export function dialIrohStream(options: {
   endpoint: string;
+  /**
+   * Single custom iroh relay for this dial, used when `p2pRelayUrls` is not set.
+   * `TendrilWebClient` passes it only for explicit endpoint dials.
+   */
   relayUrlOverride?: string | null;
   p2pRelayUrls?: string[] | null;
   p2pRelayAuthToken?: string | Uint8Array | null;
@@ -541,6 +545,11 @@ export interface WebTransportDialOptions {
   relayUrl?: string | null;
   targetPub?: string | null;
   expectedHost?: string | null;
+  /**
+   * Single custom iroh relay for an explicit `endpoint` dial only. Not applied to pairing-URI
+   * hints or stored routes, which dial through `p2pRelayUrls` or the n0 public relay map.
+   * Ignored when `p2pRelayUrls` is set.
+   */
   relayUrlOverride?: string | null;
   p2pRelayUrls?: string[] | null;
   p2pRelayAuthToken?: string | Uint8Array | null;
