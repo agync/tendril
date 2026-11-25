@@ -8,18 +8,19 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tendril_ffi::{
-    TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_OK, TENDRIL_WOULD_BLOCK,
-    TendrilEndpoint, TendrilSession, tendril_endpoint_apply_route_uri,
-    tendril_endpoint_clear_peer_routes, tendril_endpoint_configure_transports_json,
-    tendril_endpoint_confirm_peer, tendril_endpoint_export_identity_json, tendril_endpoint_free,
-    tendril_endpoint_info_json, tendril_endpoint_issue_pairing_uri, tendril_endpoint_mint_grant,
-    tendril_endpoint_new, tendril_endpoint_new_from_state, tendril_endpoint_new_sealed,
-    tendril_endpoint_pair_accept, tendril_endpoint_pair_uri, tendril_endpoint_pair_v2_accept,
-    tendril_endpoint_pair_v2_uri, tendril_endpoint_peer_routes, tendril_endpoint_refresh_routes,
-    tendril_endpoint_serve_direct, tendril_endpoint_set_peer_routes, tendril_last_error,
-    tendril_session_accept, tendril_session_accept_v2, tendril_session_connect,
-    tendril_session_connect_v2, tendril_session_connect_with_options, tendril_session_free,
-    tendril_session_poll_event, tendril_session_send_data, tendril_string_free,
+    TENDRIL_ERR_CLOSED, TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_OK,
+    TENDRIL_WOULD_BLOCK, TendrilEndpoint, TendrilSession, tendril_endpoint_apply_route_uri,
+    tendril_endpoint_clear_peer_routes, tendril_endpoint_close,
+    tendril_endpoint_configure_transports_json, tendril_endpoint_confirm_peer,
+    tendril_endpoint_export_identity_json, tendril_endpoint_free, tendril_endpoint_info_json,
+    tendril_endpoint_issue_pairing_uri, tendril_endpoint_mint_grant, tendril_endpoint_new,
+    tendril_endpoint_new_from_state, tendril_endpoint_new_sealed, tendril_endpoint_pair_accept,
+    tendril_endpoint_pair_uri, tendril_endpoint_pair_v2_accept, tendril_endpoint_pair_v2_uri,
+    tendril_endpoint_peer_routes, tendril_endpoint_refresh_routes, tendril_endpoint_serve_direct,
+    tendril_endpoint_set_peer_routes, tendril_last_error, tendril_session_accept,
+    tendril_session_accept_v2, tendril_session_connect, tendril_session_connect_v2,
+    tendril_session_connect_with_options, tendril_session_free, tendril_session_poll_event,
+    tendril_session_send_data, tendril_string_free,
 };
 
 fn cs(s: &str) -> CString {
@@ -1402,4 +1403,97 @@ fn connect_with_options_accepts_relay_host() {
     .expect("connect with an empty relay_host");
     c.send(b"relay host ok");
     h.expect_data(b"relay host ok");
+}
+
+fn close(ep: &Ep) {
+    assert_eq!(unsafe { tendril_endpoint_close(ep.raw()) }, TENDRIL_OK);
+}
+
+fn issue_rc(ep: &Ep) -> (i32, bool, String) {
+    let mut out = ptr::null_mut();
+    let rc = unsafe { tendril_endpoint_issue_pairing_uri(ep.raw(), ptr::null(), &raw mut out) };
+    let null = out.is_null();
+    if !null {
+        drop(unsafe { take_cstr(out) });
+    }
+    (rc, null, last_err())
+}
+
+fn refresh_rc(ep: &Ep, snapshot: Option<&Value>) -> (i32, bool, String) {
+    let s = snapshot.map(|v| cs(&v.to_string()));
+    let mut out = ptr::null_mut();
+    let rc = unsafe {
+        tendril_endpoint_refresh_routes(
+            ep.raw(),
+            s.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+            &raw mut out,
+        )
+    };
+    let null = out.is_null();
+    if !null {
+        drop(unsafe { take_cstr(out) });
+    }
+    (rc, null, last_err())
+}
+
+#[test]
+fn issue_pairing_uri_after_close_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let host = new_ep(Kind::StateDir, &tmp, "host", Some("closed-host"));
+    host.serve_direct("127.0.0.1:0");
+    close(&host);
+    let (rc, null, err) = issue_rc(&host);
+    assert_eq!(rc, TENDRIL_ERR_CLOSED, "{err}");
+    assert!(null, "no output on a closed endpoint");
+    assert!(err.contains("closed"), "{err}");
+
+    let idle = new_ep(Kind::StateDir, &tmp, "idle", Some("closed-idle"));
+    close(&idle);
+    let (rc, null, err) = issue_rc(&idle);
+    assert_eq!(rc, TENDRIL_ERR_CLOSED, "{err}");
+    assert!(null);
+    assert!(err.contains("closed"), "{err}");
+}
+
+#[test]
+fn refresh_routes_after_close_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let host = new_ep(Kind::StateDir, &tmp, "host", Some("closed-host"));
+    let endpoint = host.serve_direct("127.0.0.1:0");
+    close(&host);
+    let (rc, null, err) = refresh_rc(&host, None);
+    assert_eq!(rc, TENDRIL_ERR_CLOSED, "{err}");
+    assert!(null);
+    assert!(err.contains("closed"), "{err}");
+
+    let snap = snapshot(&endpoint);
+    let (rc, null, err) = refresh_rc(&host, Some(&snap));
+    assert_eq!(rc, TENDRIL_ERR_CLOSED, "{err}");
+    assert!(null);
+    assert!(err.contains("closed"), "{err}");
+
+    let idle = new_ep(Kind::StateDir, &tmp, "idle", Some("closed-idle"));
+    close(&idle);
+    assert_eq!(refresh_rc(&idle, None).0, TENDRIL_ERR_CLOSED);
+}
+
+#[test]
+fn close_is_idempotent_and_free_after_close_is_clean() {
+    let tmp = TempDir::new().unwrap();
+    let host = new_ep(Kind::StateDir, &tmp, "host", Some("closed-host"));
+    host.serve_direct("127.0.0.1:0");
+    close(&host);
+    close(&host);
+    drop(host);
+}
+
+#[test]
+fn serve_after_close_does_not_start_hosting() {
+    let tmp = TempDir::new().unwrap();
+    let host = new_ep(Kind::StateDir, &tmp, "host", Some("closed-host"));
+    close(&host);
+    host.serve_direct("127.0.0.1:0");
+    let (rc, null, err) = issue_rc(&host);
+    assert_eq!(rc, TENDRIL_ERR_CLOSED, "{err}");
+    assert!(null);
 }

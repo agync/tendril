@@ -165,7 +165,8 @@ int32_t tendril_endpoint_enroll_initiate(
  * sign_routes (default true).
  */
 /* options_json_opt: NULL or {"kind": "auto"|"lan"|"remote", "host_name": str, "sign_routes": bool}.
- * out_json: {"uri", "code_kind", "dropped", "uri_len", "qr_version_m", "route_seq"}. */
+ * out_json: {"uri", "code_kind", "dropped", "uri_len", "qr_version_m", "route_seq"}.
+ * Returns TENDRIL_ERR_CLOSED after tendril_endpoint_close. */
 int32_t tendril_endpoint_issue_pairing_uri(
     TendrilEndpoint *ep,
     const char *options_json_opt,
@@ -219,7 +220,7 @@ int32_t tendril_endpoint_apply_route_uri(
 );
 /* Host re-scan. snapshot_json_opt: NULL or the complete network snapshot
  * {"networks": [{"id", "iface", "if_index", "transports", "addrs"}]}. out_json may be NULL;
- * otherwise {"route_seq", "changed"}. */
+ * otherwise {"route_seq", "changed"}. Returns TENDRIL_ERR_CLOSED after tendril_endpoint_close. */
 int32_t tendril_endpoint_refresh_routes(
     TendrilEndpoint *ep,
     const char *snapshot_json_opt,
