@@ -232,6 +232,15 @@ class IrohStream {
 
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
+function makeAbortError(signal) {
+  if (signal?.reason instanceof Error) {
+    return signal.reason;
+  }
+  const err = new Error("dial aborted");
+  err.name = "AbortError";
+  return err;
+}
+
 export async function dialIrohStream({
   endpoint,
   relayUrlOverride = null,
@@ -240,7 +249,11 @@ export async function dialIrohStream({
   p2pApiSecret = null,
   hint = false,
   timeoutMs = 15000,
+  signal = null,
 }) {
+  if (signal?.aborted) {
+    throw makeAbortError(signal);
+  }
   if (p2pApiSecret) {
     throw new Error(
       "p2pApiSecret is not permitted in browser clients; pass a scoped p2pRelayAuthToken"
@@ -281,8 +294,12 @@ export async function dialIrohStream({
     relayUrlsJson = JSON.stringify([trimmedRelayOverride]);
   }
   const mod = await ensureP2pReady();
+  if (signal?.aborted) {
+    throw makeAbortError(signal);
+  }
   let timer = null;
-  let timedOut = false;
+  let closedOrAborted = false;
+  let onAbort = null;
   const useOptions = relayUrlsJson !== null || authTokenStr !== null;
   const dialPromise = (useOptions
     ? mod.WasmIrohStream.dial_with_options(
@@ -295,7 +312,7 @@ export async function dialIrohStream({
     : mod.WasmIrohStream.dial(endpoint, trimmedRelayOverride || null, timeoutMs, Boolean(hint))
   )
     .then(async (stream) => {
-      if (timedOut) {
+      if (closedOrAborted) {
         try {
           await stream.close();
         } catch {}
@@ -305,23 +322,42 @@ export async function dialIrohStream({
       return stream;
     })
     .catch((err) => {
-      if (timedOut) {
+      if (closedOrAborted) {
         return null;
       }
       throw err;
     });
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(() => {
-      timedOut = true;
+      closedOrAborted = true;
       reject(new Error("timed out connecting to iroh endpoint"));
     }, timeoutMs);
   });
+  const racers = [dialPromise, timeoutPromise];
+  if (signal) {
+    racers.push(
+      new Promise((_, reject) => {
+        onAbort = () => {
+          closedOrAborted = true;
+          reject(makeAbortError(signal));
+        };
+        if (signal.aborted) {
+          onAbort();
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+      })
+    );
+  }
   let inner;
   try {
-    inner = await Promise.race([dialPromise, timeoutPromise]);
+    inner = await Promise.race(racers);
   } finally {
     if (timer !== null) {
       clearTimeout(timer);
+    }
+    if (signal && onAbort) {
+      signal.removeEventListener("abort", onAbort);
     }
   }
   return new IrohStream(inner);

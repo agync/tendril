@@ -5,7 +5,7 @@ pub mod group;
 #[cfg(feature = "p2p-iroh")]
 pub mod p2p;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -28,7 +28,9 @@ use tendril_core::pairing::{
     classify_endpoint_hint, is_v2_relay_hint, mint_enrollment_token as core_mint_enrollment_token,
     persistable_routes,
 };
-use tendril_core::policy::ProviderId;
+use tendril_core::policy::{
+    CandidateEndpoint, PathPlanner, PathPolicyConfig, PlannerAction, ProviderId, sort_key,
+};
 use tendril_core::relay_auth::{
     RelayAuthRole, compute_relay_auth_hmac_b64 as core_compute_relay_auth_hmac_b64,
     mint_relay_ticket as core_mint_relay_ticket, origin_allowed,
@@ -986,6 +988,9 @@ struct SessionCandidateOpts {
     route_policy: Option<String>,
     /// `iroh://` hints are dialable (the `p2p-iroh` WASM module loaded).
     p2p: bool,
+    /// Permit cleartext `ws://` and `broker+ws://` outside loopback hosts.
+    #[serde(default)]
+    allow_insecure_ws: bool,
 }
 
 fn source_strength(source: &str) -> u8 {
@@ -1053,22 +1058,47 @@ fn filter_browser_iroh_hint(endpoint: &str, source: &str) -> Result<String, &'st
     })
 }
 
-/// The skip reason of a hint core refused: `insecure_ws` for a `ws://` relay that core refuses
-/// only because its host is off loopback (the `wss://` form is valid), else `invalid`.
-fn insecure_ws_or_invalid(hint: &str) -> &'static str {
-    let (prefix, url) = hint
-        .strip_prefix("relay:")
-        .map_or(("", hint), |rest| ("relay:", rest));
-    match url.strip_prefix("ws://") {
-        Some(rest) if classify_endpoint_hint(&format!("{prefix}wss://{rest}")).is_ok() => {
-            "insecure_ws"
-        }
-        _ => "invalid",
+fn split_ws_prefix(hint: &str) -> (&str, &str) {
+    if let Some(rest) = hint.strip_prefix("relay:") {
+        ("relay:", rest)
+    } else if let Some(rest) = hint.strip_prefix("broker+") {
+        ("broker+", rest)
+    } else {
+        ("", hint)
     }
 }
 
+fn classify_browser_hint(hint: &str, allow_insecure_ws: bool) -> Result<ProviderId, &'static str> {
+    if hint.contains('#') {
+        return Err("invalid");
+    }
+    if let Ok(provider) = classify_endpoint_hint(hint) {
+        if provider != ProviderId::P2p && hint_has_blocked_literal(hint) {
+            return Err("blocked_address");
+        }
+        return Ok(provider);
+    }
+    let (prefix, url) = split_ws_prefix(hint);
+    if url.starts_with("wss://") || url.starts_with("ws://") {
+        if url_host_blocked(url) {
+            return Err("blocked_address");
+        }
+        if let Some(rest) = url.strip_prefix("ws://") {
+            let secure = format!("{prefix}wss://{rest}");
+            if let Ok(provider) = classify_endpoint_hint(&secure) {
+                return if allow_insecure_ws {
+                    Ok(provider)
+                } else {
+                    Err("insecure_ws")
+                };
+            }
+        }
+    }
+    Err("invalid")
+}
+
 /// Checks one hint for a browser Day-2 dial. `Ok` carries the provider and the endpoint string
-/// to dial (`relay:` and `p2p:` prefixes stripped); `Err` the skip reason.
+/// to dial (`relay:`, `p2p:`, and `broker+` prefixes stripped); `Err` the skip reason.
 fn check_browser_hint(
     hint: &str,
     source: &str,
@@ -1076,15 +1106,9 @@ fn check_browser_hint(
     opts: &SessionCandidateOpts,
     relay_v2_authorized: bool,
 ) -> Result<(ProviderId, String), &'static str> {
-    if hint.contains('#') {
-        return Err("invalid");
-    }
-    let provider = classify_endpoint_hint(hint).map_err(|_| insecure_ws_or_invalid(hint))?;
+    let provider = classify_browser_hint(hint, opts.allow_insecure_ws)?;
     if provider == ProviderId::Local && source == "uri" {
         return Err("ipc_from_uri");
-    }
-    if provider != ProviderId::P2p && hint_has_blocked_literal(hint) {
-        return Err("blocked_address");
     }
     match provider {
         ProviderId::Relay => {
@@ -1100,6 +1124,14 @@ fn check_browser_hint(
             url::Url::parse(endpoint).map_err(|_| "invalid")?;
             Ok((provider, endpoint.to_owned()))
         }
+        ProviderId::Broker => {
+            let endpoint = hint.strip_prefix("broker+").unwrap_or(hint);
+            let parsed = url::Url::parse(endpoint).map_err(|_| "invalid")?;
+            if !parsed.host_str().is_some_and(|h| !h.is_empty()) {
+                return Err("invalid");
+            }
+            Ok((provider, endpoint.to_owned()))
+        }
         ProviderId::P2p => {
             if !opts.p2p {
                 return Err("p2p_feature_disabled");
@@ -1107,9 +1139,7 @@ fn check_browser_hint(
             let endpoint = hint.strip_prefix("p2p:").unwrap_or(hint);
             Ok((provider, filter_browser_iroh_hint(endpoint, source)?))
         }
-        ProviderId::Local | ProviderId::Direct | ProviderId::Overlay | ProviderId::Broker => {
-            Err("browser_unsupported")
-        }
+        ProviderId::Local | ProviderId::Direct | ProviderId::Overlay => Err("browser_unsupported"),
     }
 }
 
@@ -1173,16 +1203,16 @@ fn session_candidates_value(
     }
 
     let relay_v2_ready = entry.v2_secrets.is_some();
-    let mut candidates: Vec<(ProviderId, serde_json::Value)> = Vec::new();
+    let mut candidates: Vec<(CandidateEndpoint, serde_json::Value)> = Vec::new();
     let mut skipped = Vec::new();
-    for (hint, source) in &inputs {
+    for (idx, (hint, source)) in inputs.iter().enumerate() {
         let authorized = relay_v2_ready
             && entry.routes.iter().any(|r| {
                 r.hint == *hint && matches!(r.source, RouteSource::Operator | RouteSource::Signed)
             });
         match check_browser_hint(hint, source, wire, opts, authorized) {
             Ok((provider, endpoint)) => candidates.push((
-                provider,
+                CandidateEndpoint::new(idx, provider, hint.as_str()),
                 json!({
                     "hint": hint,
                     "endpoint": endpoint,
@@ -1193,7 +1223,7 @@ fn session_candidates_value(
             Err(reason) => skipped.push(json!({ "hint": hint, "reason": reason })),
         }
     }
-    candidates.sort_by_key(|(provider, _)| provider.rank());
+    candidates.sort_by_key(|(ep, _)| sort_key(ep));
     let relay_key = expectation
         .relay_pub()
         .copied()
@@ -3789,6 +3819,337 @@ impl WasmV2SessionInitiator {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PlannerCandidateInput {
+    Hint(String),
+    Descriptor {
+        addr: String,
+        #[serde(default)]
+        id: Option<usize>,
+        #[serde(default)]
+        provider: Option<String>,
+    },
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WasmPathPolicyConfigInput {
+    attempt_stagger_ms: Option<f64>,
+    p2p_cold_delay_ms: Option<f64>,
+    per_attempt_timeout_ms: Option<f64>,
+    exhaustion_timeout_ms: Option<f64>,
+}
+
+fn parse_provider_id(name: &str) -> Result<ProviderId, WasmError> {
+    match name {
+        "local" => Ok(ProviderId::Local),
+        "direct" => Ok(ProviderId::Direct),
+        "overlay" => Ok(ProviderId::Overlay),
+        "p2p" => Ok(ProviderId::P2p),
+        "relay" => Ok(ProviderId::Relay),
+        "broker" => Ok(ProviderId::Broker),
+        _ => Err(WasmError::from(format!("unknown provider '{name}'"))),
+    }
+}
+
+fn candidate_endpoint_json(c: &CandidateEndpoint) -> serde_json::Value {
+    json!({
+        "id": c.id,
+        "provider": provider_name(c.provider),
+        "addr": c.addr,
+        "is_numeric_host": c.is_numeric_host,
+    })
+}
+
+fn planner_action_json(action: &PlannerAction) -> serde_json::Value {
+    match action {
+        PlannerAction::DialCandidate(c) => json!({
+            "action": "dial_candidate",
+            "candidate": candidate_endpoint_json(c),
+        }),
+        PlannerAction::CancelCandidate(id) => json!({
+            "action": "cancel_candidate",
+            "id": id,
+        }),
+        PlannerAction::ActivatePath(c) => json!({
+            "action": "activate_path",
+            "candidate": candidate_endpoint_json(c),
+        }),
+        PlannerAction::ProbeBetterPath(c) => json!({
+            "action": "probe_better_path",
+            "candidate": candidate_endpoint_json(c),
+        }),
+        PlannerAction::CloseActivePath { id, reason } => json!({
+            "action": "close_active_path",
+            "id": id,
+            "reason": reason,
+        }),
+        PlannerAction::AllCandidatesExhausted => json!({
+            "action": "all_candidates_exhausted",
+        }),
+    }
+}
+
+/// Sans-I/O Happy Eyeballs multi-route path planner wrapping `tendril_core::policy::PathPlanner`.
+#[wasm_bindgen]
+pub struct WasmPathPlanner {
+    inner: PathPlanner,
+    per_attempt_timeout_ms: Option<u64>,
+    exhaustion_timeout_ms: Option<u64>,
+    exhaustion_deadline_ms: Option<u64>,
+    in_flight: BTreeSet<usize>,
+    attempt_deadlines: BTreeMap<usize, u64>,
+    pending: VecDeque<PlannerAction>,
+    started: bool,
+    exhausted: bool,
+}
+
+impl WasmPathPlanner {
+    fn new_inner(candidates_json: &str, config_json: Option<&str>) -> Result<Self, WasmError> {
+        let raw_candidates: Vec<PlannerCandidateInput> = serde_json::from_str(candidates_json)
+            .map_err(|e| WasmError::from(format!("invalid candidates_json: {e}")))?;
+        let mut seen_ids = BTreeSet::new();
+        let mut candidates = Vec::with_capacity(raw_candidates.len());
+        for (idx, item) in raw_candidates.into_iter().enumerate() {
+            let (id, provider, addr) = match item {
+                PlannerCandidateInput::Hint(hint) => {
+                    let provider = classify_endpoint_hint(&hint).map_err(WasmError::from)?;
+                    (idx, provider, hint)
+                }
+                PlannerCandidateInput::Descriptor { addr, id, provider } => {
+                    if addr.trim().is_empty() {
+                        return Err(WasmError::from("candidate addr must not be empty"));
+                    }
+                    let cid = id.unwrap_or(idx);
+                    let prov = match provider.as_deref() {
+                        Some(p) => parse_provider_id(p)?,
+                        None => classify_endpoint_hint(&addr).map_err(WasmError::from)?,
+                    };
+                    (cid, prov, addr)
+                }
+            };
+            if !seen_ids.insert(id) {
+                return Err(WasmError::from(format!("duplicate candidate id {id}")));
+            }
+            candidates.push(CandidateEndpoint::new(id, provider, addr));
+        }
+
+        let cfg_input: WasmPathPolicyConfigInput = match config_json {
+            Some(raw) if !raw.trim().is_empty() => serde_json::from_str(raw)
+                .map_err(|e| WasmError::from(format!("invalid config_json: {e}")))?,
+            _ => WasmPathPolicyConfigInput::default(),
+        };
+        let mut policy = PathPolicyConfig::default();
+        if let Some(v) = cfg_input.attempt_stagger_ms {
+            policy.happy_eyeballs_stagger_ms = f64_to_u64(v, "attempt_stagger_ms")?;
+        }
+        if let Some(v) = cfg_input.p2p_cold_delay_ms {
+            policy.p2p_cold_delay_ms = f64_to_u64(v, "p2p_cold_delay_ms")?;
+        }
+        let per_attempt_timeout_ms = cfg_input
+            .per_attempt_timeout_ms
+            .map(|v| f64_to_u64(v, "per_attempt_timeout_ms"))
+            .transpose()?;
+        let exhaustion_timeout_ms = cfg_input
+            .exhaustion_timeout_ms
+            .map(|v| f64_to_u64(v, "exhaustion_timeout_ms"))
+            .transpose()?;
+
+        Ok(Self {
+            inner: PathPlanner::new(policy, candidates),
+            per_attempt_timeout_ms,
+            exhaustion_timeout_ms,
+            exhaustion_deadline_ms: None,
+            in_flight: BTreeSet::new(),
+            attempt_deadlines: BTreeMap::new(),
+            pending: VecDeque::new(),
+            started: false,
+            exhausted: false,
+        })
+    }
+
+    fn absorb_inner_actions(&mut self, now_ms: u64) {
+        for action in self.inner.drain_actions() {
+            match &action {
+                PlannerAction::DialCandidate(cand) => {
+                    self.in_flight.insert(cand.id);
+                    if let Some(timeout_ms) = self.per_attempt_timeout_ms {
+                        self.attempt_deadlines
+                            .insert(cand.id, now_ms.saturating_add(timeout_ms));
+                    }
+                }
+                PlannerAction::CancelCandidate(id) | PlannerAction::CloseActivePath { id, .. } => {
+                    self.in_flight.remove(id);
+                    self.attempt_deadlines.remove(id);
+                }
+                PlannerAction::ActivatePath(_) => {
+                    self.in_flight.clear();
+                    self.attempt_deadlines.clear();
+                    self.exhaustion_deadline_ms = None;
+                }
+                PlannerAction::AllCandidatesExhausted => {
+                    self.exhausted = true;
+                    self.in_flight.clear();
+                    self.attempt_deadlines.clear();
+                    self.exhaustion_deadline_ms = None;
+                }
+                PlannerAction::ProbeBetterPath(_) => {}
+            }
+            self.pending.push_back(action);
+        }
+    }
+
+    fn start_inner(&mut self, now_ms: f64) -> Result<(), WasmError> {
+        let now = f64_to_u64(now_ms, "now_ms")?;
+        self.started = true;
+        self.exhausted = false;
+        self.in_flight.clear();
+        self.attempt_deadlines.clear();
+        self.exhaustion_deadline_ms = self.exhaustion_timeout_ms.map(|t| now.saturating_add(t));
+        self.inner.start(now);
+        self.absorb_inner_actions(now);
+        Ok(())
+    }
+
+    fn tick_inner(&mut self, now_ms: f64) -> Result<(), WasmError> {
+        let now = f64_to_u64(now_ms, "now_ms")?;
+        if !self.started || self.exhausted {
+            return Ok(());
+        }
+        if self.inner.active_candidate().is_none() {
+            if let Some(exhaust_at) = self.exhaustion_deadline_ms
+                && now >= exhaust_at
+            {
+                let to_cancel: Vec<usize> = self.in_flight.iter().copied().collect();
+                for id in to_cancel {
+                    self.pending.push_back(PlannerAction::CancelCandidate(id));
+                }
+                self.in_flight.clear();
+                self.attempt_deadlines.clear();
+                self.exhaustion_deadline_ms = None;
+                self.exhausted = true;
+                self.pending
+                    .push_back(PlannerAction::AllCandidatesExhausted);
+                return Ok(());
+            }
+            let timed_out: Vec<usize> = self
+                .attempt_deadlines
+                .iter()
+                .filter_map(|(&id, &dl)| (now >= dl).then_some(id))
+                .collect();
+            for id in timed_out {
+                self.in_flight.remove(&id);
+                self.attempt_deadlines.remove(&id);
+                self.pending.push_back(PlannerAction::CancelCandidate(id));
+                self.inner.on_dial_failed(id, "attempt timed out", now);
+                self.absorb_inner_actions(now);
+            }
+            if self.exhausted {
+                return Ok(());
+            }
+        }
+        self.inner.tick(now);
+        self.absorb_inner_actions(now);
+        Ok(())
+    }
+
+    fn on_dial_succeeded_inner(&mut self, id: usize, now_ms: f64) -> Result<(), WasmError> {
+        let now = f64_to_u64(now_ms, "now_ms")?;
+        self.in_flight.remove(&id);
+        self.attempt_deadlines.remove(&id);
+        self.inner.on_dial_succeeded(id, now);
+        self.absorb_inner_actions(now);
+        Ok(())
+    }
+
+    fn on_dial_failed_inner(
+        &mut self,
+        id: usize,
+        reason: &str,
+        now_ms: f64,
+    ) -> Result<(), WasmError> {
+        let now = f64_to_u64(now_ms, "now_ms")?;
+        self.in_flight.remove(&id);
+        self.attempt_deadlines.remove(&id);
+        self.inner.on_dial_failed(id, reason, now);
+        self.absorb_inner_actions(now);
+        Ok(())
+    }
+
+    fn drain_actions_json(&mut self) -> String {
+        let actions: Vec<serde_json::Value> = self
+            .pending
+            .drain(..)
+            .map(|a| planner_action_json(&a))
+            .collect();
+        serde_json::Value::Array(actions).to_string()
+    }
+
+    fn next_deadline_inner(&self) -> Option<f64> {
+        if !self.started || self.exhausted {
+            return None;
+        }
+        if self.inner.active_candidate().is_some() {
+            return self
+                .inner
+                .next_deadline_ms()
+                .and_then(|v| u64_to_f64(v).ok());
+        }
+        let mut earliest = self.inner.next_deadline_ms();
+        if let Some(attempt_dl) = self.attempt_deadlines.values().copied().min() {
+            earliest = Some(earliest.map_or(attempt_dl, |e| e.min(attempt_dl)));
+        }
+        if let Some(exhaust_dl) = self.exhaustion_deadline_ms {
+            earliest = Some(earliest.map_or(exhaust_dl, |e| e.min(exhaust_dl)));
+        }
+        earliest.and_then(|v| u64_to_f64(v).ok())
+    }
+}
+
+#[wasm_bindgen]
+impl WasmPathPlanner {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        candidates_json: &str,
+        config_json: Option<String>,
+    ) -> Result<WasmPathPlanner, JsValue> {
+        Self::new_inner(candidates_json, config_json.as_deref()).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn start(&mut self, now_ms: f64) -> Result<(), JsValue> {
+        self.start_inner(now_ms).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn tick(&mut self, now_ms: f64) -> Result<(), JsValue> {
+        self.tick_inner(now_ms).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn on_dial_succeeded(&mut self, id: usize, now_ms: f64) -> Result<(), JsValue> {
+        self.on_dial_succeeded_inner(id, now_ms).map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn on_dial_failed(&mut self, id: usize, reason: &str, now_ms: f64) -> Result<(), JsValue> {
+        self.on_dial_failed_inner(id, reason, now_ms)
+            .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn drain_actions(&mut self) -> String {
+        self.drain_actions_json()
+    }
+
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn next_deadline_ms(&self) -> Option<f64> {
+        self.next_deadline_inner()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tendril_core::crypto::b64url_decode;
@@ -6070,12 +6431,12 @@ mod route_tests {
         assert_eq!(
             candidates_of(&out),
             [
+                ("ws://127.0.0.1:9/v1/relay".to_owned(), "uri".to_owned()),
                 (RELAY_V1.to_owned(), "operator".to_owned()),
                 (
                     "wss://new.example.test/v1/relay".to_owned(),
                     "uri".to_owned()
                 ),
-                ("ws://127.0.0.1:9/v1/relay".to_owned(), "uri".to_owned()),
             ]
         );
         let skipped = skipped_of(&out);
@@ -6532,5 +6893,182 @@ mod route_tests {
             "invalid_pairing_uri",
             "route input errors are invalid_pairing_uri"
         );
+    }
+
+    #[test]
+    fn session_candidates_admit_broker_allow_insecure_ws_and_rank_v2_before_v1() {
+        let (mut roster, _host) = roster_with_routes();
+        roster
+            .set_routes_inner(
+                "host-l6a",
+                &json!([
+                    "wss://198.51.100.10/v1/relay",
+                    "wss://dns.example.test/v2/relay",
+                    "broker+wss://broker.example.test/b",
+                    "broker+ws://127.0.0.1:9000/b",
+                ])
+                .to_string(),
+            )
+            .unwrap();
+        let mut json_roster: serde_json::Value = serde_json::to_value(&roster.inner).unwrap();
+        json_roster["entries"]["host-l6a"]["routes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "hint": "broker+ws://insecure-broker.example.test/b", "source": "operator" }));
+        json_roster["entries"]["host-l6a"]["routes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "hint": "ws://insecure-relay.example.test/v1/relay", "source": "operator" }));
+        json_roster["entries"]["host-l6a"]["routes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "hint": "broker+ws://169.254.169.254/b", "source": "operator" }));
+        json_roster["entries"]["host-l6a"]["routes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "hint": "broker+wss://169.254.169.254/b", "source": "operator" }));
+        roster.replace_from_json(&json_roster.to_string()).unwrap();
+
+        let default_v2 = to_json(
+            &roster
+                .session_candidates_inner("host-l6a", Some(r#"{"wire":2}"#))
+                .unwrap(),
+        );
+        assert_eq!(
+            candidates_of(&default_v2),
+            [
+                (
+                    "wss://dns.example.test/v2/relay".to_owned(),
+                    "operator".to_owned()
+                ),
+                (
+                    "wss://198.51.100.10/v1/relay".to_owned(),
+                    "operator".to_owned()
+                ),
+                (
+                    "broker+ws://127.0.0.1:9000/b".to_owned(),
+                    "operator".to_owned()
+                ),
+                (
+                    "broker+wss://broker.example.test/b".to_owned(),
+                    "operator".to_owned()
+                ),
+            ]
+        );
+        let skipped = skipped_of(&default_v2);
+        assert!(skipped.contains(&(
+            "broker+ws://insecure-broker.example.test/b".to_owned(),
+            "insecure_ws".to_owned()
+        )));
+        assert!(skipped.contains(&(
+            "ws://insecure-relay.example.test/v1/relay".to_owned(),
+            "insecure_ws".to_owned()
+        )));
+        assert!(skipped.contains(&(
+            "broker+ws://169.254.169.254/b".to_owned(),
+            "blocked_address".to_owned()
+        )));
+        assert!(skipped.contains(&(
+            "broker+wss://169.254.169.254/b".to_owned(),
+            "blocked_address".to_owned()
+        )));
+
+        let allow_insecure = to_json(
+            &roster
+                .session_candidates_inner(
+                    "host-l6a",
+                    Some(r#"{"wire":2,"allow_insecure_ws":true}"#),
+                )
+                .unwrap(),
+        );
+        let hints: Vec<String> = candidates_of(&allow_insecure)
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert!(hints.contains(&"broker+ws://insecure-broker.example.test/b".to_owned()));
+        assert!(hints.contains(&"ws://insecure-relay.example.test/v1/relay".to_owned()));
+        assert_eq!(hints[0], "wss://dns.example.test/v2/relay");
+    }
+
+    #[test]
+    fn wasm_path_planner_staggers_enforces_p2p_cold_delay_and_rejects_bad_timestamps() {
+        let cands = json!([
+            { "addr": "wss://198.51.100.10/v1/relay", "id": 10, "provider": "relay" },
+            { "addr": "wss://v2.example.test/v2/relay", "id": 11, "provider": "relay" },
+            { "addr": "iroh://abcdefghijklmnop", "id": 12 },
+            { "addr": "broker+wss://broker.example.test/b", "id": 13 },
+        ])
+        .to_string();
+        let mut planner = WasmPathPlanner::new_inner(&cands, None).unwrap();
+        assert_eq!(planner.next_deadline_inner(), None);
+
+        // Reject negative / non-finite / fractional timestamps cleanly.
+        assert!(planner.start_inner(-1.0).is_err());
+        assert!(planner.start_inner(f64::NAN).is_err());
+        assert!(planner.start_inner(f64::INFINITY).is_err());
+        assert!(planner.tick_inner(-5.0).is_err());
+        assert!(planner.on_dial_succeeded_inner(12, f64::NAN).is_err());
+        assert!(planner.on_dial_failed_inner(12, "err", -1.0).is_err());
+
+        // Start launches P2P (id 12) at t=0; /v2/relay (id 11) waits 250 ms stagger.
+        planner.start_inner(0.0).unwrap();
+        let a0: Vec<serde_json::Value> =
+            serde_json::from_str(&planner.drain_actions_json()).unwrap();
+        assert_eq!(a0.len(), 1);
+        assert_eq!(a0[0]["action"], "dial_candidate");
+        assert_eq!(a0[0]["candidate"]["id"], 12);
+        assert_eq!(planner.next_deadline_inner(), Some(250.0));
+
+        // At t=250, /v2/relay launches; next stagger is /v1/relay (id 10) at t=500.
+        planner.tick_inner(250.0).unwrap();
+        let a1: Vec<serde_json::Value> =
+            serde_json::from_str(&planner.drain_actions_json()).unwrap();
+        assert_eq!(a1.len(), 1);
+        assert_eq!(a1[0]["candidate"]["id"], 11);
+        assert_eq!(planner.next_deadline_inner(), Some(500.0));
+
+        // /v2/relay succeeds at t=300 -> cancels P2P (id 12) and activates /v2/relay.
+        planner.on_dial_succeeded_inner(11, 300.0).unwrap();
+        let win: Vec<serde_json::Value> =
+            serde_json::from_str(&planner.drain_actions_json()).unwrap();
+        assert_eq!(win[0]["action"], "cancel_candidate");
+        assert_eq!(win[0]["id"], 12);
+        assert_eq!(win[1]["action"], "activate_path");
+        assert_eq!(win[1]["candidate"]["id"], 11);
+
+        // Cold-start P2P hold delay when non-P2P starts first, plus per_attempt_timeout_ms.
+        let cold_cands = json!(["direct:192.168.1.10:7000", "iroh://abcdefghijklmnop"]).to_string();
+        let mut cold = WasmPathPlanner::new_inner(
+            &cold_cands,
+            Some(r#"{"per_attempt_timeout_ms":1000,"exhaustion_timeout_ms":3000}"#),
+        )
+        .unwrap();
+        cold.start_inner(0.0).unwrap();
+        let first: Vec<serde_json::Value> =
+            serde_json::from_str(&cold.drain_actions_json()).unwrap();
+        assert_eq!(first[0]["candidate"]["provider"], "direct");
+        assert_eq!(cold.next_deadline_inner(), Some(500.0));
+
+        // Failing direct early at t=100 still holds P2P until 500 ms.
+        cold.on_dial_failed_inner(0, "refused", 100.0).unwrap();
+        let after_fail: Vec<serde_json::Value> =
+            serde_json::from_str(&cold.drain_actions_json()).unwrap();
+        assert!(after_fail.is_empty());
+        assert_eq!(cold.next_deadline_inner(), Some(500.0));
+
+        cold.tick_inner(500.0).unwrap();
+        let p2p_act: Vec<serde_json::Value> =
+            serde_json::from_str(&cold.drain_actions_json()).unwrap();
+        assert_eq!(p2p_act[0]["candidate"]["provider"], "p2p");
+        assert_eq!(cold.next_deadline_inner(), Some(1500.0));
+
+        // Per-attempt timeout at t=1500 cancels P2P and exhausts all candidates.
+        cold.tick_inner(1500.0).unwrap();
+        let timeout_acts: Vec<serde_json::Value> =
+            serde_json::from_str(&cold.drain_actions_json()).unwrap();
+        assert_eq!(timeout_acts[0]["action"], "cancel_candidate");
+        assert_eq!(timeout_acts[0]["id"], 1);
+        assert_eq!(timeout_acts[1]["action"], "all_candidates_exhausted");
+        assert_eq!(cold.next_deadline_inner(), None);
     }
 }

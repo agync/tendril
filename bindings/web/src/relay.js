@@ -205,6 +205,79 @@ export function validateRelayWsUrl(relayUrl, allowInsecureWs = false) {
   return { url: parsed.toString(), bareHost, host };
 }
 
+export function validateBrokerWsUrl(brokerUrl, allowInsecureWs = false) {
+  if (typeof brokerUrl !== "string") {
+    throw new Error("brokerUrl must be a string");
+  }
+  for (let i = 0; i < brokerUrl.length; i += 1) {
+    const code = brokerUrl.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) {
+      throw new Error("brokerUrl contains control characters");
+    }
+  }
+  const trimmed = brokerUrl.trim();
+  const target = /^broker\+/i.test(trimmed) ? trimmed.slice(7) : trimmed;
+  if (/^broker\+/i.test(trimmed) && !/^wss?:\/\//i.test(target)) {
+    throw new Error(`brokerUrl must use broker+ws(s):// or ws(s)://: ${brokerUrl}`);
+  }
+  return validateRelayWsUrl(target, allowInsecureWs);
+}
+
+function abortError(signal) {
+  if (signal?.reason instanceof Error) {
+    return signal.reason;
+  }
+  const err = new Error("dial aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+function waitForWsOpen(ws, canonicalUrl, label, timeoutMs, signal = null) {
+  if (signal?.aborted) {
+    return Promise.reject(abortError(signal));
+  }
+  if (ws.readyState === WebSocket.OPEN) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      ws.removeEventListener("open", onOpen);
+      ws.removeEventListener("error", onErr);
+      ws.removeEventListener("close", onClose);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (err) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    };
+    const onOpen = () => finish(null);
+    const onErr = () => finish(new Error(`failed connecting to ${label} ${canonicalUrl}`));
+    const onClose = () => finish(new Error(`${label} WebSocket closed before open`));
+    const onAbort = () => finish(abortError(signal));
+    timer = setTimeout(() => {
+      finish(new Error(`${label} WebSocket open timed out`));
+    }, timeoutMs);
+    ws.addEventListener("open", onOpen, { once: true });
+    ws.addEventListener("error", onErr, { once: true });
+    ws.addEventListener("close", onClose, { once: true });
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function randomConnIdB64() {
   const buf = new Uint8Array(16);
   crypto.getRandomValues(buf);
@@ -485,8 +558,12 @@ async function openRelayHandshake({
   expectedHost = null,
   allowInsecureWs = false,
   timeoutMs = 15000,
+  signal = null,
   buildDialMsg,
 }) {
+  if (signal?.aborted) {
+    throw abortError(signal);
+  }
   const { url: canonicalUrl, host: urlHost } = validateRelayWsUrl(relayUrl, allowInsecureWs);
   const expHost = canonicalizeHostForCompare(expectedHost || urlHost);
 
@@ -520,6 +597,13 @@ async function openRelayHandshake({
       ws.close(1002, "protocol error");
     } catch {}
   };
+
+  const onAbort = () => {
+    if (!ready) {
+      failCtrl(abortError(signal));
+    }
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
 
   ws.addEventListener("message", (ev) => {
     if (!ready) {
@@ -583,6 +667,9 @@ async function openRelayHandshake({
     if (ctrlErr) {
       return Promise.reject(ctrlErr);
     }
+    if (signal?.aborted) {
+      return Promise.reject(abortError(signal));
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const idx = ctrlWaiters.indexOf(w);
@@ -606,31 +693,7 @@ async function openRelayHandshake({
   };
 
   try {
-    await new Promise((resolve, reject) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        resolve();
-        return;
-      }
-      const timer = setTimeout(() => {
-        reject(new Error("relay WebSocket open timed out"));
-      }, timeoutMs);
-      ws.addEventListener(
-        "open",
-        () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        { once: true }
-      );
-      ws.addEventListener(
-        "error",
-        () => {
-          clearTimeout(timer);
-          reject(new Error(`failed connecting to relay ${canonicalUrl}`));
-        },
-        { once: true }
-      );
-    });
+    await waitForWsOpen(ws, canonicalUrl, "relay", timeoutMs, signal);
 
     const challenge = await nextControl();
     if (!challenge || challenge.op !== "challenge") {
@@ -655,6 +718,9 @@ async function openRelayHandshake({
     }
 
     const { connId, payload } = await buildDialMsg(challenge);
+    if (signal?.aborted) {
+      throw abortError(signal);
+    }
     ws.send(JSON.stringify(payload));
 
     const reply = await nextControl();
@@ -672,6 +738,68 @@ async function openRelayHandshake({
   } catch (err) {
     stream.close();
     throw err;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+export async function dialBrokerStream(urlOrOpts, maybeOpts = {}) {
+  let rawUrl;
+  let opts;
+  if (typeof urlOrOpts === "string") {
+    rawUrl = urlOrOpts;
+    opts = maybeOpts ?? {};
+  } else if (urlOrOpts && typeof urlOrOpts === "object") {
+    opts = urlOrOpts;
+    rawUrl = opts.brokerUrl ?? opts.url ?? opts.endpoint;
+  } else {
+    throw new TypeError("dialBrokerStream requires a broker URL or options object");
+  }
+  const { allowInsecureWs = false, timeoutMs = 15000, signal = null } = opts;
+  if (signal?.aborted) {
+    throw abortError(signal);
+  }
+  const { url: canonicalUrl } = validateBrokerWsUrl(rawUrl, allowInsecureWs);
+  const ws = new WebSocket(canonicalUrl);
+  ws.binaryType = "arraybuffer";
+  const stream = new RelayStream(ws);
+
+  let opened = false;
+  ws.addEventListener("message", (ev) => {
+    if (typeof ev.data === "string") {
+      stream._fail(new Error("unexpected text frame on broker stream"));
+      try {
+        ws.close(1002, "unexpected text frame");
+      } catch {}
+      return;
+    }
+    if (ev.data instanceof ArrayBuffer) {
+      stream._pushFrame(new Uint8Array(ev.data));
+    } else if (ev.data instanceof Blob) {
+      ev.data
+        .arrayBuffer()
+        .then((buf) => stream._pushFrame(new Uint8Array(buf)))
+        .catch((err) => stream._fail(err));
+    } else {
+      stream._fail(new Error("unsupported WebSocket frame payload"));
+    }
+  });
+  ws.addEventListener("error", () => {
+    if (opened) {
+      stream._fail(new Error(`broker WebSocket error (${canonicalUrl})`));
+    }
+  });
+  ws.addEventListener("close", () => {
+    stream._close();
+  });
+
+  try {
+    await waitForWsOpen(ws, canonicalUrl, "broker", timeoutMs, signal);
+    opened = true;
+    return stream;
+  } catch (err) {
+    stream.close();
+    throw err;
   }
 }
 
@@ -683,6 +811,7 @@ export async function dialRelayStream({
   relayAuthTicket = null,
   relayAuthSecret = null,
   timeoutMs = 15000,
+  signal = null,
 }) {
   try {
     validateRelayAuthSecretInput(relayAuthSecret);
@@ -695,6 +824,7 @@ export async function dialRelayStream({
       expectedHost,
       allowInsecureWs,
       timeoutMs,
+      signal,
       buildDialMsg: (challenge) => {
         const connId = encodeB64url(randomConnIdBytes());
         const auth = buildRelayDialAuth({
@@ -725,6 +855,7 @@ export async function dialRelayV2Stream({
   relayAuthTicket = null,
   relayAuthSecret = null,
   timeoutMs = 15000,
+  signal = null,
 }) {
   try {
     validateRelayAuthSecretInput(relayAuthSecret);
@@ -738,6 +869,7 @@ export async function dialRelayV2Stream({
       expectedHost,
       allowInsecureWs,
       timeoutMs,
+      signal,
       buildDialMsg: async (challenge) => {
         if (!Number.isInteger(challenge.epoch) || challenge.epoch < 0) {
           throw new Error(`invalid /v2/relay challenge epoch: ${challenge.epoch}`);

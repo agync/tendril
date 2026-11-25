@@ -210,11 +210,11 @@ test("filterWebCompatibleEndpoints keeps iroh with p2p, wss, loopback ws, in pro
     { hint: hints[1], endpoint: `iroh://${id}?addr=192.0.2.1:4433`, provider: "p2p" },
     { hint: hints[0], endpoint: hints[0], provider: "relay" },
     { hint: hints[10], endpoint: hints[10], provider: "relay" },
+    { hint: hints[4], endpoint: "wss://broker.example/b", provider: "broker" },
   ]);
   assert.deepEqual(Object.fromEntries(skipped.map((s) => [s.hint, s.reason])), {
     [hints[2]]: "browser_unsupported",
     [hints[3]]: "browser_unsupported",
-    [hints[4]]: "browser_unsupported",
     [hints[5]]: "relay_v2_not_authorized",
     [hints[6]]: "relay_v2_not_authorized",
     [hints[7]]: "ipc_from_uri",
@@ -222,6 +222,34 @@ test("filterWebCompatibleEndpoints keeps iroh with p2p, wss, loopback ws, in pro
     [hints[9]]: "insecure_ws",
     [hints[11]]: "blocked_address",
   });
+
+  const brokerWsInsecure = filterWebCompatibleEndpoints(["broker+ws://broker.example/b"], {
+    allowInsecureWs: true,
+  });
+  assert.deepEqual(brokerWsInsecure.candidates, [
+    {
+      hint: "broker+ws://broker.example/b",
+      endpoint: "ws://broker.example/b",
+      provider: "broker",
+    },
+  ]);
+  assert.throws(
+    () => filterWebCompatibleEndpoints(["broker+ws://broker.example/b"]),
+    (err) =>
+      NO_BROWSER.test(err.message) &&
+      err.skipped.length === 1 &&
+      err.skipped[0].reason === "insecure_ws"
+  );
+  assert.deepEqual(
+    filterWebCompatibleEndpoints(["broker+ws://127.0.0.1:8080/b"]).candidates,
+    [
+      {
+        hint: "broker+ws://127.0.0.1:8080/b",
+        endpoint: "ws://127.0.0.1:8080/b",
+        provider: "broker",
+      },
+    ]
+  );
 
   const noP2p = filterWebCompatibleEndpoints(hints.slice(0, 2));
   assert.deepEqual(
@@ -1049,6 +1077,146 @@ test("live: explicit connect binds the recovery rp, keeps persistence fail-close
     WasmSessionClient.prototype.take_route_sets = realTake;
     WasmRoster.prototype.apply_route_announcement = realApply;
     performance.now = realNow;
+    client.free();
+    host.close();
+  }
+});
+
+test("session_candidates ranks /v2/relay ahead of /v1/relay and admits broker with allowInsecureWs", async () => {
+  await ensureWasm();
+  const { WasmRoster } = await import("../pkg/tendril_wasm.js");
+  const host = await hostFixture("v2-rank-host");
+  const roster = new WasmRoster();
+  try {
+    roster.insert_pinned_host(
+      host.info.host_id,
+      host.info.host_id,
+      host.info.static_pub,
+      host.info.signing_pub,
+      0,
+      null
+    );
+    const json = JSON.parse(roster.to_json());
+    json.entries[host.info.host_id].v2_secrets = {
+      mailbox_secret: b64url(crypto.randomBytes(32)),
+      reconnect_secret: b64url(crypto.randomBytes(32)),
+    };
+    json.entries[host.info.host_id].routes = [
+      { hint: "wss://198.51.100.10/v1/relay", source: "operator" },
+      { hint: "wss://dns.example.test/v2/relay", source: "operator" },
+      { hint: "broker+ws://insecure-broker.example.test/b", source: "operator" },
+      { hint: "broker+wss://broker.example.test/b", source: "operator" },
+    ];
+    roster.replace_from_json(JSON.stringify(json));
+
+    const defaultV2 = JSON.parse(
+      roster.session_candidates(host.info.host_id, JSON.stringify({ wire: 2 }))
+    );
+    assert.deepEqual(
+      defaultV2.candidates.map((c) => c.hint),
+      [
+        "wss://dns.example.test/v2/relay",
+        "wss://198.51.100.10/v1/relay",
+        "broker+wss://broker.example.test/b",
+      ]
+    );
+    assert.deepEqual(defaultV2.skipped, [
+      { hint: "broker+ws://insecure-broker.example.test/b", reason: "insecure_ws" },
+    ]);
+
+    const insecureV2 = JSON.parse(
+      roster.session_candidates(
+        host.info.host_id,
+        JSON.stringify({ wire: 2, allow_insecure_ws: true })
+      )
+    );
+    assert.deepEqual(
+      insecureV2.candidates.map((c) => c.hint),
+      [
+        "wss://dns.example.test/v2/relay",
+        "wss://198.51.100.10/v1/relay",
+        "broker+ws://insecure-broker.example.test/b",
+        "broker+wss://broker.example.test/b",
+      ]
+    );
+  } finally {
+    roster.free();
+  }
+});
+
+test("live: broker+ws:// pairs, connects endpoint-free, falls back across dead route, and connectV2 prefers /v2/relay over /v1/relay", async () => {
+  await ensureWasm();
+  const host = await liveHost("broker-v2-host", { serveBroker: true });
+  const { relay, broker, peer, fields, seedB64 } = host;
+  assert.ok(broker?.endpoint?.startsWith("broker+ws://127.0.0.1:"), JSON.stringify(broker));
+  const client = await TendrilWebClient.create({ hostId: "broker-v2-client" });
+  try {
+    // 1. Pair over broker+ws:// via pairing URI with a dead primary relay route.
+    const dead = `ws://127.0.0.1:${await deadPort()}/v1/relay`;
+    const peerPair = peer.call({ op: "pair" });
+    const paired = await client.pair({
+      pairingUri: buildUri({ ...fields, ep: [dead, broker.endpoint], rq: 3, seedB64 }),
+      timeoutMs: 8000,
+    });
+    await peerPair;
+    assert.equal(paired.route.provider, "broker");
+    assert.equal(paired.route.hint, broker.endpoint);
+
+    const confirmedPeerId = paired.device_id;
+    await peer.call({ op: "confirm", peer_id: confirmedPeerId, sas: paired.sas });
+    const grant = (await peer.call({ op: "mint", peer_id: confirmedPeerId, caps: ["fs.read"] })).grant;
+
+    // Replace routes with dead + broker+ws:// and connect endpoint-free.
+    await client.clearPeerRoutes(fields.id, "signed");
+    await client.setPeerRoutes(fields.id, [dead, broker.endpoint]);
+    const peerConn = peer.call({ op: "connect" });
+    const sess = await client.connect({
+      targetHostId: fields.id,
+      grantJson: JSON.stringify(grant),
+      timeoutMs: 8000,
+    });
+    await peerConn;
+    assert.equal(sess.route.provider, "broker");
+    assert.equal(sess.route.hint, broker.endpoint);
+    await sess.sendData("hello-broker");
+    assert.equal((await peer.call({ op: "recv", timeout_ms: 2000 })).data_utf8, "hello-broker");
+    await sess.close(1000, "done");
+    await peer.call({ op: "recv", timeout_ms: 2000 }).catch(() => {});
+
+    // 2. Wire v2 pair + /v2/relay vs /v1/relay priority on connectV2.
+    const v2Client = await TendrilWebClient.create({ hostId: "v2-priority-client" });
+    try {
+      const code2 = (await peer.call({ op: "issue_code", kind: "remote" })).code;
+      const p2Accept = peer.call({ op: "pair_v2_accept" });
+      const paired2 = await v2Client.pairV2({
+        pairingUri: buildUri({ ...fields, code: code2, ep: [relay.wsUrl], rq: 4, seedB64 }),
+        timeoutMs: 8000,
+      });
+      const hostP2 = await p2Accept;
+      await peer.call({ op: "confirm", peer_id: hostP2.device_id, sas: hostP2.sas });
+      const grant2 = (await peer.call({ op: "mint", peer_id: hostP2.device_id, caps: ["fs.read"] })).grant;
+
+      const v2RelayUrl = relay.wsUrl.replace("/v1/relay", "/v2/relay");
+      const deadV1 = `ws://127.0.0.1:${await deadPort()}/v1/relay`;
+      await v2Client.setPeerRoutes(fields.id, [deadV1, v2RelayUrl, broker.endpoint]);
+      await peer.call({ op: "serve_relay_v2", relay_url: v2RelayUrl, expected_host: "127.0.0.1" });
+      const p2Conn = peer.call({ op: "accept_v2" });
+      const sess2 = await v2Client.connectV2({
+        targetHostId: fields.id,
+        grantJson: JSON.stringify(grant2),
+        timeoutMs: 8000,
+      });
+      await p2Conn;
+      assert.equal(sess2.route.hint, v2RelayUrl);
+      assert.equal(sess2.route.provider, "relay");
+      await sess2.sendData("hello-v2-priority");
+      assert.equal((await peer.call({ op: "recv", timeout_ms: 2000 })).data_utf8, "hello-v2-priority");
+      await sess2.close(1000, "done");
+      await peer.call({ op: "recv", timeout_ms: 2000 }).catch(() => {});
+    } finally {
+      v2Client.free();
+    }
+  } finally {
     client.free();
     host.close();
   }

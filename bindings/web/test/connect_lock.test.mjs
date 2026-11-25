@@ -970,3 +970,290 @@ test("live: an explicit handshake persists evidence from a feed that neither fai
     fx.close();
   }
 });
+
+test("live: Happy Eyeballs connect wins in <1500 ms when candidate 0 stalls and closes the loser", async () => {
+  await ensureWasm();
+  const fx = await livePair("he-connect-host");
+  const { relay } = fx.host;
+  const stalledUrl = "wss://192.0.2.1/v1/relay";
+  const stalledSockets = [];
+  const OriginalWebSocket = globalThis.WebSocket;
+
+  class StalledOrRealWebSocket extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url, protocols) {
+      super();
+      if (String(url).includes("192.0.2.1")) {
+        this.url = url;
+        this.readyState = StalledOrRealWebSocket.CONNECTING;
+        this.closedByCaller = false;
+        stalledSockets.push(this);
+        return;
+      }
+      const real = protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
+      return real;
+    }
+    send() {}
+    close() {
+      this.closedByCaller = true;
+      if (this.readyState === StalledOrRealWebSocket.CLOSED) return;
+      this.readyState = StalledOrRealWebSocket.CLOSED;
+      setTimeout(() => this.dispatchEvent(new Event("close")), 0);
+    }
+  }
+  globalThis.WebSocket = StalledOrRealWebSocket;
+  try {
+    await fx.client.clearPeerRoutes(fx.hostId, "signed");
+    await fx.client.setPeerRoutes(fx.hostId, [stalledUrl, relay.wsUrl]);
+    const t0 = performance.now();
+    const session = await fx.connect({ timeoutMs: 8000 });
+    const elapsedMs = performance.now() - t0;
+    assert.ok(elapsedMs < 1500, `expected <1500 ms Happy Eyeballs win, got ${elapsedMs} ms`);
+    assert.equal(session.isEstablished(), true);
+    assert.equal(session.route.endpoint, relay.wsUrl);
+    assert.equal(stalledSockets.length, 1);
+    assert.equal(stalledSockets[0].closedByCaller, true);
+    assert.equal(stalledSockets[0].readyState, StalledOrRealWebSocket.CLOSED);
+    await session.close(1000, "done");
+  } finally {
+    globalThis.WebSocket = OriginalWebSocket;
+    fx.close();
+  }
+});
+
+test("live: Wire v1 pair uses Happy Eyeballs (<1500 ms) and commits only once when two routes race", async () => {
+  await ensureWasm();
+  const { WasmPairInitiator } = await import(PKG);
+  const host = await liveHost("he-pair-host");
+  const { relay, peer, fields, seedB64 } = host;
+  const stalledUrl = "wss://192.0.2.2/v1/relay";
+  const stalledSockets = [];
+  const OriginalWebSocket = globalThis.WebSocket;
+  class StalledOrRealWebSocket extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url, protocols) {
+      super();
+      if (String(url).includes("192.0.2.2")) {
+        this.url = url;
+        this.readyState = StalledOrRealWebSocket.CONNECTING;
+        this.closedByCaller = false;
+        stalledSockets.push(this);
+        return;
+      }
+      return protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
+    }
+    send() {}
+    close() {
+      this.closedByCaller = true;
+      if (this.readyState === StalledOrRealWebSocket.CLOSED) return;
+      this.readyState = StalledOrRealWebSocket.CLOSED;
+      setTimeout(() => this.dispatchEvent(new Event("close")), 0);
+    }
+  }
+  globalThis.WebSocket = StalledOrRealWebSocket;
+  const realCommit = WasmPairInitiator.prototype.commit_claim;
+  let commitCount = 0;
+  WasmPairInitiator.prototype.commit_claim = function (...args) {
+    commitCount += 1;
+    return realCommit.apply(this, args);
+  };
+  let persists = 0;
+  const client = await TendrilWebClient.create({
+    hostId: "he-pair-client",
+    onPersistRoster: async () => {
+      persists += 1;
+    },
+  });
+  try {
+    // 1. Stalled primary route + live relay route wins in <1500 ms and aborts loser.
+    const peerPair = peer.call({ op: "pair" });
+    const t0 = performance.now();
+    const paired = await client.pair({
+      pairingUri: buildUri({ ...fields, ep: [stalledUrl, relay.wsUrl], rq: 3, seedB64 }),
+      timeoutMs: 8000,
+    });
+    const elapsedMs = performance.now() - t0;
+    await peerPair;
+    assert.ok(elapsedMs < 1500, `expected <1500 ms Happy Eyeballs pair, got ${elapsedMs} ms`);
+    assert.equal(paired.route.endpoint, relay.wsUrl);
+    assert.equal(commitCount, 1);
+    assert.equal(persists, 1);
+    assert.equal(stalledSockets.length, 1);
+    assert.equal(stalledSockets[0].closedByCaller, true);
+
+    // 2. Two live-capable routes racing: second route reaching msg2 does not call commit_claim.
+    const host2 = await liveHost("he-pair-race-host");
+    const client2 = await TendrilWebClient.create({ hostId: "he-pair-race-client" });
+    commitCount = 0;
+    try {
+      const code2 = (await host2.peer.call({ op: "issue_code", kind: "remote" })).code;
+      const relay2 = await (await import("./live_peer.mjs")).spawnRelay();
+      await host2.peer.call({
+        op: "serve_relay",
+        relay_url: relay2.wsUrl,
+        expected_host: "127.0.0.1",
+      });
+      try {
+        const peerPair2 = host2.peer.call({ op: "pair" });
+        const paired2 = await client2.pair({
+          pairingUri: buildUri({
+            ...host2.fields,
+            code: code2,
+            ep: [host2.relay.wsUrl, relay2.wsUrl],
+            rq: 4,
+            seedB64: host2.seedB64,
+          }),
+          timeoutMs: 8000,
+        });
+        await peerPair2;
+        assert.equal(commitCount, 1);
+        assert.equal(paired2.host_confirmed, true);
+      } finally {
+        relay2.child.kill();
+      }
+    } finally {
+      client2.free();
+      host2.close();
+    }
+  } finally {
+    WasmPairInitiator.prototype.commit_claim = realCommit;
+    globalThis.WebSocket = OriginalWebSocket;
+    client.free();
+    host.close();
+  }
+});
+
+test("pairV2 stays strictly sequential and does not launch candidate 1 while candidate 0 stalls", async () => {
+  await ensureWasm();
+  const host = await identityInfo("seq-pairv2-host");
+  const ws = installStalledWebSocket();
+  const client = await TendrilWebClient.create({ hostId: "seq-pairv2-client" });
+  try {
+    const uri = buildUri({
+      code: "TND-ABCD-EFGH-JKLM",
+      k: host.static_pub,
+      sh: host.signing_pub_hash,
+      rp: host.relay_pub,
+      ep: ["wss://stall-a.example/v1/relay", "wss://stall-b.example/v1/relay"],
+    });
+    const pairing = client.pairV2({ pairingUri: uri, timeoutMs: 2000 });
+    await waitFor(() => ws.sockets.length === 1, "first pairV2 socket");
+    await delay(400);
+    assert.equal(ws.sockets.length, 1, "pairV2 must not dial second candidate concurrently");
+    ws.sockets[0].fail();
+    await waitFor(() => ws.sockets.length === 2, "second pairV2 socket after first fails");
+    ws.sockets[1].fail();
+    await assert.rejects(pairing, (err) => err.failures.length === 2);
+  } finally {
+    ws.restore();
+    client.free();
+  }
+});
+
+test("planner exhaustion populates err.failures on single-route and multi-route timeouts (including fractional timeoutMs)", async () => {
+  await ensureWasm();
+  const host = await identityInfo("exhaust-failures-host");
+  const ws = installStalledWebSocket();
+  const client = await clientWith(host);
+  try {
+    await client.setPeerRoutes(host.host_id, ["wss://192.0.2.10/v1/relay"]);
+    await assert.rejects(
+      () => client.connect({ targetHostId: host.host_id, timeoutMs: 300.5 }),
+      (err) =>
+        err.committed === false &&
+        Array.isArray(err.failures) &&
+        err.failures.length === 1 &&
+        err.failures[0].hint === "wss://192.0.2.10/v1/relay" &&
+        /timed out/i.test(err.failures[0].error)
+    );
+
+    await client.setPeerRoutes(host.host_id, [
+      "wss://192.0.2.11/v1/relay",
+      "wss://192.0.2.12/v1/relay",
+    ]);
+    await assert.rejects(
+      () => client.connect({ targetHostId: host.host_id, timeoutMs: 450 }),
+      (err) =>
+        err.committed === false &&
+        Array.isArray(err.failures) &&
+        err.failures.length === 2 &&
+        err.failures.every((f) => /timed out/i.test(f.error))
+    );
+  } finally {
+    ws.restore();
+    client.free();
+  }
+});
+
+test("aborted handshake loser never leaks spurious stream-closed failure onto winning session.failures", async () => {
+  await ensureWasm();
+  const fx = await livePair("loser-abort-host");
+  const { relay } = fx.host;
+  const OriginalWebSocket = globalThis.WebSocket;
+  class SlowHandshakeOrRealWebSocket extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url, protocols) {
+      super();
+      if (String(url).includes("192.0.2.20")) {
+        this.url = url;
+        this.readyState = SlowHandshakeOrRealWebSocket.CONNECTING;
+        this.binaryType = "blob";
+        this.closedByCaller = false;
+        setTimeout(() => {
+          if (this.readyState !== SlowHandshakeOrRealWebSocket.CONNECTING) return;
+          this.readyState = SlowHandshakeOrRealWebSocket.OPEN;
+          this.dispatchEvent(new Event("open"));
+          const msg = new Event("message");
+          msg.data = JSON.stringify({
+            op: "challenge",
+            host: "192.0.2.20",
+            nonce: Buffer.alloc(32, 1).toString("base64url"),
+            auth_required: [],
+          });
+          this.dispatchEvent(msg);
+        }, 10);
+        return;
+      }
+      return protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
+    }
+    send(data) {
+      if (typeof data === "string") {
+        const parsed = JSON.parse(data);
+        setTimeout(() => {
+          if (this.readyState !== SlowHandshakeOrRealWebSocket.OPEN) return;
+          const msg = new Event("message");
+          msg.data = JSON.stringify({ op: "ready", conn_id: parsed.conn_id });
+          this.dispatchEvent(msg);
+        }, 10);
+      }
+    }
+    close() {
+      this.closedByCaller = true;
+      if (this.readyState === SlowHandshakeOrRealWebSocket.CLOSED) return;
+      this.readyState = SlowHandshakeOrRealWebSocket.CLOSED;
+      setTimeout(() => this.dispatchEvent(new Event("close")), 0);
+    }
+  }
+  globalThis.WebSocket = SlowHandshakeOrRealWebSocket;
+  try {
+    await fx.client.clearPeerRoutes(fx.hostId, "signed");
+    await fx.client.setPeerRoutes(fx.hostId, ["wss://192.0.2.20/v1/relay", relay.wsUrl]);
+    const session = await fx.connect({ timeoutMs: 8000 });
+    assert.equal(session.isEstablished(), true);
+    assert.equal(session.route.endpoint, relay.wsUrl);
+    assert.deepEqual(session.failures, []);
+    await session.close(1000, "done");
+  } finally {
+    globalThis.WebSocket = OriginalWebSocket;
+    fx.close();
+  }
+});
