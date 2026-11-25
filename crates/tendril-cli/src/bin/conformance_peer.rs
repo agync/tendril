@@ -27,15 +27,15 @@ use tendril_core::v2::{
 };
 use tendril_core::wire::{FLAG_PAKE_PAIR, Intent, Preamble, WIRE_VERSION, WIRE_VERSION_V2};
 use tendril_runtime::{
-    BrokerDialer, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener,
-    HttpWakeProvider, LocalDialer, MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pOptions,
-    P2pRelayAuth, P2pRelayMode, PathDialer, PathListener, PathStream, PrefixedPathStream,
-    RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer, RelayV2Listener,
-    RelayV2ListenerConfig, SessionDriver, SessionEvent, StateStore, V2ResponderState,
-    V2SessionDriver, WakeAdapterKind, WakeDialOptions, WakeSecret, WakeTarget,
-    drive_pair_responder_with_policy, drive_v2_pake_pair_initiator, drive_v2_pake_pair_responder,
-    parse_p2p_relay_mode, parse_p2p_relay_modes, peek_exact, pinned_pairing_floor,
-    wake_and_connect_v2_session,
+    BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, HttpWakeProvider, LocalDialer,
+    MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode,
+    PathDialer, PathListener, PathStream, PrefixedPathStream, RelayClientAuth, RelayDialer,
+    RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, SessionDriver,
+    SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeDialOptions,
+    WakeSecret, WakeTarget, drive_pair_responder_with_policy, drive_v2_pake_pair_initiator,
+    drive_v2_pake_pair_responder, parse_p2p_relay_mode, parse_p2p_relay_modes, peek_exact,
+    pinned_pairing_floor, wake_and_connect_v2_session,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -309,6 +309,11 @@ enum PeerCmd {
         expected_host: Option<String>,
         peer_id: Option<String>,
     },
+    #[serde(rename = "serve_broker")]
+    ServeBroker {
+        bind: Option<String>,
+        path: Option<String>,
+    },
     IssueCode {
         kind: Option<String>,
     },
@@ -501,6 +506,12 @@ impl PeerState {
         for handle in self.listener_tasks.drain(..) {
             handle.abort();
         }
+    }
+}
+
+impl Drop for PeerState {
+    fn drop(&mut self) {
+        self.shutdown_listeners();
     }
 }
 
@@ -971,6 +982,54 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 serde_json::json!({ "ok": true, "endpoint": first_ep }),
                 false,
             )
+        }
+        PeerCmd::ServeBroker { bind, path } => {
+            let listen_addr = match bind {
+                Some(raw) => match raw.trim().parse::<SocketAddr>() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        return (err_json(format!("invalid broker bind address: {e}")), false);
+                    }
+                },
+                None => SocketAddr::from(([127, 0, 0, 1], 0)),
+            };
+            if !listen_addr.ip().is_loopback() {
+                return (
+                    err_json("serve_broker only permits loopback bind addresses"),
+                    false,
+                );
+            }
+            let broker_path = match path {
+                Some(p) => {
+                    if !p.starts_with('/')
+                        || p.chars()
+                            .any(|c| c.is_control() || c.is_whitespace() || c == '?' || c == '#')
+                    {
+                        return (err_json("invalid broker path"), false);
+                    }
+                    p
+                }
+                None => BrokerServerConfig::default().path,
+            };
+            match BrokerListener::bind(BrokerServerConfig {
+                listen_addr,
+                path: broker_path,
+                ..BrokerServerConfig::default()
+            })
+            .await
+            {
+                Ok(listener) => {
+                    let ep = listener.local_endpoint();
+                    let addr = listener.local_addr().to_string();
+                    let task = state.spawn_listener(Box::new(listener));
+                    state.listener_tasks.push(task);
+                    (
+                        serde_json::json!({ "ok": true, "endpoint": ep, "addr": addr }),
+                        false,
+                    )
+                }
+                Err(e) => (err_json(e.to_string()), false),
+            }
         }
         PeerCmd::IssueCode { kind } => {
             let pk = match kind.as_deref() {

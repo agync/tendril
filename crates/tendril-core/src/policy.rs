@@ -134,10 +134,10 @@ pub struct PathPlanner {
 }
 
 impl PathPlanner {
-    /// Constructs a planner, sorting `candidates` by `(provider.rank(), !is_numeric_host, id)`.
+    /// Constructs a planner, sorting `candidates` by [`sort_key`].
     #[must_use]
     pub fn new(config: PathPolicyConfig, mut candidates: Vec<CandidateEndpoint>) -> Self {
-        candidates.sort_by_key(|c| (c.provider.rank(), !c.is_numeric_host, c.id));
+        sort_candidates(&mut candidates);
         Self {
             config,
             candidates,
@@ -288,6 +288,42 @@ impl PathPlanner {
         self.pending.drain(..).collect()
     }
 
+    /// Returns the earliest timestamp at which [`Self::tick`] has timer work pending.
+    #[must_use]
+    pub fn next_deadline_ms(&self) -> Option<u64> {
+        if !self.started {
+            return None;
+        }
+        if let Some(active) = &self.active {
+            let active_key = sort_key(active);
+            let has_better = self
+                .candidates
+                .iter()
+                .any(|c| sort_key(c) < active_key && !self.in_flight.contains(&c.id));
+            if !has_better {
+                return None;
+            }
+            let dwell_ready = self
+                .pin_since_ms
+                .saturating_add(self.config.min_pin_dwell_ms);
+            let probe_ready = self
+                .last_fall_up_probe_ms
+                .saturating_add(self.config.fall_up_probe_interval_ms);
+            return Some(dwell_ready.max(probe_ready));
+        }
+
+        let next_cand = self.candidates[self.next_dial_idx..]
+            .iter()
+            .find(|c| !self.failed.contains(&c.id) && !self.in_flight.contains(&c.id))?;
+        let mut deadline = self.next_dial_ready_ms?;
+        if next_cand.provider == ProviderId::P2p
+            && let Some(first_ms) = self.first_non_p2p_start_ms
+        {
+            deadline = deadline.max(first_ms.saturating_add(self.config.p2p_cold_delay_ms));
+        }
+        Some(deadline)
+    }
+
     fn advance_dial_wave(&mut self, now_ms: u64) {
         while self.next_dial_idx < self.candidates.len() {
             let cand = self.candidates[self.next_dial_idx].clone();
@@ -342,8 +378,23 @@ impl PathPlanner {
     }
 }
 
-fn sort_key(c: &CandidateEndpoint) -> (u8, bool, usize) {
-    (c.provider.rank(), !c.is_numeric_host, c.id)
+/// Canonical deterministic sort key for [`CandidateEndpoint`] ranking.
+///
+/// Orders by `ProviderId` rung first, prioritizes `/v2/relay` ahead of `/v1/relay` within
+/// [`ProviderId::Relay`], then prefers literal IP hosts before DNS hostnames, breaking ties by `id`.
+#[must_use]
+pub fn sort_key(c: &CandidateEndpoint) -> (u8, u8, bool, usize) {
+    (
+        c.provider.rank(),
+        u8::from(c.provider == ProviderId::Relay && !crate::pairing::is_v2_relay_hint(&c.addr)),
+        !c.is_numeric_host,
+        c.id,
+    )
+}
+
+/// Sorts `candidates` in place using [`sort_key`].
+pub fn sort_candidates(candidates: &mut [CandidateEndpoint]) {
+    candidates.sort_by_key(sort_key);
 }
 
 #[cfg(test)]
@@ -429,5 +480,126 @@ mod tests {
                 PlannerAction::DialCandidate(c)
             ] if c.id == 3
         ));
+    }
+
+    #[test]
+    fn relay_v2_precedes_relay_v1_even_against_numeric_v1_and_preempts_on_fall_up() {
+        let sorted_only = PathPlanner::new(
+            PathPolicyConfig::default(),
+            vec![
+                CandidateEndpoint::new(1, ProviderId::Relay, "wss://198.51.100.10/v1/relay"),
+                CandidateEndpoint::new(2, ProviderId::Relay, "wss://relay.example/v2/relay"),
+                CandidateEndpoint::new(3, ProviderId::Broker, "broker+wss://198.51.100.20/b"),
+                CandidateEndpoint::new(4, ProviderId::P2p, "node-p2p"),
+            ],
+        );
+        let sorted_ids: Vec<usize> = sorted_only.candidates().iter().map(|c| c.id).collect();
+        assert_eq!(sorted_ids, vec![4, 2, 1, 3]);
+
+        let cands = vec![
+            CandidateEndpoint::new(1, ProviderId::Relay, "wss://198.51.100.10/v1/relay"),
+            CandidateEndpoint::new(2, ProviderId::Relay, "wss://relay.example/v2/relay"),
+            CandidateEndpoint::new(3, ProviderId::Broker, "broker+wss://198.51.100.20/b"),
+        ];
+        let mut planner = PathPlanner::new(PathPolicyConfig::default(), cands);
+        let ids: Vec<usize> = planner.candidates().iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![2, 1, 3]);
+
+        // /v2/relay starts at t=0; /v1/relay staggers at t=250.
+        planner.start(0);
+        let a0 = planner.drain_actions();
+        assert!(matches!(&a0[..], [PlannerAction::DialCandidate(c)] if c.id == 2));
+        assert_eq!(planner.next_deadline_ms(), Some(250));
+
+        planner.tick(250);
+        let a1 = planner.drain_actions();
+        assert!(matches!(&a1[..], [PlannerAction::DialCandidate(c)] if c.id == 1));
+
+        // /v1/relay succeeds at t=270 -> /v2/relay (in-flight) is cancelled and /v1/relay activates.
+        planner.on_dial_succeeded(1, 270);
+        let act = planner.drain_actions();
+        assert!(matches!(
+            &act[..],
+            [
+                PlannerAction::CancelCandidate(2),
+                PlannerAction::ActivatePath(c)
+            ] if c.id == 1
+        ));
+
+        // After dwell + fall-up interval, /v2/relay is probed and preempts /v1/relay.
+        assert_eq!(planner.next_deadline_ms(), Some(30_270));
+        planner.tick(30_270);
+        let probe = planner.drain_actions();
+        assert!(matches!(&probe[..], [PlannerAction::ProbeBetterPath(c)] if c.id == 2));
+
+        planner.on_dial_succeeded(2, 30_300);
+        let switch = planner.drain_actions();
+        assert!(matches!(
+            &switch[..],
+            [
+                PlannerAction::CloseActivePath { id: 1, .. },
+                PlannerAction::ActivatePath(c)
+            ] if c.id == 2
+        ));
+    }
+
+    #[test]
+    fn next_deadline_ms_tracks_stagger_p2p_cold_delay_fall_up_and_exhaustion() {
+        let cands = vec![
+            CandidateEndpoint::new(1, ProviderId::Direct, "192.168.1.10:7000"),
+            CandidateEndpoint::new(2, ProviderId::P2p, "node-p2p"),
+        ];
+        let mut planner = PathPlanner::new(PathPolicyConfig::default(), cands);
+        assert_eq!(planner.next_deadline_ms(), None);
+
+        // Starting launches Direct at t=0; next candidate is P2p with 500 ms cold delay.
+        planner.start(0);
+        let _ = planner.drain_actions();
+        assert_eq!(planner.next_deadline_ms(), Some(500));
+
+        // Direct fails at t=100; P2p still respects 500 ms cold delay.
+        planner.on_dial_failed(1, "refused", 100);
+        assert!(planner.drain_actions().is_empty());
+        assert_eq!(planner.next_deadline_ms(), Some(500));
+
+        planner.tick(500);
+        let a_p2p = planner.drain_actions();
+        assert!(matches!(&a_p2p[..], [PlannerAction::DialCandidate(c)] if c.id == 2));
+        // No more undialed candidates while P2p is in flight.
+        assert_eq!(planner.next_deadline_ms(), None);
+
+        // P2p fails -> AllCandidatesExhausted, no pending timers.
+        planner.on_dial_failed(2, "timeout", 600);
+        assert!(matches!(
+            &planner.drain_actions()[..],
+            [PlannerAction::AllCandidatesExhausted]
+        ));
+        assert_eq!(planner.next_deadline_ms(), None);
+
+        // Empty planner also reports None after start.
+        let mut empty = PathPlanner::new(PathPolicyConfig::default(), Vec::new());
+        assert_eq!(empty.next_deadline_ms(), None);
+        empty.start(0);
+        assert!(matches!(
+            &empty.drain_actions()[..],
+            [PlannerAction::AllCandidatesExhausted]
+        ));
+        assert_eq!(empty.next_deadline_ms(), None);
+
+        // Stagger timer between two Direct candidates.
+        let two_direct = vec![
+            CandidateEndpoint::new(1, ProviderId::Direct, "192.168.1.10:7000"),
+            CandidateEndpoint::new(2, ProviderId::Direct, "192.168.1.11:7000"),
+        ];
+        let mut stagger = PathPlanner::new(PathPolicyConfig::default(), two_direct);
+        stagger.start(100);
+        let _ = stagger.drain_actions();
+        assert_eq!(stagger.next_deadline_ms(), Some(350));
+        stagger.tick(350);
+        assert!(matches!(
+            &stagger.drain_actions()[..],
+            [PlannerAction::DialCandidate(c)] if c.id == 2
+        ));
+        assert_eq!(stagger.next_deadline_ms(), None);
     }
 }

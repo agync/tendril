@@ -605,6 +605,118 @@ async function main() {
     `);
     console.log("CHROME_LIVE_RELAY_E2E_OK=true");
 
+    // 3. Headless Chrome E2E: serve_broker (broker+ws://), Happy Eyeballs multi-route fallback,
+    //    and /v2/relay > /v1/relay preference in connectV2.
+    const brokerPeer = spawnPeer();
+    try {
+      const bInit = await brokerPeer.call({ op: "init", host_id: "chrome-broker-host" });
+      const brokerInfo = await brokerPeer.call({ op: "serve_broker" });
+      assert.ok(brokerInfo.endpoint.startsWith("broker+ws://127.0.0.1:"));
+      await brokerPeer.call({
+        op: "serve_relay",
+        relay_url: relay.wsUrl,
+        expected_host: "127.0.0.1",
+      });
+      const bCode = (await brokerPeer.call({ op: "issue_code", kind: "remote" })).code;
+      const deadEndpoint = "ws://127.0.0.1:1/v1/relay";
+      const chromeBrokerPair = cdp.evalAsync(`
+        const sdk = window.__e2eSdk;
+        window.__brokerClient = await sdk.TendrilWebClient.create({ hostId: 'chrome-broker-client' });
+        const uri = 'tendril://pair?v=1&host=chrome-broker-host&code=' + encodeURIComponent(${JSON.stringify(bCode)}) +
+          '&k=' + encodeURIComponent(${JSON.stringify(bInit.static_pub)}) +
+          '&sh=' + encodeURIComponent(${JSON.stringify(bInit.signing_pub_hash)}) +
+          '&id=chrome-broker-host&rp=' + encodeURIComponent(${JSON.stringify(bInit.relay_pub)}) +
+          '&ep=' + encodeURIComponent(${JSON.stringify(deadEndpoint)}) + ',' + encodeURIComponent(${JSON.stringify(brokerInfo.endpoint)});
+        const res = await window.__brokerClient.pair({ pairingUri: uri, timeoutMs: 8000 });
+        return res;
+      `);
+      const bPeerPair = await brokerPeer.call({ op: "pair" });
+      const bRes = await chromeBrokerPair;
+      assert.equal(bRes.sas, bPeerPair.sas);
+      assert.equal(bRes.route.provider, "broker");
+      assert.equal(bRes.route.hint, brokerInfo.endpoint);
+
+      await brokerPeer.call({ op: "confirm", peer_id: bPeerPair.device_id, sas: bPeerPair.sas });
+      const bGrant = (
+        await brokerPeer.call({ op: "mint", peer_id: bPeerPair.device_id, caps: ["fs.read"] })
+      ).grant;
+      await cdp.evalAsync(`
+        await window.__brokerClient.setPeerRoutes('chrome-broker-host', [
+          ${JSON.stringify(deadEndpoint)},
+          ${JSON.stringify(brokerInfo.endpoint)}
+        ]);
+      `);
+      const chromeBrokerConn = cdp.evalAsync(`
+        const sess = await window.__brokerClient.connect({
+          targetHostId: 'chrome-broker-host',
+          grantJson: ${JSON.stringify(JSON.stringify(bGrant))},
+          timeoutMs: 8000,
+        });
+        await sess.sendData('hello-chrome-broker');
+        const route = sess.route;
+        await sess.close(1000, 'done');
+        window.__brokerClient.free();
+        return route;
+      `);
+      await brokerPeer.call({ op: "connect" });
+      const bConnRoute = await chromeBrokerConn;
+      assert.equal(bConnRoute.provider, "broker");
+      assert.equal(bConnRoute.hint, brokerInfo.endpoint);
+      const bMsg = await brokerPeer.call({ op: "recv", timeout_ms: 2000 });
+      assert.equal(bMsg.data_utf8, "hello-chrome-broker");
+      await brokerPeer.call({ op: "recv", timeout_ms: 2000 }).catch(() => {});
+
+      // Verify /v2/relay priority over /v1/relay in Chrome via Wire v2 pairV2 + connectV2.
+      const v2Code = (await brokerPeer.call({ op: "issue_code", kind: "remote" })).code;
+      const v2RelayUrl = relay.wsUrl.replace("/v1/relay", "/v2/relay");
+      const chromeV2Pair = cdp.evalAsync(`
+        const sdk = window.__e2eSdk;
+        window.__v2Client = await sdk.TendrilWebClient.create({ hostId: 'chrome-v2-client' });
+        const uri = 'tendril://pair?v=1&host=chrome-broker-host&code=' + encodeURIComponent(${JSON.stringify(v2Code)}) +
+          '&k=' + encodeURIComponent(${JSON.stringify(bInit.static_pub)}) +
+          '&sh=' + encodeURIComponent(${JSON.stringify(bInit.signing_pub_hash)}) +
+          '&id=chrome-broker-host&rp=' + encodeURIComponent(${JSON.stringify(bInit.relay_pub)}) +
+          '&ep=' + encodeURIComponent(${JSON.stringify(relay.wsUrl)});
+        return await window.__v2Client.pairV2({ pairingUri: uri, timeoutMs: 8000 });
+      `);
+      const v2PeerPair = await brokerPeer.call({ op: "pair_v2_accept" });
+      const v2Res = await chromeV2Pair;
+      assert.equal(v2Res.sas, v2PeerPair.sas);
+      await brokerPeer.call({ op: "confirm", peer_id: v2PeerPair.device_id, sas: v2PeerPair.sas });
+      const v2Grant = (
+        await brokerPeer.call({ op: "mint", peer_id: v2PeerPair.device_id, caps: ["fs.read"] })
+      ).grant;
+      await brokerPeer.call({ op: "serve_relay_v2", relay_url: v2RelayUrl, expected_host: "127.0.0.1" });
+      await cdp.evalAsync(`
+        await window.__v2Client.setPeerRoutes('chrome-broker-host', [
+          ${JSON.stringify(relay.wsUrl)},
+          ${JSON.stringify(v2RelayUrl)}
+        ]);
+      `);
+      const chromeV2Conn = cdp.evalAsync(`
+        const sess = await window.__v2Client.connectV2({
+          targetHostId: 'chrome-broker-host',
+          grantJson: ${JSON.stringify(JSON.stringify(v2Grant))},
+          timeoutMs: 8000,
+        });
+        await sess.sendData('hello-chrome-v2-relay');
+        const route = sess.route;
+        await sess.close(1000, 'done');
+        window.__v2Client.free();
+        return route;
+      `);
+      await brokerPeer.call({ op: "accept_v2" });
+      const v2ConnRoute = await chromeV2Conn;
+      assert.equal(v2ConnRoute.hint, v2RelayUrl);
+      assert.equal(v2ConnRoute.provider, "relay");
+      const v2Msg = await brokerPeer.call({ op: "recv", timeout_ms: 2000 });
+      assert.equal(v2Msg.data_utf8, "hello-chrome-v2-relay");
+      await brokerPeer.call({ op: "shutdown" });
+    } finally {
+      brokerPeer.close();
+    }
+    console.log("CHROME_LIVE_BROKER_AND_V2_PRIORITY_E2E_OK=true");
+
     if (process.env.TENDRIL_WEB_P2P_LIVE === "1") {
       assert.ok(fs.existsSync(CLI_BIN), `missing tendril binary at ${CLI_BIN}`);
       const p2pHostDir = fs.mkdtempSync(path.join(os.tmpdir(), "tendril-web-p2p-host-"));

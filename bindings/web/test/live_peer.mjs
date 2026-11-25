@@ -136,8 +136,8 @@ export async function deadPort() {
   return port;
 }
 
-/** Starts a relay and a conformance host serving it, with a fresh remote code. */
-export async function liveHost(hostId) {
+/** Starts a relay and a conformance host serving it (and optional broker), with a fresh remote code. */
+export async function liveHost(hostId, { serveBroker = false } = {}) {
   const relay = await spawnRelay();
   const peer = spawnPeer();
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tendril-web-uri-"));
@@ -146,6 +146,7 @@ export async function liveHost(hostId) {
     fs.readFileSync(path.join(stateDir, "identity.json"), "utf8")
   ).signing_seed_b64;
   await peer.call({ op: "serve_relay", relay_url: relay.wsUrl, expected_host: "127.0.0.1" });
+  const broker = serveBroker ? await peer.call({ op: "serve_broker" }) : null;
   const code = (await peer.call({ op: "issue_code", kind: "remote" })).code;
   const fields = {
     host: hostId,
@@ -157,6 +158,7 @@ export async function liveHost(hostId) {
   };
   return {
     relay,
+    broker,
     peer,
     seedB64,
     fields,

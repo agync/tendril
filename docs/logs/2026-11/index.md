@@ -20,3 +20,4 @@ Entries from November 2026.
 - [kotlin: pairing URIs, endpoint-free connect and the multi-network snapshot](23-kotlin-pairing-uris-endpoint-free-connect.md)
 - [pairing: security and reliability fixes](23-pairing-security-and-reliability-fixes.md)
 - [Prepare v0.1.0 release workflow, package metadata, and install docs](24-prepare-v0-1-0-release-workflow.md)
+- [web: Happy Eyeballs dialing, /v2/relay priority, and broker+ws(s)](25-web-add-happy-eyeballs-multi-route.md)

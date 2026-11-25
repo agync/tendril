@@ -241,9 +241,9 @@ export function parseP2pEndpoint(endpoint: string): Promise<ParsedP2pEndpoint>;
 export function hasP2pSupport(): Promise<boolean>;
 /**
  * Splits pairing URI hints into browser-dialable candidates (provider order) and skipped hints.
- * Keeps `iroh://` only with `p2p` (its `relay=` parameters are stripped), `wss://`, and `ws://`
- * on loopback or with `allowInsecureWs`. Throws `pairing URI contains no browser-compatible
- * endpoints (need iroh:// or wss://)` when nothing is left.
+ * Keeps `iroh://` only with `p2p` (its `relay=` parameters are stripped), `wss://` and
+ * `broker+wss://`, and `ws://` / `broker+ws://` on loopback or with `allowInsecureWs`. Throws
+ * `pairing URI contains no browser-compatible endpoints (need iroh:// or wss://)` when nothing is left.
  */
 export function filterWebCompatibleEndpoints(
   endpoints: string[],
@@ -270,7 +270,29 @@ export function validateRelayWsUrl(
   allowInsecureWs?: boolean
 ): { url: string; bareHost: string; host: string };
 
+export function validateBrokerWsUrl(
+  brokerUrl: string,
+  allowInsecureWs?: boolean
+): { url: string; bareHost: string; host: string };
+
 export function canonicalRelayHost(host: string): string;
+
+export function dialBrokerStream(
+  brokerUrl: string,
+  options?: {
+    allowInsecureWs?: boolean;
+    timeoutMs?: number;
+    signal?: AbortSignal | null;
+  }
+): Promise<TendrilStream>;
+export function dialBrokerStream(options: {
+  brokerUrl?: string;
+  url?: string;
+  endpoint?: string;
+  allowInsecureWs?: boolean;
+  timeoutMs?: number;
+  signal?: AbortSignal | null;
+}): Promise<TendrilStream>;
 
 export function dialRelayStream(options: {
   relayUrl: string;
@@ -280,6 +302,7 @@ export function dialRelayStream(options: {
   relayAuthTicket?: string | Record<string, unknown> | null;
   relayAuthSecret?: string | Uint8Array | null;
   timeoutMs?: number;
+  signal?: AbortSignal | null;
 }): Promise<TendrilStream>;
 
 export function dialRelayV2Stream(options: {
@@ -290,6 +313,7 @@ export function dialRelayV2Stream(options: {
   relayAuthTicket?: string | Record<string, unknown> | null;
   relayAuthSecret?: string | Uint8Array | null;
   timeoutMs?: number;
+  signal?: AbortSignal | null;
 }): Promise<TendrilStream>;
 
 export function dialIrohStream(options: {
@@ -304,6 +328,7 @@ export function dialIrohStream(options: {
    */
   hint?: boolean;
   timeoutMs?: number;
+  signal?: AbortSignal | null;
 }): Promise<TendrilStream>;
 
 export function b64urlEncode(bytes: Uint8Array): string;
@@ -624,8 +649,9 @@ export class TendrilWebClient {
     }
   ): Promise<EnrollResult>;
   /**
-   * Pairs over an explicit endpoint or the browser-compatible hints of `pairingUri`, one route
-   * at a time, committing on exactly one. Throws `TendrilAttemptError`.
+   * Pairs over an explicit endpoint or races the browser-compatible hints of `pairingUri` using
+   * Happy Eyeballs multi-route dialing up to `msg2` verification, committing on exactly one.
+   * Throws `TendrilAttemptError`.
    */
   pair(
     options: WebTransportDialOptions &
@@ -636,6 +662,10 @@ export class TendrilWebClient {
         deviceKind?: string;
       }
   ): Promise<PairResult>;
+  /**
+   * Pairs over Wire `0x02` PAKE using an explicit endpoint or sequential candidate dialing of
+   * `pairingUri`. Throws `TendrilAttemptError`.
+   */
   pairV2(
     options: WebTransportDialOptions &
       PairingPolicyOptions & {

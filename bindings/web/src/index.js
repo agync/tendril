@@ -2,6 +2,7 @@ import initWasm, {
   WasmGroupBook,
   WasmIdentity,
   WasmPairInitiator,
+  WasmPathPlanner,
   WasmRoster,
   WasmSessionClient,
   WasmV2PakePairInitiator,
@@ -27,9 +28,11 @@ import {
   MAX_QUEUED_FRAMES,
   MAX_RELAY_FRAME_LEN,
   RelayStream,
+  dialBrokerStream,
   dialRelayStream,
   dialRelayV2Stream,
   isLoopbackHost,
+  validateBrokerWsUrl,
   validateRelayWsUrl,
 } from "./relay.js";
 import { TendrilWebGroup } from "./group.js";
@@ -43,9 +46,11 @@ export {
   RelayStream,
   TendrilWebGroup,
   createIndexedDbVault,
+  dialBrokerStream,
   dialRelayStream,
   dialRelayV2Stream,
   openTendrilVault,
+  validateBrokerWsUrl,
   validateRelayWsUrl,
 };
 
@@ -59,8 +64,24 @@ export async function parseP2pEndpoint(endpoint) {
   return parse(endpoint);
 }
 
+function makeAbortError(signal) {
+  if (signal?.reason instanceof Error) {
+    return signal.reason;
+  }
+  const err = new Error("dial aborted");
+  err.name = "AbortError";
+  return err;
+}
+
 export async function dialIrohStream(options) {
+  const { signal = null } = options ?? {};
+  if (signal?.aborted) {
+    throw makeAbortError(signal);
+  }
   const { dialIrohStream: dial } = await import("./iroh.js");
+  if (signal?.aborted) {
+    throw makeAbortError(signal);
+  }
   return dial(options);
 }
 
@@ -109,6 +130,7 @@ async function warmTargetTransport(endpoint, relayUrl) {
 }
 
 async function dialWebStream({
+  provider = null,
   endpoint = null,
   relayUrl = null,
   targetPub = null,
@@ -124,6 +146,7 @@ async function dialWebStream({
   allowInsecureWs = false,
   irohHint = false,
   timeoutMs,
+  signal = null,
 }) {
   if (p2pApiSecret) {
     throw new Error(
@@ -131,7 +154,7 @@ async function dialWebStream({
     );
   }
   const target = endpoint || relayUrl;
-  if (target && target.startsWith("iroh://")) {
+  if (provider === "p2p" || (target && target.startsWith("iroh://"))) {
     return dialIrohStream({
       endpoint: target,
       relayUrlOverride,
@@ -140,6 +163,14 @@ async function dialWebStream({
       p2pApiSecret,
       hint: irohHint,
       timeoutMs,
+      signal,
+    });
+  }
+  if (provider === "broker" || (target && /^broker\+/i.test(target))) {
+    return dialBrokerStream(target, {
+      allowInsecureWs,
+      timeoutMs,
+      signal,
     });
   }
   if (useRelayV2) {
@@ -151,6 +182,7 @@ async function dialWebStream({
       relayAuthTicket,
       relayAuthSecret,
       timeoutMs,
+      signal,
     });
   }
   return dialRelayStream({
@@ -161,6 +193,7 @@ async function dialWebStream({
     relayAuthTicket,
     relayAuthSecret,
     timeoutMs,
+    signal,
   });
 }
 
@@ -343,8 +376,8 @@ class FatalAttemptError extends Error {
 /**
  * Splits pairing URI hints into the candidates a browser can dial, in provider order, and the
  * skipped rest. `iroh://` needs `p2p` (see `hasP2pSupport()`) and loses its `relay=`
- * parameters; `wss://` is kept, `ws://` only on loopback or with `allowInsecureWs`. IPC,
- * `direct:`, `overlay://`, `broker+ws(s)://` and every `/v2/relay` hint are skipped.
+ * parameters; `wss://` and `broker+wss://` are kept, `ws://` and `broker+ws://` only on
+ * loopback or with `allowInsecureWs`. IPC, `direct:`, `overlay://` and `/v2/relay` are skipped.
  */
 export function filterWebCompatibleEndpoints(
   endpoints,
@@ -366,12 +399,16 @@ export function filterWebCompatibleEndpoints(
       continue;
     }
     let bare = hint;
+    let isBroker = false;
     if (hint.startsWith("p2p:")) {
       bare = hint.slice(4);
     } else if (hint.startsWith("relay:")) {
       bare = hint.slice(6);
+    } else if (hint.startsWith("broker+")) {
+      bare = hint.slice(7);
+      isBroker = true;
     }
-    if (bare.startsWith("iroh://")) {
+    if (!isBroker && bare.startsWith("iroh://")) {
       if (!p2p) {
         skip(hint, "p2p_feature_disabled");
         continue;
@@ -380,7 +417,7 @@ export function filterWebCompatibleEndpoints(
       continue;
     }
     if (bare.startsWith("wss://") || bare.startsWith("ws://")) {
-      if (isV2RelayUrl(bare)) {
+      if (!isBroker && isV2RelayUrl(bare)) {
         skip(hint, "relay_v2_not_authorized");
         continue;
       }
@@ -395,7 +432,7 @@ export function filterWebCompatibleEndpoints(
         skip(hint, "insecure_ws");
         continue;
       }
-      candidates.push({ hint, endpoint: bare, provider: "relay" });
+      candidates.push({ hint, endpoint: bare, provider: isBroker ? "broker" : "relay" });
       continue;
     }
     skip(hint, "browser_unsupported");
@@ -1485,10 +1522,11 @@ export class TendrilWebClient {
   }
 
   /**
-   * Multi-route pairing: classify the code before any dial,
-   * try the candidates one at a time in provider order with a deferred claim, check `rp` and
-   * `rs` on the verified `msg2`, commit `msg3` on exactly one stream, and persist the outcome
-   * with its route plan in one roster critical section.
+   * Multi-route pairing: classify the code before any dial; for Wire v1 race browser-compatible
+   * candidates via Happy Eyeballs up to `msg2` verification behind a single-winner latch (for
+   * Wire v2 `pairV2`, try candidates strictly sequentially); check `rp` and `rs` on verified
+   * `msg2`, commit `msg3` on exactly one stream, and persist the outcome with its route plan in
+   * one roster critical section.
    */
   async #pairWithPolicy(wire, opts) {
     const {
@@ -1561,11 +1599,23 @@ export class TendrilWebClient {
       let candidates;
       let skipped = [];
       if (explicitUrl) {
+        const explicitProvider =
+          explicitUrl.startsWith("iroh://") || explicitUrl.startsWith("p2p:iroh://")
+            ? "p2p"
+            : /^broker\+/i.test(explicitUrl)
+              ? "broker"
+              : "relay";
+        const normalizedExplicit =
+          explicitProvider === "p2p"
+            ? explicitUrl.replace(/^p2p:/, "")
+            : explicitProvider === "broker"
+              ? explicitUrl.replace(/^broker\+/i, "")
+              : explicitUrl;
         candidates = [
           {
             hint: null,
-            endpoint: explicitUrl,
-            provider: explicitUrl.startsWith("iroh://") ? "p2p" : "relay",
+            endpoint: normalizedExplicit,
+            provider: explicitProvider,
             explicit: true,
           },
         ];
@@ -1581,10 +1631,11 @@ export class TendrilWebClient {
 
       let operatorEndpoint = null;
       if (explicitUrl) {
+        const normalizedOp = explicitUrl.replace(/^broker\+/i, "broker+");
         operatorEndpoint =
-          explicitTargetPub && isWsUrl(explicitUrl)
-            ? `${explicitUrl}#${explicitTargetPub}`
-            : explicitUrl;
+          explicitTargetPub && isWsUrl(normalizedOp)
+            ? `${normalizedOp}#${explicitTargetPub}`
+            : normalizedOp;
       }
       let pinnedJson = null;
       if (wire === 2) {
@@ -1634,46 +1685,73 @@ export class TendrilWebClient {
       }
       this.#ensureOpen();
       const deadlineMs = performance.now() + timeoutMs;
-      const failures = [];
-      const errors = [];
-      for (let i = 0; i < candidates.length; i += 1) {
-        const cand = candidates[i];
-        const remaining = deadlineMs - performance.now();
-        if (remaining <= 0) {
-          errors.push(new Error(`${label} timed out`));
+      if (wire === 2) {
+        const failures = [];
+        const errors = [];
+        for (let i = 0; i < candidates.length; i += 1) {
+          const cand = candidates[i];
+          const remaining = deadlineMs - performance.now();
+          if (remaining <= 0) {
+            errors.push(new Error(`${label} timed out`));
+            failures.push({
+              hint: cand.hint ?? cand.endpoint,
+              provider: cand.provider,
+              error: `${label} timed out`,
+            });
+            break;
+          }
+          const rungMs =
+            i === candidates.length - 1 ? remaining : Math.min(remaining, RUNG_BUDGET_MS);
+          const outcome = await this.#pairCandidate(
+            ctx,
+            cand,
+            performance.now() + rungMs,
+            deadlineMs
+          );
+          if (outcome.result) {
+            return { ...outcome.result, skipped, failures };
+          }
+          if (outcome.committed || outcome.fatal) {
+            throw attemptError(outcome.error, { committed: outcome.committed, skipped, failures });
+          }
+          errors.push(outcome.error);
           failures.push({
             hint: cand.hint ?? cand.endpoint,
             provider: cand.provider,
-            error: `${label} timed out`,
+            error: errorText(outcome.error),
           });
-          break;
         }
-        const rungMs =
-          i === candidates.length - 1 ? remaining : Math.min(remaining, RUNG_BUDGET_MS);
-        const outcome = await this.#pairCandidate(
-          ctx,
-          cand,
-          performance.now() + rungMs,
-          deadlineMs
+        throw attemptError(
+          mostSevere(errors) ?? new Error(`${label} failed: all candidates exhausted`),
+          {
+            skipped,
+            failures,
+          }
         );
-        if (outcome.result) {
-          return { ...outcome.result, skipped, failures };
-        }
-        if (outcome.committed || outcome.fatal) {
-          throw attemptError(outcome.error, { committed: outcome.committed, skipped, failures });
-        }
-        errors.push(outcome.error);
-        failures.push({
-          hint: cand.hint ?? cand.endpoint,
-          provider: cand.provider,
-          error: errorText(outcome.error),
+      }
+
+      const race = await this.#raceCandidatesWithPlanner({
+        candidates,
+        timeoutMs,
+        label,
+        runCandidate: ({ cand, attemptDeadlineMs, signal, claimWin }) =>
+          this.#pairCandidate(ctx, cand, attemptDeadlineMs, deadlineMs, { signal, claimWin }),
+      });
+      if (race.fatal) {
+        throw attemptError(race.fatal.error, {
+          committed: Boolean(race.fatal.committed),
+          skipped,
+          failures: race.failures,
         });
       }
+      if (race.winner?.result) {
+        return { ...race.winner.result, skipped, failures: race.failures };
+      }
       throw attemptError(
-        mostSevere(errors) ?? new Error(`${label} failed: all candidates exhausted`),
+        mostSevere(race.errors) ?? new Error(`${label} failed: all candidates exhausted`),
         {
           skipped,
-          failures,
+          failures: race.failures,
         }
       );
     } finally {
@@ -1695,8 +1773,14 @@ export class TendrilWebClient {
     }
   }
 
-  /** Dials one pairing candidate. Returns `{result}`, or `{error, committed, fatal}`. */
-  async #pairCandidate(ctx, cand, rungDeadlineMs, deadlineMs) {
+  /** Dials one pairing candidate. Returns `{result}`, `{cancelledByWinner}`, or `{error, committed, fatal}`. */
+  async #pairCandidate(
+    ctx,
+    cand,
+    rungDeadlineMs,
+    deadlineMs,
+    { signal = null, claimWin = null } = {}
+  ) {
     const { wire, label } = ctx;
     let initiator = null;
     let scratch = null;
@@ -1704,7 +1788,18 @@ export class TendrilWebClient {
     let committed = false;
     let creds = null;
     let rungDeadline = rungDeadlineMs;
+    const onAbort = () => {
+      if (stream) {
+        try {
+          void Promise.resolve(stream.close()).catch(() => {});
+        } catch {}
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
     try {
+      if (signal?.aborted) {
+        throw makeAbortError(signal);
+      }
       ({ initiator, scratch } = await this.#withRoster(
         () => {
           const scratchRoster = this.#roster.clone_roster();
@@ -1758,7 +1853,8 @@ export class TendrilWebClient {
             )
           : { relayAuthTicket: null, relayAuthSecret: null };
       stream = await dialWebStream({
-        endpoint: cand.provider === "p2p" ? cand.endpoint : null,
+        provider: cand.provider,
+        endpoint: cand.provider === "p2p" || cand.provider === "broker" ? cand.endpoint : null,
         relayUrl: cand.provider === "relay" ? cand.endpoint : null,
         targetPub: d.targetPub,
         expectedHost: d.expectedHost,
@@ -1770,6 +1866,7 @@ export class TendrilWebClient {
         allowInsecureWs: d.allowInsecureWs,
         irohHint: !cand.explicit,
         timeoutMs: remainingBudgetMs(rungDeadline, `${label} timed out connecting to transport`),
+        signal,
       });
       this.#ensureOpen();
       const startedAt = performance.now();
@@ -1778,10 +1875,16 @@ export class TendrilWebClient {
       await sendProtocolBytes(stream, startBytes);
       let verified = null;
       while (verified === null) {
+        if (signal?.aborted) {
+          throw makeAbortError(signal);
+        }
         const frame = await stream.recv(
           remainingBudgetMs(rungDeadline, `${label} timed out waiting for host response`)
         );
         this.#ensureOpen();
+        if (signal?.aborted) {
+          throw makeAbortError(signal);
+        }
         if (frame.status === "would_block") {
           throw new Error(`${label} timed out waiting for host response`);
         }
@@ -1814,6 +1917,9 @@ export class TendrilWebClient {
           "invalid_pairing_uri",
           "invalid pairing URI: route statement does not verify"
         );
+      }
+      if (claimWin && !claimWin()) {
+        return { cancelledByWinner: true };
       }
       const claim = initiator.commit_claim();
       committed = true;
@@ -1861,7 +1967,21 @@ export class TendrilWebClient {
         }
       }
     } catch (err) {
-      const fatal = err instanceof FatalAttemptError || this.#freed || this.#wasmFreed;
+      if (!committed && signal?.aborted) {
+        if (signal.reason?.cancelledByWinner) {
+          return { cancelledByWinner: true };
+        }
+        return {
+          error: candidateError(makeAbortError(signal), creds),
+          committed: false,
+          fatal: this.#freed || this.#wasmFreed,
+        };
+      }
+      if (err?.cancelledByWinner) {
+        return { cancelledByWinner: true };
+      }
+      const fatal =
+        committed || err instanceof FatalAttemptError || this.#freed || this.#wasmFreed;
       return {
         error:
           err instanceof FatalAttemptError
@@ -1871,6 +1991,7 @@ export class TendrilWebClient {
         fatal,
       };
     } finally {
+      signal?.removeEventListener("abort", onAbort);
       if (initiator) {
         initiator.free();
       }
@@ -2292,6 +2413,246 @@ export class TendrilWebClient {
   }
 
   /**
+   * Drives concurrent Happy Eyeballs dialing over `WasmPathPlanner` (`250 ms` stagger, `500 ms`
+   * P2P cold-start hold delay, `next_deadline_ms()` timer loop). `runCandidate` receives
+   * `{ id, cand, attemptDeadlineMs, signal, claimWin }` and must never reject.
+   */
+  async #raceCandidatesWithPlanner({ candidates, timeoutMs, label, runCandidate, onDiscard }) {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      throw new RangeError("timeoutMs must be a finite non-negative number");
+    }
+    const safeTimeoutMs = Math.ceil(timeoutMs);
+    const startMs = performance.now();
+    const nowRel = () => Math.max(0, Math.floor(performance.now() - startMs));
+    const planner = new WasmPathPlanner(
+      JSON.stringify(
+        candidates.map((cand, id) => ({
+          id,
+          addr: cand.hint ?? cand.endpoint,
+          provider: cand.provider,
+        }))
+      ),
+      JSON.stringify({
+        attempt_stagger_ms: 250,
+        p2p_cold_delay_ms: 500,
+        exhaustion_timeout_ms: safeTimeoutMs,
+      })
+    );
+    const controllers = new Map();
+    const inFlight = new Map();
+    const pendingResults = [];
+    const failures = [];
+    const errors = [];
+    let winner = null;
+    let winnerClaimed = false;
+    let fatal = null;
+    let exhausted = false;
+    let timer = null;
+    let wakeResolve = null;
+
+    const wake = () => {
+      if (wakeResolve) {
+        const resolve = wakeResolve;
+        wakeResolve = null;
+        resolve();
+      }
+    };
+    const abortReasonWinner = () => {
+      const err = new Error("aborted by winning route");
+      err.name = "AbortError";
+      err.cancelledByWinner = true;
+      return err;
+    };
+    const abortAllOthers = (keepId, reason) => {
+      for (const [id, ac] of controllers) {
+        if (id !== keepId && !ac.signal.aborted) {
+          ac.abort(reason);
+        }
+      }
+    };
+    const waitUntilWakeOrDeadline = (deadlineRelMs) => {
+      if (pendingResults.length > 0 || winner || fatal || exhausted) {
+        return Promise.resolve();
+      }
+      return new Promise((resolve) => {
+        wakeResolve = () => {
+          if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          resolve();
+        };
+        if (deadlineRelMs !== null && deadlineRelMs !== undefined) {
+          const delayMs = Math.max(0, deadlineRelMs - nowRel());
+          timer = setTimeout(() => {
+            timer = null;
+            if (wakeResolve) {
+              const r = wakeResolve;
+              wakeResolve = null;
+              r();
+            }
+          }, delayMs);
+        }
+      });
+    };
+
+    let processedFailure = false;
+    const ingestPendingResults = async () => {
+      processedFailure = false;
+      while (pendingResults.length > 0) {
+        const { id, cand, res } = pendingResults.shift();
+        controllers.delete(id);
+        if (res.cancelledByWinner) {
+          continue;
+        }
+        if (res.fatal) {
+          if (!fatal) {
+            fatal = res;
+            abortAllOthers(id, new Error(`${label} aborted`));
+          }
+          continue;
+        }
+        if (res.winner || res.result) {
+          if (!winner && !fatal && !exhausted) {
+            winner = res;
+            if (!winnerClaimed) {
+              winnerClaimed = true;
+              abortAllOthers(id, abortReasonWinner());
+              planner.on_dial_succeeded(id, nowRel());
+            }
+          } else if (onDiscard) {
+            await onDiscard(res);
+          }
+          continue;
+        }
+        if (this.#freed || this.#wasmFreed) {
+          if (!fatal) {
+            fatal = { error: res.error, committed: Boolean(res.committed) };
+            abortAllOthers(id, new Error(`${label} aborted`));
+          }
+          continue;
+        }
+        errors.push(res.error);
+        failures.push({
+          hint: cand.hint ?? cand.endpoint,
+          provider: cand.provider,
+          error: errorText(res.error),
+        });
+        if (!winnerClaimed && !exhausted && !fatal) {
+          planner.on_dial_failed(id, errorText(res.error), nowRel());
+          processedFailure = true;
+        }
+      }
+    };
+
+    try {
+      planner.start(0);
+      while (!winner && !fatal && !exhausted) {
+        const actions = JSON.parse(planner.drain_actions());
+        for (const action of actions) {
+          if (action.action === "dial_candidate") {
+            const id = action.candidate.id;
+            const cand = candidates[id];
+            const ac = new AbortController();
+            controllers.set(id, ac);
+            const attemptDeadlineMs = startMs + safeTimeoutMs;
+            const claimWin = () => {
+              if (winnerClaimed || winner || fatal || exhausted || ac.signal.aborted) {
+                return false;
+              }
+              winnerClaimed = true;
+              abortAllOthers(id, abortReasonWinner());
+              planner.on_dial_succeeded(id, nowRel());
+              return true;
+            };
+            const job = Promise.resolve()
+              .then(() =>
+                runCandidate({
+                  id,
+                  cand,
+                  attemptDeadlineMs,
+                  signal: ac.signal,
+                  claimWin,
+                })
+              )
+              .then(
+                (res) => ({ id, cand, res }),
+                (err) => ({ id, cand, res: { error: toError(err) } })
+              )
+              .then((entry) => {
+                pendingResults.push(entry);
+                wake();
+              });
+            inFlight.set(id, job);
+          } else if (action.action === "cancel_candidate") {
+            const ac = controllers.get(action.id);
+            if (ac && !ac.signal.aborted) {
+              ac.abort(
+                winnerClaimed || winner ? abortReasonWinner() : new Error(`${label} timed out`)
+              );
+            }
+          } else if (action.action === "all_candidates_exhausted") {
+            exhausted = true;
+          }
+        }
+        if (winner || fatal || exhausted) {
+          break;
+        }
+        await ingestPendingResults();
+        if (winner || fatal || exhausted) {
+          break;
+        }
+        if (processedFailure) {
+          continue;
+        }
+        const nextDeadline = planner.next_deadline_ms();
+        if (nextDeadline !== undefined && nextDeadline !== null) {
+          const cur = nowRel();
+          if (cur >= nextDeadline) {
+            planner.tick(cur);
+          } else {
+            await waitUntilWakeOrDeadline(nextDeadline);
+            if (pendingResults.length === 0) {
+              planner.tick(nowRel());
+            }
+          }
+        } else if (pendingResults.length === 0) {
+          if (controllers.size === 0) {
+            exhausted = true;
+            break;
+          }
+          await waitUntilWakeOrDeadline(null);
+        }
+      }
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      abortAllOthers(
+        -1,
+        winnerClaimed || winner
+          ? abortReasonWinner()
+          : fatal
+            ? new Error(`${label} aborted`)
+            : new Error(`${label} timed out`)
+      );
+      await Promise.allSettled([...inFlight.values()]);
+      await ingestPendingResults();
+      return { winner, fatal, failures, errors };
+    } finally {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      abortAllOthers(
+        -1,
+        winnerClaimed || winner ? abortReasonWinner() : new Error(`${label} aborted`)
+      );
+      planner.free();
+    }
+  }
+
+  /**
    * Endpoint-free Day-2 connect: plan under a read-only roster
    * section, dial each stored or recovery candidate against its own roster clone, reconcile the
    * evidence and run the final check in one roster section, then hand the winner over.
@@ -2308,7 +2669,6 @@ export class TendrilWebClient {
       p2p = await hasP2pSupport();
     }
     this.#ensureOpen();
-    const deadlineMs = performance.now() + ctx.timeoutMs;
     let plan;
     try {
       plan = await this.#withRoster(
@@ -2326,6 +2686,7 @@ export class TendrilWebClient {
                   wire,
                   route_policy: ctx.policy,
                   p2p,
+                  allow_insecure_ws: Boolean(ctx.allowInsecureWs),
                 })
               )
             );
@@ -2360,41 +2721,24 @@ export class TendrilWebClient {
         await initTendrilP2p();
       }
       const evidence = { records: [], recordKeys: new Set(), crls: [] };
-      const failures = [];
-      const errors = [];
-      let winner = null;
-      for (let i = 0; i < cands.candidates.length; i += 1) {
-        const cand = cands.candidates[i];
-        const remaining = deadlineMs - performance.now();
-        if (remaining <= 0) {
-          errors.push(new Error(`${base} handshake timed out`));
-          failures.push({
-            hint: cand.hint,
-            provider: cand.provider,
-            error: `${base} handshake timed out`,
-          });
-          break;
-        }
-        const rungMs =
-          i === cands.candidates.length - 1 ? remaining : Math.min(remaining, RUNG_BUDGET_MS);
-        const res = await this.#connectCandidate(
-          ctx,
-          cands,
-          cand,
-          snapBytes,
-          performance.now() + rungMs,
-          evidence
-        );
-        if (res.winner) {
-          winner = res.winner;
-          break;
-        }
-        if (this.#freed || this.#wasmFreed) {
-          throw res.error;
-        }
-        errors.push(res.error);
-        failures.push({ hint: cand.hint, provider: cand.provider, error: errorText(res.error) });
+      const race = await this.#raceCandidatesWithPlanner({
+        candidates: cands.candidates,
+        timeoutMs: ctx.timeoutMs,
+        label: `${base} handshake`,
+        runCandidate: ({ cand, attemptDeadlineMs, signal }) =>
+          this.#connectCandidate(ctx, cands, cand, snapBytes, attemptDeadlineMs, evidence, signal),
+        onDiscard: async (res) => {
+          if (res?.winner) {
+            await this.#discardWinner(res.winner);
+          }
+        },
+      });
+      if (race.fatal) {
+        throw race.fatal.error;
       }
+      const winner = race.winner?.winner ?? null;
+      const failures = race.failures;
+      const errors = race.errors;
       let fin;
       try {
         fin = await this.#finalizeConnect(ctx, snap, evidence, winner);
@@ -2447,14 +2791,25 @@ export class TendrilWebClient {
   }
 
   /** Dials one Day-2 candidate against its own roster clone and records its evidence. */
-  async #connectCandidate(ctx, cands, cand, snapBytes, rungDeadline, evidence) {
+  async #connectCandidate(ctx, cands, cand, snapBytes, rungDeadline, evidence, signal = null) {
     const { peer, base } = ctx;
     let clone = null;
     let session = null;
     let stream = null;
     let won = false;
     let creds = null;
+    const onAbort = () => {
+      if (stream) {
+        try {
+          void Promise.resolve(stream.close()).catch(() => {});
+        } catch {}
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
     try {
+      if (signal?.aborted) {
+        throw makeAbortError(signal);
+      }
       clone = WasmRoster.from_json_bytes(snapBytes.slice());
       session = this.#newSession(ctx, clone, cands.route_seq, null);
       const isRelay = cand.provider === "relay";
@@ -2464,7 +2819,8 @@ export class TendrilWebClient {
         ? relayCredsFor(cand.endpoint, null, ctx.origins, ctx.relayAuthTicket, ctx.secretMaster)
         : { relayAuthTicket: null, relayAuthSecret: null };
       stream = await dialWebStream({
-        endpoint: cand.provider === "p2p" ? cand.endpoint : null,
+        provider: cand.provider,
+        endpoint: cand.provider === "p2p" || cand.provider === "broker" ? cand.endpoint : null,
         relayUrl: isRelay ? cand.endpoint : null,
         targetPub: cands.relay_key_b64,
         p2pRelayUrls: ctx.p2pRelayUrls,
@@ -2490,8 +2846,12 @@ export class TendrilWebClient {
           rungDeadline,
           `${base} handshake timed out connecting to transport`
         ),
+        signal,
       });
       this.#ensureOpen();
+      if (signal?.aborted) {
+        throw makeAbortError(signal);
+      }
       const startedMs = performance.now();
       const initialEvents = await this.#driveHandshake(
         ctx,
@@ -2502,11 +2862,24 @@ export class TendrilWebClient {
         startedMs,
         false
       );
+      if (signal?.aborted) {
+        throw makeAbortError(signal);
+      }
       won = true;
       return { winner: { session, stream, clone, startedMs, initialEvents, cand } };
     } catch (err) {
+      if (signal?.aborted) {
+        if (signal.reason?.cancelledByWinner) {
+          return { cancelledByWinner: true };
+        }
+        return { error: candidateError(makeAbortError(signal), creds) };
+      }
+      if (err?.cancelledByWinner) {
+        return { cancelledByWinner: true };
+      }
       return { error: candidateError(err, creds) };
     } finally {
+      signal?.removeEventListener("abort", onAbort);
       if (session) {
         try {
           for (const record of JSON.parse(session.presented_rotation_json())) {
