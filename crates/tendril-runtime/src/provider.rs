@@ -113,8 +113,25 @@ pub trait PathDialer: Send + Sync {
     /// Returns the provider class implemented by this dialer.
     fn provider_id(&self) -> ProviderId;
 
+    /// Returns `true` when this dialer can carry `init_frame` inside its 0-RTT control setup.
+    fn supports_fast_open(&self) -> bool {
+        false
+    }
+
     /// Opens an outbound stream to `endpoint`.
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError>;
+
+    /// Opens an outbound stream to `endpoint`, optionally attaching `init_frame` in 0-RTT setup.
+    ///
+    /// Returns `(stream, true)` when `init_frame` was actually sent inside the dial handshake, or
+    /// `(stream, false)` when the caller must transmit initial bytes after connect.
+    async fn dial_with_init(
+        &self,
+        endpoint: &str,
+        _init_frame: Option<&[u8]>,
+    ) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
+        Ok((self.dial(endpoint).await?, false))
+    }
 }
 
 /// Shared Tokio `AsyncRead + AsyncWrite` wrapper used by `local` and `direct` providers.

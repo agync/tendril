@@ -11,19 +11,25 @@ pub mod p2p;
 pub mod relay;
 pub mod relay_v2;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Once;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use tendril_core::crypto::{b64url_decode, b64url_encode, random_bytes};
 use tendril_core::policy::ProviderId;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -138,6 +144,236 @@ pub(crate) fn ws_binary_config() -> WebSocketConfig {
         .max_write_buffer_size(MAX_OUTER_FRAME_LEN * 2)
         .max_message_size(Some(MAX_OUTER_FRAME_LEN))
         .max_frame_size(Some(MAX_OUTER_FRAME_LEN))
+}
+
+pub(crate) fn ws_control_config() -> WebSocketConfig {
+    const MAX_CONTROL_WS_MSG_LEN: usize = 128 * 1024;
+    WebSocketConfig::default()
+        .write_buffer_size(0)
+        .max_write_buffer_size(MAX_CONTROL_WS_MSG_LEN * 2)
+        .max_message_size(Some(MAX_CONTROL_WS_MSG_LEN))
+        .max_frame_size(Some(MAX_CONTROL_WS_MSG_LEN))
+}
+
+pub(crate) fn encode_fast_open_init_frame(
+    init_frame: Option<&[u8]>,
+    server_fast_open: bool,
+) -> Result<(Option<String>, bool), RuntimeError> {
+    let Some(bytes) = init_frame.filter(|_| server_fast_open) else {
+        return Ok((None, false));
+    };
+    if bytes.is_empty() {
+        return Err(RuntimeError::Protocol(
+            "fast-open init_frame must not be empty".to_owned(),
+        ));
+    }
+    if bytes.len() > MAX_OUTER_FRAME_LEN {
+        return Err(RuntimeError::FrameTooLarge {
+            size: bytes.len(),
+            max: MAX_OUTER_FRAME_LEN,
+        });
+    }
+    Ok((Some(b64url_encode(bytes)), true))
+}
+
+pub(crate) fn decode_incoming_init_frame(
+    init_frame: Option<&str>,
+) -> Result<Vec<u8>, RuntimeError> {
+    let Some(b64) = init_frame else {
+        return Ok(Vec::new());
+    };
+    let bytes = b64url_decode(b64)?;
+    if bytes.is_empty() {
+        return Err(RuntimeError::Protocol(
+            "relay incoming init_frame must not be empty".to_owned(),
+        ));
+    }
+    if bytes.len() > MAX_OUTER_FRAME_LEN {
+        return Err(RuntimeError::FrameTooLarge {
+            size: bytes.len(),
+            max: MAX_OUTER_FRAME_LEN,
+        });
+    }
+    Ok(bytes)
+}
+
+pub(crate) const STANDBY_POOL_SIZE: usize = 2;
+const STANDBY_BACKOFF_INITIAL: Duration = Duration::from_millis(100);
+const STANDBY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+pub(crate) fn jittered_standby_backoff(backoff: Duration) -> Duration {
+    let base_ms = u64::try_from(backoff.as_millis()).unwrap_or(5_000).max(1);
+    let max_jitter = (base_ms / 4).max(1);
+    let rand_u64 = u64::from(u32::from_le_bytes(random_bytes::<4>().unwrap_or([0; 4])));
+    Duration::from_millis(base_ms.saturating_add(rand_u64 % max_jitter))
+}
+
+pub(crate) enum StandbySlotOutcome {
+    Consumed,
+    Retry,
+    Unsupported,
+    Shutdown,
+}
+
+pub(crate) struct ActiveStandbyGuard(pub(crate) Arc<AtomicUsize>);
+
+impl ActiveStandbyGuard {
+    pub(crate) fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for ActiveStandbyGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) struct StandbyPoolHandle {
+    shutdown_tx: watch::Sender<bool>,
+    supervisor: JoinHandle<()>,
+}
+
+impl Drop for StandbyPoolHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        self.supervisor.abort();
+    }
+}
+
+pub(crate) async fn await_standby_ready_with_deadline(
+    ready_rxs: Vec<oneshot::Receiver<Result<(), RuntimeError>>>,
+    timeout_dur: Duration,
+) {
+    let _ = timeout(timeout_dur, futures_util::future::join_all(ready_rxs)).await;
+}
+
+pub(crate) type StandbySlotFuture = Pin<Box<dyn Future<Output = StandbySlotOutcome> + Send>>;
+
+pub(crate) fn spawn_standby_pool_supervisor<F>(
+    pool_size: usize,
+    parent_shutdown: watch::Receiver<bool>,
+    run_slot: F,
+) -> (
+    StandbyPoolHandle,
+    Vec<oneshot::Receiver<Result<(), RuntimeError>>>,
+)
+where
+    F: Fn(
+            Option<oneshot::Sender<Result<(), RuntimeError>>>,
+            oneshot::Sender<()>,
+            watch::Receiver<bool>,
+        ) -> StandbySlotFuture
+        + Send
+        + Sync
+        + 'static,
+{
+    let (pool_shutdown_tx, mut pool_shutdown_rx) = watch::channel(false);
+    let (replenish_tx, mut replenish_rx) = mpsc::channel::<u64>(pool_size.saturating_mul(4).max(8));
+    let mut slots: JoinSet<(u64, StandbySlotOutcome)> = JoinSet::new();
+    let mut live_ids: HashSet<u64> = HashSet::new();
+    let mut next_slot_id: u64 = 1;
+    let mut ready_rxs = Vec::with_capacity(pool_size);
+    let run_slot = Arc::new(run_slot);
+    let spawn_tx = pool_shutdown_tx.clone();
+    let r_base_tx = replenish_tx.clone();
+
+    let spawn_one = move |slots: &mut JoinSet<(u64, StandbySlotOutcome)>,
+                          live_ids: &mut HashSet<u64>,
+                          next_id: &mut u64,
+                          ready_tx: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+                          delay: Duration| {
+        let id = *next_id;
+        *next_id = next_id.wrapping_add(1).max(1);
+        live_ids.insert(id);
+        let (consumed_tx, consumed_rx) = oneshot::channel();
+        let r_tx = r_base_tx.clone();
+        tokio::spawn(async move {
+            if consumed_rx.await.is_ok() {
+                let _ = r_tx.send(id).await;
+            }
+        });
+        let fut = run_slot(ready_tx, consumed_tx, spawn_tx.subscribe());
+        slots.spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            (id, fut.await)
+        });
+    };
+
+    for _ in 0..pool_size {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        spawn_one(
+            &mut slots,
+            &mut live_ids,
+            &mut next_slot_id,
+            Some(ready_tx),
+            Duration::ZERO,
+        );
+        ready_rxs.push(ready_rx);
+    }
+
+    let pool_shutdown_tx_c = pool_shutdown_tx.clone();
+    let mut parent_rx = parent_shutdown;
+    let supervisor = tokio::spawn(async move {
+        let mut backoff = STANDBY_BACKOFF_INITIAL;
+        loop {
+            if *parent_rx.borrow() || *pool_shutdown_rx.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = parent_rx.changed() => {
+                    break;
+                }
+                _ = pool_shutdown_rx.changed() => {
+                    break;
+                }
+                Some(id) = replenish_rx.recv() => {
+                    if live_ids.remove(&id) && live_ids.len() < pool_size {
+                        backoff = STANDBY_BACKOFF_INITIAL;
+                        spawn_one(&mut slots, &mut live_ids, &mut next_slot_id, None, Duration::ZERO);
+                    }
+                }
+                Some(res) = slots.join_next(), if !slots.is_empty() => {
+                    let Ok((id, outcome)) = res else {
+                        continue;
+                    };
+                    let still_counted = live_ids.remove(&id);
+                    if !still_counted {
+                        continue;
+                    }
+                    match outcome {
+                        StandbySlotOutcome::Shutdown | StandbySlotOutcome::Unsupported => {}
+                        StandbySlotOutcome::Consumed => {
+                            backoff = STANDBY_BACKOFF_INITIAL;
+                            if live_ids.len() < pool_size {
+                                spawn_one(&mut slots, &mut live_ids, &mut next_slot_id, None, Duration::ZERO);
+                            }
+                        }
+                        StandbySlotOutcome::Retry => {
+                            if live_ids.len() < pool_size {
+                                let delay = jittered_standby_backoff(backoff);
+                                backoff = (backoff * 2).min(STANDBY_BACKOFF_MAX);
+                                spawn_one(&mut slots, &mut live_ids, &mut next_slot_id, None, delay);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = pool_shutdown_tx_c.send(true);
+        slots.abort_all();
+    });
+
+    (
+        StandbyPoolHandle {
+            shutdown_tx: pool_shutdown_tx,
+            supervisor,
+        },
+        ready_rxs,
+    )
 }
 
 #[cfg(unix)]
@@ -298,13 +534,31 @@ impl<S> WsBinaryPathStream<S> {
         write_timeout: Duration,
         max_recv_len: usize,
     ) -> Self {
+        Self::with_initial_bytes(
+            provider,
+            peer_ip,
+            ws,
+            write_timeout,
+            max_recv_len,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn with_initial_bytes(
+        provider: ProviderId,
+        peer_ip: Option<IpAddr>,
+        ws: WebSocketStream<S>,
+        write_timeout: Duration,
+        max_recv_len: usize,
+        initial_bytes: Vec<u8>,
+    ) -> Self {
         Self {
             provider,
             peer_ip,
             ws,
             write_timeout,
             max_recv_len,
-            pending_read: VecDeque::new(),
+            pending_read: VecDeque::from(initial_bytes),
         }
     }
 }

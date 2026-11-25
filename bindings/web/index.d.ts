@@ -113,6 +113,7 @@ export type WebStreamRecvResult =
   | { status: "eof" };
 
 export interface TendrilStream {
+  readonly fastOpenSent?: boolean;
   maxFrame(): number;
   send(bytes: Uint8Array): Promise<void> | void;
   recv(timeoutMs?: number): Promise<WebStreamRecvResult>;
@@ -259,6 +260,7 @@ export const MAX_QUEUED_FRAMES: number;
 
 export class RelayStream implements TendrilStream {
   constructor(ws: WebSocket, maxQueuedBytes?: number, maxQueuedFrames?: number);
+  readonly fastOpenSent: boolean;
   maxFrame(): number;
   send(bytes: Uint8Array): void;
   recv(timeoutMs?: number): Promise<WebStreamRecvResult>;
@@ -301,6 +303,7 @@ export function dialRelayStream(options: {
   allowInsecureWs?: boolean;
   relayAuthTicket?: string | Record<string, unknown> | null;
   relayAuthSecret?: string | Uint8Array | null;
+  initFrame?: Uint8Array | null;
   timeoutMs?: number;
   signal?: AbortSignal | null;
 }): Promise<TendrilStream>;
@@ -312,6 +315,7 @@ export function dialRelayV2Stream(options: {
   allowInsecureWs?: boolean;
   relayAuthTicket?: string | Record<string, unknown> | null;
   relayAuthSecret?: string | Uint8Array | null;
+  initFrame?: Uint8Array | null;
   timeoutMs?: number;
   signal?: AbortSignal | null;
 }): Promise<TendrilStream>;

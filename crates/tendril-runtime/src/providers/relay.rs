@@ -3,6 +3,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,21 +19,35 @@ use tendril_relay::protocol::{
 };
 use tendril_relay::server::{ClientWsStream, RelayConfig, RelayHandle, RelayServer};
 use tokio::net::TcpStream;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant as TokioInstant, timeout};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use super::{
-    WsBinaryPathStream, connect_ws_resolved, ensure_rustls_ring_provider, ws_binary_config,
+    ActiveStandbyGuard, STANDBY_POOL_SIZE, StandbyPoolHandle, StandbySlotOutcome,
+    WsBinaryPathStream, await_standby_ready_with_deadline, connect_ws_resolved,
+    decode_incoming_init_frame, encode_fast_open_init_frame, ensure_rustls_ring_provider,
+    spawn_standby_pool_supervisor, ws_binary_config, ws_control_config,
 };
 use crate::error::{RelayOffline, RuntimeError};
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
 use crate::redact::{redact_hint, redact_url_str};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONTROL_PING_MIN_MS: u64 = 22_500;
+pub(crate) const CONTROL_PING_MAX_MS: u64 = 37_500;
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_ACCEPTS: usize = 16;
+
+pub(crate) fn jittered_ping_delay() -> Duration {
+    let raw = u32::from_le_bytes(random_bytes::<4>().unwrap_or([0; 4]));
+    Duration::from_millis(
+        CONTROL_PING_MIN_MS + u64::from(raw) % (CONTROL_PING_MAX_MS - CONTROL_PING_MIN_MS + 1),
+    )
+}
 
 /// Client-side admission credentials presented to `/v1/relay` and `/v2/relay` servers.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -174,7 +189,18 @@ fn extract_url_host(relay_url: &str) -> Result<String, RuntimeError> {
 async fn connect_and_verify_challenge(
     relay_url: &str,
     expected_host: Option<&str>,
-) -> Result<(ClientWsStream, String, [u8; 32], Option<Vec<String>>), RuntimeError> {
+    ws_config: WebSocketConfig,
+) -> Result<
+    (
+        ClientWsStream,
+        String,
+        [u8; 32],
+        Option<Vec<String>>,
+        bool,
+        bool,
+    ),
+    RuntimeError,
+> {
     let required_host = match expected_host {
         Some(h) if !h.is_empty() => h.to_owned(),
         _ => extract_url_host(relay_url)?,
@@ -182,11 +208,7 @@ async fn connect_and_verify_challenge(
     ensure_rustls_ring_provider();
     let (mut ws, _) = timeout(
         CONTROL_TIMEOUT,
-        connect_ws_resolved(
-            relay_url,
-            Some(client_ws_config()),
-            "relay websocket connect",
-        ),
+        connect_ws_resolved(relay_url, Some(ws_config), "relay websocket connect"),
     )
     .await
     .map_err(|_| RuntimeError::Timeout("relay websocket connect timed out"))??;
@@ -196,6 +218,8 @@ async fn connect_and_verify_challenge(
         host,
         max_frame,
         auth_required,
+        fast_open,
+        standby,
     } = recv_control_msg(&mut ws).await?
     else {
         return Err(RuntimeError::Protocol(
@@ -213,25 +237,54 @@ async fn connect_and_verify_challenge(
         )));
     }
     let nonce_bytes = b64url_decode_array::<32>(&nonce)?;
-    Ok((ws, host, nonce_bytes, auth_required))
+    Ok((
+        ws,
+        host,
+        nonce_bytes,
+        auth_required,
+        fast_open == Some(true),
+        standby == Some(true),
+    ))
 }
 
 /// Active binary bridge stream over a Tendril v1 WebSocket relay.
 pub struct RelayStream {
     inner: WsBinaryPathStream<MaybeTlsStream<TcpStream>>,
+    fast_open_sent: bool,
 }
 
 impl RelayStream {
     pub(crate) fn new(ws: ClientWsStream, write_timeout: Duration) -> Self {
+        Self::with_initial_bytes(ws, write_timeout, Vec::new())
+    }
+
+    pub(crate) fn with_initial_bytes(
+        ws: ClientWsStream,
+        write_timeout: Duration,
+        initial_bytes: Vec<u8>,
+    ) -> Self {
         Self {
-            inner: WsBinaryPathStream::new(
+            inner: WsBinaryPathStream::with_initial_bytes(
                 ProviderId::Relay,
                 None,
                 ws,
                 write_timeout,
                 MAX_RELAY_FRAME_LEN,
+                initial_bytes,
             ),
+            fast_open_sent: false,
         }
+    }
+
+    pub(crate) fn with_fast_open_sent(mut self, sent: bool) -> Self {
+        self.fast_open_sent = sent;
+        self
+    }
+
+    /// Returns `true` when the caller's 0-RTT `init_frame` was accepted inside `Dial`.
+    #[must_use]
+    pub fn fast_open_sent(&self) -> bool {
+        self.fast_open_sent
     }
 }
 
@@ -272,7 +325,9 @@ pub struct RelayListener {
     accepted_rx: mpsc::Receiver<RelayStream>,
     endpoint: String,
     mailbox_pub_b64: String,
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    active_standby_sockets: Arc<AtomicUsize>,
+    standby_pool: Option<StandbyPoolHandle>,
+    shutdown_tx: watch::Sender<bool>,
     control_task: Option<JoinHandle<()>>,
 }
 
@@ -305,8 +360,15 @@ impl RelayListener {
     ) -> Result<Self, RuntimeError> {
         let parsed = super::validate_ws_url(&relay_url.into(), false)?;
         let relay_url = parsed.as_str().to_owned();
-        let (mut control_ws, challenge_host, nonce, auth_required) =
-            connect_and_verify_challenge(&relay_url, expected_host.as_deref()).await?;
+        let (
+            mut control_ws,
+            challenge_host,
+            nonce,
+            auth_required,
+            server_fast_open,
+            server_standby,
+        ) = connect_and_verify_challenge(&relay_url, expected_host.as_deref(), ws_control_config())
+            .await?;
         let (pub_b64, sig_b64) = sign_relay_register(&signing_key, &challenge_host, &nonce);
         let pub_bytes = signing_key.verifying_key().to_bytes();
         let reg_auth = build_relay_auth_proof(
@@ -323,6 +385,7 @@ impl RelayListener {
                 pub_key: pub_b64.clone(),
                 sig: sig_b64,
                 auth: reg_auth,
+                fast_open: server_fast_open.then_some(true),
             },
             write_timeout,
         )
@@ -345,22 +408,46 @@ impl RelayListener {
         let endpoint = format!("{relay_url}#{pub_b64}");
         let mailbox_pub_b64 = pub_b64.clone();
         let (accepted_tx, accepted_rx) = mpsc::channel(32);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let accept_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_ACCEPTS));
+        let active_standby_sockets = Arc::new(AtomicUsize::new(0));
         let signing_key = Arc::new(signing_key);
         let auth = Arc::new(auth);
 
+        let standby_pool = if server_standby {
+            let (pool_handle, sb_ready_rxs) = spawn_v1_standby_pool(
+                relay_url.clone(),
+                expected_host.clone(),
+                Arc::clone(&signing_key),
+                pub_b64.clone(),
+                Arc::clone(&accept_sem),
+                accepted_tx.clone(),
+                Arc::clone(&active_standby_sockets),
+                Arc::clone(&auth),
+                write_timeout,
+                shutdown_tx.subscribe(),
+            );
+            await_standby_ready_with_deadline(sb_ready_rxs, CONTROL_TIMEOUT).await;
+            Some(pool_handle)
+        } else {
+            None
+        };
+
         let control_task = tokio::spawn(async move {
             loop {
+                if *shutdown_rx.borrow() {
+                    let _ = timeout(write_timeout, control_ws.close(None)).await;
+                    break;
+                }
                 tokio::select! {
-                    _ = &mut shutdown_rx => {
+                    _ = shutdown_rx.changed() => {
                         let _ = timeout(write_timeout, control_ws.close(None)).await;
                         break;
                     }
                     maybe_msg = control_ws.next() => {
                         match maybe_msg {
                             Some(Ok(Message::Text(text))) => {
-                                if let Ok(RelayServerMsg::Incoming { conn_id }) =
+                                if let Ok(RelayServerMsg::Incoming { conn_id, init_frame }) =
                                     serde_json::from_str::<RelayServerMsg>(&text)
                                 {
                                     let Ok(permit) = Arc::clone(&accept_sem).try_acquire_owned() else {
@@ -381,6 +468,7 @@ impl RelayListener {
                                             &key_c,
                                             &pub_c,
                                             &conn_id,
+                                            init_frame.as_deref(),
                                             &auth_c,
                                             write_timeout,
                                         )
@@ -404,7 +492,9 @@ impl RelayListener {
             accepted_rx,
             endpoint,
             mailbox_pub_b64,
-            shutdown_tx: Some(shutdown_tx),
+            active_standby_sockets,
+            standby_pool,
+            shutdown_tx,
             control_task: Some(control_task),
         })
     }
@@ -414,15 +504,253 @@ impl RelayListener {
     pub fn mailbox_pub_b64(&self) -> &str {
         &self.mailbox_pub_b64
     }
+
+    /// Returns the number of currently registered standby acceptor sockets.
+    #[must_use]
+    pub fn active_standby_socket_count(&self) -> usize {
+        self.active_standby_sockets.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for RelayListener {
     fn drop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
+        let _ = self.shutdown_tx.send(true);
+        drop(self.standby_pool.take());
         if let Some(handle) = self.control_task.take() {
             handle.abort();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_v1_standby_pool(
+    relay_url: String,
+    expected_host: Option<String>,
+    signing_key: Arc<SigningKey>,
+    pub_b64: String,
+    accept_sem: Arc<Semaphore>,
+    accepted_tx: mpsc::Sender<RelayStream>,
+    active_standby: Arc<AtomicUsize>,
+    auth: Arc<RelayClientAuth>,
+    write_timeout: Duration,
+    shutdown_rx: watch::Receiver<bool>,
+) -> (
+    StandbyPoolHandle,
+    Vec<oneshot::Receiver<Result<(), RuntimeError>>>,
+) {
+    spawn_standby_pool_supervisor(
+        STANDBY_POOL_SIZE,
+        shutdown_rx,
+        move |ready_tx, consumed_tx, slot_shutdown| {
+            let url_c = relay_url.clone();
+            let host_c = expected_host.clone();
+            let key_c = Arc::clone(&signing_key);
+            let pub_c = pub_b64.clone();
+            let sem_c = Arc::clone(&accept_sem);
+            let tx_c = accepted_tx.clone();
+            let active_c = Arc::clone(&active_standby);
+            let auth_c = Arc::clone(&auth);
+            Box::pin(run_v1_standby_slot(
+                url_c,
+                host_c,
+                key_c,
+                pub_c,
+                sem_c,
+                tx_c,
+                active_c,
+                auth_c,
+                write_timeout,
+                ready_tx,
+                consumed_tx,
+                slot_shutdown,
+            ))
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_v1_standby_slot(
+    relay_url: String,
+    expected_host: Option<String>,
+    signing_key: Arc<SigningKey>,
+    pub_b64: String,
+    accept_sem: Arc<Semaphore>,
+    accepted_tx: mpsc::Sender<RelayStream>,
+    active_standby: Arc<AtomicUsize>,
+    auth: Arc<RelayClientAuth>,
+    write_timeout: Duration,
+    mut ready_tx: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+    consumed_tx: oneshot::Sender<()>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> StandbySlotOutcome {
+    if *shutdown_rx.borrow() {
+        return StandbySlotOutcome::Shutdown;
+    }
+    let (mut ws, challenge_host, nonce, auth_required, _fast_open, server_standby) =
+        match connect_and_verify_challenge(
+            &relay_url,
+            expected_host.as_deref(),
+            ws_control_config(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(err));
+                }
+                return StandbySlotOutcome::Retry;
+            }
+        };
+    if !server_standby {
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(Ok(()));
+        }
+        let _ = timeout(write_timeout, ws.close(None)).await;
+        return StandbySlotOutcome::Unsupported;
+    }
+
+    let (derived_pub, sig_b64) = sign_relay_register(&signing_key, &challenge_host, &nonce);
+    if derived_pub != pub_b64 {
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(Err(RuntimeError::Protocol(
+                "standby signing key mismatch".to_owned(),
+            )));
+        }
+        return StandbySlotOutcome::Unsupported;
+    }
+    let pub_bytes = signing_key.verifying_key().to_bytes();
+    let sb_auth = match build_relay_auth_proof(
+        &auth,
+        auth_required.as_deref(),
+        "register",
+        &challenge_host,
+        &nonce,
+        &pub_bytes,
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(err));
+            }
+            return StandbySlotOutcome::Unsupported;
+        }
+    };
+    if let Err(err) = send_control_msg(
+        &mut ws,
+        &RelayClientMsg::Standby {
+            pub_key: pub_b64.clone(),
+            sig: sig_b64,
+            auth: sb_auth,
+        },
+        write_timeout,
+    )
+    .await
+    {
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(Err(err));
+        }
+        return StandbySlotOutcome::Retry;
+    }
+
+    match recv_control_msg(&mut ws).await {
+        Ok(RelayServerMsg::StandbyReady) => {}
+        Ok(RelayServerMsg::Error { code }) => {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(RuntimeError::Protocol(format!(
+                    "relay standby rejected: {code}"
+                ))));
+            }
+            return StandbySlotOutcome::Retry;
+        }
+        Ok(other) => {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(RuntimeError::Protocol(format!(
+                    "unexpected relay standby response: {other:?}"
+                ))));
+            }
+            return StandbySlotOutcome::Retry;
+        }
+        Err(err) => {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(err));
+            }
+            return StandbySlotOutcome::Retry;
+        }
+    }
+
+    let active_guard = ActiveStandbyGuard::enter(&active_standby);
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(Ok(()));
+    }
+
+    let idle_sleep = tokio::time::sleep(CONTROL_IDLE_TIMEOUT);
+    tokio::pin!(idle_sleep);
+    let ping_sleep = tokio::time::sleep(jittered_ping_delay());
+    tokio::pin!(ping_sleep);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            let _ = timeout(write_timeout, ws.close(None)).await;
+            return StandbySlotOutcome::Shutdown;
+        }
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                let _ = timeout(write_timeout, ws.close(None)).await;
+                return StandbySlotOutcome::Shutdown;
+            }
+            () = &mut idle_sleep => {
+                let _ = timeout(write_timeout, ws.close(None)).await;
+                return StandbySlotOutcome::Retry;
+            }
+            () = &mut ping_sleep => {
+                ping_sleep
+                    .as_mut()
+                    .reset(TokioInstant::now() + jittered_ping_delay());
+                if !timeout(write_timeout, ws.send(Message::Ping(Vec::new().into())))
+                    .await
+                    .is_ok_and(|res| res.is_ok())
+                {
+                    let _ = timeout(write_timeout, ws.close(None)).await;
+                    return StandbySlotOutcome::Retry;
+                }
+            }
+            maybe_msg = ws.next() => {
+                match maybe_msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(RelayServerMsg::Incoming { conn_id: _, init_frame }) =
+                            serde_json::from_str::<RelayServerMsg>(&text)
+                        else {
+                            let _ = timeout(write_timeout, ws.close(None)).await;
+                            return StandbySlotOutcome::Retry;
+                        };
+                        drop(active_guard);
+
+                        let Ok(init_bytes) = decode_incoming_init_frame(init_frame.as_deref()) else {
+                            let _ = timeout(write_timeout, ws.close(None)).await;
+                            return StandbySlotOutcome::Retry;
+                        };
+                        let Ok(permit) = Arc::clone(&accept_sem).try_acquire_owned() else {
+                            let _ = timeout(write_timeout, ws.close(None)).await;
+                            return StandbySlotOutcome::Retry;
+                        };
+                        let _ = consumed_tx.send(());
+                        let stream = RelayStream::with_initial_bytes(ws, write_timeout, init_bytes);
+                        let _ = timeout(CONTROL_TIMEOUT, accepted_tx.send(stream)).await;
+                        drop(permit);
+                        return StandbySlotOutcome::Consumed;
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                        idle_sleep
+                            .as_mut()
+                            .reset(TokioInstant::now() + CONTROL_IDLE_TIMEOUT);
+                        ping_sleep
+                            .as_mut()
+                            .reset(TokioInstant::now() + jittered_ping_delay());
+                    }
+                    _ => return StandbySlotOutcome::Retry,
+                }
+            }
         }
     }
 }
@@ -439,18 +767,21 @@ impl PathListener for RelayListener {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_one_stream(
     relay_url: &str,
     expected_host: Option<&str>,
     signing_key: &SigningKey,
     pub_b64: &str,
     conn_id_b64: &str,
+    init_frame: Option<&str>,
     auth: &RelayClientAuth,
     write_timeout: Duration,
 ) -> Result<RelayStream, RuntimeError> {
     let conn_id_bytes = b64url_decode_array::<16>(conn_id_b64)?;
-    let (mut ws, host, nonce, auth_required) =
-        connect_and_verify_challenge(relay_url, expected_host).await?;
+    let init_bytes = decode_incoming_init_frame(init_frame)?;
+    let (mut ws, host, nonce, auth_required, _, _) =
+        connect_and_verify_challenge(relay_url, expected_host, client_ws_config()).await?;
     let sig_b64 = sign_relay_accept(signing_key, &host, &nonce, &conn_id_bytes);
     let pub_bytes = signing_key.verifying_key().to_bytes();
     let acc_auth = build_relay_auth_proof(
@@ -474,9 +805,9 @@ async fn accept_one_stream(
     .await?;
 
     match recv_control_msg(&mut ws).await? {
-        RelayServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => {
-            Ok(RelayStream::new(ws, write_timeout))
-        }
+        RelayServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => Ok(
+            RelayStream::with_initial_bytes(ws, write_timeout, init_bytes),
+        ),
         RelayServerMsg::Error { code } => Err(RuntimeError::Protocol(format!(
             "relay accept rejected: {code}"
         ))),
@@ -551,9 +882,27 @@ impl RelayDialer {
         relay_url: &str,
         target_signing_pub: &[u8; 32],
     ) -> Result<Box<dyn PathStream>, RuntimeError> {
+        self.connect_with_init(relay_url, target_signing_pub, None)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    /// Connects through `relay_url` to `target_signing_pub`, optionally attaching `init_frame`
+    /// inside `Dial` when the relay advertises `fast_open`. Returns `(stream, fast_open_sent)`.
+    pub async fn connect_with_init(
+        &self,
+        relay_url: &str,
+        target_signing_pub: &[u8; 32],
+        init_frame: Option<&[u8]>,
+    ) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
         let parsed = super::validate_ws_url(relay_url, self.allow_insecure_ws)?;
-        let (mut ws, host, nonce, auth_required) =
-            connect_and_verify_challenge(parsed.as_str(), self.expected_host.as_deref()).await?;
+        let (mut ws, host, nonce, auth_required, server_fast_open, _server_standby) =
+            connect_and_verify_challenge(
+                parsed.as_str(),
+                self.expected_host.as_deref(),
+                client_ws_config(),
+            )
+            .await?;
         if self.auth_withheld
             && auth_required
                 .as_deref()
@@ -575,21 +924,26 @@ impl RelayDialer {
             &nonce,
             target_signing_pub,
         )?;
+        let (init_b64, fast_open_sent) = encode_fast_open_init_frame(init_frame, server_fast_open)?;
         send_control_msg(
             &mut ws,
             &RelayClientMsg::Dial {
                 target_pub: target_b64,
                 conn_id: conn_id_b64.clone(),
                 auth: dial_auth,
+                init_frame: init_b64,
             },
             self.write_timeout,
         )
         .await?;
 
         match recv_control_msg(&mut ws).await? {
-            RelayServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => {
-                Ok(Box::new(RelayStream::new(ws, self.write_timeout)))
-            }
+            RelayServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => Ok((
+                Box::new(
+                    RelayStream::new(ws, self.write_timeout).with_fast_open_sent(fast_open_sent),
+                ),
+                fast_open_sent,
+            )),
             RelayServerMsg::Error { code } if code == "offline" => {
                 Err(RuntimeError::RelayOffline(RelayOffline::V1Dial))
             }
@@ -609,7 +963,21 @@ impl PathDialer for RelayDialer {
         ProviderId::Relay
     }
 
+    fn supports_fast_open(&self) -> bool {
+        true
+    }
+
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+        self.dial_with_init(endpoint, None)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    async fn dial_with_init(
+        &self,
+        endpoint: &str,
+        init_frame: Option<&[u8]>,
+    ) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
         let (url, target_b64) = endpoint.split_once('#').ok_or_else(|| {
             RuntimeError::Protocol(format!(
                 "relay endpoint must include #<b64url_signing_pub>: {}",
@@ -617,7 +985,7 @@ impl PathDialer for RelayDialer {
             ))
         })?;
         let target_pub = b64url_decode_array::<32>(target_b64)?;
-        self.connect(url, &target_pub).await
+        self.connect_with_init(url, &target_pub, init_frame).await
     }
 }
 
@@ -709,15 +1077,8 @@ impl RelayHintDialer {
     fn gated_auth(&self, dial_url: &str) -> RelayClientAuth {
         gate_relay_auth(&self.auth, dial_url, &self.origins, self.operator_endpoint)
     }
-}
 
-#[async_trait]
-impl PathDialer for RelayHintDialer {
-    fn provider_id(&self) -> ProviderId {
-        ProviderId::Relay
-    }
-
-    async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+    fn build_inner_dialer(&self, endpoint: &str) -> Result<RelayDialer, RuntimeError> {
         if endpoint.contains('#') {
             return Err(RuntimeError::Protocol(format!(
                 "invalid: relay hint must not carry a fragment: {}",
@@ -731,7 +1092,34 @@ impl PathDialer for RelayHintDialer {
         if let Some(host) = &self.expected_host {
             dialer = dialer.with_expected_host(host.clone());
         }
-        dialer.connect(endpoint, &self.target_key).await
+        Ok(dialer)
+    }
+}
+
+#[async_trait]
+impl PathDialer for RelayHintDialer {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::Relay
+    }
+
+    fn supports_fast_open(&self) -> bool {
+        true
+    }
+
+    async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+        self.build_inner_dialer(endpoint)?
+            .connect(endpoint, &self.target_key)
+            .await
+    }
+
+    async fn dial_with_init(
+        &self,
+        endpoint: &str,
+        init_frame: Option<&[u8]>,
+    ) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
+        self.build_inner_dialer(endpoint)?
+            .connect_with_init(endpoint, &self.target_key, init_frame)
+            .await
     }
 }
 

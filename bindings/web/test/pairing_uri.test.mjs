@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   TendrilWebClient,
+  b64urlDecode,
   classifyPairingCode,
   filterWebCompatibleEndpoints,
   initTendril,
@@ -1219,5 +1220,182 @@ test("live: broker+ws:// pairs, connects endpoint-free, falls back across dead r
   } finally {
     client.free();
     host.close();
+  }
+});
+
+test("pair, connect, and connectV2 send 0-RTT init_frame when fast_open=true and fall back when omitted", async () => {
+  await ensureWasm();
+  const host = await hostFixture("fast-open-host");
+  const { v1RosterBytes, v2RosterBytes } = await (async () => {
+    const { WasmRoster } = await import("../pkg/tendril_wasm.js");
+    const r = new WasmRoster();
+    try {
+      r.insert_pinned_host(
+        host.info.host_id,
+        host.info.host_id,
+        host.info.static_pub,
+        host.info.signing_pub,
+        0,
+        null
+      );
+      const v1 = r.to_json_bytes();
+      const doc = JSON.parse(r.to_json());
+      const entry = doc.entries[host.info.host_id];
+      entry.min_wire_version = 2;
+      entry.v2_secrets = {
+        reconnect_secret: b64url(Buffer.alloc(32, 0x11)),
+        mailbox_secret: b64url(Buffer.alloc(32, 0x22)),
+      };
+      r.replace_from_json(JSON.stringify(doc));
+      const v2 = r.to_json_bytes();
+      return { v1RosterBytes: v1, v2RosterBytes: v2 };
+    } finally {
+      r.free();
+    }
+  })();
+
+  const installSpyWs = (advertiseFastOpen) => {
+    const records = [];
+    const Original = globalThis.WebSocket;
+    class SpyWebSocket extends EventTarget {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      constructor(url) {
+        super();
+        this.url = url;
+        this.readyState = SpyWebSocket.CONNECTING;
+        this.binaryType = "arraybuffer";
+        this.rec = { url, dial: null, postReadyBinary: [] };
+        records.push(this.rec);
+        setTimeout(() => {
+          this.readyState = SpyWebSocket.OPEN;
+          this.dispatchEvent(new Event("open"));
+          const challenge = {
+            op: "challenge",
+            host: new URL(url).hostname,
+            nonce: b64url(crypto.randomBytes(32)),
+            max_frame: 65521,
+          };
+          if (url.includes("/v2/relay")) {
+            challenge.epoch = Math.floor(Date.now() / 1000 / 3600);
+          }
+          if (advertiseFastOpen !== undefined) {
+            challenge.fast_open = advertiseFastOpen;
+          }
+          this.#emitText(challenge);
+        }, 0);
+      }
+      #emitText(obj) {
+        const ev = new Event("message");
+        ev.data = JSON.stringify(obj);
+        this.dispatchEvent(ev);
+      }
+      send(data) {
+        if (typeof data === "string") {
+          const msg = JSON.parse(data);
+          this.rec.dial = msg;
+          setTimeout(() => {
+            this.#emitText({ op: "ready", conn_id: msg.conn_id });
+            if (advertiseFastOpen) {
+              setTimeout(() => this.close(), 15);
+            }
+          }, 0);
+        } else {
+          this.rec.postReadyBinary.push(new Uint8Array(data));
+          setTimeout(() => this.close(), 5);
+        }
+      }
+      close() {
+        if (this.readyState === SpyWebSocket.CLOSED) return;
+        this.readyState = SpyWebSocket.CLOSED;
+        setTimeout(() => this.dispatchEvent(new Event("close")), 0);
+      }
+    }
+    globalThis.WebSocket = SpyWebSocket;
+    return {
+      records,
+      restore: () => {
+        globalThis.WebSocket = Original;
+      },
+    };
+  };
+
+  for (const fastOpen of [true, undefined]) {
+    const spy = installSpyWs(fastOpen);
+    const idMod = await import("../pkg/tendril_wasm.js");
+    const cliId = idMod.WasmIdentity.generate("fast-open-cli");
+    const idBytes = cliId.to_json_bytes();
+    cliId.free();
+    const v1Client = await TendrilWebClient.create({
+      identityBytes: idBytes.slice(),
+      rosterBytes: v1RosterBytes.slice(),
+    });
+    const v2Client = await TendrilWebClient.create({
+      identityBytes: idBytes.slice(),
+      rosterBytes: v2RosterBytes.slice(),
+    });
+    try {
+      const code = "TND-ABCD-EFGH-JKLM";
+      const relayV1 = "ws://127.0.0.1:49999/v1/relay";
+      const relayV2 = "ws://127.0.0.1:49999/v2/relay";
+      const uri = buildUri({
+        k: host.info.static_pub,
+        sh: host.info.signing_pub_hash,
+        rp: host.info.relay_pub,
+        id: host.info.host_id,
+        code,
+        ep: [relayV1],
+        rq: 1,
+        seedB64: host.seedB64,
+      });
+
+      await assert.rejects(() =>
+        v1Client.pair({ pairingUri: uri, allowInsecureWs: true, timeoutMs: 2000 })
+      );
+      assert.equal(spy.records.length, 1, "pair did not dial");
+      await assert.rejects(() =>
+        v1Client.connect({
+          relayUrl: relayV1,
+          targetPub: host.info.relay_pub,
+          targetHostId: host.info.host_id,
+          allowInsecureWs: true,
+          timeoutMs: 2000,
+        })
+      );
+      assert.equal(spy.records.length, 2, "connect(v1) did not dial");
+      await v2Client.setPeerRoutes(host.info.host_id, [relayV2]);
+      await assert.rejects(() =>
+        v2Client.connectV2({
+          targetHostId: host.info.host_id,
+          allowInsecureWs: true,
+          timeoutMs: 2000,
+        })
+      );
+      assert.equal(spy.records.length, 3, "connectV2 did not dial");
+      for (const rec of spy.records) {
+        if (fastOpen) {
+          assert.equal(typeof rec.dial.init_frame, "string", `${rec.url} missing init_frame`);
+          assert.ok(b64urlDecode(rec.dial.init_frame).length > 0);
+          assert.equal(
+            rec.postReadyBinary.length,
+            0,
+            `${rec.url} must not resend msg1 when fastOpenSent=true`
+          );
+        } else {
+          assert.equal(rec.dial.init_frame, undefined, `${rec.url} must omit init_frame`);
+          assert.equal(
+            rec.postReadyBinary.length,
+            1,
+            `${rec.url} must fall back to binary msg1 after Ready`
+          );
+        }
+      }
+    } finally {
+      v1Client.free();
+      v2Client.free();
+      spy.restore();
+    }
   }
 });

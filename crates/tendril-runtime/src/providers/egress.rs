@@ -445,8 +445,24 @@ impl PathDialer for EgressDialer {
         self.inner.provider_id()
     }
 
+    fn supports_fast_open(&self) -> bool {
+        self.inner.supports_fast_open()
+    }
+
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
         with_addr_policy(Arc::clone(&self.policy), self.inner.dial(endpoint)).await
+    }
+
+    async fn dial_with_init(
+        &self,
+        endpoint: &str,
+        init_frame: Option<&[u8]>,
+    ) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
+        with_addr_policy(
+            Arc::clone(&self.policy),
+            self.inner.dial_with_init(endpoint, init_frame),
+        )
+        .await
     }
 }
 

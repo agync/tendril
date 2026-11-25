@@ -18,6 +18,7 @@ import {
   TendrilWebClient,
   WasmV2PakePairInitiator,
   WasmV2SessionInitiator,
+  b64urlEncode,
   canonicalRelayHost,
   computeCodeMac,
   computeCodeMacBytes,
@@ -1295,6 +1296,128 @@ test("dialRelayStream and dialRelayV2Stream enforce dial auth, zeroize secrets, 
     }
   } finally {
     client.free();
+    await mock.close();
+  }
+});
+
+test("W2-0RTT dialRelayStream and dialRelayV2Stream gate init_frame on Challenge.fast_open", async () => {
+  await ensureWasm();
+  const nonceBytes = crypto.randomBytes(32);
+  const nonceB64 = b64urlEncode(nonceBytes);
+  const targetPub = b64urlEncode(crypto.randomBytes(32));
+  const mbSecret = crypto.randomBytes(32);
+  const serverEpoch = Math.floor(Date.now() / 1000 / 3600);
+
+  let challengeFastOpen = true;
+  const capturedDials = [];
+  const mock = await startMockRelayWsServer((reqUrl) => {
+    const isV2 = reqUrl.startsWith("/v2/relay");
+    const challenge = {
+      op: "challenge",
+      host: "127.0.0.1",
+      nonce: nonceB64,
+      max_frame: MAX_RELAY_FRAME_LEN,
+    };
+    if (isV2) {
+      challenge.epoch = serverEpoch;
+    }
+    if (challengeFastOpen !== undefined) {
+      challenge.fast_open = challengeFastOpen;
+    }
+    return {
+      challenge,
+      handleDial: (msg) => {
+        capturedDials.push({ path: reqUrl, msg });
+        return { op: "ready", conn_id: msg.conn_id };
+      },
+    };
+  });
+
+  try {
+    const sampleInit = new Uint8Array([0x54, 0x4e, 0x44, 0x31, 0xaa, 0xbb]);
+    const expectedB64 = b64urlEncode(sampleInit);
+
+    // Validation before network: non-Uint8Array, empty, or oversize initFrame must throw.
+    await assert.rejects(
+      () =>
+        dialRelayStream({
+          relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+          targetPub,
+          allowInsecureWs: true,
+          initFrame: "not-bytes",
+        }),
+      TypeError
+    );
+    await assert.rejects(
+      () =>
+        dialRelayStream({
+          relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+          targetPub,
+          allowInsecureWs: true,
+          initFrame: new Uint8Array(0),
+        }),
+      RangeError
+    );
+    await assert.rejects(
+      () =>
+        dialRelayV2Stream({
+          relayUrl: `ws://127.0.0.1:${mock.port}/v2/relay`,
+          allowInsecureWs: true,
+          deriveV2Dial: ({ relayHost, nonceBytes: n, connIdBytes }) =>
+            deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, n, connIdBytes),
+          initFrame: new Uint8Array(MAX_RELAY_FRAME_LEN + 1),
+        }),
+      RangeError
+    );
+    assert.equal(capturedDials.length, 0);
+
+    // 1. Challenge.fast_open === true -> Dial.init_frame carries b64url(initFrame), fastOpenSent === true.
+    challengeFastOpen = true;
+    const v1Fast = await dialRelayStream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+      targetPub,
+      allowInsecureWs: true,
+      initFrame: sampleInit,
+    });
+    assert.equal(v1Fast.fastOpenSent, true);
+    assert.equal(capturedDials.at(-1).msg.init_frame, expectedB64);
+    v1Fast.close();
+
+    const v2Fast = await dialRelayV2Stream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v2/relay`,
+      allowInsecureWs: true,
+      deriveV2Dial: ({ relayHost, nonceBytes: n, connIdBytes }) =>
+        deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, n, connIdBytes),
+      initFrame: sampleInit,
+    });
+    assert.equal(v2Fast.fastOpenSent, true);
+    assert.equal(capturedDials.at(-1).msg.init_frame, expectedB64);
+    v2Fast.close();
+
+    // 2. Old relay without Challenge.fast_open -> init_frame omitted, fastOpenSent === false.
+    challengeFastOpen = undefined;
+    const v1Old = await dialRelayStream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v1/relay`,
+      targetPub,
+      allowInsecureWs: true,
+      initFrame: sampleInit,
+    });
+    assert.equal(v1Old.fastOpenSent, false);
+    assert.equal(capturedDials.at(-1).msg.init_frame, undefined);
+    v1Old.close();
+
+    challengeFastOpen = false;
+    const v2Old = await dialRelayV2Stream({
+      relayUrl: `ws://127.0.0.1:${mock.port}/v2/relay`,
+      allowInsecureWs: true,
+      deriveV2Dial: ({ relayHost, nonceBytes: n, connIdBytes }) =>
+        deriveV2RelayDial(mbSecret, relayHost, serverEpoch * 3600, n, connIdBytes),
+      initFrame: sampleInit,
+    });
+    assert.equal(v2Old.fastOpenSent, false);
+    assert.equal(capturedDials.at(-1).msg.init_frame, undefined);
+    v2Old.close();
+  } finally {
     await mock.close();
   }
 });

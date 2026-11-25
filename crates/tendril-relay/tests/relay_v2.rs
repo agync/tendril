@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tendril_core::crypto::{b64url_decode_array, b64url_encode};
@@ -80,6 +80,7 @@ async fn relay_serves_v1_and_v2_concurrently_and_bridges_v2_frames() {
                 pub_key: v1_pub.clone(),
                 sig: v1_sig,
                 auth: None,
+                fast_open: None,
             })
             .unwrap()
             .into(),
@@ -104,6 +105,7 @@ async fn relay_serves_v1_and_v2_concurrently_and_bridges_v2_frames() {
         epoch: srv_epoch,
         max_frame,
         auth_required,
+        ..
     }) = recv_v2_msg(&mut listener_ws).await
     else {
         panic!("expected v2 challenge");
@@ -122,6 +124,7 @@ async fn relay_serves_v1_and_v2_concurrently_and_bridges_v2_frames() {
             epoch: mailbox.epoch,
             sig: b64url_encode(&reg_sig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -157,6 +160,7 @@ async fn relay_serves_v1_and_v2_concurrently_and_bridges_v2_frames() {
             conn_id: conn_id_b64.clone(),
             dial_token: dial_token_b64.clone(),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -169,6 +173,7 @@ async fn relay_serves_v1_and_v2_concurrently_and_bridges_v2_frames() {
             conn_id: conn_id_b64.clone(),
             dial_nonce: dial_nonce_b64,
             dial_token: dial_token_b64,
+            init_frame: None,
         })
     );
 
@@ -263,6 +268,7 @@ async fn relay_v2_rejects_bad_sigs_out_of_skew_epochs_and_unregistered_mailboxes
             epoch: far_mailbox.epoch,
             sig: b64url_encode(&bad_sig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -287,6 +293,7 @@ async fn relay_v2_rejects_bad_sigs_out_of_skew_epochs_and_unregistered_mailboxes
             epoch: mailbox.epoch,
             sig: b64url_encode(&wrong_host_sig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -315,6 +322,7 @@ async fn relay_v2_rejects_bad_sigs_out_of_skew_epochs_and_unregistered_mailboxes
             conn_id: b64url_encode(&d1_conn),
             dial_token: b64url_encode(&d1_tok),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -340,6 +348,7 @@ async fn relay_v2_rejects_bad_sigs_out_of_skew_epochs_and_unregistered_mailboxes
             epoch: mailbox.epoch,
             sig: b64url_encode(&r_sig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -369,6 +378,7 @@ async fn relay_v2_rejects_bad_sigs_out_of_skew_epochs_and_unregistered_mailboxes
                 conn_id: b64url_encode(&d2_conn),
                 dial_token: b64url_encode(&d2_tok),
                 auth: None,
+                init_frame: None,
             },
         )
         .await;
@@ -400,6 +410,7 @@ async fn relay_v2_rejects_bad_sigs_out_of_skew_epochs_and_unregistered_mailboxes
             epoch: mailbox.epoch,
             sig: b64url_encode(&r2_sig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -424,6 +435,7 @@ async fn relay_v2_rejects_bad_sigs_out_of_skew_epochs_and_unregistered_mailboxes
             conn_id: b64url_encode(&d3_conn),
             dial_token: b64url_encode(&d3_tok),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -533,6 +545,7 @@ async fn relay_v2_epoch_boundaries_sig_tampering_bridge_limits_and_cleanup() {
                 epoch: bad_epoch,
                 sig: b64url_encode(&sig),
                 auth: None,
+                fast_open: None,
             },
         )
         .await;
@@ -555,6 +568,7 @@ async fn relay_v2_epoch_boundaries_sig_tampering_bridge_limits_and_cleanup() {
             epoch: mb_prev.epoch,
             sig: b64url_encode(&flipped_sig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -574,6 +588,7 @@ async fn relay_v2_epoch_boundaries_sig_tampering_bridge_limits_and_cleanup() {
             epoch: srv_epoch,
             sig: b64url_encode(&[0u8; 64]),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -602,6 +617,7 @@ async fn relay_v2_epoch_boundaries_sig_tampering_bridge_limits_and_cleanup() {
                 epoch: mb.epoch,
                 sig: b64url_encode(&sig),
                 auth: None,
+                fast_open: None,
             },
         )
         .await;
@@ -631,6 +647,7 @@ async fn relay_v2_epoch_boundaries_sig_tampering_bridge_limits_and_cleanup() {
             epoch: mb_extra.epoch,
             sig: b64url_encode(&cap_sig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -659,6 +676,7 @@ async fn relay_v2_epoch_boundaries_sig_tampering_bridge_limits_and_cleanup() {
                 conn_id: b64url_encode(&cid),
                 dial_token: b64url_encode(&tok),
                 auth: None,
+                init_frame: None,
             },
         )
         .await;
@@ -689,6 +707,7 @@ async fn relay_v2_epoch_boundaries_sig_tampering_bridge_limits_and_cleanup() {
                 conn_id: b64url_encode(&cid),
                 dial_token: b64url_encode(&tok),
                 auth: None,
+                init_frame: None,
             },
         )
         .await;
@@ -718,6 +737,7 @@ async fn relay_v2_epoch_boundaries_sig_tampering_bridge_limits_and_cleanup() {
             conn_id: cid_b64.clone(),
             dial_token: b64url_encode(&tok),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -828,6 +848,7 @@ async fn relay_v2_short_timeout_idle_ping_pong_watchdog_reaps_silent_client_and_
             epoch: mb_live.epoch,
             sig: b64url_encode(&lsig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -851,6 +872,7 @@ async fn relay_v2_short_timeout_idle_ping_pong_watchdog_reaps_silent_client_and_
             epoch: mb_dead.epoch,
             sig: b64url_encode(&dsig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -898,6 +920,7 @@ async fn relay_v2_short_timeout_idle_ping_pong_watchdog_reaps_silent_client_and_
             conn_id: b64url_encode(&dd_c),
             dial_token: b64url_encode(&dd_t),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -952,6 +975,7 @@ async fn relay_v2_clock_seam_expires_registered_mailbox_at_e_plus_2() {
             epoch: mb.epoch,
             sig: b64url_encode(&sig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -1009,6 +1033,7 @@ async fn relay_v2_accepts_65521_byte_frame_and_rejects_65522_byte_frame() {
             epoch: mb.epoch,
             sig: b64url_encode(&rsig),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -1034,6 +1059,7 @@ async fn relay_v2_accepts_65521_byte_frame_and_rejects_65522_byte_frame() {
             conn_id: cid_b64.clone(),
             dial_token: b64url_encode(&tok),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -1118,6 +1144,7 @@ async fn relay_enforces_shared_v1_and_v2_max_mailboxes_cap() {
                 pub_key: p1,
                 sig: s1,
                 auth: None,
+                fast_open: None,
             })
             .unwrap()
             .into(),
@@ -1145,6 +1172,7 @@ async fn relay_enforces_shared_v1_and_v2_max_mailboxes_cap() {
             epoch: v2_mb.epoch,
             sig: b64url_encode(&s2),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -1167,6 +1195,7 @@ async fn relay_enforces_shared_v1_and_v2_max_mailboxes_cap() {
                 pub_key: p3,
                 sig: s3,
                 auth: None,
+                fast_open: None,
             })
             .unwrap()
             .into(),
@@ -1196,6 +1225,7 @@ async fn relay_enforces_shared_v1_and_v2_max_mailboxes_cap() {
             epoch: v2_mb2.epoch,
             sig: b64url_encode(&s4),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -1239,6 +1269,7 @@ async fn relay_v2_fails_a_pending_dial_offline_when_its_registration_ends() {
             epoch: mailbox.epoch,
             sig: b64url_encode(&sign_v2_relay_register(&mailbox, &host, &nonce).unwrap()),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -1264,6 +1295,7 @@ async fn relay_v2_fails_a_pending_dial_offline_when_its_registration_ends() {
                 &sign_v2_relay_dial(&mailbox, &host, &nonce, &conn_id).unwrap(),
             ),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -1335,6 +1367,7 @@ async fn relay_v2_an_accept_that_claimed_a_dial_wins_over_registration_end() {
             epoch: mailbox.epoch,
             sig: b64url_encode(&sign_v2_relay_register(&mailbox, &host, &nonce).unwrap()),
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -1361,6 +1394,7 @@ async fn relay_v2_an_accept_that_claimed_a_dial_wins_over_registration_end() {
                 &sign_v2_relay_dial(&mailbox, &host, &nonce, &conn_id).unwrap(),
             ),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -1418,5 +1452,406 @@ async fn relay_v2_an_accept_that_claimed_a_dial_wins_over_registration_end() {
         .expect("acceptor recv")
         .expect("frame");
     assert_eq!(frame, Message::Binary(b"after-race".to_vec().into()));
+    handle.stop().await.expect("stop relay");
+}
+
+#[tokio::test]
+async fn v2_standby_registration_zero_accept_hit_and_init_frame() {
+    let server = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind relay");
+    let handle = server.spawn();
+    let v2_url = handle.ws_v2_url();
+
+    let mb = derive_epoch_mailbox(&[0x5A; 32], now_unix_secs() / 3600);
+    let (mut ctrl_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge {
+        nonce,
+        host,
+        fast_open,
+        standby,
+        ..
+    }) = recv_v2_msg(&mut ctrl_ws).await
+    else {
+        panic!("challenge");
+    };
+    assert_eq!(fast_open, Some(true));
+    assert_eq!(standby, Some(true));
+    let reg_sig =
+        sign_v2_relay_register(&mb, &host, &b64url_decode_array::<32>(&nonce).unwrap()).unwrap();
+    send_v2_msg(
+        &mut ctrl_ws,
+        &RelayV2ClientMsg::Register {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            sig: b64url_encode(&reg_sig),
+            auth: None,
+            fast_open: Some(true),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_v2_msg(&mut ctrl_ws).await,
+        Some(RelayV2ServerMsg::Registered {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+        })
+    );
+
+    let (mut standby_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge {
+        nonce: sb_nonce,
+        host: sb_host,
+        ..
+    }) = recv_v2_msg(&mut standby_ws).await
+    else {
+        panic!("standby challenge");
+    };
+    let sb_sig = sign_v2_relay_register(
+        &mb,
+        &sb_host,
+        &b64url_decode_array::<32>(&sb_nonce).unwrap(),
+    )
+    .unwrap();
+    send_v2_msg(
+        &mut standby_ws,
+        &RelayV2ClientMsg::Standby {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            sig: b64url_encode(&sb_sig),
+            auth: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_v2_msg(&mut standby_ws).await,
+        Some(RelayV2ServerMsg::StandbyReady {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+        })
+    );
+
+    let (mut dialer_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge {
+        nonce: dial_nonce_b64,
+        host: dial_host,
+        fast_open: Some(true),
+        standby: Some(true),
+        ..
+    }) = recv_v2_msg(&mut dialer_ws).await
+    else {
+        panic!("dial challenge");
+    };
+    let dial_nonce = b64url_decode_array::<32>(&dial_nonce_b64).unwrap();
+    let conn_id = [0x5B; 16];
+    let conn_id_b64 = b64url_encode(&conn_id);
+    let dial_token_b64 =
+        b64url_encode(&sign_v2_relay_dial(&mb, &dial_host, &dial_nonce, &conn_id).unwrap());
+    let init_b64 = b64url_encode(b"TND\x02\x01\x00\x00\x05v2msg");
+
+    send_v2_msg(
+        &mut dialer_ws,
+        &RelayV2ClientMsg::Dial {
+            target_mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            conn_id: conn_id_b64.clone(),
+            dial_token: dial_token_b64.clone(),
+            auth: None,
+            init_frame: Some(init_b64.clone()),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        recv_v2_msg(&mut standby_ws).await,
+        Some(RelayV2ServerMsg::Incoming {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            conn_id: conn_id_b64.clone(),
+            dial_nonce: dial_nonce_b64,
+            dial_token: dial_token_b64,
+            init_frame: Some(init_b64),
+        })
+    );
+    assert_eq!(
+        recv_v2_msg(&mut dialer_ws).await,
+        Some(RelayV2ServerMsg::Ready {
+            conn_id: conn_id_b64
+        })
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), ctrl_ws.next())
+            .await
+            .is_err(),
+        "v2 control socket must stay idle on standby hit"
+    );
+
+    standby_ws
+        .send(Message::Binary(b"v2-standby-msg2".to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        dialer_ws.next().await.unwrap().unwrap(),
+        Message::Binary(b"v2-standby-msg2".to_vec().into())
+    );
+    handle.stop().await.expect("stop relay");
+}
+
+#[tokio::test]
+async fn v2_standby_dead_socket_skipped_and_legacy_binary_injection_fallback() {
+    let server = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind relay");
+    let handle = server.spawn();
+    let v2_url = handle.ws_v2_url();
+
+    let mb = derive_epoch_mailbox(&[0x6A; 32], now_unix_secs() / 3600);
+    let (mut ctrl_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge { nonce, host, .. }) = recv_v2_msg(&mut ctrl_ws).await
+    else {
+        panic!("challenge");
+    };
+    let reg_sig =
+        sign_v2_relay_register(&mb, &host, &b64url_decode_array::<32>(&nonce).unwrap()).unwrap();
+    send_v2_msg(
+        &mut ctrl_ws,
+        &RelayV2ClientMsg::Register {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            sig: b64url_encode(&reg_sig),
+            auth: None,
+            fast_open: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_v2_msg(&mut ctrl_ws).await,
+        Some(RelayV2ServerMsg::Registered { .. })
+    ));
+
+    let (mut sb_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge { nonce, host, .. }) = recv_v2_msg(&mut sb_ws).await
+    else {
+        panic!("challenge");
+    };
+    let sb_sig =
+        sign_v2_relay_register(&mb, &host, &b64url_decode_array::<32>(&nonce).unwrap()).unwrap();
+    send_v2_msg(
+        &mut sb_ws,
+        &RelayV2ClientMsg::Standby {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            sig: b64url_encode(&sb_sig),
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_v2_msg(&mut sb_ws).await,
+        Some(RelayV2ServerMsg::StandbyReady { .. })
+    ));
+    drop(sb_ws);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let (mut dialer_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge {
+        nonce: d_nonce,
+        host: d_host,
+        ..
+    }) = recv_v2_msg(&mut dialer_ws).await
+    else {
+        panic!("challenge");
+    };
+    let cid = [0x6B; 16];
+    let cid_b64 = b64url_encode(&cid);
+    let d_tok = sign_v2_relay_dial(
+        &mb,
+        &d_host,
+        &b64url_decode_array::<32>(&d_nonce).unwrap(),
+        &cid,
+    )
+    .unwrap();
+    let init_bytes = b"v2-legacy-injected";
+    send_v2_msg(
+        &mut dialer_ws,
+        &RelayV2ClientMsg::Dial {
+            target_mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            conn_id: cid_b64.clone(),
+            dial_token: b64url_encode(&d_tok),
+            auth: None,
+            init_frame: Some(b64url_encode(init_bytes)),
+        },
+    )
+    .await;
+    let Message::Text(raw_inc) = ctrl_ws.next().await.unwrap().unwrap() else {
+        panic!("incoming");
+    };
+    assert!(
+        !raw_inc.contains("init_frame"),
+        "legacy v2 listener must not receive init_frame field: {raw_inc}"
+    );
+
+    let (mut acc_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge {
+        nonce: a_nonce,
+        host: a_host,
+        ..
+    }) = recv_v2_msg(&mut acc_ws).await
+    else {
+        panic!("challenge");
+    };
+    let a_sig = sign_v2_relay_accept(
+        &mb,
+        &a_host,
+        &b64url_decode_array::<32>(&a_nonce).unwrap(),
+        &cid,
+    )
+    .unwrap();
+    send_v2_msg(
+        &mut acc_ws,
+        &RelayV2ClientMsg::Accept {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            conn_id: cid_b64.clone(),
+            sig: b64url_encode(&a_sig),
+            auth: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_v2_msg(&mut acc_ws).await,
+        Some(RelayV2ServerMsg::Ready {
+            conn_id: cid_b64.clone()
+        })
+    );
+    assert_eq!(
+        recv_v2_msg(&mut dialer_ws).await,
+        Some(RelayV2ServerMsg::Ready { conn_id: cid_b64 })
+    );
+    assert_eq!(
+        acc_ws.next().await.unwrap().unwrap(),
+        Message::Binary(init_bytes.to_vec().into())
+    );
+
+    handle.stop().await.expect("stop relay");
+}
+
+#[tokio::test]
+async fn v2_standby_hit_without_fast_open_omits_incoming_init_frame_and_injects_binary() {
+    let server = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind relay");
+    let handle = server.spawn();
+    let v2_url = handle.ws_v2_url();
+
+    let mb = derive_epoch_mailbox(&[0x6C; 32], now_unix_secs() / 3600);
+    let (mut ctrl_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge { nonce, host, .. }) = recv_v2_msg(&mut ctrl_ws).await
+    else {
+        panic!("challenge");
+    };
+    let reg_sig =
+        sign_v2_relay_register(&mb, &host, &b64url_decode_array::<32>(&nonce).unwrap()).unwrap();
+    send_v2_msg(
+        &mut ctrl_ws,
+        &RelayV2ClientMsg::Register {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            sig: b64url_encode(&reg_sig),
+            auth: None,
+            fast_open: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_v2_msg(&mut ctrl_ws).await,
+        Some(RelayV2ServerMsg::Registered { .. })
+    ));
+
+    let (mut standby_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge { nonce, host, .. }) = recv_v2_msg(&mut standby_ws).await
+    else {
+        panic!("challenge");
+    };
+    let sb_sig =
+        sign_v2_relay_register(&mb, &host, &b64url_decode_array::<32>(&nonce).unwrap()).unwrap();
+    send_v2_msg(
+        &mut standby_ws,
+        &RelayV2ClientMsg::Standby {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            sig: b64url_encode(&sb_sig),
+            auth: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_v2_msg(&mut standby_ws).await,
+        Some(RelayV2ServerMsg::StandbyReady { .. })
+    ));
+
+    let (mut dialer_ws, _) = connect_async(&v2_url).await.unwrap();
+    let Some(RelayV2ServerMsg::Challenge {
+        nonce: d_nonce,
+        host: d_host,
+        ..
+    }) = recv_v2_msg(&mut dialer_ws).await
+    else {
+        panic!("challenge");
+    };
+    let cid = [0x6D; 16];
+    let cid_b64 = b64url_encode(&cid);
+    let d_nonce_bytes = b64url_decode_array::<32>(&d_nonce).unwrap();
+    let d_tok = sign_v2_relay_dial(&mb, &d_host, &d_nonce_bytes, &cid).unwrap();
+    let init_bytes = b"v2-standby-legacy-binary-inject";
+    send_v2_msg(
+        &mut dialer_ws,
+        &RelayV2ClientMsg::Dial {
+            target_mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            conn_id: cid_b64.clone(),
+            dial_token: b64url_encode(&d_tok),
+            auth: None,
+            init_frame: Some(b64url_encode(init_bytes)),
+        },
+    )
+    .await;
+
+    let Message::Text(raw_inc) = standby_ws.next().await.unwrap().unwrap() else {
+        panic!("expected standby incoming text");
+    };
+    assert!(
+        !raw_inc.contains("init_frame"),
+        "legacy v2 standby without Register.fast_open must omit Incoming.init_frame: {raw_inc}"
+    );
+    assert_eq!(
+        serde_json::from_str::<RelayV2ServerMsg>(&raw_inc).unwrap(),
+        RelayV2ServerMsg::Incoming {
+            mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            conn_id: cid_b64.clone(),
+            dial_nonce: d_nonce,
+            dial_token: b64url_encode(&d_tok),
+            init_frame: None,
+        }
+    );
+    assert_eq!(
+        recv_v2_msg(&mut dialer_ws).await,
+        Some(RelayV2ServerMsg::Ready { conn_id: cid_b64 })
+    );
+    assert_eq!(
+        standby_ws.next().await.unwrap().unwrap(),
+        Message::Binary(init_bytes.to_vec().into())
+    );
+    standby_ws
+        .send(Message::Binary(b"v2-sb-legacy-reply".to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        dialer_ws.next().await.unwrap().unwrap(),
+        Message::Binary(b"v2-sb-legacy-reply".to_vec().into())
+    );
+
     handle.stop().await.expect("stop relay");
 }

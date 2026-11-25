@@ -26,16 +26,20 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use super::relay::{RelayClientAuth, RelayStream, build_relay_auth_proof};
-use super::{connect_ws_resolved, ensure_rustls_ring_provider, ws_binary_config};
+use super::relay::{RelayClientAuth, RelayStream, build_relay_auth_proof, jittered_ping_delay};
+use super::{
+    ActiveStandbyGuard, STANDBY_POOL_SIZE, StandbyPoolHandle, StandbySlotOutcome,
+    await_standby_ready_with_deadline, connect_ws_resolved, decode_incoming_init_frame,
+    encode_fast_open_init_frame, ensure_rustls_ring_provider, spawn_standby_pool_supervisor,
+    ws_binary_config, ws_control_config,
+};
 use crate::error::{RelayOffline, RuntimeError};
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
-const CONTROL_PING_MIN_MS: u64 = 22_500;
-const CONTROL_PING_MAX_MS: u64 = 37_500;
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_ACCEPTS: usize = 16;
 const EPOCH_ROTATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -52,14 +56,6 @@ fn warn_multi_epoch_ticket(auth: &RelayClientAuth) {
              prefer Tier 2 HMAC admission or per-epoch scoped tickets"
         );
     }
-}
-
-/// Returns a CSPRNG-jittered control ping delay in `22.5s..=37.5s` (30s +/- 25%).
-fn jittered_ping_delay() -> Duration {
-    let raw = u32::from_le_bytes(random_bytes::<4>().unwrap_or([0; 4]));
-    Duration::from_millis(
-        CONTROL_PING_MIN_MS + u64::from(raw) % (CONTROL_PING_MAX_MS - CONTROL_PING_MIN_MS + 1),
-    )
 }
 
 fn jittered_backoff(backoff: Duration) -> Duration {
@@ -133,6 +129,7 @@ fn extract_expected_host(
 async fn connect_and_verify_v2_challenge(
     relay_url: &str,
     expected_host: &str,
+    ws_config: WebSocketConfig,
 ) -> Result<
     (
         ClientWsStream,
@@ -140,17 +137,15 @@ async fn connect_and_verify_v2_challenge(
         [u8; 32],
         u64,
         Option<Vec<String>>,
+        bool,
+        bool,
     ),
     RuntimeError,
 > {
     ensure_rustls_ring_provider();
     let (mut ws, _) = timeout(
         CONTROL_TIMEOUT,
-        connect_ws_resolved(
-            relay_url,
-            Some(ws_binary_config()),
-            "v2 relay websocket connect",
-        ),
+        connect_ws_resolved(relay_url, Some(ws_config), "v2 relay websocket connect"),
     )
     .await
     .map_err(|_| RuntimeError::Timeout("v2 relay websocket connect timed out"))??;
@@ -161,6 +156,8 @@ async fn connect_and_verify_v2_challenge(
         epoch,
         max_frame,
         auth_required,
+        fast_open,
+        standby,
     } = recv_v2_control_msg(&mut ws).await?
     else {
         return Err(RuntimeError::Protocol(
@@ -174,7 +171,15 @@ async fn connect_and_verify_v2_challenge(
     }
     let verified_host = VerifiedRelayHost::from_challenge(expected_host, &host)?;
     let nonce_bytes = b64url_decode_array::<32>(&nonce)?;
-    Ok((ws, verified_host, nonce_bytes, epoch, auth_required))
+    Ok((
+        ws,
+        verified_host,
+        nonce_bytes,
+        epoch,
+        auth_required,
+        fast_open == Some(true),
+        standby == Some(true),
+    ))
 }
 
 /// Configuration for [`RelayV2Listener`].
@@ -246,7 +251,9 @@ pub struct RelayV2Listener {
     window: Arc<Mutex<RelayEpochWindow>>,
     replay_cache: Arc<Mutex<RelayDialReplayCache>>,
     active_control_sockets: Arc<AtomicUsize>,
+    active_standby_sockets: Arc<AtomicUsize>,
     epoch_tasks: Arc<Mutex<HashMap<u64, EpochSocketHandle>>>,
+    standby_pool: Arc<Mutex<Option<StandbyPoolHandle>>>,
     shutdown_tx: watch::Sender<bool>,
     manager_task: Option<JoinHandle<()>>,
 }
@@ -310,10 +317,12 @@ impl RelayV2Listener {
             .replay_cache
             .unwrap_or_else(|| Arc::new(Mutex::new(RelayDialReplayCache::new())));
         let active_control_sockets = Arc::new(AtomicUsize::new(0));
+        let active_standby_sockets = Arc::new(AtomicUsize::new(0));
         let (accepted_tx, accepted_rx) = mpsc::channel(32);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let accept_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_ACCEPTS));
         let epoch_tasks = Arc::new(Mutex::new(HashMap::<u64, EpochSocketHandle>::new()));
+        let standby_pool = Arc::new(Mutex::new(None));
         let mut bind_guard = BindCleanupGuard {
             shutdown_tx: shutdown_tx.clone(),
             epoch_tasks: Arc::clone(&epoch_tasks),
@@ -346,15 +355,17 @@ impl RelayV2Listener {
         }
 
         let mut center_ok = false;
+        let mut center_standby = false;
         let mut any_ok = false;
         let mut first_err: Option<RuntimeError> = None;
         let mut challenge_err: Option<RuntimeError> = None;
         for (epoch, rx) in ready_waiters {
             match rx.await {
-                Ok(Ok(())) => {
+                Ok(Ok(sb)) => {
                     any_ok = true;
                     if epoch == center_epoch {
                         center_ok = true;
+                        center_standby = sb;
                     }
                 }
                 Ok(Err(err)) => {
@@ -379,12 +390,35 @@ impl RelayV2Listener {
             return Err(first_err.unwrap_or(RuntimeError::Closed));
         }
 
+        if center_standby {
+            let (pool_handle, sb_ready_rxs) = spawn_v2_standby_pool(
+                relay_url.clone(),
+                required_host.clone(),
+                initial_window.current.clone(),
+                Arc::clone(&window),
+                Arc::clone(&replay_cache),
+                Arc::clone(&accept_sem),
+                accepted_tx.clone(),
+                Arc::clone(&active_standby_sockets),
+                Arc::clone(&auth),
+                config.write_timeout,
+                shutdown_tx.subscribe(),
+            );
+            *standby_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pool_handle);
+            await_standby_ready_with_deadline(sb_ready_rxs, CONTROL_TIMEOUT).await;
+        }
+
         let pinned_unix = config.unix_secs;
         let write_timeout = config.write_timeout;
         let window_c = Arc::clone(&window);
         let cache_c = Arc::clone(&replay_cache);
         let sockets_c = Arc::clone(&active_control_sockets);
+        let standby_sockets_c = Arc::clone(&active_standby_sockets);
         let tasks_c = Arc::clone(&epoch_tasks);
+        let standby_pool_c = Arc::clone(&standby_pool);
+        let standby_shutdown_tx = shutdown_tx.clone();
         let url_c = relay_url.clone();
         let mut shut_rx = shutdown_rx;
         let manager_task = tokio::spawn(async move {
@@ -398,6 +432,9 @@ impl RelayV2Listener {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .clear();
+                        *standby_pool_c
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                         break;
                     }
                     _ = interval.tick() => {
@@ -405,6 +442,7 @@ impl RelayV2Listener {
                         let new_center = epoch_for_unix(now);
                         if new_center != active_center {
                             let new_win = derive_epoch_mailbox_window(&secret, now);
+                            let new_current = new_win.current.clone();
                             let keep_epochs: Vec<u64> =
                                 new_win.mailboxes().into_iter().map(|m| m.epoch).collect();
                             {
@@ -431,6 +469,30 @@ impl RelayV2Listener {
                             }
                             for h in removed {
                                 h.stop();
+                            }
+                            if center_standby {
+                                let old_sb = standby_pool_c
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take();
+                                drop(old_sb);
+                                let (new_pool, _) = spawn_v2_standby_pool(
+                                    url_c.clone(),
+                                    required_host.clone(),
+                                    new_current,
+                                    Arc::clone(&window_c),
+                                    Arc::clone(&cache_c),
+                                    Arc::clone(&accept_sem),
+                                    accepted_tx.clone(),
+                                    Arc::clone(&standby_sockets_c),
+                                    Arc::clone(&auth),
+                                    write_timeout,
+                                    standby_shutdown_tx.subscribe(),
+                                );
+                                *standby_pool_c
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(new_pool);
                             }
                             active_center = new_center;
                         }
@@ -482,7 +544,9 @@ impl RelayV2Listener {
             window,
             replay_cache,
             active_control_sockets,
+            active_standby_sockets,
             epoch_tasks,
+            standby_pool,
             shutdown_tx,
             manager_task: Some(manager_task),
         })
@@ -513,6 +577,12 @@ impl RelayV2Listener {
         self.active_control_sockets.load(Ordering::Acquire)
     }
 
+    /// Returns the number of currently parked standby sockets for the center epoch.
+    #[must_use]
+    pub fn active_standby_socket_count(&self) -> usize {
+        self.active_standby_sockets.load(Ordering::Acquire)
+    }
+
     /// Returns the shared [`RelayDialReplayCache`] guarding `incoming` dial notifications.
     #[must_use]
     pub fn replay_cache(&self) -> Arc<Mutex<RelayDialReplayCache>> {
@@ -526,6 +596,10 @@ impl Drop for RelayV2Listener {
         if let Some(task) = self.manager_task.take() {
             task.abort();
         }
+        *self
+            .standby_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let mut guard = self
             .epoch_tasks
             .lock()
@@ -555,6 +629,294 @@ impl Drop for ActiveSocketGuard {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn spawn_v2_standby_pool(
+    relay_url: String,
+    expected_host: String,
+    mailbox: DerivedMailbox,
+    window: Arc<Mutex<RelayEpochWindow>>,
+    replay_cache: Arc<Mutex<RelayDialReplayCache>>,
+    accept_sem: Arc<Semaphore>,
+    accepted_tx: mpsc::Sender<RelayStream>,
+    active_standby: Arc<AtomicUsize>,
+    auth: Arc<RelayClientAuth>,
+    write_timeout: Duration,
+    shutdown_rx: watch::Receiver<bool>,
+) -> (
+    StandbyPoolHandle,
+    Vec<oneshot::Receiver<Result<(), RuntimeError>>>,
+) {
+    spawn_standby_pool_supervisor(
+        STANDBY_POOL_SIZE,
+        shutdown_rx,
+        move |ready_tx, consumed_tx, slot_shutdown| {
+            let url_c = relay_url.clone();
+            let host_c = expected_host.clone();
+            let mb_c = mailbox.clone();
+            let win_c = Arc::clone(&window);
+            let cache_c = Arc::clone(&replay_cache);
+            let sem_c = Arc::clone(&accept_sem);
+            let tx_c = accepted_tx.clone();
+            let active_c = Arc::clone(&active_standby);
+            let auth_c = Arc::clone(&auth);
+            Box::pin(run_v2_standby_slot(
+                url_c,
+                host_c,
+                mb_c,
+                win_c,
+                cache_c,
+                sem_c,
+                tx_c,
+                active_c,
+                auth_c,
+                write_timeout,
+                ready_tx,
+                consumed_tx,
+                slot_shutdown,
+            ))
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_v2_standby_slot(
+    relay_url: String,
+    expected_host: String,
+    mailbox: DerivedMailbox,
+    window: Arc<Mutex<RelayEpochWindow>>,
+    replay_cache: Arc<Mutex<RelayDialReplayCache>>,
+    accept_sem: Arc<Semaphore>,
+    accepted_tx: mpsc::Sender<RelayStream>,
+    active_standby: Arc<AtomicUsize>,
+    auth: Arc<RelayClientAuth>,
+    write_timeout: Duration,
+    mut ready_tx: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+    consumed_tx: oneshot::Sender<()>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> StandbySlotOutcome {
+    if *shutdown_rx.borrow() {
+        return StandbySlotOutcome::Shutdown;
+    }
+    let (mut ws, verified_host, nonce, _srv_epoch, auth_required, _fast_open, server_standby) =
+        match connect_and_verify_v2_challenge(&relay_url, &expected_host, ws_control_config()).await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                let is_core = matches!(err, RuntimeError::Core(_));
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(err));
+                }
+                return if is_core {
+                    StandbySlotOutcome::Unsupported
+                } else {
+                    StandbySlotOutcome::Retry
+                };
+            }
+        };
+    if !server_standby {
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(Ok(()));
+        }
+        let _ = timeout(write_timeout, ws.close(None)).await;
+        return StandbySlotOutcome::Unsupported;
+    }
+
+    let sig = match sign_v2_relay_register(&mailbox, verified_host.as_str(), &nonce) {
+        Ok(s) => s,
+        Err(err) => {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(err.into()));
+            }
+            return StandbySlotOutcome::Unsupported;
+        }
+    };
+    let sb_auth = match build_relay_auth_proof(
+        &auth,
+        auth_required.as_deref(),
+        "register",
+        verified_host.as_str(),
+        &nonce,
+        &mailbox.mailbox_id,
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(err));
+            }
+            return StandbySlotOutcome::Unsupported;
+        }
+    };
+    let mailbox_b64 = mailbox.mailbox_id_b64url();
+    if let Err(err) = send_v2_control_msg(
+        &mut ws,
+        &RelayV2ClientMsg::Standby {
+            mailbox_id: mailbox_b64.clone(),
+            epoch: mailbox.epoch,
+            sig: b64url_encode(&sig),
+            auth: sb_auth,
+        },
+        write_timeout,
+    )
+    .await
+    {
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(Err(err));
+        }
+        return StandbySlotOutcome::Retry;
+    }
+
+    match recv_v2_control_msg(&mut ws).await {
+        Ok(RelayV2ServerMsg::StandbyReady { mailbox_id, epoch })
+            if mailbox_id == mailbox_b64 && epoch == mailbox.epoch => {}
+        Ok(RelayV2ServerMsg::Error { code }) => {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(RuntimeError::Protocol(format!(
+                    "v2 relay standby rejected: {code}"
+                ))));
+            }
+            return StandbySlotOutcome::Retry;
+        }
+        Ok(other) => {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(RuntimeError::Protocol(format!(
+                    "unexpected v2 relay standby response: {other:?}"
+                ))));
+            }
+            return StandbySlotOutcome::Retry;
+        }
+        Err(err) => {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(err));
+            }
+            return StandbySlotOutcome::Retry;
+        }
+    }
+
+    let active_guard = ActiveStandbyGuard::enter(&active_standby);
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(Ok(()));
+    }
+
+    let idle_sleep = tokio::time::sleep(CONTROL_IDLE_TIMEOUT);
+    tokio::pin!(idle_sleep);
+    let ping_sleep = tokio::time::sleep(jittered_ping_delay());
+    tokio::pin!(ping_sleep);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            let _ = timeout(write_timeout, ws.close(None)).await;
+            return StandbySlotOutcome::Shutdown;
+        }
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                let _ = timeout(write_timeout, ws.close(None)).await;
+                return StandbySlotOutcome::Shutdown;
+            }
+            () = &mut idle_sleep => {
+                let _ = timeout(write_timeout, ws.close(None)).await;
+                return StandbySlotOutcome::Retry;
+            }
+            () = &mut ping_sleep => {
+                ping_sleep
+                    .as_mut()
+                    .reset(TokioInstant::now() + jittered_ping_delay());
+                if !timeout(write_timeout, ws.send(Message::Ping(Vec::new().into())))
+                    .await
+                    .is_ok_and(|res| res.is_ok())
+                {
+                    let _ = timeout(write_timeout, ws.close(None)).await;
+                    return StandbySlotOutcome::Retry;
+                }
+            }
+            maybe_msg = ws.next() => {
+                match maybe_msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(RelayV2ServerMsg::Incoming {
+                            mailbox_id: inc_mailbox_b64,
+                            epoch: inc_epoch,
+                            conn_id,
+                            dial_nonce,
+                            dial_token,
+                            init_frame,
+                        }) = serde_json::from_str::<RelayV2ServerMsg>(&text)
+                        else {
+                            let _ = timeout(write_timeout, ws.close(None)).await;
+                            return StandbySlotOutcome::Retry;
+                        };
+                        drop(active_guard);
+
+                        let (
+                            Ok(inc_mailbox_bytes),
+                            Ok(conn_id_bytes),
+                            Ok(dial_nonce_bytes),
+                            Ok(dial_token_bytes),
+                        ) = (
+                            b64url_decode_array::<32>(&inc_mailbox_b64),
+                            b64url_decode_array::<16>(&conn_id),
+                            b64url_decode_array::<32>(&dial_nonce),
+                            b64url_decode_array::<32>(&dial_token),
+                        ) else {
+                            let _ = timeout(write_timeout, ws.close(None)).await;
+                            return StandbySlotOutcome::Retry;
+                        };
+                        if inc_mailbox_bytes != mailbox.mailbox_id || inc_epoch != mailbox.epoch {
+                            let _ = timeout(write_timeout, ws.close(None)).await;
+                            return StandbySlotOutcome::Retry;
+                        }
+
+                        // Verify and record dial_token BEFORE acquiring accept_sem or emitting stream.
+                        let verified = {
+                            let mut cache = replay_cache
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let win = window
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            verify_and_record_v2_relay_dial(
+                                &mut cache,
+                                &win,
+                                &verified_host,
+                                inc_epoch,
+                                &dial_nonce_bytes,
+                                &conn_id_bytes,
+                                &dial_token_bytes,
+                            )
+                            .is_ok()
+                        };
+                        if !verified {
+                            let _ = timeout(write_timeout, ws.close(None)).await;
+                            return StandbySlotOutcome::Retry;
+                        }
+
+                        let Ok(init_bytes) = decode_incoming_init_frame(init_frame.as_deref()) else {
+                            let _ = timeout(write_timeout, ws.close(None)).await;
+                            return StandbySlotOutcome::Retry;
+                        };
+                        let Ok(permit) = Arc::clone(&accept_sem).try_acquire_owned() else {
+                            let _ = timeout(write_timeout, ws.close(None)).await;
+                            return StandbySlotOutcome::Retry;
+                        };
+                        let _ = consumed_tx.send(());
+                        let stream = RelayStream::with_initial_bytes(ws, write_timeout, init_bytes);
+                        let _ = timeout(CONTROL_TIMEOUT, accepted_tx.send(stream)).await;
+                        drop(permit);
+                        return StandbySlotOutcome::Consumed;
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                        idle_sleep
+                            .as_mut()
+                            .reset(TokioInstant::now() + CONTROL_IDLE_TIMEOUT);
+                        ping_sleep
+                            .as_mut()
+                            .reset(TokioInstant::now() + jittered_ping_delay());
+                    }
+                    _ => return StandbySlotOutcome::Retry,
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_epoch_control_task(
     relay_url: String,
     expected_host: String,
@@ -566,7 +928,7 @@ fn spawn_epoch_control_task(
     active_sockets: Arc<AtomicUsize>,
     auth: Arc<RelayClientAuth>,
     write_timeout: Duration,
-    ready_tx: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+    ready_tx: Option<oneshot::Sender<Result<bool, RuntimeError>>>,
 ) -> EpochSocketHandle {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(async move {
@@ -578,26 +940,39 @@ fn spawn_epoch_control_task(
             if *shutdown_rx.borrow() {
                 break;
             }
-            let (mut control_ws, verified_host, nonce, _srv_epoch, auth_required) =
-                match connect_and_verify_v2_challenge(&relay_url, &expected_host).await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        let is_core_err = matches!(err, RuntimeError::Core(_));
-                        if let Some(tx) = ready_tx.take() {
-                            let _ = tx.send(Err(err));
-                            break;
-                        }
-                        if is_core_err {
-                            break;
-                        }
-                        tokio::select! {
-                            _ = shutdown_rx.changed() => break,
-                            () = tokio::time::sleep(jittered_backoff(backoff)) => {}
-                        }
-                        backoff = (backoff * 2).min(BACKOFF_MAX);
-                        continue;
+            let (
+                mut control_ws,
+                verified_host,
+                nonce,
+                _srv_epoch,
+                auth_required,
+                server_fast_open,
+                server_standby,
+            ) = match connect_and_verify_v2_challenge(
+                &relay_url,
+                &expected_host,
+                ws_control_config(),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    let is_core_err = matches!(err, RuntimeError::Core(_));
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(err));
+                        break;
                     }
-                };
+                    if is_core_err {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => break,
+                        () = tokio::time::sleep(jittered_backoff(backoff)) => {}
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+                    continue;
+                }
+            };
             let sig = match sign_v2_relay_register(&mailbox, verified_host.as_str(), &nonce) {
                 Ok(s) => s,
                 Err(err) => {
@@ -631,6 +1006,7 @@ fn spawn_epoch_control_task(
                     epoch: mailbox.epoch,
                     sig: b64url_encode(&sig),
                     auth: reg_auth,
+                    fast_open: server_fast_open.then_some(true),
                 },
                 write_timeout,
             )
@@ -697,7 +1073,7 @@ fn spawn_epoch_control_task(
             active_sockets.fetch_add(1, Ordering::AcqRel);
             let _socket_guard = ActiveSocketGuard(Arc::clone(&active_sockets));
             if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(Ok(()));
+                let _ = tx.send(Ok(server_standby));
             }
 
             let idle_sleep = tokio::time::sleep(CONTROL_IDLE_TIMEOUT);
@@ -749,6 +1125,7 @@ fn spawn_epoch_control_task(
                                     conn_id,
                                     dial_nonce,
                                     dial_token,
+                                    init_frame,
                                 }) = serde_json::from_str::<RelayV2ServerMsg>(&text)
                                 {
                                     let (
@@ -790,6 +1167,9 @@ fn spawn_epoch_control_task(
                                     let Some(matched_mailbox) = matched_mailbox else {
                                         continue;
                                     };
+                                    let Ok(init_bytes) = decode_incoming_init_frame(init_frame.as_deref()) else {
+                                        continue;
+                                    };
 
                                     let Ok(permit) = Arc::clone(&accept_sem).try_acquire_owned() else {
                                         continue;
@@ -806,6 +1186,7 @@ fn spawn_epoch_control_task(
                                             &matched_mailbox,
                                             &conn_id,
                                             &conn_id_bytes,
+                                            init_bytes,
                                             &auth_c,
                                             write_timeout,
                                         )
@@ -845,17 +1226,19 @@ fn spawn_epoch_control_task(
     EpochSocketHandle { shutdown_tx, task }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_one_v2_stream(
     relay_url: &str,
     expected_host: &str,
     mailbox: &DerivedMailbox,
     conn_id_b64: &str,
     conn_id_bytes: &[u8; 16],
+    init_bytes: Vec<u8>,
     auth: &RelayClientAuth,
     write_timeout: Duration,
 ) -> Result<RelayStream, RuntimeError> {
-    let (mut ws, verified_host, nonce, _srv_epoch, auth_required) =
-        connect_and_verify_v2_challenge(relay_url, expected_host).await?;
+    let (mut ws, verified_host, nonce, _srv_epoch, auth_required, _, _) =
+        connect_and_verify_v2_challenge(relay_url, expected_host, ws_binary_config()).await?;
     let sig = sign_v2_relay_accept(mailbox, verified_host.as_str(), &nonce, conn_id_bytes)?;
     let acc_auth = build_relay_auth_proof(
         auth,
@@ -879,9 +1262,9 @@ async fn accept_one_v2_stream(
     .await?;
 
     match recv_v2_control_msg(&mut ws).await? {
-        RelayV2ServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => {
-            Ok(RelayStream::new(ws, write_timeout))
-        }
+        RelayV2ServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => Ok(
+            RelayStream::with_initial_bytes(ws, write_timeout, init_bytes),
+        ),
         RelayV2ServerMsg::Error { code } => Err(RuntimeError::Protocol(format!(
             "v2 relay accept rejected: {code}"
         ))),
@@ -1003,8 +1386,21 @@ impl RelayV2Dialer {
 
     /// Connects through `relay_url` for the current epoch derived from clock.
     pub async fn connect(&self, relay_url: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+        self.connect_with_init(relay_url, None)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    /// Connects through `relay_url` for the current epoch, optionally sending `init_frame`
+    /// inside `Dial` when the relay advertises `fast_open`. Returns `(stream, fast_open_sent)`.
+    pub async fn connect_with_init(
+        &self,
+        relay_url: &str,
+        init_frame: Option<&[u8]>,
+    ) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
         let epoch = epoch_for_unix(self.unix_secs.unwrap_or_else(current_unix_secs));
-        self.connect_for_epoch(relay_url, epoch).await
+        self.connect_for_epoch_with_init(relay_url, epoch, init_frame)
+            .await
     }
 
     /// Connects through `relay_url` targeting an explicit epoch `epoch`.
@@ -1013,10 +1409,24 @@ impl RelayV2Dialer {
         relay_url: &str,
         epoch: u64,
     ) -> Result<Box<dyn PathStream>, RuntimeError> {
+        self.connect_for_epoch_with_init(relay_url, epoch, None)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    /// Connects through `relay_url` targeting an explicit epoch `epoch`, optionally sending
+    /// `init_frame` inside `Dial` when the relay advertises `fast_open`.
+    pub async fn connect_for_epoch_with_init(
+        &self,
+        relay_url: &str,
+        epoch: u64,
+        init_frame: Option<&[u8]>,
+    ) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
         let parsed = super::validate_ws_url(relay_url, self.allow_insecure_ws)?;
         let required_host = extract_expected_host(&parsed, self.expected_host.as_deref())?;
-        let (mut ws, verified_host, nonce, _srv_epoch, auth_required) =
-            connect_and_verify_v2_challenge(parsed.as_str(), &required_host).await?;
+        let (mut ws, verified_host, nonce, _srv_epoch, auth_required, server_fast_open, _) =
+            connect_and_verify_v2_challenge(parsed.as_str(), &required_host, ws_binary_config())
+                .await?;
         if self.auth_withheld
             && auth_required
                 .as_deref()
@@ -1047,6 +1457,7 @@ impl RelayV2Dialer {
             &nonce,
             &mailbox.mailbox_id,
         )?;
+        let (init_b64, fast_open_sent) = encode_fast_open_init_frame(init_frame, server_fast_open)?;
 
         send_v2_control_msg(
             &mut ws,
@@ -1056,15 +1467,19 @@ impl RelayV2Dialer {
                 conn_id: conn_id_b64.clone(),
                 dial_token: b64url_encode(&dial_token),
                 auth: dial_auth,
+                init_frame: init_b64,
             },
             self.write_timeout,
         )
         .await?;
 
         match recv_v2_control_msg(&mut ws).await? {
-            RelayV2ServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => {
-                Ok(Box::new(RelayStream::new(ws, self.write_timeout)))
-            }
+            RelayV2ServerMsg::Ready { conn_id } if conn_id == conn_id_b64 => Ok((
+                Box::new(
+                    RelayStream::new(ws, self.write_timeout).with_fast_open_sent(fast_open_sent),
+                ),
+                fast_open_sent,
+            )),
             RelayV2ServerMsg::Error { code } if code == "offline" => {
                 Err(RuntimeError::RelayOffline(RelayOffline::V2Dial))
             }
@@ -1084,9 +1499,23 @@ impl PathDialer for RelayV2Dialer {
         ProviderId::Relay
     }
 
+    fn supports_fast_open(&self) -> bool {
+        true
+    }
+
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+        self.dial_with_init(endpoint, None)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    async fn dial_with_init(
+        &self,
+        endpoint: &str,
+        init_frame: Option<&[u8]>,
+    ) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
         let url = endpoint.split_once('#').map_or(endpoint, |(u, _)| u);
-        self.connect(url).await
+        self.connect_with_init(url, init_frame).await
     }
 }
 
@@ -1105,8 +1534,14 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..64 {
             let d = jittered_ping_delay();
-            assert!(d >= Duration::from_millis(CONTROL_PING_MIN_MS), "{d:?}");
-            assert!(d <= Duration::from_millis(CONTROL_PING_MAX_MS), "{d:?}");
+            assert!(
+                d >= Duration::from_millis(crate::providers::relay::CONTROL_PING_MIN_MS),
+                "{d:?}"
+            );
+            assert!(
+                d <= Duration::from_millis(crate::providers::relay::CONTROL_PING_MAX_MS),
+                "{d:?}"
+            );
             seen.insert(d);
         }
         assert!(seen.len() > 1, "ping delay must not be constant");

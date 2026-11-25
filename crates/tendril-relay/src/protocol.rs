@@ -3,7 +3,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use tendril_core::MAX_FRAME_LEN;
-use tendril_core::crypto::{b64url_decode_array, b64url_encode};
+use tendril_core::crypto::{b64url_decode, b64url_decode_array, b64url_encode};
 use tendril_core::error::CoreError;
 use tendril_core::relay_auth::RelayAuthProof;
 
@@ -13,6 +13,9 @@ pub const RELAY_PATH: &str = "/v1/relay";
 /// Canonical WebSocket path for Tendril v2 blinded-epoch relays (`spec/relay-v2.md`).
 pub const RELAY_V2_PATH: &str = "/v2/relay";
 
+/// Maximum number of pre-warmed standby acceptor sockets parked per mailbox.
+pub const MAX_STANDBY_PER_MAILBOX: usize = 4;
+
 /// 21-byte domain prefix for mailbox registration signatures.
 pub const RELAY_REG_DOMAIN: &[u8] = b"tendril-relay-reg-v1\0";
 
@@ -21,6 +24,21 @@ pub const RELAY_ACCEPT_DOMAIN: &[u8] = b"tendril-relay-accept-v1\0";
 
 /// Maximum binary frame length forwarded by the relay (`2 B len + 65519 B body`).
 pub const MAX_RELAY_FRAME_LEN: usize = 2 + MAX_FRAME_LEN;
+
+/// Validates and decodes an optional unpadded base64url `init_frame` (`1..=MAX_RELAY_FRAME_LEN`).
+pub fn decode_init_frame(init_frame: Option<&str>) -> Result<Option<Vec<u8>>, &'static str> {
+    let Some(b64) = init_frame else {
+        return Ok(None);
+    };
+    let bytes = b64url_decode(b64).map_err(|_| "bad_request")?;
+    if bytes.is_empty() {
+        return Err("bad_request");
+    }
+    if bytes.len() > MAX_RELAY_FRAME_LEN {
+        return Err("frame_too_large");
+    }
+    Ok(Some(bytes))
+}
 
 /// Messages sent from the relay server to a WebSocket client during the control phase.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,13 +50,20 @@ pub enum RelayServerMsg {
         max_frame: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_required: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast_open: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        standby: Option<bool>,
     },
     Registered {
         #[serde(rename = "pub")]
         pub_key: String,
     },
+    StandbyReady,
     Incoming {
         conn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        init_frame: Option<String>,
     },
     Ready {
         conn_id: String,
@@ -58,12 +83,23 @@ pub enum RelayClientMsg {
         sig: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<RelayAuthProof>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast_open: Option<bool>,
+    },
+    Standby {
+        #[serde(rename = "pub")]
+        pub_key: String,
+        sig: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RelayAuthProof>,
     },
     Dial {
         target_pub: String,
         conn_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<RelayAuthProof>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        init_frame: Option<String>,
     },
     Accept {
         #[serde(rename = "pub")]
@@ -86,8 +122,16 @@ pub enum RelayV2ServerMsg {
         max_frame: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_required: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast_open: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        standby: Option<bool>,
     },
     Registered {
+        mailbox_id: String,
+        epoch: u64,
+    },
+    StandbyReady {
         mailbox_id: String,
         epoch: u64,
     },
@@ -97,6 +141,8 @@ pub enum RelayV2ServerMsg {
         conn_id: String,
         dial_nonce: String,
         dial_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        init_frame: Option<String>,
     },
     Ready {
         conn_id: String,
@@ -116,6 +162,15 @@ pub enum RelayV2ClientMsg {
         sig: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<RelayAuthProof>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast_open: Option<bool>,
+    },
+    Standby {
+        mailbox_id: String,
+        epoch: u64,
+        sig: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RelayAuthProof>,
     },
     Dial {
         target_mailbox_id: String,
@@ -124,6 +179,8 @@ pub enum RelayV2ClientMsg {
         dial_token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<RelayAuthProof>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        init_frame: Option<String>,
     },
     Accept {
         mailbox_id: String,

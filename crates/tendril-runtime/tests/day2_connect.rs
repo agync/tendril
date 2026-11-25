@@ -2081,3 +2081,67 @@ fn wakeable_miss_adds_only_uncommitted_typed_relay_offline() {
         assert!(!attempt(error, false).is_wakeable_miss(), "never by text");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v1_and_v2_policy_connect_complete_over_standby_pool_and_fast_open() {
+    let relay = local_relay().await;
+    let me = Arc::new(identity(0x71));
+
+    // Wire v1 over /v1/relay with RelayListener standby pool + fast_open init_frame.
+    let (v1_host, mut v1_rx) = Host::new(0x81, Wire::V1, &me);
+    let v1_url = relay.ws_url();
+    let v1_listener = RelayListener::bind(
+        &v1_url,
+        None,
+        v1_host.identity.signing_key().ed25519_signing_key().clone(),
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v1_listener.active_standby_socket_count(), 2);
+    v1_host.serve_on(Box::new(v1_listener));
+    let mut v1_roster = client_roster(&v1_host);
+    set_signed(&mut v1_roster, &v1_host, std::slice::from_ref(&v1_url), 1);
+    let v1_store = RosterAccess::memory(v1_roster);
+    let mut v1_res = connect(Wire::V1, &me, &v1_host.id(), &v1_store, opts())
+        .await
+        .expect("v1 connect over standby+fast_open");
+    assert_eq!(v1_res.route.provider, ProviderId::Relay);
+    assert_eq!(v1_res.route.addr, v1_url);
+    let v1_sess = v1_rx.recv().await.expect("v1 host session");
+    v1_sess.send_data(b"ping-v1").await.unwrap();
+    let v1_cli_roster = Mutex::new(v1_store.load().unwrap());
+    assert_eq!(
+        v1_res.session.next_event(&v1_cli_roster).await,
+        Some(SessionEvent::AppData(b"ping-v1".to_vec()))
+    );
+
+    // Wire v2 over /v2/relay with RelayV2Listener standby pool + fast_open init_frame.
+    let (v2_host, mut v2_rx) = Host::new(0x82, Wire::V2, &me);
+    let v2_url = relay.ws_v2_url();
+    let v2_listener = RelayV2Listener::bind(
+        &v2_url,
+        None,
+        *secrets().mailbox_secret(),
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v2_listener.active_control_socket_count(), 3);
+    assert_eq!(v2_listener.active_standby_socket_count(), 2);
+    v2_host.serve_on(Box::new(v2_listener));
+    let mut v2_roster = client_roster(&v2_host);
+    set_signed(&mut v2_roster, &v2_host, std::slice::from_ref(&v2_url), 1);
+    let v2_store = RosterAccess::memory(v2_roster);
+    let mut v2_res = connect(Wire::V2, &me, &v2_host.id(), &v2_store, opts())
+        .await
+        .expect("v2 connect over standby+fast_open");
+    assert_eq!(v2_res.route.addr, v2_url);
+    let v2_sess = v2_rx.recv().await.expect("v2 host session");
+    v2_sess.send_data(b"ping-v2").await.unwrap();
+    let v2_cli_roster = Mutex::new(v2_store.load().unwrap());
+    assert_eq!(
+        v2_res.session.next_event(&v2_cli_roster).await,
+        Some(SessionEvent::AppData(b"ping-v2".to_vec()))
+    );
+}
