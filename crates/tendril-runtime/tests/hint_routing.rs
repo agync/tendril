@@ -1415,6 +1415,7 @@ fn blocked_literals_include_nested_iroh_and_relay_hosts() {
     use tendril_runtime::providers::hints::hint_has_blocked_literal;
     for hint in [
         "direct:0.0.0.1:9",
+        "wt://0.0.0.1:4433",
         "overlay://240.0.0.1:9",
         "wss://240.0.0.1/v1/relay",
         "broker+wss://240.0.0.2/x",
@@ -1425,6 +1426,7 @@ fn blocked_literals_include_nested_iroh_and_relay_hosts() {
     }
     for hint in [
         "direct:192.168.1.1:9",
+        "wt://192.168.1.1:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "wss://relay.example/v1/relay",
         "local:/run/x",
         "iroh://abc?addr=10.0.0.1:1",
@@ -1432,4 +1434,30 @@ fn blocked_literals_include_nested_iroh_and_relay_hosts() {
         assert!(!hint_has_blocked_literal(hint), "{hint}");
     }
     let _: IpAddr = "127.0.0.1".parse().expect("ip");
+}
+
+#[cfg(not(feature = "webtransport"))]
+#[tokio::test]
+async fn sole_wt_candidate_errors_when_webtransport_feature_is_disabled() {
+    let opts = MultiDialOptions::new(
+        Arc::new(HintDialers::new(HintDialerConfig::default())),
+        DialWire::V1,
+    );
+    let err = build_pairing_candidates(
+        &[HintInput::new(
+            "wt://127.0.0.1:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            HintSource::Uri,
+        )],
+        &HintTarget::pairing(None),
+        &EgressContext::new(EgressKind::Session),
+        &opts,
+    )
+    .await
+    .err()
+    .expect("sole wt candidate without feature must error");
+    assert!(
+        err.to_string()
+            .contains("webtransport feature is not enabled"),
+        "{err}"
+    );
 }

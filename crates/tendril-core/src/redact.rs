@@ -220,7 +220,7 @@ fn has_code_groups(word: &str) -> bool {
 /// URL schemes that hints, relay and wake endpoints use; any other scheme run in free text
 /// is redacted with its token.
 fn is_known_scheme(scheme: &str) -> bool {
-    const SCHEMES: [&str; 12] = [
+    const SCHEMES: [&str; 13] = [
         "http",
         "https",
         "ws",
@@ -232,6 +232,7 @@ fn is_known_scheme(scheme: &str) -> bool {
         "tcp",
         "udp",
         "quic",
+        "wt",
         "tendril",
     ];
     SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(scheme))
@@ -311,6 +312,15 @@ mod tests {
             ("local:/run/app/sock", "local:<redacted>"),
             ("direct:user:pw@host:9100", REDACTED),
             ("direct:host:9100?token=x", REDACTED),
+            (
+                "wt://192.168.1.10:4433/secret?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "wt://192.168.1.10:4433",
+            ),
+            (
+                "wt://[::1]:4433/?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "wt://[::1]:4433",
+            ),
+            ("wt://TND-ABCD-EFGH:4433/", REDACTED),
             ("tnd-abcd-efgh", REDACTED),
             ("direct:TnD-ABCD-EFGH-JKLM:1", REDACTED),
             ("ABCD-EFGH-JKLM", REDACTED),
@@ -363,6 +373,11 @@ mod tests {
 
         let out = redact_text("(https://u:p@host:1/p?q),next");
         assert_eq!(out, "(https://host:1");
+
+        let wt_out = redact_text(
+            "dial wt://192.168.1.10:4433/secret?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA failed",
+        );
+        assert_eq!(wt_out, "dial wt://192.168.1.10:4433 failed");
     }
 
     #[test]

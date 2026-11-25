@@ -4024,3 +4024,38 @@ fn old_initiator_new_responder_v1() {
     assert_eq!(entry.state, PeerState::Pending);
     assert_eq!(entry.signing_pub, None);
 }
+
+#[test]
+fn wt_redaction_and_policy_block_secrets_and_ssrf_hosts() {
+    use tendril_core::pairing::is_valid_pairing_endpoint_hint;
+    use tendril_core::policy::is_numeric_host_addr;
+    use tendril_core::redact::{REDACTED, redact_hint, redact_text, redact_url_str};
+
+    let cert_hash = b64url_encode(&[0x5Au8; 32]);
+    let raw_wt = format!("wt://10.0.0.4:4433/private/path?certhash={cert_hash}");
+    assert_eq!(redact_hint(&raw_wt), "wt://10.0.0.4:4433");
+    assert_eq!(redact_url_str(&raw_wt), "wt://10.0.0.4:4433");
+    let scrubbed = redact_text(&format!("connect {raw_wt} failed"));
+    assert_eq!(scrubbed, "connect wt://10.0.0.4:4433 failed");
+    assert!(!scrubbed.contains(&cert_hash));
+    assert!(!scrubbed.contains("private"));
+
+    let code_wt = "wt://TND-ABCD-EFGH.local:4433/?certhash=secret";
+    assert_eq!(redact_hint(code_wt), REDACTED);
+    assert_eq!(redact_url_str(code_wt), REDACTED);
+
+    assert!(is_numeric_host_addr(&raw_wt));
+    assert!(is_numeric_host_addr("wt://[fd00::1]:4433"));
+    assert!(!is_numeric_host_addr("wt://peer.example:4433"));
+
+    for ssrf in [
+        "wt://[::ffff:169.254.169.254]:4433",
+        "wt://2852039166:4433",
+        "wt://0251.0376.0.1:4433",
+        "wt://[fe80::1]:4433",
+        "wt://[::]:4433",
+        "wt://0.0.0.0:4433",
+    ] {
+        assert!(!is_valid_pairing_endpoint_hint(ssrf), "{ssrf}");
+    }
+}

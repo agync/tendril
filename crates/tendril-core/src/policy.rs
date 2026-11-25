@@ -417,6 +417,13 @@ mod tests {
         assert!(!is_numeric_host_addr("[::1]:abc"));
         assert!(is_numeric_host_addr("[::1]:7000"));
         assert!(is_numeric_host_addr("[::1]"));
+        assert!(is_numeric_host_addr(
+            "wt://192.168.1.10:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
+        assert!(is_numeric_host_addr("wt://[fd00::1]:4433"));
+        assert!(!is_numeric_host_addr(
+            "wt://peer.example:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
     }
 
     #[test]

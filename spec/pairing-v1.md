@@ -204,7 +204,7 @@ Exactly one classification decides the kind of every pairing code, whether it ar
 | Hint form | Provider |
 |---|---|
 | `local:<path>`, `unix://<path>` | `Local` |
-| `direct:<ip>:<port>`, bare `<host>:<port>` | `Direct` |
+| `direct:<ip>:<port>`, bare `<host>:<port>`, `wt://<host>:<port>[/<path>][?certhash=<43-char-b64url>]` | `Direct` |
 | `overlay://<host>:<port>` | `Overlay` |
 | `iroh://<node_id>[?addr=...&relay=...]`, `p2p:iroh://...` | `P2p` |
 | `wss://...`, `ws://...` (loopback only), `relay:ws(s)://...` | `Relay` |
@@ -212,9 +212,9 @@ Exactly one classification decides the kind of every pairing code, whether it ar
 
 **Rules:**
 
-1. A URI whose hints include any `Remote`-class hint (Section 6.8 rule 2) MUST carry a `Remote3Group` code. A `Lan2Group` URI MUST NOT carry an `Overlay`, `P2p`, `Relay` or `Broker` hint, nor a `direct:` or bare `host:port` hint whose host is not an IP literal in the loopback or LAN ranges (`InvalidPairingUri`). A `Lan2Group` code claimed on a `Remote` path burns on the responder (Section 3.1).
+1. A URI whose hints include any `Remote`-class hint (Section 6.8 rule 2) MUST carry a `Remote3Group` code. A `Lan2Group` URI MUST NOT carry an `Overlay`, `P2p`, `Relay` or `Broker` hint, nor a `direct:`, bare `host:port`, or `wt://` hint whose host is not an IP literal in the loopback or LAN ranges (`InvalidPairingUri`). A `Lan2Group` code claimed on a `Remote` path burns on the responder (Section 3.1).
 2. **Client guard.** The initiator applies the guard to the **effective code** (the code actually sent, including an operator override) and to the **actual dial path**. A malformed code fails `PairingCodeInvalid` with zero dials. A `Lan2Group` code is dialed only on candidates whose path class is `Lan` (Section 6.8 rule 2). If none remain, the attempt fails `PairingPathDisallowed` without dialing.
-3. **Builder choice.** When the caller does not request a kind (auto), a builder picks `Remote3Group` whenever any `Remote`-class hint survives the caps, so LAN pairing works and a later fallback to a remote rung can never burn the code. It picks `Lan2Group` only when at least one hint survives and every surviving hint is a loopback or LAN `direct:` literal. With **zero** surviving hints the default is `Remote3Group`. An explicit `Lan2Group` request drops every other hint (reason `lan_code_remote_hint`), and an explicit request is never overridden. For auto kind the choice is **re-evaluated after every hint dropped by the size trim** (Section 6.2 `1,024` byte bound): dropping the last remote hint can turn the set into LAN-only literals, which changes the kind from `Remote3Group` to `Lan2Group`. The change only shortens the code, so the trim loop terminates.
+3. **Builder choice.** When the caller does not request a kind (auto), a builder picks `Remote3Group` whenever any `Remote`-class hint survives the caps, so LAN pairing works and a later fallback to a remote rung can never burn the code. It picks `Lan2Group` only when at least one hint survives and every surviving hint is a loopback or LAN `direct:` or `wt://` literal. With **zero** surviving hints the default is `Remote3Group`. An explicit `Lan2Group` request drops every other hint (reason `lan_code_remote_hint`), and an explicit request is never overridden. For auto kind the choice is **re-evaluated after every hint dropped by the size trim** (Section 6.2 `1,024` byte bound): dropping the last remote hint can turn the set into LAN-only literals, which changes the kind from `Remote3Group` to `Lan2Group`. The change only shortens the code, so the trim loop terminates.
 
 ### 6.4 Relay Key `rp`
 
@@ -333,6 +333,7 @@ Applies at dial time to URI hints and to `committed` and `signed` routes (includ
 | Scheme | Enforcement |
 |---|---|
 | `direct:` | IP literals only. Names are dropped (`direct_requires_ip_literal`). |
+| `wt://` | HTTP/3 over QUIC (`wt://<host>:<port>[/<path>][?certhash=<43-char-b64url>]`). Requires an explicit non-zero port and at most one `certhash` parameter decoding to 32 bytes (pinned via `serverCertificateHashes`; when omitted, native WebPKI roots apply). Hostnames are resolved once through the checked resolver, every answer is screened, and the QUIC connect dials only a checked address while preserving TLS SNI. |
 | `overlay://` | Plain TCP. The dialer resolves once, checks every address, and connects to the checked literal. |
 | `ws(s)://`, `/v1/relay`, `/v2/relay`, `broker+ws(s)://` | The URL is not rewritten, so TLS SNI, certificate verification and the `Host` header keep the original authority. The checked resolution is the one the TCP connect uses. |
 | `iroh://` | Hint dialer **without address lookup**: no Pkarr, no DNS address lookup, no other lookup service. The dial address holds the node id, the `relay=` URLs that are members of the dialer's configured relay map (all of the map when no hint relay is a member), and `addr=` literals that pass the `direct:` rules. A hint relay outside the map is dropped (`iroh_relay_not_configured`); an empty map with no surviving `addr=` skips the hint. Lookup must be off because a lookup result is inserted into the remote's candidate paths and a relay connection is opened to any URL given. |

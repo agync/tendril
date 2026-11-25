@@ -30,13 +30,16 @@ import {
   dialBrokerStream,
   dialRelayStream,
   dialRelayV2Stream,
+  dialWtStream,
   initTendril,
   initTendrilP2p,
   openTendrilVault,
   v2EpochWithinSkew,
   validateBrokerWsUrl,
   validateRelayWsUrl,
+  validateWtUrl,
 } from "../src/index.js";
+import { redactHint } from "../src/redact.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.resolve(__dirname, "..");
@@ -2108,5 +2111,15 @@ test("PRIV-09 createIndexedDbVault encrypts with non-extractable AES-256-GCM and
     const declRe = new RegExp(`export\\s+(?:declare\\s+)?(?:function|class|const|let|var)\\s+${name}\\b`);
     assert.match(dts, declRe, `index.d.ts missing export declaration for '${name}'`);
   }
+
+  // 3. Verify redactHint strips wt:// paths and ?certhash= secrets.
+  assert.equal(
+    redactHint("wt://127.0.0.1:4433/secret?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    "wt://127.0.0.1:4433"
+  );
+  assert.equal(redactHint("wt://TND-ABCD-EFGH:4433/"), "<redacted>");
+  assert.equal(redactHint("wt://127.0.0.1:4433/path@host"), "<redacted>");
+  assert.equal(redactHint("wt://127.0.0.1:4433/?q=@x"), "<redacted>");
 });
 import "./group.test.mjs";
+import "./webtransport.test.mjs";

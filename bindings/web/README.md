@@ -1,6 +1,6 @@
 # @tendril-sdk/web
 
-Browser WebAssembly client SDK over `tendril-wasm` for Tendril relays (`/v1/relay`, `/v2/relay`), reverse-proxied WebSocket brokers (`broker+ws(s)://`), and opt-in `iroh://` peer-to-peer relays (`pkg-p2p`) with Happy Eyeballs multi-route dialing, an IndexedDB WebCrypto vault (`openTendrilVault`), and Web Worker Argon2id offload.
+Browser WebAssembly client SDK over `tendril-wasm` for direct browser WebTransport (`wt://`), Tendril relays (`/v1/relay`, `/v2/relay`), reverse-proxied WebSocket brokers (`broker+ws(s)://`), and opt-in `iroh://` peer-to-peer relays (`pkg-p2p`) with Happy Eyeballs multi-route dialing, an IndexedDB WebCrypto vault (`openTendrilVault`), and Web Worker Argon2id offload.
 
 ## Installation
 

@@ -3,6 +3,7 @@
 const HOST_PORT_HINT = /^(?:direct:|overlay:\/\/)(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]):\d{1,5}$/;
 const HINT_PREFIX = /^(?:p2p:|relay:|broker\+)/i;
 const WS_URL = /^wss?:\/\//i;
+const WT_URL = /^wt:\/\//i;
 const IROH_ID = /^iroh:\/\/([0-9A-Fa-f]{64})(?:[?/]|$)/i;
 const STANDARD_HOST = /^(?:[a-z0-9-]+(?:\.[a-z0-9-]+)*|\[[0-9a-f:.]+\])(?::\d{1,5})?$/;
 // Core `contains_code`: `tnd-` in any case, or two consecutive four-character alphanumeric
@@ -12,9 +13,9 @@ const NON_PRINTABLE_ASCII = /[^\x21-\x7e]/;
 
 /**
  * A hint reduced to its prefix, scheme and host for error text: `direct:`/`overlay://`
- * `host:port`, `ws(s)://host[:port]` (also under `relay:` or `broker+`) and an `iroh://` 64-hex
- * node id. Anything else, including every other scheme and any text holding a pairing code,
- * whitespace or non-ASCII characters, is `<redacted>`.
+ * `host:port`, `wt://host:port`, `ws(s)://host[:port]` (also under `relay:` or `broker+`) and
+ * an `iroh://` 64-hex node id. Anything else, including every other scheme and any text holding
+ * a pairing code, whitespace or non-ASCII characters, is `<redacted>`.
  */
 export function redactHint(hint) {
   const text = String(hint);
@@ -29,6 +30,24 @@ export function redactHint(hint) {
   const iroh = rest.match(IROH_ID);
   if (iroh && prefix !== "broker+" && prefix !== "relay:") {
     return `${prefix}iroh://${iroh[1].toLowerCase()}`;
+  }
+  if (prefix === "" && WT_URL.test(rest) && !rest.includes("\\")) {
+    try {
+      const url = new URL(`https://${rest.slice(5)}`);
+      if (
+        !url.username &&
+        !url.password &&
+        !url.pathname.includes("@") &&
+        !url.search.includes("@") &&
+        !url.hash.includes("@") &&
+        STANDARD_HOST.test(url.host)
+      ) {
+        const rawAuth = rest.slice(5).split(/[/?#]/)[0];
+        const explicit443 = url.port === "" && rawAuth.endsWith(":443");
+        const hostPort = explicit443 ? `${url.host}:443` : url.host;
+        return `wt://${hostPort}`;
+      }
+    } catch {}
   }
   if (WS_URL.test(rest) && prefix !== "p2p:") {
     try {

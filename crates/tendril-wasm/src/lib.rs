@@ -1172,6 +1172,9 @@ fn hint_has_blocked_literal(hint: &str) -> bool {
     };
     match provider {
         ProviderId::Local => false,
+        ProviderId::Direct if hint.starts_with("wt://") => {
+            url_host_blocked(&format!("https://{}", &hint["wt://".len()..]))
+        }
         ProviderId::Direct => host_port_blocked(hint.strip_prefix("direct:").unwrap_or(hint)),
         ProviderId::Overlay => host_port_blocked(hint.strip_prefix("overlay://").unwrap_or(hint)),
         ProviderId::Relay => url_host_blocked(hint.strip_prefix("relay:").unwrap_or(hint)),
@@ -1207,6 +1210,9 @@ fn hint_urls_parse(hint: &str) -> bool {
                 _ => true,
             })
         }
+        ProviderId::Direct if hint.starts_with("wt://") => {
+            url_has_host(&format!("https://{}", &hint["wt://".len()..]))
+        }
         ProviderId::Local | ProviderId::Direct | ProviderId::Overlay => true,
     }
 }
@@ -1229,6 +1235,7 @@ fn has_known_prefix(raw: &str) -> bool {
         "local:",
         "unix://",
         "direct:",
+        "wt://",
         "overlay://",
         "iroh://",
         "p2p:",
@@ -1315,6 +1322,8 @@ struct SessionCandidateOpts {
     route_policy: Option<String>,
     /// `iroh://` hints are dialable (the `p2p-iroh` WASM module loaded).
     p2p: bool,
+    /// `wt://` hints are dialable (browser `WebTransport` API available).
+    webtransport: bool,
     /// Permit cleartext `ws://` and `broker+ws://` outside loopback hosts.
     #[serde(default)]
     allow_insecure_ws: bool,
@@ -1406,6 +1415,12 @@ fn classify_browser_hint(hint: &str, allow_insecure_ws: bool) -> Result<Provider
         return Ok(provider);
     }
     let (prefix, url) = split_ws_prefix(hint);
+    if prefix.is_empty()
+        && hint.starts_with("wt://")
+        && url_host_blocked(&format!("https://{}", &hint["wt://".len()..]))
+    {
+        return Err("blocked_address");
+    }
     if url.starts_with("wss://") || url.starts_with("ws://") {
         if url_host_blocked(url) {
             return Err("blocked_address");
@@ -1465,6 +1480,17 @@ fn check_browser_hint(
             }
             let endpoint = hint.strip_prefix("p2p:").unwrap_or(hint);
             Ok((provider, filter_browser_iroh_hint(endpoint, source)?))
+        }
+        ProviderId::Direct if hint.starts_with("wt://") => {
+            if !opts.webtransport {
+                return Err("webtransport_feature_disabled");
+            }
+            let https_url = format!("https://{}", &hint["wt://".len()..]);
+            let parsed = url::Url::parse(&https_url).map_err(|_| "invalid")?;
+            if !parsed.host_str().is_some_and(|h| !h.is_empty()) {
+                return Err("invalid");
+            }
+            Ok((ProviderId::Direct, hint.to_owned()))
         }
         ProviderId::Local | ProviderId::Direct | ProviderId::Overlay => Err("browser_unsupported"),
     }
@@ -7683,5 +7709,56 @@ mod route_tests {
         );
         validate_relay_ticket_schema_json_inner(&ticket_json).unwrap();
         assert!(validate_relay_ticket_schema_json_inner(r#"{"bogus":1}"#).is_err());
+    }
+
+    #[test]
+    fn wasm_session_candidates_handles_wt_feature_gate_and_blocked_hosts() {
+        let (mut roster, _host) = roster_with_routes();
+        let valid_wt = "wt://127.0.0.1:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let blocked_wt_meta =
+            "wt://169.254.169.254:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let blocked_wt_res =
+            "wt://240.0.0.1:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let wss = "wss://relay.example.test/v1/relay";
+
+        roster
+            .set_routes_inner("host-l6a", &json!([valid_wt, wss]).to_string())
+            .unwrap();
+        let mut json_roster: serde_json::Value = serde_json::to_value(&roster.inner).unwrap();
+        let routes = json_roster["entries"]["host-l6a"]["routes"]
+            .as_array_mut()
+            .unwrap();
+        for hint in [blocked_wt_meta, blocked_wt_res] {
+            routes.push(json!({ "hint": hint, "source": "operator" }));
+        }
+        roster.replace_from_json(&json_roster.to_string()).unwrap();
+
+        let wt_off = to_json(
+            &roster
+                .session_candidates_inner("host-l6a", Some(r#"{"webtransport":false}"#))
+                .unwrap(),
+        );
+        let off_cands: Vec<String> = candidates_of(&wt_off).into_iter().map(|(h, _)| h).collect();
+        assert_eq!(off_cands, vec![wss.to_owned()]);
+        let off_skipped = skipped_of(&wt_off);
+        assert!(off_skipped.contains(&(
+            valid_wt.to_owned(),
+            "webtransport_feature_disabled".to_owned()
+        )));
+        assert!(off_skipped.contains(&(blocked_wt_meta.to_owned(), "blocked_address".to_owned())));
+        assert!(off_skipped.contains(&(blocked_wt_res.to_owned(), "blocked_address".to_owned())));
+
+        let wt_on = to_json(
+            &roster
+                .session_candidates_inner("host-l6a", Some(r#"{"webtransport":true}"#))
+                .unwrap(),
+        );
+        let on_cands = candidates_of(&wt_on);
+        assert_eq!(on_cands[0].0, valid_wt);
+        assert_eq!(wt_on["candidates"][0]["provider"], "direct");
+        assert_eq!(on_cands[1].0, wss);
+        let on_skipped = skipped_of(&wt_on);
+        assert!(on_skipped.contains(&(blocked_wt_meta.to_owned(), "blocked_address".to_owned())));
+        assert!(on_skipped.contains(&(blocked_wt_res.to_owned(), "blocked_address".to_owned())));
     }
 }

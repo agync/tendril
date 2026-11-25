@@ -38,20 +38,32 @@ import {
 import { TendrilWebGroup } from "./group.js";
 import { redactHint } from "./redact.js";
 import { createIndexedDbVault, openTendrilVault } from "./vault.js";
+import {
+  MAX_WT_FRAME_LEN,
+  MAX_WT_QUEUED_BYTES,
+  WtStream,
+  dialWtStream,
+  validateWtUrl,
+} from "./webtransport.js";
 
 export {
   MAX_QUEUED_BYTES,
   MAX_QUEUED_FRAMES,
   MAX_RELAY_FRAME_LEN,
+  MAX_WT_FRAME_LEN,
+  MAX_WT_QUEUED_BYTES,
   RelayStream,
   TendrilWebGroup,
+  WtStream,
   createIndexedDbVault,
   dialBrokerStream,
   dialRelayStream,
   dialRelayV2Stream,
+  dialWtStream,
   openTendrilVault,
   validateBrokerWsUrl,
   validateRelayWsUrl,
+  validateWtUrl,
 };
 
 export async function initTendrilP2p(wasmUrl) {
@@ -167,6 +179,12 @@ async function dialWebStream({
       signal,
     });
   }
+  if (provider === "direct" || (target && target.startsWith("wt://"))) {
+    return dialWtStream(target, {
+      timeoutMs,
+      signal,
+    });
+  }
   if (provider === "broker" || (target && /^broker\+/i.test(target))) {
     return dialBrokerStream(target, {
       allowInsecureWs,
@@ -213,7 +231,7 @@ const RUNG_BUDGET_MS = 4000;
 const ROSTER_LOCK_WARN_MS = 5000;
 const CLIENT_ROUTE_SET_INTERVAL_MS = 10000;
 const NO_BROWSER_ENDPOINTS =
-  "pairing URI contains no browser-compatible endpoints (need iroh:// or wss://)";
+  "pairing URI contains no browser-compatible endpoints (need wt://, iroh:// or wss://)";
 const DAY2_RECOVERY_GUIDANCE =
   "advertise a configured relay as a stable route, or scan a fresh signed pairing URI and apply it or connect with it as a recovery URI";
 const PAIR_V2_RELAY_REJECTED =
@@ -286,6 +304,16 @@ function isV2RelayUrl(url) {
 
 function isIrohHint(hint) {
   return typeof hint === "string" && (hint.startsWith("iroh://") || hint.startsWith("p2p:iroh://"));
+}
+
+function isRelayTarget(target) {
+  return !(
+    target &&
+    (target.startsWith("iroh://") ||
+      target.startsWith("p2p:iroh://") ||
+      target.startsWith("wt://") ||
+      /^broker\+/i.test(target))
+  );
 }
 
 function stripIrohRelayParams(endpoint) {
@@ -378,13 +406,14 @@ class FatalAttemptError extends Error {
 
 /**
  * Splits pairing URI hints into the candidates a browser can dial, in provider order, and the
- * skipped rest. `iroh://` needs `p2p` (see `hasP2pSupport()`) and loses its `relay=`
- * parameters; `wss://` and `broker+wss://` are kept, `ws://` and `broker+ws://` only on
- * loopback or with `allowInsecureWs`. IPC, `direct:`, `overlay://` and `/v2/relay` are skipped.
+ * skipped rest. `wt://` needs `webtransport`; `iroh://` needs `p2p` (see `hasP2pSupport()`)
+ * and loses its `relay=` parameters; `wss://` and `broker+wss://` are kept, `ws://` and
+ * `broker+ws://` only on loopback or with `allowInsecureWs`. IPC, `direct:`, `overlay://`
+ * and `/v2/relay` are skipped.
  */
 export function filterWebCompatibleEndpoints(
   endpoints,
-  { p2p = false, allowInsecureWs = false } = {}
+  { p2p = false, allowInsecureWs = false, webtransport = false } = {}
 ) {
   if (!Array.isArray(endpoints)) {
     throw new TypeError("endpoints must be an array of strings");
@@ -410,6 +439,20 @@ export function filterWebCompatibleEndpoints(
     } else if (hint.startsWith("broker+")) {
       bare = hint.slice(7);
       isBroker = true;
+    }
+    if (bare === hint && bare.startsWith("wt://")) {
+      try {
+        validateWtUrl(bare);
+      } catch (err) {
+        skip(hint, err?.blocked ? "blocked_address" : "invalid");
+        continue;
+      }
+      if (!webtransport) {
+        skip(hint, "webtransport_feature_disabled");
+        continue;
+      }
+      candidates.push({ hint, endpoint: bare, provider: "direct" });
+      continue;
     }
     if (!isBroker && bare.startsWith("iroh://")) {
       if (!p2p) {
@@ -1409,12 +1452,7 @@ export class TendrilWebClient {
       let stream = null;
       try {
         const target = endpoint || relayUrl;
-        const isRelay = !(
-          target &&
-          (target.startsWith("iroh://") ||
-            target.startsWith("p2p:iroh://") ||
-            /^broker\+/i.test(target))
-        );
+        const isRelay = isRelayTarget(target);
         const startBytes = initiator.start();
         stream = await dialWebStream({
           endpoint,
@@ -1593,12 +1631,7 @@ export class TendrilWebClient {
       if (wire === 2 && codeBytes === null) {
         codeBytes = encoder.encode(codeStr);
       }
-      if (classifyPairingCode(codeStr) === "lan2_group") {
-        throw codedError(
-          "pairing_path_disallowed",
-          "pairing path disallowed: 2-group code disallowed on remote path"
-        );
-      }
+      const codeKind = classifyPairingCode(codeStr);
 
       // An operator relay `URL#key` dials the URL with the key as the mailbox; `/v2/relay` is
       // never a pairing route.
@@ -1615,15 +1648,31 @@ export class TendrilWebClient {
         const explicitProvider =
           explicitUrl.startsWith("iroh://") || explicitUrl.startsWith("p2p:iroh://")
             ? "p2p"
-            : /^broker\+/i.test(explicitUrl)
-              ? "broker"
-              : "relay";
+            : explicitUrl.startsWith("wt://")
+              ? "direct"
+              : /^broker\+/i.test(explicitUrl)
+                ? "broker"
+                : "relay";
         const normalizedExplicit =
           explicitProvider === "p2p"
             ? explicitUrl.replace(/^p2p:/, "")
             : explicitProvider === "broker"
               ? explicitUrl.replace(/^broker\+/i, "")
               : explicitUrl;
+        if (codeKind === "lan2_group") {
+          let lanOk = false;
+          if (explicitProvider === "direct") {
+            try {
+              lanOk = validateWtUrl(normalizedExplicit).isLanOrLoopback;
+            } catch {}
+          }
+          if (!lanOk) {
+            throw codedError(
+              "pairing_path_disallowed",
+              "pairing path disallowed: 2-group code disallowed on remote path"
+            );
+          }
+        }
         candidates = [
           {
             hint: null,
@@ -1634,10 +1683,51 @@ export class TendrilWebClient {
         ];
       } else if (parsed) {
         const p2p = parsed.endpoints.some(isIrohHint) ? await hasP2pSupport() : false;
-        ({ candidates, skipped } = filterWebCompatibleEndpoints(parsed.endpoints, {
-          p2p,
-          allowInsecureWs,
-        }));
+        const webtransport = typeof globalThis.WebTransport === "function";
+        try {
+          ({ candidates, skipped } = filterWebCompatibleEndpoints(parsed.endpoints, {
+            p2p,
+            allowInsecureWs,
+            webtransport,
+          }));
+        } catch (err) {
+          if (codeKind === "lan2_group") {
+            throw codedError(
+              "pairing_path_disallowed",
+              "pairing path disallowed: 2-group code disallowed on remote path"
+            );
+          }
+          throw err;
+        }
+        if (codeKind === "lan2_group") {
+          const lanCandidates = [];
+          for (const cand of candidates) {
+            let lanOk = false;
+            if (cand.provider === "direct") {
+              try {
+                lanOk = validateWtUrl(cand.endpoint).isLanOrLoopback;
+              } catch {}
+            }
+            if (lanOk) {
+              lanCandidates.push(cand);
+            } else {
+              skipped.push({
+                hint: String(cand.hint ?? cand.endpoint),
+                reason: "lan_code_remote_hint",
+              });
+            }
+          }
+          if (lanCandidates.length === 0) {
+            throw attemptError(
+              codedError(
+                "pairing_path_disallowed",
+                "pairing path disallowed: 2-group code disallowed on remote path"
+              ),
+              { skipped }
+            );
+          }
+          candidates = lanCandidates;
+        }
       } else {
         throw new Error("endpoint, relayUrl or pairingUri is required");
       }
@@ -1873,7 +1963,10 @@ export class TendrilWebClient {
       }
       stream = await dialWebStream({
         provider: cand.provider,
-        endpoint: cand.provider === "p2p" || cand.provider === "broker" ? cand.endpoint : null,
+        endpoint:
+          cand.provider === "p2p" || cand.provider === "broker" || cand.provider === "direct"
+            ? cand.endpoint
+            : null,
         relayUrl: cand.provider === "relay" ? cand.endpoint : null,
         targetPub: d.targetPub,
         expectedHost: d.expectedHost,
@@ -2370,7 +2463,7 @@ export class TendrilWebClient {
               )
             )
         : null;
-      const isRelay = !(target && (target.startsWith("iroh://") || /^broker\+/i.test(target)));
+      const isRelay = isRelayTarget(target);
       const startedMs = performance.now();
       const preBytes = isRelay
         ? wire === 2
@@ -2702,6 +2795,7 @@ export class TendrilWebClient {
     if (recoveryHasIroh || (view && view.routes.some((r) => isIrohHint(r.hint)))) {
       p2p = await hasP2pSupport();
     }
+    const webtransport = typeof globalThis.WebTransport === "function";
     this.#ensureOpen();
     let plan;
     try {
@@ -2720,6 +2814,7 @@ export class TendrilWebClient {
                   wire,
                   route_policy: ctx.policy,
                   p2p,
+                  webtransport,
                   allow_insecure_ws: Boolean(ctx.allowInsecureWs),
                 })
               )
@@ -2860,7 +2955,10 @@ export class TendrilWebClient {
         : { relayAuthTicket: null, relayAuthSecret: null };
       stream = await dialWebStream({
         provider: cand.provider,
-        endpoint: cand.provider === "p2p" || cand.provider === "broker" ? cand.endpoint : null,
+        endpoint:
+          cand.provider === "p2p" || cand.provider === "broker" || cand.provider === "direct"
+            ? cand.endpoint
+            : null,
         relayUrl: isRelay ? cand.endpoint : null,
         targetPub: cands.relay_key_b64,
         p2pRelayUrls: ctx.p2pRelayUrls,

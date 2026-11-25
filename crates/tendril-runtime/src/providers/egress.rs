@@ -167,6 +167,9 @@ pub enum SkipReason {
     RelayV2NotAuthorized,
     /// A `/v2/relay` hint on a Wire v1 driver.
     WireV1NoRelayV2,
+    /// A `wt://` hint while the `webtransport` feature is disabled.
+    #[serde(rename = "webtransport_feature_disabled")]
+    WebtransportFeatureDisabled,
 }
 
 impl SkipReason {
@@ -184,6 +187,7 @@ impl SkipReason {
             Self::P2pFeatureDisabled => "p2p_feature_disabled",
             Self::RelayV2NotAuthorized => "relay_v2_not_authorized",
             Self::WireV1NoRelayV2 => "wire_v1_no_relay_v2",
+            Self::WebtransportFeatureDisabled => "webtransport_feature_disabled",
         }
     }
 }
@@ -555,6 +559,31 @@ pub struct CheckedHint {
     pub relay_pins: Vec<(String, Vec<IpAddr>)>,
 }
 
+#[cfg(feature = "webtransport")]
+struct PinnedHostResolver {
+    host: String,
+    addrs: Vec<SocketAddr>,
+}
+
+#[cfg(feature = "webtransport")]
+#[async_trait]
+impl HostResolver for PinnedHostResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, RuntimeError> {
+        if bare_host(host).eq_ignore_ascii_case(&self.host) {
+            Ok(self
+                .addrs
+                .iter()
+                .map(|a| SocketAddr::new(a.ip(), port))
+                .collect())
+        } else {
+            Err(egress_err(
+                SkipReason::Unresolved,
+                "unpinned host lookup rejected",
+            ))
+        }
+    }
+}
+
 fn split_host_port(target: &str) -> Option<(&str, u16)> {
     let (host, port) = target.rsplit_once(':')?;
     let port = port.parse::<u16>().ok().filter(|p| *p != 0)?;
@@ -723,6 +752,61 @@ pub async fn check_hint(
                 .or_else(|| hint.strip_prefix("unix://"))
                 .unwrap_or(hint);
             checked.dial_endpoint = path.to_owned();
+        }
+        ProviderId::Direct if hint.starts_with("wt://") => {
+            let rest = &hint["wt://".len()..];
+            let parsed = url::Url::parse(&format!("https://{rest}"))
+                .map_err(|_| skip(SkipReason::Invalid))?;
+            let host = parsed
+                .host_str()
+                .map(bare_host)
+                .filter(|h| !h.is_empty())
+                .ok_or_else(|| skip(SkipReason::Invalid))?;
+            let authority = rest.split(['/', '?']).next().unwrap_or_default();
+            let port = authority
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .filter(|&p| p > 0)
+                .ok_or_else(|| skip(SkipReason::Invalid))?;
+            if host.eq_ignore_ascii_case("metadata.google.internal")
+                || host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| classify_destination(ip) == DestClass::Blocked)
+            {
+                return Err(skip(SkipReason::BlockedAddress));
+            }
+            #[cfg(not(feature = "webtransport"))]
+            {
+                let _ = port;
+                if ctx.kind == EgressKind::Pairing(PairingCodeKind::Lan2Group) {
+                    let is_lan_literal = host.parse::<IpAddr>().is_ok_and(|ip| {
+                        matches!(
+                            classify_destination(ip),
+                            DestClass::Loopback | DestClass::Lan
+                        )
+                    });
+                    if !is_lan_literal {
+                        return Err(skip(SkipReason::LanCodeRemoteHint));
+                    }
+                }
+                return Err(skip(SkipReason::WebtransportFeatureDisabled));
+            }
+            #[cfg(feature = "webtransport")]
+            {
+                let policy = EgressAddrPolicy::new(Arc::clone(&ctx.resolver));
+                let addrs = resolve_checked(host, port, &policy)
+                    .await
+                    .map_err(|err| skip(err.skip_reason().unwrap_or(SkipReason::Unresolved)))?;
+                checked.dial_endpoint = hint.to_owned();
+                checked.destinations = addrs.iter().map(SocketAddr::ip).collect();
+                if host.parse::<IpAddr>().is_err() {
+                    let pinned = Arc::new(PinnedHostResolver {
+                        host: host.to_owned(),
+                        addrs,
+                    });
+                    checked.addr_policy = Some(Arc::new(EgressAddrPolicy::new(pinned)));
+                }
+            }
         }
         ProviderId::Direct => {
             let target = hint.strip_prefix("direct:").unwrap_or(hint);

@@ -478,6 +478,8 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
                 "--overlay-allow-non-tailnet",
                 "--broker",
                 "127.0.0.1:0",
+                "--webtransport",
+                "127.0.0.1:0",
                 "--issue-code",
                 "remote",
             ])
@@ -506,6 +508,14 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
         .as_str()
         .expect("broker_endpoint")
         .to_owned();
+    let wt_ep = listening["wt_endpoint"]
+        .as_str()
+        .expect("wt_endpoint")
+        .to_owned();
+    assert!(
+        wt_ep.starts_with("wt://127.0.0.1:") && wt_ep.contains("?certhash="),
+        "{wt_ep}"
+    );
     assert!(listening["embedded_relay_url"].as_str().is_some());
     let code = listening["pairing_code"]
         .as_str()
@@ -560,6 +570,7 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
     let grant_json = String::from_utf8(mint_out.stdout).expect("grant utf8");
 
     for (ep, expected_provider, msg) in [
+        (&wt_ep, "Direct", "hello-cli-webtransport"),
         (&p2p_ep, "P2p", "hello-cli-p2p"),
         (&overlay_ep, "Overlay", "hello-cli-overlay"),
         (&broker_ep, "Broker", "hello-cli-broker"),

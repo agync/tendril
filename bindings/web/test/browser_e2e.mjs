@@ -823,6 +823,91 @@ async function main() {
     }
     console.log("CHROME_LIVE_BROKER_AND_V2_PRIORITY_E2E_OK=true");
 
+    // 4. Headless Chrome E2E: live WebTransport direct (wt://127.0.0.1:<port>?certhash=...)
+    //    pair (including lan2_group) + Day-2 connect winning provider: "direct" ahead of relay.
+    const wtPeer = spawnPeer();
+    try {
+      const wtInit = await wtPeer.call({ op: "init", host_id: "chrome-wt-host" });
+      const wtInfo = await wtPeer.call({ op: "serve_wt" });
+      assert.ok(
+        wtInfo.endpoint.startsWith("wt://127.0.0.1:") && wtInfo.endpoint.includes("?certhash="),
+        `unexpected wt endpoint: ${wtInfo.endpoint}`
+      );
+      await wtPeer.call({
+        op: "serve_relay",
+        relay_url: relay.wsUrl,
+        expected_host: "127.0.0.1",
+      });
+      const wtLanCode = (await wtPeer.call({ op: "issue_code", kind: "lan" })).code;
+      const chromeWtPair = cdp.evalAsync(`
+        const sdk = window.__e2eSdk;
+        window.__wtClient = await sdk.TendrilWebClient.create({ hostId: 'chrome-wt-client' });
+        const uri = 'tendril://pair?v=1&host=chrome-wt-host&code=' + encodeURIComponent(${JSON.stringify(wtLanCode)}) +
+          '&k=' + encodeURIComponent(${JSON.stringify(wtInit.static_pub)}) +
+          '&sh=' + encodeURIComponent(${JSON.stringify(wtInit.signing_pub_hash)}) +
+          '&id=chrome-wt-host' +
+          '&ep=' + encodeURIComponent(${JSON.stringify(wtInfo.endpoint)});
+        return await window.__wtClient.pair({ pairingUri: uri, timeoutMs: 8000 });
+      `);
+      const wtPeerPair = await wtPeer.call({ op: "pair" });
+      const wtPairRes = await chromeWtPair;
+      assert.equal(wtPairRes.sas, wtPeerPair.sas);
+      assert.equal(wtPairRes.route.provider, "direct");
+      assert.equal(wtPairRes.route.endpoint, wtInfo.endpoint);
+
+      await wtPeer.call({ op: "confirm", peer_id: wtPeerPair.device_id, sas: wtPeerPair.sas });
+      const wtGrant = (
+        await wtPeer.call({ op: "mint", peer_id: wtPeerPair.device_id, caps: ["fs.read"] })
+      ).grant;
+
+      // Store relay ahead of wt:// to verify PathPlanner picks direct (provider: "direct") first.
+      const proxiedWtRelay = `ws://127.0.0.1:${server.port}/v1/relay`;
+      await cdp.evalAsync(`
+        await window.__wtClient.setPeerRoutes('chrome-wt-host', [
+          ${JSON.stringify(proxiedWtRelay)},
+          ${JSON.stringify(wtInfo.endpoint)}
+        ]);
+      `);
+      const chromeWtConn = cdp.evalAsync(`
+        window.__wtSession = await window.__wtClient.connect({
+          targetHostId: 'chrome-wt-host',
+          grantJson: ${JSON.stringify(JSON.stringify(wtGrant))},
+          timeoutMs: 8000,
+        });
+        await window.__wtSession.sendData('hello-from-chrome-wt');
+        return {
+          route: window.__wtSession.route,
+          established: window.__wtSession.isEstablished(),
+          allowRead: window.__wtSession.authorize('fs.read'),
+        };
+      `);
+      await wtPeer.call({ op: "connect" });
+      const wtConnState = await chromeWtConn;
+      assert.equal(wtConnState.established, true);
+      assert.equal(wtConnState.allowRead, true);
+      assert.equal(wtConnState.route.provider, "direct");
+      assert.equal(wtConnState.route.endpoint, wtInfo.endpoint);
+
+      const wtMsg = await wtPeer.call({ op: "recv", timeout_ms: 2000 });
+      assert.equal(wtMsg.data_utf8, "hello-from-chrome-wt");
+
+      await wtPeer.call({ op: "send", data_utf8: "back-to-chrome-wt" });
+      const wtBack = await cdp.evalAsync(`
+        const ev = await window.__wtSession.pollEvent(2000);
+        if (ev.event !== 'data') throw new Error('expected data event: ' + JSON.stringify(ev));
+        const text = new TextDecoder().decode(window.__e2eSdk.b64urlDecode(ev.data_b64));
+        await window.__wtSession.close(1000, 'done');
+        window.__wtClient.free();
+        return text;
+      `);
+      assert.equal(wtBack, "back-to-chrome-wt");
+      await wtPeer.call({ op: "recv", timeout_ms: 2000 }).catch(() => {});
+      await wtPeer.call({ op: "shutdown" });
+    } finally {
+      wtPeer.close();
+    }
+    console.log("CHROME_LIVE_WEBTRANSPORT_DIRECT_E2E_OK=true");
+
     if (process.env.TENDRIL_WEB_P2P_LIVE === "1") {
       assert.ok(fs.existsSync(CLI_BIN), `missing tendril binary at ${CLI_BIN}`);
       const p2pHostDir = fs.mkdtempSync(path.join(os.tmpdir(), "tendril-web-p2p-host-"));

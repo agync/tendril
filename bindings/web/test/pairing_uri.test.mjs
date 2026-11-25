@@ -33,7 +33,7 @@ const WEB_ROOT = path.resolve(__dirname, "..");
 const WASM_PATH = path.join(WEB_ROOT, "pkg", "tendril_wasm_bg.wasm");
 const P2P_WASM_PATH = path.join(WEB_ROOT, "pkg-p2p", "tendril_wasm_bg.wasm");
 const NO_BROWSER =
-  /pairing URI contains no browser-compatible endpoints \(need iroh:\/\/ or wss:\/\/\)/;
+  /pairing URI contains no browser-compatible endpoints \(need wt:\/\/, iroh:\/\/ or wss:\/\/\)/;
 
 let wasmReady = false;
 async function ensureWasm() {
@@ -287,6 +287,14 @@ test("redactHint keeps only ws(s) standard hosts, host:port hints and iroh ids",
     ["broker+wss://broker.example.com/x?y=z", "broker+wss://broker.example.com"],
     [`iroh://${id}?relay=https://r.example/&addr=192.0.2.1:4433`, `iroh://${id}`],
     [`p2p:iroh://${id.toUpperCase()}`, `p2p:iroh://${id}`],
+    [
+      "wt://192.168.1.10:4433/secret?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "wt://192.168.1.10:4433",
+    ],
+    [
+      "wt://[::1]:4433/?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "wt://[::1]:4433",
+    ],
   ];
   for (const [hint, want] of kept) {
     assert.equal(redactHint(hint), want, hint);
@@ -307,6 +315,8 @@ test("redactHint keeps only ws(s) standard hosts, host:port hints and iroh ids",
     "broker+iroh://" + id,
     "p2p:wss://relay.example.com/v1/relay",
     "direct:192.0.2.1:7000?tok=secret",
+    "wt://user:pw@192.168.1.10:4433/",
+    "wt://TND-ABCD-EFGH:4433/",
     "local:/run/tendril.sock",
     "not a url",
   ]) {

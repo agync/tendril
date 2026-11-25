@@ -34,6 +34,8 @@ use super::egress::{
 use super::p2p::{P2pBindAddrs, P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode};
 use super::relay::{RelayHintDialer, gate_relay_auth};
 use super::relay_v2::MailboxSecretSource;
+#[cfg(feature = "webtransport")]
+use super::webtransport::WtDialer;
 use super::{
     BrokerDialer, DirectDialer, LocalDialer, OverlayDialer, RelayClientAuth, RelayV2Dialer,
 };
@@ -350,6 +352,8 @@ impl fmt::Debug for HintDialerConfig {
 pub struct HintDialers {
     config: HintDialerConfig,
     direct: Arc<dyn PathDialer>,
+    #[cfg(feature = "webtransport")]
+    wt: Arc<dyn PathDialer>,
     local: Arc<dyn PathDialer>,
     overlay: Arc<dyn PathDialer>,
     broker: Arc<dyn PathDialer>,
@@ -392,6 +396,8 @@ impl HintDialers {
         Self {
             config,
             direct: Arc::new(DirectDialer::new()),
+            #[cfg(feature = "webtransport")]
+            wt: Arc::new(WtDialer::new()),
             local: Arc::new(LocalDialer::new()),
             overlay: Arc::new(OverlayDialer::new()),
             broker: Arc::new(BrokerDialer::new()),
@@ -714,6 +720,20 @@ pub async fn build_pairing_candidates(
         let mut relay_credentials = false;
         let dialer: Arc<dyn PathDialer> = match checked.provider {
             ProviderId::Local => Arc::clone(&set.local),
+            ProviderId::Direct if hint.starts_with("wt://") => {
+                #[cfg(feature = "webtransport")]
+                {
+                    Arc::clone(&set.wt)
+                }
+                #[cfg(not(feature = "webtransport"))]
+                {
+                    skipped.push(SkippedHint::new(
+                        hint,
+                        SkipReason::WebtransportFeatureDisabled,
+                    ));
+                    continue;
+                }
+            }
             ProviderId::Direct => Arc::clone(&set.direct),
             ProviderId::Overlay => Arc::clone(&set.overlay),
             ProviderId::Broker => Arc::clone(&set.broker),
@@ -814,6 +834,16 @@ pub async fn build_pairing_candidates(
             "p2p-iroh feature is not enabled in tendril-runtime".to_owned(),
         ));
     }
+    if candidates.is_empty()
+        && !skipped.is_empty()
+        && skipped
+            .iter()
+            .all(|s| s.reason == SkipReason::WebtransportFeatureDisabled)
+    {
+        return Err(RuntimeError::Protocol(
+            "webtransport feature is not enabled in tendril-runtime".to_owned(),
+        ));
+    }
 
     let mut providers: Vec<ProviderId> = routes.keys().copied().collect();
     providers.sort();
@@ -837,6 +867,7 @@ fn has_known_prefix(raw: &str) -> bool {
         "local:",
         "unix://",
         "direct:",
+        "wt://",
         "overlay://",
         "iroh://",
         "p2p:",
@@ -947,6 +978,9 @@ fn hint_urls_parse(hint: &str) -> bool {
                 _ => true,
             })
         }
+        ProviderId::Direct if hint.starts_with("wt://") => {
+            url_has_host(&format!("https://{}", &hint["wt://".len()..]))
+        }
         ProviderId::Local | ProviderId::Direct | ProviderId::Overlay => true,
     }
 }
@@ -959,6 +993,9 @@ pub fn hint_has_blocked_literal(hint: &str) -> bool {
     };
     match provider {
         ProviderId::Local => false,
+        ProviderId::Direct if hint.starts_with("wt://") => {
+            url_host_blocked(&format!("https://{}", &hint["wt://".len()..]))
+        }
         ProviderId::Direct => host_port_blocked(hint.strip_prefix("direct:").unwrap_or(hint)),
         ProviderId::Overlay => host_port_blocked(hint.strip_prefix("overlay://").unwrap_or(hint)),
         ProviderId::Relay => url_host_blocked(hint.strip_prefix("relay:").unwrap_or(hint)),

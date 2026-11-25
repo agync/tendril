@@ -2032,3 +2032,83 @@ fn debug_output_redacts_the_pairing_code() {
     assert!(!shown.contains(CODE3), "{shown}");
     assert!(!shown.contains("ABCD-EFGH"), "{shown}");
 }
+
+#[test]
+fn wt_endpoint_hints_validate_classify_announce_and_gate_lan2_codes() {
+    let valid_hash = b64url_encode(&[0xABu8; 32]);
+    assert_eq!(valid_hash.len(), 43);
+
+    for good in [
+        format!("wt://192.168.1.10:4433?certhash={valid_hash}"),
+        format!("wt://127.0.0.1:4433/tendril?certhash={valid_hash}"),
+        format!("wt://[fd00::1]:4433?certhash={valid_hash}"),
+        "wt://peer.example:4433".to_owned(),
+        "wt://peer.example:443/wt".to_owned(),
+    ] {
+        assert_eq!(
+            classify_endpoint_hint(&good),
+            Ok(ProviderId::Direct),
+            "{good}"
+        );
+        assert!(is_valid_pairing_endpoint_hint(&good), "{good}");
+    }
+
+    for bad in [
+        "wt://192.168.1.10",
+        "wt://192.168.1.10:0",
+        "wt://192.168.1.10:4433?",
+        "wt://192.168.1.10:4433?foo=bar",
+        &format!("wt://192.168.1.10:4433?certhash={valid_hash}&extra=1"),
+        &format!("wt://192.168.1.10:4433?certhash={}=", &valid_hash[..42]),
+        "wt://192.168.1.10:4433?certhash=too_short",
+        "wt://192.168.1.10:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!",
+        // 43 chars with non-zero trailing padding bits in final sextet ('B' = 1)
+        "wt://192.168.1.10:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB",
+        "wt://user@192.168.1.10:4433",
+        "wt://192.168.1.10:4433#frag",
+        "wt://192.168.1.10:4433\\evil",
+        "wt://0.0.0.0:4433",
+        "wt://169.254.169.254:4433",
+        "wt://0xa9.254.169.254:4433",
+        "wt://224.0.0.1:4433",
+        "wt://[fe80::1]:4433",
+        "wt://metadata.google.internal:4433",
+        "wt://.:4433",
+        "wt://192.168.1.10:4433\n",
+    ] {
+        assert!(!is_valid_pairing_endpoint_hint(bad), "must reject {bad}");
+        assert!(classify_endpoint_hint(bad).is_err(), "must reject {bad}");
+    }
+
+    let id = identity(0x41);
+    let lan_wt = format!("wt://192.168.1.10:4433?certhash={valid_hash}");
+    let lo_wt = format!("wt://[::1]:4433?certhash={valid_hash}");
+    let pub_wt = format!("wt://203.0.113.5:4433?certhash={valid_hash}");
+    let dns_wt = "wt://peer.example:4433".to_owned();
+
+    // Auto code kind picks Lan2Group for LAN/loopback wt:// literals and Remote3Group for public/domain wt://.
+    let mut roster = Roster::new();
+    let mut mgr = PairingManager::new(PairingConfig::default());
+
+    let lan_ann = PairingManager::announced_route_set(&id, &[lan_wt.clone(), lo_wt.clone()]);
+    assert_eq!(lan_ann.routes(), &[lan_wt.clone(), lo_wt.clone()]);
+    let lan_state = roster.bump_local_routes(&lan_ann, NOW_UNIX).unwrap();
+    let lan_issued = mgr
+        .issue_pairing_uri(&id, "Studio", &lan_state, IssueOptions::default(), NOW_UNIX)
+        .unwrap();
+    assert_eq!(lan_issued.code_kind, PairingCodeKind::Lan2Group);
+    assert_eq!(lan_issued.parsed.endpoints, vec![lan_wt.clone(), lo_wt]);
+
+    let pub_ann = PairingManager::announced_route_set(&id, std::slice::from_ref(&pub_wt));
+    assert_eq!(pub_ann.routes(), std::slice::from_ref(&pub_wt));
+    let pub_state = roster.bump_local_routes(&pub_ann, NOW_UNIX).unwrap();
+    let pub_issued = mgr
+        .issue_pairing_uri(&id, "Studio", &pub_state, IssueOptions::default(), NOW_UNIX)
+        .unwrap();
+    assert_eq!(pub_issued.code_kind, PairingCodeKind::Remote3Group);
+
+    // Public or domain wt:// hints are rejected on Lan2Group pairing URIs.
+    assert!(PairingUri::parse(&raw(&id, "TND-ABCD-EFGH", &format!("&ep={}", lan_wt))).is_ok());
+    assert!(PairingUri::parse(&raw(&id, "TND-ABCD-EFGH", &format!("&ep={}", pub_wt))).is_err());
+    assert!(PairingUri::parse(&raw(&id, "TND-ABCD-EFGH", &format!("&ep={}", dns_wt))).is_err());
+}

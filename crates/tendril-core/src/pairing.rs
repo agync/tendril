@@ -1,5 +1,6 @@
 //! Pairing code management, URI codec, and Sans-I/O pairing state machines.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -523,7 +524,7 @@ pub fn classify_endpoint_hint(ep: &str) -> Result<ProviderId, CoreError> {
 pub(crate) fn provider_of_valid_hint(ep: &str) -> ProviderId {
     if is_ipc_hint(ep) {
         ProviderId::Local
-    } else if ep.starts_with("direct:") {
+    } else if ep.starts_with("direct:") || ep.starts_with("wt://") {
         ProviderId::Direct
     } else if ep.starts_with("overlay://") {
         ProviderId::Overlay
@@ -605,8 +606,11 @@ fn is_lan_or_loopback_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Returns `true` for a `direct:` IP literal in the Loopback or LAN class.
+/// Returns `true` for a `direct:` or `wt://` IP literal in the Loopback or LAN class.
 fn is_lan_direct_literal(ep: &str) -> bool {
+    if ep.starts_with("wt://") {
+        return hint_host_ip(ep).is_some_and(is_lan_or_loopback_ip);
+    }
     ep.strip_prefix("direct:")
         .and_then(|t| t.parse::<SocketAddr>().ok())
         .is_some_and(|s| is_lan_or_loopback_ip(s.ip()))
@@ -617,9 +621,15 @@ fn is_lan_direct_literal(ep: &str) -> bool {
 fn is_remote_for_lan_code(ep: &str) -> bool {
     match provider_of_valid_hint(ep) {
         ProviderId::Local => false,
-        ProviderId::Direct => !direct_target(ep)
-            .parse::<SocketAddr>()
-            .is_ok_and(|s| is_lan_or_loopback_ip(s.ip())),
+        ProviderId::Direct => {
+            if ep.starts_with("wt://") {
+                !hint_host_ip(ep).is_some_and(is_lan_or_loopback_ip)
+            } else {
+                !direct_target(ep)
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|s| is_lan_or_loopback_ip(s.ip()))
+            }
+        }
         _ => true,
     }
 }
@@ -1867,10 +1877,15 @@ fn hint_host_ip(ep: &str) -> Option<IpAddr> {
     host.trim_end_matches('.').parse::<IpAddr>().ok()
 }
 
-/// IP host of a `ws`, `wss`, `http` or `https` URL after the WHATWG host normalization the
+/// IP host of a `ws`, `wss`, `http`, `https` or `wt` URL after the WHATWG host normalization the
 /// runtime's URL parser applies, so `https://0xf0.1/` is `240.0.0.1`.
 fn normalized_url_host_ip(url: &str) -> Option<IpAddr> {
-    let parsed = url::Url::parse(url).ok()?;
+    let to_parse = if let Some(rest) = url.strip_prefix("wt://") {
+        Cow::Owned(format!("https://{rest}"))
+    } else {
+        Cow::Borrowed(url)
+    };
+    let parsed = url::Url::parse(&to_parse).ok()?;
     if !matches!(parsed.scheme(), "ws" | "wss" | "http" | "https") {
         return None;
     }
@@ -1989,6 +2004,7 @@ fn normalize_announced_hint(raw: &str, identity_ed_b64: &str) -> Result<String, 
     if is_valid_pairing_endpoint_hint(&hint)
         && hint.len() <= MAX_PAIRING_ENDPOINT_HINT_LEN
         && provider_of_valid_hint(&hint) == ProviderId::Direct
+        && !hint.starts_with("wt://")
         && direct_target(&hint).parse::<SocketAddr>().is_err()
     {
         return Err(DropReason::DirectRequiresIpLiteral);
@@ -2274,7 +2290,9 @@ fn is_valid_url_hint(url: &str, secure_scheme: &str, loopback_scheme: &str) -> b
         return false;
     }
     let bare_host = host.strip_prefix('[').unwrap_or(host);
+    let trimmed_host = bare_host.trim_end_matches('.');
     if bare_host.is_empty()
+        || trimmed_host.is_empty()
         || (!bare_host.contains(':')
             && !bare_host
                 .bytes()
@@ -2282,13 +2300,10 @@ fn is_valid_url_hint(url: &str, secure_scheme: &str, loopback_scheme: &str) -> b
     {
         return false;
     }
-    if bare_host
-        .trim_end_matches('.')
-        .eq_ignore_ascii_case("metadata.google.internal")
-    {
+    if trimmed_host.eq_ignore_ascii_case("metadata.google.internal") {
         return false;
     }
-    if let Ok(ip) = bare_host.trim_end_matches('.').parse::<IpAddr>()
+    if let Ok(ip) = trimmed_host.parse::<IpAddr>()
         && is_disallowed_hint_ip(ip)
     {
         return false;
@@ -2334,6 +2349,95 @@ fn is_valid_host_port_hint(target: &str) -> bool {
     port_str.parse::<u16>().ok().filter(|&n| n > 0).is_some()
 }
 
+fn is_valid_wt_hint(url: &str) -> bool {
+    if url
+        .bytes()
+        .any(|b| b < 0x20 || b == 0x7f || b.is_ascii_whitespace())
+        || url.contains(['#', '@', '\\'])
+    {
+        return false;
+    }
+    let Some(rest) = url.strip_prefix("wt://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return false;
+    }
+    let (host, port_opt) = if let Some(bracket_rest) = authority.strip_prefix('[') {
+        let Some((inner, after)) = bracket_rest.split_once(']') else {
+            return false;
+        };
+        if inner.parse::<Ipv6Addr>().is_err() {
+            return false;
+        }
+        let port_str = after.strip_prefix(':');
+        if !after.is_empty() && port_str.is_none() {
+            return false;
+        }
+        (authority.split(']').next().unwrap_or(authority), port_str)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        if h.contains(':') {
+            return false;
+        }
+        (h, Some(p))
+    } else {
+        (authority, None)
+    };
+    let Some(port_str) = port_opt else {
+        return false;
+    };
+    if port_str.parse::<u16>().ok().filter(|&n| n > 0).is_none() {
+        return false;
+    }
+    let bare_host = host.strip_prefix('[').unwrap_or(host);
+    let trimmed_host = bare_host.trim_end_matches('.');
+    if bare_host.is_empty()
+        || trimmed_host.is_empty()
+        || (!bare_host.contains(':')
+            && !bare_host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')))
+    {
+        return false;
+    }
+    if trimmed_host.eq_ignore_ascii_case("metadata.google.internal") {
+        return false;
+    }
+    if let Ok(ip) = trimmed_host.parse::<IpAddr>()
+        && is_disallowed_hint_ip(ip)
+    {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(&format!("https://{rest}")) else {
+        return false;
+    };
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || parsed.host().is_none()
+    {
+        return false;
+    }
+    if let Some(ip) = normalized_url_host_ip(url)
+        && is_disallowed_hint_ip(unmapped(ip))
+    {
+        return false;
+    }
+    if let Some((_, query)) = rest.split_once('?') {
+        let Some(val) = query.strip_prefix("certhash=") else {
+            return false;
+        };
+        if val.len() != 43
+            || !val.bytes().all(is_b64url_char)
+            || b64url_decode_array::<32>(val).is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Returns `true` when `ep` passes the pairing endpoint hint grammar.
 #[must_use]
 pub fn is_valid_pairing_endpoint_hint(ep: &str) -> bool {
@@ -2344,6 +2448,9 @@ pub fn is_valid_pairing_endpoint_hint(ep: &str) -> bool {
         || ep.contains('@')
     {
         return false;
+    }
+    if ep.starts_with("wt://") {
+        return is_valid_wt_hint(ep);
     }
     if let Some(ws) = ep.strip_prefix("relay:") {
         return is_valid_url_hint(ws, "wss://", "ws://");
