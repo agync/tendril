@@ -812,7 +812,7 @@ mod iroh_hints {
         // Operator relay host names resolve once at check time (stub answer below).
         let resolver = Arc::new(StubResolver::default().with("evil.example", &["203.0.113.66"]));
         let id = node_id();
-        let ctx = session(&resolver).with_iroh_relay_mode(Some(configured()));
+        let ctx = session(&resolver).with_iroh_relay_mode(configured());
         let hint = format!("p2p:iroh://{id}?relay=https://evil.example/");
         let uri = checked(&hint, HintSource::Stored(RouteSource::Signed), &ctx).await;
         assert!(uri.p2p_hint_dialer);
@@ -838,7 +838,7 @@ mod iroh_hints {
                 vec!["203.0.113.66".parse::<std::net::IpAddr>().unwrap()]
             )]
         );
-        let disabled = session(&resolver).with_iroh_relay_mode(Some(P2pRelayMode::Disabled));
+        let disabled = session(&resolver).with_iroh_relay_mode(P2pRelayMode::Disabled);
         assert_eq!(
             skipped(&hint, HintSource::Uri, &disabled).await,
             SkipReason::IrohRelayNotConfigured
@@ -853,7 +853,7 @@ mod iroh_hints {
                 .with("relay.two.example", &["203.0.113.2", "0.0.0.9"]),
         );
         let id = node_id();
-        let ctx = session(&resolver).with_iroh_relay_mode(Some(P2pRelayMode::Disabled));
+        let ctx = session(&resolver).with_iroh_relay_mode(P2pRelayMode::Disabled);
         let hint = format!(
             "iroh://{id}?addr=240.0.0.1:4433&addr=192.168.1.4:4433&addr=[64:ff9b::a9fe:a9fe]:1\
              &relay=https://0.0.0.7/&relay=https://relay.one.example/"
@@ -936,9 +936,11 @@ mod iroh_hints {
         let _on_contacts = count_relay_contacts(on_map).await;
         let hint = format!("iroh://{}?relay={off_url}", node_id());
 
-        let dialer = P2pDialer::bind_hint_dialer(Some(P2pRelayMode::Custom(on_url)))
-            .await
-            .expect("hint dialer");
+        let dialer = P2pDialer::bind_with_options(
+            P2pOptions::for_hint_dialer(P2pRelayMode::Custom(on_url)).with_port_mapping(false),
+        )
+        .await
+        .expect("hint dialer");
         let _ = timeout(Duration::from_secs(3), dialer.dial(&hint)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
@@ -952,7 +954,8 @@ mod iroh_hints {
         let control_opts = P2pOptions::for_endpoint(&hint, None, true)
             .expect("control options")
             .with_resolve_pkarr(false)
-            .with_publish_pkarr(false);
+            .with_publish_pkarr(false)
+            .with_port_mapping(false);
         let control = P2pDialer::bind_with_options(control_opts)
             .await
             .expect("control dialer");
@@ -973,9 +976,10 @@ mod iroh_hints {
     #[tokio::test]
     async fn hint_dialer_never_installs_address_lookup() {
         let relay = P2pRelayMode::Custom("http://127.0.0.1:9/".to_owned());
-        let forced = P2pOptions::for_hint_dialer(Some(relay.clone()))
+        let forced = P2pOptions::for_hint_dialer(relay.clone())
             .with_resolve_pkarr(true)
-            .with_publish_pkarr(true);
+            .with_publish_pkarr(true)
+            .with_port_mapping(false);
         let hint_dialer = P2pDialer::bind_with_options(forced)
             .await
             .expect("hint dialer");
@@ -986,10 +990,13 @@ mod iroh_hints {
         );
         hint_dialer.close().await;
 
-        let operator =
-            P2pDialer::bind_with_options(P2pOptions::for_dialer(relay).with_resolve_pkarr(true))
-                .await
-                .expect("operator dialer");
+        let operator = P2pDialer::bind_with_options(
+            P2pOptions::for_dialer(relay)
+                .with_resolve_pkarr(true)
+                .with_port_mapping(false),
+        )
+        .await
+        .expect("operator dialer");
         assert!(!operator.is_hint_dialer());
         assert!(
             operator.uses_address_lookup(),
@@ -1000,19 +1007,24 @@ mod iroh_hints {
 
     #[tokio::test]
     async fn hint_dialer_reaches_a_listener_over_a_filtered_addr() {
-        let mut listener = P2pListener::bind(P2pRelayMode::Disabled)
-            .await
-            .expect("listener");
+        let mut listener = P2pListener::bind_with_options(
+            P2pOptions::for_listener(P2pRelayMode::Disabled).with_port_mapping(false),
+            None,
+        )
+        .await
+        .expect("listener");
         let advertised = listener.local_endpoint();
         let sep = if advertised.contains('?') { '&' } else { '?' };
         let hint = format!("{advertised}{sep}relay=https://evil.example/");
         let resolver = Arc::new(StubResolver::default());
-        let ctx = session(&resolver).with_iroh_relay_mode(Some(P2pRelayMode::Disabled));
+        let ctx = session(&resolver).with_iroh_relay_mode(P2pRelayMode::Disabled);
         let ok = checked(&hint, HintSource::Uri, &ctx).await;
         assert_eq!(ok.dropped_relays, vec!["https://evil.example/"]);
-        let dialer = P2pDialer::bind_hint_dialer(Some(P2pRelayMode::Disabled))
-            .await
-            .expect("hint dialer");
+        let dialer = P2pDialer::bind_with_options(
+            P2pOptions::for_hint_dialer(P2pRelayMode::Disabled).with_port_mapping(false),
+        )
+        .await
+        .expect("hint dialer");
         let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
         let stream = timeout(Duration::from_secs(20), dialer.dial(&hint))
             .await

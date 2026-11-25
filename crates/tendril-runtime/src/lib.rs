@@ -64,9 +64,9 @@ pub use providers::{
 };
 #[cfg(feature = "p2p-iroh")]
 pub use providers::{
-    MAX_P2P_CUSTOM_RELAYS, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode,
-    TENDRIL_P2P_ALPN, format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_endpoint,
-    parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
+    MAX_P2P_CUSTOM_RELAYS, P2pBindAddrs, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth,
+    P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint, format_p2p_endpoint_with_addrs,
+    parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
 };
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};

@@ -31,7 +31,7 @@ use super::egress::{
     check_hint, classify_destination,
 };
 #[cfg(feature = "p2p-iroh")]
-use super::p2p::{P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode};
+use super::p2p::{P2pBindAddrs, P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode};
 use super::relay::{RelayHintDialer, gate_relay_auth};
 use super::relay_v2::MailboxSecretSource;
 use super::{
@@ -274,15 +274,15 @@ pub enum DialWire {
 }
 
 /// Configuration of the shared pairing and Day-2 dialer set.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HintDialerConfig {
     /// Relay admission material, attached only through the origin gate.
     pub relay_auth: RelayClientAuth,
     /// Expected relay challenge host for explicit operator relay endpoints only.
     pub relay_expected_host: Option<String>,
-    /// Configured Iroh relay mode; `None` means the default relays.
+    /// Configured Iroh relay mode; defaults to [`P2pRelayMode::N0Public`].
     #[cfg(feature = "p2p-iroh")]
-    pub p2p_relay_mode: Option<P2pRelayMode>,
+    pub p2p_relay_mode: P2pRelayMode,
     /// Iroh relay credentials, attached by Iroh to relays of the configured map only.
     #[cfg(feature = "p2p-iroh")]
     pub p2p_relay_auth: Option<P2pRelayAuth>,
@@ -294,6 +294,35 @@ pub struct HintDialerConfig {
     /// look up addresses whatever this says.
     #[cfg(feature = "p2p-iroh")]
     pub p2p_pkarr: Option<bool>,
+    /// Ask the local router for a port mapping on every Iroh endpoint of this set (default
+    /// `true`; see [`P2pOptions::port_mapping`]).
+    #[cfg(feature = "p2p-iroh")]
+    pub p2p_port_mapping: bool,
+    /// Local UDP addresses of every Iroh endpoint of this set (default
+    /// [`P2pBindAddrs::AllInterfaces`]).
+    #[cfg(feature = "p2p-iroh")]
+    pub p2p_bind_addrs: P2pBindAddrs,
+}
+
+impl Default for HintDialerConfig {
+    fn default() -> Self {
+        Self {
+            relay_auth: RelayClientAuth::default(),
+            relay_expected_host: None,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_relay_mode: P2pRelayMode::default(),
+            #[cfg(feature = "p2p-iroh")]
+            p2p_relay_auth: None,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_allow_private_addrs: false,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_pkarr: None,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_port_mapping: true,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_bind_addrs: P2pBindAddrs::default(),
+        }
+    }
 }
 
 impl fmt::Debug for HintDialerConfig {
@@ -305,7 +334,9 @@ impl fmt::Debug for HintDialerConfig {
         d.field("p2p_relay_mode", &self.p2p_relay_mode)
             .field("p2p_relay_auth", &self.p2p_relay_auth)
             .field("p2p_allow_private_addrs", &self.p2p_allow_private_addrs)
-            .field("p2p_pkarr", &self.p2p_pkarr);
+            .field("p2p_pkarr", &self.p2p_pkarr)
+            .field("p2p_port_mapping", &self.p2p_port_mapping)
+            .field("p2p_bind_addrs", &self.p2p_bind_addrs);
         d.finish()
     }
 }
@@ -343,15 +374,19 @@ impl HintDialers {
         #[cfg(feature = "p2p-iroh")]
         let p2p_hint = Arc::new(LazyHintP2pDialer {
             options: P2pOptions::for_hint_dialer(config.p2p_relay_mode.clone())
-                .with_relay_auth(config.p2p_relay_auth.clone()),
+                .with_relay_auth(config.p2p_relay_auth.clone())
+                .with_port_mapping(config.p2p_port_mapping)
+                .with_bind_addrs(config.p2p_bind_addrs.clone()),
             dialer: tokio::sync::OnceCell::new(),
         });
         #[cfg(feature = "p2p-iroh")]
         let p2p_operator = Arc::new(OperatorP2pDialer {
-            relay_mode: config.p2p_relay_mode.clone(),
+            relay_mode: Some(config.p2p_relay_mode.clone()),
             relay_auth: config.p2p_relay_auth.clone(),
             allow_private_addrs: config.p2p_allow_private_addrs,
             pkarr: config.p2p_pkarr,
+            port_mapping: config.p2p_port_mapping,
+            bind_addrs: config.p2p_bind_addrs.clone(),
             dns_pins: Vec::new(),
         });
         Self {
@@ -374,7 +409,9 @@ impl HintDialers {
 
     /// Replaces the base dialer of `dialer.provider_id()` (`Direct`, `Local`, `Overlay` or
     /// `Broker`) with `dialer`, for custom transports and dial spies. Egress checks still run
-    /// first, so the dialer receives only checked targets. Other providers are unchanged.
+    /// first, so the dialer receives only checked targets. Other providers are unchanged: a
+    /// `P2p` or `Relay` dialer passed here is ignored, because the set builds those rungs
+    /// itself.
     #[must_use]
     pub fn with_provider_dialer(mut self, dialer: Arc<dyn PathDialer>) -> Self {
         match dialer.provider_id() {
@@ -456,6 +493,8 @@ struct OperatorP2pDialer {
     relay_auth: Option<P2pRelayAuth>,
     allow_private_addrs: bool,
     pkarr: Option<bool>,
+    port_mapping: bool,
+    bind_addrs: P2pBindAddrs,
     dns_pins: Vec<(String, Vec<IpAddr>)>,
 }
 
@@ -465,6 +504,8 @@ impl OperatorP2pDialer {
         let mut opts =
             P2pOptions::for_endpoint(endpoint, self.relay_mode.clone(), self.allow_private_addrs)?
                 .with_relay_auth(self.relay_auth.clone())
+                .with_port_mapping(self.port_mapping)
+                .with_bind_addrs(self.bind_addrs.clone())
                 .with_dns_pins(self.dns_pins.clone());
         if let Some(pkarr) = self.pkarr {
             opts = opts.with_resolve_pkarr(pkarr);
@@ -1157,6 +1198,7 @@ mod tests {
             dns_pins: vec![(PINNED_RELAY.to_owned(), vec![IpAddr::from([127, 0, 0, 1])])],
             ..(*HintDialers::new(HintDialerConfig {
                 p2p_allow_private_addrs: true,
+                p2p_port_mapping: false,
                 ..HintDialerConfig::default()
             })
             .p2p_operator)
@@ -1183,7 +1225,7 @@ mod tests {
             p2p_pkarr: Some(false),
             ..HintDialerConfig::default()
         }));
-        let custom = Some(P2pRelayMode::Custom("https://relay.example/".into()));
+        let custom = P2pRelayMode::Custom("https://relay.example/".into());
         assert!(!resolves(HintDialerConfig {
             p2p_relay_mode: custom.clone(),
             ..HintDialerConfig::default()
@@ -1201,5 +1243,38 @@ mod tests {
         });
         assert!(!dialers.p2p_hint.options.resolve_pkarr);
         assert!(dialers.p2p_hint.options.hint_dialer);
+    }
+    #[test]
+    fn port_mapping_and_bind_addrs_reach_both_dialer_kinds() {
+        let node = iroh::SecretKey::from_bytes(&[10; 32]).public();
+        let endpoint = format!("iroh://{node}");
+        let only = P2pBindAddrs::Only {
+            v4: Some(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            )),
+            v6: None,
+        };
+
+        let defaults = HintDialers::new(HintDialerConfig::default());
+        assert!(defaults.p2p_hint.options.port_mapping);
+        assert_eq!(
+            defaults.p2p_hint.options.bind_addrs,
+            P2pBindAddrs::AllInterfaces
+        );
+        let operator = defaults.operator_p2p_options(&endpoint).expect("options");
+        assert!(operator.port_mapping);
+        assert_eq!(operator.bind_addrs, P2pBindAddrs::AllInterfaces);
+
+        let dialers = HintDialers::new(HintDialerConfig {
+            p2p_port_mapping: false,
+            p2p_bind_addrs: only.clone(),
+            ..HintDialerConfig::default()
+        });
+        assert!(!dialers.p2p_hint.options.port_mapping);
+        assert_eq!(dialers.p2p_hint.options.bind_addrs, only);
+        let operator = dialers.operator_p2p_options(&endpoint).expect("options");
+        assert!(!operator.port_mapping);
+        assert_eq!(operator.bind_addrs, only);
     }
 }

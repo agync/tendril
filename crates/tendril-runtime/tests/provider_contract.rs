@@ -184,12 +184,19 @@ async fn setup_provider(provider: ProviderId) -> ProviderPair {
         }
         #[cfg(feature = "p2p-iroh")]
         ProviderId::P2p => {
-            let listener = P2pListener::bind(P2pRelayMode::Disabled)
-                .await
-                .expect("bind p2p");
-            let dialer = P2pDialer::bind(P2pRelayMode::Disabled)
-                .await
-                .expect("bind p2p dialer");
+            let listener = P2pListener::bind_with_options(
+                tendril_runtime::P2pOptions::for_listener(P2pRelayMode::Disabled)
+                    .with_port_mapping(false),
+                None,
+            )
+            .await
+            .expect("bind p2p");
+            let dialer = P2pDialer::bind_with_options(
+                tendril_runtime::P2pOptions::for_dialer(P2pRelayMode::Disabled)
+                    .with_port_mapping(false),
+            )
+            .await
+            .expect("bind p2p dialer");
             let endpoint = listener.local_endpoint();
             ProviderPair {
                 listener: Box::new(listener),
@@ -1620,14 +1627,20 @@ async fn relay_hint_migration_public_to_self_hosted_to_embedded_without_repairin
 #[cfg(feature = "p2p-iroh")]
 #[tokio::test]
 async fn dial_with_policy_respects_p2p_cold_delay_and_falls_back_across_rungs() {
-    let mut p2p_listener = P2pListener::bind(P2pRelayMode::Disabled)
-        .await
-        .expect("bind p2p");
+    let mut p2p_listener = P2pListener::bind_with_options(
+        tendril_runtime::P2pOptions::for_listener(P2pRelayMode::Disabled).with_port_mapping(false),
+        None,
+    )
+    .await
+    .expect("bind p2p");
     let p2p_ep = p2p_listener.local_endpoint();
     let p2p_dialer = Arc::new(
-        P2pDialer::bind(P2pRelayMode::Disabled)
-            .await
-            .expect("p2p dialer"),
+        P2pDialer::bind_with_options(
+            tendril_runtime::P2pOptions::for_dialer(P2pRelayMode::Disabled)
+                .with_port_mapping(false),
+        )
+        .await
+        .expect("p2p dialer"),
     );
 
     let dead = DeadPort::new();
@@ -1737,15 +1750,21 @@ async fn p2p_deterministic_endpoint_id_and_peer_transport_id() {
     .with_host_id("deterministic-p2p-host");
     let seed1 = id.derive_p2p_identity_seed();
 
-    let l1 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, seed1.clone())
-        .await
-        .expect("bind l1");
+    let l1 = P2pListener::bind_with_options(
+        tendril_runtime::P2pOptions::for_listener(P2pRelayMode::Disabled).with_port_mapping(false),
+        Some(seed1.clone()),
+    )
+    .await
+    .expect("bind l1");
     let ep_id1 = l1.endpoint_id();
     drop(l1);
 
-    let l2 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, seed1)
-        .await
-        .expect("rebind l2");
+    let l2 = P2pListener::bind_with_options(
+        tendril_runtime::P2pOptions::for_listener(P2pRelayMode::Disabled).with_port_mapping(false),
+        Some(seed1),
+    )
+    .await
+    .expect("rebind l2");
     assert_eq!(l2.endpoint_id(), ep_id1);
     drop(l2);
 
@@ -1757,16 +1776,21 @@ async fn p2p_deterministic_endpoint_id_and_peer_transport_id() {
     .expect("rotate identity");
     let seed2 = id.derive_p2p_identity_seed();
 
-    let mut l3 = P2pListener::bind_with_secret(P2pRelayMode::Disabled, seed2)
-        .await
-        .expect("bind rotated l3");
+    let mut l3 = P2pListener::bind_with_options(
+        tendril_runtime::P2pOptions::for_listener(P2pRelayMode::Disabled).with_port_mapping(false),
+        Some(seed2),
+    )
+    .await
+    .expect("bind rotated l3");
     assert_ne!(l3.endpoint_id(), ep_id1);
     let ep3 = l3.local_endpoint();
 
     let accept_task = tokio::spawn(async move { l3.accept().await });
-    let dialer = P2pDialer::bind(P2pRelayMode::Disabled)
-        .await
-        .expect("bind dialer");
+    let dialer = P2pDialer::bind_with_options(
+        tendril_runtime::P2pOptions::for_dialer(P2pRelayMode::Disabled).with_port_mapping(false),
+    )
+    .await
+    .expect("bind dialer");
     let mut cli_stream = dialer.dial(&ep3).await.expect("dial rotated");
     drop(dialer);
 
@@ -2166,14 +2190,18 @@ fn batch2a_sec05_relay_partition_and_unattributed_bucket() {
 async fn batch2a_sec06_p2p_per_peer_accept_cap() {
     use tendril_runtime::{TENDRIL_P2P_ALPN, parse_p2p_endpoint};
 
-    let mut listener = P2pListener::bind(P2pRelayMode::Disabled)
-        .await
-        .expect("bind p2p listener");
+    let mut listener = P2pListener::bind_with_options(
+        tendril_runtime::P2pOptions::for_listener(P2pRelayMode::Disabled).with_port_mapping(false),
+        None,
+    )
+    .await
+    .expect("bind p2p listener");
     let ep_str = listener.local_endpoint();
     let target_addr = parse_p2p_endpoint(&ep_str).expect("parse p2p endpoint");
 
     let attacker_ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .relay_mode(iroh::RelayMode::Disabled)
+        .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
         .bind()
         .await
         .expect("bind attacker endpoint");
@@ -2206,9 +2234,11 @@ async fn batch2a_sec06_p2p_per_peer_accept_cap() {
         "expected >= 4 attacker connections holding per-peer cap, got {held_count}"
     );
 
-    let legit_dialer = P2pDialer::bind(P2pRelayMode::Disabled)
-        .await
-        .expect("bind legit dialer");
+    let legit_dialer = P2pDialer::bind_with_options(
+        tendril_runtime::P2pOptions::for_dialer(P2pRelayMode::Disabled).with_port_mapping(false),
+    )
+    .await
+    .expect("bind legit dialer");
     let dial_task = tokio::spawn(async move { legit_dialer.dial(&ep_str).await });
     let srv_stream = timeout(Duration::from_secs(2), listener.accept())
         .await
@@ -2434,12 +2464,12 @@ async fn batch2a_priv01_priv02_p2p_options_and_endpoint_formatting() {
     assert!(!custom_opts.advertise_direct_addrs);
     assert!(!custom_opts.allow_private_addrs);
 
-    let default_listener_opts = P2pOptions::for_listener(P2pRelayMode::Default);
+    let default_listener_opts = P2pOptions::for_listener(P2pRelayMode::N0Public);
     assert!(default_listener_opts.publish_pkarr);
     assert!(default_listener_opts.resolve_pkarr);
     assert!(!default_listener_opts.advertise_direct_addrs);
 
-    let default_dialer_opts = P2pOptions::for_dialer(P2pRelayMode::Default);
+    let default_dialer_opts = P2pOptions::for_dialer(P2pRelayMode::N0Public);
     assert!(!default_dialer_opts.publish_pkarr);
     assert!(default_dialer_opts.resolve_pkarr);
 
@@ -2466,13 +2496,18 @@ async fn batch2a_priv01_priv02_p2p_options_and_endpoint_formatting() {
     assert!(!with_addrs.contains("169.254.169.254"));
     assert!(with_addrs.contains("relay=https://relay.example/"));
 
-    let disabled_listener = P2pListener::bind(P2pRelayMode::Disabled)
-        .await
-        .expect("bind disabled");
+    let disabled_listener = P2pListener::bind_with_options(
+        tendril_runtime::P2pOptions::for_listener(P2pRelayMode::Disabled).with_port_mapping(false),
+        None,
+    )
+    .await
+    .expect("bind disabled");
     assert!(disabled_listener.local_endpoint().contains("addr="));
 
     let hidden_listener = P2pListener::bind_with_options(
-        P2pOptions::for_listener(P2pRelayMode::Disabled).with_advertise_direct_addrs(false),
+        P2pOptions::for_listener(P2pRelayMode::Disabled)
+            .with_advertise_direct_addrs(false)
+            .with_port_mapping(false),
         None,
     )
     .await
@@ -3357,7 +3392,9 @@ async fn p2p_custom_many_validation_and_live_gated_iroh_relay_pairing_and_rekey(
     // Negative control: wrong token cannot authenticate to the gated relay and cannot pair over relay-only.
     let bad_auth = P2pRelayAuth::BearerToken(Zeroizing::new("wrong-bearer-token".to_owned()));
     let bad_listener = P2pListener::bind_with_options(
-        P2pOptions::for_listener(custom_many.clone()).with_relay_auth(Some(bad_auth.clone())),
+        P2pOptions::for_listener(custom_many.clone())
+            .with_relay_auth(Some(bad_auth.clone()))
+            .with_port_mapping(false),
         None,
     )
     .await
@@ -3365,7 +3402,9 @@ async fn p2p_custom_many_validation_and_live_gated_iroh_relay_pairing_and_rekey(
     let bad_ep = bad_listener.local_endpoint();
     assert!(!bad_ep.contains("wrong-bearer-token"));
     let bad_dialer = P2pDialer::bind_with_options(
-        P2pOptions::for_dialer(custom_many.clone()).with_relay_auth(Some(bad_auth)),
+        P2pOptions::for_dialer(custom_many.clone())
+            .with_relay_auth(Some(bad_auth))
+            .with_port_mapping(false),
     )
     .await
     .expect("bind bad dialer");
@@ -3385,8 +3424,9 @@ async fn p2p_custom_many_validation_and_live_gated_iroh_relay_pairing_and_rekey(
     bad_dialer.close().await;
 
     // Positive control: CustomMany + valid BearerToken completes Noise_XXhfs pairing + grant + REKEY.
-    let srv_opts =
-        P2pOptions::for_listener(custom_many.clone()).with_relay_auth(Some(auth_tok.clone()));
+    let srv_opts = P2pOptions::for_listener(custom_many.clone())
+        .with_relay_auth(Some(auth_tok.clone()))
+        .with_port_mapping(false);
     assert!(!srv_opts.publish_pkarr);
     assert!(!srv_opts.resolve_pkarr);
     assert!(!srv_opts.advertise_direct_addrs);
@@ -3409,7 +3449,9 @@ async fn p2p_custom_many_validation_and_live_gated_iroh_relay_pairing_and_rekey(
         "expected relay hint in {listener_ep}"
     );
 
-    let cli_opts = P2pOptions::for_dialer(custom_many).with_relay_auth(Some(auth_tok));
+    let cli_opts = P2pOptions::for_dialer(custom_many)
+        .with_relay_auth(Some(auth_tok))
+        .with_port_mapping(false);
     let dialer = P2pDialer::bind_with_options(cli_opts)
         .await
         .expect("bind gated p2p dialer");
@@ -3625,7 +3667,9 @@ async fn p2p_iroh_services_derives_rcan_token_on_custom_many_without_pkarr_leak(
     assert!(format!("{auth:?}").contains("<redacted>"));
     assert!(!format!("{auth:?}").contains(&api_secret_str));
 
-    let opts = P2pOptions::for_listener(mode).with_relay_auth(Some(auth));
+    let opts = P2pOptions::for_listener(mode)
+        .with_relay_auth(Some(auth))
+        .with_port_mapping(false);
     assert!(!opts.publish_pkarr);
     assert!(!opts.resolve_pkarr);
 
@@ -3647,4 +3691,117 @@ async fn p2p_iroh_services_derives_rcan_token_on_custom_many_without_pkarr_leak(
     assert!(!ep.contains(&api_secret_str));
     drop(listener);
     let _ = iroh_srv.shutdown().await;
+}
+
+#[cfg(feature = "p2p-iroh")]
+fn loopback_only_options(
+    v4: Option<std::net::SocketAddrV4>,
+    v6: Option<std::net::SocketAddrV6>,
+) -> tendril_runtime::P2pOptions {
+    tendril_runtime::P2pOptions::for_listener(P2pRelayMode::Disabled)
+        .with_port_mapping(false)
+        .with_bind_addrs(tendril_runtime::P2pBindAddrs::Only { v4, v6 })
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn p2p_listener_binds_only_loopback_v4() {
+    let v4 = std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    let listener = P2pListener::bind_with_options(loopback_only_options(Some(v4), None), None)
+        .await
+        .expect("bind loopback v4");
+    let sockets = listener.bound_sockets();
+    assert!(!sockets.is_empty(), "no bound sockets");
+    for sock in &sockets {
+        assert!(
+            matches!(sock, SocketAddr::V4(a) if *a.ip() == Ipv4Addr::LOCALHOST),
+            "{sock}"
+        );
+        assert_ne!(sock.port(), 0);
+    }
+    drop(listener);
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn p2p_listener_binds_only_loopback_v6() {
+    if std::net::UdpSocket::bind("[::1]:0").is_err() {
+        eprintln!("skipping: IPv6 loopback is unavailable on this host");
+        return;
+    }
+    let v6 = std::net::SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, 0, 0, 0);
+    let listener = P2pListener::bind_with_options(loopback_only_options(None, Some(v6)), None)
+        .await
+        .expect("bind loopback v6");
+    let sockets = listener.bound_sockets();
+    assert!(!sockets.is_empty(), "no bound sockets");
+    for sock in &sockets {
+        assert!(
+            matches!(sock, SocketAddr::V6(a) if *a.ip() == std::net::Ipv6Addr::LOCALHOST),
+            "{sock}"
+        );
+        assert_ne!(sock.port(), 0);
+    }
+    drop(listener);
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn p2p_loopback_bind_round_trip() {
+    let v4 = std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    let mut listener = P2pListener::bind_with_options(
+        loopback_only_options(Some(v4), None).with_advertise_direct_addrs(true),
+        None,
+    )
+    .await
+    .expect("bind loopback listener");
+    let endpoint = listener.local_endpoint();
+    let dialer = P2pDialer::bind_with_options(
+        tendril_runtime::P2pOptions::for_dialer(P2pRelayMode::Disabled)
+            .with_port_mapping(false)
+            .with_bind_addrs(tendril_runtime::P2pBindAddrs::Only {
+                v4: Some(v4),
+                v6: None,
+            }),
+    )
+    .await
+    .expect("bind loopback dialer");
+    let dialer_sockets = dialer.bound_sockets();
+    assert!(!dialer_sockets.is_empty(), "no dialer sockets");
+    assert!(
+        dialer_sockets
+            .iter()
+            .all(|sock| matches!(sock, SocketAddr::V4(a) if *a.ip() == Ipv4Addr::LOCALHOST)),
+        "{dialer_sockets:?}"
+    );
+
+    let accept = tokio::spawn(async move { (listener.accept().await, listener) });
+    let mut client = timeout(Duration::from_secs(20), dialer.dial(&endpoint))
+        .await
+        .expect("dial timeout")
+        .expect("dial");
+    let (server, listener) = accept.await.expect("join");
+    let mut server = server.expect("accept");
+    send_tendril_frame(client.as_mut(), b"ping")
+        .await
+        .expect("send");
+    let mut reader = ResumableFrameReader::new();
+    assert_eq!(
+        recv_tendril_frame(server.as_mut(), &mut reader)
+            .await
+            .expect("recv"),
+        b"ping"
+    );
+    send_tendril_frame(server.as_mut(), b"pong")
+        .await
+        .expect("echo");
+    let mut reader = ResumableFrameReader::new();
+    assert_eq!(
+        recv_tendril_frame(client.as_mut(), &mut reader)
+            .await
+            .expect("recv echo"),
+        b"pong"
+    );
+    dialer.close().await;
+    drop(listener);
 }

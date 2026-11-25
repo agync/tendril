@@ -1,7 +1,7 @@
 //! Iroh QUIC P2P path provider (`p2p`, zero-config hole-punching + public relay fallback).
 
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -136,15 +136,34 @@ impl fmt::Debug for P2pRelayAuth {
 /// Relay strategy used when constructing [`P2pListener`] and [`P2pDialer`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum P2pRelayMode {
-    /// Zero-setup public relays (`RelayMode::Default`).
+    /// n0's public relays; with [`P2pOptions::for_listener`] also publishes to and resolves from
+    /// n0 Pkarr/DNS. This is the documented default.
     #[default]
-    Default,
+    N0Public,
     /// Single self-hosted or regional `iroh-relay` URL (`https://...` or loopback `http://...`).
     Custom(String),
     /// Multi-region custom `iroh-relay` URL list (`2..=8` URLs).
     CustomMany(Vec<String>),
     /// Direct UDP socket addresses only (no relay server).
     Disabled,
+}
+
+/// Local UDP addresses a P2P endpoint binds for QUIC.
+///
+/// This controls only the QUIC UDP sockets. It does not bind or restrict relay TCP/TLS
+/// connections, DNS lookups, or the port mapping sockets; see "Sockets a P2P endpoint opens" in
+/// `docs/design/providers-and-relay-ladder.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum P2pBindAddrs {
+    /// `0.0.0.0:0` plus a best-effort `[::]:0`: every interface, random ports (the `iroh`
+    /// default).
+    #[default]
+    AllInterfaces,
+    /// Exactly the given sockets. A family left `None` gets no socket. Fixed ports are allowed.
+    Only {
+        v4: Option<SocketAddrV4>,
+        v6: Option<SocketAddrV6>,
+    },
 }
 
 /// Privacy and discovery options controlling `iroh` P2P endpoint construction.
@@ -156,9 +175,22 @@ pub struct P2pOptions {
     pub advertise_direct_addrs: bool,
     pub allow_private_addrs: bool,
     pub relay_auth: Option<P2pRelayAuth>,
+    /// Ask the local router for a port mapping (UPnP, NAT-PMP, PCP). On by default.
+    ///
+    /// When on, the endpoint multicasts UPnP (SSDP) discovery on the local network and sends
+    /// NAT-PMP/PCP requests to the default gateway. This starts at bind for listeners and
+    /// dialers alike, whatever the relay mode, and again on later network reports only when the
+    /// relay map is not empty. Turn it off to keep the endpoint from probing the gateway, at the
+    /// cost of worse direct connectivity behind some NATs.
+    pub port_mapping: bool,
+    /// Local UDP addresses the endpoint binds. Defaults to every interface.
+    pub bind_addrs: P2pBindAddrs,
     /// `true` when `relay_mode` was derived from an untrusted peer URI rather than supplied by
     /// the caller, so its relays never count as operator-trusted.
     pub(crate) uri_derived_relays: bool,
+    /// `true` for a per-dial endpoint ([`P2pOptions::for_endpoint`]); its bind is logged at
+    /// `debug` instead of `info`.
+    pub(crate) ephemeral: bool,
     /// `true` for the lookup-free hint dialer: no address lookup service is installed whatever
     /// `publish_pkarr` or `resolve_pkarr` say, and every dial is filtered to the relay map.
     pub(crate) hint_dialer: bool,
@@ -169,19 +201,19 @@ pub struct P2pOptions {
 
 impl Default for P2pOptions {
     fn default() -> Self {
-        Self::for_listener(P2pRelayMode::Default)
+        Self::for_listener(P2pRelayMode::N0Public)
     }
 }
 
 impl P2pOptions {
     /// Default privacy-preserving options for a listening [`P2pListener`].
     ///
-    /// - [`P2pRelayMode::Default`]: publishes and resolves via `n0` Pkarr/DNS; omits direct `?addr=` hints.
+    /// - [`P2pRelayMode::N0Public`]: publishes and resolves via `n0` Pkarr/DNS; omits direct `?addr=` hints.
     /// - [`P2pRelayMode::Custom`] / [`P2pRelayMode::CustomMany`]: disables `n0` Pkarr/DNS (`presets::Minimal`) and omits direct `?addr=` hints.
     /// - [`P2pRelayMode::Disabled`]: disables `n0` Pkarr/DNS and advertises local `?addr=` hints.
     #[must_use]
     pub fn for_listener(relay_mode: P2pRelayMode) -> Self {
-        let is_default = matches!(relay_mode, P2pRelayMode::Default);
+        let is_default = matches!(relay_mode, P2pRelayMode::N0Public);
         let is_disabled = matches!(relay_mode, P2pRelayMode::Disabled);
         Self {
             relay_mode,
@@ -190,7 +222,10 @@ impl P2pOptions {
             advertise_direct_addrs: is_disabled,
             allow_private_addrs: is_disabled,
             relay_auth: None,
+            port_mapping: true,
+            bind_addrs: P2pBindAddrs::AllInterfaces,
             uri_derived_relays: false,
+            ephemeral: false,
             hint_dialer: false,
             dns_pins: Vec::new(),
         }
@@ -201,7 +236,7 @@ impl P2pOptions {
     /// Never enables `PkarrPublisher` so ephemeral client identities are never published.
     #[must_use]
     pub fn for_dialer(relay_mode: P2pRelayMode) -> Self {
-        let is_default = matches!(relay_mode, P2pRelayMode::Default);
+        let is_default = matches!(relay_mode, P2pRelayMode::N0Public);
         let is_disabled = matches!(relay_mode, P2pRelayMode::Disabled);
         Self {
             relay_mode,
@@ -210,7 +245,10 @@ impl P2pOptions {
             advertise_direct_addrs: false,
             allow_private_addrs: is_disabled,
             relay_auth: None,
+            port_mapping: true,
+            bind_addrs: P2pBindAddrs::AllInterfaces,
             uri_derived_relays: false,
+            ephemeral: false,
             hint_dialer: false,
             dns_pins: Vec::new(),
         }
@@ -218,14 +256,14 @@ impl P2pOptions {
 
     /// Options for the lookup-free dialer used for pairing URI hints and stored routes.
     ///
-    /// `configured_mode` is the operator's relay mode; `None` means [`P2pRelayMode::Default`].
+    /// `configured_mode` is the operator's relay mode ([`P2pRelayMode::N0Public`] unless set).
     /// The endpoint never installs `PkarrResolver`, `DnsAddressLookup`, or any other address
     /// lookup service, even if `resolve_pkarr` is later set, and each dial keeps only `relay=`
     /// URLs from this relay map and `addr=` literals outside the always-blocked set (see
     /// [`filter_p2p_hint`]). Hint relays never become a custom relay map.
     #[must_use]
-    pub fn for_hint_dialer(configured_mode: Option<P2pRelayMode>) -> Self {
-        let mut opts = Self::for_dialer(configured_mode.unwrap_or_default())
+    pub fn for_hint_dialer(configured_mode: P2pRelayMode) -> Self {
+        let mut opts = Self::for_dialer(configured_mode)
             .with_resolve_pkarr(false)
             .with_allow_private_addrs(true);
         opts.hint_dialer = true;
@@ -263,8 +301,8 @@ impl P2pOptions {
 
     /// Derives dialer options for dialing `endpoint`.
     ///
-    /// When `explicit_mode` is `None` or [`P2pRelayMode::Default`] and the URI carries validated
-    /// `?relay=` URLs, those relays become [`P2pRelayMode::Custom`] / [`P2pRelayMode::CustomMany`]
+    /// `explicit_mode: None` means [`P2pRelayMode::N0Public`]. When the mode is `None` or
+    /// [`P2pRelayMode::N0Public`] and the URI carries validated `?relay=` URLs, those relays become [`P2pRelayMode::Custom`] / [`P2pRelayMode::CustomMany`]
     /// so the dialer never contacts `n0` public relays or Pkarr/DNS for that peer. Any other
     /// explicit mode is kept as given.
     pub fn for_endpoint(
@@ -272,8 +310,18 @@ impl P2pOptions {
         explicit_mode: Option<P2pRelayMode>,
         allow_private_addrs: bool,
     ) -> Result<Self, RuntimeError> {
+        let mut opts = Self::for_endpoint_modes(endpoint, explicit_mode, allow_private_addrs)?;
+        opts.ephemeral = true;
+        Ok(opts)
+    }
+
+    fn for_endpoint_modes(
+        endpoint: &str,
+        explicit_mode: Option<P2pRelayMode>,
+        allow_private_addrs: bool,
+    ) -> Result<Self, RuntimeError> {
         if let Some(mode) = explicit_mode
-            && !matches!(mode, P2pRelayMode::Default)
+            && !matches!(mode, P2pRelayMode::N0Public)
         {
             let is_disabled = matches!(mode, P2pRelayMode::Disabled);
             return Ok(
@@ -282,7 +330,7 @@ impl P2pOptions {
         }
         let urls = extract_p2p_relay_urls_from_endpoint(endpoint, allow_private_addrs)?;
         if urls.is_empty() {
-            return Ok(Self::for_dialer(P2pRelayMode::Default)
+            return Ok(Self::for_dialer(P2pRelayMode::N0Public)
                 .with_allow_private_addrs(allow_private_addrs));
         }
         let mut opts = Self::for_dialer(parse_p2p_relay_modes(&urls)?)
@@ -323,6 +371,20 @@ impl P2pOptions {
     #[must_use]
     pub fn with_allow_private_addrs(mut self, allow: bool) -> Self {
         self.allow_private_addrs = allow;
+        self
+    }
+
+    /// Enables or disables port mapping (UPnP, NAT-PMP, PCP); see [`P2pOptions::port_mapping`].
+    #[must_use]
+    pub fn with_port_mapping(mut self, port_mapping: bool) -> Self {
+        self.port_mapping = port_mapping;
+        self
+    }
+
+    /// Selects the local UDP addresses the endpoint binds; see [`P2pBindAddrs`].
+    #[must_use]
+    pub fn with_bind_addrs(mut self, bind_addrs: P2pBindAddrs) -> Self {
+        self.bind_addrs = bind_addrs;
         self
     }
 
@@ -367,7 +429,8 @@ impl Drop for EndpointGuard {
     }
 }
 
-/// Parses an optional P2P relay mode selector (`"default"`, `"disabled"`/`"local"`, or `http(s)://...`).
+/// Parses an optional P2P relay mode selector (`"default"` or its alias `"n0"` for n0's public
+/// relays, `"disabled"`/`"local"`, or `http(s)://...`).
 pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeError> {
     if mode.is_some_and(|raw| raw.chars().any(char::is_control)) {
         return Err(RuntimeError::Protocol(
@@ -375,7 +438,7 @@ pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeE
         ));
     }
     match mode.map(str::trim) {
-        None | Some("" | "default") => Ok(P2pRelayMode::Default),
+        None | Some("" | "default" | "n0") => Ok(P2pRelayMode::N0Public),
         Some("disabled" | "local") => Ok(P2pRelayMode::Disabled),
         Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
             let validated = super::validate_iroh_relay_url(url)?;
@@ -389,7 +452,7 @@ pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeE
             Ok(P2pRelayMode::Custom(canonical))
         }
         Some(other) => Err(RuntimeError::Protocol(format!(
-            "invalid p2p relay mode {} (expected default, disabled, local, or relay URL)",
+            "invalid p2p relay mode {} (expected default (n0 public relays), n0, disabled, local, or relay URL)",
             redact_hint(other)
         ))),
     }
@@ -439,13 +502,21 @@ fn validate_p2p_auth_str(raw: &str, label: &str) -> Result<(), RuntimeError> {
 }
 
 fn validate_p2p_options(options: &P2pOptions) -> Result<(), RuntimeError> {
+    if matches!(
+        options.bind_addrs,
+        P2pBindAddrs::Only { v4: None, v6: None }
+    ) {
+        return Err(RuntimeError::Protocol(
+            "p2p bind needs at least one address".into(),
+        ));
+    }
     if let Some(auth) = &options.relay_auth {
         if matches!(options.relay_mode, P2pRelayMode::Disabled) {
             return Err(RuntimeError::Protocol(
                 "relay_auth is invalid when relay_mode is Disabled".into(),
             ));
         }
-        if matches!(options.relay_mode, P2pRelayMode::Default) {
+        if matches!(options.relay_mode, P2pRelayMode::N0Public) {
             return Err(RuntimeError::Protocol(
                 "relay_auth requires an explicit custom relay and is never sent to public relays"
                     .into(),
@@ -526,6 +597,7 @@ fn resolve_p2p_auth_token(
 
 async fn build_iroh_endpoint(
     options: &P2pOptions,
+    role: P2pRole,
     alpns: Vec<Vec<u8>>,
     secret_seed: Option<Zeroizing<[u8; 32]>>,
 ) -> Result<Endpoint, RuntimeError> {
@@ -551,19 +623,49 @@ async fn build_iroh_endpoint(
     let secret_key = SecretKey::from_bytes(&seed);
     let auth_token = resolve_p2p_auth_token(options.relay_auth.as_ref(), secret_key.public())?;
 
+    let builder = assemble_iroh_builder(
+        options,
+        secret_key,
+        auth_token.as_ref().map(|tok| tok.as_str()),
+        alpns,
+    )?;
+    let endpoint = builder
+        .bind()
+        .await
+        .map_err(|err| RuntimeError::Protocol(format!("iroh endpoint bind failed: {err}")))?;
+    log_p2p_endpoint_bound(options, role);
+    Ok(endpoint)
+}
+
+/// Maps the port mapping switch to the `iroh` portmapper configuration.
+fn iroh_portmapper_config(port_mapping: bool) -> iroh::endpoint::PortmapperConfig {
+    if port_mapping {
+        iroh::endpoint::PortmapperConfig::default()
+    } else {
+        iroh::endpoint::PortmapperConfig::Disabled
+    }
+}
+
+/// Builds the `iroh` endpoint builder for `options` without binding any socket.
+fn assemble_iroh_builder(
+    options: &P2pOptions,
+    secret_key: SecretKey,
+    auth_token: Option<&str>,
+    alpns: Vec<Vec<u8>>,
+) -> Result<iroh::endpoint::Builder, RuntimeError> {
     let relay_mode = match &options.relay_mode {
-        P2pRelayMode::Default => RelayMode::Default,
+        P2pRelayMode::N0Public => RelayMode::Default,
         P2pRelayMode::Custom(url_str) => {
             let mut map = build_custom_relay_map(std::slice::from_ref(url_str))?;
-            if let Some(tok) = auth_token.as_ref() {
-                map = map.with_auth_token(tok.as_str());
+            if let Some(tok) = auth_token {
+                map = map.with_auth_token(tok);
             }
             RelayMode::Custom(map)
         }
         P2pRelayMode::CustomMany(urls) => {
             let mut map = build_custom_relay_map(urls)?;
-            if let Some(tok) = auth_token.as_ref() {
-                map = map.with_auth_token(tok.as_str());
+            if let Some(tok) = auth_token {
+                map = map.with_auth_token(tok);
             }
             RelayMode::Custom(map)
         }
@@ -572,7 +674,20 @@ async fn build_iroh_endpoint(
 
     let mut builder = Endpoint::builder(presets::Minimal)
         .relay_mode(relay_mode)
-        .secret_key(secret_key);
+        .secret_key(secret_key)
+        .portmapper_config(iroh_portmapper_config(options.port_mapping));
+    if let P2pBindAddrs::Only { v4, v6 } = &options.bind_addrs {
+        builder = builder.clear_ip_transports();
+        for addr in v4
+            .iter()
+            .map(|a| SocketAddr::V4(*a))
+            .chain(v6.iter().map(|a| SocketAddr::V6(*a)))
+        {
+            builder = builder.bind_addr(addr).map_err(|err| {
+                RuntimeError::Protocol(format!("invalid p2p bind address: {err}"))
+            })?;
+        }
+    }
     if !options.dns_pins.is_empty() {
         builder = builder.dns_resolver(iroh::dns::DnsResolver::custom(PinnedDnsResolver {
             pins: options.dns_pins.clone(),
@@ -589,10 +704,125 @@ async fn build_iroh_endpoint(
     if !alpns.is_empty() {
         builder = builder.alpns(alpns);
     }
-    builder
-        .bind()
-        .await
-        .map_err(|err| RuntimeError::Protocol(format!("iroh endpoint bind failed: {err}")))
+    Ok(builder)
+}
+
+/// Which side of a connection an endpoint serves, for the startup summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum P2pRole {
+    Listener,
+    Dialer,
+}
+
+/// What a bound endpoint will contact, for the once-per-bind startup log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P2pEndpointSummary {
+    role: &'static str,
+    relays: String,
+    pkarr_publish: bool,
+    address_lookup: &'static str,
+    port_mapping: bool,
+    bind: String,
+}
+
+impl fmt::Display for P2pEndpointSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "role={} relays={} pkarr_publish={} address_lookup={} port_mapping={} bind={}",
+            self.role,
+            self.relays,
+            self.pkarr_publish,
+            self.address_lookup,
+            self.port_mapping,
+            self.bind
+        )
+    }
+}
+
+/// The host of one relay URL for the startup summary, or the redaction marker when the URL
+/// carries userinfo-like or backslash tricks (the same guard as `tendril_core::redact::redact_url`).
+fn summary_relay_host(raw: &str) -> String {
+    if raw.contains('\\') {
+        return crate::redact::REDACTED.to_owned();
+    }
+    match super::validate_iroh_relay_url(raw) {
+        Ok(url) if !url.path().contains('@') => {
+            redact_host(url.host_str().unwrap_or_default().trim_end_matches('.'))
+        }
+        _ => crate::redact::REDACTED.to_owned(),
+    }
+}
+
+/// Summarizes `options` without any token, URL path, or key material.
+fn p2p_endpoint_summary(options: &P2pOptions, role: P2pRole) -> P2pEndpointSummary {
+    let relays = match &options.relay_mode {
+        P2pRelayMode::N0Public => "n0-public".to_owned(),
+        P2pRelayMode::Disabled => "none".to_owned(),
+        P2pRelayMode::Custom(_) | P2pRelayMode::CustomMany(_) => {
+            let raw: &[String] = match &options.relay_mode {
+                P2pRelayMode::Custom(url) => std::slice::from_ref(url),
+                P2pRelayMode::CustomMany(urls) => urls,
+                _ => &[],
+            };
+            if options.uri_derived_relays {
+                format!("peer({})", raw.len())
+            } else {
+                let hosts: Vec<String> = raw.iter().map(|url| summary_relay_host(url)).collect();
+                format!("custom({})[{}]", hosts.len(), hosts.join(","))
+            }
+        }
+    };
+    let lookup = !options.hint_dialer;
+    let bind = match &options.bind_addrs {
+        P2pBindAddrs::AllInterfaces => "all-interfaces".to_owned(),
+        P2pBindAddrs::Only { v4, v6 } => {
+            let show = |addr: Option<String>| addr.unwrap_or_else(|| "none".to_owned());
+            format!(
+                "only(v4={}, v6={})",
+                show(v4.map(|a| a.to_string())),
+                show(v6.map(|a| a.to_string()))
+            )
+        }
+    };
+    P2pEndpointSummary {
+        role: match (role, options.hint_dialer) {
+            (P2pRole::Listener, _) => "listener",
+            (P2pRole::Dialer, true) => "hint-dialer",
+            (P2pRole::Dialer, false) => "dialer",
+        },
+        relays,
+        pkarr_publish: lookup && options.publish_pkarr,
+        address_lookup: if lookup && options.resolve_pkarr {
+            "n0-pkarr+dns"
+        } else {
+            "none"
+        },
+        port_mapping: options.port_mapping,
+        bind,
+    }
+}
+
+fn log_p2p_endpoint_bound(options: &P2pOptions, role: P2pRole) {
+    let summary = p2p_endpoint_summary(options, role);
+    macro_rules! emit {
+        ($level:ident) => {
+            tracing::$level!(
+                role = summary.role,
+                relays = %summary.relays,
+                pkarr_publish = summary.pkarr_publish,
+                address_lookup = summary.address_lookup,
+                port_mapping = summary.port_mapping,
+                bind = %summary.bind,
+                "p2p endpoint bound"
+            )
+        };
+    }
+    if options.ephemeral {
+        emit!(debug);
+    } else {
+        emit!(info);
+    }
 }
 
 /// Formats an [`EndpointAddr`] without direct `?addr=` IP hints (`iroh://<endpoint_id>[?relay=...]`).
@@ -744,7 +974,7 @@ pub struct P2pHintAddr {
 /// Returns the URLs of the relay map an endpoint built with `mode` uses.
 fn relay_map_urls(mode: &P2pRelayMode) -> Result<Vec<RelayUrl>, RuntimeError> {
     let map = match mode {
-        P2pRelayMode::Default => RelayMode::Default.relay_map(),
+        P2pRelayMode::N0Public => RelayMode::Default.relay_map(),
         P2pRelayMode::Custom(url) => build_custom_relay_map(std::slice::from_ref(url))?,
         P2pRelayMode::CustomMany(urls) => build_custom_relay_map(urls)?,
         P2pRelayMode::Disabled => return Ok(Vec::new()),
@@ -1032,13 +1262,24 @@ impl P2pListener {
         Self::bind_with_options(P2pOptions::for_listener(relay_mode), Some(secret_seed)).await
     }
 
+    /// Local UDP socket addresses this listener's endpoint is bound to.
+    #[must_use]
+    pub fn bound_sockets(&self) -> Vec<SocketAddr> {
+        self.guard.endpoint.bound_sockets()
+    }
+
     /// Binds a new `iroh` P2P endpoint listener with explicit privacy and lookup options.
     pub async fn bind_with_options(
         options: P2pOptions,
         secret_seed: Option<Zeroizing<[u8; 32]>>,
     ) -> Result<Self, RuntimeError> {
-        let endpoint =
-            build_iroh_endpoint(&options, vec![TENDRIL_P2P_ALPN.to_vec()], secret_seed).await?;
+        let endpoint = build_iroh_endpoint(
+            &options,
+            P2pRole::Listener,
+            vec![TENDRIL_P2P_ALPN.to_vec()],
+            secret_seed,
+        )
+        .await?;
         if !matches!(options.relay_mode, P2pRelayMode::Disabled) {
             let _ = timeout(Duration::from_secs(3), endpoint.online()).await;
         }
@@ -1181,7 +1422,7 @@ fn configured_relay_urls(mode: &P2pRelayMode) -> Vec<String> {
     let raw: &[String] = match mode {
         P2pRelayMode::Custom(url) => std::slice::from_ref(url),
         P2pRelayMode::CustomMany(urls) => urls,
-        P2pRelayMode::Default | P2pRelayMode::Disabled => &[],
+        P2pRelayMode::N0Public | P2pRelayMode::Disabled => &[],
     };
     raw.iter()
         .filter_map(|u| super::validate_iroh_relay_url(u).ok())
@@ -1387,9 +1628,7 @@ impl P2pDialer {
 
     /// Binds the lookup-free hint dialer for URI hints and stored routes
     /// ([`P2pOptions::for_hint_dialer`]).
-    pub async fn bind_hint_dialer(
-        configured_mode: Option<P2pRelayMode>,
-    ) -> Result<Self, RuntimeError> {
+    pub async fn bind_hint_dialer(configured_mode: P2pRelayMode) -> Result<Self, RuntimeError> {
         Self::bind_with_options(P2pOptions::for_hint_dialer(configured_mode)).await
     }
 
@@ -1411,7 +1650,7 @@ impl P2pDialer {
         } else {
             None
         };
-        let endpoint = build_iroh_endpoint(&options, Vec::new(), None).await?;
+        let endpoint = build_iroh_endpoint(&options, P2pRole::Dialer, Vec::new(), None).await?;
         Ok(Self {
             guard: EndpointGuard::new(endpoint),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
@@ -1420,6 +1659,12 @@ impl P2pDialer {
             hint_relay_map,
             dns_pins: options.dns_pins,
         })
+    }
+
+    /// Local UDP socket addresses this dialer's endpoint is bound to.
+    #[must_use]
+    pub fn bound_sockets(&self) -> Vec<SocketAddr> {
+        self.guard.endpoint.bound_sockets()
     }
 
     /// Returns `true` for a dialer built with [`P2pOptions::for_hint_dialer`].
@@ -1625,7 +1870,7 @@ pub(crate) mod tests {
         assert!(!opts.publish_pkarr && !opts.resolve_pkarr);
 
         let many = format!("iroh://{ep_id}?relay=https://r1.example/&relay=https://r2.example/");
-        let opts = P2pOptions::for_endpoint(&many, Some(P2pRelayMode::Default), false)
+        let opts = P2pOptions::for_endpoint(&many, Some(P2pRelayMode::N0Public), false)
             .expect("derive many");
         assert!(matches!(opts.relay_mode, P2pRelayMode::CustomMany(ref u) if u.len() == 2));
         assert!(!opts.resolve_pkarr);
@@ -1636,7 +1881,7 @@ pub(crate) mod tests {
 
         let bare = P2pOptions::for_endpoint(&format!("iroh://{ep_id}"), None, false)
             .expect("bare default");
-        assert_eq!(bare.relay_mode, P2pRelayMode::Default);
+        assert_eq!(bare.relay_mode, P2pRelayMode::N0Public);
         assert!(bare.resolve_pkarr);
 
         let private = format!("iroh://{ep_id}?relay=http://127.0.0.1:9/");
@@ -1646,7 +1891,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn relay_auth_is_refused_for_default_public_relays() {
-        let opts = P2pOptions::for_dialer(P2pRelayMode::Default).with_relay_auth(Some(
+        let opts = P2pOptions::for_dialer(P2pRelayMode::N0Public).with_relay_auth(Some(
             P2pRelayAuth::BearerToken(Zeroizing::new("tok".to_owned())),
         ));
         assert!(matches!(
@@ -1658,7 +1903,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dial_rejects_private_relay_hint_before_connecting() {
         let dialer = P2pDialer::bind_with_options(
-            P2pOptions::for_dialer(P2pRelayMode::Disabled).with_allow_private_addrs(false),
+            P2pOptions::for_dialer(P2pRelayMode::Disabled)
+                .with_allow_private_addrs(false)
+                .with_port_mapping(false),
         )
         .await
         .expect("bind");
@@ -1706,16 +1953,19 @@ pub(crate) mod tests {
         let ep_id = iroh::SecretKey::from_bytes(&[25u8; 32]).public();
         let uri = format!("iroh://{ep_id}?relay=http://127.0.0.1:9/");
         let derived = P2pDialer::bind_with_options(
-            P2pOptions::for_endpoint(&uri, None, true).expect("derive"),
+            P2pOptions::for_endpoint(&uri, None, true)
+                .expect("derive")
+                .with_port_mapping(false),
         )
         .await
         .expect("bind derived");
         assert!(derived.trusted_relays.is_empty());
         derived.close().await;
 
-        let explicit = P2pDialer::bind_with_options(P2pOptions::for_dialer(P2pRelayMode::Custom(
-            "http://127.0.0.1:9/".to_owned(),
-        )))
+        let explicit = P2pDialer::bind_with_options(
+            P2pOptions::for_dialer(P2pRelayMode::Custom("http://127.0.0.1:9/".to_owned()))
+                .with_port_mapping(false),
+        )
         .await
         .expect("explicit loopback relay stays permitted");
         assert_eq!(
@@ -1797,7 +2047,8 @@ pub(crate) mod tests {
             .with_dns_pins(vec![(
                 PINNED_RELAY.to_owned(),
                 vec![IpAddr::from([127, 0, 0, 1])],
-            )]);
+            )])
+            .with_port_mapping(false);
         let dialer = P2pDialer::bind_with_options(opts).await.expect("bind");
         assert_pinned_dial_skips_lookup(dialer.dial(&uri)).await;
         dialer.close().await;
@@ -1877,5 +2128,210 @@ pub(crate) mod tests {
             ),
             None
         );
+    }
+
+    fn all_option_sets() -> Vec<(&'static str, P2pOptions)> {
+        let custom = P2pRelayMode::Custom("https://relay.example/".to_owned());
+        let ep = iroh::SecretKey::from_bytes(&[41u8; 32]).public();
+        vec![
+            (
+                "listener n0",
+                P2pOptions::for_listener(P2pRelayMode::N0Public),
+            ),
+            ("listener custom", P2pOptions::for_listener(custom.clone())),
+            (
+                "listener many",
+                P2pOptions::for_listener(P2pRelayMode::CustomMany(vec![
+                    "https://r1.example/".to_owned(),
+                    "https://r2.example/".to_owned(),
+                ])),
+            ),
+            (
+                "listener disabled",
+                P2pOptions::for_listener(P2pRelayMode::Disabled),
+            ),
+            ("dialer", P2pOptions::for_dialer(custom)),
+            (
+                "hint dialer",
+                P2pOptions::for_hint_dialer(P2pRelayMode::N0Public),
+            ),
+            (
+                "group dialer",
+                P2pOptions::for_group_dialer(Some(P2pRelayMode::Disabled), false, None, None, None)
+                    .expect("group dialer"),
+            ),
+            (
+                "endpoint",
+                P2pOptions::for_endpoint(&format!("iroh://{ep}"), None, false).expect("endpoint"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn port_mapping_defaults_on_for_every_constructor() {
+        for (name, opts) in all_option_sets() {
+            assert!(opts.port_mapping, "{name} must keep port mapping on");
+            assert!(!opts.with_port_mapping(false).port_mapping, "{name}");
+        }
+        assert!(P2pOptions::default().port_mapping);
+    }
+
+    #[test]
+    fn iroh_portmapper_config_follows_switch() {
+        assert!(matches!(
+            iroh_portmapper_config(false),
+            iroh::endpoint::PortmapperConfig::Disabled
+        ));
+        assert!(matches!(
+            iroh_portmapper_config(true),
+            iroh::endpoint::PortmapperConfig::Enabled { .. }
+        ));
+    }
+
+    #[test]
+    fn assembled_builder_disables_portmapper() {
+        // Pinned to the iroh 1.5 `Builder` Debug output; revisit on an iroh upgrade.
+        let render = |opts: &P2pOptions| {
+            let key = SecretKey::from_bytes(&[42u8; 32]);
+            let builder = assemble_iroh_builder(opts, key, None, Vec::new()).expect("assemble");
+            format!("{builder:?}")
+        };
+        let off =
+            render(&P2pOptions::for_listener(P2pRelayMode::Disabled).with_port_mapping(false));
+        assert!(off.contains("portmapper_config: Disabled"), "{off}");
+        let on = render(&P2pOptions::for_listener(P2pRelayMode::Disabled));
+        assert!(on.contains("portmapper_config: Enabled"), "{on}");
+    }
+
+    #[test]
+    fn bind_addrs_default_all_interfaces() {
+        assert_eq!(P2pBindAddrs::default(), P2pBindAddrs::AllInterfaces);
+        for (name, opts) in all_option_sets() {
+            assert_eq!(opts.bind_addrs, P2pBindAddrs::AllInterfaces, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_only_without_addrs_rejected() {
+        let opts = P2pOptions::for_listener(P2pRelayMode::Disabled)
+            .with_port_mapping(false)
+            .with_bind_addrs(P2pBindAddrs::Only { v4: None, v6: None });
+        assert!(
+            matches!(validate_p2p_options(&opts), Err(RuntimeError::Protocol(m)) if m.contains("at least one address"))
+        );
+        assert!(
+            P2pListener::bind_with_options(opts.clone(), None)
+                .await
+                .is_err()
+        );
+        assert!(P2pDialer::bind_with_options(opts).await.is_err());
+    }
+
+    #[test]
+    fn parse_relay_mode_default_and_n0_alias() {
+        for spec in [None, Some(""), Some("default"), Some("n0"), Some(" n0 ")] {
+            assert_eq!(
+                parse_p2p_relay_mode(spec).expect("n0 public"),
+                P2pRelayMode::N0Public,
+                "{spec:?}"
+            );
+        }
+        let err = parse_p2p_relay_mode(Some("bogus")).expect_err("invalid");
+        assert!(err.to_string().contains("n0"), "{err}");
+    }
+
+    #[test]
+    fn relay_mode_default_is_n0_public() {
+        assert_eq!(P2pRelayMode::default(), P2pRelayMode::N0Public);
+        assert_eq!(
+            crate::providers::hints::HintDialerConfig::default().p2p_relay_mode,
+            P2pRelayMode::N0Public
+        );
+    }
+
+    #[test]
+    fn endpoint_summary_names_relays_and_lookup() {
+        let listener = p2p_endpoint_summary(
+            &P2pOptions::for_listener(P2pRelayMode::N0Public),
+            P2pRole::Listener,
+        );
+        assert_eq!(listener.relays, "n0-public");
+        assert!(listener.pkarr_publish);
+        assert_eq!(listener.address_lookup, "n0-pkarr+dns");
+        assert!(listener.port_mapping);
+        assert_eq!(listener.bind, "all-interfaces");
+        let text = listener.to_string();
+        assert!(text.contains("n0-public"), "{text}");
+
+        let dialer = p2p_endpoint_summary(
+            &P2pOptions::for_dialer(P2pRelayMode::N0Public),
+            P2pRole::Dialer,
+        );
+        assert!(!dialer.pkarr_publish);
+        assert_eq!(dialer.address_lookup, "n0-pkarr+dns");
+
+        let hint = p2p_endpoint_summary(
+            &P2pOptions::for_hint_dialer(P2pRelayMode::N0Public),
+            P2pRole::Dialer,
+        );
+        assert_eq!(hint.role, "hint-dialer");
+        assert_eq!(hint.address_lookup, "none");
+        assert!(!hint.pkarr_publish);
+
+        let custom = P2pOptions::for_listener(P2pRelayMode::Custom(
+            "https://relay.example/SECRETTOKEN".to_owned(),
+        ))
+        .with_relay_auth(Some(P2pRelayAuth::BearerToken(Zeroizing::new(
+            "SECRETTOKEN".to_owned(),
+        ))));
+        let custom = p2p_endpoint_summary(&custom, P2pRole::Listener).to_string();
+        assert!(custom.contains("custom(1)"), "{custom}");
+        assert!(custom.contains("relay.example"), "{custom}");
+        assert!(!custom.contains("SECRETTOKEN"), "{custom}");
+
+        let disabled = p2p_endpoint_summary(
+            &P2pOptions::for_listener(P2pRelayMode::Disabled).with_port_mapping(false),
+            P2pRole::Listener,
+        );
+        assert_eq!(disabled.relays, "none");
+        assert_eq!(disabled.address_lookup, "none");
+        assert!(!disabled.port_mapping);
+
+        let only = p2p_endpoint_summary(
+            &P2pOptions::for_listener(P2pRelayMode::Disabled).with_bind_addrs(P2pBindAddrs::Only {
+                v4: Some(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::LOCALHOST,
+                    0,
+                )),
+                v6: None,
+            }),
+            P2pRole::Listener,
+        );
+        assert_eq!(only.bind, "only(v4=127.0.0.1:0, v6=none)");
+    }
+    #[test]
+    fn endpoint_summary_hides_peer_relays_and_odd_urls() {
+        let ep = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
+        let uri = format!("iroh://{ep}?relay=https://peer-relay.example/");
+        let derived = P2pOptions::for_endpoint(&uri, None, false).expect("derive");
+        assert!(derived.ephemeral && derived.uri_derived_relays);
+        let text = p2p_endpoint_summary(&derived, P2pRole::Dialer).to_string();
+        assert!(text.contains("relays=peer(1)"), "{text}");
+        assert!(!text.contains("peer-relay.example"), "{text}");
+
+        for odd in [
+            P2pRelayMode::Custom("https://relay.example/a@b".to_owned()),
+            P2pRelayMode::Custom("https://relay.example\\@evil.example/".to_owned()),
+        ] {
+            let text =
+                p2p_endpoint_summary(&P2pOptions::for_listener(odd), P2pRole::Listener).to_string();
+            assert!(text.contains(crate::redact::REDACTED), "{text}");
+            assert!(!text.contains("relay.example"), "{text}");
+            assert!(!text.contains("evil.example"), "{text}");
+        }
+
+        assert!(!P2pOptions::for_listener(P2pRelayMode::N0Public).ephemeral);
+        assert!(!P2pOptions::for_dialer(P2pRelayMode::N0Public).ephemeral);
+        assert!(!P2pOptions::for_hint_dialer(P2pRelayMode::N0Public).ephemeral);
     }
 }

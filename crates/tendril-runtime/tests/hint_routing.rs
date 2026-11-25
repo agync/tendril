@@ -453,7 +453,8 @@ async fn iroh_hints_use_the_lookup_free_dialer_and_operator_routes_keep_theirs()
     let uri_hint = format!("iroh://{node}?relay=https://relay.attacker.example/");
     let op_hint = format!("iroh://{node}?addr=192.168.1.4:4000");
     let dialers = HintDialers::new(HintDialerConfig {
-        p2p_relay_mode: Some(P2pRelayMode::Custom("http://127.0.0.1:3340/".into())),
+        p2p_relay_mode: P2pRelayMode::Custom("http://127.0.0.1:3340/".into()),
+        p2p_port_mapping: false,
         ..HintDialerConfig::default()
     });
     let ctx = dialers.egress_context(EgressKind::Session, Vec::new());
