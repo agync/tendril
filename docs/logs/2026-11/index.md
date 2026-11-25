@@ -27,3 +27,4 @@ Entries from November 2026.
 - [usage: add Cloudflare Workers relay and complete hosting guide](25-usage-add-cloudflare-workers-relay-and.md)
 - [pairing: core initiators enforce the URI route checks before msg3](25-pairing-initiators-enforce-the-uri-route.md)
 - [Add WebTransport direct path provider (wt://)](25-add-webtransport-direct-path-provider-wt.md)
+- [Add in-band WebRTC direct path upgrade](25-add-in-band-webrtc-direct-path.md)

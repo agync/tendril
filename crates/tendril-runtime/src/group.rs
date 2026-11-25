@@ -1570,6 +1570,8 @@ pub struct GroupHub {
     config: GroupPoolConfig,
     wake: Option<Arc<dyn WakeProvider>>,
     pools: Mutex<BTreeMap<String, GroupPool>>,
+    #[cfg(feature = "webrtc")]
+    webrtc_upgrade: Option<crate::providers::webrtc::WebRtcUpgradeHandle>,
 }
 
 impl GroupHub {
@@ -1587,7 +1589,21 @@ impl GroupHub {
             config,
             wake,
             pools: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "webrtc")]
+            webrtc_upgrade: None,
         }
+    }
+
+    /// Configures an optional host-side [`crate::providers::webrtc::WebRtcUpgradeHandle`]
+    /// for accepted ordinary sessions.
+    #[cfg(feature = "webrtc")]
+    #[must_use]
+    pub fn with_webrtc_upgrade_handle(
+        mut self,
+        handle: crate::providers::webrtc::WebRtcUpgradeHandle,
+    ) -> Self {
+        self.webrtc_upgrade = Some(handle);
+        self
     }
 
     /// Opens a pool for every stored group the local device is an active member of (at most
@@ -1737,7 +1753,14 @@ impl GroupHub {
             }
         }
         drop(book);
-        let accepted = accept_handshake(
+        #[cfg(feature = "webrtc")]
+        let v1_webrtc_handle = self
+            .webrtc_upgrade
+            .as_ref()
+            .or_else(|| v2_state.webrtc_upgrade_handle())
+            .cloned();
+        #[cfg_attr(not(feature = "webrtc"), allow(unused_mut))]
+        let mut accepted = accept_handshake(
             stream,
             &self.identity,
             combined,
@@ -1745,6 +1768,8 @@ impl GroupHub {
             v2_state,
             rate_limiter,
             guard,
+            #[cfg(feature = "webrtc")]
+            v1_webrtc_handle.as_ref(),
         )
         .await?;
 
@@ -1763,6 +1788,10 @@ impl GroupHub {
             Some((pool, kind))
         });
         if let Some((pool, kind)) = routed {
+            #[cfg(feature = "webrtc")]
+            if let AcceptedIo::V2(ref mut driver) = accepted.io {
+                driver.set_webrtc_upgrade_handle(None);
+            }
             let peer = accepted.peer_id.clone();
             pool.ensure_book_watcher();
             if let Err(err) = pool.inner.ensure_open() {
@@ -1775,10 +1804,21 @@ impl GroupHub {
                 peer_device_id: peer,
             });
         }
-        self.admit_ordinary(accepted).await
+        self.admit_ordinary(
+            accepted,
+            #[cfg(feature = "webrtc")]
+            v1_webrtc_handle,
+        )
+        .await
     }
 
-    async fn admit_ordinary(&self, accepted: Accepted) -> Result<InboundSession, RuntimeError> {
+    async fn admit_ordinary(
+        &self,
+        accepted: Accepted,
+        #[cfg(feature = "webrtc")] webrtc_upgrade: Option<
+            crate::providers::webrtc::WebRtcUpgradeHandle,
+        >,
+    ) -> Result<InboundSession, RuntimeError> {
         let store = self.store.clone();
         let (roster, stamp) = blocking(move || store.load_roster_with_stamp()).await?;
         if ordinary_entry(&roster, &accepted).is_none() {
@@ -1787,11 +1827,22 @@ impl GroupHub {
             return Err(CoreError::PeerNotFound(peer).into());
         }
         match accepted.io {
-            AcceptedIo::V1(session) => Ok(InboundSession::OrdinaryV1 {
-                session,
-                roster,
-                stamp,
-            }),
+            #[cfg_attr(not(feature = "webrtc"), allow(unused_mut))]
+            AcceptedIo::V1(mut session) => {
+                #[cfg(feature = "webrtc")]
+                {
+                    if session.provider_id() == ProviderId::P2p {
+                        session.set_webrtc_upgrade_handle(None);
+                    } else if webrtc_upgrade.is_some() {
+                        session.set_webrtc_upgrade_handle(webrtc_upgrade);
+                    }
+                }
+                Ok(InboundSession::OrdinaryV1 {
+                    session,
+                    roster,
+                    stamp,
+                })
+            }
             AcceptedIo::V2(mut session) => {
                 let store = self.store.clone();
                 let peer = accepted.peer_id.clone();
@@ -1826,6 +1877,7 @@ impl GroupHub {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_handshake(
     stream: Box<dyn PathStream>,
     identity: &EndpointIdentity,
@@ -1834,6 +1886,9 @@ async fn accept_handshake(
     v2_state: &V2ResponderState,
     rate_limiter: Option<&PreAuthRateLimiter>,
     guard: Option<HalfOpenGuard>,
+    #[cfg(feature = "webrtc")] webrtc_upgrade: Option<
+        &crate::providers::webrtc::WebRtcUpgradeHandle,
+    >,
 ) -> Result<Accepted, RuntimeError> {
     let now = current_unix_secs();
     let roster = Mutex::new(roster);
@@ -1862,7 +1917,15 @@ async fn accept_handshake(
             io: AcceptedIo::V2(driver),
         })
     } else {
-        let driver = SessionDriver::accept_locked(
+        #[cfg(feature = "webrtc")]
+        let upgrade_caps = if webrtc_upgrade.is_some() && stream.provider_id() != ProviderId::P2p {
+            vec![tendril_core::UPGRADE_CAP_WEBRTC_V1.to_owned()]
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(feature = "webrtc"))]
+        let upgrade_caps = Vec::new();
+        let driver = SessionDriver::accept_locked_with_upgrade_caps(
             stream,
             identity,
             &roster,
@@ -1870,6 +1933,7 @@ async fn accept_handshake(
             rate_limiter,
             guard,
             DEFAULT_PRE_AUTH_TIMEOUT,
+            upgrade_caps,
         )
         .await?;
         let peer_id = driver
@@ -3590,6 +3654,8 @@ impl Inner {
             &self.v2_state,
             Some(&self.admission),
             Some(guard),
+            #[cfg(feature = "webrtc")]
+            None,
         )
         .await?;
         let grouped = matches!(

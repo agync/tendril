@@ -3748,6 +3748,10 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                             }
                         }
                     }
+                    SessionEvent::PathUpgrade(msg) => serde_json::json!({
+                        "event": "path_upgrade",
+                        "upgrade": msg,
+                    }),
                     SessionEvent::Closed { code, reason } => serde_json::json!({
                         "event": "closed",
                         "code": code,

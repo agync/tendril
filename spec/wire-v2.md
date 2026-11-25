@@ -211,12 +211,13 @@ Inside Noise transport mode, each outer AEAD frame decrypts to a plaintext paylo
 |---|---|---|---|---|
 | `0x01`..`0x07` | v1 types | v1 and optional v2 rx | See `spec/wire-v1.md` Section 5 | Legacy unpadded frames; the v2 legacy receive path accepts only this range, so a bare `0x0A`, `0x0B` or `0x0C` on v2 is `UnknownInnerFrameType` under every padding policy, including a disabled one |
 | `0x08` | `PADDING` | v2 only | `0..(MAX_TRANSPORT_PLAINTEXT - 1)` zero bytes (`0x00`) | Pure cover traffic; silently discarded after AEAD decrypt and nonce advance |
-| `0x09` | `PADDED` | v2 only | `inner_type (1 B) || real_len (2 B uint16_be) || real_payload || zero_padding` | Length-hidden envelope enclosing one inner frame of type `0x01..=0x03`, `0x05..=0x07`, `0x0A..=0x0C`, or `0x04` via `seal_rekey()` |
+| `0x09` | `PADDED` | v2 only | `inner_type (1 B) || real_len (2 B uint16_be) || real_payload || zero_padding` | Length-hidden envelope enclosing one inner frame of type `0x01..=0x03`, `0x05..=0x07`, `0x0A..=0x0D`, or `0x04` via `seal_rekey()` |
 | `0x0A` | `GROUP_MANIFEST` | v1 and v2 | Compact JSON `GroupManifest`, `<= 32768 B` | Group manifest push or gossip (`spec/groups-v1.md`); sealed inside `0x09 PADDED` on v2 sessions |
 | `0x0B` | `GROUP_RENDEZVOUS` | v1 and v2 | Exactly `60 B` (`group_id || seq || key`) | Group rendezvous key delivery (`spec/groups-v1.md` Section 7); sealed inside `0x09 PADDED` on v2 sessions |
 | `0x0C` | `ROUTE_SET` | v1 and v2 | `route_set_body \|\| sig`, `3455..=5003 B` (`spec/wire-v1.md` Section 5.2) | Host-signed route announcement, responder to initiator only; sealed inside `0x09 PADDED` on v2 sessions. A v2 session with padding disabled neither sends nor receives it |
+| `0x0D` | `PATH_UPGRADE` | v1 and v2 | Compact UTF-8 JSON `PathUpgradeMsg`, `<= 16384 B` (`spec/wire-v1.md` Section 5.3) | In-band direct path upgrade signaling; sealed inside `0x09 PADDED` on v2 sessions. A v2 session with padding disabled omits both `HostHello.upgrade` and `SessionHello.upgrade` and neither sends nor accepts `0x0D` |
 
-Receivers MUST reject `0x08` and `0x09` on v1 (`0x01`) sessions (`UnknownInnerFrameType`). Direct application `seal()` calls MUST reject `0x04 REKEY`, `0x08 PADDING`, and `0x09 PADDED` (callers use `seal_rekey()` and `seal_dummy_cover()`).
+Receivers MUST reject `0x08` and `0x09` on v1 (`0x01`) sessions (`UnknownInnerFrameType`). Direct application `seal()` calls MUST reject `0x04 REKEY`, `0x08 PADDING`, and `0x09 PADDED` (callers use `seal_rekey()` and `seal_dummy_cover()`). A bare unpadded `0x0D PATH_UPGRADE` on v2 is rejected (`UnknownInnerFrameType`).
 
 ### 5.2 Standard Padding Buckets and Validation
 
@@ -226,16 +227,16 @@ Standard bucket sizes for total inner plaintext length (before adding the 16-byt
 [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65503]
 ```
 
-- When sealing an inner frame of type `kind in 0x01..=0x07` or `0x0A..=0x0C` with `real_payload`:
+- When sealing an inner frame of type `kind in 0x01..=0x07` or `0x0A..=0x0D` with `real_payload`:
   - `real_payload.len()` MUST satisfy `real_payload.len() <= 65499` (`MAX_TRANSPORT_PLAINTEXT - 4`). Oversized or invalid payloads MUST fail closed BEFORE advancing the TX cipher state, calling `seal_rekey()`, or incrementing TX nonces.
   - Select the smallest bucket `B >= 4 + real_payload.len()`.
   - Emit `0x09 || (kind as u8) || uint16_be(real_payload.len()) || real_payload || 0x00^(B - 4 - real_payload.len())`.
 - When receiving `0x09` `PADDED`:
   - Require `plaintext.len() >= 4`.
-  - Require `inner_type` is in `0x01..=0x07` or `0x0A..=0x0C` (nested `0x08` or `0x09` MUST be rejected).
+  - Require `inner_type` is in `0x01..=0x07` or `0x0A..=0x0D` (nested `0x08` or `0x09` MUST be rejected).
   - Require `real_len <= plaintext.len() - 4`.
   - Verify every trailing padding byte in `plaintext[4 + real_len..]` equals `0x00` in constant time (`subtle::ConstantTimeEq`); reject any non-zero padding byte (`InvalidInnerFramePayload`).
-  - Validate per-type inner payload rules (e.g., `REKEY` empty, `PING`/`PONG` 8 bytes, `CLOSE >= 2` bytes, `GROUP_MANIFEST <= 32768` bytes, `GROUP_RENDEZVOUS` exactly 60 bytes, `ROUTE_SET` per the receive-check order of `spec/wire-v1.md` Section 5.2.3).
+  - Validate per-type inner payload rules (e.g., `REKEY` empty, `PING`/`PONG` 8 bytes, `CLOSE >= 2` bytes, `GROUP_MANIFEST <= 32768` bytes, `GROUP_RENDEZVOUS` exactly 60 bytes, `ROUTE_SET` per the receive-check order of `spec/wire-v1.md` Section 5.2.3, and `PATH_UPGRADE` `<= 16384` bytes per `spec/wire-v1.md` Section 5.3).
 - When receiving `0x08` `PADDING` (dummy cover frame):
   - Verify every byte in `plaintext[1..]` equals `0x00` in constant time; reject any non-zero byte.
   - Advance the Noise RX nonce as normal for AEAD decryption and discard the frame without emitting application data.

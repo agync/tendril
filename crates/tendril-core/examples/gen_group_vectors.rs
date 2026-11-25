@@ -440,6 +440,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         ]),
         route_seq: None,
+        upgrade: Vec::new(),
     };
 
     let admin_unsigned = grant.unsigned();

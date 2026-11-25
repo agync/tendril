@@ -787,6 +787,7 @@ fn build_pair_transcript(
         proto_version: 1,
         signing_pub: host_signing_pub_b64.clone(),
         rotation: vec![],
+        upgrade: vec![],
     };
     let host_hello_json = serde_json::to_string(&host_hello)?;
     let n2 = responder.write_message(host_hello_json.as_bytes(), &mut buf)?;
@@ -911,6 +912,7 @@ fn build_session_transcript(
         proto_version: 1,
         signing_pub: host_signing.public_key().to_b64url(),
         rotation: vec![],
+        upgrade: vec![],
     };
     let host_hello_json = serde_json::to_string(&host_hello)?;
     let n2 = responder.write_message(host_hello_json.as_bytes(), &mut buf)?;
@@ -926,6 +928,7 @@ fn build_session_transcript(
         crl_seq: Some(1),
         groups: None,
         route_seq: None,
+        upgrade: vec![],
     };
     let session_hello_json = serde_json::to_string(&session_hello)?;
     let n3 = initiator.write_message(session_hello_json.as_bytes(), &mut buf)?;
@@ -1074,6 +1077,7 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
         proto_version: 1,
         signing_pub: resp_signing_pub.to_b64url(),
         rotation: vec![],
+        upgrade: vec![],
     };
     let host_hello_json = serde_json::to_string(&host_hello)?;
     let n2 = responder.write_message(host_hello_json.as_bytes(), &mut buf)?;
@@ -1480,6 +1484,7 @@ fn build_v2_reconnect_vector(
         proto_version: WIRE_VERSION_V2,
         signing_pub: resp_signing.public_key().to_b64url(),
         rotation: vec![],
+        upgrade: vec![],
     };
     let host_hello_json = serde_json::to_string(&host_hello)?;
 
@@ -1519,6 +1524,7 @@ fn build_v2_reconnect_vector(
         crl_seq: Some(0),
         groups: None,
         route_seq: None,
+        upgrade: vec![],
     };
     let session_hello_json = serde_json::to_string(&session_hello)?;
     let msg3_padded_payload = pad_msg3_payload(session_hello_json.as_bytes())?;
@@ -1679,6 +1685,7 @@ fn build_v2_pake_vector(preamble: &[u8; 6]) -> Result<V2PakeVector, Box<dyn std:
         proto_version: WIRE_VERSION_V2,
         signing_pub: resp_signing.public_key().to_b64url(),
         rotation: vec![],
+        upgrade: vec![],
     };
     let host_hello_json = serde_json::to_string(&host_hello)?;
     let msg2_bucket_len = pake_msg2_bucket_for_hello_len(host_hello_json.len())?;

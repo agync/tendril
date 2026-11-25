@@ -30,8 +30,8 @@ use tendril_core::v2::{
     V2SessionResponder,
 };
 use tendril_core::wire::{
-    FLAG_PAKE_PAIR, InnerFrameType, Intent, PREAMBLE_FLAG_NONE, Preamble, ResumableFrameReader,
-    WIRE_VERSION_V2, encode_frame,
+    FLAG_PAKE_PAIR, InnerFrameType, Intent, PREAMBLE_FLAG_NONE, PathUpgradeMsg, PathUpgradeState,
+    Preamble, ResumableFrameReader, WIRE_VERSION_V2, encode_frame,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
@@ -54,6 +54,8 @@ use crate::provider::{
 };
 use crate::providers::egress::SkippedHint;
 use crate::providers::hints::DialWire;
+#[cfg(feature = "webrtc")]
+use crate::providers::webrtc::WebRtcUpgradeHandle;
 use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
 use crate::store::StateStore;
 use crate::wake::{DEFAULT_WAKE_TIMEOUT, WakeOutcome, WakeProvider, WakeSecret, WakeTarget};
@@ -72,6 +74,9 @@ pub struct V2ResponderConfig {
     pub pre_auth_timeout: Duration,
     pub padding: PaddingPolicy,
     pub jitter: ScheduleJitterPolicy,
+    pub upgrade_caps: Vec<String>,
+    #[cfg(feature = "webrtc")]
+    pub webrtc_upgrade_handle: Option<WebRtcUpgradeHandle>,
 }
 
 impl Default for V2ResponderConfig {
@@ -82,6 +87,9 @@ impl Default for V2ResponderConfig {
             pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
             padding: PaddingPolicy::v2_default(),
             jitter: ScheduleJitterPolicy::default(),
+            upgrade_caps: Vec::new(),
+            #[cfg(feature = "webrtc")]
+            webrtc_upgrade_handle: None,
         }
     }
 }
@@ -132,6 +140,30 @@ impl V2ResponderState {
     #[must_use]
     pub fn argon2_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.argon2_semaphore)
+    }
+
+    /// Returns the configured WebRTC upgrade handle, if any.
+    #[cfg(feature = "webrtc")]
+    #[must_use]
+    pub fn webrtc_upgrade_handle(&self) -> Option<&crate::providers::webrtc::WebRtcUpgradeHandle> {
+        self.config.webrtc_upgrade_handle.as_ref()
+    }
+
+    /// Returns a clone of this responder state with `handle` configured for WebRTC upgrades,
+    /// preserving the shared replay cache and Argon2id semaphore.
+    #[cfg(feature = "webrtc")]
+    #[must_use]
+    pub fn with_webrtc_upgrade_handle(
+        &self,
+        handle: crate::providers::webrtc::WebRtcUpgradeHandle,
+    ) -> Self {
+        let mut config = self.config.clone();
+        config.webrtc_upgrade_handle = Some(handle);
+        Self {
+            replay_cache: Arc::clone(&self.replay_cache),
+            argon2_semaphore: Arc::clone(&self.argon2_semaphore),
+            config,
+        }
     }
 
     /// Returns the active [`V2ResponderConfig`].
@@ -758,6 +790,9 @@ struct V2TransportCore {
     peer_route_seq: Option<u64>,
     /// Decoded, not yet verified route sets (at most [`MAX_QUEUED_ROUTE_SETS`]).
     route_sets: Vec<RouteSet>,
+    negotiated_upgrade_caps: Vec<String>,
+    peer_upgrade_caps: Vec<String>,
+    upgrade_state: PathUpgradeState,
 }
 
 /// Outcome of [`V2SessionDriver::stage_commit_frame`].
@@ -978,6 +1013,20 @@ impl V2TransportCore {
         self.seal_frame(InnerFrameType::RouteSet, payload, now_ms)
     }
 
+    fn seal_path_upgrade(
+        &mut self,
+        msg: &PathUpgradeMsg,
+        now_ms: u64,
+    ) -> Result<(Vec<Vec<u8>>, bool), CoreError> {
+        if self.closed {
+            return Err(CoreError::NotReady("v2 session closed"));
+        }
+        let payload = self.upgrade_state.prepare_send(msg)?;
+        let out = self.seal_frame(InnerFrameType::PathUpgrade, &payload, now_ms)?;
+        self.upgrade_state.commit_send(msg);
+        Ok(out)
+    }
+
     fn seal_dummy_cover(
         &mut self,
         bucket: usize,
@@ -1190,6 +1239,10 @@ impl V2TransportCore {
                         }
                     }
                 },
+                InnerFrameType::PathUpgrade => {
+                    let msg = self.upgrade_state.receive(&payload)?;
+                    events.push(SessionEvent::PathUpgrade(msg));
+                }
                 InnerFrameType::Padding | InnerFrameType::Padded => {
                     return Err(CoreError::UnknownInnerFrameType(kind as u8));
                 }
@@ -1351,6 +1404,8 @@ pub struct V2SessionDriver {
     _half_open: Option<HalfOpenGuard>,
     verified_recovery: Option<Box<VerifiedRouteStatement>>,
     route_ingest: IngestSlot,
+    #[cfg(feature = "webrtc")]
+    webrtc_upgrade_handle: Option<WebRtcUpgradeHandle>,
 }
 
 /// Persists a peer revocation observed while a v2 connect failed, before the error surfaces.
@@ -1407,6 +1462,28 @@ impl V2SessionDriver {
         roster: &mut Roster,
         now_unix: u64,
     ) -> Result<Self, RuntimeError> {
+        Self::connect_with_upgrade_caps(
+            stream,
+            local_identity,
+            target_host_id,
+            initial_grant,
+            roster,
+            now_unix,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Initiates a Wire v2 (`0x02`) session handshake advertising `upgrade_caps` in `SessionHello.upgrade`.
+    pub async fn connect_with_upgrade_caps(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        initial_grant: Option<Grant>,
+        roster: &mut Roster,
+        now_unix: u64,
+        upgrade_caps: Vec<String>,
+    ) -> Result<Self, RuntimeError> {
         let reconnect_secret = extract_v2_reconnect_secret(roster, target_host_id)?;
         let crl_seq = roster.crl(target_host_id).map(|c| c.seq);
         Self::connect_with_roster_ref(
@@ -1421,6 +1498,7 @@ impl V2SessionDriver {
             now_unix,
             Vec::new(),
             V2RouteInit::default(),
+            upgrade_caps,
         )
         .await
     }
@@ -1451,6 +1529,7 @@ impl V2SessionDriver {
             now_unix,
             Vec::new(),
             V2RouteInit::default(),
+            Vec::new(),
         )
         .await
     }
@@ -1464,6 +1543,28 @@ impl V2SessionDriver {
         initial_grant: Option<Grant>,
         roster: &Mutex<Roster>,
         now_unix: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::connect_locked_with_upgrade_caps(
+            stream,
+            local_identity,
+            target_host_id,
+            initial_grant,
+            roster,
+            now_unix,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Initiates a Wire v2 session handshake with a mutex-guarded roster advertising `upgrade_caps`.
+    pub async fn connect_locked_with_upgrade_caps(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        initial_grant: Option<Grant>,
+        roster: &Mutex<Roster>,
+        now_unix: u64,
+        upgrade_caps: Vec<String>,
     ) -> Result<Self, RuntimeError> {
         let (reconnect_secret, crl_seq) = {
             let guard = roster
@@ -1486,6 +1587,7 @@ impl V2SessionDriver {
             now_unix,
             Vec::new(),
             V2RouteInit::default(),
+            upgrade_caps,
         )
         .await
     }
@@ -1516,6 +1618,7 @@ impl V2SessionDriver {
             now_unix,
             groups,
             V2RouteInit::default(),
+            Vec::new(),
         )
         .await
     }
@@ -1662,6 +1765,7 @@ impl V2SessionDriver {
                     now_unix,
                     Vec::new(),
                     V2RouteInit::default(),
+                    Vec::new(),
                 )
                 .await
             }
@@ -1682,6 +1786,7 @@ impl V2SessionDriver {
         now_unix: u64,
         groups: Vec<GroupSeq>,
         route: V2RouteInit,
+        upgrade_caps: Vec<String>,
     ) -> Result<Self, RuntimeError> {
         Self::connect_with_source(
             StreamSource::Stream(stream),
@@ -1695,6 +1800,7 @@ impl V2SessionDriver {
             now_unix,
             groups,
             route,
+            upgrade_caps,
         )
         .await
     }
@@ -1712,6 +1818,7 @@ impl V2SessionDriver {
         now_unix: u64,
         groups: Vec<GroupSeq>,
         route: V2RouteInit,
+        upgrade_caps: Vec<String>,
     ) -> Result<Self, RuntimeError> {
         let started_at = Instant::now();
         let mut machine = V2SessionInitiator::new(
@@ -1725,7 +1832,14 @@ impl V2SessionDriver {
         if let Some(expectation) = route.expectation {
             machine = machine.with_route_expectation(expectation)?;
         }
-        let mut machine = machine.with_route_seq(route.route_seq)?;
+        let upgrade_caps = if source.provider_id() == ProviderId::P2p {
+            Vec::new()
+        } else {
+            upgrade_caps
+        };
+        let mut machine = machine
+            .with_route_seq(route.route_seq)?
+            .with_upgrade_caps(upgrade_caps)?;
         machine.set_local_groups(groups)?;
         let start_actions = machine.start(now_unix)?;
         let init_bytes = match start_actions.as_slice() {
@@ -1824,6 +1938,10 @@ impl V2SessionDriver {
         let active_grant = machine.active_grant().cloned();
         let exported_secrets = machine.exported_v2_secrets().cloned();
         let verified_recovery = machine.verified_recovery_statement().cloned().map(Box::new);
+        let negotiated_upgrade_caps = machine.negotiated_upgrade_caps().to_vec();
+        let peer_upgrade_caps = machine.peer_upgrade_caps().to_vec();
+        let mut upgrade_state = PathUpgradeState::new(true);
+        upgrade_state.set_negotiated(negotiated_upgrade_caps.clone());
         let sealed = machine.into_sealed_session()?;
         let peer_static = peer_static_pub.ok_or(RuntimeError::Protocol(
             "missing peer static key after v2 establish".to_owned(),
@@ -1843,6 +1961,9 @@ impl V2SessionDriver {
                 route_seq_sent: route.route_seq.is_some(),
                 peer_route_seq: None,
                 route_sets: Vec::new(),
+                negotiated_upgrade_caps,
+                peer_upgrade_caps,
+                upgrade_state,
             },
             frame_reader,
             pending_events: VecDeque::new(),
@@ -1858,6 +1979,8 @@ impl V2SessionDriver {
             _half_open: None,
             verified_recovery,
             route_ingest: IngestSlot::default(),
+            #[cfg(feature = "webrtc")]
+            webrtc_upgrade_handle: None,
         })
     }
 
@@ -1988,8 +2111,29 @@ impl V2SessionDriver {
         };
 
         let started_at = Instant::now();
+        #[allow(unused_mut)]
+        let mut upgrade_caps = if stream.provider_id() == ProviderId::P2p {
+            Vec::new()
+        } else {
+            state.config.upgrade_caps.clone()
+        };
+        #[cfg(feature = "webrtc")]
+        let webrtc_upgrade_handle = if stream.provider_id() == ProviderId::P2p {
+            None
+        } else {
+            if state.config.webrtc_upgrade_handle.is_some()
+                && !upgrade_caps
+                    .iter()
+                    .any(|c| c == tendril_core::UPGRADE_CAP_WEBRTC_V1)
+                && upgrade_caps.len() < tendril_core::MAX_UPGRADE_CAPS
+            {
+                upgrade_caps.push(tendril_core::UPGRADE_CAP_WEBRTC_V1.to_owned());
+            }
+            state.config.webrtc_upgrade_handle.clone()
+        };
         let mut machine = V2SessionResponder::new(local_identity)?
-            .with_padding_policy(state.config.padding.clone());
+            .with_padding_policy(state.config.padding.clone())
+            .with_upgrade_caps(upgrade_caps)?;
         let mut frame_reader = ResumableFrameReader::with_preamble();
         let mut recv_buf = vec![0u8; MAX_OUTER_FRAME_LEN];
         let deadline = TokioInstant::now() + handshake_timeout;
@@ -2203,6 +2347,10 @@ impl V2SessionDriver {
         let matched_rendezvous = machine
             .matched_rendezvous_secret()
             .map(|s| Zeroizing::new(*s));
+        let negotiated_upgrade_caps = machine.negotiated_upgrade_caps().to_vec();
+        let peer_upgrade_caps = machine.peer_upgrade_caps().to_vec();
+        let mut upgrade_state = PathUpgradeState::new(false);
+        upgrade_state.set_negotiated(negotiated_upgrade_caps.clone());
         let sealed = machine.into_sealed_session()?;
 
         Ok(Self {
@@ -2221,6 +2369,9 @@ impl V2SessionDriver {
                 route_seq_sent: false,
                 peer_route_seq,
                 route_sets: Vec::new(),
+                negotiated_upgrade_caps,
+                peer_upgrade_caps,
+                upgrade_state,
             },
             frame_reader,
             pending_events: VecDeque::new(),
@@ -2236,6 +2387,8 @@ impl V2SessionDriver {
             _half_open: half_open,
             verified_recovery: None,
             route_ingest: IngestSlot::default(),
+            #[cfg(feature = "webrtc")]
+            webrtc_upgrade_handle,
         })
     }
 
@@ -2517,6 +2670,69 @@ impl V2SessionDriver {
         self.stream.provider_id()
     }
 
+    /// Returns the path-upgrade capabilities negotiated with the peer.
+    #[must_use]
+    pub fn negotiated_upgrade_caps(&self) -> &[String] {
+        &self.core.negotiated_upgrade_caps
+    }
+
+    /// Returns the raw path-upgrade capabilities advertised by the peer in hello.
+    #[must_use]
+    pub fn peer_upgrade_caps(&self) -> &[String] {
+        &self.core.peer_upgrade_caps
+    }
+
+    /// Sends one encrypted `0x0D PATH_UPGRADE` frame wrapped inside `0x09 PADDED`.
+    pub async fn send_path_upgrade(&mut self, msg: &PathUpgradeMsg) -> Result<(), RuntimeError> {
+        let now_ms = self.elapsed_ms();
+        let (writes, rekeyed) = self.core.seal_path_upgrade(msg, now_ms)?;
+        self.write_wire_frames(&writes).await?;
+        if rekeyed {
+            self.pending_events.push_back(SessionEvent::Rekeyed {
+                direction: RekeyDirection::Outgoing,
+            });
+        }
+        Ok(())
+    }
+
+    /// Attaches a host-side [`WebRtcUpgradeHandle`] that auto-answers matching in-band offers.
+    #[cfg(feature = "webrtc")]
+    #[must_use]
+    pub fn with_webrtc_upgrade_handle(mut self, handle: WebRtcUpgradeHandle) -> Self {
+        self.webrtc_upgrade_handle = Some(handle);
+        self
+    }
+
+    /// Sets or clears the host-side [`WebRtcUpgradeHandle`] on an established [`V2SessionDriver`].
+    #[cfg(feature = "webrtc")]
+    pub fn set_webrtc_upgrade_handle(&mut self, handle: Option<WebRtcUpgradeHandle>) {
+        self.webrtc_upgrade_handle = handle;
+    }
+
+    #[cfg(feature = "webrtc")]
+    async fn maybe_auto_respond_offer(&mut self, upgrade_id: u64, protocol: &str, sdp: &str) {
+        let Some(ref handle) = self.webrtc_upgrade_handle else {
+            return;
+        };
+        if protocol != tendril_core::UPGRADE_CAP_WEBRTC_V1 {
+            return;
+        }
+        let reply = match handle.accept_offer(sdp).await {
+            Ok(answer_sdp) => PathUpgradeMsg::Answer {
+                upgrade_id,
+                protocol: protocol.to_owned(),
+                sdp: answer_sdp,
+            },
+            Err(err) => PathUpgradeMsg::Reject {
+                upgrade_id,
+                reason: crate::driver::webrtc_reject_reason(&err),
+            },
+        };
+        if let Err(err) = self.send_path_upgrade(&reply).await {
+            tracing::debug!(error = %err, "failed to send auto WebRTC path upgrade reply");
+        }
+    }
+
     /// Returns the next semantic event, reading and decrypting padded/cover transport frames.
     pub async fn next_event(
         &mut self,
@@ -2607,6 +2823,16 @@ impl V2SessionDriver {
         let mut recv_buf = vec![0u8; MAX_OUTER_FRAME_LEN];
         loop {
             if let Some(ev) = self.pending_events.pop_front() {
+                #[cfg(feature = "webrtc")]
+                if let SessionEvent::PathUpgrade(PathUpgradeMsg::Offer {
+                    upgrade_id,
+                    ref protocol,
+                    ref sdp,
+                }) = ev
+                {
+                    self.maybe_auto_respond_offer(upgrade_id, protocol, sdp)
+                        .await;
+                }
                 return Ok(Some(ev));
             }
             if self.core.closed {
@@ -2696,6 +2922,8 @@ impl V2SessionDriver {
         let provider_id = self.stream.provider_id();
         let is_closed = self.core.closed;
         let peer_device_id = self.core.peer_device_id().to_owned();
+        let negotiated_upgrade_caps = self.core.negotiated_upgrade_caps.clone();
+        let peer_upgrade_caps = self.core.peer_upgrade_caps.clone();
         let (reader, writer) = self.stream.into_split();
         let (shutdown_tx, _) = watch::channel(is_closed);
         ConcurrentV2Session {
@@ -2718,6 +2946,10 @@ impl V2SessionDriver {
             store: self.store,
             _half_open: self._half_open,
             route_ingest: self.route_ingest,
+            negotiated_upgrade_caps,
+            peer_upgrade_caps,
+            #[cfg(feature = "webrtc")]
+            webrtc_upgrade_handle: Mutex::new(self.webrtc_upgrade_handle),
         }
     }
 
@@ -2792,6 +3024,10 @@ pub struct ConcurrentV2Session {
     store: Option<StateStore>,
     _half_open: Option<HalfOpenGuard>,
     route_ingest: IngestSlot,
+    negotiated_upgrade_caps: Vec<String>,
+    peer_upgrade_caps: Vec<String>,
+    #[cfg(feature = "webrtc")]
+    webrtc_upgrade_handle: Mutex<Option<WebRtcUpgradeHandle>>,
 }
 
 impl ConcurrentV2Session {
@@ -2843,6 +3079,63 @@ impl ConcurrentV2Session {
     #[must_use]
     pub fn provider_id(&self) -> ProviderId {
         self.provider_id
+    }
+
+    /// Returns the path-upgrade capabilities negotiated with the peer.
+    #[must_use]
+    pub fn negotiated_upgrade_caps(&self) -> &[String] {
+        &self.negotiated_upgrade_caps
+    }
+
+    /// Returns the raw path-upgrade capabilities advertised by the peer in hello.
+    #[must_use]
+    pub fn peer_upgrade_caps(&self) -> &[String] {
+        &self.peer_upgrade_caps
+    }
+
+    /// Sets or clears the host-side [`WebRtcUpgradeHandle`] on an established [`ConcurrentV2Session`].
+    #[cfg(feature = "webrtc")]
+    pub fn set_webrtc_upgrade_handle(&self, handle: Option<WebRtcUpgradeHandle>) {
+        *self
+            .webrtc_upgrade_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = handle;
+    }
+
+    /// Sends one encrypted `0x0D PATH_UPGRADE` frame concurrently with inbound polling.
+    pub async fn send_path_upgrade(&self, msg: &PathUpgradeMsg) -> Result<(), RuntimeError> {
+        self.run_write_op(|core, now_ms| core.seal_path_upgrade(msg, now_ms))
+            .await
+    }
+
+    #[cfg(feature = "webrtc")]
+    async fn maybe_auto_respond_offer(&self, upgrade_id: u64, protocol: &str, sdp: &str) {
+        let handle = {
+            self.webrtc_upgrade_handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        let Some(handle) = handle else {
+            return;
+        };
+        if protocol != tendril_core::UPGRADE_CAP_WEBRTC_V1 {
+            return;
+        }
+        let reply = match handle.accept_offer(sdp).await {
+            Ok(answer_sdp) => PathUpgradeMsg::Answer {
+                upgrade_id,
+                protocol: protocol.to_owned(),
+                sdp: answer_sdp,
+            },
+            Err(err) => PathUpgradeMsg::Reject {
+                upgrade_id,
+                reason: crate::driver::webrtc_reject_reason(&err),
+            },
+        };
+        if let Err(err) = self.send_path_upgrade(&reply).await {
+            tracing::debug!(error = %err, "failed to send auto WebRTC path upgrade reply");
+        }
     }
 
     /// Returns the exported v2 `(reconnect_secret, mailbox_secret)` derived at establish.
@@ -3063,6 +3356,16 @@ impl ConcurrentV2Session {
                 return Ok(None);
             }
             if let Some(ev) = self.pop_pending_event() {
+                #[cfg(feature = "webrtc")]
+                if let SessionEvent::PathUpgrade(PathUpgradeMsg::Offer {
+                    upgrade_id,
+                    ref protocol,
+                    ref sdp,
+                }) = ev
+                {
+                    self.maybe_auto_respond_offer(upgrade_id, protocol, sdp)
+                        .await;
+                }
                 return Ok(Some(ev));
             }
             let staged = {
@@ -3873,6 +4176,7 @@ impl V2SessionDriver {
                                 route_seq,
                                 evidence: Some((Arc::clone(&ev), crl_seq)),
                             },
+                            Vec::new(),
                         )
                         .await?;
                         Ok::<_, RuntimeError>(driver)

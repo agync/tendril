@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::{
     HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, b64url_decode,
     b64url_decode_array, b64url_encode, random_bytes,
@@ -26,6 +25,7 @@ use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
 use tendril_core::wire::{FLAG_PAKE_PAIR, Intent, Preamble, WIRE_VERSION, WIRE_VERSION_V2};
+use tendril_core::{PREAMBLE_LEN, UPGRADE_CAP_WEBRTC_V1};
 use tendril_runtime::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
     DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, HttpWakeProvider, LocalDialer,
@@ -33,9 +33,10 @@ use tendril_runtime::{
     PathDialer, PathListener, PathStream, PrefixedPathStream, RelayClientAuth, RelayDialer,
     RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, SessionDriver,
     SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeDialOptions,
-    WakeSecret, WakeTarget, WtDialer, WtListener, drive_pair_responder_with_policy,
-    drive_v2_pake_pair_initiator, drive_v2_pake_pair_responder, parse_p2p_relay_mode,
-    parse_p2p_relay_modes, peek_exact, pinned_pairing_floor, wake_and_connect_v2_session,
+    WakeSecret, WakeTarget, WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtDialer, WtListener,
+    drive_pair_responder_with_policy, drive_v2_pake_pair_initiator, drive_v2_pake_pair_responder,
+    parse_p2p_relay_mode, parse_p2p_relay_modes, peek_exact, pinned_pairing_floor,
+    wake_and_connect_v2_session,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -303,11 +304,20 @@ enum PeerCmd {
     ServeRelay {
         relay_url: String,
         expected_host: Option<String>,
+        #[serde(default)]
+        webrtc_upgrade_bind: Option<String>,
     },
     ServeRelayV2 {
         relay_url: String,
         expected_host: Option<String>,
         peer_id: Option<String>,
+        #[serde(default)]
+        webrtc_upgrade_bind: Option<String>,
+    },
+    #[serde(rename = "serve_webrtc")]
+    ServeWebRtc {
+        #[serde(alias = "bind_addr")]
+        bind: Option<String>,
     },
     #[serde(rename = "serve_broker")]
     ServeBroker {
@@ -374,6 +384,11 @@ enum PeerCmd {
     },
     AcceptV2 {
         timeout_ms: Option<u64>,
+    },
+    #[serde(rename = "accept_upgraded_session")]
+    AcceptUpgradedSession {
+        timeout_ms: Option<u64>,
+        v2: Option<bool>,
     },
     Send {
         data_b64: Option<String>,
@@ -466,6 +481,9 @@ struct PeerState {
     self_m2m_enabled: bool,
     accepted_tx: mpsc::Sender<Box<dyn PathStream>>,
     accepted_rx: mpsc::Receiver<Box<dyn PathStream>>,
+    webrtc_handle: Option<WebRtcUpgradeHandle>,
+    webrtc_tx: mpsc::Sender<Box<dyn PathStream>>,
+    webrtc_rx: mpsc::Receiver<Box<dyn PathStream>>,
     listener_tasks: Vec<JoinHandle<()>>,
     session: Option<SessionBackend>,
 }
@@ -473,6 +491,7 @@ struct PeerState {
 impl PeerState {
     fn new() -> Self {
         let (accepted_tx, accepted_rx) = mpsc::channel(32);
+        let (webrtc_tx, webrtc_rx) = mpsc::channel(8);
         Self {
             store: None,
             identity: None,
@@ -483,9 +502,31 @@ impl PeerState {
             self_m2m_enabled: false,
             accepted_tx,
             accepted_rx,
+            webrtc_handle: None,
+            webrtc_tx,
+            webrtc_rx,
             listener_tasks: Vec::new(),
             session: None,
         }
+    }
+
+    async fn bind_webrtc(&mut self, addr: SocketAddr) -> Result<SocketAddr, String> {
+        let (handle, mut listener) = WebRtcUpgradeEndpoint::bind(addr)
+            .await
+            .map_err(|e| e.to_string())?;
+        let bound = listener.local_addr();
+        self.webrtc_handle = Some(handle.clone());
+        self.v2_state = Arc::new(self.v2_state.with_webrtc_upgrade_handle(handle));
+        let tx = self.webrtc_tx.clone();
+        let task = tokio::spawn(async move {
+            while let Ok(stream) = listener.accept().await {
+                if tx.send(stream).await.is_err() {
+                    break;
+                }
+            }
+        });
+        self.listener_tasks.push(task);
+        Ok(bound)
     }
 
     fn persist_roster(&self) -> Result<(), String> {
@@ -920,7 +961,26 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
         PeerCmd::ServeRelay {
             relay_url,
             expected_host,
+            webrtc_upgrade_bind,
         } => {
+            if state.identity.is_none() {
+                return (err_json("init required before serve_relay"), false);
+            }
+            let webrtc_addr = match webrtc_upgrade_bind {
+                Some(raw) => {
+                    let parsed = match raw.trim().parse::<SocketAddr>() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            return (err_json(format!("invalid webrtc bind address: {e}")), false);
+                        }
+                    };
+                    match state.bind_webrtc(parsed).await {
+                        Ok(a) => Some(a.to_string()),
+                        Err(e) => return (err_json(e), false),
+                    }
+                }
+                None => None,
+            };
             let Some(id) = state.identity.as_ref() else {
                 return (err_json("init required before serve_relay"), false);
             };
@@ -937,7 +997,14 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                     let ep = listener.local_endpoint();
                     let task = state.spawn_listener(Box::new(listener));
                     state.listener_tasks.push(task);
-                    (serde_json::json!({ "ok": true, "endpoint": ep }), false)
+                    (
+                        serde_json::json!({
+                            "ok": true,
+                            "endpoint": ep,
+                            "webrtc_upgrade_addr": webrtc_addr,
+                        }),
+                        false,
+                    )
                 }
                 Err(e) => (err_json(e.to_string()), false),
             }
@@ -946,9 +1013,25 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
             relay_url,
             expected_host,
             peer_id,
+            webrtc_upgrade_bind,
         } => {
             let Some(_) = state.identity.as_ref() else {
                 return (err_json("init required before serve_relay_v2"), false);
+            };
+            let webrtc_addr = match webrtc_upgrade_bind {
+                Some(raw) => {
+                    let parsed = match raw.trim().parse::<SocketAddr>() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            return (err_json(format!("invalid webrtc bind address: {e}")), false);
+                        }
+                    };
+                    match state.bind_webrtc(parsed).await {
+                        Ok(a) => Some(a.to_string()),
+                        Err(e) => return (err_json(e), false),
+                    }
+                }
+                None => None,
             };
             let secrets: Vec<[u8; 32]> = if let Some(ref pid) = peer_id.filter(|s| !s.is_empty()) {
                 match lookup_v2_mailbox_secret_for_target(&state.roster, pid) {
@@ -992,9 +1075,35 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 }
             }
             (
-                serde_json::json!({ "ok": true, "endpoint": first_ep }),
+                serde_json::json!({
+                    "ok": true,
+                    "endpoint": first_ep,
+                    "webrtc_upgrade_addr": webrtc_addr,
+                }),
                 false,
             )
+        }
+        PeerCmd::ServeWebRtc { bind } => {
+            let listen_addr = match bind {
+                Some(raw) => match raw.trim().parse::<SocketAddr>() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        return (err_json(format!("invalid webrtc bind address: {e}")), false);
+                    }
+                },
+                None => SocketAddr::from(([127, 0, 0, 1], 0)),
+            };
+            match state.bind_webrtc(listen_addr).await {
+                Ok(bound) => (
+                    serde_json::json!({
+                        "ok": true,
+                        "addr": bound.to_string(),
+                        "endpoint": format!("webrtc://{bound}"),
+                    }),
+                    false,
+                ),
+                Err(e) => (err_json(e), false),
+            }
         }
         PeerCmd::ServeBroker { bind, path } => {
             let listen_addr = match bind {
@@ -1658,13 +1767,40 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 else {
                     return (err_json("timed out accepting session connection"), false);
                 };
-                SessionDriver::accept(stream, &id, &mut state.roster, now_unix(), None).await
+                let allow_upgrade =
+                    stream.provider_id() != ProviderId::P2p && state.webrtc_handle.is_some();
+                let caps = if allow_upgrade {
+                    vec![UPGRADE_CAP_WEBRTC_V1.to_owned()]
+                } else {
+                    Vec::new()
+                };
+                match SessionDriver::accept_with_upgrade_caps(
+                    stream,
+                    &id,
+                    &mut state.roster,
+                    now_unix(),
+                    None,
+                    None,
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                    caps,
+                )
+                .await
+                {
+                    Ok(mut d) => {
+                        if allow_upgrade {
+                            d.set_webrtc_upgrade_handle(state.webrtc_handle.clone());
+                        }
+                        Ok(d)
+                    }
+                    Err(e) => Err(e),
+                }
             };
             match driver_res {
                 Ok(driver) => {
                     let peer_device_id = driver.peer_device_id().map(ToOwned::to_owned);
                     let peer_crl_seq = driver.peer_crl_seq();
                     let provider = format!("{:?}", driver.provider_id());
+                    let negotiated_upgrade_caps = driver.negotiated_upgrade_caps().to_vec();
                     state.session = Some(SessionBackend::V1(driver));
                     let _ = state.persist_roster();
                     (
@@ -1673,6 +1809,7 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                             "peer_device_id": peer_device_id,
                             "peer_crl_seq": peer_crl_seq,
                             "provider": provider,
+                            "negotiated_upgrade_caps": negotiated_upgrade_caps,
                         }),
                         false,
                     )
@@ -1811,6 +1948,7 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                     let peer_device_id = driver.peer_device_id().to_owned();
                     let peer_crl_seq = driver.peer_crl_seq();
                     let provider = format!("{:?}", driver.provider_id());
+                    let negotiated_upgrade_caps = driver.negotiated_upgrade_caps().to_vec();
                     if driver.exported_v2_secrets().is_some() {
                         let _ = state
                             .roster
@@ -1825,6 +1963,7 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                             "peer_crl_seq": peer_crl_seq,
                             "provider": provider,
                             "wire_version": 2,
+                            "negotiated_upgrade_caps": negotiated_upgrade_caps,
                         }),
                         false,
                     )
@@ -1832,6 +1971,113 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 Err(e) => {
                     let _ = state.persist_roster();
                     (err_json(e.to_string()), false)
+                }
+            }
+        }
+        PeerCmd::AcceptUpgradedSession { timeout_ms, v2 } => {
+            let Some(id) = state.identity.clone() else {
+                return (
+                    err_json("init required before accept_upgraded_session"),
+                    false,
+                );
+            };
+            let mut old_session = state.session.take();
+            let use_v2 = v2.unwrap_or(matches!(old_session, Some(SessionBackend::V2(_))));
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_millis(timeout_ms.unwrap_or(15_000));
+            let sleep_fut = tokio::time::sleep_until(deadline);
+            tokio::pin!(sleep_fut);
+
+            let upgraded_stream = loop {
+                tokio::select! {
+                    biased;
+                    maybe_stream = state.webrtc_rx.recv() => {
+                        match maybe_stream {
+                            Some(s) => break Ok(s),
+                            None => break Err("webrtc upgrade listener closed".to_owned()),
+                        }
+                    }
+                    ev_res = async {
+                        if let Some(ref mut sess) = old_session {
+                            Some(sess.next_event_now(&mut state.roster).await)
+                        } else {
+                            std::future::pending::<Option<Result<Option<SessionEvent>, String>>>().await
+                        }
+                    }, if old_session.is_some() => {
+                        match ev_res {
+                            Some(Ok(Some(_))) => {}
+                            Some(Ok(None)) | Some(Err(_)) | None => {
+                                old_session = None;
+                            }
+                        }
+                    }
+                    () = &mut sleep_fut => {
+                        break Err("timed out waiting for upgraded WebRTC session".to_owned());
+                    }
+                }
+            };
+            drop(old_session);
+            let stream = match upgraded_stream {
+                Ok(s) => s,
+                Err(e) => return (err_json(e), false),
+            };
+            if use_v2 {
+                match V2SessionDriver::accept(
+                    stream,
+                    &id,
+                    &mut state.roster,
+                    now_unix(),
+                    &state.v2_state,
+                    None,
+                )
+                .await
+                {
+                    Ok(driver) => {
+                        let peer_device_id = driver.peer_device_id().to_owned();
+                        let provider = format!("{:?}", driver.provider_id());
+                        let negotiated_upgrade_caps = driver.negotiated_upgrade_caps().to_vec();
+                        let _ = state.persist_roster();
+                        state.session = Some(SessionBackend::V2(driver));
+                        (
+                            serde_json::json!({
+                                "ok": true,
+                                "peer_device_id": peer_device_id,
+                                "provider": provider,
+                                "wire_version": 2,
+                                "negotiated_upgrade_caps": negotiated_upgrade_caps,
+                            }),
+                            false,
+                        )
+                    }
+                    Err(e) => {
+                        let _ = state.persist_roster();
+                        (err_json(e.to_string()), false)
+                    }
+                }
+            } else {
+                match SessionDriver::accept(stream, &id, &mut state.roster, now_unix(), None).await
+                {
+                    Ok(driver) => {
+                        let peer_device_id = driver.peer_device_id().map(ToOwned::to_owned);
+                        let provider = format!("{:?}", driver.provider_id());
+                        let negotiated_upgrade_caps = driver.negotiated_upgrade_caps().to_vec();
+                        let _ = state.persist_roster();
+                        state.session = Some(SessionBackend::V1(driver));
+                        (
+                            serde_json::json!({
+                                "ok": true,
+                                "peer_device_id": peer_device_id,
+                                "provider": provider,
+                                "wire_version": 1,
+                                "negotiated_upgrade_caps": negotiated_upgrade_caps,
+                            }),
+                            false,
+                        )
+                    }
+                    Err(e) => {
+                        let _ = state.persist_roster();
+                        (err_json(e.to_string()), false)
+                    }
                 }
             }
         }
@@ -1932,6 +2178,14 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                     serde_json::json!({
                         "ok": true,
                         "event": "group_rendezvous_unverified",
+                    }),
+                    false,
+                ),
+                Ok(Ok(Some(SessionEvent::PathUpgrade(msg)))) => (
+                    serde_json::json!({
+                        "ok": true,
+                        "event": "path_upgrade",
+                        "msg": msg,
                     }),
                     false,
                 ),

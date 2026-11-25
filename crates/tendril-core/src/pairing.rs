@@ -3658,6 +3658,11 @@ impl PairingInitiator {
                 if host_hello.host_id.is_empty() || has_control_chars(&host_hello.host_id) {
                     return Err(CoreError::ProtocolViolation("invalid host_id in HostHello"));
                 }
+                if !host_hello.upgrade.is_empty() {
+                    return Err(CoreError::ProtocolViolation(
+                        "upgrade capabilities not allowed in pairing",
+                    ));
+                }
                 let host_signing_pub = HybridSigningPublicKey::from_b64url(&host_hello.signing_pub)
                     .map_err(|_| {
                         CoreError::ProtocolViolation("invalid signing_pub in HostHello")
@@ -3905,6 +3910,7 @@ impl PairingResponder {
                 proto_version: 1,
                 signing_pub: identity.signing_key().public_key().to_b64url(),
                 rotation: identity.rotation_chain().to_vec(),
+                upgrade: Vec::new(),
             },
             host_signing_pub: identity.signing_key().public_key().clone(),
             path,

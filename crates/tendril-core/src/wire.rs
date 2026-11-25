@@ -50,6 +50,24 @@ pub const MAX_APP_DATA_LEN: usize = MAX_TRANSPORT_PLAINTEXT - 1;
 /// Maximum total bytes queued inside [`ResumableFrameReader`] before rejecting unbounded buffering.
 pub const MAX_READ_BUFFER_LEN: usize = 4 * (2 + MAX_FRAME_LEN);
 
+/// Upgrade capability string for in-band WebRTC DataChannel direct path upgrade.
+pub const UPGRADE_CAP_WEBRTC_V1: &str = "webrtc/v1";
+
+/// Maximum number of upgrade capability strings advertised in `HostHello` / `SessionHello`.
+pub const MAX_UPGRADE_CAPS: usize = 4;
+
+/// Maximum byte length of a single upgrade capability identifier.
+pub const MAX_UPGRADE_CAP_LEN: usize = 32;
+
+/// Maximum encoded JSON byte length of a `0x0D PATH_UPGRADE` inner frame payload.
+pub const MAX_PATH_UPGRADE_LEN: usize = 16_384;
+
+/// Maximum number of `0x0D PATH_UPGRADE` offers permitted within a single Tendril session.
+pub const MAX_PATH_UPGRADE_OFFERS_PER_SESSION: usize = 4;
+
+/// Ordered SCTP DataChannel label negotiated during `webrtc/v1` upgrades.
+pub const WEBRTC_DATACHANNEL_LABEL: &str = "tendril/v1";
+
 /// Handshake intent carried in the 6-byte cleartext preamble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -237,6 +255,8 @@ pub enum InnerFrameType {
     GroupRendezvous = 0x0B,
     /// Host-signed route set (`0x0C`), responder to initiator only; decoded by `routes::RouteSet`.
     RouteSet = 0x0C,
+    /// In-band direct path upgrade signaling (`0x0D`); `0x09 PADDED`-only on Wire v2.
+    PathUpgrade = 0x0D,
 }
 
 impl TryFrom<u8> for InnerFrameType {
@@ -256,6 +276,7 @@ impl TryFrom<u8> for InnerFrameType {
             0x0A => Ok(Self::GroupManifest),
             0x0B => Ok(Self::GroupRendezvous),
             0x0C => Ok(Self::RouteSet),
+            0x0D => Ok(Self::PathUpgrade),
             other => Err(CoreError::UnknownInnerFrameType(other)),
         }
     }
@@ -370,6 +391,15 @@ pub(crate) fn validate_inner_payload(
             full.extend_from_slice(payload);
             crate::v2::unpad_inner_frame(&full)?;
         }
+        InnerFrameType::PathUpgrade => {
+            if payload.len() > MAX_PATH_UPGRADE_LEN {
+                return Err(CoreError::FrameTooLarge {
+                    len: payload.len(),
+                    max: MAX_PATH_UPGRADE_LEN,
+                });
+            }
+            PathUpgradeMsg::decode(payload)?;
+        }
         InnerFrameType::GroupRendezvous
         | InnerFrameType::Rekey
         | InnerFrameType::Ping
@@ -388,6 +418,12 @@ pub struct HostHello {
     pub signing_pub: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rotation: Vec<RotationRecord>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_upgrade_caps"
+    )]
+    pub upgrade: Vec<String>,
 }
 
 /// Encrypted `msg3` payload for `intent = session` (`initiator -> responder`).
@@ -412,6 +448,385 @@ pub struct SessionHello {
         deserialize_with = "deserialize_route_seq"
     )]
     pub route_seq: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_upgrade_caps"
+    )]
+    pub upgrade: Vec<String>,
+}
+
+fn validate_single_upgrade_cap(cap: &str) -> Result<(), CoreError> {
+    if cap.is_empty()
+        || cap.len() > MAX_UPGRADE_CAP_LEN
+        || !cap.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'/' | b'-')
+        })
+    {
+        return Err(CoreError::InvalidInnerFramePayload(
+            "upgrade capability must be 1..=32 bytes matching [a-z0-9._/-]",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a list of upgrade capability identifiers for `HostHello` / `SessionHello`.
+pub fn validate_upgrade_caps(caps: &[String]) -> Result<(), CoreError> {
+    if caps.len() > MAX_UPGRADE_CAPS {
+        return Err(CoreError::InvalidInnerFramePayload(
+            "too many upgrade capabilities",
+        ));
+    }
+    for (i, cap) in caps.iter().enumerate() {
+        validate_single_upgrade_cap(cap)?;
+        if caps[..i].iter().any(|prev| prev == cap) {
+            return Err(CoreError::InvalidInnerFramePayload(
+                "duplicate upgrade capability",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn deserialize_upgrade_caps<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items = Vec::<String>::deserialize(deserializer)?;
+    if items.is_empty() {
+        return Err(serde::de::Error::custom(
+            "empty upgrade array must be omitted",
+        ));
+    }
+    validate_upgrade_caps(&items).map_err(serde::de::Error::custom)?;
+    Ok(items)
+}
+
+/// Payload carried inside encrypted `0x0D PATH_UPGRADE` signaling frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PathUpgradeMsg {
+    Offer {
+        upgrade_id: u64,
+        protocol: String,
+        sdp: String,
+    },
+    Answer {
+        upgrade_id: u64,
+        protocol: String,
+        sdp: String,
+    },
+    Reject {
+        upgrade_id: u64,
+        reason: String,
+    },
+}
+
+const MAX_PATH_UPGRADE_SDP_LEN: usize = 15_360;
+const MAX_PATH_UPGRADE_REJECT_REASON_LEN: usize = 256;
+
+impl PathUpgradeMsg {
+    fn validate_fields(&self) -> Result<(), CoreError> {
+        match self {
+            Self::Offer {
+                upgrade_id,
+                protocol,
+                sdp,
+            }
+            | Self::Answer {
+                upgrade_id,
+                protocol,
+                sdp,
+            } => {
+                if *upgrade_id == 0 || *upgrade_id > MAX_ROUTE_SEQ {
+                    return Err(CoreError::InvalidInnerFramePayload(
+                        "upgrade_id must be 1..=2^53 - 1",
+                    ));
+                }
+                validate_single_upgrade_cap(protocol)?;
+                if sdp.is_empty()
+                    || sdp.len() > MAX_PATH_UPGRADE_SDP_LEN
+                    || sdp.as_bytes().contains(&0)
+                {
+                    return Err(CoreError::InvalidInnerFramePayload(
+                        "path upgrade SDP must be 1..=15360 bytes with no NUL bytes",
+                    ));
+                }
+            }
+            Self::Reject { upgrade_id, reason } => {
+                if *upgrade_id == 0 || *upgrade_id > MAX_ROUTE_SEQ {
+                    return Err(CoreError::InvalidInnerFramePayload(
+                        "upgrade_id must be 1..=2^53 - 1",
+                    ));
+                }
+                if reason.is_empty()
+                    || reason.len() > MAX_PATH_UPGRADE_REJECT_REASON_LEN
+                    || reason.bytes().any(|b| b.is_ascii_control())
+                {
+                    return Err(CoreError::InvalidInnerFramePayload(
+                        "path upgrade reject reason must be 1..=256 bytes without control chars",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn serialize_checked(&self) -> Result<Vec<u8>, CoreError> {
+        self.validate_fields()?;
+        let bytes = serde_json::to_vec(self).map_err(|err| CoreError::Json(err.to_string()))?;
+        if bytes.is_empty() {
+            return Err(CoreError::InvalidInnerFramePayload(
+                "PATH_UPGRADE payload cannot be empty",
+            ));
+        }
+        if bytes.len() > MAX_PATH_UPGRADE_LEN {
+            return Err(CoreError::FrameTooLarge {
+                len: bytes.len(),
+                max: MAX_PATH_UPGRADE_LEN,
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Validates field lengths, character sets, `upgrade_id` bounds, and encoded JSON size.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        self.serialize_checked().map(|_| ())
+    }
+
+    /// Validates and serializes the signaling message to compact JSON.
+    pub fn encode(&self) -> Result<Vec<u8>, CoreError> {
+        self.serialize_checked()
+    }
+
+    /// Decodes and validates a `0x0D PATH_UPGRADE` JSON payload.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CoreError> {
+        if bytes.is_empty() {
+            return Err(CoreError::InvalidInnerFramePayload(
+                "PATH_UPGRADE payload cannot be empty",
+            ));
+        }
+        if bytes.len() > MAX_PATH_UPGRADE_LEN {
+            return Err(CoreError::FrameTooLarge {
+                len: bytes.len(),
+                max: MAX_PATH_UPGRADE_LEN,
+            });
+        }
+        let msg: Self = serde_json::from_slice(bytes)
+            .map_err(|_| CoreError::InvalidInnerFramePayload("invalid PATH_UPGRADE JSON"))?;
+        msg.validate_fields()?;
+        Ok(msg)
+    }
+}
+
+/// Shared session state machine tracker enforcing directional, capability, and `upgrade_id` rules
+/// for `0x0D PATH_UPGRADE`.
+#[derive(Debug, Clone)]
+pub struct PathUpgradeState {
+    is_initiator: bool,
+    negotiated_caps: Vec<String>,
+    pending_upgrade_ids: Vec<(u64, String)>,
+    seen_upgrade_ids: Vec<u64>,
+    total_offers: usize,
+}
+
+impl PathUpgradeState {
+    /// Creates an empty tracker for initiator or responder role.
+    #[must_use]
+    pub const fn new(is_initiator: bool) -> Self {
+        Self {
+            is_initiator,
+            negotiated_caps: Vec::new(),
+            pending_upgrade_ids: Vec::new(),
+            seen_upgrade_ids: Vec::new(),
+            total_offers: 0,
+        }
+    }
+
+    /// Records the intersection of negotiated upgrade capabilities once the handshake completes.
+    pub fn set_negotiated(&mut self, caps: Vec<String>) {
+        self.negotiated_caps = caps;
+    }
+
+    /// Returns the negotiated upgrade capabilities for the active session.
+    #[must_use]
+    pub fn negotiated_caps(&self) -> &[String] {
+        &self.negotiated_caps
+    }
+
+    /// Validates an outbound `0x0D PATH_UPGRADE` message before sealing without mutating state.
+    pub fn prepare_send(&self, msg: &PathUpgradeMsg) -> Result<Vec<u8>, CoreError> {
+        let encoded = msg.serialize_checked()?;
+        if self.is_initiator {
+            let PathUpgradeMsg::Offer {
+                upgrade_id,
+                protocol,
+                ..
+            } = msg
+            else {
+                return Err(CoreError::NotReady(
+                    "initiator may only send path upgrade offers",
+                ));
+            };
+            if !self.negotiated_caps.iter().any(|c| c == protocol) {
+                return Err(CoreError::NotReady("upgrade protocol not negotiated"));
+            }
+            if self.total_offers >= MAX_PATH_UPGRADE_OFFERS_PER_SESSION {
+                return Err(CoreError::NotReady(
+                    "maximum path upgrade offers per session exceeded",
+                ));
+            }
+            if self.seen_upgrade_ids.contains(upgrade_id) {
+                return Err(CoreError::NotReady("duplicate path upgrade_id"));
+            }
+        } else {
+            match msg {
+                PathUpgradeMsg::Offer { .. } => {
+                    return Err(CoreError::NotReady(
+                        "responder may only send path upgrade answers or rejections",
+                    ));
+                }
+                PathUpgradeMsg::Answer {
+                    upgrade_id,
+                    protocol,
+                    ..
+                } => {
+                    if !self.negotiated_caps.iter().any(|c| c == protocol) {
+                        return Err(CoreError::NotReady("upgrade protocol not negotiated"));
+                    }
+                    if !self
+                        .pending_upgrade_ids
+                        .iter()
+                        .any(|(id, p)| id == upgrade_id && p == protocol)
+                    {
+                        return Err(CoreError::NotReady(
+                            "unknown, already answered, or protocol-mismatched path upgrade_id",
+                        ));
+                    }
+                }
+                PathUpgradeMsg::Reject { upgrade_id, .. } => {
+                    if !self
+                        .pending_upgrade_ids
+                        .iter()
+                        .any(|(id, _)| id == upgrade_id)
+                    {
+                        return Err(CoreError::NotReady(
+                            "unknown or already answered path upgrade_id",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(encoded)
+    }
+
+    /// Commits a previously validated outbound `0x0D PATH_UPGRADE` after sealing succeeds.
+    pub fn commit_send(&mut self, msg: &PathUpgradeMsg) {
+        if self.is_initiator {
+            if let PathUpgradeMsg::Offer {
+                upgrade_id,
+                protocol,
+                ..
+            } = msg
+            {
+                self.seen_upgrade_ids.push(*upgrade_id);
+                self.pending_upgrade_ids
+                    .push((*upgrade_id, protocol.clone()));
+                self.total_offers += 1;
+            }
+        } else {
+            let id = match msg {
+                PathUpgradeMsg::Answer { upgrade_id, .. }
+                | PathUpgradeMsg::Reject { upgrade_id, .. } => *upgrade_id,
+                PathUpgradeMsg::Offer { .. } => return,
+            };
+            self.pending_upgrade_ids
+                .retain(|(pending_id, _)| *pending_id != id);
+        }
+    }
+
+    /// Validates and records an inbound `0x0D PATH_UPGRADE` frame payload, failing closed on any violation.
+    pub fn receive(&mut self, payload: &[u8]) -> Result<PathUpgradeMsg, CoreError> {
+        let msg = PathUpgradeMsg::decode(payload)?;
+        if self.negotiated_caps.is_empty() {
+            return Err(CoreError::ProtocolViolation(
+                "unsolicited path upgrade frame without negotiated capabilities",
+            ));
+        }
+        if self.is_initiator {
+            match &msg {
+                PathUpgradeMsg::Offer { .. } => {
+                    return Err(CoreError::ProtocolViolation(
+                        "initiator received path upgrade offer",
+                    ));
+                }
+                PathUpgradeMsg::Answer {
+                    upgrade_id,
+                    protocol,
+                    ..
+                } => {
+                    if !self.negotiated_caps.iter().any(|c| c == protocol) {
+                        return Err(CoreError::ProtocolViolation(
+                            "unnegotiated protocol in path upgrade answer",
+                        ));
+                    }
+                    let Some(pos) = self
+                        .pending_upgrade_ids
+                        .iter()
+                        .position(|(id, p)| id == upgrade_id && p == protocol)
+                    else {
+                        return Err(CoreError::ProtocolViolation(
+                            "unknown, replayed, or protocol-mismatched upgrade_id in path upgrade answer",
+                        ));
+                    };
+                    self.pending_upgrade_ids.swap_remove(pos);
+                }
+                PathUpgradeMsg::Reject { upgrade_id, .. } => {
+                    let Some(pos) = self
+                        .pending_upgrade_ids
+                        .iter()
+                        .position(|(id, _)| id == upgrade_id)
+                    else {
+                        return Err(CoreError::ProtocolViolation(
+                            "unknown or replayed upgrade_id in path upgrade reject",
+                        ));
+                    };
+                    self.pending_upgrade_ids.swap_remove(pos);
+                }
+            }
+        } else {
+            let PathUpgradeMsg::Offer {
+                upgrade_id,
+                protocol,
+                ..
+            } = &msg
+            else {
+                return Err(CoreError::ProtocolViolation(
+                    "responder received non-offer path upgrade frame",
+                ));
+            };
+            if !self.negotiated_caps.iter().any(|c| c == protocol) {
+                return Err(CoreError::ProtocolViolation(
+                    "unnegotiated protocol in path upgrade offer",
+                ));
+            }
+            if self.total_offers >= MAX_PATH_UPGRADE_OFFERS_PER_SESSION {
+                return Err(CoreError::ProtocolViolation(
+                    "too many path upgrade offers in session",
+                ));
+            }
+            if self.seen_upgrade_ids.contains(upgrade_id) {
+                return Err(CoreError::ProtocolViolation(
+                    "duplicate upgrade_id in path upgrade offer",
+                ));
+            }
+            self.seen_upgrade_ids.push(*upgrade_id);
+            self.pending_upgrade_ids
+                .push((*upgrade_id, protocol.clone()));
+            self.total_offers += 1;
+        }
+        Ok(msg)
+    }
 }
 
 fn groups_is_unset(groups: &Option<Vec<GroupSeq>>) -> bool {
@@ -832,8 +1247,12 @@ mod tests {
             InnerFrameType::RouteSet
         );
         assert_eq!(
-            InnerFrameType::try_from(0x0D),
-            Err(CoreError::UnknownInnerFrameType(0x0D))
+            InnerFrameType::try_from(0x0D).unwrap(),
+            InnerFrameType::PathUpgrade
+        );
+        assert_eq!(
+            InnerFrameType::try_from(0x0E),
+            Err(CoreError::UnknownInnerFrameType(0x0E))
         );
         for len in [0usize, 1, 3_454, 5_004, MAX_APP_DATA_LEN] {
             let payload = vec![0xA5; len];
@@ -859,6 +1278,7 @@ mod tests {
             crl_seq: None,
             groups: None,
             route_seq: None,
+            upgrade: Vec::new(),
         };
         let json = serde_json::to_string(&base).unwrap();
         assert!(!json.contains("route_seq"));
