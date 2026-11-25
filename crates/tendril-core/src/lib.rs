@@ -30,12 +30,15 @@ pub use pairing::{
     MAX_LIVE_PAIRING_CODES, PAIR_KEY_PROOF_DOMAIN,
 };
 pub use relay_auth::{
-    MAX_RELAY_AUTH_SECRET_BYTES, MAX_RELAY_TICKET_TTL_SECS, RELAY_AUTH_HMAC_DOMAIN,
-    RELAY_TICKET_CLOCK_SKEW_SECS, RELAY_TICKET_DOMAIN, RelayAuthProof, RelayAuthRole,
-    RelayAuthScope, RelayAuthSecret, RelayTicket, compute_relay_auth_hmac,
-    compute_relay_auth_hmac_b64, mint_relay_ticket, mint_v2_epoch_relay_ticket,
-    relay_auth_hmac_input, relay_ticket_signed_bytes, validate_relay_auth_op,
-    validate_relay_auth_secret, verify_relay_auth_hmac, verify_relay_ticket,
+    MAX_RELAY_AUTH_SECRET_BYTES, MAX_RELAY_FRAME_LEN, MAX_RELAY_TICKET_TTL_SECS,
+    MAX_STANDBY_PER_MAILBOX, RELAY_ACCEPT_DOMAIN, RELAY_AUTH_HMAC_DOMAIN, RELAY_HEALTH_PATH,
+    RELAY_PATH, RELAY_REG_DOMAIN, RELAY_TICKET_CLOCK_SKEW_SECS, RELAY_TICKET_DOMAIN, RELAY_V2_PATH,
+    RelayAuthProof, RelayAuthRole, RelayAuthScope, RelayAuthSecret, RelayTicket,
+    compute_relay_auth_hmac, compute_relay_auth_hmac_b64, decode_init_frame, mint_relay_ticket,
+    mint_v2_epoch_relay_ticket, relay_accept_signed_bytes, relay_auth_hmac_input,
+    relay_register_signed_bytes, relay_ticket_signed_bytes, sign_relay_accept, sign_relay_register,
+    validate_relay_auth_op, validate_relay_auth_secret, verify_relay_accept,
+    verify_relay_auth_hmac, verify_relay_register, verify_relay_ticket,
 };
 pub use roster::{AnchorState, MAX_BURNED_ENROLLMENT_NONCES, TrustAnchor, V2PeerSecrets};
 pub use routes::{

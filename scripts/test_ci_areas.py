@@ -39,6 +39,13 @@ class CiAreasTests(unittest.TestCase):
             if other != "web":
                 self.assertFalse(areas[other], other)
 
+    def test_cloudflare_deploy_triggers_web_area(self):
+        areas = classify(["deploy/cloudflare/src/relay_core.js"])
+        self.assertTrue(areas["web"])
+        for other in areas:
+            if other != "web":
+                self.assertFalse(areas[other], other)
+
     def test_core_change_fans_out_to_runtime_bindings_and_container(self):
         areas = classify(["crates/tendril-core/src/lib.rs"])
         for expected in (

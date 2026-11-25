@@ -1,46 +1,72 @@
 ---
 type: Guide
 title: Private relay hosting and deployment
-description: How developers and app end users deploy a private Tendril ciphertext relay on PaaS containers, Tailscale Funnel, Oracle Cloud Always Free, or self-hosted servers.
+description: Single-entry guide for developers and app end users to deploy a private Tendril ciphertext relay on Cloudflare Workers, PaaS containers, Oracle Cloud Always Free, or home tunnels.
 status: stable
-tags: [usage, relay, deployment, hosting]
+tags: [usage, relay, deployment, hosting, cloudflare]
 ---
 
 # Private relay hosting and deployment
 
 A Tendril relay forwards Noise ciphertexts over WebSockets on `/v1/relay` and `/v2/relay` when two devices cannot reach each other over LAN, a Tailscale overlay, or peer-to-peer UDP. Because every session is end-to-end encrypted inside `tendril-core` (`Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256`), the relay operator cannot read messages or forge capability grants.
 
-Hosting your own relay keeps traffic off shared public infrastructure, isolates rate limits for your devices, and gives Day-2 reconnects a stable fallback address.
+Hosting your own relay keeps traffic off shared infrastructure, isolates rate limits for your devices, and gives Day-2 reconnects a stable fallback address. Pick one of the three tracks below depending on whether you want one-click serverless hosting (no container maintenance), a managed single container / Always Free VM, or a local binary behind a tunnel.
 
 ```mermaid
 flowchart TD
   D["Client device (phone, browser, CLI)"] --> R["Policy ladder (local, direct, overlay, p2p)"]
   R -->|Direct link works| S["End-to-end Noise session directly"]
-  R -->|NAT or firewall blocks direct link| H{"Choose private relay tier"}
-  H -->|"Managed PaaS container"| P["Railway / Fly.io (--ha=false) / Render Blueprint"]
-  H -->|"Always Free VM"| O["Oracle Cloud Always Free (Caddy + Podman)"]
-  H -->|"No cloud port forwarding"| T["Tailscale Funnel / Cloudflare Tunnel -> localhost"]
-  P --> W["tendril-relay (GET /healthz, PORT, host auto-detect)"]
-  O --> W
-  T --> W
+  R -->|NAT or firewall blocks direct link| H{"Choose private relay track"}
+  H -->|"Track 1: Serverless click-to-deploy"| C["Cloudflare Workers + Hibernatable DO"]
+  H -->|"Track 2: Managed container or Free VM"| P["Oracle Always Free / Railway / Fly.io / Render"]
+  H -->|"Track 3: Home host without port forwards"| T["Tailscale Funnel / Cloudflare Tunnel -> localhost"]
+  C --> W["tendril-core WASM (/v1/relay, /v2/relay, GET /healthz)"]
+  P --> W2["tendril-relay binary (/v1/relay, /v2/relay, GET /healthz)"]
+  T --> W2
 ```
 
-## Pick a hosting tier
+## Pick a hosting track
 
-Tendril tries `local`, `direct`, `overlay`, and `p2p` (`iroh`) links before falling back to `relay`, so relay bandwidth stays low unless devices sit behind strict firewalls or connect from web browsers. Match the host option below to your uptime requirements and budget.
+Tendril tries `local`, `direct`, `overlay`, and `p2p` (`iroh`) links before falling back to `relay`, so relay bandwidth stays low unless devices sit behind strict firewalls or connect from web browsers.
 
 | Option | Audience | Cost and Allowance | Persistent Listeners | Config Location |
 |---|---|---|---|---|
-| **Tailscale Funnel + Host** | App end users | Free with Tailscale account (bandwidth limits apply) | While host device stays awake | See [Tailscale Funnel or Cloudflare Tunnel](#tailscale-funnel-or-cloudflare-tunnel) |
+| **Cloudflare Workers + DO** | Developers and app end users | Free tier (`100k` req/day, `20:1` WS frame billing ratio) | Yes via WebSocket Hibernation | [Cloudflare Worker template](https://github.com/agync/tendril/tree/main/deploy/cloudflare) |
+| **Tailscale Funnel + Host** | App end users | Free with Tailscale account (bandwidth limits apply) | While host device stays awake | See [Track 3: Tailscale Funnel or Cloudflare Tunnel](#track-3-tailscale-funnel-or-cloudflare-tunnel) |
 | **Oracle Cloud Always Free** | Developers and self-hosters | Always Free E2.1.Micro (card required for signup verification) | Yes | [Oracle Cloud stack](https://github.com/agync/tendril/tree/main/deploy/oracle) |
 | **Render Blueprint (`free`)** | Testing and wake-assisted peers | Free web service, sleeps after 15 min idle | Sleeps on `free` (paid `starter` stays up) | [Render Blueprint](https://github.com/agync/tendril/tree/main/deploy/render) |
 | **Railway Docker image** | Developers and small teams | Usage trial then Hobby credit tier, bills active CPU and RAM | Yes while credit covers runtime | [Railway config](https://github.com/agync/tendril/tree/main/deploy/railway) |
 | **Fly.io (`--ha=false`)** | Developers wanting regional placement | Paid per machine (~USD 2/mo for one shared-cpu 256 MB machine) | Yes with `min_machines_running = 1` | [Fly.io config](https://github.com/agync/tendril/tree/main/deploy/fly) |
 
 > [!IMPORTANT]
-> Run `tendril-relay` as a single instance (`numReplicas: 1`, `numInstances: 1`, or `fly launch --ha=false`). Registered mailboxes live in process memory. Running two replicas behind a load balancer causes dials for a listener on replica A to fail `"offline"` when they hit replica B.
+> Run `tendril-relay` as a single instance (`numReplicas: 1`, `numInstances: 1`, or `fly launch --ha=false`), and keep the Cloudflare Worker routed to one named Durable Object (`global`). Registered mailboxes live in single-instance memory or attached sockets, so load-balancing across two replicas causes dials to fail `"offline"`.
 
-## PaaS container deployment
+## Track 1: Cloudflare Workers and Durable Objects
+
+`deploy/cloudflare/` packages a thin Cloudflare Worker router and a singleton SQLite-backed Durable Object (`TendrilRelay`) powered by `tendril-core` compiled to WebAssembly. App end users with a GitHub and free Cloudflare account can deploy a private personal relay directly from their browser without running containers or managing Linux hosts, and app developers can embed the same button in onboarding docs or deploy the worker into their own organization account.
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/agync/tendril/tree/main/deploy/cloudflare)
+
+1. Click **Deploy to Cloudflare** (no credit card is required on Cloudflare Workers Free for a forked repo deployment), sign in, authorize GitHub fork creation, and let Workers Builds compile `tendril-wasm` into the Worker bundle via `scripts/build.sh` (`main` branch by default, configurable via `TENDRIL_SOURCE_REF`).
+2. Open the deployed Worker's **Settings -> Variables and Secrets** and add `TENDRIL_RELAY_AUTH_SECRET` (generate a `32`-byte secret via `openssl rand -hex 32`) so unauthenticated callers on your `*.workers.dev` URL cannot probe mailboxes or consume quota.
+3. For scripted or developer deployments from a local checkout:
+
+```bash
+cd deploy/cloudflare
+npm ci
+npx wrangler secret put TENDRIL_RELAY_AUTH_SECRET
+npx wrangler deploy
+```
+
+### Cloudflare Free-plan envelope and design rules
+
+`deploy/cloudflare/wrangler.jsonc` declares `new_sqlite_classes: ["TendrilRelay"]`, which satisfies Cloudflare Free's requirement that Durable Objects use SQLite storage. Quiet registered `/v1/relay`, `/v2/relay`, and `standby` control sockets hibernate with zero wall-clock duration billing until a frame arrives, and Durable Object alarms never close quiet listeners at the `300 s` stream-idle ceiling. Incoming WebSocket frames count against the Free `100,000` requests/day cap at a `20:1` ratio, and Tendril only uses the relay when `local`, `direct`, `overlay`, and `p2p` links cannot connect.
+
+Set `TENDRIL_RELAY_AUTH_SECRET` for Tier 2 HMAC, `TENDRIL_RELAY_ISSUER_PUBS` for Tier 3 signed `RelayTicket` issuers (comma-separated base64url Ed25519 keys), `TENDRIL_RELAY_ALLOW_MAILBOXES` for Tier 1 allowlisted keys, and `TENDRIL_RELAY_AUTH_SCOPE` (`"all"` default or `"register-only"`). On `dial`, `TendrilRelay` verifies admission inside `tendril-core` WASM before decoding `init_frame`, checking epoch skew, or looking up mailboxes so unauthenticated callers cannot probe peer presence.
+
+Socket attachments stay under `1 KiB` across hibernations. Classic non-`fast_open` `init_frame` payloads up to `65,521` bytes live transiently in Durable Object SQLite (`pending_init_frames`) until claimed, withdrawn, or timed out. When serving behind a custom domain whose internal request hostname differs from what clients expect in `challenge.host`, set `TENDRIL_RELAY_HOST` in Wrangler variables.
+
+## Track 2: PaaS container deployment
 
 The official OCI image (`ghcr.io/agync/tendril-relay:latest`, built from the root `Containerfile`) reads standard PaaS environment variables with no shell wrapper or start-command override.
 
@@ -84,7 +110,7 @@ Point a Railway service at `ghcr.io/agync/tendril-relay:latest`, set `TENDRIL_RE
 - Writes `TENDRIL_RELAY_AUTH_SECRET` (`48` generated characters when omitted) to `/etc/tendril-relay/auth.secret` with `0600` permissions.
 - Terminates HTTPS in Caddy for your domain, or `<public_ip>.sslip.io` when `relay_domain` is blank.
 
-## Tailscale Funnel or Cloudflare Tunnel
+## Track 3: Tailscale Funnel or Cloudflare Tunnel
 
 If you keep a home server, desktop, or NAS online, expose a loopback relay over HTTPS without router port forwards:
 
@@ -150,4 +176,4 @@ tendril --state-dir ./cli-state dial \
   --grant '<grant_json>' --message "hello"
 ```
 
-Pass `--relay-auth-origin "wss://<relay_host>"` (or `relay_auth_origins` / `relayAuthOrigins` in language bindings) whenever the relay endpoint comes from a scanned QR code or signed route set rather than an explicit `--endpoint`. For the wire rules and rate limits, see [Stateless relay v1 and async runtime providers](../design/relay-and-runtime.md) and [Reference CLI, relay deployment, and conformance peer](cli-demo.md).
+Pass `--relay-auth-origin "wss://<relay_host>"` (or `relay_auth_origins` / `relayAuthOrigins` in language bindings) whenever the relay endpoint comes from a scanned QR code or signed route set rather than an explicit `--endpoint`. In an app offering private-relay onboarding to end users, accept any `wss://<relay_host>/v1/relay` URL pasted by the user (along with their generated secret and matching `relayAuthOrigins`), validate the origin with `relay_auth_origin_allowed`, and add `/v2/relay` on the same origin once peers pair and activate Wire v2. For wire rules and rate limits, see [Stateless relay v1 and async runtime providers](../design/relay-and-runtime.md) and [Reference CLI, relay deployment, and conformance peer](cli-demo.md).
