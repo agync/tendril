@@ -5,6 +5,7 @@ import {
   compute_relay_auth_hmac_b64,
   v2_epoch_within_skew,
 } from "../pkg/tendril_wasm.js";
+import { redactHint } from "./redact.js";
 
 export const MAX_RELAY_FRAME_LEN = 65521;
 export const MAX_QUEUED_BYTES = 16 * MAX_RELAY_FRAME_LEN;
@@ -182,11 +183,11 @@ export function validateRelayWsUrl(relayUrl, allowInsecureWs = false) {
   let parsed;
   try {
     parsed = new URL(trimmed);
-  } catch (err) {
-    throw new Error(`invalid relayUrl '${relayUrl}': ${err.message}`);
+  } catch {
+    throw new Error(`invalid relayUrl '${redactHint(relayUrl)}'`);
   }
   if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
-    throw new Error(`relayUrl must use ws:// or wss://: ${relayUrl}`);
+    throw new Error(`relayUrl must use ws:// or wss://: ${redactHint(relayUrl)}`);
   }
   if (parsed.username !== "" || parsed.password !== "") {
     throw new Error("relayUrl userinfo credentials are not permitted");
@@ -218,7 +219,7 @@ export function validateBrokerWsUrl(brokerUrl, allowInsecureWs = false) {
   const trimmed = brokerUrl.trim();
   const target = /^broker\+/i.test(trimmed) ? trimmed.slice(7) : trimmed;
   if (/^broker\+/i.test(trimmed) && !/^wss?:\/\//i.test(target)) {
-    throw new Error(`brokerUrl must use broker+ws(s):// or ws(s)://: ${brokerUrl}`);
+    throw new Error(`brokerUrl must use broker+ws(s):// or ws(s)://: ${redactHint(brokerUrl)}`);
   }
   return validateRelayWsUrl(target, allowInsecureWs);
 }
@@ -265,7 +266,7 @@ function waitForWsOpen(ws, canonicalUrl, label, timeoutMs, signal = null) {
       }
     };
     const onOpen = () => finish(null);
-    const onErr = () => finish(new Error(`failed connecting to ${label} ${canonicalUrl}`));
+    const onErr = () => finish(new Error(`failed connecting to ${label} ${redactHint(canonicalUrl)}`));
     const onClose = () => finish(new Error(`${label} WebSocket closed before open`));
     const onAbort = () => finish(abortError(signal));
     timer = setTimeout(() => {
@@ -653,7 +654,7 @@ async function openRelayHandshake({
   });
 
   ws.addEventListener("error", () => {
-    const err = new Error(`relay WebSocket error (${canonicalUrl})`);
+    const err = new Error(`relay WebSocket error (${redactHint(canonicalUrl)})`);
     if (!ready) {
       failCtrl(err);
     } else {
@@ -796,7 +797,7 @@ export async function dialBrokerStream(urlOrOpts, maybeOpts = {}) {
   });
   ws.addEventListener("error", () => {
     if (opened) {
-      stream._fail(new Error(`broker WebSocket error (${canonicalUrl})`));
+      stream._fail(new Error(`broker WebSocket error (${redactHint(canonicalUrl)})`));
     }
   });
   ws.addEventListener("close", () => {

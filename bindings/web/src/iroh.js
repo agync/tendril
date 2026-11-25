@@ -1,3 +1,5 @@
+import { redactHint } from "./redact.js";
+
 const MAX_IROH_FRAME_LEN = 65521;
 const MAX_QUEUED_BYTES = 16 * MAX_IROH_FRAME_LEN;
 
@@ -260,7 +262,7 @@ export async function dialIrohStream({
     );
   }
   if (!endpoint || !endpoint.startsWith("iroh://")) {
-    throw new Error(`iroh endpoint must start with iroh://: ${endpoint}`);
+    throw new Error(`iroh endpoint must start with iroh://: ${redactHint(endpoint)}`);
   }
   let authTokenStr = null;
   if (p2pRelayAuthToken !== null && p2pRelayAuthToken !== undefined) {
