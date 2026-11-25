@@ -104,3 +104,4 @@ html .mark-l { width: 10px; height: 2px; background: var(--color-accent); }
 html .mark-b { width: 8px; height: 8px; border: 2px solid var(--color-accent); }
 html .wordmark { font: 600 17px/1 var(--font-code); letter-spacing: -0.03em; color: var(--color-heading); }
 html .brand-sub { font-family: var(--font-code); }
+html .prose a:has(> img) { display: inline-block; }

@@ -40,6 +40,7 @@ const pages = [
   { name: "docs-home", path: "/docs/", shoot: true },
   { name: "docs-overview", path: "/docs/overview.html", shoot: false },
   { name: "docs-cli-demo", path: "/docs/usage/cli-demo.html", shoot: false },
+  { name: "docs-relay-hosting", path: "/docs/usage/relay-hosting.html", shoot: false },
   { name: "not-found", path: "/no-such-page", shoot: false },
 ];
 const sizes = [
@@ -81,6 +82,14 @@ try {
         if (response.status() !== expected) fail(`${p.name}: status ${response.status()}`);
         await page.evaluate(() => document.fonts.ready);
         await page.waitForTimeout(300);
+        const brokenImgs = await page.evaluate(() =>
+          [...document.querySelectorAll("img")]
+            .filter((img) => !img.complete || img.naturalWidth === 0)
+            .map((img) => img.getAttribute("src") || "<empty>"),
+        );
+        for (const src of brokenImgs) {
+          fail(`${p.name} ${theme} ${size.name}: broken image ${src}`);
+        }
 
         const axe = await new AxeBuilder({ page })
           .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa", "best-practice"])
