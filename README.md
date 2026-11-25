@@ -20,6 +20,7 @@ Tendril extracts the pairing ceremony, sealed session protocol, capability grant
 | `crates/` | Rust workspace (`tendril-core`, `tendril-relay`, `tendril-runtime`, `tendril-cli`, `tendril-ffi`, `tendril-wasm`) |
 | `bindings/` | Thin host-language packages (Go, Python, TypeScript, Swift, Kotlin) |
 | `spec/` | Normative wire, pairing, grant, and relay specifications plus `vectors/` |
+| `deploy/` | Deploy templates for Cloudflare Workers (`Deploy to Cloudflare`), Fly.io, Render, Railway, and Oracle Cloud |
 | `docs/` | OKF v0.2 documentation bundle |
 
 ## Development
@@ -38,6 +39,7 @@ The [documentation bundle](docs/index.md) is kept as an OKF v0.2 wiki:
 
 - [Overview](docs/overview.md): goals, non-goals, and design boundaries
 - [Architecture](docs/architecture/index.md): layered trust boundary and module responsibilities
+- [Private relay hosting](docs/usage/relay-hosting.md): one-click Cloudflare Workers, PaaS containers, Always Free VMs, and home tunnels
 - [Decisions](docs/adr/index.md): architecture decision records
 - [Contribution](docs/contribution/index.md): workflow, conventions, and review gates
 

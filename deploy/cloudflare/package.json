@@ -1,0 +1,20 @@
+{
+  "name": "tendril-relay-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Workers and Durable Objects WebSocket relay for Tendril v1 and v2.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/hibernation_and_security.test.mjs test/workerd_e2e.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.168.0"
+  }
+}

@@ -13,7 +13,7 @@ JNI_OS := $(if $(filter Darwin,$(shell uname -s)),darwin,linux)
 override MSG := $(value MSG)
 export MSG
 
-.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check bindings/go bindings/python bindings/node bindings/wasm bindings/wasm-p2p bindings/web bindings/jni bindings/android bindings/check docs/check docs/build docs/serve docs/log site site/serve site/check site/brand site/clean hooks/require hooks/update
+.PHONY: help setup build test rust/lint lint lint/staged fmt fmt/check check clean vectors/check bindings/go bindings/python bindings/node bindings/wasm bindings/wasm-p2p bindings/web bindings/jni bindings/android bindings/check relay/cloudflare docs/check docs/build docs/serve docs/log site site/serve site/check site/brand site/clean hooks/require hooks/update
 
 ##@ Bootstrap
 
@@ -58,7 +58,7 @@ vectors/check: ## Verify canonical conformance vectors in Rust and Go
 	cargo test -p tendril-core --test vectors
 	cd spec/vectors/verify_go && go test ./...
 
-check: lint test vectors/check bindings/check ## Full quality gate
+check: lint test vectors/check bindings/check relay/cloudflare ## Full quality gate
 	@printf 'check: ok\n'
 
 clean: ## Remove build artifacts
@@ -66,7 +66,7 @@ clean: ## Remove build artifacts
 	cargo clean --manifest-path bindings/python/Cargo.toml
 	cargo clean --manifest-path bindings/node/Cargo.toml
 	rm -f bindings/python/tendril/_tendril.so bindings/node/index.node
-	rm -rf bindings/web/pkg bindings/web/pkg-p2p bindings/kotlin/build-jni
+	rm -rf bindings/web/pkg bindings/web/pkg-p2p bindings/kotlin/build-jni deploy/cloudflare/pkg deploy/cloudflare/.tools
 
 ##@ Bindings
 
@@ -105,6 +105,14 @@ bindings/web: bindings/wasm bindings/wasm-p2p ## Run Web SDK security tests, con
 	node --test bindings/web/test/pairing_uri.test.mjs
 	node --test bindings/web/test/connect_lock.test.mjs
 	node bindings/web/test/browser_e2e.mjs
+
+relay/cloudflare: bindings/wasm ## Build and test Cloudflare Workers Durable Object relay
+	@if [ ! -x deploy/cloudflare/node_modules/.bin/wrangler ] || [ deploy/cloudflare/package-lock.json -nt deploy/cloudflare/node_modules/.package-lock.json ]; then \
+	  npm --prefix deploy/cloudflare ci; \
+	fi
+	bash deploy/cloudflare/scripts/build.sh
+	cargo build -p tendril-cli --bin tendril-conformance-peer
+	TENDRIL_SKIP_WASM_BUILD=1 WRANGLER_SEND_METRICS=false CI=1 npm --prefix deploy/cloudflare test
 
 bindings/jni: ## Build tendril_jni shared library and run host JVM conformance tests
 	cargo build -p tendril-ffi --lib

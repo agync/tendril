@@ -71,6 +71,7 @@ bindings/kotlin/.kotlin/
 
 # Deployment tooling and Terraform state
 .wrangler/
+.tools/
 .terraform/
 *.tfstate
 *.tfstate.*

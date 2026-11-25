@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tendril-relay",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  "build": {
+    "command": "bash scripts/build.sh"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RELAY",
+        "class_name": "TendrilRelay"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TendrilRelay"]
+    }
+  ]
+  // Optional configuration via Wrangler secrets or [vars]:
+  // - TENDRIL_RELAY_HOST: canonical external hostname (defaults to the incoming URL hostname)
+  // - TENDRIL_RELAY_AUTH_SECRET: Tier 2 shared HMAC secret (store as a Wrangler secret)
+  // - TENDRIL_RELAY_ISSUER_PUBS: comma-separated unpadded base64url Ed25519 ticket issuer keys
+  // - TENDRIL_RELAY_ALLOW_MAILBOXES: comma-separated unpadded base64url Ed25519 mailbox keys
+  // - TENDRIL_RELAY_AUTH_SCOPE: "all" (default) or "register-only"
+  // - TENDRIL_RELAY_MAX_CONNECTIONS / MAX_CONNS_PER_IP / MAX_MAILBOXES / MAX_PENDING_PER_MAILBOX / MAX_ACTIVE_PER_MAILBOX
+}

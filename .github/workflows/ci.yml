@@ -281,6 +281,7 @@ jobs:
           fi
           test -x /usr/bin/google-chrome || test -x /usr/bin/chromium || test -x /usr/bin/chromium-browser
       - run: make bindings/web
+      - run: make relay/cloudflare
 
   bindings-android:
     name: Android NDK and Kotlin JNI

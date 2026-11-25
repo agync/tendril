@@ -32,8 +32,14 @@ use tendril_core::policy::{
     CandidateEndpoint, PathPlanner, PathPolicyConfig, PlannerAction, ProviderId, sort_key,
 };
 use tendril_core::relay_auth::{
-    RelayAuthRole, compute_relay_auth_hmac_b64 as core_compute_relay_auth_hmac_b64,
-    mint_relay_ticket as core_mint_relay_ticket, origin_allowed,
+    MAX_RELAY_FRAME_LEN, MAX_STANDBY_PER_MAILBOX, RELAY_HEALTH_PATH, RELAY_PATH, RELAY_V2_PATH,
+    RelayAuthRole, RelayTicket, compute_relay_auth_hmac_b64 as core_compute_relay_auth_hmac_b64,
+    decode_init_frame as core_decode_init_frame, mint_relay_ticket as core_mint_relay_ticket,
+    origin_allowed, validate_relay_auth_secret as core_validate_relay_auth_secret,
+    verify_relay_accept as core_verify_relay_accept,
+    verify_relay_auth_hmac as core_verify_relay_auth_hmac,
+    verify_relay_register as core_verify_relay_register,
+    verify_relay_ticket as core_verify_relay_ticket,
 };
 use tendril_core::roster::{
     OperatorEndpoint, PairMergeOutcome, PeerState, PinSnapshot, Roster, RouteSetOutcome,
@@ -44,10 +50,11 @@ use tendril_core::session::{
     RouteExpectation, SessionAction, SessionMachine, check_peer_allows_wire_v1,
 };
 use tendril_core::v2::{
-    PaddingPolicy, PakeArgon2Params, V2PairAction, V2PairOutcome, V2PakePairInitiator,
-    V2PinnedHost, V2SessionAction, V2SessionInitiator, VerifiedRelayHost,
+    PaddingPolicy, PakeArgon2Params, RELAY_V2_EPOCH_SECS, V2PairAction, V2PairOutcome,
+    V2PakePairInitiator, V2PinnedHost, V2SessionAction, V2SessionInitiator, VerifiedRelayHost,
     canonical_relay_host as core_canonical_relay_host, derive_epoch_mailbox, epoch_for_unix,
-    epoch_within_skew, sign_v2_relay_dial,
+    epoch_within_skew, sign_v2_relay_dial, verify_v2_relay_accept as core_verify_v2_relay_accept,
+    verify_v2_relay_register as core_verify_v2_relay_register,
 };
 use tendril_core::wire::WIRE_VERSION_V2;
 use wasm_bindgen::prelude::*;
@@ -417,6 +424,326 @@ pub fn v2_epoch_within_skew(server_epoch: f64, claimed_epoch: f64) -> Result<boo
 #[wasm_bindgen]
 pub fn canonical_relay_host(host: &str) -> Result<String, JsValue> {
     core_canonical_relay_host(host).map_err(to_js_err)
+}
+
+fn relay_protocol_constants_json_inner() -> String {
+    json!({
+        "relay_path": RELAY_PATH,
+        "relay_v2_path": RELAY_V2_PATH,
+        "health_path": RELAY_HEALTH_PATH,
+        "max_standby_per_mailbox": MAX_STANDBY_PER_MAILBOX,
+        "max_relay_frame_len": MAX_RELAY_FRAME_LEN,
+        "v2_epoch_secs": RELAY_V2_EPOCH_SECS,
+    })
+    .to_string()
+}
+
+#[wasm_bindgen]
+pub fn relay_protocol_constants_json() -> String {
+    relay_protocol_constants_json_inner()
+}
+
+fn v2_epoch_for_unix_inner(unix_secs: f64) -> Result<f64, WasmError> {
+    let unix = f64_to_u64(unix_secs, "unix_secs")?;
+    u64_to_f64(epoch_for_unix(unix)).map_err(|_| WasmError::from("epoch exceeds safe integer"))
+}
+
+#[wasm_bindgen]
+pub fn v2_epoch_for_unix(unix_secs: f64) -> Result<f64, JsValue> {
+    v2_epoch_for_unix_inner(unix_secs).map_err(to_js_err)
+}
+
+fn validate_relay_auth_secret_bytes_inner(secret: &mut [u8]) -> Result<(), WasmError> {
+    let res = core_validate_relay_auth_secret(secret).map_err(WasmError::from);
+    secret.zeroize();
+    res
+}
+
+#[wasm_bindgen]
+pub fn validate_relay_auth_secret_bytes(secret: &mut [u8]) -> Result<(), JsValue> {
+    validate_relay_auth_secret_bytes_inner(secret).map_err(to_js_err)
+}
+
+fn decode_b64url_exact_inner(raw: &str, expected_len: usize) -> Result<Vec<u8>, WasmError> {
+    let bytes = b64url_decode(raw).map_err(WasmError::from)?;
+    if bytes.len() != expected_len {
+        return Err(WasmError::from(
+            tendril_core::error::CoreError::InvalidLength {
+                expected: expected_len,
+                actual: bytes.len(),
+            },
+        ));
+    }
+    Ok(bytes)
+}
+
+#[wasm_bindgen]
+pub fn decode_b64url_exact(raw: &str, expected_len: usize) -> Result<Vec<u8>, JsValue> {
+    decode_b64url_exact_inner(raw, expected_len).map_err(to_js_err)
+}
+
+fn validate_ed25519_pub_b64_inner(raw: &str) -> Result<Vec<u8>, WasmError> {
+    let bytes = b64url_decode_array::<32>(raw).map_err(WasmError::from)?;
+    if !is_valid_ed25519_public_key(&bytes) {
+        return Err(WasmError::from(
+            tendril_core::error::CoreError::InvalidSignature,
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
+#[wasm_bindgen]
+pub fn validate_ed25519_pub_b64(raw: &str) -> Result<Vec<u8>, JsValue> {
+    validate_ed25519_pub_b64_inner(raw).map_err(to_js_err)
+}
+
+fn decode_relay_init_frame_b64_inner(
+    init_frame: Option<&str>,
+) -> Result<Option<Vec<u8>>, WasmError> {
+    core_decode_init_frame(init_frame).map_err(|code| WasmError {
+        code,
+        message: code.to_owned(),
+    })
+}
+
+#[wasm_bindgen]
+pub fn decode_relay_init_frame_b64(init_frame: &str) -> Result<Vec<u8>, JsValue> {
+    decode_relay_init_frame_b64_inner(Some(init_frame))
+        .map(|opt| opt.unwrap_or_default())
+        .map_err(to_js_err)
+}
+
+fn verify_relay_register_v1_inner(
+    pub_b64: &str,
+    sig_b64: &str,
+    relay_host: &str,
+    nonce: &[u8],
+) -> Result<Vec<u8>, WasmError> {
+    let nonce_arr = as_32(nonce, "nonce")?;
+    core_verify_relay_register(pub_b64, sig_b64, relay_host, &nonce_arr)
+        .map(|pk| pk.to_vec())
+        .map_err(WasmError::from)
+}
+
+#[wasm_bindgen]
+pub fn verify_relay_register_v1(
+    pub_b64: &str,
+    sig_b64: &str,
+    relay_host: &str,
+    nonce: &[u8],
+) -> Result<Vec<u8>, JsValue> {
+    verify_relay_register_v1_inner(pub_b64, sig_b64, relay_host, nonce).map_err(to_js_err)
+}
+
+fn verify_relay_accept_v1_inner(
+    pub_b64: &str,
+    conn_id_b64: &str,
+    sig_b64: &str,
+    relay_host: &str,
+    nonce: &[u8],
+) -> Result<Vec<u8>, WasmError> {
+    let nonce_arr = as_32(nonce, "nonce")?;
+    let (pk, cid) = core_verify_relay_accept(pub_b64, conn_id_b64, sig_b64, relay_host, &nonce_arr)
+        .map_err(WasmError::from)?;
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(&pk);
+    out.extend_from_slice(&cid);
+    Ok(out)
+}
+
+#[wasm_bindgen]
+pub fn verify_relay_accept_v1(
+    pub_b64: &str,
+    conn_id_b64: &str,
+    sig_b64: &str,
+    relay_host: &str,
+    nonce: &[u8],
+) -> Result<Vec<u8>, JsValue> {
+    verify_relay_accept_v1_inner(pub_b64, conn_id_b64, sig_b64, relay_host, nonce)
+        .map_err(to_js_err)
+}
+
+fn verify_v2_relay_register_b64_inner(
+    mailbox_id_b64: &str,
+    epoch: f64,
+    relay_host: &str,
+    nonce: &[u8],
+    sig_b64: &str,
+) -> Result<Vec<u8>, WasmError> {
+    let ep = f64_to_u64(epoch, "epoch")?;
+    let nonce_arr = as_32(nonce, "nonce")?;
+    let mailbox_id = b64url_decode_array::<32>(mailbox_id_b64).map_err(WasmError::from)?;
+    let sig = b64url_decode_array::<64>(sig_b64).map_err(WasmError::from)?;
+    core_verify_v2_relay_register(&mailbox_id, ep, relay_host, &nonce_arr, &sig)
+        .map_err(WasmError::from)?;
+    Ok(mailbox_id.to_vec())
+}
+
+#[wasm_bindgen]
+pub fn verify_v2_relay_register_b64(
+    mailbox_id_b64: &str,
+    epoch: f64,
+    relay_host: &str,
+    nonce: &[u8],
+    sig_b64: &str,
+) -> Result<Vec<u8>, JsValue> {
+    verify_v2_relay_register_b64_inner(mailbox_id_b64, epoch, relay_host, nonce, sig_b64)
+        .map_err(to_js_err)
+}
+
+fn verify_v2_relay_accept_b64_inner(
+    mailbox_id_b64: &str,
+    epoch: f64,
+    relay_host: &str,
+    nonce: &[u8],
+    conn_id_b64: &str,
+    sig_b64: &str,
+) -> Result<Vec<u8>, WasmError> {
+    let ep = f64_to_u64(epoch, "epoch")?;
+    let nonce_arr = as_32(nonce, "nonce")?;
+    let mailbox_id = b64url_decode_array::<32>(mailbox_id_b64).map_err(WasmError::from)?;
+    let conn_id = b64url_decode_array::<16>(conn_id_b64).map_err(WasmError::from)?;
+    let sig = b64url_decode_array::<64>(sig_b64).map_err(WasmError::from)?;
+    core_verify_v2_relay_accept(&mailbox_id, ep, relay_host, &nonce_arr, &conn_id, &sig)
+        .map_err(WasmError::from)?;
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(&mailbox_id);
+    out.extend_from_slice(&conn_id);
+    Ok(out)
+}
+
+#[wasm_bindgen]
+pub fn verify_v2_relay_accept_b64(
+    mailbox_id_b64: &str,
+    epoch: f64,
+    relay_host: &str,
+    nonce: &[u8],
+    conn_id_b64: &str,
+    sig_b64: &str,
+) -> Result<Vec<u8>, JsValue> {
+    verify_v2_relay_accept_b64_inner(
+        mailbox_id_b64,
+        epoch,
+        relay_host,
+        nonce,
+        conn_id_b64,
+        sig_b64,
+    )
+    .map_err(to_js_err)
+}
+
+fn verify_relay_auth_hmac_b64_inner(
+    secret: &mut [u8],
+    op: &str,
+    relay_host: &str,
+    nonce: &[u8],
+    pub_or_target: &[u8],
+    candidate_mac_b64: &str,
+) -> Result<(), WasmError> {
+    let res = as_32(nonce, "nonce").and_then(|nonce_arr| {
+        as_32(pub_or_target, "pub_or_target").and_then(|target_arr| {
+            core_verify_relay_auth_hmac(
+                secret,
+                op,
+                relay_host,
+                &nonce_arr,
+                &target_arr,
+                candidate_mac_b64,
+            )
+            .map_err(WasmError::from)
+        })
+    });
+    secret.zeroize();
+    res
+}
+
+#[wasm_bindgen]
+pub fn verify_relay_auth_hmac_b64(
+    secret: &mut [u8],
+    op: &str,
+    relay_host: &str,
+    nonce: &[u8],
+    pub_or_target: &[u8],
+    candidate_mac_b64: &str,
+) -> Result<(), JsValue> {
+    verify_relay_auth_hmac_b64_inner(
+        secret,
+        op,
+        relay_host,
+        nonce,
+        pub_or_target,
+        candidate_mac_b64,
+    )
+    .map_err(to_js_err)
+}
+
+fn verify_relay_ticket_json_inner(
+    ticket_json: &str,
+    trusted_issuers_json: &str,
+    expected_relay_host: &str,
+    required_op: &str,
+    target_pub: &[u8],
+    now_unix_secs: f64,
+) -> Result<Vec<u8>, WasmError> {
+    let ticket: RelayTicket = serde_json::from_str(ticket_json)?;
+    let issuer_strs: Vec<String> = serde_json::from_str(trusted_issuers_json)
+        .map_err(|e| WasmError::from(format!("invalid trusted_issuers_json: {e}")))?;
+    let mut trusted_issuers = Vec::with_capacity(issuer_strs.len());
+    for raw in &issuer_strs {
+        trusted_issuers.push(b64url_decode_array::<32>(raw).map_err(WasmError::from)?);
+    }
+    let op = match required_op {
+        "register" | "accept" => RelayAuthRole::Register,
+        "dial" => RelayAuthRole::Dial,
+        _ => {
+            return Err(WasmError::from(
+                "required_op must be register, accept, or dial",
+            ));
+        }
+    };
+    let target = as_32(target_pub, "target_pub")?;
+    let now = f64_to_u64(now_unix_secs, "now_unix_secs")?;
+    let issuer = core_verify_relay_ticket(
+        &ticket,
+        &trusted_issuers,
+        expected_relay_host,
+        op,
+        &target,
+        now,
+    )
+    .map_err(WasmError::from)?;
+    Ok(issuer.to_vec())
+}
+
+fn validate_relay_ticket_schema_json_inner(ticket_json: &str) -> Result<(), WasmError> {
+    serde_json::from_str::<RelayTicket>(ticket_json)
+        .map(|_| ())
+        .map_err(WasmError::from)
+}
+
+#[wasm_bindgen]
+pub fn validate_relay_ticket_schema_json(ticket_json: &str) -> Result<(), JsValue> {
+    validate_relay_ticket_schema_json_inner(ticket_json).map_err(to_js_err)
+}
+
+#[wasm_bindgen]
+pub fn verify_relay_ticket_json(
+    ticket_json: &str,
+    trusted_issuers_json: &str,
+    expected_relay_host: &str,
+    required_op: &str,
+    target_pub: &[u8],
+    now_unix_secs: f64,
+) -> Result<Vec<u8>, JsValue> {
+    verify_relay_ticket_json_inner(
+        ticket_json,
+        trusted_issuers_json,
+        expected_relay_host,
+        required_op,
+        target_pub,
+        now_unix_secs,
+    )
+    .map_err(to_js_err)
 }
 
 #[wasm_bindgen]
@@ -7070,5 +7397,167 @@ mod route_tests {
         assert_eq!(timeout_acts[0]["id"], 1);
         assert_eq!(timeout_acts[1]["action"], "all_candidates_exhausted");
         assert_eq!(cold.next_deadline_inner(), None);
+    }
+
+    #[test]
+    fn wasm_relay_server_verifiers_cover_v1_v2_and_admission() {
+        let constants: serde_json::Value =
+            serde_json::from_str(&relay_protocol_constants_json_inner()).unwrap();
+        assert_eq!(constants["relay_path"], "/v1/relay");
+        assert_eq!(constants["relay_v2_path"], "/v2/relay");
+        assert_eq!(constants["health_path"], "/healthz");
+        assert_eq!(constants["max_standby_per_mailbox"], 4);
+        assert_eq!(constants["max_relay_frame_len"], 65_521);
+        assert_eq!(constants["v2_epoch_secs"], 3_600);
+
+        assert_eq!(v2_epoch_for_unix_inner(3_600.0).unwrap(), 1.0);
+        assert!(v2_epoch_for_unix_inner(-1.0).is_err());
+
+        let mut ok_secret = b"super-secret".to_vec();
+        validate_relay_auth_secret_bytes_inner(&mut ok_secret).unwrap();
+        assert!(ok_secret.iter().all(|&b| b == 0));
+
+        let mut empty_secret = Vec::new();
+        assert!(validate_relay_auth_secret_bytes_inner(&mut empty_secret).is_err());
+
+        let nonce = [0x11; 32];
+        let conn_id = [0x22; 16];
+        let conn_b64 = b64url_encode(&conn_id);
+        assert_eq!(
+            decode_b64url_exact_inner(&conn_b64, 16).unwrap(),
+            conn_id.to_vec()
+        );
+        assert_eq!(
+            decode_b64url_exact_inner(&conn_b64, 32).unwrap_err().code,
+            "invalid_length"
+        );
+        assert_eq!(
+            decode_b64url_exact_inner("not!valid", 16).unwrap_err().code,
+            "base64_decode"
+        );
+
+        let id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x43; 32]),
+            SigningKeypair::from_seed([0x44; 32]),
+        );
+        let signing_kp = id.signing_key().ed25519_signing_key();
+        let pub_b64 = b64url_encode(&signing_kp.verifying_key().to_bytes());
+        assert_eq!(
+            validate_ed25519_pub_b64_inner(&pub_b64).unwrap(),
+            signing_kp.verifying_key().to_bytes().to_vec()
+        );
+        let zero_b64 = b64url_encode(&[0u8; 32]);
+        assert_eq!(
+            validate_ed25519_pub_b64_inner(&zero_b64).unwrap_err().code,
+            "invalid_signature"
+        );
+
+        assert_eq!(decode_relay_init_frame_b64_inner(None).unwrap(), None);
+        assert_eq!(
+            decode_relay_init_frame_b64_inner(Some(""))
+                .unwrap_err()
+                .code,
+            "bad_request"
+        );
+        let big_init = b64url_encode(&[0x55; 65_522]);
+        assert_eq!(
+            decode_relay_init_frame_b64_inner(Some(&big_init))
+                .unwrap_err()
+                .code,
+            "frame_too_large"
+        );
+
+        let (_, reg_sig) = tendril_core::sign_relay_register(&signing_kp, "relay.example", &nonce);
+        assert_eq!(
+            verify_relay_register_v1_inner(&pub_b64, &reg_sig, "relay.example", &nonce).unwrap(),
+            signing_kp.verifying_key().to_bytes().to_vec()
+        );
+        assert!(
+            verify_relay_register_v1_inner(&pub_b64, &reg_sig, "evil.example", &nonce).is_err()
+        );
+
+        let acc_sig =
+            tendril_core::sign_relay_accept(&signing_kp, "relay.example", &nonce, &conn_id);
+        let acc_out =
+            verify_relay_accept_v1_inner(&pub_b64, &conn_b64, &acc_sig, "relay.example", &nonce)
+                .unwrap();
+        assert_eq!(&acc_out[..32], &signing_kp.verifying_key().to_bytes());
+        assert_eq!(&acc_out[32..], &conn_id);
+
+        let v2_mailbox = derive_epoch_mailbox(&[0x33; 32], 42);
+        let v2_sig =
+            tendril_core::v2::sign_v2_relay_register(&v2_mailbox, "relay.example", &nonce).unwrap();
+        let v2_pub_b64 = b64url_encode(&v2_mailbox.mailbox_id);
+        assert_eq!(
+            verify_v2_relay_register_b64_inner(
+                &v2_pub_b64,
+                42.0,
+                "relay.example",
+                &nonce,
+                &b64url_encode(&v2_sig),
+            )
+            .unwrap(),
+            v2_mailbox.mailbox_id.to_vec()
+        );
+        let v2_acc_sig =
+            tendril_core::v2::sign_v2_relay_accept(&v2_mailbox, "relay.example", &nonce, &conn_id)
+                .unwrap();
+        let v2_acc_out = verify_v2_relay_accept_b64_inner(
+            &v2_pub_b64,
+            42.0,
+            "relay.example",
+            &nonce,
+            &conn_b64,
+            &b64url_encode(&v2_acc_sig),
+        )
+        .unwrap();
+        assert_eq!(&v2_acc_out[..32], &v2_mailbox.mailbox_id);
+        assert_eq!(&v2_acc_out[32..], &conn_id);
+
+        let mut hmac_secret = b"relay-secret-bytes".to_vec();
+        let mac = core_compute_relay_auth_hmac_b64(
+            &hmac_secret,
+            "register",
+            "relay.example",
+            &nonce,
+            &v2_mailbox.mailbox_id,
+        )
+        .unwrap();
+        verify_relay_auth_hmac_b64_inner(
+            &mut hmac_secret,
+            "register",
+            "relay.example",
+            &nonce,
+            &v2_mailbox.mailbox_id,
+            &mac,
+        )
+        .unwrap();
+        assert!(hmac_secret.iter().all(|&b| b == 0));
+
+        let ticket = core_mint_relay_ticket(
+            &signing_kp,
+            "relay.example",
+            RelayAuthRole::Dial,
+            "*",
+            1_700_000_000,
+            600,
+        )
+        .unwrap();
+        let ticket_json = serde_json::to_string(&ticket).unwrap();
+        let issuers_json = serde_json::to_string(&vec![pub_b64]).unwrap();
+        assert_eq!(
+            verify_relay_ticket_json_inner(
+                &ticket_json,
+                &issuers_json,
+                "relay.example",
+                "dial",
+                &v2_mailbox.mailbox_id,
+                1_700_000_100.0,
+            )
+            .unwrap(),
+            signing_kp.verifying_key().to_bytes().to_vec()
+        );
+        validate_relay_ticket_schema_json_inner(&ticket_json).unwrap();
+        assert!(validate_relay_ticket_schema_json_inner(r#"{"bogus":1}"#).is_err());
     }
 }

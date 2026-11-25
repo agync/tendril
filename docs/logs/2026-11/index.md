@@ -24,3 +24,4 @@ Entries from November 2026.
 - [ffi: add tendril_session_peer_id and binding session peer accessors](25-ffi-add-tendril-session-peer-id.md)
 - [Add relay standby acceptor pools and 0-RTT fast-open](25-add-relay-standby-acceptor-pools-and.md)
 - [usage: add private relay hosting guide and PaaS probes](25-usage-add-private-relay-hosting-guide.md)
+- [usage: add Cloudflare Workers relay and complete hosting guide](25-usage-add-cloudflare-workers-relay-and.md)
