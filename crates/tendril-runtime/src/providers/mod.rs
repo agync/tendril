@@ -10,6 +10,8 @@ pub mod overlay;
 pub mod p2p;
 pub mod relay;
 pub mod relay_v2;
+#[cfg(feature = "webtransport")]
+pub mod webtransport;
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -62,6 +64,8 @@ pub use p2p::{
 };
 pub use relay::{EmbeddedRelay, RelayClientAuth, RelayDialer, RelayListener};
 pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};
+#[cfg(feature = "webtransport")]
+pub use webtransport::{WtDialer, WtListener};
 
 /// Dials any supported Tendril endpoint (`iroh://`, `overlay://`, `broker+ws(s)://`,
 /// `ws(s)://`, `unix://`/`/...`, or `host:port`) via its matching [`PathDialer`].
@@ -123,6 +127,18 @@ pub async fn dial_endpoint_with_auth(
             dialer = dialer.with_expected_host(host);
         }
         return dialer.dial(endpoint).await;
+    }
+    if endpoint.starts_with("wt://") {
+        #[cfg(feature = "webtransport")]
+        {
+            return WtDialer::new().dial(endpoint).await;
+        }
+        #[cfg(not(feature = "webtransport"))]
+        {
+            return Err(RuntimeError::Protocol(
+                "webtransport feature is not enabled in tendril-runtime".to_owned(),
+            ));
+        }
     }
     if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
         return LocalDialer::new().dial(endpoint).await;

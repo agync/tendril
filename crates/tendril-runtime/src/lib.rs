@@ -68,6 +68,8 @@ pub use providers::{
     P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint, format_p2p_endpoint_with_addrs,
     parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
 };
+#[cfg(feature = "webtransport")]
+pub use providers::{WtDialer, WtListener};
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
 pub use store::{RosterStamp, StateStore, deserialize_identity_json, serialize_identity_json};

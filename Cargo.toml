@@ -47,6 +47,7 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
+wtransport = { version = "0.7.2", default-features = false, features = ["ring", "self-signed"] }
 x25519-dalek = { version = "3.0", default-features = false, features = ["precomputed-tables", "static_secrets", "zeroize"] }
 zeroize = { version = "1.9", features = ["derive"] }
 tendril-core = { version = "0.1.0", path = "crates/tendril-core" }

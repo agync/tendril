@@ -19,12 +19,14 @@ use tendril_core::grants::{Grant, canonical_json};
 use tendril_core::identity::SigningKeyPin;
 use tendril_core::pairing::{
     DEFAULT_ENROLLMENT_TTL_SECS, EnrollmentPolicy, IssueOptions, PairOutcome, PairingCodeKind,
-    PairingConfig, PairingManager, PairingUri, PersistOpts, PinnedHost, RoutePolicy,
-    mint_enrollment_token,
+    PairingConfig, PairingManager, PairingPathKind, PairingUri, PersistOpts, PinnedHost,
+    RoutePolicy, mint_enrollment_token,
 };
+use tendril_core::policy::ProviderId;
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket, origin_allowed};
 use tendril_core::roster::{AnchorState, PeerState, Roster, RouteSource, StoredRoute};
 use tendril_core::v2::{V2PairOutcome, canonical_relay_host};
+use tendril_runtime::providers::egress::{DestClass, classify_destination};
 use tendril_runtime::providers::hints::{
     HintDialerConfig, HintDialers, RouteApplyOpts, apply_signed_route_uri, clear_peer_routes,
     peer_routes, set_peer_routes,
@@ -40,11 +42,11 @@ use tendril_runtime::{
     RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer,
     RouteSetSink, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
     V2SessionDriver, WakeAdapterKind, WakeDialOptions, WakeOutcome, WakeSecret, WakeTarget,
-    dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
+    WtListener, dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_policy,
     drive_pair_responder_with_store, drive_v2_pair_initiator_with_policy,
-    drive_v2_pake_pair_responder_with_store, pairing_path_kind_for_provider, parse_p2p_relay_mode,
-    parse_p2p_relay_modes, recv_routed,
+    drive_v2_pake_pair_responder_with_store, parse_p2p_relay_mode, parse_p2p_relay_modes,
+    recv_routed,
 };
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use zeroize::{Zeroize, Zeroizing};
@@ -275,6 +277,8 @@ enum Command {
         overlay_allow_non_tailnet: bool,
         #[arg(long)]
         broker: Option<SocketAddr>,
+        #[arg(long)]
+        webtransport: Option<SocketAddr>,
         #[arg(long, value_enum)]
         issue_code: Option<PairKindArg>,
         /// Extra route to advertise in pairing URIs and route sets (repeatable).
@@ -1319,6 +1323,25 @@ where
     })
 }
 
+fn responder_path_kind(stream: &dyn PathStream) -> PairingPathKind {
+    match stream.provider_id() {
+        ProviderId::Local => PairingPathKind::Lan,
+        ProviderId::Direct => {
+            if stream.peer_ip().is_some_and(|ip| {
+                matches!(
+                    classify_destination(ip),
+                    DestClass::Loopback | DestClass::Lan
+                )
+            }) {
+                PairingPathKind::Lan
+            } else {
+                PairingPathKind::Remote
+            }
+        }
+        _ => PairingPathKind::Remote,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_v1_pair(
     mut stream: Box<dyn PathStream>,
@@ -1332,7 +1355,7 @@ async fn handle_v1_pair(
     redact_logs: bool,
 ) {
     let now = now_unix();
-    let path_kind = pairing_path_kind_for_provider(stream.provider_id());
+    let path_kind = responder_path_kind(stream.as_ref());
     let policy = if allow_enroll {
         EnrollmentPolicy::enabled_default()
     } else {
@@ -1411,7 +1434,7 @@ async fn handle_v2_pair(
     rate_limiter: PreAuthRateLimiter,
 ) {
     let now = now_unix();
-    let path_kind = pairing_path_kind_for_provider(stream.provider_id());
+    let path_kind = responder_path_kind(stream.as_ref());
     match drive_v2_pake_pair_responder_with_store(
         stream.as_mut(),
         &identity,
@@ -2398,6 +2421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             overlay,
             overlay_allow_non_tailnet,
             broker,
+            webtransport,
             issue_code,
             advertise_endpoints,
             no_route_signature,
@@ -2547,10 +2571,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
+            let wt_ep = if let Some(wt_addr) = webtransport {
+                let wtl = WtListener::bind(wt_addr).await?;
+                let ep = if wtl.local_addr().ip().is_unspecified() {
+                    tracing::warn!(
+                        addr = %wtl.local_addr(),
+                        "webtransport bound to unspecified address; bind a concrete address or pass --advertise-endpoint to advertise wt://"
+                    );
+                    None
+                } else {
+                    Some(wtl.local_endpoint())
+                };
+                router.spawn_listener(&handle, Box::new(wtl));
+                ep
+            } else {
+                None
+            };
+
             // Explicit advertising only: concrete listener binds and
             // `--advertise-endpoint`; unspecified binds are dropped, never enumerated.
             let served_endpoints: Vec<String> = [
                 Some(direct_ep.clone()),
+                wt_ep.clone(),
                 relay_ep.clone(),
                 v2_relay_url.clone(),
                 p2p_ep.clone(),
@@ -2623,6 +2665,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "p2p_endpoint": p2p_ep,
                 "overlay_endpoint": overlay_ep,
                 "broker_endpoint": broker_ep,
+                "wt_endpoint": wt_ep,
                 "pairing_code": pairing_code.as_deref(),
                 "pairing_uri": pairing_uri.as_deref(),
                 "advertised_endpoints": advertised,

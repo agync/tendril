@@ -242,13 +242,14 @@ export function parseP2pEndpoint(endpoint: string): Promise<ParsedP2pEndpoint>;
 export function hasP2pSupport(): Promise<boolean>;
 /**
  * Splits pairing URI hints into browser-dialable candidates (provider order) and skipped hints.
- * Keeps `iroh://` only with `p2p` (its `relay=` parameters are stripped), `wss://` and
- * `broker+wss://`, and `ws://` / `broker+ws://` on loopback or with `allowInsecureWs`. Throws
- * `pairing URI contains no browser-compatible endpoints (need iroh:// or wss://)` when nothing is left.
+ * Keeps `wt://` only with `webtransport`, `iroh://` only with `p2p` (its `relay=` parameters are
+ * stripped), `wss://` and `broker+wss://`, and `ws://` / `broker+ws://` on loopback or with
+ * `allowInsecureWs`. Throws
+ * `pairing URI contains no browser-compatible endpoints (need wt://, iroh:// or wss://)` when nothing is left.
  */
 export function filterWebCompatibleEndpoints(
   endpoints: string[],
-  options?: { p2p?: boolean; allowInsecureWs?: boolean }
+  options?: { p2p?: boolean; allowInsecureWs?: boolean; webtransport?: boolean }
 ): { candidates: WebCandidate[]; skipped: SkippedHint[] };
 /** `lan2_group` or `remote3_group`; throws `pairing code invalid` for a malformed code. */
 export function classifyPairingCode(code: string): "lan2_group" | "remote3_group";
@@ -257,6 +258,37 @@ export function relayAuthOriginAllowed(url: string, origins: string[]): boolean;
 export const MAX_RELAY_FRAME_LEN: number;
 export const MAX_QUEUED_BYTES: number;
 export const MAX_QUEUED_FRAMES: number;
+export const MAX_WT_FRAME_LEN: number;
+export const MAX_WT_QUEUED_BYTES: number;
+
+export interface WtStreamOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal | null;
+  webTransportImpl?: typeof WebTransport;
+}
+
+export class WtStream implements TendrilStream {
+  readonly provider: "direct";
+  readonly fastOpenSent: boolean;
+  maxFrame(): number;
+  send(bytes: Uint8Array): Promise<void>;
+  recv(timeoutMs?: number): Promise<WebStreamRecvResult>;
+  abort(reason?: unknown): void;
+  close(): Promise<void>;
+}
+
+export function validateWtUrl(endpoint: string): {
+  httpsUrl: string;
+  bareHost: string;
+  port: number;
+  certhashBytes: Uint8Array | null;
+  isLanOrLoopback: boolean;
+};
+
+export function dialWtStream(endpoint: string, options?: WtStreamOptions): Promise<WtStream>;
+export function dialWtStream(
+  options: WtStreamOptions & { endpoint?: string; url?: string }
+): Promise<WtStream>;
 
 export class RelayStream implements TendrilStream {
   constructor(ws: WebSocket, maxQueuedBytes?: number, maxQueuedFrames?: number);

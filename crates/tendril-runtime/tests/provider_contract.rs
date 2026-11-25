@@ -29,6 +29,8 @@ use tendril_runtime::{
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{P2pDialer, P2pListener, P2pRelayMode};
+#[cfg(feature = "webtransport")]
+use tendril_runtime::{WtDialer, WtListener};
 use tokio::time::timeout;
 
 /// A loopback port nothing listens on, held for the guard's lifetime. The port is the local end
@@ -352,8 +354,11 @@ impl PathStream for WireTapStream {
 }
 
 async fn run_six_point_contract(provider: ProviderId) {
-    let mut pair = setup_provider(provider).await;
+    let pair = setup_provider(provider).await;
+    run_six_point_contract_pair(provider, pair).await;
+}
 
+async fn run_six_point_contract_pair(provider: ProviderId, mut pair: ProviderPair) {
     // 1. 1 B and MAX_FRAME_LEN (65519 B) round-trip intact.
     {
         let (mut srv, mut cli) = open_pair(&mut pair).await;
@@ -620,6 +625,43 @@ async fn six_point_provider_contract_p2p() {
 #[tokio::test]
 async fn six_point_provider_contract_broker() {
     run_six_point_contract(ProviderId::Broker).await;
+}
+
+#[cfg(feature = "webtransport")]
+#[tokio::test]
+async fn six_point_provider_contract_webtransport() {
+    let listener = WtListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind webtransport");
+    let endpoint = listener.local_endpoint();
+    let pair = ProviderPair {
+        listener: Box::new(listener),
+        dialer: Box::new(WtDialer::new()),
+        endpoint,
+        _tmp: None,
+        _relay: None,
+    };
+    run_six_point_contract_pair(ProviderId::Direct, pair).await;
+}
+
+#[cfg(feature = "webtransport")]
+#[tokio::test]
+async fn webtransport_rejects_wrong_certhash() {
+    let listener = WtListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind webtransport");
+    let addr = listener.local_addr();
+    let wrong_hash = tendril_core::crypto::b64url_encode(&[0xFFu8; 32]);
+    let bad_ep = format!("wt://{addr}?certhash={wrong_hash}");
+    let err = WtDialer::new()
+        .dial(&bad_ep)
+        .await
+        .err()
+        .expect("wrong certhash must fail TLS verification");
+    assert!(
+        matches!(err, RuntimeError::Protocol(_)),
+        "expected protocol/TLS error, got {err:?}"
+    );
 }
 
 #[tokio::test]

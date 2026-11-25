@@ -33,9 +33,9 @@ use tendril_runtime::{
     PathDialer, PathListener, PathStream, PrefixedPathStream, RelayClientAuth, RelayDialer,
     RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, SessionDriver,
     SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeDialOptions,
-    WakeSecret, WakeTarget, drive_pair_responder_with_policy, drive_v2_pake_pair_initiator,
-    drive_v2_pake_pair_responder, parse_p2p_relay_mode, parse_p2p_relay_modes, peek_exact,
-    pinned_pairing_floor, wake_and_connect_v2_session,
+    WakeSecret, WakeTarget, WtDialer, WtListener, drive_pair_responder_with_policy,
+    drive_v2_pake_pair_initiator, drive_v2_pake_pair_responder, parse_p2p_relay_mode,
+    parse_p2p_relay_modes, peek_exact, pinned_pairing_floor, wake_and_connect_v2_session,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -313,6 +313,10 @@ enum PeerCmd {
     ServeBroker {
         bind: Option<String>,
         path: Option<String>,
+    },
+    #[serde(rename = "serve_wt")]
+    ServeWt {
+        bind: Option<String>,
     },
     IssueCode {
         kind: Option<String>,
@@ -644,6 +648,12 @@ async fn dial_endpoint_with_cfg(
         }
         return dialer.dial(endpoint).await.map_err(|e| e.to_string());
     }
+    if endpoint.starts_with("wt://") {
+        return WtDialer::new()
+            .dial(endpoint)
+            .await
+            .map_err(|e| e.to_string());
+    }
     if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
         return LocalDialer::new()
             .dial(endpoint)
@@ -690,6 +700,9 @@ async fn build_dialer_with_cfg(
             dialer = dialer.with_expected_host(host);
         }
         return Ok(Box::new(dialer));
+    }
+    if endpoint.starts_with("wt://") {
+        return Ok(Box::new(WtDialer::new()));
     }
     if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
         return Ok(Box::new(LocalDialer::new()));
@@ -1018,6 +1031,36 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
             })
             .await
             {
+                Ok(listener) => {
+                    let ep = listener.local_endpoint();
+                    let addr = listener.local_addr().to_string();
+                    let task = state.spawn_listener(Box::new(listener));
+                    state.listener_tasks.push(task);
+                    (
+                        serde_json::json!({ "ok": true, "endpoint": ep, "addr": addr }),
+                        false,
+                    )
+                }
+                Err(e) => (err_json(e.to_string()), false),
+            }
+        }
+        PeerCmd::ServeWt { bind } => {
+            let listen_addr = match bind {
+                Some(raw) => match raw.trim().parse::<SocketAddr>() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        return (err_json(format!("invalid wt bind address: {e}")), false);
+                    }
+                },
+                None => SocketAddr::from(([127, 0, 0, 1], 0)),
+            };
+            if !listen_addr.ip().is_loopback() {
+                return (
+                    err_json("serve_wt only permits loopback bind addresses"),
+                    false,
+                );
+            }
+            match WtListener::bind(listen_addr).await {
                 Ok(listener) => {
                     let ep = listener.local_endpoint();
                     let addr = listener.local_addr().to_string();

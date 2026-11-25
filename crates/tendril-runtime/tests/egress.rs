@@ -1072,3 +1072,144 @@ async fn iroh_hints_need_the_p2p_feature() {
         SkipReason::P2pFeatureDisabled
     );
 }
+
+#[cfg(not(feature = "webtransport"))]
+#[tokio::test]
+async fn wt_hints_need_the_webtransport_feature() {
+    let resolver = Arc::new(StubResolver::default());
+    assert_eq!(
+        skipped(
+            "wt://192.168.1.10:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            HintSource::Uri,
+            &session(&resolver)
+        )
+        .await,
+        SkipReason::WebtransportFeatureDisabled
+    );
+    let lan_ctx = ctx(EgressKind::Pairing(PairingCodeKind::Lan2Group), &resolver);
+    assert_eq!(
+        skipped(
+            "wt://203.0.113.5:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            HintSource::Uri,
+            &lan_ctx
+        )
+        .await,
+        SkipReason::LanCodeRemoteHint
+    );
+    assert_eq!(
+        skipped(
+            "wt://good.example:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            HintSource::Uri,
+            &lan_ctx
+        )
+        .await,
+        SkipReason::LanCodeRemoteHint
+    );
+}
+
+#[cfg(feature = "webtransport")]
+#[tokio::test]
+async fn wt_hints_enforce_ssrf_single_lookup_and_lan2_policy() {
+    use tendril_runtime::WtDialer;
+
+    let hash = tendril_core::crypto::b64url_encode(&[0x11u8; 32]);
+    let resolver = Arc::new(
+        StubResolver::default()
+            .with("good.example", &["203.0.113.5"])
+            .with("lan.example", &["192.168.1.50"])
+            .with("evil.example", &["169.254.169.254"])
+            .with("loopback.example", &["127.0.0.1"]),
+    );
+    let sess = session(&resolver);
+    let lan_ctx = ctx(EgressKind::Pairing(PairingCodeKind::Lan2Group), &resolver);
+
+    // Blocked literal host never resolves.
+    assert_eq!(
+        skipped(
+            &format!("wt://240.0.0.1:4433?certhash={hash}"),
+            HintSource::Uri,
+            &sess
+        )
+        .await,
+        SkipReason::BlockedAddress
+    );
+    assert_eq!(
+        skipped(
+            &format!("wt://169.254.169.254:4433?certhash={hash}"),
+            HintSource::Uri,
+            &sess
+        )
+        .await,
+        SkipReason::Invalid
+    );
+    assert_eq!(
+        skipped(
+            &format!("wt://evil.example:4433?certhash={hash}"),
+            HintSource::Uri,
+            &sess
+        )
+        .await,
+        SkipReason::BlockedAddress
+    );
+    assert_eq!(resolver.lookups(), 1);
+
+    // LAN literal passes Lan2Group; public literal fails Lan2Group.
+    let lan_ok = checked(
+        &format!("wt://192.168.1.10:4433?certhash={hash}"),
+        HintSource::Uri,
+        &lan_ctx,
+    )
+    .await;
+    assert_eq!(lan_ok.provider, ProviderId::Direct);
+    assert_eq!(lan_ok.path_class, PairingPathKind::Lan);
+    assert!(lan_ok.addr_policy.is_none());
+
+    assert_eq!(
+        skipped(
+            &format!("wt://203.0.113.5:4433?certhash={hash}"),
+            HintSource::Uri,
+            &lan_ctx
+        )
+        .await,
+        SkipReason::LanCodeRemoteHint
+    );
+    assert_eq!(
+        skipped(
+            &format!("wt://good.example:4433?certhash={hash}"),
+            HintSource::Uri,
+            &lan_ctx
+        )
+        .await,
+        SkipReason::LanCodeRemoteHint
+    );
+    assert_eq!(resolver.lookups(), 2);
+
+    // Good domain hint resolves once in check_hint and pins its checked IP in addr_policy.
+    let checked_domain = checked(
+        &format!("wt://loopback.example:4433?certhash={hash}"),
+        HintSource::Uri,
+        &sess,
+    )
+    .await;
+    assert_eq!(resolver.lookups(), 3);
+    assert_eq!(
+        checked_domain.destinations,
+        vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+    );
+    assert!(checked_domain.addr_policy.is_some());
+
+    // Direct EgressDialer wrapping WtDialer rejects DNS rebinding to metadata/blocked IPs
+    // without touching SystemResolver.
+    let before_sys = SystemResolver::lookups();
+    let blocked_policy = Arc::new(EgressAddrPolicy::new(
+        Arc::clone(&resolver) as Arc<dyn HostResolver>
+    ));
+    let dialer = EgressDialer::new(Arc::new(WtDialer::new()), blocked_policy);
+    let err = dialer
+        .dial(&format!("wt://evil.example:4433?certhash={hash}"))
+        .await
+        .err()
+        .expect("blocked resolved IP must fail closed");
+    assert_eq!(err.skip_reason(), Some(SkipReason::BlockedAddress));
+    assert_eq!(SystemResolver::lookups(), before_sys);
+}
