@@ -1,0 +1,85 @@
+title: "Tendril Private Relay (Oracle Cloud Always Free)"
+description: "Provision an Always Free OCI VM running tendril-relay behind Caddy automatic HTTPS."
+schemaVersion: 1.1.0
+locale: "en"
+
+variableGroups:
+  - title: "Relay Configuration"
+    variables:
+      - relay_domain
+      - relay_auth_secret
+      - relay_image
+  - title: "Compute Placement"
+    variables:
+      - compartment_ocid
+      - region
+      - instance_shape
+      - flex_ocpus
+      - flex_memory_gb
+      - name_prefix
+      - ssh_public_key
+      - ssh_cidr
+
+variables:
+  compartment_ocid:
+    type: oci:identity:compartment:id
+    required: true
+    title: "Compartment"
+  region:
+    type: oci:identity:region:name
+    required: true
+    title: "Region"
+  instance_shape:
+    type: enum
+    title: "Always Free VM Shape"
+    default: "VM.Standard.E2.1.Micro"
+    enum:
+      - "VM.Standard.E2.1.Micro"
+      - "VM.Standard.A1.Flex"
+  flex_ocpus:
+    type: integer
+    title: "Flex OCPUs"
+    default: 1
+    visible:
+      eq:
+        - instance_shape
+        - "VM.Standard.A1.Flex"
+  flex_memory_gb:
+    type: integer
+    title: "Flex Memory (GB)"
+    default: 6
+    visible:
+      eq:
+        - instance_shape
+        - "VM.Standard.A1.Flex"
+  relay_domain:
+    type: string
+    title: "Custom Relay Hostname (optional)"
+    description: "Leave blank to obtain automatic HTTPS on <ip>.sslip.io via Caddy."
+    required: false
+  relay_auth_secret:
+    type: password
+    title: "Relay HMAC Auth Secret (optional)"
+    description: "Leave blank to generate a random 48-character secret."
+    required: false
+  relay_image:
+    type: string
+    title: "Container Image"
+    default: "ghcr.io/agync/tendril-relay:latest"
+  name_prefix:
+    type: string
+    title: "Resource Name Prefix"
+    default: "tendril-relay"
+  ssh_public_key:
+    type: string
+    title: "SSH Public Key (optional)"
+    required: false
+  ssh_cidr:
+    type: string
+    title: "SSH Allowed CIDR"
+    default: "0.0.0.0/0"
+    visible:
+      not:
+        - eq:
+            - ssh_public_key
+            - ""

@@ -27,11 +27,11 @@ use tendril_core::v2::{
     verify_v2_relay_accept, verify_v2_relay_register,
 };
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
@@ -42,9 +42,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroizing;
 
 use crate::protocol::{
-    MAX_RELAY_FRAME_LEN, MAX_STANDBY_PER_MAILBOX, RELAY_PATH, RELAY_V2_PATH, RelayClientMsg,
-    RelayServerMsg, RelayV2ClientMsg, RelayV2ServerMsg, decode_init_frame, verify_relay_accept,
-    verify_relay_register,
+    MAX_RELAY_FRAME_LEN, MAX_STANDBY_PER_MAILBOX, RELAY_HEALTH_PATH, RELAY_PATH, RELAY_V2_PATH,
+    RelayClientMsg, RelayServerMsg, RelayV2ClientMsg, RelayV2ServerMsg, decode_init_frame,
+    verify_relay_accept, verify_relay_register,
 };
 use crate::rate_limit::{IpTokenLimiter, normalize_rate_limit_ip};
 
@@ -585,8 +585,10 @@ struct PendingV2Dial {
     match_tx: oneshot::Sender<AcceptorTransfer>,
 }
 
+type RelayWsStream = WebSocketStream<PrefixedStream<RelayTcpStream>>;
+
 struct AcceptorTransfer {
-    ws: WebSocketStream<RelayTcpStream>,
+    ws: RelayWsStream,
     _global_guard: GlobalConnGuard,
     _ip_guard: IpConnGuard,
     _stream_guard: MailboxStreamGuard,
@@ -1100,7 +1102,7 @@ impl RelayServer {
 }
 
 async fn send_json<T: Serialize>(
-    ws: &mut WebSocketStream<RelayTcpStream>,
+    ws: &mut WebSocketStream<PrefixedStream<RelayTcpStream>>,
     msg: &T,
     write_timeout: Duration,
 ) -> bool {
@@ -1113,7 +1115,7 @@ async fn send_json<T: Serialize>(
 }
 
 async fn send_error_and_close(
-    ws: &mut WebSocketStream<RelayTcpStream>,
+    ws: &mut WebSocketStream<PrefixedStream<RelayTcpStream>>,
     code: &str,
     write_timeout: Duration,
 ) {
@@ -1129,7 +1131,7 @@ async fn send_error_and_close(
 }
 
 async fn send_v2_error_and_close(
-    ws: &mut WebSocketStream<RelayTcpStream>,
+    ws: &mut WebSocketStream<PrefixedStream<RelayTcpStream>>,
     code: &str,
     write_timeout: Duration,
 ) {
@@ -1298,6 +1300,141 @@ fn extract_trusted_client_ip(
     peer_ip
 }
 
+const MAX_HTTP_HEAD_BYTES: usize = 8192;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HealthMethod {
+    Get,
+    Head,
+}
+
+struct PrefixedStream<S> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.pos < this.prefix.len() {
+            let avail = &this.prefix[this.pos..];
+            let n = avail.len().min(buf.remaining());
+            buf.put_slice(&avail[..n]);
+            this.pos += n;
+            if this.pos == this.prefix.len() {
+                this.prefix = Vec::new();
+                this.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+fn find_header_end(buf: &[u8], start_search: usize) -> Option<usize> {
+    buf[start_search..]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|rel| start_search + rel)
+}
+
+fn parse_plain_healthz_request(head: &[u8]) -> Option<HealthMethod> {
+    let text = std::str::from_utf8(head).ok()?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split(' ');
+    let method = match parts.next()? {
+        "GET" => HealthMethod::Get,
+        "HEAD" => HealthMethod::Head,
+        _ => return None,
+    };
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if parts.next().is_some()
+        || target != RELAY_HEALTH_PATH
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+    {
+        return None;
+    }
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if line.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+            return None;
+        }
+        let (name, value) = line.split_once(':')?;
+        if name.is_empty() || name.bytes().any(|b| b.is_ascii_whitespace()) {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("upgrade") || name.eq_ignore_ascii_case("sec-websocket-key") {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
+        {
+            return None;
+        }
+    }
+    Some(method)
+}
+
+async fn write_healthz_response(
+    io: &mut RelayTcpStream,
+    method: HealthMethod,
+    write_timeout: Duration,
+) {
+    let payload: &[u8] = match method {
+        HealthMethod::Get => {
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 2\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nok"
+        }
+        HealthMethod::Head => {
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 2\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+        }
+    };
+    let _ = timeout(write_timeout, async {
+        io.write_all(payload).await?;
+        io.flush().await?;
+        io.shutdown().await
+    })
+    .await;
+}
+
 async fn handle_connection(
     stream: TcpStream,
     peer_ip: IpAddr,
@@ -1309,7 +1446,7 @@ async fn handle_connection(
 ) {
     let _ = stream.set_nodelay(true);
     let upgrade_timeout = Duration::from_secs(5).min(state.config.accept_timeout);
-    let io_stream = match tls_acceptor {
+    let mut io_stream = match tls_acceptor {
         Some(acceptor) => match timeout(upgrade_timeout, acceptor.accept(stream)).await {
             Ok(Ok(tls_stream)) => RelayTcpStream::Tls(Box::new(tls_stream)),
             Ok(Err(_)) | Err(_) => return,
@@ -1318,6 +1455,35 @@ async fn handle_connection(
     };
 
     const MAX_CONTROL_WS_MSG_LEN: usize = 128 * 1024;
+    let upgrade_deadline = TokioInstant::now() + upgrade_timeout;
+    let mut head_buf = Vec::new();
+    let mut head_end = None;
+    while head_buf.len() < MAX_HTTP_HEAD_BYTES {
+        let prev_len = head_buf.len();
+        let mut chunk = [0u8; 1024];
+        let max_read = (MAX_HTTP_HEAD_BYTES - prev_len).min(chunk.len());
+        let Ok(Ok(n)) = timeout_at(upgrade_deadline, io_stream.read(&mut chunk[..max_read])).await
+        else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        head_buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_header_end(&head_buf, prev_len.saturating_sub(3)) {
+            head_end = Some(pos);
+            break;
+        }
+    }
+
+    if let Some(end) = head_end
+        && let Some(method) = parse_plain_healthz_request(&head_buf[..end])
+    {
+        write_healthz_response(&mut io_stream, method, state.config.write_timeout).await;
+        return;
+    }
+
+    let prefixed_stream = PrefixedStream::new(head_buf, io_stream);
     let ws_config = WebSocketConfig::default()
         .write_buffer_size(0)
         .max_write_buffer_size(MAX_CONTROL_WS_MSG_LEN * 2)
@@ -1354,9 +1520,9 @@ async fn handle_connection(
         Ok(resp)
     };
 
-    let Ok(Ok(mut ws)) = timeout(
-        upgrade_timeout,
-        accept_hdr_async_with_config(io_stream, validate_req, Some(ws_config)),
+    let Ok(Ok(mut ws)) = timeout_at(
+        upgrade_deadline,
+        accept_hdr_async_with_config(prefixed_stream, validate_req, Some(ws_config)),
     )
     .await
     else {
@@ -1511,7 +1677,7 @@ async fn handle_connection(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_register(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     _global_guard: GlobalConnGuard,
     _ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -1646,7 +1812,7 @@ async fn handle_register(
 
 #[allow(clippy::too_many_arguments)]
 async fn park_standby_socket<N, AckMsg, IncMsg>(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     global_guard: GlobalConnGuard,
     ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -1751,7 +1917,7 @@ async fn park_standby_socket<N, AckMsg, IncMsg>(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_standby(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     global_guard: GlobalConnGuard,
     ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -1839,7 +2005,7 @@ enum DialDispatchResult<N> {
 }
 
 async fn deliver_ready_and_bridge<R: Serialize>(
-    mut dialer_ws: WebSocketStream<RelayTcpStream>,
+    mut dialer_ws: RelayWsStream,
     mut acceptor: AcceptorTransfer,
     ready_msg: &R,
     binary_inject: Option<Vec<u8>>,
@@ -1867,7 +2033,7 @@ async fn deliver_ready_and_bridge<R: Serialize>(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_dial(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     _global_guard: GlobalConnGuard,
     _ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -2117,7 +2283,7 @@ async fn handle_dial(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_accept(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     global_guard: GlobalConnGuard,
     ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -2237,7 +2403,7 @@ async fn handle_accept(
 }
 
 async fn handle_v2_connection(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     global_guard: GlobalConnGuard,
     ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -2378,7 +2544,7 @@ async fn handle_v2_connection(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_v2_register(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     _global_guard: GlobalConnGuard,
     _ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -2545,7 +2711,7 @@ async fn handle_v2_register(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_v2_standby(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     global_guard: GlobalConnGuard,
     ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -2647,7 +2813,7 @@ async fn handle_v2_standby(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_v2_dial(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     _global_guard: GlobalConnGuard,
     _ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -2929,7 +3095,7 @@ async fn handle_v2_dial(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_v2_accept(
-    mut ws: WebSocketStream<RelayTcpStream>,
+    mut ws: RelayWsStream,
     global_guard: GlobalConnGuard,
     ip_guard: IpConnGuard,
     state: Arc<RelayState>,
@@ -3067,8 +3233,8 @@ async fn handle_v2_accept(
 }
 
 async fn bridge_streams(
-    dialer_ws: WebSocketStream<RelayTcpStream>,
-    acceptor_ws: WebSocketStream<RelayTcpStream>,
+    dialer_ws: RelayWsStream,
+    acceptor_ws: RelayWsStream,
     write_timeout: Duration,
     idle_timeout: Duration,
 ) {

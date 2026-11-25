@@ -69,6 +69,14 @@ bindings/kotlin/.kotlin/
 .env.*
 !.env.example
 
+# Deployment tooling and Terraform state
+.wrangler/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
 # Editor and OS
 .DS_Store
 Thumbs.db
