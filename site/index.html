@@ -183,6 +183,84 @@
   <a class="more" href="/docs/overview.html">How each one works</a>
 </section>
 
+<section id="paths" class="band wrap" aria-labelledby="h-paths">
+  <h2 id="h-paths">Six ways to connect, nearest first.</h2>
+  <p class="sub">Every path is untrusted. A path counts only once the other device proves who it is inside the handshake, so a captive portal or a wrong host that answers never wins.</p>
+  <figure class="net" data-net>
+    <svg class="net-defs" aria-hidden="true" focusable="false">
+      <symbol id="ni-laptop" viewBox="0 0 32 32"><path d="M7 8.5h18v12H7zM3.5 24.5h25"/></symbol>
+      <symbol id="ni-phone" viewBox="0 0 32 32"><path d="M10.5 3.5h11v25h-11zM14 25h4"/></symbol>
+      <symbol id="ni-browser" viewBox="0 0 32 32"><path d="M4.5 6.5h23v19h-23zM4.5 11.5h23M7.5 9h2"/></symbol>
+    </svg>
+    <div class="net-pick" role="tablist" aria-label="Scenario" hidden>
+      <button type="button" role="tab" id="nt-lan" aria-controls="np-lan" aria-selected="true" data-scene="0"><span class="n">01</span>Same network</button>
+      <button type="button" role="tab" id="nt-wan" aria-controls="np-wan" aria-selected="false" tabindex="-1" data-scene="1"><span class="n">02</span>Across the internet</button>
+      <button type="button" role="tab" id="nt-nat" aria-controls="np-nat" aria-selected="false" tabindex="-1" data-scene="2"><span class="n">03</span>Strict NAT or firewall</button>
+      <button type="button" role="tab" id="nt-move" aria-controls="np-move" aria-selected="false" tabindex="-1" data-scene="3"><span class="n">04</span>Network changes</button>
+      <button type="button" role="tab" id="nt-web" aria-controls="np-web" aria-selected="false" tabindex="-1" data-scene="4"><span class="n">05</span>In a browser</button>
+    </div>
+    <div class="net-stage" role="img" aria-label="Diagram of the six paths between two devices, ranked nearest first">
+      <div class="net-dev" data-dev="a">
+        <svg class="net-ic" viewBox="0 0 32 32" aria-hidden="true"><use href="#ni-phone" data-dev-ic/></svg>
+        <span class="net-dev-n" data-dev-name>phone</span>
+        <span class="net-dev-r" data-dev-role>client</span>
+        <span class="net-dev-w" data-dev-net>home Wi-Fi</span>
+      </div>
+      <svg class="net-fan" data-fan="a" viewBox="0 0 56 240" aria-hidden="true"><path class="is-idle" d="M7 120C31 120 32 28.5 56 28.5"/><path class="is-win" d="M7 120C31 120 32 68.5 56 68.5"/><path class="is-idle" d="M7 120C31 120 32 108.5 56 108.5"/><path class="is-idle" d="M7 120C31 120 32 148.5 56 148.5"/><path class="is-idle" d="M7 120C31 120 32 188.5 56 188.5"/><path class="is-idle" d="M7 120C31 120 32 228.5 56 228.5"/><rect class="port-a" x="0.5" y="116.5" width="7" height="7"/></svg>
+      <ol class="net-lanes">
+        <li class="lane is-idle" data-lane="local"><span class="lane-k"><span class="lane-n">01</span>local <span class="lane-d">same machine</span></span><span class="lane-s">other machine</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+        <li class="lane is-win" data-lane="direct"><span class="lane-k"><span class="lane-n">02</span>direct <span class="lane-d">home or office LAN</span></span><span class="lane-s">in use</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+        <li class="lane is-idle" data-lane="overlay"><span class="lane-k"><span class="lane-n">03</span>overlay <span class="lane-d">an existing tailnet</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+        <li class="lane is-idle" data-lane="p2p"><span class="lane-k"><span class="lane-n">04</span>p2p <span class="lane-d">hole punching via iroh</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+        <li class="lane is-idle" data-lane="relay"><span class="lane-k"><span class="lane-n">05</span>relay <span class="lane-d">blind, sealed packets</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i><span class="lane-box">relay</span></span></li>
+        <li class="lane is-idle" data-lane="broker"><span class="lane-k"><span class="lane-n">06</span>broker <span class="lane-d">WebSocket via a proxy</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
+      </ol>
+      <svg class="net-fan" data-fan="b" viewBox="0 0 56 240" aria-hidden="true"><path class="is-idle" d="M49 120C25 120 24 28.5 0 28.5"/><path class="is-win" d="M49 120C25 120 24 68.5 0 68.5"/><path class="is-idle" d="M49 120C25 120 24 108.5 0 108.5"/><path class="is-idle" d="M49 120C25 120 24 148.5 0 148.5"/><path class="is-idle" d="M49 120C25 120 24 188.5 0 188.5"/><path class="is-idle" d="M49 120C25 120 24 228.5 0 228.5"/><rect class="port-b" x="48.5" y="116.5" width="7" height="7"/></svg>
+      <div class="lane lane-pair"><span class="lane-k">pairing <span class="lane-d">held by the devices, not the path</span></span><span class="lane-s" data-pair>paired</span><span class="lane-t"></span></div>
+      <div class="net-dev" data-dev="b">
+        <svg class="net-ic" viewBox="0 0 32 32" aria-hidden="true"><use href="#ni-laptop"/></svg>
+        <span class="net-dev-n">laptop</span>
+        <span class="net-dev-r">host</span>
+        <span class="net-dev-w">home network</span>
+      </div>
+    </div>
+    <div class="net-foot">
+      <div class="net-caps">
+        <div class="net-cap" id="np-lan">
+          <p><span class="net-cap-k">Same network. </span>On one network, the direct path proves the other device first and wins.</p>
+          <p class="vh">The phone and the laptop share a home network. Local does not apply, as they are different machines. The direct path completes the handshake and is in use. Overlay, peer-to-peer, relay and broker are not used.</p>
+        </div>
+        <div class="net-cap" id="np-wan">
+          <p><span class="net-cap-k">Across the internet. </span>Away from home, the direct path fails and hole punching through iroh wins.</p>
+          <p class="vh">A phone on mobile data reaches the laptop at home. Local does not apply. On the direct path a wrong host answers and fails the handshake, so it does not count. There is no tailnet. The peer-to-peer path through iroh completes the handshake and is in use.</p>
+        </div>
+        <div class="net-cap" id="np-nat">
+          <p><span class="net-cap-k">Strict NAT or firewall. </span>When nothing direct gets through, a relay carries sealed packets it cannot read.</p>
+          <dl class="net-sees">
+            <div><dt>The relay sees</dt><dd>IP addresses, timing, sizes, a mailbox key</dd></div>
+            <div><dt>It cannot see</dt><dd>Your data, grants, device names, the pairing code</dd></div>
+          </dl>
+          <p class="vh">A phone on an office network reaches the laptop at home. The direct path and the peer-to-peer path are blocked, and there is no tailnet. The relay path is in use. The broker path is not used.</p>
+        </div>
+        <div class="net-cap" id="np-move">
+          <p><span class="net-cap-k">Network changes. </span>The phone leaves Wi-Fi, so the devices handshake again on another path and keep their pairing.</p>
+          <p class="vh">A phone on home Wi-Fi uses the direct path to the laptop. The phone moves to mobile data and the direct path drops. The devices handshake again, and the peer-to-peer path is now in use. The pairing is the same, with no new pairing needed.</p>
+        </div>
+        <div class="net-cap" id="np-web">
+          <p><span class="net-cap-k">In a browser. </span>A browser tab joins only as a client. It races the routes a browser can dial, a relay, a broker or p2p through an iroh relay, and here the relay wins.</p>
+          <dl class="net-sees">
+            <div><dt>The relay sees</dt><dd>IP addresses, timing, sizes, a mailbox key</dd></div>
+            <div><dt>It cannot see</dt><dd>Your data, grants, device names, the pairing code</dd></div>
+          </dl>
+          <p class="vh">A browser tab reaches the laptop through the relay path, which is in use. Local, direct and overlay are not available in a browser. The broker path is available, through a secure WebSocket, but not needed here. With the opt-in p2p build, a tab can also take the p2p path, but only through an iroh relay, as a browser cannot open UDP sockets.</p>
+        </div>
+      </div>
+      <button class="play net-play" type="button" data-net-play hidden>Pause</button>
+    </div>
+    <p class="caption faint net-note"><span>Illustrative. Device names, networks and timing are examples.</span><span class="net-key" aria-hidden="true"><i></i>handshake<i class="key-pk"></i>sealed data</span></p>
+  </figure>
+</section>
+
 <section id="routes" class="band wrap" aria-labelledby="h-routes">
   <h2 id="h-routes">One scan finds the host at home and away.</h2>
   <p class="sub">A host's QR code carries every route it can be reached on, such as its home network address, its address on a VPN like a tailnet, and a relay, all signed by the host. Later connects try them nearest first, with nothing to type or approve.</p>
@@ -222,6 +300,79 @@
     <figcaption class="rl-cap">Illustrative addresses. Start times follow the defaults. A route that fails early lets the next one start at once.</figcaption>
   </figure>
   <p class="more-row"><a class="more" href="/how-it-works#routes">How the routes stay current</a><a class="more" href="/docs/usage/seamless-pairing.html">Seamless pairing guide</a></p>
+</section>
+
+<section id="groups" class="band wrap" aria-labelledby="h-groups">
+  <h2 id="h-groups">Up to 32 devices, each paired once.</h2>
+  <p class="sub">One device roots the group and signs a list of who is in and what each may do. Members check each other against it and link directly, each pair with its own keys.</p>
+  <figure class="grp" data-grp>
+    <div class="grp-stage">
+      <p class="grp-status" aria-hidden="true"><span class="grp-n" data-grp-n>04</span><span class="grp-l" data-grp-l>one is removed</span><span class="grp-s" data-grp-s>server cut off from every member</span></p>
+      <svg class="fd grp-svg" viewBox="0 0 360 240" role="img" aria-label="A group of five devices. The Mac mini is the root. The phone, laptop, NAS and server each paired once with it, and hold the list it signed. The members link to each other directly, the phone to the NAS through a relay. The server has been removed: the root signed list version 2, and every link to the server is cut.">
+        <g>
+          <path class="gl is-quiet" data-l="s0" d="M168 46 56 96"/>
+          <path class="gl is-quiet" data-l="s1" d="M192 46 304 96"/>
+          <path class="gl is-quiet" data-l="s2" d="M174 46 84 190"/>
+          <path class="gl is-cut" data-l="s3" d="M186 46 276 190"/>
+          <path class="gl is-win" data-l="m0" d="M104 116H256"/>
+          <path class="gl is-win" data-l="m1" d="M256 130 104 196"/>
+          <path class="gl is-win gl-relay" data-l="m2" d="M56 136V190"/>
+          <path class="gl is-cut" data-l="m3" d="M104 210H256"/>
+          <path class="gl is-cut" data-l="m4" d="M304 136V190"/>
+          <path class="gl is-cut" data-l="m5" d="M104 130 256 196"/>
+        </g>
+        <g data-grp-pk></g>
+        <g class="grp-relay" data-grp-relay><rect class="b-gap" x="26" y="155" width="60" height="16"/><text class="t-xs" x="56" y="167" text-anchor="middle">relay</text></g>
+        <g class="grp-pill" data-grp-pill><rect class="b-gap" x="124" y="64" width="112" height="18"/><text class="t-xs t-acc" x="180" y="77" text-anchor="middle" data-grp-pilltext>list v2 · signed</text></g>
+        <g class="gd" data-d="root">
+          <rect class="b b-acc" x="132" y="6" width="96" height="40"/>
+          <text class="t-s t-strong" x="180" y="23" text-anchor="middle">Mac mini</text>
+          <text class="t-xs t-acc" x="180" y="38" text-anchor="middle">root · signs</text>
+          <rect class="sq gm" x="218" y="10" width="6" height="6"/>
+        </g>
+        <g class="gd" data-d="phone">
+          <rect class="b" x="8" y="96" width="96" height="40"/>
+          <text class="t-s t-strong" x="56" y="113" text-anchor="middle">phone</text>
+          <text class="t-xs t-mut" x="56" y="128" text-anchor="middle" data-r>member · away</text>
+          <rect class="sq gm" x="94" y="100" width="6" height="6"/>
+        </g>
+        <g class="gd" data-d="laptop">
+          <rect class="b" x="256" y="96" width="96" height="40"/>
+          <text class="t-s t-strong" x="304" y="113" text-anchor="middle">laptop</text>
+          <text class="t-xs t-mut" x="304" y="128" text-anchor="middle" data-r>member</text>
+          <rect class="sq gm" x="342" y="100" width="6" height="6"/>
+        </g>
+        <g class="gd" data-d="nas">
+          <rect class="b" x="8" y="190" width="96" height="40"/>
+          <text class="t-s t-strong" x="56" y="207" text-anchor="middle">NAS</text>
+          <text class="t-xs t-mut" x="56" y="222" text-anchor="middle" data-r>member</text>
+          <rect class="sq gm" x="94" y="194" width="6" height="6"/>
+        </g>
+        <g class="gd is-gone" data-d="server">
+          <rect class="b" x="256" y="190" width="96" height="40"/>
+          <text class="t-s t-strong" x="304" y="207" text-anchor="middle">server</text>
+          <text class="t-xs t-mut" x="304" y="222" text-anchor="middle" data-r>removed</text>
+          <rect class="sq gm" x="342" y="194" width="6" height="6"/>
+        </g>
+      </svg>
+      <ol class="grp-phases" aria-label="What the diagram shows">
+        <li data-p="1"><span class="n">01</span>Each device pairs once, with the root</li>
+        <li data-p="2"><span class="n">02</span>The root signs the list. It lands on every member</li>
+        <li data-p="3"><span class="n">03</span>Members link directly, the phone to the NAS through a relay</li>
+        <li data-p="4" class="is-now"><span class="n">04</span>The server is removed. A new list cuts its links everywhere</li>
+      </ol>
+    </div>
+    <div class="grp-foot">
+      <p class="caption faint grp-note"><span>Illustrative. Links open when there is something to send, over any path.</span><span class="grp-key" aria-hidden="true"><i></i>handshake<i class="key-list"></i>signed list<i class="key-pk"></i>sealed data</span></p>
+      <button class="play grp-play" type="button" data-grp-play hidden>Pause</button>
+    </div>
+    <div class="grp-after">
+      <div><p class="grp-after-h"><span class="grp-big">31</span> pairings, not <span class="grp-big">496</span></p><p>At 32 devices, each pairs once with the root, not with every other member.</p></div>
+      <div><p class="grp-after-h">No group key</p><p>Each pair runs its own handshake. A relay learns nothing about the group.</p></div>
+      <div><p class="grp-after-h">Lists only move forward</p><p>Each new list carries a higher number. A removed device cannot come back.</p></div>
+    </div>
+  </figure>
+  <a class="more" href="/how-it-works#groups">How groups work</a>
 </section>
 
 <section id="uses" class="band wrap" aria-labelledby="h-uses">
@@ -310,157 +461,6 @@
     </li>
   </ul>
   <a class="more" href="/use-cases">See the use cases</a>
-</section>
-
-<section id="groups" class="band wrap" aria-labelledby="h-groups">
-  <h2 id="h-groups">Up to 32 devices, each paired once.</h2>
-  <p class="sub">One device roots the group and signs a list of who is in and what each may do. Members check each other against it and link directly, each pair with its own keys.</p>
-  <figure class="grp" data-grp>
-    <div class="grp-stage">
-      <p class="grp-status" aria-hidden="true"><span class="grp-n" data-grp-n>04</span><span class="grp-l" data-grp-l>one is removed</span><span class="grp-s" data-grp-s>server cut off from every member</span></p>
-      <svg class="fd grp-svg" viewBox="0 0 360 240" role="img" aria-label="A group of five devices. The Mac mini is the root. The phone, laptop, NAS and server each paired once with it, and hold the list it signed. The members link to each other directly, the phone to the NAS through a relay. The server has been removed: the root signed list version 2, and every link to the server is cut.">
-        <g>
-          <path class="gl is-quiet" data-l="s0" d="M168 46 56 96"/>
-          <path class="gl is-quiet" data-l="s1" d="M192 46 304 96"/>
-          <path class="gl is-quiet" data-l="s2" d="M174 46 84 190"/>
-          <path class="gl is-cut" data-l="s3" d="M186 46 276 190"/>
-          <path class="gl is-win" data-l="m0" d="M104 116H256"/>
-          <path class="gl is-win" data-l="m1" d="M256 130 104 196"/>
-          <path class="gl is-win gl-relay" data-l="m2" d="M56 136V190"/>
-          <path class="gl is-cut" data-l="m3" d="M104 210H256"/>
-          <path class="gl is-cut" data-l="m4" d="M304 136V190"/>
-          <path class="gl is-cut" data-l="m5" d="M104 130 256 196"/>
-        </g>
-        <g data-grp-pk></g>
-        <g class="grp-relay" data-grp-relay><rect class="b-gap" x="26" y="155" width="60" height="16"/><text class="t-xs" x="56" y="167" text-anchor="middle">relay</text></g>
-        <g class="grp-pill" data-grp-pill><rect class="b-gap" x="124" y="64" width="112" height="18"/><text class="t-xs t-acc" x="180" y="77" text-anchor="middle" data-grp-pilltext>list v2 · signed</text></g>
-        <g class="gd" data-d="root">
-          <rect class="b b-acc" x="132" y="6" width="96" height="40"/>
-          <text class="t-s t-strong" x="180" y="23" text-anchor="middle">Mac mini</text>
-          <text class="t-xs t-acc" x="180" y="38" text-anchor="middle">root · signs</text>
-          <rect class="sq gm" x="218" y="10" width="6" height="6"/>
-        </g>
-        <g class="gd" data-d="phone">
-          <rect class="b" x="8" y="96" width="96" height="40"/>
-          <text class="t-s t-strong" x="56" y="113" text-anchor="middle">phone</text>
-          <text class="t-xs t-mut" x="56" y="128" text-anchor="middle" data-r>member · away</text>
-          <rect class="sq gm" x="94" y="100" width="6" height="6"/>
-        </g>
-        <g class="gd" data-d="laptop">
-          <rect class="b" x="256" y="96" width="96" height="40"/>
-          <text class="t-s t-strong" x="304" y="113" text-anchor="middle">laptop</text>
-          <text class="t-xs t-mut" x="304" y="128" text-anchor="middle" data-r>member</text>
-          <rect class="sq gm" x="342" y="100" width="6" height="6"/>
-        </g>
-        <g class="gd" data-d="nas">
-          <rect class="b" x="8" y="190" width="96" height="40"/>
-          <text class="t-s t-strong" x="56" y="207" text-anchor="middle">NAS</text>
-          <text class="t-xs t-mut" x="56" y="222" text-anchor="middle" data-r>member</text>
-          <rect class="sq gm" x="94" y="194" width="6" height="6"/>
-        </g>
-        <g class="gd is-gone" data-d="server">
-          <rect class="b" x="256" y="190" width="96" height="40"/>
-          <text class="t-s t-strong" x="304" y="207" text-anchor="middle">server</text>
-          <text class="t-xs t-mut" x="304" y="222" text-anchor="middle" data-r>removed</text>
-          <rect class="sq gm" x="342" y="194" width="6" height="6"/>
-        </g>
-      </svg>
-      <ol class="grp-phases" aria-label="What the diagram shows">
-        <li data-p="1"><span class="n">01</span>Each device pairs once, with the root</li>
-        <li data-p="2"><span class="n">02</span>The root signs the list. It lands on every member</li>
-        <li data-p="3"><span class="n">03</span>Members link directly, the phone to the NAS through a relay</li>
-        <li data-p="4" class="is-now"><span class="n">04</span>The server is removed. A new list cuts its links everywhere</li>
-      </ol>
-    </div>
-    <div class="grp-foot">
-      <p class="caption faint grp-note"><span>Illustrative. Links open when there is something to send, over any path.</span><span class="grp-key" aria-hidden="true"><i></i>handshake<i class="key-list"></i>signed list<i class="key-pk"></i>sealed data</span></p>
-      <button class="play grp-play" type="button" data-grp-play hidden>Pause</button>
-    </div>
-    <div class="grp-after">
-      <div><p class="grp-after-h"><span class="grp-big">31</span> pairings, not <span class="grp-big">496</span></p><p>At 32 devices, each pairs once with the root, not with every other member.</p></div>
-      <div><p class="grp-after-h">No group key</p><p>Each pair runs its own handshake. A relay learns nothing about the group.</p></div>
-      <div><p class="grp-after-h">Lists only move forward</p><p>Each new list carries a higher number. A removed device cannot come back.</p></div>
-    </div>
-  </figure>
-  <a class="more" href="/how-it-works#groups">How groups work</a>
-</section>
-
-<section id="paths" class="band wrap" aria-labelledby="h-paths">
-  <h2 id="h-paths">Six ways to connect, nearest first.</h2>
-  <p class="sub">Every path is untrusted. A path counts only once the other device proves who it is inside the handshake, so a captive portal or a wrong host that answers never wins.</p>
-  <figure class="net" data-net>
-    <svg class="net-defs" aria-hidden="true" focusable="false">
-      <symbol id="ni-laptop" viewBox="0 0 32 32"><path d="M7 8.5h18v12H7zM3.5 24.5h25"/></symbol>
-      <symbol id="ni-phone" viewBox="0 0 32 32"><path d="M10.5 3.5h11v25h-11zM14 25h4"/></symbol>
-      <symbol id="ni-browser" viewBox="0 0 32 32"><path d="M4.5 6.5h23v19h-23zM4.5 11.5h23M7.5 9h2"/></symbol>
-    </svg>
-    <div class="net-pick" role="tablist" aria-label="Scenario" hidden>
-      <button type="button" role="tab" id="nt-lan" aria-controls="np-lan" aria-selected="true" data-scene="0"><span class="n">01</span>Same network</button>
-      <button type="button" role="tab" id="nt-wan" aria-controls="np-wan" aria-selected="false" tabindex="-1" data-scene="1"><span class="n">02</span>Across the internet</button>
-      <button type="button" role="tab" id="nt-nat" aria-controls="np-nat" aria-selected="false" tabindex="-1" data-scene="2"><span class="n">03</span>Strict NAT or firewall</button>
-      <button type="button" role="tab" id="nt-move" aria-controls="np-move" aria-selected="false" tabindex="-1" data-scene="3"><span class="n">04</span>Network changes</button>
-      <button type="button" role="tab" id="nt-web" aria-controls="np-web" aria-selected="false" tabindex="-1" data-scene="4"><span class="n">05</span>In a browser</button>
-    </div>
-    <div class="net-stage" role="img" aria-label="Diagram of the six paths between two devices, ranked nearest first">
-      <div class="net-dev" data-dev="a">
-        <svg class="net-ic" viewBox="0 0 32 32" aria-hidden="true"><use href="#ni-phone" data-dev-ic/></svg>
-        <span class="net-dev-n" data-dev-name>phone</span>
-        <span class="net-dev-r" data-dev-role>client</span>
-        <span class="net-dev-w" data-dev-net>home Wi-Fi</span>
-      </div>
-      <svg class="net-fan" data-fan="a" viewBox="0 0 56 240" aria-hidden="true"><path class="is-idle" d="M7 120C31 120 32 28.5 56 28.5"/><path class="is-win" d="M7 120C31 120 32 68.5 56 68.5"/><path class="is-idle" d="M7 120C31 120 32 108.5 56 108.5"/><path class="is-idle" d="M7 120C31 120 32 148.5 56 148.5"/><path class="is-idle" d="M7 120C31 120 32 188.5 56 188.5"/><path class="is-idle" d="M7 120C31 120 32 228.5 56 228.5"/><rect class="port-a" x="0.5" y="116.5" width="7" height="7"/></svg>
-      <ol class="net-lanes">
-        <li class="lane is-idle" data-lane="local"><span class="lane-k"><span class="lane-n">01</span>local <span class="lane-d">same machine</span></span><span class="lane-s">other machine</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
-        <li class="lane is-win" data-lane="direct"><span class="lane-k"><span class="lane-n">02</span>direct <span class="lane-d">home or office LAN</span></span><span class="lane-s">in use</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
-        <li class="lane is-idle" data-lane="overlay"><span class="lane-k"><span class="lane-n">03</span>overlay <span class="lane-d">an existing tailnet</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
-        <li class="lane is-idle" data-lane="p2p"><span class="lane-k"><span class="lane-n">04</span>p2p <span class="lane-d">hole punching via iroh</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
-        <li class="lane is-idle" data-lane="relay"><span class="lane-k"><span class="lane-n">05</span>relay <span class="lane-d">blind, sealed packets</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i><span class="lane-box">relay</span></span></li>
-        <li class="lane is-idle" data-lane="broker"><span class="lane-k"><span class="lane-n">06</span>broker <span class="lane-d">WebSocket via a proxy</span></span><span class="lane-s">not used</span><span class="lane-t"><i class="lane-probe"></i><i class="lane-bar"></i></span></li>
-      </ol>
-      <svg class="net-fan" data-fan="b" viewBox="0 0 56 240" aria-hidden="true"><path class="is-idle" d="M49 120C25 120 24 28.5 0 28.5"/><path class="is-win" d="M49 120C25 120 24 68.5 0 68.5"/><path class="is-idle" d="M49 120C25 120 24 108.5 0 108.5"/><path class="is-idle" d="M49 120C25 120 24 148.5 0 148.5"/><path class="is-idle" d="M49 120C25 120 24 188.5 0 188.5"/><path class="is-idle" d="M49 120C25 120 24 228.5 0 228.5"/><rect class="port-b" x="48.5" y="116.5" width="7" height="7"/></svg>
-      <div class="lane lane-pair"><span class="lane-k">pairing <span class="lane-d">held by the devices, not the path</span></span><span class="lane-s" data-pair>paired</span><span class="lane-t"></span></div>
-      <div class="net-dev" data-dev="b">
-        <svg class="net-ic" viewBox="0 0 32 32" aria-hidden="true"><use href="#ni-laptop"/></svg>
-        <span class="net-dev-n">laptop</span>
-        <span class="net-dev-r">host</span>
-        <span class="net-dev-w">home network</span>
-      </div>
-    </div>
-    <div class="net-foot">
-      <div class="net-caps">
-        <div class="net-cap" id="np-lan">
-          <p><span class="net-cap-k">Same network. </span>On one network, the direct path proves the other device first and wins.</p>
-          <p class="vh">The phone and the laptop share a home network. Local does not apply, as they are different machines. The direct path completes the handshake and is in use. Overlay, peer-to-peer, relay and broker are not used.</p>
-        </div>
-        <div class="net-cap" id="np-wan">
-          <p><span class="net-cap-k">Across the internet. </span>Away from home, the direct path fails and hole punching through iroh wins.</p>
-          <p class="vh">A phone on mobile data reaches the laptop at home. Local does not apply. On the direct path a wrong host answers and fails the handshake, so it does not count. There is no tailnet. The peer-to-peer path through iroh completes the handshake and is in use.</p>
-        </div>
-        <div class="net-cap" id="np-nat">
-          <p><span class="net-cap-k">Strict NAT or firewall. </span>When nothing direct gets through, a relay carries sealed packets it cannot read.</p>
-          <dl class="net-sees">
-            <div><dt>The relay sees</dt><dd>IP addresses, timing, sizes, a mailbox key</dd></div>
-            <div><dt>It cannot see</dt><dd>Your data, grants, device names, the pairing code</dd></div>
-          </dl>
-          <p class="vh">A phone on an office network reaches the laptop at home. The direct path and the peer-to-peer path are blocked, and there is no tailnet. The relay path is in use. The broker path is not used.</p>
-        </div>
-        <div class="net-cap" id="np-move">
-          <p><span class="net-cap-k">Network changes. </span>The phone leaves Wi-Fi, so the devices handshake again on another path and keep their pairing.</p>
-          <p class="vh">A phone on home Wi-Fi uses the direct path to the laptop. The phone moves to mobile data and the direct path drops. The devices handshake again, and the peer-to-peer path is now in use. The pairing is the same, with no new pairing needed.</p>
-        </div>
-        <div class="net-cap" id="np-web">
-          <p><span class="net-cap-k">In a browser. </span>A browser tab joins only as a client. It races the routes a browser can dial, a relay, a broker or p2p through an iroh relay, and here the relay wins.</p>
-          <dl class="net-sees">
-            <div><dt>The relay sees</dt><dd>IP addresses, timing, sizes, a mailbox key</dd></div>
-            <div><dt>It cannot see</dt><dd>Your data, grants, device names, the pairing code</dd></div>
-          </dl>
-          <p class="vh">A browser tab reaches the laptop through the relay path, which is in use. Local, direct and overlay are not available in a browser. The broker path is available, through a secure WebSocket, but not needed here. With the opt-in p2p build, a tab can also take the p2p path, but only through an iroh relay, as a browser cannot open UDP sockets.</p>
-        </div>
-      </div>
-      <button class="play net-play" type="button" data-net-play hidden>Pause</button>
-    </div>
-    <p class="caption faint net-note"><span>Illustrative. Device names, networks and timing are examples.</span><span class="net-key" aria-hidden="true"><i></i>handshake<i class="key-pk"></i>sealed data</span></p>
-  </figure>
 </section>
 
 <section class="band wrap" aria-labelledby="h-stack">
