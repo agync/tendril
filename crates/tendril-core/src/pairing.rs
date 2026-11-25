@@ -612,13 +612,14 @@ fn is_lan_direct_literal(ep: &str) -> bool {
         .is_some_and(|s| is_lan_or_loopback_ip(s.ip()))
 }
 
-/// Hints a `Lan2Group` code may never be paired with.
+/// Hints a `Lan2Group` code may never be paired with: every hint but IPC and a `direct:` or bare
+/// loopback or LAN IP literal.
 fn is_remote_for_lan_code(ep: &str) -> bool {
     match provider_of_valid_hint(ep) {
         ProviderId::Local => false,
-        ProviderId::Direct => direct_target(ep)
+        ProviderId::Direct => !direct_target(ep)
             .parse::<SocketAddr>()
-            .is_ok_and(|s| !is_lan_or_loopback_ip(s.ip())),
+            .is_ok_and(|s| is_lan_or_loopback_ip(s.ip())),
         _ => true,
     }
 }
@@ -1091,6 +1092,9 @@ impl PairingUri {
         let Ok((signed, Some(route_seq))) = Self::parse_body(prefix, true) else {
             return RouteCheck::Invalid;
         };
+        if !signed.same_public_fields(self) {
+            return RouteCheck::Invalid;
+        }
         if key.sha256_hash() != signed.host_signing_pub_hash {
             return if session {
                 RouteCheck::Invalid
@@ -1247,6 +1251,161 @@ impl RouteCheck {
             Self::Verified(s) => Some(s),
             _ => None,
         }
+    }
+}
+
+/// The pairing URI and operator relay key a pairing initiator checks the verified host
+/// against before `msg3` (spec 6.5 steps 2-3).
+#[derive(Debug, Clone, Default)]
+pub struct PairRouteBinding {
+    uri: Option<PairingUri>,
+    operator_relay_key: Option<[u8; 32]>,
+}
+
+impl PairRouteBinding {
+    /// Binds `uri` and the operator `URL#key`. Fails with `InvalidPairingUri` when both name a
+    /// relay key and the keys differ.
+    pub fn new(
+        uri: Option<PairingUri>,
+        operator_relay_key: Option<[u8; 32]>,
+    ) -> Result<Self, CoreError> {
+        if let (Some(op), Some(rp)) = (operator_relay_key, uri.as_ref().and_then(|u| u.relay_pub))
+            && op != rp
+        {
+            return Err(CoreError::InvalidPairingUri(
+                "operator relay key does not match the URI rp".into(),
+            ));
+        }
+        Ok(Self {
+            uri,
+            operator_relay_key,
+        })
+    }
+
+    /// The host pin `msg2` is verified against: the bound URI's pin (`k`, `sh`, `id`, `seq`)
+    /// merged with `pinned`, so a URI binding never lets an unrelated host key through. A
+    /// `pinned` host that names another host is `HostKeyUnverified`.
+    pub(crate) fn host_pin(
+        &self,
+        pinned: Option<&PinnedHost>,
+    ) -> Result<Option<PinnedHost>, CoreError> {
+        match (pinned, &self.uri) {
+            (Some(pin), Some(uri)) => merge_uri_pin(pin, uri)
+                .map(Some)
+                .ok_or(CoreError::HostKeyUnverified),
+            (pin, None) => Ok(pin.cloned()),
+            (None, Some(uri)) => Ok(Some(uri.to_pinned_host())),
+        }
+    }
+
+    /// Checks a binding set on an initiator that already holds `pinned`.
+    pub(crate) fn check_pin(&self, pinned: Option<&PinnedHost>) -> Result<(), CoreError> {
+        self.host_pin(pinned).map(|_| ()).map_err(|_| {
+            CoreError::InvalidPairingUri("pairing URI does not match the pinned host".into())
+        })
+    }
+
+    /// Binds `uri` without an operator relay key, which cannot disagree.
+    pub(crate) fn from_uri(uri: &PairingUri) -> Self {
+        Self {
+            uri: Some(uri.clone()),
+            operator_relay_key: None,
+        }
+    }
+
+    /// The bound pairing URI.
+    #[must_use]
+    pub const fn uri(&self) -> Option<&PairingUri> {
+        self.uri.as_ref()
+    }
+
+    /// Checks `rp` and the operator relay key against the Ed25519 half of `host_signing_pub`,
+    /// and the route statement against the whole key.
+    #[must_use]
+    pub fn verdict(&self, host_signing_pub: &HybridSigningPublicKey) -> PairRouteVerdict {
+        let ed = host_signing_pub.ed25519_bytes();
+        let relay_pub_ok = self
+            .uri
+            .as_ref()
+            .is_none_or(|u| u.check_relay_pub(host_signing_pub).is_ok())
+            && self.operator_relay_key.is_none_or(|k| k == *ed);
+        let check = self
+            .uri
+            .as_ref()
+            .map_or(RouteCheck::Unsigned(UnsignedReason::Absent), |u| {
+                u.verify_route_statement(host_signing_pub)
+            });
+        PairRouteVerdict {
+            relay_pub_ok,
+            check,
+        }
+    }
+}
+
+/// The stricter of `pin` and `uri`'s pin when both name the same host, else `None`.
+///
+/// They agree on the static key `k`; on the signing key when `pin`'s full key or hash matches
+/// `sh`; on `id` when either omits it or both are equal; and on `seq` when the URI omits it or
+/// both are equal. The merge keeps `pin`'s signing pin (a full key is stricter than `sh`), the
+/// `id` either side names and `pin`'s `seq`.
+fn merge_uri_pin(pin: &PinnedHost, uri: &PairingUri) -> Option<PinnedHost> {
+    if pin.static_pub != uri.host_static_pub {
+        return None;
+    }
+    let signing_agrees = match &pin.signing_pin {
+        SigningKeyPin::Full(key) => key.sha256_hash() == uri.host_signing_pub_hash,
+        SigningKeyPin::Hash(hash) => *hash == uri.host_signing_pub_hash,
+    };
+    if !signing_agrees {
+        return None;
+    }
+    let host_id = match (&pin.host_id, &uri.host_id) {
+        (Some(a), Some(b)) if a != b => return None,
+        (a, b) => a.clone().or_else(|| b.clone()),
+    };
+    if uri.rotation_seq.is_some_and(|seq| seq != pin.rotation_seq) {
+        return None;
+    }
+    Some(PinnedHost {
+        host_id,
+        static_pub: pin.static_pub,
+        signing_pin: pin.signing_pin.clone(),
+        rotation_seq: pin.rotation_seq,
+    })
+}
+
+/// The pre-`msg3` route verdict of one verified host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairRouteVerdict {
+    relay_pub_ok: bool,
+    check: RouteCheck,
+}
+
+impl PairRouteVerdict {
+    /// `rp` and the operator relay key, when present, name the host's Ed25519 key.
+    #[must_use]
+    pub const fn relay_pub_ok(&self) -> bool {
+        self.relay_pub_ok
+    }
+
+    /// The route statement result.
+    #[must_use]
+    pub const fn route_check(&self) -> &RouteCheck {
+        &self.check
+    }
+
+    /// The route check when `msg3` may be written: `HostKeyUnverified` on a relay key mismatch
+    /// (checked first), `InvalidPairingUri` on an invalid route statement.
+    pub fn committable(&self) -> Result<&RouteCheck, CoreError> {
+        if !self.relay_pub_ok {
+            return Err(CoreError::HostKeyUnverified);
+        }
+        if matches!(self.check, RouteCheck::Invalid) {
+            return Err(CoreError::InvalidPairingUri(
+                "route statement does not verify".into(),
+            ));
+        }
+        Ok(&self.check)
     }
 }
 
@@ -2037,17 +2196,24 @@ impl PairingManager {
     }
 }
 
+/// Link-local, unspecified, multicast or cloud metadata, judged after [`unmapped`], plus the
+/// IPv6 embeddings whose IPv4 target is not fixed: local-use NAT64 `64:ff9b:1::/48` and Teredo
+/// `2001::/32`.
 fn is_disallowed_hint_ip(ip: IpAddr) -> bool {
-    match ip {
+    match unmapped(ip) {
         IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified() || v4.is_multicast(),
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_disallowed_hint_ip(IpAddr::V4(mapped));
-            }
             let seg = v6.segments();
             let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
             let is_aws_metadata = v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
-            is_link_local || is_aws_metadata || v6.is_unspecified() || v6.is_multicast()
+            let is_local_nat64 = seg[..3] == [0x0064, 0xff9b, 0x0001];
+            let is_teredo = seg[..2] == [0x2001, 0];
+            is_link_local
+                || is_aws_metadata
+                || is_local_nat64
+                || is_teredo
+                || v6.is_unspecified()
+                || v6.is_multicast()
         }
     }
 }
@@ -2128,7 +2294,7 @@ fn is_valid_url_hint(url: &str, secure_scheme: &str, loopback_scheme: &str) -> b
         return false;
     }
     if let Some(ip) = normalized_url_host_ip(url)
-        && is_disallowed_hint_ip(unmapped(ip))
+        && is_disallowed_hint_ip(ip)
     {
         return false;
     }
@@ -2874,6 +3040,8 @@ pub struct PairingInitiator {
     v2_floored_static_pubs: BTreeSet<[u8; 32]>,
     v2_floored_host_ids: BTreeSet<String>,
     deferred_claim: bool,
+    route_binding: PairRouteBinding,
+    route_verdict: Option<PairRouteVerdict>,
     #[cfg(any(test, feature = "test-utils"))]
     key_claim_tamper: Option<KeyClaimTamper>,
 }
@@ -3001,6 +3169,8 @@ impl PairingInitiator {
             v2_floored_static_pubs: BTreeSet::new(),
             v2_floored_host_ids: BTreeSet::new(),
             deferred_claim: false,
+            route_binding: PairRouteBinding::default(),
+            route_verdict: None,
             #[cfg(any(test, feature = "test-utils"))]
             key_claim_tamper: None,
         })
@@ -3050,6 +3220,43 @@ impl PairingInitiator {
         self
     }
 
+    /// Binds the pairing URI and operator relay key whose `rp`, operator key and route statement
+    /// checks gate `msg3`. A bound URI's host pin is enforced at `msg2`: it is the pin when none
+    /// was given, and a different pinned host refuses `msg2` with `HostKeyUnverified`.
+    #[must_use]
+    pub fn with_route_binding(mut self, binding: PairRouteBinding) -> Self {
+        self.route_binding = binding;
+        self
+    }
+
+    /// Binds `uri` alone, as [`Self::with_route_binding`].
+    #[must_use]
+    pub fn with_pairing_uri(self, uri: &PairingUri) -> Self {
+        self.with_route_binding(PairRouteBinding::from_uri(uri))
+    }
+
+    /// Replaces the route binding. Fails with `NotReady` once `msg2` was accepted, and with
+    /// `InvalidPairingUri` when the URI's host pin differs from the pinned host.
+    pub fn set_route_binding(&mut self, binding: PairRouteBinding) -> Result<(), CoreError> {
+        if !matches!(
+            self.phase,
+            InitiatorPhase::Init(_) | InitiatorPhase::AwaitMsg2(_)
+        ) {
+            return Err(CoreError::NotReady(
+                "pairing route binding is set before msg2",
+            ));
+        }
+        binding.check_pin(self.pinned_host.as_ref())?;
+        self.route_binding = binding;
+        Ok(())
+    }
+
+    /// The route verdict of the verified host, from `msg2` acceptance on.
+    #[must_use]
+    pub const fn route_verdict(&self) -> Option<&PairRouteVerdict> {
+        self.route_verdict.as_ref()
+    }
+
     /// Returns `true` while a verified `msg2` waits for [`Self::commit_claim`].
     #[must_use]
     pub const fn is_awaiting_commit(&self) -> bool {
@@ -3087,7 +3294,8 @@ impl PairingInitiator {
 
     /// Builds and returns the `msg3` claim of a deferred initiator from this handshake's `h`.
     ///
-    /// Fails with `NotReady` before a verified `msg2` or when called twice.
+    /// Fails with `NotReady` before a verified `msg2` or when called twice. A failed route
+    /// verdict returns its error and closes the initiator without `msg3`.
     pub fn commit_claim(&mut self) -> Result<Vec<PairAction>, CoreError> {
         if !self.is_awaiting_commit() {
             return Err(CoreError::NotReady(
@@ -3101,6 +3309,10 @@ impl PairingInitiator {
                 "pairing initiator is not awaiting commit",
             ));
         };
+        self.route_verdict
+            .as_ref()
+            .ok_or(CoreError::HostKeyUnverified)?
+            .committable()?;
         let mut actions = Vec::new();
         self.write_claim(hs, host, &mut actions)?;
         Ok(actions)
@@ -3161,7 +3373,7 @@ impl PairingInitiator {
             verified_seq: host.verified_seq,
             presented_rotation: host.presented_rotation,
             pairing_sas: host.pairing_sas,
-            host_pin_verified: self.pinned_host.is_some(),
+            host_pin_verified: host.verified_seq.is_some(),
         };
         Ok(())
     }
@@ -3212,6 +3424,8 @@ impl PairingInitiator {
             v2_floored_static_pubs: BTreeSet::new(),
             v2_floored_host_ids: BTreeSet::new(),
             deferred_claim: false,
+            route_binding: PairRouteBinding::default(),
+            route_verdict: None,
             #[cfg(any(test, feature = "test-utils"))]
             key_claim_tamper: None,
         })
@@ -3359,7 +3573,8 @@ impl PairingInitiator {
                 }
 
                 let mut verified_seq = None;
-                if let Some(pin) = &self.pinned_host {
+                let pin = self.route_binding.host_pin(self.pinned_host.as_ref())?;
+                if let Some(pin) = &pin {
                     if let Some(ref exp_id) = pin.host_id
                         && exp_id != &host_hello.host_id
                     {
@@ -3416,9 +3631,15 @@ impl PairingInitiator {
                     presented_rotation: host_hello.rotation,
                     pairing_sas: sas,
                 };
+                let verdict = self.route_binding.verdict(&host.verified_host_signing_pub);
+                let refusal = verdict.committable().err();
+                self.route_verdict = Some(verdict);
                 if self.deferred_claim {
                     self.phase = InitiatorPhase::AwaitCommit { hs, host };
                     return Ok(());
+                }
+                if let Some(err) = refusal {
+                    return Err(err);
                 }
                 self.write_claim(hs, host, actions)
             }
@@ -4004,6 +4225,118 @@ mod tests {
             unmapped("::1".parse().unwrap()),
             "::1".parse::<IpAddr>().unwrap()
         );
+    }
+
+    fn uri_with(code: &str, hints: &[&str]) -> PairingUri {
+        let host = EndpointIdentity::from_keys(
+            crate::crypto::StaticKeypair::from_scalar([0x11; 32]),
+            crate::crypto::SigningKeypair::from_seed([0x22; 32]),
+        );
+        PairingUri::new(
+            "Studio",
+            code,
+            *host.static_key().public_bytes(),
+            host.signing_key().signing_pub_hash(),
+            hints.iter().map(|h| (*h).to_owned()).collect(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn parse_rejects_disallowed_ipv4_embeddings_in_host_port_hints() {
+        for hint in [
+            "direct:[64:ff9b::a9fe:a9fe]:9000",
+            "direct:[2002:a9fe:a9fe::1]:9000",
+            "[::ffff:0:a9fe:a9fe]:9000",
+            "overlay://[64:ff9b::e000:1]:7000",
+            "overlay://[::a9fe:a9fe]:1",
+            "iroh://n?addr=[64:ff9b::a9fe:a9fe]:1",
+            "direct:[::]:9000",
+            "direct:[64:ff9b:1::cb00:7107]:9000",
+            "[64:ff9b:1::1]:9000",
+            "wss://[64:ff9b:1::1]/v1/relay",
+            "direct:[2001:0:4136:e378:8000:63bf:3fff:fdd2]:9000",
+            "[2001::1]:9000",
+            "wss://[2001::1]/v1/relay",
+            "overlay://[2001::1]:7000",
+        ] {
+            assert!(!is_valid_pairing_endpoint_hint(hint), "{hint}");
+            let uri = uri_with("TND-ABCD-EFGH-JKLM", &[hint]);
+            assert!(
+                matches!(uri.try_encode(), Err(CoreError::InvalidPairingUri(_))),
+                "{hint}"
+            );
+        }
+        for hint in [
+            "direct:[64:ff9b::cb00:7107]:9000",
+            "direct:[2002:cb00:7107::1]:9000",
+            "direct:[::1]:9000",
+            "direct:[2001:db8::1]:9000",
+            "direct:[64:ff9b:2::1]:9000",
+        ] {
+            assert!(is_valid_pairing_endpoint_hint(hint), "{hint}");
+            let encoded = uri_with("TND-ABCD-EFGH-JKLM", &[hint]).try_encode();
+            assert!(PairingUri::parse(&encoded.unwrap()).is_ok(), "{hint}");
+        }
+    }
+
+    #[test]
+    fn uri_pin_merge_keeps_the_stricter_pin() {
+        let host = EndpointIdentity::from_keys(
+            crate::crypto::StaticKeypair::from_scalar([0x11; 32]),
+            crate::crypto::SigningKeypair::from_seed([0x22; 32]),
+        );
+        let mut uri = uri_with("TND-ABCD-EFGH-JKLM", &["direct:192.168.1.5:7000"]);
+        uri.host_id = Some("host-a".into());
+        uri.rotation_seq = Some(0);
+        let full = PinnedHost::with_full_key(
+            None,
+            *host.static_key().public_bytes(),
+            host.signing_key().public_key().clone(),
+            2,
+        );
+        assert!(
+            merge_uri_pin(&full, &uri).is_none(),
+            "URI seq 0 against pin seq 2"
+        );
+        uri.rotation_seq = None;
+        let merged = merge_uri_pin(&full, &uri).unwrap();
+        assert_eq!(merged.host_id.as_deref(), Some("host-a"));
+        assert_eq!(merged.rotation_seq, 2);
+        assert!(matches!(merged.signing_pin, SigningKeyPin::Full(_)));
+        let binding = PairRouteBinding::from_uri(&uri);
+        assert_eq!(binding.host_pin(Some(&full)), Ok(Some(merged)));
+        assert_eq!(binding.host_pin(None), Ok(Some(uri.to_pinned_host())));
+        let mut other_id = full.clone();
+        other_id.host_id = Some("host-b".into());
+        assert_eq!(
+            binding.host_pin(Some(&other_id)),
+            Err(CoreError::HostKeyUnverified)
+        );
+    }
+
+    #[test]
+    fn lan_code_rejects_named_direct_hints() {
+        for hint in [
+            "direct:host.lan:7000",
+            "host.lan:7000",
+            "direct:8.8.8.8:7000",
+        ] {
+            assert!(
+                matches!(
+                    uri_with("TND-ABCD-EFGH", &[hint]).try_encode(),
+                    Err(CoreError::InvalidPairingUri(_))
+                ),
+                "{hint}"
+            );
+        }
+        for hint in ["direct:192.168.1.5:7000", "192.168.1.5:7000"] {
+            let encoded = uri_with("TND-ABCD-EFGH", &[hint]).try_encode().unwrap();
+            assert!(PairingUri::parse(&encoded).is_ok(), "{hint}");
+        }
+        let remote = uri_with("TND-ABCD-EFGH-JKLM", &["direct:host.lan:7000"]);
+        assert!(PairingUri::parse(&remote.try_encode().unwrap()).is_ok());
     }
 
     #[test]

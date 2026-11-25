@@ -1,4 +1,168 @@
 {
+  "pairing_route_check": {
+    "cases": [
+      {
+        "commit_error": null,
+        "name": "verified",
+        "pin_ok": true,
+        "presented_ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",
+        "presented_rotation_seq": 0,
+        "presented_signing_pub_sha256_hex": "3ffc120506bd774a15d6f305d67d5d06c479fc2d8c2cf7549963b276f2779f0c",
+        "presented_static_pub_hex": "4049502db92ca2342c3f92dac5d6de7c85db5df5407a5b4996ce39f2efb7e827",
+        "relay_pub_ok": true,
+        "responder": "uri_key",
+        "route_check": "verified",
+        "uri": "tendril://pair?v=1&host=Studio%20Host&code=TND-ABCD-EFGH-JKLM&k=QElQLbksojQsP5LaxdbefIXbXfVAeltJls458u-36Cc&sh=P_wSBQa9d0oV1vMF1n1dBsR5_C2MLPdUmWOydvJ3nww&id=dev_21469e52ecee69ca&seq=0&rp=LfBBJfABWvtHzoU674dyCU_5SYwUyxueEpc8KSfaD6Y&ep=direct%3A192.168.1.20%3A9100,wss%3A%2F%2Frelay.example.com%2Fv1%2Frelay&rq=7&rs=lPfHf8D9yj6pb0yaLi2fFXnz5NhWXKZ6QqTSKCYOixYx5meVitn7Bj0YUdwe0kX60XeQTipyaTBRI7ux-CUeDg",
+        "wires": [
+          "v1",
+          "v2"
+        ]
+      },
+      {
+        "commit_error": null,
+        "name": "unsigned",
+        "pin_ok": true,
+        "presented_ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",
+        "presented_rotation_seq": 0,
+        "presented_signing_pub_sha256_hex": "3ffc120506bd774a15d6f305d67d5d06c479fc2d8c2cf7549963b276f2779f0c",
+        "presented_static_pub_hex": "4049502db92ca2342c3f92dac5d6de7c85db5df5407a5b4996ce39f2efb7e827",
+        "relay_pub_ok": true,
+        "responder": "uri_key",
+        "route_check": "unsigned",
+        "uri": "tendril://pair?v=1&host=Studio%20Host&code=TND-ABCD-EFGH-JKLM&k=QElQLbksojQsP5LaxdbefIXbXfVAeltJls458u-36Cc&sh=P_wSBQa9d0oV1vMF1n1dBsR5_C2MLPdUmWOydvJ3nww&id=dev_21469e52ecee69ca&seq=0&rp=LfBBJfABWvtHzoU674dyCU_5SYwUyxueEpc8KSfaD6Y&ep=direct%3A192.168.1.20%3A9100,wss%3A%2F%2Frelay.example.com%2Fv1%2Frelay",
+        "wires": [
+          "v1",
+          "v2"
+        ]
+      },
+      {
+        "commit_error": null,
+        "name": "route_key_rotated",
+        "pin_ok": true,
+        "presented_ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",
+        "presented_rotation_seq": 1,
+        "presented_signing_pub_sha256_hex": "3ffc120506bd774a15d6f305d67d5d06c479fc2d8c2cf7549963b276f2779f0c",
+        "presented_static_pub_hex": "4049502db92ca2342c3f92dac5d6de7c85db5df5407a5b4996ce39f2efb7e827",
+        "relay_pub_ok": true,
+        "responder": "rotated_from_uri_key",
+        "route_check": "route_key_rotated",
+        "uri": "tendril://pair?v=1&host=Studio%20Host&code=TND-ABCD-EFGH-JKLM&k=az1Xdi-LrbaUM_nG0GD4X15ca2gDqBbRQcB19jVBrRA&sh=Sq-gz0HdcrK-idbvdl8ivNibE6Ys1_7A1e3VqdDAwcA&id=dev_96e6c1ecaa2009c7&seq=0&ep=direct%3A192.168.1.20%3A9100&rq=7&rs=sFDFXBYKXNHvDMxhxMZwLSbN-vvUTkA0Kj8fXfQhQvgLnRu2XM5Dk_8VVeBZF-OPIFOfYiSxnWIkrSVDEgBZBA",
+        "wires": [
+          "v1",
+          "v2"
+        ]
+      },
+      {
+        "commit_error": null,
+        "name": "route_key_rotated_stale_rs",
+        "pin_ok": true,
+        "presented_ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",
+        "presented_rotation_seq": 1,
+        "presented_signing_pub_sha256_hex": "3ffc120506bd774a15d6f305d67d5d06c479fc2d8c2cf7549963b276f2779f0c",
+        "presented_static_pub_hex": "4049502db92ca2342c3f92dac5d6de7c85db5df5407a5b4996ce39f2efb7e827",
+        "relay_pub_ok": true,
+        "responder": "rotated_from_uri_key",
+        "route_check": "route_key_rotated",
+        "uri": "tendril://pair?v=1&host=Studio%20Host&code=TND-ABCD-EFGH-JKLM&k=az1Xdi-LrbaUM_nG0GD4X15ca2gDqBbRQcB19jVBrRA&sh=Sq-gz0HdcrK-idbvdl8ivNibE6Ys1_7A1e3VqdDAwcA&id=dev_96e6c1ecaa2009c7&seq=0&ep=direct%3A192.168.1.21%3A9100&rq=7&rs=sFDFXBYKXNHvDMxhxMZwLSbN-vvUTkA0Kj8fXfQhQvgLnRu2XM5Dk_8VVeBZF-OPIFOfYiSxnWIkrSVDEgBZBA",
+        "wires": [
+          "v1",
+          "v2"
+        ]
+      },
+      {
+        "commit_error": "invalid_pairing_uri",
+        "name": "invalid_rs",
+        "pin_ok": true,
+        "presented_ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",
+        "presented_rotation_seq": 0,
+        "presented_signing_pub_sha256_hex": "3ffc120506bd774a15d6f305d67d5d06c479fc2d8c2cf7549963b276f2779f0c",
+        "presented_static_pub_hex": "4049502db92ca2342c3f92dac5d6de7c85db5df5407a5b4996ce39f2efb7e827",
+        "relay_pub_ok": true,
+        "responder": "uri_key",
+        "route_check": "invalid",
+        "uri": "tendril://pair?v=1&host=Studio%20Host&code=TND-ABCD-EFGH-JKLM&k=QElQLbksojQsP5LaxdbefIXbXfVAeltJls458u-36Cc&sh=P_wSBQa9d0oV1vMF1n1dBsR5_C2MLPdUmWOydvJ3nww&id=dev_21469e52ecee69ca&seq=0&rp=LfBBJfABWvtHzoU674dyCU_5SYwUyxueEpc8KSfaD6Y&ep=direct%3A192.168.1.21%3A9100,wss%3A%2F%2Frelay.example.com%2Fv1%2Frelay&rq=7&rs=lPfHf8D9yj6pb0yaLi2fFXnz5NhWXKZ6QqTSKCYOixYx5meVitn7Bj0YUdwe0kX60XeQTipyaTBRI7ux-CUeDg",
+        "wires": [
+          "v1",
+          "v2"
+        ]
+      },
+      {
+        "commit_error": "host_key_unverified",
+        "name": "rp_mismatch",
+        "pin_ok": true,
+        "presented_ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",
+        "presented_rotation_seq": 0,
+        "presented_signing_pub_sha256_hex": "3ffc120506bd774a15d6f305d67d5d06c479fc2d8c2cf7549963b276f2779f0c",
+        "presented_static_pub_hex": "4049502db92ca2342c3f92dac5d6de7c85db5df5407a5b4996ce39f2efb7e827",
+        "relay_pub_ok": false,
+        "responder": "uri_key",
+        "route_check": "verified",
+        "uri": "tendril://pair?v=1&host=Studio%20Host&code=TND-ABCD-EFGH-JKLM&k=QElQLbksojQsP5LaxdbefIXbXfVAeltJls458u-36Cc&sh=P_wSBQa9d0oV1vMF1n1dBsR5_C2MLPdUmWOydvJ3nww&id=dev_21469e52ecee69ca&seq=0&rp=1i8Bah79Hk_feT60LNhEceG6nwzwTRKHtcxx9hYofLg&ep=direct%3A192.168.1.20%3A9100,wss%3A%2F%2Frelay.example.com%2Fv1%2Frelay&rq=7&rs=fA0Am-XX_4rRvDkErizhmYC806FLfA6tF5qWp4E9xu0Llg2uA7I9nOaloz4Iqvbct7b15TQzSfE5yS_yf4uPDQ",
+        "wires": [
+          "v1",
+          "v2"
+        ]
+      },
+      {
+        "commit_error": "host_key_unverified",
+        "name": "rp_mismatch_and_invalid_rs",
+        "pin_ok": true,
+        "presented_ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",
+        "presented_rotation_seq": 0,
+        "presented_signing_pub_sha256_hex": "3ffc120506bd774a15d6f305d67d5d06c479fc2d8c2cf7549963b276f2779f0c",
+        "presented_static_pub_hex": "4049502db92ca2342c3f92dac5d6de7c85db5df5407a5b4996ce39f2efb7e827",
+        "relay_pub_ok": false,
+        "responder": "uri_key",
+        "route_check": "invalid",
+        "uri": "tendril://pair?v=1&host=Studio%20Host&code=TND-ABCD-EFGH-JKLM&k=QElQLbksojQsP5LaxdbefIXbXfVAeltJls458u-36Cc&sh=P_wSBQa9d0oV1vMF1n1dBsR5_C2MLPdUmWOydvJ3nww&id=dev_21469e52ecee69ca&seq=0&rp=1i8Bah79Hk_feT60LNhEceG6nwzwTRKHtcxx9hYofLg&ep=direct%3A192.168.1.21%3A9100,wss%3A%2F%2Frelay.example.com%2Fv1%2Frelay&rq=7&rs=fA0Am-XX_4rRvDkErizhmYC806FLfA6tF5qWp4E9xu0Llg2uA7I9nOaloz4Iqvbct7b15TQzSfE5yS_yf4uPDQ",
+        "wires": [
+          "v1",
+          "v2"
+        ]
+      },
+      {
+        "commit_error": "host_key_unverified",
+        "name": "operator_key_mismatch",
+        "operator_relay_key_hex": "d62f016a1efd1e4fdf793eb42cd84471e1ba9f0cf04d1287b5cc71f616287cb8",
+        "pin_ok": true,
+        "presented_ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",
+        "presented_rotation_seq": 0,
+        "presented_signing_pub_sha256_hex": "3ffc120506bd774a15d6f305d67d5d06c479fc2d8c2cf7549963b276f2779f0c",
+        "presented_static_pub_hex": "4049502db92ca2342c3f92dac5d6de7c85db5df5407a5b4996ce39f2efb7e827",
+        "relay_pub_ok": false,
+        "responder": "uri_key",
+        "route_check": "verified",
+        "uri": "tendril://pair?v=1&host=Studio%20Host&code=TND-ABCD-EFGH-JKLM&k=QElQLbksojQsP5LaxdbefIXbXfVAeltJls458u-36Cc&sh=P_wSBQa9d0oV1vMF1n1dBsR5_C2MLPdUmWOydvJ3nww&id=dev_21469e52ecee69ca&seq=0&ep=direct%3A192.168.1.20%3A9100&rq=7&rs=X26yjAsSOY7rIzfxIggOtiuaEzyDHFUqPXtbBeqUQJGiujXXL2iBuHgPYgfqdO3tYrjPBVXBjx0_QNLzEM9GCA",
+        "wires": [
+          "v1",
+          "v2"
+        ]
+      },
+      {
+        "commit_error": "host_key_unverified",
+        "name": "unchained_key",
+        "pin_ok": false,
+        "presented_ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",
+        "presented_rotation_seq": 0,
+        "presented_signing_pub_sha256_hex": "3ffc120506bd774a15d6f305d67d5d06c479fc2d8c2cf7549963b276f2779f0c",
+        "presented_static_pub_hex": "4049502db92ca2342c3f92dac5d6de7c85db5df5407a5b4996ce39f2efb7e827",
+        "relay_pub_ok": null,
+        "responder": "unrelated_key",
+        "route_check": null,
+        "uri": "tendril://pair?v=1&host=Studio%20Host&code=TND-ABCD-EFGH-JKLM&k=az1Xdi-LrbaUM_nG0GD4X15ca2gDqBbRQcB19jVBrRA&sh=Sq-gz0HdcrK-idbvdl8ivNibE6Ys1_7A1e3VqdDAwcA&id=dev_96e6c1ecaa2009c7&seq=0&ep=direct%3A192.168.1.20%3A9100&rq=7&rs=sFDFXBYKXNHvDMxhxMZwLSbN-vvUTkA0Kj8fXfQhQvgLnRu2XM5Dk_8VVeBZF-OPIFOfYiSxnWIkrSVDEgBZBA",
+        "wires": [
+          "v1",
+          "v2"
+        ]
+      }
+    ],
+    "uri_identity": {
+      "rotated_at": 1795564800,
+      "signing_mldsa_seed_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+      "signing_seed_hex": "6565656565656565656565656565656565656565656565656565656565656565",
+      "static_scalar_hex": "6464646464646464646464646464646464646464646464646464646464646464"
+    }
+  },
   "pairing_route_statement": {
     "domain_hex": "74656e6472696c2d70616972696e672d726f757465732d763100",
     "ed25519_pub_hex": "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6",

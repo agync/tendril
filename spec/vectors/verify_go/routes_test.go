@@ -288,3 +288,163 @@ func TestPairingRouteStatement(t *testing.T) {
 		t.Fatalf("ep hints mismatch")
 	}
 }
+
+// classifyPairingRoute recomputes spec/pairing-v1.md Section 6.5 steps 2-3 for one presented
+// host key: the relay key agreement, then the route statement result.
+func classifyPairingRoute(t *testing.T, uri string, edPub, sh, operator []byte) (bool, string) {
+	t.Helper()
+	query, ok := strings.CutPrefix(uri, "tendril://pair?")
+	if !ok {
+		t.Fatalf("missing tendril://pair? prefix")
+	}
+	prefix, sigB64, signed := "", "", false
+	if i := strings.LastIndex(uri, "&rs="); i >= 0 && len(uri)-i == 90 {
+		prefix, sigB64, signed = uri[:i], uri[i+4:], true
+		query = strings.TrimPrefix(prefix, "tendril://pair?")
+	}
+	var rp, uriSh []byte
+	for _, pair := range strings.Split(query, "&") {
+		k, val, _ := strings.Cut(pair, "=")
+		var err error
+		switch k {
+		case "rp":
+			rp, err = base64.RawURLEncoding.DecodeString(val)
+		case "sh":
+			uriSh, err = base64.RawURLEncoding.DecodeString(val)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	relayOK := (rp == nil || bytes.Equal(rp, edPub)) &&
+		(operator == nil || bytes.Equal(operator, edPub))
+	switch {
+	case !signed:
+		return relayOK, "unsigned"
+	case !bytes.Equal(uriSh, sh):
+		return relayOK, "route_key_rotated"
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(sigB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := append([]byte(pairingRoutesDomain), prefix...)
+	if ed25519.Verify(ed25519.PublicKey(edPub), input, sig) {
+		return relayOK, "verified"
+	}
+	return relayOK, "invalid"
+}
+
+// uriParam returns the base64url-decoded value of `key` in a pairing URI, or nil.
+func uriParam(t *testing.T, uri, key string) []byte {
+	t.Helper()
+	query, _ := strings.CutPrefix(uri, "tendril://pair?")
+	for _, pair := range strings.Split(query, "&") {
+		k, val, _ := strings.Cut(pair, "=")
+		if k == key {
+			b, err := base64.RawURLEncoding.DecodeString(val)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return b
+		}
+	}
+	return nil
+}
+
+// TestPairingRouteCheck recomputes steps 2-3 (relay keys, route statement) and the refusal from
+// the bytes. Step 1 (the host pin) is checked only for the `uri_key` responder, whose presented
+// keys must equal the URI's `k` and `sh`. Go does not verify hybrid rotation chains: for
+// `rotated_from_uri_key` and `unrelated_key` it checks that the presented key is not the URI's
+// key and takes `pin_ok` from the Rust handshake replay.
+func TestPairingRouteCheck(t *testing.T) {
+	var v struct {
+		RouteSet struct {
+			StaticPubHex   string `json:"static_pub_hex"`
+			SigningSeedHex string `json:"signing_seed_hex"`
+			ShHex          string `json:"sh_hex"`
+		} `json:"route_set"`
+		Check struct {
+			Cases []struct {
+				Name                         string   `json:"name"`
+				URI                          string   `json:"uri"`
+				Responder                    string   `json:"responder"`
+				PresentedStaticPubHex        string   `json:"presented_static_pub_hex"`
+				PresentedEd25519PubHex       string   `json:"presented_ed25519_pub_hex"`
+				PresentedSigningPubSha256Hex string   `json:"presented_signing_pub_sha256_hex"`
+				PresentedRotationSeq         uint64   `json:"presented_rotation_seq"`
+				OperatorRelayKeyHex          string   `json:"operator_relay_key_hex"`
+				PinOk                        bool     `json:"pin_ok"`
+				RelayPubOk                   *bool    `json:"relay_pub_ok"`
+				RouteCheck                   *string  `json:"route_check"`
+				CommitError                  *string  `json:"commit_error"`
+				Wires                        []string `json:"wires"`
+			} `json:"cases"`
+		} `json:"pairing_route_check"`
+	}
+	loadVector(t, "routes.json", &v)
+	edKey := ed25519.NewKeyFromSeed(mustHex(t, v.RouteSet.SigningSeedHex))
+	edPub := []byte(edKey.Public().(ed25519.PublicKey))
+	sh := mustHex(t, v.RouteSet.ShHex)
+	staticPub := mustHex(t, v.RouteSet.StaticPubHex)
+	if len(v.Check.Cases) != 9 {
+		t.Fatalf("expected 9 pairing route check cases, got %d", len(v.Check.Cases))
+	}
+	for _, c := range v.Check.Cases {
+		if !bytes.Equal(mustHex(t, c.PresentedEd25519PubHex), edPub) ||
+			!bytes.Equal(mustHex(t, c.PresentedSigningPubSha256Hex), sh) ||
+			!bytes.Equal(mustHex(t, c.PresentedStaticPubHex), staticPub) {
+			t.Fatalf("%s: presented key is not the fixed host key", c.Name)
+		}
+		if strings.Join(c.Wires, ",") != "v1,v2" {
+			t.Fatalf("%s: wires %v", c.Name, c.Wires)
+		}
+		uriIsPresented := bytes.Equal(uriParam(t, c.URI, "k"), staticPub) &&
+			bytes.Equal(uriParam(t, c.URI, "sh"), sh)
+		switch c.Responder {
+		case "uri_key":
+			if !uriIsPresented || c.PresentedRotationSeq != 0 || !c.PinOk {
+				t.Fatalf("%s: uri_key responder must match the URI pin", c.Name)
+			}
+		case "rotated_from_uri_key":
+			if uriIsPresented || c.PresentedRotationSeq == 0 || !c.PinOk {
+				t.Fatalf("%s: rotated responder must present a chain from the URI key", c.Name)
+			}
+		case "unrelated_key":
+			if uriIsPresented || c.PresentedRotationSeq != 0 || c.PinOk {
+				t.Fatalf("%s: unrelated key without a chain must fail the pin", c.Name)
+			}
+		default:
+			t.Fatalf("%s: unknown responder %q", c.Name, c.Responder)
+		}
+		got := ""
+		if c.CommitError != nil {
+			got = *c.CommitError
+		}
+		if !c.PinOk {
+			if c.RelayPubOk != nil || c.RouteCheck != nil || got != "host_key_unverified" {
+				t.Fatalf("%s: a failed pin has no verdict and refuses with host_key_unverified", c.Name)
+			}
+			continue
+		}
+		var operator []byte
+		if c.OperatorRelayKeyHex != "" {
+			operator = mustHex(t, c.OperatorRelayKeyHex)
+		}
+		relayOK, check := classifyPairingRoute(t, c.URI, edPub, sh, operator)
+		if c.RelayPubOk == nil || c.RouteCheck == nil ||
+			relayOK != *c.RelayPubOk || check != *c.RouteCheck {
+			t.Fatalf("%s: got (%v, %s), want (%v, %v)", c.Name, relayOK, check, c.RelayPubOk, c.RouteCheck)
+		}
+		var want string
+		switch {
+		case !relayOK:
+			want = "host_key_unverified"
+		case check == "invalid":
+			want = "invalid_pairing_uri"
+		}
+		if got != want {
+			t.Fatalf("%s: commit_error %q, want %q", c.Name, got, want)
+		}
+	}
+}

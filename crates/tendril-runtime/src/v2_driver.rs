@@ -16,7 +16,8 @@ use tendril_core::grants::{
 use tendril_core::group::{GroupManifest, GroupSeq, V2GroupSecrets, decode_group_rendezvous_frame};
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
 use tendril_core::pairing::{
-    PairingManager, PairingPathKind, RouteCheck, RoutePolicy, VerifiedRouteStatement,
+    PairRouteBinding, PairingManager, PairingPathKind, RouteCheck, RoutePolicy,
+    VerifiedRouteStatement,
 };
 use tendril_core::policy::{CandidateEndpoint, PathPlanner, PathPolicyConfig, ProviderId};
 use tendril_core::roster::{PeerState, Roster, V2PeerSecrets};
@@ -41,7 +42,7 @@ use crate::driver::{
     AttemptError, CandidateError, CandidateFailure, ConnectOpts, ConnectPlan, ConnectResult,
     DEFAULT_PRE_AUTH_TIMEOUT, IngestSlot, PairPolicyOptions, PairPolicyResult, PairingPlan,
     RaceEnd, RouteIngest, SessionEvent, SharedEvidence, StreamSource, WinnerFacts,
-    check_candidate_routes, collect_failures, committed_error, connect_exhausted,
+    collect_failures, committable_route_check, committed_error, connect_exhausted,
     current_unix_secs, day2_candidate_error, dial_source_with_init, dial_with_policy_candidates,
     finalize_connect, has_complete_outer_frame, pairing_persist_plan, plan_connect, plan_pairing,
     race_candidates, record_evidence, write_protocol_bytes, write_protocol_chunks,
@@ -3539,7 +3540,7 @@ async fn v2_pairing_rung(
     identity: &EndpointIdentity,
     opts: &PairPolicyOptions,
     pinned: Option<V2PinnedHost>,
-    operator_relay_key: Option<&[u8; 32]>,
+    binding: PairRouteBinding,
 ) -> Result<V2PendingCommit, CandidateError> {
     let budget = v2_rung_budget(cand.provider);
     let permit = acquire_initiator_argon2(budget).await?;
@@ -3552,6 +3553,7 @@ async fn v2_pairing_rung(
         PakeArgon2Params::production(),
     )
     .map_err(|err| CandidateError::fatal(err.into()))?
+    .with_route_binding(binding)
     .with_deferred_claim();
     let (deadline, mut stream, mut machine, init_actions, fast_open_sent) =
         if dialer.supports_fast_open() {
@@ -3632,17 +3634,13 @@ async fn v2_pairing_rung(
         let _ = stream.close().await;
         return Err(err.into());
     }
-    let host = machine
-        .verified_host()
-        .ok_or(CoreError::HostKeyUnverified)?;
-    let route_check =
-        match check_candidate_routes(opts.uri.as_ref(), operator_relay_key, &host.signing_pub) {
-            Ok(check) => check,
-            Err(err) => {
-                let _ = stream.close().await;
-                return Err(err);
-            }
-        };
+    let route_check = match committable_route_check(machine.route_verdict()) {
+        Ok(check) => check,
+        Err(err) => {
+            let _ = stream.close().await;
+            return Err(err);
+        }
+    };
     Ok(V2PendingCommit {
         stream,
         machine,
@@ -3673,7 +3671,7 @@ pub async fn drive_v2_pair_initiator_with_policy(
         pinned,
         floor,
         persist,
-        operator_relay_key,
+        binding,
         ..
     } = plan;
     let v2_pin = pinned
@@ -3696,7 +3694,7 @@ pub async fn drive_v2_pair_initiator_with_policy(
             &identity,
             &opts,
             v2_pin.clone(),
-            operator_relay_key.as_ref(),
+            binding.clone(),
         )
         .await
         {

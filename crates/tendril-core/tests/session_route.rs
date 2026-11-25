@@ -6,8 +6,8 @@ use tendril_core::error::CoreError;
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::noise::{NoiseHfsHandshakeBuilder, NoiseTransport};
 use tendril_core::pairing::{
-    PairingCodeKind, PairingConfig, PairingManager, PairingPathKind, PairingUri, PersistOpts,
-    RouteCheck, persistable_routes, sign_route_statement,
+    PairRouteBinding, PairingCodeKind, PairingConfig, PairingManager, PairingPathKind, PairingUri,
+    PersistOpts, PinnedHost, RouteCheck, persistable_routes, sign_route_statement,
 };
 use tendril_core::relay_auth::origin_allowed;
 use tendril_core::roster::{PeerState, Roster, RouteOrigin, RouteSource, V2PeerSecrets};
@@ -15,7 +15,7 @@ use tendril_core::routes::{MIN_ROUTE_SET_PAYLOAD, RouteSet};
 use tendril_core::session::{RouteExpectation, SessionAction, SessionMachine};
 use tendril_core::v2::{
     PaddingPolicy, PakeArgon2Params, SealedSession, V2InnerFrame, V2PairAction, V2PairOutcome,
-    V2PakePairInitiator, V2PakePairResponder, V2SessionAction, V2SessionInitiator,
+    V2PakePairInitiator, V2PakePairResponder, V2PinnedHost, V2SessionAction, V2SessionInitiator,
     V2SessionResponder, decode_v2_inner_frame, pad_inner_frame,
 };
 use tendril_core::wire::{InnerFrameType, WIRE_VERSION_V2, encode_inner_frame};
@@ -833,6 +833,240 @@ fn v2_deferred_claim_reports_rotation_and_closes_on_an_unexpected_frame() {
         init.feed_bytes(&m2),
         Err(CoreError::SessionClosed { .. })
     ));
+}
+
+/// A v2 PAKE pairing bound to `uri`, run until the initiator has `msg2` in hand.
+fn bound_v2(
+    host: &EndpointIdentity,
+    uri: &str,
+    deferred: bool,
+) -> (V2PakePairInitiator, Vec<u8>, PairingManager) {
+    let cli = identity(0x40);
+    let params = PakeArgon2Params::production();
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr.issue_code(PairingCodeKind::Remote3Group, NOW).unwrap();
+    let uri = PairingUri::parse(uri).unwrap();
+    let mut init = V2PakePairInitiator::new(&cli, "Cli", "cli", &code, None, params)
+        .unwrap()
+        .with_pairing_uri(&uri);
+    if deferred {
+        init = init.with_deferred_claim();
+    }
+    let mut resp = V2PakePairResponder::new(host, PairingPathKind::Remote, params).unwrap();
+    let mut hroster = Roster::new();
+    let m1 = pair_bytes(&init.start().unwrap());
+    let m2 = pair_bytes(&resp.feed_bytes(&m1, NOW, &mut mgr, &mut hroster).unwrap());
+    (init, m2, mgr)
+}
+
+const V2_NOT_AWAITING: CoreError = CoreError::NotReady("v2 PAKE initiator is not awaiting commit");
+
+fn assert_v2_refusal(host: &EndpointIdentity, uri: &str, expected: &CoreError) {
+    let (mut init, m2, mgr) = bound_v2(host, uri, true);
+    let actions = init.feed_bytes(&m2).unwrap();
+    assert!(pair_bytes(&actions).is_empty(), "no msg3 before commit");
+    assert!(init.is_awaiting_commit());
+    assert!(init.verified_host().is_some());
+    let verdict = init.route_verdict().unwrap();
+    assert_eq!(verdict.committable().err().as_ref(), Some(expected));
+    assert_eq!(init.commit_claim().err().as_ref(), Some(expected));
+    assert!(!init.is_awaiting_commit());
+    assert_eq!(init.commit_claim().err(), Some(V2_NOT_AWAITING));
+    assert_eq!(mgr.live_code_count(NOW), 1);
+
+    let (mut init, m2, mgr) = bound_v2(host, uri, false);
+    assert_eq!(init.feed_bytes(&m2).err().as_ref(), Some(expected));
+    assert!(init.route_verdict().is_some());
+    assert!(!init.is_awaiting_commit());
+    assert_eq!(init.commit_claim().err(), Some(V2_NOT_AWAITING));
+    assert!(matches!(
+        init.feed_bytes(&m2),
+        Err(CoreError::SessionClosed { .. })
+    ));
+    assert_eq!(mgr.live_code_count(NOW), 1);
+}
+
+#[test]
+fn v2_pake_uri_bound_initiator_refuses_msg3_on_rp_mismatch() {
+    let host = identity(0x20).with_host_id("host-route");
+    let uri = uri_for(
+        host.host_id(),
+        *host.static_key().public_bytes(),
+        host.signing_key().signing_pub_hash(),
+        Some(*identity(0x50).signing_key().ed25519_public_bytes()),
+    );
+    let uri = uri.try_encode().unwrap();
+    assert_v2_refusal(&host, &uri, &CoreError::HostKeyUnverified);
+    let (mut init, m2, _) = bound_v2(&host, &uri, true);
+    init.feed_bytes(&m2).unwrap();
+    assert!(!init.route_verdict().unwrap().relay_pub_ok());
+}
+
+#[test]
+fn v2_pake_uri_bound_initiator_refuses_msg3_on_invalid_rs() {
+    let host = identity(0x20).with_host_id("host-route");
+    let tampered =
+        sign(&host, &unsigned_recovery(&host)).replacen("192.168.1.20", "192.168.1.21", 1);
+    let invalid = CoreError::InvalidPairingUri("route statement does not verify".into());
+    assert_v2_refusal(&host, &tampered, &invalid);
+    let (mut init, m2, _) = bound_v2(&host, &tampered, true);
+    init.feed_bytes(&m2).unwrap();
+    let verdict = init.route_verdict().unwrap();
+    assert!(verdict.relay_pub_ok());
+    assert_eq!(verdict.route_check(), &RouteCheck::Invalid);
+
+    let signed = sign(&host, &unsigned_recovery(&host));
+    for deferred in [true, false] {
+        let (mut init, m2, _) = bound_v2(&host, &signed, deferred);
+        let mut actions = init.feed_bytes(&m2).unwrap();
+        assert!(matches!(
+            init.route_verdict().unwrap().route_check(),
+            RouteCheck::Verified(_)
+        ));
+        if deferred {
+            actions = init.commit_claim().unwrap();
+        }
+        assert!(!pair_bytes(&actions).is_empty(), "msg3 on a verified route");
+    }
+}
+
+/// A signed URI of `host` with only a LAN `direct:` hint (no `rp`).
+fn direct_only_uri(host: &EndpointIdentity) -> PairingUri {
+    let uri = PairingUri::new(
+        "Studio",
+        CODE3,
+        *host.static_key().public_bytes(),
+        host.signing_key().signing_pub_hash(),
+        vec![HINTS[0].to_owned()],
+        Some(host.host_id().to_owned()),
+        Some(0),
+    );
+    PairingUri::parse(&sign(host, &uri)).unwrap()
+}
+
+#[test]
+fn v2_pake_uri_binding_enforces_the_uri_host_pin() {
+    let host = identity(0x20).with_host_id("host-route");
+    let unrelated = identity(0x60).with_host_id("host-other");
+    let other_uri = direct_only_uri(&unrelated);
+    for deferred in [true, false] {
+        let (mut init, m2, mgr) = bound_v2(&host, &other_uri.try_encode().unwrap(), deferred);
+        assert_eq!(
+            init.feed_bytes(&m2).err(),
+            Some(CoreError::HostKeyUnverified),
+            "deferred={deferred}"
+        );
+        assert!(init.route_verdict().is_none());
+        assert_eq!(init.commit_claim().err(), Some(V2_NOT_AWAITING));
+        assert_eq!(mgr.live_code_count(NOW), 1);
+    }
+
+    let cli = identity(0x40);
+    let params = PakeArgon2Params::production();
+    let host_uri = direct_only_uri(&host);
+    let pin = || Some(V2PinnedHost::new(host_uri.to_pinned_host(), WIRE_VERSION_V2).unwrap());
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr.issue_code(PairingCodeKind::Remote3Group, NOW).unwrap();
+    let fresh = || V2PakePairInitiator::new(&cli, "Cli", "cli", &code, pin(), params).unwrap();
+    assert_eq!(
+        fresh().set_route_binding(PairRouteBinding::new(Some(other_uri.clone()), None).unwrap()),
+        Err(CoreError::InvalidPairingUri(
+            "pairing URI does not match the pinned host".into()
+        ))
+    );
+    fresh()
+        .set_route_binding(PairRouteBinding::new(Some(host_uri.clone()), None).unwrap())
+        .unwrap();
+    let mut init = fresh().with_pairing_uri(&other_uri);
+    let mut resp = V2PakePairResponder::new(&host, PairingPathKind::Remote, params).unwrap();
+    let mut hroster = Roster::new();
+    let m1 = pair_bytes(&init.start().unwrap());
+    let m2 = pair_bytes(&resp.feed_bytes(&m1, NOW, &mut mgr, &mut hroster).unwrap());
+    assert_eq!(
+        init.feed_bytes(&m2).err(),
+        Some(CoreError::HostKeyUnverified)
+    );
+    assert!(init.route_verdict().is_none());
+}
+
+#[test]
+fn v2_pake_uri_binding_agrees_with_a_full_key_pin() {
+    let host = identity(0x20).with_host_id("host-route");
+    let cli = identity(0x40);
+    let params = PakeArgon2Params::production();
+    let host_uri = direct_only_uri(&host);
+    for host_id in [Some(host.host_id().to_owned()), None] {
+        let pin = PinnedHost::with_full_key(
+            host_id,
+            *host.static_key().public_bytes(),
+            host.signing_key().public_key().clone(),
+            0,
+        );
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr.issue_code(PairingCodeKind::Remote3Group, NOW).unwrap();
+        let mut init = V2PakePairInitiator::new(
+            &cli,
+            "Cli",
+            "cli",
+            &code,
+            Some(V2PinnedHost::new(pin, WIRE_VERSION_V2).unwrap()),
+            params,
+        )
+        .unwrap()
+        .with_pairing_uri(&host_uri);
+        let mut resp = V2PakePairResponder::new(&host, PairingPathKind::Remote, params).unwrap();
+        let mut hroster = Roster::new();
+        let m1 = pair_bytes(&init.start().unwrap());
+        let m2 = pair_bytes(&resp.feed_bytes(&m1, NOW, &mut mgr, &mut hroster).unwrap());
+        let m3 = pair_bytes(&init.feed_bytes(&m2).unwrap());
+        assert!(!m3.is_empty());
+        let resp_actions = resp.feed_bytes(&m3, NOW, &mut mgr, &mut hroster).unwrap();
+        let done = init.feed_bytes(&pair_bytes(&resp_actions)).unwrap();
+        assert!(done.iter().any(|a| matches!(
+            a,
+            V2PairAction::Completed(V2PairOutcome::InitiatorPending {
+                host_pin_verified: true,
+                ..
+            })
+        )));
+    }
+}
+
+#[test]
+fn v2_session_omits_route_seq_without_padding() {
+    let host = identity(0x20).with_host_id("host-route");
+    let cli = identity(0x40);
+    let mut cli_roster = client_roster(
+        host.host_id(),
+        *host.static_key().public_bytes(),
+        host.signing_key().public_key(),
+    );
+    cli_roster
+        .set_peer_min_wire_version(host.host_id(), WIRE_VERSION_V2)
+        .unwrap();
+    let mut init = V2SessionInitiator::new(
+        &cli,
+        host.host_id(),
+        *secrets().reconnect_secret(),
+        None,
+        None,
+    )
+    .unwrap()
+    .with_padding_policy(PaddingPolicy::disabled())
+    .with_route_seq(Some(3))
+    .unwrap();
+    let mut resp = V2SessionResponder::new(&host).unwrap();
+    let mut hroster = host_roster(&cli);
+    let m1 = v2_bytes(init.start(NOW).unwrap());
+    let m2 = v2_bytes(resp.feed_bytes(&m1, NOW, 1, &mut hroster).unwrap());
+    let m3 = v2_bytes(init.feed_bytes(&m2, NOW, 2, &mut cli_roster).unwrap());
+    resp.feed_bytes(&m3, NOW, 3, &mut hroster).unwrap();
+    assert!(init.is_established() && resp.is_established());
+    assert_eq!(resp.peer_route_seq(), None);
+    assert_eq!(
+        resp.send_route_set(&route_set(&host, 4), 10).err(),
+        Some(CoreError::NotReady("peer did not negotiate route sets"))
+    );
 }
 
 // ---------------------------------------------------------------------------

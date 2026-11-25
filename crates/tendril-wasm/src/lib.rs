@@ -2219,28 +2219,14 @@ struct PersistOptionsInput {
     winner_hint: Option<String>,
 }
 
-/// Fails pre-dial when the operator `URL#key` and the URI `rp` name different keys.
-fn check_relay_keys_agree(
-    operator_relay_key: Option<[u8; 32]>,
-    uri_rp: Option<[u8; 32]>,
-) -> Result<(), WasmError> {
-    match (operator_relay_key, uri_rp) {
-        (Some(op), Some(rp)) if op != rp => Err(invalid_route(
-            "operator relay key does not match the URI rp",
-        )),
-        _ => Ok(()),
-    }
-}
-
-/// Route-statement checks and the persist plan of one pairing, shared by both initiators.
+/// The URI, operator relay key and persist plan of one pairing, shared by both initiators. The
+/// route checks themselves run in the core machine, which holds the same binding.
 struct PairRouteContext {
     code: Zeroizing<String>,
     uri: Option<PairingUri>,
     opts: PersistOpts,
     operator_relay_key: Option<[u8; 32]>,
     winner_hint: Option<String>,
-    check: Option<RouteCheck>,
-    relay_pub_ok: Option<bool>,
 }
 
 impl PairRouteContext {
@@ -2251,22 +2237,7 @@ impl PairRouteContext {
             opts: PersistOpts::default(),
             operator_relay_key: None,
             winner_hint: None,
-            check: None,
-            relay_pub_ok: None,
         }
-    }
-
-    /// Refuses the deferred claim of a verified host whose relay key does not match (checked
-    /// first) or whose route statement is invalid. JS falls back on the first and
-    /// stops on the second, but `msg3` is never written for either.
-    fn require_committable(&self) -> Result<(), WasmError> {
-        if self.relay_pub_ok == Some(false) {
-            return Err(tendril_core::error::CoreError::HostKeyUnverified.into());
-        }
-        if matches!(self.check, Some(RouteCheck::Invalid)) {
-            return Err(invalid_route("route statement does not verify"));
-        }
-        Ok(())
     }
 
     /// The roster name of the paired host: the pairing URI's host name when set, else its id.
@@ -2279,14 +2250,26 @@ impl PairRouteContext {
             .to_owned()
     }
 
-    fn set_uri(&mut self, uri: &str) -> Result<(), WasmError> {
+    /// Parses `uri` and hands the resulting binding to `bind` (the machine) before keeping it.
+    fn set_uri(
+        &mut self,
+        uri: &str,
+        bind: impl FnOnce(tendril_core::pairing::PairRouteBinding) -> Result<(), WasmError>,
+    ) -> Result<(), WasmError> {
         let uri = PairingUri::parse(uri)?;
-        check_relay_keys_agree(self.operator_relay_key, uri.relay_pub)?;
+        bind(tendril_core::pairing::PairRouteBinding::new(
+            Some(uri.clone()),
+            self.operator_relay_key,
+        )?)?;
         self.uri = Some(uri);
         Ok(())
     }
 
-    fn set_options(&mut self, json: &str) -> Result<(), WasmError> {
+    fn set_options(
+        &mut self,
+        json: &str,
+        bind: impl FnOnce(tendril_core::pairing::PairRouteBinding) -> Result<(), WasmError>,
+    ) -> Result<(), WasmError> {
         let input: PersistOptionsInput = if json.trim().is_empty() {
             PersistOptionsInput::default()
         } else {
@@ -2308,68 +2291,58 @@ impl PairRouteContext {
         };
         opts.validate().map_err(WasmError::from)?;
         let operator_relay_key = endpoint.and_then(|e| e.relay_key);
-        check_relay_keys_agree(
-            operator_relay_key,
-            self.uri.as_ref().and_then(|u| u.relay_pub),
-        )?;
+        if operator_relay_key != self.operator_relay_key {
+            bind(tendril_core::pairing::PairRouteBinding::new(
+                self.uri.clone(),
+                operator_relay_key,
+            )?)?;
+        }
         self.opts = opts;
         self.operator_relay_key = operator_relay_key;
         self.winner_hint = input.winner_hint.filter(|h| !h.is_empty());
         Ok(())
     }
 
-    fn check_for(&self, host_signing: &HybridSigningPublicKey) -> RouteCheck {
-        self.uri.as_ref().map_or(
-            RouteCheck::Unsigned(tendril_core::pairing::UnsignedReason::Absent),
-            |uri| uri.verify_route_statement(host_signing),
-        )
-    }
-
-    /// `rp` of the URI and the operator `URL#key`, when present, name the verified host's
-    /// Ed25519 key.
-    fn relay_pub_ok(&self, host_signing: &HybridSigningPublicKey) -> bool {
-        let uri_ok = self
-            .uri
-            .as_ref()
-            .is_none_or(|uri| uri.check_relay_pub(host_signing).is_ok());
-        let operator_ok = self
-            .operator_relay_key
-            .is_none_or(|key| key == *host_signing.ed25519_bytes());
-        uri_ok && operator_ok
-    }
-
-    /// Records the check of the verified host and returns the host-verified report.
+    /// The host-verified report of the machine's pre-`msg3` verdict.
     fn host_verified_json(
-        &mut self,
         host: &tendril_core::pairing::VerifiedHost,
+        verdict: Option<&tendril_core::pairing::PairRouteVerdict>,
     ) -> serde_json::Value {
-        let check = self.check_for(&host.signing_pub);
+        let check = verdict.map(tendril_core::pairing::PairRouteVerdict::route_check);
         let route_seq = check
-            .statement()
+            .and_then(RouteCheck::statement)
             .and_then(|s| u64_to_f64(s.route_seq()).ok());
-        let relay_pub_ok = self.relay_pub_ok(&host.signing_pub);
-        let report = json!({
+        json!({
             "host_verified": true,
             "host_id": host.host_id,
-            "relay_pub_ok": relay_pub_ok,
-            "route_check": check.as_str(),
+            "relay_pub_ok": verdict.is_some_and(tendril_core::pairing::PairRouteVerdict::relay_pub_ok),
+            "route_check": check.map_or("unsigned", RouteCheck::as_str),
             "route_seq": route_seq,
-        });
-        self.check = Some(check);
-        self.relay_pub_ok = Some(relay_pub_ok);
-        report
+        })
     }
 
-    fn plan(&self, host_signing: &HybridSigningPublicKey) -> (PersistPlan, &'static str) {
-        let check = self
-            .check
-            .clone()
-            .unwrap_or_else(|| self.check_for(host_signing));
-        let label = check.as_str();
+    /// The persist plan of a completed pairing from the route check the machine committed on.
+    fn plan(&self, check: Option<&RouteCheck>) -> (PersistPlan, &'static str) {
+        let unsigned = RouteCheck::Unsigned(tendril_core::pairing::UnsignedReason::Absent);
+        let check = check.unwrap_or(&unsigned);
         (
-            persistable_routes(&check, &self.code, self.winner_hint.as_deref(), &self.opts),
-            label,
+            persistable_routes(check, &self.code, self.winner_hint.as_deref(), &self.opts),
+            check.as_str(),
         )
+    }
+}
+
+/// Hands a route binding to a pairing machine, which refuses it once `msg2` was accepted.
+fn bind_routes<M>(
+    machine: Option<&mut M>,
+    set: impl FnOnce(
+        &mut M,
+        tendril_core::pairing::PairRouteBinding,
+    ) -> Result<(), tendril_core::error::CoreError>,
+) -> impl FnOnce(tendril_core::pairing::PairRouteBinding) -> Result<(), WasmError> {
+    move |binding| {
+        let machine = machine.ok_or_else(|| WasmError::from("pairing initiator unavailable"))?;
+        set(machine, binding).map_err(WasmError::from)
     }
 }
 
@@ -2466,8 +2439,17 @@ impl WasmPairInitiator {
         Ok(())
     }
 
+    fn set_uri_inner(&mut self, uri: &str) -> Result<(), WasmError> {
+        let bind = bind_routes(self.inner.as_mut(), PairingInitiator::set_route_binding);
+        self.routes.set_uri(uri, bind)
+    }
+
+    fn set_options_inner(&mut self, json: &str) -> Result<(), WasmError> {
+        let bind = bind_routes(self.inner.as_mut(), PairingInitiator::set_route_binding);
+        self.routes.set_options(json, bind)
+    }
+
     fn commit_claim_inner(&mut self) -> Result<Vec<u8>, WasmError> {
-        self.routes.require_committable()?;
         let actions = self.machine()?.commit_claim().map_err(WasmError::from)?;
         let mut out = Vec::new();
         for action in actions {
@@ -2480,6 +2462,10 @@ impl WasmPairInitiator {
 
     fn step_bytes(&mut self, bytes: &[u8], roster: &mut WasmRoster) -> Result<String, WasmError> {
         let actions = self.machine()?.feed_bytes(bytes).map_err(WasmError::from)?;
+        let verdict = self.machine()?.route_verdict().cloned();
+        let check = verdict
+            .as_ref()
+            .map(tendril_core::pairing::PairRouteVerdict::route_check);
         let mut writes = Vec::new();
         let mut sas: Option<String> = None;
         let mut outcome_json: Option<serde_json::Value> = None;
@@ -2499,7 +2485,7 @@ impl WasmPairInitiator {
                     pairing_sas,
                     host_pin_verified,
                 }) => {
-                    let (plan, route_check) = self.routes.plan(&host_signing_pub);
+                    let (plan, route_check) = self.routes.plan(check);
                     let name = self.routes.host_name(&host_id);
                     let merge = if host_pin_verified {
                         roster.inner.insert_pinned_host_with_plan(
@@ -2541,7 +2527,7 @@ impl WasmPairInitiator {
                     host_rotation_seq,
                     token_nonce,
                 }) => {
-                    let (plan, route_check) = self.routes.plan(&host_signing_pub);
+                    let (plan, route_check) = self.routes.plan(check);
                     let merge = roster
                         .inner
                         .insert_pinned_host_with_plan(
@@ -2584,7 +2570,7 @@ impl WasmPairInitiator {
             None
         };
         if let Some(host) = host {
-            let mut report = self.routes.host_verified_json(&host);
+            let mut report = PairRouteContext::host_verified_json(&host, verdict.as_ref());
             report["sas"] = json!(sas);
             report["outcome"] = serde_json::Value::Null;
             return Ok(report.to_string());
@@ -2781,18 +2767,19 @@ impl WasmPairInitiator {
         self.enable_deferred_claim_inner().map_err(to_js_err)
     }
 
-    /// Supplies the pairing URI whose `rp` and route statement are checked against the
-    /// verified host. Valid before `msg2` is processed.
+    /// Supplies the pairing URI whose host pin, `rp` and route statement are checked against
+    /// the verified host. Valid before `msg2` is processed.
     #[wasm_bindgen]
     pub fn set_pairing_uri(&mut self, uri: &str) -> Result<(), JsValue> {
-        self.routes.set_uri(uri).map_err(to_js_err)
+        self.set_uri_inner(uri).map_err(to_js_err)
     }
 
     /// Sets the route persist options: `route_policy`, `operator_endpoint`, `save_committed`
-    /// and `winner_hint`, as a JSON object.
+    /// and `winner_hint`, as a JSON object. Valid before `msg2` is processed when it changes the
+    /// operator relay key.
     #[wasm_bindgen]
     pub fn set_persist_options(&mut self, opts_json: &str) -> Result<(), JsValue> {
-        self.routes.set_options(opts_json).map_err(to_js_err)
+        self.set_options_inner(opts_json).map_err(to_js_err)
     }
 
     /// Writes `msg3` once `feed_bytes` reported `host_verified: true`. Refused, with code
@@ -3410,14 +3397,27 @@ impl WasmV2PakePairInitiator {
         Ok(())
     }
 
+    fn set_uri_inner(&mut self, uri: &str) -> Result<(), WasmError> {
+        let bind = bind_routes(self.inner.as_mut(), V2PakePairInitiator::set_route_binding);
+        self.routes.set_uri(uri, bind)
+    }
+
+    fn set_options_inner(&mut self, json: &str) -> Result<(), WasmError> {
+        let bind = bind_routes(self.inner.as_mut(), V2PakePairInitiator::set_route_binding);
+        self.routes.set_options(json, bind)
+    }
+
     fn commit_claim_inner(&mut self) -> Result<Vec<u8>, WasmError> {
-        self.routes.require_committable()?;
         let actions = self.machine()?.commit_claim().map_err(WasmError::from)?;
         Ok(collect_v2_pair_writes(actions))
     }
 
     fn step_bytes(&mut self, bytes: &[u8], roster: &mut WasmRoster) -> Result<String, WasmError> {
         let actions = self.machine()?.feed_bytes(bytes).map_err(WasmError::from)?;
+        let verdict = self.machine()?.route_verdict().cloned();
+        let check = verdict
+            .as_ref()
+            .map(tendril_core::pairing::PairRouteVerdict::route_check);
         let mut writes = Vec::new();
         let mut sas: Option<String> = None;
         let mut outcome_json: Option<serde_json::Value> = None;
@@ -3441,13 +3441,12 @@ impl WasmV2PakePairInitiator {
                     ref outcome @ V2PairOutcome::InitiatorPending {
                         ref device_id,
                         ref host_id,
-                        ref host_signing_pub,
                         ref pairing_sas,
                         host_pin_verified,
                         ..
                     },
                 ) => {
-                    let (plan, route_check) = self.routes.plan(host_signing_pub);
+                    let (plan, route_check) = self.routes.plan(check);
                     let (_, merge) = roster
                         .inner
                         .apply_v2_pair_initiator_outcome_with_plan(
@@ -3501,7 +3500,7 @@ impl WasmV2PakePairInitiator {
             None
         };
         if let Some(host) = host {
-            let mut report = self.routes.host_verified_json(&host);
+            let mut report = PairRouteContext::host_verified_json(&host, verdict.as_ref());
             report["sas"] = json!(sas);
             report["outcome"] = serde_json::Value::Null;
             self.pending_events.push(json!({
@@ -3594,18 +3593,19 @@ impl WasmV2PakePairInitiator {
         self.enable_deferred_claim_inner().map_err(to_js_err)
     }
 
-    /// Supplies the pairing URI whose `rp` and route statement are checked against the
-    /// verified host. Valid before `msg2` is processed.
+    /// Supplies the pairing URI whose host pin, `rp` and route statement are checked against
+    /// the verified host. Valid before `msg2` is processed.
     #[wasm_bindgen]
     pub fn set_pairing_uri(&mut self, uri: &str) -> Result<(), JsValue> {
-        self.routes.set_uri(uri).map_err(to_js_err)
+        self.set_uri_inner(uri).map_err(to_js_err)
     }
 
     /// Sets the route persist options: `route_policy`, `operator_endpoint`, `save_committed`
-    /// and `winner_hint`, as a JSON object.
+    /// and `winner_hint`, as a JSON object. Valid before `msg2` is processed when it changes the
+    /// operator relay key.
     #[wasm_bindgen]
     pub fn set_persist_options(&mut self, opts_json: &str) -> Result<(), JsValue> {
-        self.routes.set_options(opts_json).map_err(to_js_err)
+        self.set_options_inner(opts_json).map_err(to_js_err)
     }
 
     /// Writes `msg3` once `feed_bytes` reported `host_verified: true`. Refused, with code
@@ -5491,8 +5491,8 @@ mod route_tests {
         )
         .unwrap();
         init.enable_deferred_claim_inner().unwrap();
-        init.routes.set_uri(uri_for_check).unwrap();
-        init.routes.set_options(persist).unwrap();
+        init.set_uri_inner(uri_for_check).unwrap();
+        init.set_options_inner(persist).unwrap();
         let mut resp =
             PairingResponder::new(&host.identity, PairingPathKind::Remote, None).unwrap();
         let m1 = init.start().unwrap();
@@ -5657,12 +5657,14 @@ mod route_tests {
         let mut conflicting = PairRouteContext::new("TND-AAAA-AAAA");
         assert!(
             conflicting
-                .set_options(r#"{"route_policy":"none","save_committed":true}"#)
+                .set_options(r#"{"route_policy":"none","save_committed":true}"#, |_| Ok(
+                    ()
+                ))
                 .is_err()
         );
         assert!(
             conflicting
-                .set_options(r#"{"route_policy":"bogus"}"#)
+                .set_options(r#"{"route_policy":"bogus"}"#, |_| Ok(()))
                 .is_err()
         );
     }
@@ -5690,8 +5692,18 @@ mod route_tests {
         assert!(p.init.commit_claim_inner().is_err());
         assert!(cli_roster.inner.get("host-l6a").is_none());
 
-        // A host that no longer hashes to the URI's `sh` is `route_key_rotated`.
-        let mut rotated = TestHost::new(0x51, "host-l6a");
+        // A host that rotated after issuing the URI, so its key no longer hashes to the URI's
+        // `sh` but chains from it, is `route_key_rotated`.
+        let mut rotated = TestHost::new(0x51, "host-l6b");
+        let issued = rotated.issue(&[DIRECT, RELAY_V1]);
+        rotated
+            .identity
+            .rotate(
+                StaticKeypair::from_scalar([0x52; 32]),
+                SigningKeypair::from_seed([0x53; 32]),
+                NOW,
+            )
+            .unwrap();
         let mut other_roster = WasmRoster::new();
         let p = v1_pairing_to_host_verified(
             &mut rotated,
@@ -5779,9 +5791,8 @@ mod route_tests {
             WasmV2PakePairInitiator::new_inner(&cli, "web", "browser", &uri.code, Some(&pinned))
                 .unwrap();
         init.enable_deferred_claim_inner().unwrap();
-        init.routes.set_uri(&issued.uri).unwrap();
-        init.routes
-            .set_options(r#"{"operator_endpoint":"wss://op.example.test/v2/relay#mailbox"}"#)
+        init.set_uri_inner(&issued.uri).unwrap();
+        init.set_options_inner(r#"{"operator_endpoint":"wss://op.example.test/v2/relay#mailbox"}"#)
             .unwrap();
         let mut resp = V2PakePairResponder::new(
             &host.identity,
@@ -6958,20 +6969,35 @@ mod route_tests {
             json!({ "operator_endpoint": format!("wss://op.example.test/v1/relay#{own}") })
                 .to_string();
 
-        let mut uri_first = PairRouteContext::new(&issued.parsed.code);
-        uri_first.set_uri(&issued.uri).unwrap();
-        let err = uri_first.set_options(&conflicting).unwrap_err();
+        let cli = wasm_identity(0x41);
+        let fresh = || {
+            WasmPairInitiator::new_inner(
+                &cli,
+                "web",
+                "browser",
+                &issued.parsed.code,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let mut uri_first = fresh();
+        uri_first.set_uri_inner(&issued.uri).unwrap();
+        let err = uri_first.set_options_inner(&conflicting).unwrap_err();
         assert_eq!(err.code, "invalid_pairing_uri", "{err}");
         assert!(err.message.contains("does not match the URI rp"), "{err}");
 
-        let mut options_first = PairRouteContext::new(&issued.parsed.code);
-        options_first.set_options(&conflicting).unwrap();
-        let err = options_first.set_uri(&issued.uri).unwrap_err();
+        let mut options_first = fresh();
+        options_first.set_options_inner(&conflicting).unwrap();
+        let err = options_first.set_uri_inner(&issued.uri).unwrap_err();
         assert_eq!(err.code, "invalid_pairing_uri", "{err}");
 
-        let mut ok = PairRouteContext::new(&issued.parsed.code);
-        ok.set_uri(&issued.uri).unwrap();
-        ok.set_options(&matching).unwrap();
+        let mut ok = fresh();
+        ok.set_uri_inner(&issued.uri).unwrap();
+        ok.set_options_inner(&matching).unwrap();
     }
 
     #[test]
@@ -6998,7 +7024,7 @@ mod route_tests {
         assert_eq!(p.report["relay_pub_ok"], json!(false));
         let err = p.init.commit_claim_inner().unwrap_err();
         assert_eq!(err.code, "host_key_unverified", "{err}");
-        assert!(p.init.is_awaiting_commit());
+        assert!(!p.init.is_awaiting_commit());
 
         // Both a wrong rp and a broken signature: the rp check ranks first.
         let both = format!("{forged}&rq=1&rs={}", b64url_encode(&[0u8; 64]));
@@ -7039,7 +7065,7 @@ mod route_tests {
             WasmV2PakePairInitiator::new_inner(&cli, "web", "browser", &uri.code, Some(&pinned))
                 .unwrap();
         init.enable_deferred_claim_inner().unwrap();
-        init.routes.set_uri(&tampered).unwrap();
+        init.set_uri_inner(&tampered).unwrap();
         let mut resp = V2PakePairResponder::new(
             &host.identity,
             PairingPathKind::Remote,
@@ -7055,6 +7081,104 @@ mod route_tests {
         assert_eq!(report["route_check"], json!("invalid"));
         let err = init.commit_claim_inner().unwrap_err();
         assert_eq!(err.code, "invalid_pairing_uri", "{err}");
+    }
+
+    #[test]
+    fn uri_bound_initiator_refuses_an_unrelated_host_key() {
+        let mut host = TestHost::new(0x31, "host-l6a");
+        let issued = host.issue(&[DIRECT]);
+        let mut other = TestHost::new(0x35, "host-other");
+        let other_uri = other.issue(&[DIRECT]).uri;
+        let cli = wasm_identity(0x41);
+        for deferred in [true, false] {
+            let mut roster = WasmRoster::new();
+            let mut init = WasmPairInitiator::new_inner(
+                &cli,
+                "web",
+                "browser",
+                &issued.parsed.code,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            if deferred {
+                init.enable_deferred_claim_inner().unwrap();
+            }
+            init.set_uri_inner(&other_uri).unwrap();
+            let mut resp =
+                PairingResponder::new(&host.identity, PairingPathKind::Remote, None).unwrap();
+            let m1 = init.start().unwrap();
+            let m2 = pair_writes(
+                resp.feed_bytes(&m1, NOW, &mut host.mgr, &mut host.roster)
+                    .unwrap(),
+            );
+            let err = init.step_bytes(&m2, &mut roster).unwrap_err();
+            assert_eq!(err.code, "host_key_unverified", "deferred={deferred} {err}");
+            assert!(init.commit_claim_inner().is_err());
+            assert!(roster.inner.get("host-l6a").is_none());
+        }
+    }
+
+    #[test]
+    fn non_deferred_initiator_with_uri_refuses_msg3_on_invalid_rs() {
+        let mut host = TestHost::new(0x31, "host-l6a");
+        let issued = host.issue(&[DIRECT, RELAY_V1]);
+        let tampered = flip_rs(&issued.uri);
+        let cli = wasm_identity(0x41);
+        let mut roster = WasmRoster::new();
+        let mut init = WasmPairInitiator::new_inner(
+            &cli,
+            "web",
+            "browser",
+            &issued.parsed.code,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        init.set_uri_inner(&tampered).unwrap();
+        let mut resp =
+            PairingResponder::new(&host.identity, PairingPathKind::Remote, None).unwrap();
+        let m1 = init.start().unwrap();
+        let m2 = pair_writes(
+            resp.feed_bytes(&m1, NOW, &mut host.mgr, &mut host.roster)
+                .unwrap(),
+        );
+        let err = init.step_bytes(&m2, &mut roster).unwrap_err();
+        assert_eq!(err.code, "invalid_pairing_uri", "{err}");
+        assert!(!init.is_awaiting_commit());
+        assert!(roster.inner.get("host-l6a").is_none());
+
+        let mut late = WasmPairInitiator::new_inner(
+            &cli,
+            "web",
+            "browser",
+            &issued.parsed.code,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        late.enable_deferred_claim_inner().unwrap();
+        let mut resp =
+            PairingResponder::new(&host.identity, PairingPathKind::Remote, None).unwrap();
+        let m1 = late.start().unwrap();
+        let m2 = pair_writes(
+            resp.feed_bytes(&m1, NOW, &mut host.mgr, &mut host.roster)
+                .unwrap(),
+        );
+        let report = to_json(&late.step_bytes(&m2, &mut roster).unwrap());
+        assert_eq!(report["route_check"], json!("unsigned"));
+        let err = late.set_uri_inner(&tampered).unwrap_err();
+        assert_eq!(err.code, "not_ready", "{err}");
+        assert!(late.commit_claim_inner().is_ok());
     }
 
     #[test]

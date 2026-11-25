@@ -13,9 +13,9 @@ use tendril_core::grants::{AuditEvent, Grant, RevocationList};
 use tendril_core::group::{GroupManifest, GroupRendezvousFrame, GroupSeq, V2GroupSecrets};
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
 use tendril_core::pairing::{
-    EnrollmentPolicy, PairAction, PairOutcome, PairingCodeKind, PairingInitiator, PairingManager,
-    PairingPathKind, PairingResponder, PairingUri, PersistOpts, PersistPlan, PinnedHost,
-    RouteCheck, RoutePolicy, UnsignedReason, VerifiedRouteStatement, is_v2_relay_hint,
+    EnrollmentPolicy, PairAction, PairOutcome, PairRouteBinding, PairRouteVerdict, PairingCodeKind,
+    PairingInitiator, PairingManager, PairingPathKind, PairingResponder, PairingUri, PersistOpts,
+    PersistPlan, PinnedHost, RouteCheck, RoutePolicy, VerifiedRouteStatement, is_v2_relay_hint,
     persistable_routes,
 };
 use tendril_core::policy::{
@@ -2565,7 +2565,7 @@ pub(crate) struct PairingPlan {
     pub(crate) floor: u8,
     pub(crate) roster: Roster,
     pub(crate) persist: PersistOpts,
-    pub(crate) operator_relay_key: Option<[u8; 32]>,
+    pub(crate) binding: PairRouteBinding,
 }
 
 pub(crate) async fn plan_pairing(
@@ -2592,14 +2592,7 @@ pub(crate) async fn plan_pairing(
     }
     let operator_relay_key = operator.as_ref().and_then(|op| op.relay_key);
     let uri_rp = opts.uri.as_ref().and_then(|u| u.relay_pub);
-    if let (Some(a), Some(b)) = (operator_relay_key, uri_rp)
-        && a != b
-    {
-        return Err(CoreError::InvalidPairingUri(
-            "operator relay key does not match the URI rp".into(),
-        )
-        .into());
-    }
+    let binding = PairRouteBinding::new(opts.uri.clone(), operator_relay_key)?;
     let hints: Vec<HintInput> = match (&operator, &opts.uri) {
         (Some(op), _) => vec![HintInput::new(&op.hint, HintSource::Operator)],
         (None, Some(uri)) => uri
@@ -2658,31 +2651,21 @@ pub(crate) async fn plan_pairing(
         floor,
         roster,
         persist,
-        operator_relay_key,
+        binding,
     })
 }
 
-/// The `rp`, operator relay key and route statement checks of one verified candidate. `Invalid` is fatal for the whole attempt.
-pub(crate) fn check_candidate_routes(
-    uri: Option<&PairingUri>,
-    operator_relay_key: Option<&[u8; 32]>,
-    signing_pub: &HybridSigningPublicKey,
+/// The route check of one candidate from the machine's pre-`msg3` verdict. An invalid route
+/// statement is fatal for the whole attempt, every other refusal moves on to the next candidate.
+pub(crate) fn committable_route_check(
+    verdict: Option<&PairRouteVerdict>,
 ) -> Result<RouteCheck, CandidateError> {
-    if let Some(uri) = uri {
-        uri.check_relay_pub(signing_pub)?;
+    let verdict = verdict.ok_or(CoreError::HostKeyUnverified)?;
+    match verdict.committable() {
+        Ok(check) => Ok(check.clone()),
+        Err(err @ CoreError::InvalidPairingUri(_)) => Err(CandidateError::fatal(err.into())),
+        Err(err) => Err(err.into()),
     }
-    if operator_relay_key.is_some_and(|k| k != signing_pub.ed25519_bytes()) {
-        return Err(CoreError::HostKeyUnverified.into());
-    }
-    let check = uri.map_or(RouteCheck::Unsigned(UnsignedReason::Absent), |u| {
-        u.verify_route_statement(signing_pub)
-    });
-    if matches!(check, RouteCheck::Invalid) {
-        return Err(CandidateError::fatal(
-            CoreError::InvalidPairingUri("route statement does not verify".into()).into(),
-        ));
-    }
-    Ok(check)
 }
 
 /// The persistence plan of a successful pairing: the winner's original hint counts only when it
@@ -2789,11 +2772,10 @@ pub async fn drive_pair_initiator_with_policy(
         floor,
         roster,
         persist,
-        operator_relay_key,
+        binding,
     } = plan;
     let mut skipped = set.skipped.clone();
     let roster = Arc::new(roster);
-    let uri = opts.uri.clone().map(Arc::new);
     let code = opts.code.clone();
     let (name, kind, budget) = (
         opts.device_name.clone(),
@@ -2807,7 +2789,7 @@ pub async fn drive_pair_initiator_with_policy(
         move |cand, dialer| {
             let identity = Arc::clone(&identity);
             let roster = Arc::clone(&roster);
-            let uri = uri.clone();
+            let binding = binding.clone();
             let (code, name, kind, pinned) =
                 (code.clone(), name.clone(), kind.clone(), pinned.clone());
             async move {
@@ -2815,6 +2797,7 @@ pub async fn drive_pair_initiator_with_policy(
                     &identity, name, kind, code, pinned, floor, None,
                 )?
                 .with_roster_floors(&roster)
+                .with_route_binding(binding)
                 .with_deferred_claim();
                 let mut sas = None;
                 let start = machine.start()?;
@@ -2858,14 +2841,7 @@ pub async fn drive_pair_initiator_with_policy(
                     ))
                     .into());
                 }
-                let host = machine
-                    .verified_host()
-                    .ok_or(CoreError::HostKeyUnverified)?;
-                let route_check = check_candidate_routes(
-                    uri.as_deref(),
-                    operator_relay_key.as_ref(),
-                    &host.signing_pub,
-                )?;
+                let route_check = committable_route_check(machine.route_verdict())?;
                 Ok(PendingCommit {
                     stream,
                     machine,
