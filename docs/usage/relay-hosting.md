@@ -19,7 +19,7 @@ flowchart TD
   R -->|NAT or firewall blocks direct link| H{"Choose private relay track"}
   H -->|"Track 1: Serverless click-to-deploy"| C["Cloudflare Workers + Hibernatable DO"]
   H -->|"Track 2: Managed container or Free VM"| P["Oracle Always Free / Railway / Fly.io / Render"]
-  H -->|"Track 3: Home host without port forwards"| T["Tailscale Funnel / Cloudflare Tunnel -> localhost"]
+  H -->|"Track 3: Home host without port forwards"| T["Tailscale Funnel / Cloudflare Tunnel to localhost"]
   C --> W["tendril-core WASM (/v1/relay, /v2/relay, GET /healthz)"]
   P --> W2["tendril-relay binary (/v1/relay, /v2/relay, GET /healthz)"]
   T --> W2
@@ -45,7 +45,7 @@ Tendril tries `local`, `direct`, `overlay`, and `p2p` (`iroh`) links before fall
 
 `deploy/cloudflare/` packages a thin Cloudflare Worker router and a singleton SQLite-backed Durable Object (`TendrilRelay`) powered by `tendril-core` compiled to WebAssembly. App end users with a GitHub and free Cloudflare account can deploy a private personal relay directly from their browser without running containers or managing Linux hosts, and app developers can embed the same button in onboarding docs or deploy the worker into their own organization account.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/agync/tendril/tree/main/deploy/cloudflare)
+<p><a href="https://deploy.workers.cloudflare.com/?url=https://github.com/agync/tendril/tree/main/deploy/cloudflare"><img src="assets/deploy-to-cloudflare.svg" alt="Deploy to Cloudflare" width="184" height="39"></a></p>
 
 1. Click **Deploy to Cloudflare** (no credit card is required on Cloudflare Workers Free for a forked repo deployment), sign in, authorize GitHub fork creation, and let Workers Builds compile `tendril-wasm` into the Worker bundle via `scripts/build.sh` (`main` branch by default, configurable via `TENDRIL_SOURCE_REF`).
 2. Open the deployed Worker's **Settings -> Variables and Secrets** and add `TENDRIL_RELAY_AUTH_SECRET` (generate a `32`-byte secret via `openssl rand -hex 32`) so unauthenticated callers on your `*.workers.dev` URL cannot probe mailboxes or consume quota.
