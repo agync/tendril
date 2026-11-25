@@ -15,6 +15,6 @@ RUN apt-get update \
     && useradd -r -u 65532 -g 65532 -s /sbin/nologin tendril
 COPY --from=builder /out/tendril-relay /usr/local/bin/tendril-relay
 USER 65532:65532
+ENV PORT=8443
 EXPOSE 8443
 ENTRYPOINT ["/usr/local/bin/tendril-relay"]
-CMD ["--listen", "0.0.0.0:8443"]

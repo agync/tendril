@@ -8,11 +8,19 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use tendril_core::crypto::{b64url_decode_array, is_valid_ed25519_public_key};
 use tendril_core::relay_auth::validate_relay_auth_secret;
+use tendril_core::v2::canonical_relay_host;
 use tendril_relay::server::{MAX_AUTH_SECRET_FILE_BYTES, read_private_file};
 use tendril_relay::{IpCidr, RelayAuthScope, RelayConfig, RelayServer, TrustedProxyHeader};
 use zeroize::Zeroizing;
 
 const MAX_ALLOW_MAILBOXES_FILE_BYTES: usize = 1024 * 1024;
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8443";
+const DEFAULT_RELAY_HOST: &str = "localhost";
+const PLATFORM_HOST_ENVS: &[&str] = &[
+    "RAILWAY_PUBLIC_DOMAIN",
+    "RENDER_EXTERNAL_HOSTNAME",
+    "KOYEB_PUBLIC_DOMAIN",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliAuthScope {
@@ -50,10 +58,12 @@ impl From<CliTrustedProxyHeader> for TrustedProxyHeader {
     about = "Stateless Tendril v1/v2 WebSocket ciphertext relay"
 )]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:8443")]
-    listen: SocketAddr,
-    #[arg(long, default_value = "localhost")]
-    host: String,
+    /// Listen socket address (falls back to TENDRIL_RELAY_LISTEN, 0.0.0.0:$PORT, or 127.0.0.1:8443).
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// Canonical relay host name (falls back to TENDRIL_RELAY_HOST, PaaS host env vars, or localhost).
+    #[arg(long)]
+    host: Option<String>,
     #[arg(long, default_value_t = 8)]
     max_pending: usize,
     #[arg(long, default_value_t = 4096)]
@@ -172,10 +182,98 @@ fn load_auth_secret(file: Option<&Path>) -> Result<Option<Zeroizing<Vec<u8>>>, S
     }
 }
 
-fn build_relay_config(
+fn read_env_var(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(val) => Ok(Some(val)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid UTF-8")),
+    }
+}
+
+fn resolve_listen_addr<F>(
+    cli_listen: Option<SocketAddr>,
+    mut get_env: F,
+) -> Result<SocketAddr, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    if let Some(addr) = cli_listen {
+        return Ok(addr);
+    }
+    if let Some(raw) = get_env("TENDRIL_RELAY_LISTEN")? {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("TENDRIL_RELAY_LISTEN must not be empty".to_owned());
+        }
+        return trimmed
+            .parse::<SocketAddr>()
+            .map_err(|err| format!("invalid TENDRIL_RELAY_LISTEN '{trimmed}': {err}"));
+    }
+    if let Some(raw_port) = get_env("PORT")? {
+        let trimmed = raw_port.trim();
+        if !trimmed.is_empty() {
+            let port: u16 = trimmed
+                .parse()
+                .map_err(|err| format!("invalid PORT '{trimmed}': {err}"))?;
+            if port == 0 {
+                return Err("PORT must be in 1..=65535".to_owned());
+            }
+            return Ok(SocketAddr::from(([0, 0, 0, 0], port)));
+        }
+    }
+    Ok(DEFAULT_LISTEN_ADDR
+        .parse()
+        .expect("default listen address parses"))
+}
+
+fn resolve_relay_host<F>(cli_host: Option<String>, mut get_env: F) -> Result<String, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    let candidate = if let Some(host) = cli_host {
+        host
+    } else if let Some(raw) = get_env("TENDRIL_RELAY_HOST")? {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("TENDRIL_RELAY_HOST must not be empty".to_owned());
+        }
+        trimmed.to_owned()
+    } else {
+        let mut detected = None;
+        for name in PLATFORM_HOST_ENVS {
+            if let Some(raw) = get_env(name)? {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    detected = Some(trimmed.to_owned());
+                    break;
+                }
+            }
+        }
+        if detected.is_none()
+            && let Some(raw) = get_env("FLY_APP_NAME")?
+        {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                detected = Some(format!("{trimmed}.fly.dev"));
+            }
+        }
+        detected.unwrap_or_else(|| DEFAULT_RELAY_HOST.to_owned())
+    };
+    canonical_relay_host(&candidate)
+        .map_err(|err| format!("invalid relay host '{candidate}': {err}"))
+}
+
+fn build_relay_config_with_env<F>(
     args: Args,
     auth_secret: Option<Zeroizing<Vec<u8>>>,
-) -> Result<RelayConfig, String> {
+    mut get_env: F,
+) -> Result<RelayConfig, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    let listen_addr = resolve_listen_addr(args.listen, &mut get_env)?;
+    let host = resolve_relay_host(args.host, &mut get_env)?;
+
     let mut allowed_mailboxes = Vec::with_capacity(args.allow_mailboxes.len());
     for raw in &args.allow_mailboxes {
         allowed_mailboxes.push(decode_32b_key(raw, "--allow-mailbox", false)?);
@@ -199,8 +297,8 @@ fn build_relay_config(
     }
 
     Ok(RelayConfig {
-        listen_addr: args.listen,
-        host: args.host,
+        listen_addr,
+        host,
         max_pending_per_mailbox: args.max_pending,
         max_total_connections: args.max_connections,
         max_mailboxes: args.max_mailboxes,
@@ -216,6 +314,13 @@ fn build_relay_config(
         auth_scope: args.auth_scope.unwrap_or(CliAuthScope::All).into(),
         ..RelayConfig::default()
     })
+}
+
+fn build_relay_config(
+    args: Args,
+    auth_secret: Option<Zeroizing<Vec<u8>>>,
+) -> Result<RelayConfig, String> {
+    build_relay_config_with_env(args, auth_secret, read_env_var)
 }
 
 #[tokio::main]
@@ -353,6 +458,114 @@ mod tests {
         assert!(
             load_auth_secret(Some(&link_path)).is_err(),
             "symlink auth-secret-file must be rejected"
+        );
+    }
+
+    #[test]
+    fn paas_env_resolution_and_precedence() {
+        use std::collections::HashMap;
+
+        let map_lookup = |vars: &HashMap<&str, &str>| {
+            let map: HashMap<String, String> = vars
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            move |key: &str| -> Result<Option<String>, String> { Ok(map.get(key).cloned()) }
+        };
+
+        // Defaults with empty environment.
+        let empty = HashMap::new();
+        let default_args = Args::try_parse_from(["tendril-relay"]).unwrap();
+        let default_cfg =
+            build_relay_config_with_env(default_args, None, map_lookup(&empty)).unwrap();
+        assert_eq!(default_cfg.listen_addr, "127.0.0.1:8443".parse().unwrap());
+        assert_eq!(default_cfg.host, "localhost");
+
+        // PORT binds 0.0.0.0:<PORT>; FLY_APP_NAME maps to <app>.fly.dev.
+        let fly_vars = HashMap::from([("PORT", "8080"), ("FLY_APP_NAME", "my-tendril")]);
+        let fly_args = Args::try_parse_from(["tendril-relay"]).unwrap();
+        let fly_cfg = build_relay_config_with_env(fly_args, None, map_lookup(&fly_vars)).unwrap();
+        assert_eq!(fly_cfg.listen_addr, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(fly_cfg.host, "my-tendril.fly.dev");
+
+        // TENDRIL_RELAY_LISTEN beats PORT; RAILWAY_PUBLIC_DOMAIN beats RENDER/KOYEB/FLY.
+        let precedence_vars = HashMap::from([
+            ("PORT", "8080"),
+            ("TENDRIL_RELAY_LISTEN", "127.0.0.1:9443"),
+            ("RAILWAY_PUBLIC_DOMAIN", "relay.up.railway.app"),
+            ("RENDER_EXTERNAL_HOSTNAME", "relay.onrender.com"),
+            ("KOYEB_PUBLIC_DOMAIN", "relay.koyeb.app"),
+            ("FLY_APP_NAME", "ignored-fly"),
+        ]);
+        let p_args = Args::try_parse_from(["tendril-relay"]).unwrap();
+        let p_cfg =
+            build_relay_config_with_env(p_args, None, map_lookup(&precedence_vars)).unwrap();
+        assert_eq!(p_cfg.listen_addr, "127.0.0.1:9443".parse().unwrap());
+        assert_eq!(p_cfg.host, "relay.up.railway.app");
+
+        // TENDRIL_RELAY_HOST beats platform domain vars and canonicalizes trailing dots/case.
+        let host_override = HashMap::from([
+            ("TENDRIL_RELAY_HOST", "RELAY.Example.COM."),
+            ("RAILWAY_PUBLIC_DOMAIN", "ignored.up.railway.app"),
+        ]);
+        let ho_args = Args::try_parse_from(["tendril-relay"]).unwrap();
+        let ho_cfg =
+            build_relay_config_with_env(ho_args, None, map_lookup(&host_override)).unwrap();
+        assert_eq!(ho_cfg.host, "relay.example.com");
+
+        // Explicit CLI flags override all env vars.
+        let cli_args = Args::try_parse_from([
+            "tendril-relay",
+            "--listen",
+            "127.0.0.1:7443",
+            "--host",
+            "cli.example",
+        ])
+        .unwrap();
+        let cli_cfg =
+            build_relay_config_with_env(cli_args, None, map_lookup(&precedence_vars)).unwrap();
+        assert_eq!(cli_cfg.listen_addr, "127.0.0.1:7443".parse().unwrap());
+        assert_eq!(cli_cfg.host, "cli.example");
+
+        // Render and Koyeb fallbacks work when higher-priority platform vars are empty or absent.
+        let render_vars = HashMap::from([
+            ("RAILWAY_PUBLIC_DOMAIN", "  "),
+            ("RENDER_EXTERNAL_HOSTNAME", "relay-svc.onrender.com"),
+            ("FLY_APP_NAME", "fallback-fly"),
+        ]);
+        assert_eq!(
+            resolve_relay_host(None, map_lookup(&render_vars)).unwrap(),
+            "relay-svc.onrender.com"
+        );
+        let koyeb_vars = HashMap::from([
+            ("KOYEB_PUBLIC_DOMAIN", "relay-svc.koyeb.app"),
+            ("FLY_APP_NAME", "fallback-fly"),
+        ]);
+        assert_eq!(
+            resolve_relay_host(None, map_lookup(&koyeb_vars)).unwrap(),
+            "relay-svc.koyeb.app"
+        );
+
+        // Blank PORT falls through to default; invalid/empty explicit overrides fail closed.
+        let blank_port = HashMap::from([("PORT", "  ")]);
+        assert_eq!(
+            resolve_listen_addr(None, map_lookup(&blank_port)).unwrap(),
+            "127.0.0.1:8443".parse::<SocketAddr>().unwrap()
+        );
+        for bad_port in ["0", "70000", "abc"] {
+            let vars = HashMap::from([("PORT", bad_port)]);
+            assert!(resolve_listen_addr(None, map_lookup(&vars)).is_err());
+        }
+        for bad_listen in ["", "   ", "not-an-addr"] {
+            let vars = HashMap::from([("TENDRIL_RELAY_LISTEN", bad_listen)]);
+            assert!(resolve_listen_addr(None, map_lookup(&vars)).is_err());
+        }
+        for bad_host in ["", "  ", "https://bad.example", "bad.example:8443"] {
+            let vars = HashMap::from([("TENDRIL_RELAY_HOST", bad_host)]);
+            assert!(resolve_relay_host(None, map_lookup(&vars)).is_err());
+        }
+        assert!(
+            resolve_relay_host(Some("bad.example/path".to_owned()), map_lookup(&empty)).is_err()
         );
     }
 }

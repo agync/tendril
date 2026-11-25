@@ -13,6 +13,9 @@ pub const RELAY_PATH: &str = "/v1/relay";
 /// Canonical WebSocket path for Tendril v2 blinded-epoch relays (`spec/relay-v2.md`).
 pub const RELAY_V2_PATH: &str = "/v2/relay";
 
+/// Plain HTTP health probe path (`GET` and `HEAD` without `Upgrade`).
+pub const RELAY_HEALTH_PATH: &str = "/healthz";
+
 /// Maximum number of pre-warmed standby acceptor sockets parked per mailbox.
 pub const MAX_STANDBY_PER_MAILBOX: usize = 4;
 

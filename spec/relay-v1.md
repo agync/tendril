@@ -9,7 +9,8 @@ Conventions follow `spec/wire-v1.md`. The relay is an untrusted byte forwarder: 
 ## 1. Endpoint and Transport
 
 - WebSocket endpoint: `wss://<host>/v1/relay` (`ws://<host>/v1/relay` permitted on loopback `127.0.0.1` / `::1` test fixtures).
-- Requests to any other HTTP path MUST be rejected before completing the WebSocket upgrade.
+- Relays MAY answer unauthenticated plain HTTP `GET /healthz` and `HEAD /healthz` liveness probes (carrying no `Upgrade` or `Sec-WebSocket-Key` header) with `200 OK` (`Content-Type: text/plain; charset=utf-8`, `Cache-Control: no-store`, body `ok` on `GET`).
+- WebSocket upgrade requests targeting `/healthz` and requests to any other HTTP path MUST be rejected before completing the WebSocket upgrade.
 - Every forwarded data unit inside binary bridge mode is one WebSocket **binary** frame carrying verbatim Tendril wire bytes (`2 B uint16_be len || body`, total `<= 65521` bytes).
 - Relays MUST NOT log application payloads, client device names, pairing codes, or unhashed peer messages.
 

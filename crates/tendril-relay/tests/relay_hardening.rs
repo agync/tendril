@@ -2313,3 +2313,256 @@ async fn w2_standby_cap_control_lifecycle_and_zero_presence_leak() {
 
     srv.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn paas_healthz_probe_serves_http_and_rejects_ws_upgrade_over_plain_and_tls() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_http_response<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        io: &mut S,
+        req: &[u8],
+    ) -> String {
+        io.write_all(req).await.expect("write http req");
+        io.flush().await.expect("flush http req");
+        let mut buf = Vec::new();
+        timeout(Duration::from_secs(2), io.read_to_end(&mut buf))
+            .await
+            .expect("http read timed out")
+            .expect("http read failed");
+        String::from_utf8(buf).expect("valid utf8 http response")
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind plain relay");
+    let handle = server.spawn();
+    let addr = handle.local_addr();
+
+    // GET /healthz across split header writes returns 200 OK with body "ok".
+    {
+        let mut sock = TcpStream::connect(addr).await.expect("connect plain");
+        sock.write_all(b"GET /healthz HTTP/1.1\r\n").await.unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let resp =
+            read_http_response(&mut sock, b"Host: localhost\r\nConnection: close\r\n\r\n").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected 200 OK on GET /healthz, got: {resp:?}"
+        );
+        assert!(resp.contains("Content-Length: 2\r\n"));
+        assert!(resp.contains("Cache-Control: no-store\r\n"));
+        assert!(
+            resp.ends_with("\r\n\r\nok"),
+            "expected body ok, got: {resp:?}"
+        );
+    }
+
+    // HEAD /healthz returns 200 OK with Content-Length: 2 and empty body.
+    {
+        let mut sock = TcpStream::connect(addr).await.expect("connect head");
+        let resp = read_http_response(
+            &mut sock,
+            b"HEAD /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected 200 OK on HEAD /healthz, got: {resp:?}"
+        );
+        assert!(resp.contains("Content-Length: 2\r\n"));
+        assert!(
+            resp.ends_with("\r\n\r\n"),
+            "HEAD must have empty body, got: {resp:?}"
+        );
+    }
+
+    // Non-GET/HEAD methods, query suffixes, Upgrade/HTTP anomalies, and other paths must not return 200 OK.
+    for req in [
+        b"POST /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".as_slice(),
+        b"GET /healthz?probe=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".as_slice(),
+        b"GET /healthz HTTP/9.9\r\nHost: localhost\r\nConnection: close\r\n\r\n".as_slice(),
+        b"GET /healthz HTTP/1.1\r\nHost: localhost\nUpgrade: websocket\r\n\r\n".as_slice(),
+        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive, Upgrade\r\n\r\n"
+            .as_slice(),
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".as_slice(),
+    ] {
+        let mut sock = TcpStream::connect(addr).await.expect("connect non-healthz");
+        let resp = read_http_response(&mut sock, req).await;
+        assert!(
+            !resp.starts_with("HTTP/1.1 200 OK"),
+            "unexpected 200 OK for {}: {resp:?}",
+            String::from_utf8_lossy(req)
+        );
+    }
+
+    // WebSocket upgrades targeting /healthz MUST be rejected before upgrade.
+    let bad_ws_url = format!("ws://{addr}/healthz");
+    assert!(
+        tokio_tungstenite::connect_async(&bad_ws_url).await.is_err(),
+        "websocket upgrade to /healthz must be rejected"
+    );
+
+    // /v1/relay still serves WebSocket challenges on the same listener.
+    let (mut ws, _) = tokio_tungstenite::connect_async(&handle.ws_url())
+        .await
+        .expect("v1 ws connect");
+    let first = timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("challenge timeout")
+        .expect("challenge item")
+        .expect("challenge ok")
+        .into_text()
+        .expect("challenge text");
+    assert!(matches!(
+        serde_json::from_str::<RelayServerMsg>(&first).expect("parse challenge"),
+        RelayServerMsg::Challenge { .. }
+    ));
+    drop(ws);
+    handle.stop().await.expect("stop plain relay");
+
+    // TLS listener serves GET /healthz with 200 OK as well.
+    let tmp = TempDir::new().expect("tempdir");
+    let (ca_cert_path, cert_path, key_path) = generate_ephemeral_cert(tmp.path());
+    let tls_server = RelayServer::bind(RelayConfig {
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..RelayConfig::default()
+    })
+    .await
+    .expect("bind tls relay");
+    let tls_handle = tls_server.spawn();
+    let tls_addr = tls_handle.local_addr();
+
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(&ca_cert_path).expect("open ca cert") {
+        roots
+            .add(cert.expect("parse ca cert"))
+            .expect("add ca cert");
+    }
+    let tls_cfg = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let tls_connector = tokio_rustls::TlsConnector::from(tls_cfg);
+    let tcp = TcpStream::connect(tls_addr).await.expect("connect tls tcp");
+    let server_name = rustls_pki_types::ServerName::try_from("localhost").expect("server name");
+    let mut tls_stream = tls_connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls connect");
+    let tls_resp = read_http_response(
+        &mut tls_stream,
+        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        tls_resp.starts_with("HTTP/1.1 200 OK\r\n") && tls_resp.ends_with("\r\n\r\nok"),
+        "expected TLS GET /healthz 200 OK with body ok, got: {tls_resp:?}"
+    );
+    tls_handle.stop().await.expect("stop tls relay");
+}
+
+#[tokio::test]
+async fn paas_cli_env_configures_listen_host_and_healthz() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command as StdCommand, Stdio};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let bin = env!("CARGO_BIN_EXE_tendril-relay");
+    let child = StdCommand::new(bin)
+        .env_clear()
+        .env("RUST_LOG", "info")
+        .env("TENDRIL_RELAY_LISTEN", "127.0.0.1:0")
+        .env("FLY_APP_NAME", "tendril-paas-smoke")
+        .env("TENDRIL_RELAY_AUTH_SECRET", "paas-smoke-secret-value")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tendril-relay");
+    let mut guard = ChildGuard(child);
+
+    let stdout = guard.0.stdout.take().expect("stdout pipe");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(pos) = line.find("ws://") {
+                let candidate = line[pos..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                if candidate.ends_with("/v1/relay") {
+                    let _ = tx.send(candidate);
+                    break;
+                }
+            }
+        }
+    });
+    let ws_url = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("tendril-relay did not log listening URL");
+    let host_port = ws_url
+        .strip_prefix("ws://")
+        .and_then(|s| s.strip_suffix("/v1/relay"))
+        .expect("parse ws_url");
+    let addr: std::net::SocketAddr = host_port.parse().expect("parse socket addr");
+
+    let mut sock = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+        .await
+        .expect("connect timeout")
+        .expect("connect child");
+    sock.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut body = Vec::new();
+    timeout(Duration::from_secs(2), sock.read_to_end(&mut body))
+        .await
+        .expect("healthz read timeout")
+        .unwrap();
+    let resp = String::from_utf8(body).unwrap();
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.ends_with("\r\n\r\nok"),
+        "expected /healthz 200 OK, got: {resp:?}"
+    );
+
+    let (mut ws, _) = timeout(
+        Duration::from_secs(2),
+        tokio_tungstenite::connect_async(&ws_url),
+    )
+    .await
+    .expect("ws connect timeout")
+    .expect("connect child ws");
+    let first = timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("timeout")
+        .expect("item")
+        .expect("ok")
+        .into_text()
+        .expect("txt");
+    match serde_json::from_str::<RelayServerMsg>(&first).expect("parse") {
+        RelayServerMsg::Challenge {
+            host,
+            auth_required,
+            ..
+        } => {
+            assert_eq!(host, "tendril-paas-smoke.fly.dev");
+            assert_eq!(
+                auth_required,
+                Some(vec!["register".to_owned(), "dial".to_owned()])
+            );
+        }
+        other => panic!("unexpected msg: {other:?}"),
+    }
+}

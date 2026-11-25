@@ -12,11 +12,13 @@ tags: [usage, cli, relay, conformance]
 
 ## Running a standalone relay
 
-Launch `tendril-relay` locally or build the rootless container defined in the root `Containerfile`:
+Launch `tendril-relay` locally, from the root `Containerfile`, or via a PaaS blueprint in `deploy/` (see [Private relay hosting and deployment](relay-hosting.md)):
 
 ```bash
 cargo run -p tendril-relay -- --listen 127.0.0.1:8443 --host localhost
 ```
+
+`tendril-relay` resolves its bind socket from `--listen`, then `TENDRIL_RELAY_LISTEN`, then `0.0.0.0:$PORT`, defaulting to `127.0.0.1:8443` (with `Containerfile` setting `ENV PORT=8443`). It resolves `--host` from CLI `--host`, then `TENDRIL_RELAY_HOST`, then platform hostname variables (`RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`, `KOYEB_PUBLIC_DOMAIN`, and `<FLY_APP_NAME>.fly.dev`), defaulting to `localhost`. Plain HTTP `GET /healthz` and `HEAD /healthz` probes (without `Upgrade` or `Sec-WebSocket-Key`) return `200 OK`, while WebSocket upgrades to `/healthz` are rejected.
 
 In production deployments, terminate TLS directly on `tendril-relay` (`--tls-cert` and `--tls-key`, where `--tls-key` enforces `0600` regular non-symlink file permissions, serving `wss://<host>/v1/relay` and `wss://<host>/v2/relay`) or behind a trusted reverse proxy configured with `--trusted-proxy <CIDR>`. Right-to-left header extraction runs only when the TCP peer matches `--trusted-proxy`, using `--trusted-proxy-header <xff|forwarded>` (default `xff`, explicitly selected rather than allowing `Forwarded` to bypass `X-Forwarded-For`). Trusted-proxy peers take a pre-upgrade semaphore permit (`(max_total_connections / 4).max(1)`) and run handshake upgrade under a `min(5s, accept_timeout)` timeout; per-IP `ip_guard` limits apply to the extracted client IP after upgrade. Reverse proxies should strip or overwrite untrusted client forwarding headers. Rate limits normalize IPv4-mapped addresses and group IPv6 addresses by `/64` prefix alongside global `--max-connections` and `--max-mailboxes` caps.
 

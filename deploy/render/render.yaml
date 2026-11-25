@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: tendril-relay
+    runtime: image
+    image:
+      url: ghcr.io/agync/tendril-relay:latest
+    plan: free
+    numInstances: 1
+    healthCheckPath: /healthz
+    envVars:
+      - key: TENDRIL_RELAY_AUTH_SECRET
+        generateValue: true
