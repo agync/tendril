@@ -145,6 +145,7 @@ async function dialWebStream({
   deriveV2Dial = null,
   allowInsecureWs = false,
   irohHint = false,
+  initFrame = null,
   timeoutMs,
   signal = null,
 }) {
@@ -181,6 +182,7 @@ async function dialWebStream({
       allowInsecureWs,
       relayAuthTicket,
       relayAuthSecret,
+      initFrame,
       timeoutMs,
       signal,
     });
@@ -192,6 +194,7 @@ async function dialWebStream({
     allowInsecureWs,
     relayAuthTicket,
     relayAuthSecret,
+    initFrame,
     timeoutMs,
     signal,
   });
@@ -1405,6 +1408,14 @@ export class TendrilWebClient {
       );
       let stream = null;
       try {
+        const target = endpoint || relayUrl;
+        const isRelay = !(
+          target &&
+          (target.startsWith("iroh://") ||
+            target.startsWith("p2p:iroh://") ||
+            /^broker\+/i.test(target))
+        );
+        const startBytes = initiator.start();
         stream = await dialWebStream({
           endpoint,
           relayUrl,
@@ -1417,14 +1428,16 @@ export class TendrilWebClient {
           relayAuthTicket,
           relayAuthSecret,
           allowInsecureWs,
+          initFrame: isRelay ? startBytes : null,
           timeoutMs: remainingBudgetMs(
             deadlineMs,
             "m2m enrollment timed out connecting to transport"
           ),
         });
         this.#ensureOpen();
-        const startBytes = initiator.start();
-        await sendProtocolBytes(stream, startBytes);
+        if (!stream.fastOpenSent) {
+          await sendProtocolBytes(stream, startBytes);
+        }
         while (true) {
           const waitMs = remainingBudgetMs(
             deadlineMs,
@@ -1852,6 +1865,12 @@ export class TendrilWebClient {
               d.secretMaster
             )
           : { relayAuthTicket: null, relayAuthSecret: null };
+      let preStart = null;
+      if (cand.provider === "relay") {
+        const startedAt = performance.now();
+        preStart = initiator.start();
+        rungDeadline += performance.now() - startedAt;
+      }
       stream = await dialWebStream({
         provider: cand.provider,
         endpoint: cand.provider === "p2p" || cand.provider === "broker" ? cand.endpoint : null,
@@ -1865,14 +1884,19 @@ export class TendrilWebClient {
         relayAuthSecret: creds.relayAuthSecret,
         allowInsecureWs: d.allowInsecureWs,
         irohHint: !cand.explicit,
+        initFrame: preStart,
         timeoutMs: remainingBudgetMs(rungDeadline, `${label} timed out connecting to transport`),
         signal,
       });
       this.#ensureOpen();
-      const startedAt = performance.now();
-      const startBytes = initiator.start();
-      rungDeadline += performance.now() - startedAt;
-      await sendProtocolBytes(stream, startBytes);
+      if (!preStart) {
+        const startedAt = performance.now();
+        preStart = initiator.start();
+        rungDeadline += performance.now() - startedAt;
+      }
+      if (!stream.fastOpenSent) {
+        await sendProtocolBytes(stream, preStart);
+      }
       let verified = null;
       while (verified === null) {
         if (signal?.aborted) {
@@ -2137,10 +2161,12 @@ export class TendrilWebClient {
    * changed, whether the feed failed, established or closed; a failed evidence persist locks the
    * client. Writes happen after the section releases.
    */
-  async #driveHandshake(ctx, session, stream, roster, deadlineMs, startedMs, locked) {
+  async #driveHandshake(ctx, session, stream, roster, deadlineMs, startedMs, locked, preStart = null) {
     const { wire, base } = ctx;
-    const m1 = wire === 2 ? session.start(nowUnixSecs()) : session.start();
-    await sendProtocolBytes(stream, m1);
+    const m1 = preStart?.bytes ?? (wire === 2 ? session.start(nowUnixSecs()) : session.start());
+    if (!preStart?.fastOpenSent) {
+      await sendProtocolBytes(stream, m1);
+    }
     while (true) {
       const frame = await stream.recv(remainingBudgetMs(deadlineMs, `${base} handshake timed out`));
       this.#ensureOpen();
@@ -2344,6 +2370,13 @@ export class TendrilWebClient {
               )
             )
         : null;
+      const isRelay = !(target && (target.startsWith("iroh://") || /^broker\+/i.test(target)));
+      const startedMs = performance.now();
+      const preBytes = isRelay
+        ? wire === 2
+          ? session.start(nowUnixSecs())
+          : session.start()
+        : null;
       stream = await dialWebStream({
         endpoint,
         relayUrl,
@@ -2356,21 +2389,22 @@ export class TendrilWebClient {
         useRelayV2: t.useRelayV2,
         deriveV2Dial,
         allowInsecureWs: ctx.allowInsecureWs,
+        initFrame: preBytes,
         timeoutMs: remainingBudgetMs(
           deadlineMs,
           `${base} handshake timed out connecting to transport`
         ),
       });
       this.#ensureOpen();
-      const startedMs = performance.now();
       const initialEvents = await this.#driveHandshake(
         ctx,
         session,
         stream,
         this.#roster,
         deadlineMs,
-        startedMs,
-        true
+        isRelay ? startedMs : performance.now(),
+        true,
+        preBytes ? { bytes: preBytes, fastOpenSent: Boolean(stream.fastOpenSent) } : null
       );
       let recoveryRoutes = null;
       if (ctx.recoveryUri) {
@@ -2815,6 +2849,12 @@ export class TendrilWebClient {
       const isRelay = cand.provider === "relay";
       const v2Relay = isRelay && isV2RelayUrl(cand.endpoint);
       const dialClone = clone;
+      const startedMs = performance.now();
+      const preBytes = isRelay
+        ? ctx.wire === 2
+          ? session.start(nowUnixSecs())
+          : session.start()
+        : null;
       creds = isRelay
         ? relayCredsFor(cand.endpoint, null, ctx.origins, ctx.relayAuthTicket, ctx.secretMaster)
         : { relayAuthTicket: null, relayAuthSecret: null };
@@ -2842,6 +2882,7 @@ export class TendrilWebClient {
           : null,
         allowInsecureWs: ctx.allowInsecureWs,
         irohHint: cand.source !== "operator",
+        initFrame: preBytes,
         timeoutMs: remainingBudgetMs(
           rungDeadline,
           `${base} handshake timed out connecting to transport`
@@ -2852,21 +2893,22 @@ export class TendrilWebClient {
       if (signal?.aborted) {
         throw makeAbortError(signal);
       }
-      const startedMs = performance.now();
+      const handshakeStartedMs = isRelay ? startedMs : performance.now();
       const initialEvents = await this.#driveHandshake(
         ctx,
         session,
         stream,
         clone,
         rungDeadline,
-        startedMs,
-        false
+        handshakeStartedMs,
+        false,
+        preBytes ? { bytes: preBytes, fastOpenSent: Boolean(stream.fastOpenSent) } : null
       );
       if (signal?.aborted) {
         throw makeAbortError(signal);
       }
       won = true;
-      return { winner: { session, stream, clone, startedMs, initialEvents, cand } };
+      return { winner: { session, stream, clone, startedMs: handshakeStartedMs, initialEvents, cand } };
     } catch (err) {
       if (signal?.aborted) {
         if (signal.reason?.cancelledByWinner) {

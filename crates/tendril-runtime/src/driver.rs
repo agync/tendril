@@ -899,13 +899,31 @@ impl SessionDriver {
             shared: Arc::clone(&shared_roster),
         };
         let target_owned = target_host_id.to_owned();
-        dial_with_policy_verified(dialers, policy_config, candidates, move |_cand, stream| {
+        dial_with_policy_candidates(dialers, policy_config, candidates, move |cand, dialer| {
             let id_c = Arc::clone(&local_identity);
             let target_c = target_owned.clone();
             let grant_c = initial_grant.clone();
             let roster_c = Arc::clone(&shared_roster);
             async move {
-                Self::connect_locked(stream, &id_c, &target_c, grant_c, &roster_c, now_unix).await
+                let crl_seq = roster_c
+                    .lock()
+                    .expect("roster mutex poisoned")
+                    .crl(&target_c)
+                    .map(|c| c.seq);
+                Self::connect_with_source(
+                    StreamSource::Dial {
+                        dialer: &*dialer,
+                        addr: &cand.addr,
+                    },
+                    &id_c,
+                    &target_c,
+                    grant_c,
+                    crl_seq,
+                    RosterRef::Locked(&roster_c),
+                    now_unix,
+                    Vec::new(),
+                )
+                .await
             }
         })
         .await
@@ -914,6 +932,30 @@ impl SessionDriver {
     #[allow(clippy::too_many_arguments)]
     async fn connect_with_roster(
         stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        initial_grant: Option<Grant>,
+        crl_seq: Option<u64>,
+        roster: RosterRef<'_>,
+        now_unix: u64,
+        groups: Vec<GroupSeq>,
+    ) -> Result<Self, RuntimeError> {
+        Self::connect_with_source(
+            StreamSource::Stream(stream),
+            local_identity,
+            target_host_id,
+            initial_grant,
+            crl_seq,
+            roster,
+            now_unix,
+            groups,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_with_source(
+        source: StreamSource<'_>,
         local_identity: &EndpointIdentity,
         target_host_id: &str,
         initial_grant: Option<Grant>,
@@ -938,6 +980,11 @@ impl SessionDriver {
         )?;
         machine.set_local_groups(groups)?;
         let start_actions = machine.start()?;
+        let init_bytes = match start_actions.as_slice() {
+            [SessionAction::WriteBytes(bytes)] if !bytes.is_empty() => Some(bytes.as_slice()),
+            _ => None,
+        };
+        let (stream, fast_open_sent) = dial_source_with_init(source, init_bytes).await?;
         let mut driver = Self {
             stream,
             machine,
@@ -947,7 +994,9 @@ impl SessionDriver {
             _half_open: None,
             route_ingest: IngestSlot::default(),
         };
-        driver.apply_actions(start_actions).await?;
+        if !fast_open_sent {
+            driver.apply_actions(start_actions).await?;
+        }
         driver
             .drive_until_established(now_unix, &mut roster, None, Some(DEFAULT_PRE_AUTH_TIMEOUT))
             .await?;
@@ -1888,6 +1937,54 @@ pub async fn dial_with_policy(
     .await
 }
 
+pub(crate) enum StreamSource<'a> {
+    Stream(Box<dyn PathStream>),
+    Dial {
+        dialer: &'a dyn PathDialer,
+        addr: &'a str,
+    },
+}
+
+pub(crate) async fn dial_source_with_init(
+    source: StreamSource<'_>,
+    init_bytes: Option<&[u8]>,
+) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
+    match source {
+        StreamSource::Stream(stream) => Ok((stream, false)),
+        StreamSource::Dial { dialer, addr } => match init_bytes {
+            Some(bytes) if dialer.supports_fast_open() => {
+                dialer.dial_with_init(addr, Some(bytes)).await
+            }
+            _ => Ok((dialer.dial(addr).await?, false)),
+        },
+    }
+}
+
+pub(crate) async fn dial_with_policy_candidates<T, F, Fut>(
+    dialers: &[Arc<dyn PathDialer>],
+    policy_config: PathPolicyConfig,
+    candidates: Vec<CandidateEndpoint>,
+    drive: F,
+) -> Result<(CandidateEndpoint, T), RuntimeError>
+where
+    T: Send + 'static,
+    F: Fn(CandidateEndpoint, Arc<dyn PathDialer>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<T, RuntimeError>> + Send + 'static,
+{
+    let drive = Arc::new(drive);
+    let race = race_candidates(dialers, policy_config, candidates, move |cand, dialer| {
+        let drive = Arc::clone(&drive);
+        async move { drive(cand, dialer).await.map_err(CandidateError::retry) }
+    })
+    .await;
+    match race.outcome {
+        Ok(won) => Ok(won),
+        Err(RaceEnd::Fatal(err)) => Err(err),
+        Err(RaceEnd::Exhausted) => Err(RuntimeError::Policy("all candidates exhausted")),
+        Err(RaceEnd::ChannelClosed) => Err(RuntimeError::Policy("dialer channel closed")),
+    }
+}
+
 /// Drives [`PathPlanner`] concurrently across provider dialers and gates path activation on an
 /// asynchronous caller verifier (`verify`), keeping competing candidates alive until verification
 /// succeeds.
@@ -1903,17 +2000,14 @@ where
     Fut: Future<Output = Result<T, RuntimeError>> + Send + 'static,
 {
     let verify = Arc::new(verify);
-    let race = race_verified(dialers, policy_config, candidates, move |cand, stream| {
+    dial_with_policy_candidates(dialers, policy_config, candidates, move |cand, dialer| {
         let verify = Arc::clone(&verify);
-        async move { verify(cand, stream).await.map_err(CandidateError::retry) }
+        async move {
+            let stream = dialer.dial(&cand.addr).await?;
+            verify(cand, stream).await
+        }
     })
-    .await;
-    match race.outcome {
-        Ok(won) => Ok(won),
-        Err(RaceEnd::Fatal(err)) => Err(err),
-        Err(RaceEnd::Exhausted) => Err(RuntimeError::Policy("all candidates exhausted")),
-        Err(RaceEnd::ChannelClosed) => Err(RuntimeError::Policy("dialer channel closed")),
-    }
+    .await
 }
 
 /// Failure of one raced candidate. A `fatal` failure ends the whole race.
@@ -1953,25 +2047,24 @@ pub(crate) enum RaceEnd {
     ChannelClosed,
 }
 
-/// Result of [`race_verified`]: the winner or why the race ended, and every candidate that
+/// Result of [`race_candidates`]: the winner or why the race ended, and every candidate that
 /// failed before that, with its typed error.
 pub(crate) struct Race<T> {
     pub(crate) outcome: Result<(CandidateEndpoint, T), RaceEnd>,
     pub(crate) failures: Vec<(CandidateEndpoint, RuntimeError)>,
 }
 
-/// The Happy Eyeballs race behind [`dial_with_policy_verified`], keeping each failed candidate's
-/// typed error and ending at once on a fatal verifier failure (every in-flight candidate is
-/// aborted).
-pub(crate) async fn race_verified<T, F, Fut>(
+/// Happy Eyeballs candidate racer passing the selected [`PathDialer`] directly so callers can
+/// prepare 0-RTT fast-open frames before dialing.
+pub(crate) async fn race_candidates<T, F, Fut>(
     dialers: &[Arc<dyn PathDialer>],
     policy_config: PathPolicyConfig,
     candidates: Vec<CandidateEndpoint>,
-    verify: F,
+    drive: F,
 ) -> Race<T>
 where
     T: Send + 'static,
-    F: Fn(CandidateEndpoint, Box<dyn PathStream>) -> Fut + Send + Sync + 'static,
+    F: Fn(CandidateEndpoint, Arc<dyn PathDialer>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<T, CandidateError>> + Send + 'static,
 {
     let dialer_map: HashMap<ProviderId, Arc<dyn PathDialer>> = dialers
@@ -1981,7 +2074,7 @@ where
     let by_id: HashMap<usize, CandidateEndpoint> =
         candidates.iter().map(|c| (c.id, c.clone())).collect();
 
-    let verifier = Arc::new(verify);
+    let driver = Arc::new(drive);
     let mut planner = PathPlanner::new(policy_config, candidates);
     let started = Instant::now();
     planner.start(0);
@@ -2012,13 +2105,9 @@ where
                     };
                     let tx = result_tx.clone();
                     let id = cand.id;
-                    let endpoint = cand.addr.clone();
-                    let verify_c = Arc::clone(&verifier);
+                    let drive_c = Arc::clone(&driver);
                     let handle = tokio::spawn(async move {
-                        let res = match dialer.dial(&endpoint).await {
-                            Ok(stream) => verify_c(cand, stream).await,
-                            Err(err) => Err(CandidateError::retry(err)),
-                        };
+                        let res = drive_c(cand, dialer).await;
                         let _ = tx.send((id, res)).await;
                     });
                     in_flight_handles.insert(id, AbortOnDrop(handle.abort_handle()));
@@ -2711,18 +2800,17 @@ pub async fn drive_pair_initiator_with_policy(
         opts.device_kind.clone(),
         opts.handshake_timeout,
     );
-    let race = race_verified(
+    let race = race_candidates(
         &set.dialers,
         opts.policy_config,
         set.candidates.clone(),
-        move |_cand, mut stream| {
+        move |cand, dialer| {
             let identity = Arc::clone(&identity);
             let roster = Arc::clone(&roster);
             let uri = uri.clone();
             let (code, name, kind, pinned) =
                 (code.clone(), name.clone(), kind.clone(), pinned.clone());
             async move {
-                let deadline = TokioInstant::now() + budget;
                 let mut machine = PairingInitiator::new_with_min_wire_version(
                     &identity, name, kind, code, pinned, floor, None,
                 )?
@@ -2730,19 +2818,35 @@ pub async fn drive_pair_initiator_with_policy(
                 .with_deferred_claim();
                 let mut sas = None;
                 let start = machine.start()?;
-                match timeout_at(
-                    deadline,
-                    dispatch_pair_actions(stream.as_mut(), start, &mut sas),
+                let init_bytes = match start.as_slice() {
+                    [PairAction::WriteBytes(bytes)] if !bytes.is_empty() => Some(bytes.as_slice()),
+                    _ => None,
+                };
+                let (mut stream, fast_open_sent) = dial_source_with_init(
+                    StreamSource::Dial {
+                        dialer: &*dialer,
+                        addr: &cand.addr,
+                    },
+                    init_bytes,
                 )
-                .await
-                {
-                    Ok(res) => {
-                        res?;
-                    }
-                    Err(_) => {
-                        return Err(
-                            RuntimeError::Timeout("pre-auth pairing handshake timed out").into(),
-                        );
+                .await?;
+                let deadline = TokioInstant::now() + budget;
+                if !fast_open_sent {
+                    match timeout_at(
+                        deadline,
+                        dispatch_pair_actions(stream.as_mut(), start, &mut sas),
+                    )
+                    .await
+                    {
+                        Ok(res) => {
+                            res?;
+                        }
+                        Err(_) => {
+                            return Err(RuntimeError::Timeout(
+                                "pre-auth pairing handshake timed out",
+                            )
+                            .into());
+                        }
                     }
                 }
                 if let Some(outcome) =
@@ -3292,11 +3396,11 @@ impl SessionDriver {
         let target_owned = target.to_owned();
         let grant = opts.grant.clone();
         let ev = Arc::clone(&evidence);
-        let race = race_verified(
+        let race = race_candidates(
             &set.dialers,
             opts.policy_config,
             set.candidates.clone(),
-            move |_cand, stream| {
+            move |cand, dialer| {
                 let identity = Arc::clone(&identity);
                 let roster = (*roster).clone();
                 let (target, grant, expectation) =
@@ -3304,7 +3408,10 @@ impl SessionDriver {
                 let ev = Arc::clone(&ev);
                 async move {
                     Self::day2_candidate(
-                        stream,
+                        StreamSource::Dial {
+                            dialer: &*dialer,
+                            addr: &cand.addr,
+                        },
                         &identity,
                         &target,
                         grant,
@@ -3399,7 +3506,7 @@ impl SessionDriver {
     /// clone of the snapshot roster). The presented rotation is recorded whatever the outcome.
     #[allow(clippy::too_many_arguments)]
     async fn day2_candidate(
-        stream: Box<dyn PathStream>,
+        source: StreamSource<'_>,
         identity: &EndpointIdentity,
         target: &str,
         grant: Option<Grant>,
@@ -3415,6 +3522,11 @@ impl SessionDriver {
         }
         let mut machine = machine.with_route_seq(route_seq)?;
         let start_actions = machine.start()?;
+        let init_bytes = match start_actions.as_slice() {
+            [SessionAction::WriteBytes(bytes)] if !bytes.is_empty() => Some(bytes.as_slice()),
+            _ => None,
+        };
+        let (stream, fast_open_sent) = dial_source_with_init(source, init_bytes).await?;
         let mut driver = Self {
             stream,
             machine,
@@ -3429,7 +3541,9 @@ impl SessionDriver {
         // Evidence is recorded right after each feed, so a candidate aborted once another wins
         // still contributes the `HostHello` it verified.
         let res = async {
-            driver.apply_actions(start_actions).await?;
+            if !fast_open_sent {
+                driver.apply_actions(start_actions).await?;
+            }
             while !driver.machine.is_established() {
                 if driver.machine.is_closed() {
                     return Err(RuntimeError::Closed);

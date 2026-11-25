@@ -28,7 +28,9 @@ Upon opening `/v1/relay`, the server sends one JSON text frame (`challenge`) bin
   "nonce": string,        // b64url 32-byte CSPRNG challenge nonce
   "host": string,         // canonical relay host name bound into signatures
   "max_frame": 65521,     // maximum allowed binary frame byte length
-  "auth_required"?: string[] // optional: ["register"] or ["register", "dial"]; omitted when open
+  "auth_required"?: string[], // optional: ["register"] or ["register", "dial"]; omitted when open
+  "fast_open"?: bool,     // optional: true when relay supports Dial.init_frame (0-RTT)
+  "standby"?: bool        // optional: true when relay supports standby acceptor sockets
 }
 ```
 
@@ -42,7 +44,8 @@ A listening peer registers its 32-byte Ed25519 signing public key as a mailbox a
   "op": "register",
   "pub": string,          // b64url 32-byte Ed25519 signing public key
   "sig": string,          // b64url 64-byte strict Ed25519 signature
-  "auth"?: RelayAuthProof // optional stateless admission proof (required when challenge advertises "register")
+  "auth"?: RelayAuthProof, // optional stateless admission proof (required when challenge advertises "register")
+  "fast_open"?: bool      // optional: true when listener handles Incoming.init_frame
 }
 ```
 
@@ -60,7 +63,29 @@ On valid signature verification, the relay binds `pub` to that control WebSocket
 { "op": "registered", "pub": string }
 ```
 
-### 2.2 Dial Request and Pending Notification
+### 2.1.1 Standby Acceptor Sockets (`standby`)
+
+When `challenge.standby == true`, a registered listener MAY park up to `max_standby_per_mailbox = 4` pre-authenticated standby WebSocket connections so incoming dials bridge without a post-dial `accept` round-trip. On each standby connection, the listener verifies `challenge`, signs the identical Section 2.1 `register` input under `pub`, attaches `auth` covering `"register"` when admission requires it, and sends:
+
+```jsonc
+// Standby Acceptor -> Server
+{
+  "op": "standby",
+  "pub": string,          // b64url 32-byte Ed25519 mailbox public key (MUST match an active registration)
+  "sig": string,          // b64url 64-byte strict Ed25519 signature over Section 2.1 input
+  "auth"?: RelayAuthProof // optional stateless admission proof (required when admission covers "register")
+}
+```
+
+If `pub` is not actively registered, the relay fails closed (`"offline"` or `"unauthorized"`). If `max_standby_per_mailbox` sockets are already parked for `pub`, the relay returns `{ "op": "error", "code": "rate_limited" }` and closes the extra socket. Otherwise it parks the standby socket and replies:
+
+```jsonc
+{ "op": "standby_ready" }
+```
+
+Parked standby sockets are bound to the primary mailbox registration and close when the primary control socket unregisters or disconnects.
+
+### 2.2 Dial Request, 0-RTT `init_frame`, and Pending Notification
 
 A dialing peer initiates a stream toward a target mailbox key:
 
@@ -70,17 +95,24 @@ A dialing peer initiates a stream toward a target mailbox key:
   "op": "dial",
   "target_pub": string,   // b64url 32-byte Ed25519 mailbox key
   "conn_id": string,      // b64url 16-byte unique stream identifier
-  "auth"?: RelayAuthProof // optional stateless admission proof (required when challenge advertises "dial")
+  "auth"?: RelayAuthProof, // optional stateless admission proof (required when challenge advertises "dial")
+  "init_frame"?: string   // optional: b64url 1..=65521 raw initial Tendril bytes (only when challenge.fast_open == true)
 }
 ```
 
-If `target_pub` has an active control connection and fewer than `max_pending_per_mailbox` pending dials, the relay pushes an `incoming` notification over the listener's control WebSocket and holds the dialer socket waiting for an `accept`. If that control connection ends before the dial is accepted, the relay MUST fail the dial with `"offline"` at once rather than hold it until `accept_timeout`:
+When admission covers `dial`, the relay MUST verify `dial.auth` before decoding `init_frame` or looking up `target_pub` so unauthenticated callers cannot probe mailbox presence. If `init_frame` is present, invalid base64url or empty decoded bytes MUST fail with `"bad_request"`, and decoded length exceeding `max_frame` (`65521` bytes) MUST fail with `"frame_too_large"`. Relay control frames permit up to `131072` bytes (`128 KiB`) of JSON text so a base64url-encoded `65521`-byte `init_frame` fits while binary forwarding remains capped at `65521` bytes.
+
+If `target_pub` has an active control connection and `active_count` / `pending_count` are below cap:
+
+1. **Standby hit:** If a live standby socket is parked for `target_pub` (skipping any dead standby socket found at dequeue), the relay pops it atomically, sends `{ "op": "incoming", "conn_id": string }` (adding `"init_frame"` when the listener registered `"fast_open": true`) on that standby socket, sends `{ "op": "ready", "conn_id": string }` to the dialer, and enters binary bridge mode immediately on both sockets without an `accept` round-trip. If the dialer supplied `init_frame` but the listener did not register `"fast_open": true`, the relay injects the decoded bytes as the first WebSocket binary frame toward the acceptor immediately after stream transition.
+2. **Classic fallback:** When no live standby socket is parked, the relay holds the dial pending, pushes `incoming` on the primary control WebSocket (carrying `"init_frame"` only when the listener registered `"fast_open": true`), and waits for `accept`. If that control connection ends before the dial is accepted, the relay MUST fail the dial with `"offline"` at once rather than hold it until `accept_timeout`:
 
 ```jsonc
-// Server -> Listener (control socket)
+// Server -> Listener (control socket or consumed standby socket)
 {
   "op": "incoming",
-  "conn_id": string
+  "conn_id": string,
+  "init_frame"?: string   // present when dialer sent init_frame and listener registered fast_open=true
 }
 ```
 
@@ -88,7 +120,7 @@ A valid `accept` (Section 2.3) claims the pending dial atomically, and the claim
 
 ### 2.3 Anti-Hijack Stream Accept (Listener Data Socket)
 
-To claim a pending `conn_id`, the listener opens a fresh `/v1/relay` WebSocket connection, receives a new `challenge` (`nonce_accept`), and sends:
+To claim a pending `conn_id` delivered via classic `incoming`, the listener opens a fresh `/v1/relay` WebSocket connection, receives a new `challenge` (`nonce_accept`), and sends:
 
 ```jsonc
 // Listener data socket -> Server
@@ -110,13 +142,13 @@ nonce_accept  (32 B) = raw 32-byte decoded challenge.nonce of the accept socket
 conn_id       (16 B) = raw 16-byte decoded conn_id
 ```
 
-On valid signature and `accept.pub == pending.target_pub`, the relay sends `ready` to BOTH the dialer socket and the acceptor socket, then enters raw binary forwarding mode:
+On valid signature and `accept.pub == pending.target_pub`, the relay sends `ready` to BOTH the dialer socket and the acceptor socket, then enters raw binary forwarding mode (if the dialer supplied `init_frame` while the listener did not register `"fast_open": true`, the relay injects the decoded `init_frame` bytes as the first WebSocket binary frame sent to the acceptor after `ready`):
 
 ```jsonc
 { "op": "ready", "conn_id": string }
 ```
 
-Requiring strict Ed25519 proof on BOTH `register` and `accept` bound to the connection's `nonce` and `host` prevents mailbox hijacking, cross-relay signature replay, and third-party theft of pending incoming dials.
+Requiring strict Ed25519 proof on `register`, `standby`, and `accept` bound to the connection's `nonce` and `host` prevents mailbox hijacking, cross-relay signature replay, and third-party theft of pending incoming dials.
 
 ### 2.4 Error Frames
 
@@ -126,7 +158,7 @@ Before entering binary forwarding mode, control errors return one JSON text fram
 { "op": "error", "code": string }
 ```
 
-Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"capacity_exceeded"`, `"invalid_request"`, `"timeout"`.
+Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"capacity_exceeded"`, `"invalid_request"`, `"bad_request"`, `"frame_too_large"`, `"timeout"`.
 
 ### 2.5 Stateless Admission Tiers 1-3 and Option 1A Scoping
 
@@ -199,6 +231,7 @@ Once `ready` has been sent:
 | `max_tracked_ips` | `4096` entries | LRU-bounded per-IP/prefix (`/64` IPv6) token bucket table with eviction-overflow throttling |
 | `max_total_connections` | `4096` active sockets | Reject above cap immediately at accept |
 | `max_mailboxes` | `1024` registered keys | Return `"capacity_exceeded"` on new registrations above cap |
+| `max_standby_per_mailbox` | `4` standby sockets | Return `"rate_limited"` above cap |
 | `max_pending_per_mailbox` | `8` concurrent pending dials | Return `"rate_limited"` above cap |
 | `max_active_per_ip` | `64` active connections | Reject above cap before holding state |
 | `max_active_per_mailbox` | `64` active bridged streams | Reject above cap |

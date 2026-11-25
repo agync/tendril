@@ -585,6 +585,12 @@ impl PathDialer for RoutedDialer {
         self.provider
     }
 
+    fn supports_fast_open(&self) -> bool {
+        self.routes
+            .values()
+            .any(|(dialer, _)| dialer.supports_fast_open())
+    }
+
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
         let (dialer, target) = self.routes.get(endpoint).ok_or_else(|| {
             RuntimeError::Protocol(format!(
@@ -593,6 +599,20 @@ impl PathDialer for RoutedDialer {
             ))
         })?;
         dialer.dial(target).await
+    }
+
+    async fn dial_with_init(
+        &self,
+        endpoint: &str,
+        init_frame: Option<&[u8]>,
+    ) -> Result<(Box<dyn PathStream>, bool), RuntimeError> {
+        let (dialer, target) = self.routes.get(endpoint).ok_or_else(|| {
+            RuntimeError::Protocol(format!(
+                "no checked candidate for {}",
+                redact_hint(endpoint)
+            ))
+        })?;
+        dialer.dial_with_init(target, init_frame).await
     }
 }
 

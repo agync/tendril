@@ -127,6 +127,10 @@ function spawnPeer() {
 function launchChrome(userDataDir) {
   return new Promise((resolve, reject) => {
     const chromeBin = findChrome();
+    const chromeEnv = { ...process.env };
+    if (chromeEnv.DBUS_SESSION_BUS_ADDRESS === "/dev/null") {
+      delete chromeEnv.DBUS_SESSION_BUS_ADDRESS;
+    }
     const child = spawn(
       chromeBin,
       [
@@ -134,17 +138,21 @@ function launchChrome(userDataDir) {
         "--no-sandbox",
         "--disable-gpu",
         "--disable-dev-shm-usage",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--password-store=basic",
+        "--disable-background-networking",
         "--remote-debugging-port=0",
         `--user-data-dir=${userDataDir}`,
         "about:blank",
       ],
-      { stdio: ["ignore", "pipe", "pipe"] }
+      { stdio: ["ignore", "pipe", "pipe"], env: chromeEnv }
     );
     let stderr = "";
     const timer = setTimeout(() => {
       child.kill();
       reject(new Error(`chrome CDP startup timed out: ${stderr}`));
-    }, 15000);
+    }, 45000);
     const onData = (chunk) => {
       stderr += chunk.toString("utf8");
       const m = stderr.match(/DevTools listening on (ws:\/\/127\.0\.0\.1:(\d+)\/[^\s]+)/);
@@ -498,17 +506,47 @@ async function main() {
       await window.__e2eClient.confirmPeer('web-e2e-host', ${JSON.stringify(browserPair.sas)});
     `);
 
-    // Endpoint-free Day-2 connect over the stored operator route.
+    // Endpoint-free Day-2 connect over the stored operator route (verifying 0-RTT Dial.init_frame).
     const chromeConnEval = cdp.evalAsync(`
-      window.__e2eSession = await window.__e2eClient.connect({
-        targetHostId: 'web-e2e-host',
-        grantJson: ${JSON.stringify(JSON.stringify(grantObj))},
-      });
+      const origSend = WebSocket.prototype.send;
+      let capturedDialInit = null;
+      const binaryLengths = [];
+      let firstBinaryPrefix = null;
+      WebSocket.prototype.send = function (data) {
+        if (typeof data === 'string') {
+          try {
+            const msg = JSON.parse(data);
+            if (msg.op === 'dial' && typeof msg.init_frame === 'string') {
+              capturedDialInit = msg.init_frame;
+            }
+          } catch {}
+        } else {
+          const u8 = new Uint8Array(data instanceof ArrayBuffer ? data : data.buffer, data.byteOffset || 0, data.byteLength);
+          binaryLengths.push(u8.byteLength);
+          if (firstBinaryPrefix === null) {
+            firstBinaryPrefix = Array.from(u8.slice(0, 3));
+          }
+        }
+        return origSend.call(this, data);
+      };
+      try {
+        window.__e2eSession = await window.__e2eClient.connect({
+          targetHostId: 'web-e2e-host',
+          grantJson: ${JSON.stringify(JSON.stringify(grantObj))},
+        });
+      } finally {
+        WebSocket.prototype.send = origSend;
+      }
+      const decodedInit = capturedDialInit ? window.__e2eSdk.b64urlDecode(capturedDialInit) : null;
       return {
         route: window.__e2eSession.route,
         established: window.__e2eSession.isEstablished(),
         allowRead: window.__e2eSession.authorize('fs.read'),
         denyExec: window.__e2eSession.authorize('shell.exec'),
+        dialInitPrefix: decodedInit ? Array.from(decodedInit.slice(0, 3)) : null,
+        dialInitLen: decodedInit ? decodedInit.byteLength : 0,
+        binaryCount: binaryLengths.length,
+        firstBinaryPrefix,
       };
     `);
     await peer.call({ op: "connect" });
@@ -521,6 +559,18 @@ async function main() {
     assert.equal(connState.established, true);
     assert.equal(connState.allowRead, true);
     assert.equal(connState.denyExec, false);
+    assert.deepEqual(
+      connState.dialInitPrefix,
+      [0x54, 0x4e, 0x44],
+      "Chrome relay Dial.init_frame must carry Tendril TND preamble + msg1"
+    );
+    assert.ok(connState.dialInitLen > 100, `unexpected init_frame length: ${connState.dialInitLen}`);
+    assert.equal(
+      connState.binaryCount,
+      1,
+      `expected only msg3 over binary WS (not duplicate msg1), got ${connState.binaryCount}`
+    );
+    assert.notDeepEqual(connState.firstBinaryPrefix, [0x54, 0x4e, 0x44]);
     assert.equal((await peer.call({ op: "authorize", cap: "fs.read" })).allowed, true);
     assert.equal((await peer.call({ op: "authorize", cap: "shell.exec" })).allowed, false);
 
@@ -694,21 +744,77 @@ async function main() {
         ]);
       `);
       const chromeV2Conn = cdp.evalAsync(`
-        const sess = await window.__v2Client.connectV2({
-          targetHostId: 'chrome-broker-host',
-          grantJson: ${JSON.stringify(JSON.stringify(v2Grant))},
-          timeoutMs: 8000,
-        });
+        const origSend = WebSocket.prototype.send;
+        let capturedDialInit = null;
+        const binaryLengths = [];
+        let firstBinaryPrefix = null;
+        WebSocket.prototype.send = function (data) {
+          if (typeof data === 'string') {
+            try {
+              const msg = JSON.parse(data);
+              if (
+                msg.op === 'dial' &&
+                typeof msg.target_mailbox_id === 'string' &&
+                typeof msg.init_frame === 'string'
+              ) {
+                capturedDialInit = msg.init_frame;
+              }
+            } catch {}
+          } else {
+            const u8 = new Uint8Array(
+              data instanceof ArrayBuffer ? data : data.buffer,
+              data.byteOffset || 0,
+              data.byteLength
+            );
+            binaryLengths.push(u8.byteLength);
+            if (firstBinaryPrefix === null) {
+              firstBinaryPrefix = Array.from(u8.slice(0, 3));
+            }
+          }
+          return origSend.call(this, data);
+        };
+        let sess;
+        try {
+          sess = await window.__v2Client.connectV2({
+            targetHostId: 'chrome-broker-host',
+            grantJson: ${JSON.stringify(JSON.stringify(v2Grant))},
+            timeoutMs: 8000,
+          });
+        } finally {
+          WebSocket.prototype.send = origSend;
+        }
         await sess.sendData('hello-chrome-v2-relay');
         const route = sess.route;
         await sess.close(1000, 'done');
         window.__v2Client.free();
-        return route;
+        const decodedInit = capturedDialInit ? window.__e2eSdk.b64urlDecode(capturedDialInit) : null;
+        return {
+          route,
+          dialInitPrefix: decodedInit ? Array.from(decodedInit.slice(0, 3)) : null,
+          dialInitLen: decodedInit ? decodedInit.byteLength : 0,
+          binaryCount: binaryLengths.length,
+          firstBinaryPrefix,
+        };
       `);
       await brokerPeer.call({ op: "accept_v2" });
-      const v2ConnRoute = await chromeV2Conn;
-      assert.equal(v2ConnRoute.hint, v2RelayUrl);
-      assert.equal(v2ConnRoute.provider, "relay");
+      const v2ConnState = await chromeV2Conn;
+      assert.equal(v2ConnState.route.hint, v2RelayUrl);
+      assert.equal(v2ConnState.route.provider, "relay");
+      assert.deepEqual(
+        v2ConnState.dialInitPrefix,
+        [0x54, 0x4e, 0x44],
+        "Chrome /v2/relay Dial.init_frame must carry Tendril TND preamble + msg1"
+      );
+      assert.ok(
+        v2ConnState.dialInitLen > 100,
+        `unexpected v2 init_frame length: ${v2ConnState.dialInitLen}`
+      );
+      assert.equal(
+        v2ConnState.binaryCount,
+        1,
+        `expected only v2 msg3 over binary WS (not duplicate msg1), got ${v2ConnState.binaryCount}`
+      );
+      assert.notDeepEqual(v2ConnState.firstBinaryPrefix, [0x54, 0x4e, 0x44]);
       const v2Msg = await brokerPeer.call({ op: "recv", timeout_ms: 2000 });
       assert.equal(v2Msg.data_utf8, "hello-chrome-v2-relay");
       await brokerPeer.call({ op: "shutdown" });

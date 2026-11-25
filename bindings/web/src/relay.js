@@ -299,11 +299,20 @@ export class RelayStream {
   #closed = false;
   #error = null;
   #maxFrame = MAX_RELAY_FRAME_LEN;
+  #fastOpenSent = false;
 
   constructor(ws, maxQueuedBytes = MAX_QUEUED_BYTES, maxQueuedFrames = MAX_QUEUED_FRAMES) {
     this.#ws = ws;
     this.#maxQueuedBytes = maxQueuedBytes;
     this.#maxQueuedFrames = maxQueuedFrames;
+  }
+
+  get fastOpenSent() {
+    return this.#fastOpenSent;
+  }
+
+  _setFastOpenSent(sent) {
+    this.#fastOpenSent = Boolean(sent);
   }
 
   maxFrame() {
@@ -717,7 +726,7 @@ async function openRelayHandshake({
       stream._setMaxFrame(challenge.max_frame);
     }
 
-    const { connId, payload } = await buildDialMsg(challenge);
+    const { connId, payload, fastOpenSent = false } = await buildDialMsg(challenge);
     if (signal?.aborted) {
       throw abortError(signal);
     }
@@ -733,6 +742,7 @@ async function openRelayHandshake({
     if (reply.op !== "ready" || reply.conn_id !== connId) {
       throw new Error(`unexpected relay ready frame: ${JSON.stringify(reply)}`);
     }
+    stream._setFastOpenSent(fastOpenSent);
     ready = true;
     return stream;
   } catch (err) {
@@ -803,6 +813,29 @@ export async function dialBrokerStream(urlOrOpts, maybeOpts = {}) {
   }
 }
 
+function validateFastOpenInitFrame(initFrame) {
+  if (initFrame === null || initFrame === undefined) {
+    return null;
+  }
+  if (!(initFrame instanceof Uint8Array)) {
+    throw new TypeError("initFrame must be a Uint8Array");
+  }
+  if (initFrame.byteLength === 0 || initFrame.byteLength > MAX_RELAY_FRAME_LEN) {
+    throw new RangeError(
+      `initFrame length ${initFrame.byteLength} must be within 1..=${MAX_RELAY_FRAME_LEN}`
+    );
+  }
+  return initFrame;
+}
+
+function applyFastOpenInitFrame(payload, initBytes, challenge) {
+  const fastOpenSent = Boolean(initBytes && challenge?.fast_open === true);
+  if (fastOpenSent) {
+    payload.init_frame = encodeB64url(initBytes);
+  }
+  return fastOpenSent;
+}
+
 export async function dialRelayStream({
   relayUrl,
   targetPub,
@@ -810,11 +843,13 @@ export async function dialRelayStream({
   allowInsecureWs = false,
   relayAuthTicket = null,
   relayAuthSecret = null,
+  initFrame = null,
   timeoutMs = 15000,
   signal = null,
 }) {
   try {
     validateRelayAuthSecretInput(relayAuthSecret);
+    const validatedInit = validateFastOpenInitFrame(initFrame);
     if (!targetPub) {
       throw new Error("targetPub is required for relay dial");
     }
@@ -837,7 +872,8 @@ export async function dialRelayStream({
         if (auth) {
           payload.auth = auth;
         }
-        return { connId, payload };
+        const fastOpenSent = applyFastOpenInitFrame(payload, validatedInit, challenge);
+        return { connId, payload, fastOpenSent };
       },
     });
   } finally {
@@ -854,11 +890,13 @@ export async function dialRelayV2Stream({
   allowInsecureWs = false,
   relayAuthTicket = null,
   relayAuthSecret = null,
+  initFrame = null,
   timeoutMs = 15000,
   signal = null,
 }) {
   try {
     validateRelayAuthSecretInput(relayAuthSecret);
+    const validatedInit = validateFastOpenInitFrame(initFrame);
     if (typeof deriveV2Dial !== "function") {
       throw new Error(
         "dialRelayV2Stream requires a deriveV2Dial callback (dial_token binds server nonce and per-dial conn_id)"
@@ -908,7 +946,8 @@ export async function dialRelayV2Stream({
         if (auth) {
           payload.auth = auth;
         }
-        return { connId, payload };
+        const fastOpenSent = applyFastOpenInitFrame(payload, validatedInit, challenge);
+        return { connId, payload, fastOpenSent };
       },
     });
   } finally {

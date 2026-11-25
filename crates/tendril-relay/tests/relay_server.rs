@@ -45,6 +45,7 @@ async fn relay_register_dial_accept_and_bidirectional_binary_bridge() {
         host,
         max_frame,
         auth_required,
+        ..
     } = recv_server_msg(&mut listener_ws).await.expect("challenge")
     else {
         panic!("expected challenge");
@@ -60,6 +61,7 @@ async fn relay_register_dial_accept_and_bidirectional_binary_bridge() {
             pub_key: pub_b64.clone(),
             sig: sig_b64,
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -82,6 +84,7 @@ async fn relay_register_dial_accept_and_bidirectional_binary_bridge() {
             target_pub: pub_b64.clone(),
             conn_id: conn_id_b64.clone(),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -89,7 +92,8 @@ async fn relay_register_dial_accept_and_bidirectional_binary_bridge() {
     assert_eq!(
         recv_server_msg(&mut listener_ws).await,
         Some(RelayServerMsg::Incoming {
-            conn_id: conn_id_b64.clone()
+            conn_id: conn_id_b64.clone(),
+            init_frame: None,
         })
     );
 
@@ -189,6 +193,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
             pub_key: pub_a.clone(),
             sig: bad_sig,
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -208,6 +213,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
             target_pub: pub_a.clone(),
             conn_id: b64url_encode(&[1; 16]),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -233,6 +239,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
             pub_key: pub_a.clone(),
             sig: sig_a,
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -250,6 +257,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
             target_pub: pub_a.clone(),
             conn_id: b64url_encode(&[0x01; 16]),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -266,6 +274,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
             target_pub: pub_a.clone(),
             conn_id: b64url_encode(&[0x02; 16]),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -282,6 +291,7 @@ async fn relay_rejects_bad_proofs_hijacks_wrong_path_and_oversize_frames() {
             target_pub: pub_a.clone(),
             conn_id: b64url_encode(&[0x03; 16]),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -427,6 +437,7 @@ async fn relay_rejects_zero_byte_binary_frames_without_forwarding() {
             pub_key: pub_b64.clone(),
             sig: reg_sig,
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -445,6 +456,7 @@ async fn relay_rejects_zero_byte_binary_frames_without_forwarding() {
             target_pub: pub_b64.clone(),
             conn_id: conn_id_b64.clone(),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -524,6 +536,7 @@ async fn relay_fails_a_pending_dial_offline_when_its_registration_ends() {
             pub_key: pub_b64.clone(),
             sig: sig_b64,
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -543,6 +556,7 @@ async fn relay_fails_a_pending_dial_offline_when_its_registration_ends() {
             target_pub: pub_b64,
             conn_id: b64url_encode(&[0x62; 16]),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -615,6 +629,7 @@ async fn relay_an_accept_that_claimed_a_dial_wins_over_registration_end() {
             pub_key: pub_b64.clone(),
             sig: sig_b64,
             auth: None,
+            fast_open: None,
         },
     )
     .await;
@@ -636,6 +651,7 @@ async fn relay_an_accept_that_claimed_a_dial_wins_over_registration_end() {
             target_pub: pub_b64.clone(),
             conn_id: conn_id_b64.clone(),
             auth: None,
+            init_frame: None,
         },
     )
     .await;
@@ -691,5 +707,441 @@ async fn relay_an_accept_that_claimed_a_dial_wins_over_registration_end() {
         .expect("acceptor recv")
         .expect("frame");
     assert_eq!(frame, Message::Binary(b"after-race".to_vec().into()));
+    handle.stop().await.expect("stop relay");
+}
+
+#[tokio::test]
+async fn v1_standby_registration_zero_accept_hit_and_init_frame() {
+    let server = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind relay");
+    let handle = server.spawn();
+    let url = handle.ws_url();
+
+    let listener_key = SigningKey::from_bytes(&[0x31; 32]);
+    let (mut ctrl_ws, _) = connect_async(&url).await.expect("connect ctrl");
+    let Some(RelayServerMsg::Challenge {
+        nonce,
+        host,
+        fast_open,
+        standby,
+        ..
+    }) = recv_server_msg(&mut ctrl_ws).await
+    else {
+        panic!("expected challenge");
+    };
+    assert_eq!(fast_open, Some(true));
+    assert_eq!(standby, Some(true));
+    let nonce_bytes = b64url_decode_array::<32>(&nonce).unwrap();
+    let (pub_b64, sig_b64) = sign_relay_register(&listener_key, &host, &nonce_bytes);
+    send_client_msg(
+        &mut ctrl_ws,
+        &RelayClientMsg::Register {
+            pub_key: pub_b64.clone(),
+            sig: sig_b64,
+            auth: None,
+            fast_open: Some(true),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_server_msg(&mut ctrl_ws).await,
+        Some(RelayServerMsg::Registered {
+            pub_key: pub_b64.clone()
+        })
+    );
+
+    let (mut standby_ws, _) = connect_async(&url).await.expect("connect standby");
+    let Some(RelayServerMsg::Challenge {
+        nonce: sb_nonce,
+        host: sb_host,
+        ..
+    }) = recv_server_msg(&mut standby_ws).await
+    else {
+        panic!("expected standby challenge");
+    };
+    let sb_nonce_bytes = b64url_decode_array::<32>(&sb_nonce).unwrap();
+    let (_, sb_sig) = sign_relay_register(&listener_key, &sb_host, &sb_nonce_bytes);
+    send_client_msg(
+        &mut standby_ws,
+        &RelayClientMsg::Standby {
+            pub_key: pub_b64.clone(),
+            sig: sb_sig,
+            auth: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_server_msg(&mut standby_ws).await,
+        Some(RelayServerMsg::StandbyReady)
+    );
+
+    let (mut dialer_ws, _) = connect_async(&url).await.expect("connect dialer");
+    assert!(matches!(
+        recv_server_msg(&mut dialer_ws).await,
+        Some(RelayServerMsg::Challenge {
+            fast_open: Some(true),
+            standby: Some(true),
+            ..
+        })
+    ));
+    let conn_id_b64 = b64url_encode(&[0x32; 16]);
+    let init_bytes = b"TND\x01\x01\x00\x00\x04ping";
+    let init_b64 = b64url_encode(init_bytes);
+    send_client_msg(
+        &mut dialer_ws,
+        &RelayClientMsg::Dial {
+            target_pub: pub_b64,
+            conn_id: conn_id_b64.clone(),
+            auth: None,
+            init_frame: Some(init_b64.clone()),
+        },
+    )
+    .await;
+
+    // Standby socket gets Incoming with init_frame directly; control socket stays idle; zero Accept needed.
+    assert_eq!(
+        recv_server_msg(&mut standby_ws).await,
+        Some(RelayServerMsg::Incoming {
+            conn_id: conn_id_b64.clone(),
+            init_frame: Some(init_b64),
+        })
+    );
+    assert_eq!(
+        recv_server_msg(&mut dialer_ws).await,
+        Some(RelayServerMsg::Ready {
+            conn_id: conn_id_b64
+        })
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), ctrl_ws.next())
+            .await
+            .is_err(),
+        "control socket must not receive Incoming when standby handled Dial"
+    );
+
+    // Bridge is live immediately without Accept or Ready on standby_ws.
+    standby_ws
+        .send(Message::Binary(b"msg2-from-standby".to_vec().into()))
+        .await
+        .expect("standby send");
+    assert_eq!(
+        dialer_ws.next().await.unwrap().unwrap(),
+        Message::Binary(b"msg2-from-standby".to_vec().into())
+    );
+    dialer_ws
+        .send(Message::Binary(b"msg3-from-dialer".to_vec().into()))
+        .await
+        .expect("dialer send");
+    assert_eq!(
+        standby_ws.next().await.unwrap().unwrap(),
+        Message::Binary(b"msg3-from-dialer".to_vec().into())
+    );
+
+    handle.stop().await.expect("stop relay");
+}
+
+#[tokio::test]
+async fn v1_standby_dead_socket_skipped_and_classic_init_frame_fallback_modes() {
+    let server = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind relay");
+    let handle = server.spawn();
+    let url = handle.ws_url();
+
+    // Case A: fast_open = true listener with dead standby -> skips dead standby and falls back to control Incoming with init_frame.
+    let key_a = SigningKey::from_bytes(&[0x41; 32]);
+    let (mut ctrl_a, _) = connect_async(&url).await.unwrap();
+    let Some(RelayServerMsg::Challenge { nonce, host, .. }) = recv_server_msg(&mut ctrl_a).await
+    else {
+        panic!("challenge");
+    };
+    let (pub_a, sig_a) =
+        sign_relay_register(&key_a, &host, &b64url_decode_array::<32>(&nonce).unwrap());
+    send_client_msg(
+        &mut ctrl_a,
+        &RelayClientMsg::Register {
+            pub_key: pub_a.clone(),
+            sig: sig_a,
+            auth: None,
+            fast_open: Some(true),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut ctrl_a).await,
+        Some(RelayServerMsg::Registered { .. })
+    ));
+
+    let (mut sb_dead, _) = connect_async(&url).await.unwrap();
+    let Some(RelayServerMsg::Challenge { nonce, host, .. }) = recv_server_msg(&mut sb_dead).await
+    else {
+        panic!("challenge");
+    };
+    let (_, sb_sig) =
+        sign_relay_register(&key_a, &host, &b64url_decode_array::<32>(&nonce).unwrap());
+    send_client_msg(
+        &mut sb_dead,
+        &RelayClientMsg::Standby {
+            pub_key: pub_a.clone(),
+            sig: sb_sig,
+            auth: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_server_msg(&mut sb_dead).await,
+        Some(RelayServerMsg::StandbyReady)
+    );
+    drop(sb_dead);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let (mut dial_a, _) = connect_async(&url).await.unwrap();
+    assert!(matches!(
+        recv_server_msg(&mut dial_a).await,
+        Some(RelayServerMsg::Challenge { .. })
+    ));
+    let cid_a = [0x42; 16];
+    let cid_a_b64 = b64url_encode(&cid_a);
+    let init_a = b64url_encode(b"classic-fast-open-bytes");
+    send_client_msg(
+        &mut dial_a,
+        &RelayClientMsg::Dial {
+            target_pub: pub_a.clone(),
+            conn_id: cid_a_b64.clone(),
+            auth: None,
+            init_frame: Some(init_a.clone()),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_server_msg(&mut ctrl_a).await,
+        Some(RelayServerMsg::Incoming {
+            conn_id: cid_a_b64.clone(),
+            init_frame: Some(init_a),
+        })
+    );
+
+    let (mut acc_a, _) = connect_async(&url).await.unwrap();
+    let Some(RelayServerMsg::Challenge { nonce, host, .. }) = recv_server_msg(&mut acc_a).await
+    else {
+        panic!("challenge");
+    };
+    send_client_msg(
+        &mut acc_a,
+        &RelayClientMsg::Accept {
+            pub_key: pub_a,
+            conn_id: cid_a_b64.clone(),
+            sig: sign_relay_accept(
+                &key_a,
+                &host,
+                &b64url_decode_array::<32>(&nonce).unwrap(),
+                &cid_a,
+            ),
+            auth: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_server_msg(&mut acc_a).await,
+        Some(RelayServerMsg::Ready {
+            conn_id: cid_a_b64.clone()
+        })
+    );
+    assert_eq!(
+        recv_server_msg(&mut dial_a).await,
+        Some(RelayServerMsg::Ready { conn_id: cid_a_b64 })
+    );
+
+    // Case B: legacy listener (Register.fast_open == None) receives Incoming without init_frame, then receives decoded binary frame after Ready!
+    let key_b = SigningKey::from_bytes(&[0x43; 32]);
+    let (mut ctrl_b, _) = connect_async(&url).await.unwrap();
+    let Some(RelayServerMsg::Challenge { nonce, host, .. }) = recv_server_msg(&mut ctrl_b).await
+    else {
+        panic!("challenge");
+    };
+    let (pub_b, sig_b) =
+        sign_relay_register(&key_b, &host, &b64url_decode_array::<32>(&nonce).unwrap());
+    send_client_msg(
+        &mut ctrl_b,
+        &RelayClientMsg::Register {
+            pub_key: pub_b.clone(),
+            sig: sig_b,
+            auth: None,
+            fast_open: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut ctrl_b).await,
+        Some(RelayServerMsg::Registered { .. })
+    ));
+
+    let (mut dial_b, _) = connect_async(&url).await.unwrap();
+    assert!(matches!(
+        recv_server_msg(&mut dial_b).await,
+        Some(RelayServerMsg::Challenge { .. })
+    ));
+    let cid_b = [0x44; 16];
+    let cid_b_b64 = b64url_encode(&cid_b);
+    let injected_bytes = b"injected-first-binary-frame";
+    send_client_msg(
+        &mut dial_b,
+        &RelayClientMsg::Dial {
+            target_pub: pub_b.clone(),
+            conn_id: cid_b_b64.clone(),
+            auth: None,
+            init_frame: Some(b64url_encode(injected_bytes)),
+        },
+    )
+    .await;
+    let Message::Text(raw_incoming) = ctrl_b.next().await.unwrap().unwrap() else {
+        panic!("expected incoming text");
+    };
+    assert!(
+        !raw_incoming.contains("init_frame"),
+        "legacy listener without fast_open must not receive init_frame field: {raw_incoming}"
+    );
+
+    let (mut acc_b, _) = connect_async(&url).await.unwrap();
+    let Some(RelayServerMsg::Challenge { nonce, host, .. }) = recv_server_msg(&mut acc_b).await
+    else {
+        panic!("challenge");
+    };
+    send_client_msg(
+        &mut acc_b,
+        &RelayClientMsg::Accept {
+            pub_key: pub_b,
+            conn_id: cid_b_b64.clone(),
+            sig: sign_relay_accept(
+                &key_b,
+                &host,
+                &b64url_decode_array::<32>(&nonce).unwrap(),
+                &cid_b,
+            ),
+            auth: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_server_msg(&mut acc_b).await,
+        Some(RelayServerMsg::Ready {
+            conn_id: cid_b_b64.clone()
+        })
+    );
+    assert_eq!(
+        recv_server_msg(&mut dial_b).await,
+        Some(RelayServerMsg::Ready { conn_id: cid_b_b64 })
+    );
+    assert_eq!(
+        acc_b.next().await.unwrap().unwrap(),
+        Message::Binary(injected_bytes.to_vec().into())
+    );
+
+    handle.stop().await.expect("stop relay");
+}
+
+#[tokio::test]
+async fn v1_standby_hit_without_fast_open_omits_incoming_init_frame_and_injects_binary() {
+    let server = RelayServer::bind(RelayConfig::default())
+        .await
+        .expect("bind relay");
+    let handle = server.spawn();
+    let url = handle.ws_url();
+
+    let key = SigningKey::from_bytes(&[0x45; 32]);
+    let (mut ctrl_ws, _) = connect_async(&url).await.unwrap();
+    let Some(RelayServerMsg::Challenge { nonce, host, .. }) = recv_server_msg(&mut ctrl_ws).await
+    else {
+        panic!("challenge");
+    };
+    let (pub_b64, sig) =
+        sign_relay_register(&key, &host, &b64url_decode_array::<32>(&nonce).unwrap());
+    send_client_msg(
+        &mut ctrl_ws,
+        &RelayClientMsg::Register {
+            pub_key: pub_b64.clone(),
+            sig,
+            auth: None,
+            fast_open: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_server_msg(&mut ctrl_ws).await,
+        Some(RelayServerMsg::Registered { .. })
+    ));
+
+    let (mut standby_ws, _) = connect_async(&url).await.unwrap();
+    let Some(RelayServerMsg::Challenge { nonce, host, .. }) =
+        recv_server_msg(&mut standby_ws).await
+    else {
+        panic!("challenge");
+    };
+    let (_, sb_sig) = sign_relay_register(&key, &host, &b64url_decode_array::<32>(&nonce).unwrap());
+    send_client_msg(
+        &mut standby_ws,
+        &RelayClientMsg::Standby {
+            pub_key: pub_b64.clone(),
+            sig: sb_sig,
+            auth: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_server_msg(&mut standby_ws).await,
+        Some(RelayServerMsg::StandbyReady)
+    );
+
+    let (mut dial_ws, _) = connect_async(&url).await.unwrap();
+    assert!(matches!(
+        recv_server_msg(&mut dial_ws).await,
+        Some(RelayServerMsg::Challenge { .. })
+    ));
+    let cid = [0x46; 16];
+    let cid_b64 = b64url_encode(&cid);
+    let init_bytes = b"v1-standby-legacy-binary-inject";
+    send_client_msg(
+        &mut dial_ws,
+        &RelayClientMsg::Dial {
+            target_pub: pub_b64,
+            conn_id: cid_b64.clone(),
+            auth: None,
+            init_frame: Some(b64url_encode(init_bytes)),
+        },
+    )
+    .await;
+
+    let Message::Text(raw_inc) = standby_ws.next().await.unwrap().unwrap() else {
+        panic!("expected standby incoming text");
+    };
+    assert!(
+        !raw_inc.contains("init_frame"),
+        "legacy standby without Register.fast_open must omit Incoming.init_frame: {raw_inc}"
+    );
+    assert_eq!(
+        serde_json::from_str::<RelayServerMsg>(&raw_inc).unwrap(),
+        RelayServerMsg::Incoming {
+            conn_id: cid_b64.clone(),
+            init_frame: None,
+        }
+    );
+    assert_eq!(
+        recv_server_msg(&mut dial_ws).await,
+        Some(RelayServerMsg::Ready { conn_id: cid_b64 })
+    );
+    assert_eq!(
+        standby_ws.next().await.unwrap().unwrap(),
+        Message::Binary(init_bytes.to_vec().into())
+    );
+    standby_ws
+        .send(Message::Binary(b"v1-sb-legacy-reply".to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        dial_ws.next().await.unwrap().unwrap(),
+        Message::Binary(b"v1-sb-legacy-reply".to_vec().into())
+    );
+
     handle.stop().await.expect("stop relay");
 }

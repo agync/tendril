@@ -40,11 +40,11 @@ use crate::announce::{RosterAccess, RouteSetSink};
 use crate::driver::{
     AttemptError, CandidateError, CandidateFailure, ConnectOpts, ConnectPlan, ConnectResult,
     DEFAULT_PRE_AUTH_TIMEOUT, IngestSlot, PairPolicyOptions, PairPolicyResult, PairingPlan,
-    RaceEnd, RouteIngest, SessionEvent, SharedEvidence, WinnerFacts, check_candidate_routes,
-    collect_failures, committed_error, connect_exhausted, current_unix_secs, day2_candidate_error,
-    dial_with_policy_verified, finalize_connect, has_complete_outer_frame, pairing_persist_plan,
-    plan_connect, plan_pairing, race_verified, record_evidence, write_protocol_bytes,
-    write_protocol_chunks,
+    RaceEnd, RouteIngest, SessionEvent, SharedEvidence, StreamSource, WinnerFacts,
+    check_candidate_routes, collect_failures, committed_error, connect_exhausted,
+    current_unix_secs, day2_candidate_error, dial_source_with_init, dial_with_policy_candidates,
+    finalize_connect, has_complete_outer_frame, pairing_persist_plan, plan_connect, plan_pairing,
+    race_candidates, record_evidence, write_protocol_bytes, write_protocol_chunks,
 };
 use crate::error::RuntimeError;
 use crate::provider::{
@@ -1631,13 +1631,38 @@ impl V2SessionDriver {
             shared: Arc::clone(&shared_roster),
         };
         let target_owned = target_host_id.to_owned();
-        dial_with_policy_verified(dialers, policy_config, candidates, move |_cand, stream| {
+        dial_with_policy_candidates(dialers, policy_config, candidates, move |cand, dialer| {
             let id_c = Arc::clone(&local_identity);
             let target_c = target_owned.clone();
             let grant_c = initial_grant.clone();
             let roster_c = Arc::clone(&shared_roster);
             async move {
-                Self::connect_locked(stream, &id_c, &target_c, grant_c, &roster_c, now_unix).await
+                let (reconnect_secret, crl_seq) = {
+                    let guard = roster_c
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (
+                        extract_v2_reconnect_secret(&guard, &target_c)?,
+                        guard.crl(&target_c).map(|c| c.seq),
+                    )
+                };
+                Self::connect_with_source(
+                    StreamSource::Dial {
+                        dialer: &*dialer,
+                        addr: &cand.addr,
+                    },
+                    &id_c,
+                    &target_c,
+                    reconnect_secret,
+                    grant_c,
+                    crl_seq,
+                    PaddingPolicy::v2_default(),
+                    V2RosterRef::Locked(&roster_c),
+                    now_unix,
+                    Vec::new(),
+                    V2RouteInit::default(),
+                )
+                .await
             }
         })
         .await
@@ -1645,7 +1670,37 @@ impl V2SessionDriver {
 
     #[allow(clippy::too_many_arguments)]
     async fn connect_with_roster_ref(
-        mut stream: Box<dyn PathStream>,
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        target_host_id: &str,
+        reconnect_secret: Zeroizing<[u8; 32]>,
+        initial_grant: Option<Grant>,
+        crl_seq: Option<u64>,
+        padding: PaddingPolicy,
+        roster: V2RosterRef<'_>,
+        now_unix: u64,
+        groups: Vec<GroupSeq>,
+        route: V2RouteInit,
+    ) -> Result<Self, RuntimeError> {
+        Self::connect_with_source(
+            StreamSource::Stream(stream),
+            local_identity,
+            target_host_id,
+            reconnect_secret,
+            initial_grant,
+            crl_seq,
+            padding,
+            roster,
+            now_unix,
+            groups,
+            route,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_with_source(
+        source: StreamSource<'_>,
         local_identity: &EndpointIdentity,
         target_host_id: &str,
         reconnect_secret: Zeroizing<[u8; 32]>,
@@ -1671,20 +1726,27 @@ impl V2SessionDriver {
         }
         let mut machine = machine.with_route_seq(route.route_seq)?;
         machine.set_local_groups(groups)?;
+        let start_actions = machine.start(now_unix)?;
+        let init_bytes = match start_actions.as_slice() {
+            [V2SessionAction::WriteBytes(bytes)] if !bytes.is_empty() => Some(bytes.as_slice()),
+            _ => None,
+        };
+        let (mut stream, fast_open_sent) = dial_source_with_init(source, init_bytes).await?;
         let deadline = TokioInstant::now() + DEFAULT_PRE_AUTH_TIMEOUT;
         let mut frame_reader = ResumableFrameReader::new();
         let mut peer_static_pub = None;
         // A failed handshake closes the stream gracefully before the error is returned.
         let handshake = async {
-            let start_actions = machine.start(now_unix)?;
-            for action in start_actions {
-                if let V2SessionAction::WriteBytes(bytes) = action {
-                    await_deadline!(
-                        deadline,
-                        stream,
-                        "pre-auth v2 session handshake timed out",
-                        write_protocol_bytes_timed(stream.as_mut(), &bytes)
-                    );
+            if !fast_open_sent {
+                for action in start_actions {
+                    if let V2SessionAction::WriteBytes(bytes) = action {
+                        await_deadline!(
+                            deadline,
+                            stream,
+                            "pre-auth v2 session handshake timed out",
+                            write_protocol_bytes_timed(stream.as_mut(), &bytes)
+                        );
+                    }
                 }
             }
 
@@ -3481,11 +3543,6 @@ async fn v2_pairing_rung(
 ) -> Result<V2PendingCommit, CandidateError> {
     let budget = v2_rung_budget(cand.provider);
     let permit = acquire_initiator_argon2(budget).await?;
-    let mut deadline = TokioInstant::now() + budget;
-    let mut stream = match timeout_at(deadline, dialer.dial(&cand.addr)).await {
-        Ok(res) => res?,
-        Err(_) => return Err(RuntimeError::Timeout("v2 pairing rung dial timed out").into()),
-    };
     let machine = V2PakePairInitiator::new(
         identity,
         opts.device_name.clone(),
@@ -3496,23 +3553,51 @@ async fn v2_pairing_rung(
     )
     .map_err(|err| CandidateError::fatal(err.into()))?
     .with_deferred_claim();
-    let kdf_started = TokioInstant::now();
-    let (mut machine, init_actions) = match start_v2_pake_initiator(machine, permit).await {
-        Ok(started) => started,
-        Err(err) => {
-            let _ = stream.close().await;
-            return Err(err.into());
-        }
-    };
-    deadline += kdf_started.elapsed();
+    let (deadline, mut stream, mut machine, init_actions, fast_open_sent) =
+        if dialer.supports_fast_open() {
+            let (machine, init_actions) = start_v2_pake_initiator(machine, permit).await?;
+            let init_bytes = match init_actions.as_slice() {
+                [V2PairAction::WriteBytes(bytes)] if !bytes.is_empty() => Some(bytes.as_slice()),
+                _ => None,
+            };
+            let deadline = TokioInstant::now() + budget;
+            let (stream, fast_open_sent) =
+                match timeout_at(deadline, dialer.dial_with_init(&cand.addr, init_bytes)).await {
+                    Ok(res) => res?,
+                    Err(_) => {
+                        return Err(RuntimeError::Timeout("v2 pairing rung dial timed out").into());
+                    }
+                };
+            (deadline, stream, machine, init_actions, fast_open_sent)
+        } else {
+            let mut deadline = TokioInstant::now() + budget;
+            let mut stream = match timeout_at(deadline, dialer.dial(&cand.addr)).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    return Err(RuntimeError::Timeout("v2 pairing rung dial timed out").into());
+                }
+            };
+            let kdf_started = TokioInstant::now();
+            let (machine, init_actions) = match start_v2_pake_initiator(machine, permit).await {
+                Ok(started) => started,
+                Err(err) => {
+                    let _ = stream.close().await;
+                    return Err(err.into());
+                }
+            };
+            deadline += kdf_started.elapsed();
+            (deadline, stream, machine, init_actions, false)
+        };
     let mut sas = None;
     let res = async {
-        if let Some(outcome) = await_deadline!(
-            deadline,
-            stream,
-            "v2 pairing rung timed out",
-            dispatch_v2_pair_actions(stream.as_mut(), init_actions, &mut sas)
-        ) {
+        if !fast_open_sent
+            && let Some(outcome) = await_deadline!(
+                deadline,
+                stream,
+                "v2 pairing rung timed out",
+                dispatch_v2_pair_actions(stream.as_mut(), init_actions, &mut sas)
+            )
+        {
             return Err(RuntimeError::Protocol(format!(
                 "v2 pairing completed before commit: {outcome:?}"
             )));
@@ -3758,11 +3843,11 @@ impl V2SessionDriver {
         let target_owned = target.to_owned();
         let grant = opts.grant.clone();
         let ev = Arc::clone(&evidence);
-        let race = race_verified(
+        let race = race_candidates(
             &set.dialers,
             opts.policy_config,
             set.candidates.clone(),
-            move |_cand, stream| {
+            move |cand, dialer| {
                 let identity = Arc::clone(&identity);
                 let mut roster = (*roster).clone();
                 let (target, grant, expectation) =
@@ -3771,8 +3856,11 @@ impl V2SessionDriver {
                 async move {
                     let res = async {
                         let secret = extract_v2_reconnect_secret(&roster, &target)?;
-                        let driver = Self::connect_with_roster_ref(
-                            stream,
+                        let driver = Self::connect_with_source(
+                            StreamSource::Dial {
+                                dialer: &*dialer,
+                                addr: &cand.addr,
+                            },
                             &identity,
                             &target,
                             secret,

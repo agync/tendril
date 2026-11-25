@@ -506,6 +506,8 @@ async fn stub_auth_relay() -> (u16, Arc<Mutex<Vec<bool>>>) {
                     host: "127.0.0.1".into(),
                     max_frame: MAX_RELAY_FRAME_LEN,
                     auth_required: Some(vec!["dial".into()]),
+                    fast_open: None,
+                    standby: None,
                 };
                 let text = serde_json::to_string(&challenge).expect("json");
                 if ws.send(Message::Text(text.into())).await.is_err() {
@@ -871,6 +873,8 @@ async fn stub_v2_relay(demand_auth: bool) -> (u16, Arc<Mutex<Vec<bool>>>) {
                     epoch: 1,
                     max_frame: MAX_RELAY_FRAME_LEN,
                     auth_required: demand_auth.then(|| vec!["dial".into()]),
+                    fast_open: None,
+                    standby: None,
                 };
                 let text = serde_json::to_string(&challenge).expect("json");
                 if ws.send(Message::Text(text.into())).await.is_err() {

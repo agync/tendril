@@ -445,6 +445,7 @@ async fn sec13_global_connection_and_mailbox_caps() {
             pub_key: pub_b64,
             sig: sig_b64,
             auth: None,
+            fast_open: None,
         })
         .expect("ser");
         ws.send(Message::Text(reg.into())).await.expect("send reg");
@@ -579,6 +580,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     pub_key: other_pub.clone(),
                     sig: other_sig,
                     auth: None,
+                    fast_open: None,
                 })
                 .unwrap()
                 .into(),
@@ -620,6 +622,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     pub_key: ok_pub.clone(),
                     sig: ok_sig,
                     auth: None,
+                    fast_open: None,
                 })
                 .unwrap()
                 .into(),
@@ -651,6 +654,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     target_pub: other_pub,
                     conn_id: b64url_encode(&[0x55; 16]),
                     auth: None,
+                    init_frame: None,
                 })
                 .unwrap()
                 .into(),
@@ -691,6 +695,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     epoch: other_v2_mb.epoch,
                     sig: b64url_encode(&bad_sig),
                     auth: None,
+                    fast_open: None,
                 })
                 .unwrap()
                 .into(),
@@ -725,6 +730,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     epoch: allowed_v2_mb.epoch,
                     sig: b64url_encode(&ok_sig),
                     auth: None,
+                    fast_open: None,
                 })
                 .unwrap()
                 .into(),
@@ -793,6 +799,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                         target_pub: v1_pub_b64.clone(),
                         conn_id: b64url_encode(&[0x11; 16]),
                         auth: None,
+                        init_frame: None,
                     })
                     .unwrap()
                     .into(),
@@ -836,6 +843,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                         conn_id: b64url_encode(&cid),
                         dial_token: b64url_encode(&tok),
                         auth: None,
+                        init_frame: None,
                     })
                     .unwrap()
                     .into(),
@@ -929,6 +937,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     pub_key: pk,
                     sig,
                     auth: Some(RelayAuthProof::Ticket { ticket: bad_ticket }),
+                    fast_open: None,
                 })
                 .unwrap()
                 .into(),
@@ -972,6 +981,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     auth: Some(RelayAuthProof::Ticket {
                         ticket: skew_edge_ticket,
                     }),
+                    fast_open: None,
                 })
                 .unwrap()
                 .into(),
@@ -1005,6 +1015,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     auth: Some(RelayAuthProof::Ticket {
                         ticket: dial_ticket,
                     }),
+                    init_frame: None,
                 })
                 .unwrap()
                 .into(),
@@ -1154,6 +1165,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     auth: Some(RelayAuthProof::Ticket {
                         ticket: wildcard_reg_ticket,
                     }),
+                    fast_open: None,
                 })
                 .unwrap()
                 .into(),
@@ -1203,6 +1215,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     conn_id: b64url_encode(&cid2),
                     dial_token: b64url_encode(&tok2),
                     auth: Some(RelayAuthProof::Hmac { mac: dial_mac }),
+                    init_frame: None,
                 })
                 .unwrap()
                 .into(),
@@ -1305,6 +1318,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     target_pub: pub_b64,
                     conn_id: b64url_encode(&[0x71; 16]),
                     auth: None,
+                    init_frame: None,
                 })
                 .unwrap()
                 .into(),
@@ -1355,6 +1369,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
                     conn_id: b64url_encode(&cid),
                     dial_token: b64url_encode(&tok),
                     auth: None,
+                    init_frame: None,
                 })
                 .unwrap()
                 .into(),
@@ -1527,6 +1542,7 @@ async fn sec09_v1_early_dialer_disconnect_frees_pending_slot_immediately() {
                 pub_key: pub_b64.clone(),
                 sig: sig_b64,
                 auth: None,
+                fast_open: None,
             })
             .expect("ser")
             .into(),
@@ -1556,6 +1572,7 @@ async fn sec09_v1_early_dialer_disconnect_frees_pending_slot_immediately() {
                 target_pub: pub_b64.clone(),
                 conn_id: b64url_encode(&[0x90 + i; 16]),
                 auth: None,
+                init_frame: None,
             })
             .expect("ser")
             .into(),
@@ -1633,6 +1650,7 @@ async fn sec09_v1_idle_ping_pong_watchdog_reaps_silent_client_and_keeps_live_cli
                 pub_key: pub_b64.clone(),
                 sig: sig_b64,
                 auth: None,
+                fast_open: None,
             })
             .expect("ser")
             .into(),
@@ -1688,6 +1706,7 @@ async fn sec09_v1_idle_ping_pong_watchdog_reaps_silent_client_and_keeps_live_cli
                 target_pub: dead_pub,
                 conn_id: b64url_encode(&[0x42; 16]),
                 auth: None,
+                init_frame: None,
             })
             .expect("ser")
             .into(),
@@ -1813,4 +1832,484 @@ async fn sec18_tls_key_rejects_symlink_and_world_readable() {
         matches!(res_link, Err(RelayError::Tls(_))),
         "symlink TLS key must be rejected"
     );
+}
+
+#[tokio::test]
+async fn w2_standby_cap_control_lifecycle_and_zero_presence_leak() {
+    use tendril_core::crypto::{b64url_decode_array, b64url_encode};
+    use tendril_core::relay_auth::{RelayAuthProof, RelayAuthScope, compute_relay_auth_hmac_b64};
+    use tendril_core::v2::{derive_epoch_mailbox, sign_v2_relay_dial, sign_v2_relay_register};
+    use tendril_relay::protocol::{
+        MAX_RELAY_FRAME_LEN, MAX_STANDBY_PER_MAILBOX, RelayV2ClientMsg, RelayV2ServerMsg,
+    };
+    use zeroize::Zeroizing;
+
+    assert_eq!(MAX_STANDBY_PER_MAILBOX, 4);
+    let secret = b"standby-auth-secret-32bytes-long!".to_vec();
+    let srv = RelayServer::bind(RelayConfig {
+        auth_secret: Some(Zeroizing::new(secret.clone())),
+        auth_scope: RelayAuthScope::All,
+        ..RelayConfig::default()
+    })
+    .await
+    .unwrap()
+    .spawn();
+    let v1_url = srv.ws_url();
+    let v2_url = srv.ws_v2_url();
+
+    let kp = SigningKeypair::generate().unwrap();
+    let sk = kp.ed25519_signing_key();
+    let pub_bytes = sk.verifying_key().to_bytes();
+    let pub_b64 = b64url_encode(&pub_bytes);
+
+    // 1. Standby without active Register fails closed ("offline" after auth/sig pass, "unauthorized" if bad auth).
+    {
+        let (mut ws, _) = tokio_tungstenite::connect_async(&v1_url).await.unwrap();
+        let RelayServerMsg::Challenge { nonce, host, .. } =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap()
+        else {
+            panic!("challenge");
+        };
+        let n = b64url_decode_array::<32>(&nonce).unwrap();
+        let (_, sig) = sign_relay_register(&sk, &host, &n);
+        let mac = compute_relay_auth_hmac_b64(&secret, "register", &host, &n, &pub_bytes).unwrap();
+        ws.send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Standby {
+                pub_key: pub_b64.clone(),
+                sig,
+                auth: Some(RelayAuthProof::Hmac { mac }),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayServerMsg>(
+                &ws.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Error {
+                code: "offline".to_owned()
+            }
+        );
+    }
+
+    // 2. Register v1 control, park 4 standby sockets, verify 5th gets rate_limited.
+    let (mut ctrl_v1, _) = tokio_tungstenite::connect_async(&v1_url).await.unwrap();
+    let RelayServerMsg::Challenge { nonce, host, .. } =
+        serde_json::from_str(&ctrl_v1.next().await.unwrap().unwrap().into_text().unwrap()).unwrap()
+    else {
+        panic!("challenge");
+    };
+    let n = b64url_decode_array::<32>(&nonce).unwrap();
+    let (_, sig) = sign_relay_register(&sk, &host, &n);
+    let mac = compute_relay_auth_hmac_b64(&secret, "register", &host, &n, &pub_bytes).unwrap();
+    ctrl_v1
+        .send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Register {
+                pub_key: pub_b64.clone(),
+                sig,
+                auth: Some(RelayAuthProof::Hmac { mac }),
+                fast_open: Some(true),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<RelayServerMsg>(
+            &ctrl_v1.next().await.unwrap().unwrap().into_text().unwrap()
+        )
+        .unwrap(),
+        RelayServerMsg::Registered { .. }
+    ));
+
+    let mut standbys = Vec::new();
+    for _ in 0..MAX_STANDBY_PER_MAILBOX {
+        let (mut ws, _) = tokio_tungstenite::connect_async(&v1_url).await.unwrap();
+        let RelayServerMsg::Challenge { nonce, host, .. } =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap()
+        else {
+            panic!("challenge");
+        };
+        let n = b64url_decode_array::<32>(&nonce).unwrap();
+        let (_, sig) = sign_relay_register(&sk, &host, &n);
+        let mac = compute_relay_auth_hmac_b64(&secret, "register", &host, &n, &pub_bytes).unwrap();
+        ws.send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Standby {
+                pub_key: pub_b64.clone(),
+                sig,
+                auth: Some(RelayAuthProof::Hmac { mac }),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayServerMsg>(
+                &ws.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::StandbyReady
+        );
+        standbys.push(ws);
+    }
+
+    // 5th standby socket must fail closed with rate_limited.
+    {
+        let (mut ws5, _) = tokio_tungstenite::connect_async(&v1_url).await.unwrap();
+        let RelayServerMsg::Challenge { nonce, host, .. } =
+            serde_json::from_str(&ws5.next().await.unwrap().unwrap().into_text().unwrap()).unwrap()
+        else {
+            panic!("challenge");
+        };
+        let n = b64url_decode_array::<32>(&nonce).unwrap();
+        let (_, sig) = sign_relay_register(&sk, &host, &n);
+        let mac = compute_relay_auth_hmac_b64(&secret, "register", &host, &n, &pub_bytes).unwrap();
+        ws5.send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Standby {
+                pub_key: pub_b64.clone(),
+                sig,
+                auth: Some(RelayAuthProof::Hmac { mac }),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayServerMsg>(
+                &ws5.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Error {
+                code: "rate_limited".to_owned()
+            }
+        );
+    }
+
+    // 3. Unauthorized Dial (missing auth, with and without init_frame) must return "unauthorized" without leaking presence or popping standby.
+    for init_frame in [None, Some(b64url_encode(b"probe"))] {
+        let (mut d_ws, _) = tokio_tungstenite::connect_async(&v1_url).await.unwrap();
+        let _ = d_ws.next().await;
+        d_ws.send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Dial {
+                target_pub: pub_b64.clone(),
+                conn_id: b64url_encode(&[0x91; 16]),
+                auth: None,
+                init_frame,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayServerMsg>(
+                &d_ws.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Error {
+                code: "unauthorized".to_owned()
+            }
+        );
+    }
+
+    // 4. Invalid / empty / oversized init_frame must be rejected BEFORE popping standby!
+    for (bad_init, expected_code) in [
+        ("!!!not-b64url!!!".to_owned(), "bad_request"),
+        (String::new(), "bad_request"),
+        (
+            b64url_encode(&vec![0xAA; MAX_RELAY_FRAME_LEN + 1]),
+            "frame_too_large",
+        ),
+    ] {
+        let (mut d_ws, _) = tokio_tungstenite::connect_async(&v1_url).await.unwrap();
+        let RelayServerMsg::Challenge { nonce, host, .. } =
+            serde_json::from_str(&d_ws.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap()
+        else {
+            panic!("challenge");
+        };
+        let n = b64url_decode_array::<32>(&nonce).unwrap();
+        let mac = compute_relay_auth_hmac_b64(&secret, "dial", &host, &n, &pub_bytes).unwrap();
+        d_ws.send(Message::Text(
+            serde_json::to_string(&RelayClientMsg::Dial {
+                target_pub: pub_b64.clone(),
+                conn_id: b64url_encode(&[0x92; 16]),
+                auth: Some(RelayAuthProof::Hmac { mac }),
+                init_frame: Some(bad_init),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayServerMsg>(
+                &d_ws.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayServerMsg::Error {
+                code: expected_code.to_owned()
+            }
+        );
+    }
+
+    // None of the 4 standby sockets should have been consumed! Dropping control closes them.
+    for sb in &mut standbys {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), sb.next())
+                .await
+                .is_err(),
+            "standby socket must not be consumed by rejected dials"
+        );
+    }
+    drop(ctrl_v1);
+    for mut sb in standbys {
+        let closed = tokio::time::timeout(Duration::from_secs(2), sb.next())
+            .await
+            .expect("standby must close when control disconnects");
+        assert!(matches!(
+            closed,
+            None | Some(Ok(Message::Close(_))) | Some(Err(_))
+        ));
+    }
+
+    // 5. Same zero-presence-leak and init_frame validation on /v2/relay.
+    let now_u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mb = derive_epoch_mailbox(&[0x7C; 32], now_u64 / 3600);
+    let (mut ctrl_v2, _) = tokio_tungstenite::connect_async(&v2_url).await.unwrap();
+    let RelayV2ServerMsg::Challenge { nonce, host, .. } =
+        serde_json::from_str(&ctrl_v2.next().await.unwrap().unwrap().into_text().unwrap()).unwrap()
+    else {
+        panic!("v2 challenge");
+    };
+    let n = b64url_decode_array::<32>(&nonce).unwrap();
+    let reg_sig = sign_v2_relay_register(&mb, &host, &n).unwrap();
+    let mac = compute_relay_auth_hmac_b64(&secret, "register", &host, &n, &mb.mailbox_id).unwrap();
+    ctrl_v2
+        .send(Message::Text(
+            serde_json::to_string(&RelayV2ClientMsg::Register {
+                mailbox_id: mb.mailbox_id_b64url(),
+                epoch: mb.epoch,
+                sig: b64url_encode(&reg_sig),
+                auth: Some(RelayAuthProof::Hmac { mac }),
+                fast_open: Some(true),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<RelayV2ServerMsg>(
+            &ctrl_v2.next().await.unwrap().unwrap().into_text().unwrap()
+        )
+        .unwrap(),
+        RelayV2ServerMsg::Registered { .. }
+    ));
+
+    let (mut v2_sb, _) = tokio_tungstenite::connect_async(&v2_url).await.unwrap();
+    let RelayV2ServerMsg::Challenge { nonce, host, .. } =
+        serde_json::from_str(&v2_sb.next().await.unwrap().unwrap().into_text().unwrap()).unwrap()
+    else {
+        panic!("v2 standby challenge");
+    };
+    let n = b64url_decode_array::<32>(&nonce).unwrap();
+    let sb_sig = sign_v2_relay_register(&mb, &host, &n).unwrap();
+    let mac = compute_relay_auth_hmac_b64(&secret, "register", &host, &n, &mb.mailbox_id).unwrap();
+    v2_sb
+        .send(Message::Text(
+            serde_json::to_string(&RelayV2ClientMsg::Standby {
+                mailbox_id: mb.mailbox_id_b64url(),
+                epoch: mb.epoch,
+                sig: b64url_encode(&sb_sig),
+                auth: Some(RelayAuthProof::Hmac { mac }),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<RelayV2ServerMsg>(
+            &v2_sb.next().await.unwrap().unwrap().into_text().unwrap()
+        )
+        .unwrap(),
+        RelayV2ServerMsg::StandbyReady { .. }
+    ));
+
+    // Unauthorized v2 Dial (with and without init_frame) must return "unauthorized" without consuming standby.
+    for unauth_init in [None, Some(b64url_encode(b"probe-v2"))] {
+        let (mut d_unauth, _) = tokio_tungstenite::connect_async(&v2_url).await.unwrap();
+        let _ = d_unauth.next().await;
+        d_unauth
+            .send(Message::Text(
+                serde_json::to_string(&RelayV2ClientMsg::Dial {
+                    target_mailbox_id: mb.mailbox_id_b64url(),
+                    epoch: mb.epoch,
+                    conn_id: b64url_encode(&[0x95; 16]),
+                    dial_token: b64url_encode(&[0x00; 32]),
+                    auth: None,
+                    init_frame: unauth_init,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayV2ServerMsg>(
+                &d_unauth.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayV2ServerMsg::Error {
+                code: "unauthorized".to_owned()
+            }
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), v2_sb.next())
+            .await
+            .is_err(),
+        "v2 standby socket must stay idle on unauthorized dial"
+    );
+
+    // Also park a second v2 standby socket to test control-disconnect eviction after dial tests.
+    let (mut v2_sb_evict, _) = tokio_tungstenite::connect_async(&v2_url).await.unwrap();
+    let RelayV2ServerMsg::Challenge { nonce, host, .. } = serde_json::from_str(
+        &v2_sb_evict
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap() else {
+        panic!("v2 standby2 challenge");
+    };
+    let n = b64url_decode_array::<32>(&nonce).unwrap();
+    let sb2_sig = sign_v2_relay_register(&mb, &host, &n).unwrap();
+    let sb2_mac =
+        compute_relay_auth_hmac_b64(&secret, "register", &host, &n, &mb.mailbox_id).unwrap();
+    v2_sb_evict
+        .send(Message::Text(
+            serde_json::to_string(&RelayV2ClientMsg::Standby {
+                mailbox_id: mb.mailbox_id_b64url(),
+                epoch: mb.epoch,
+                sig: b64url_encode(&sb2_sig),
+                auth: Some(RelayAuthProof::Hmac { mac: sb2_mac }),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<RelayV2ServerMsg>(
+            &v2_sb_evict
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap()
+        )
+        .unwrap(),
+        RelayV2ServerMsg::StandbyReady { .. }
+    ));
+
+    // Oversized init_frame on v2 rejected with frame_too_large before popping standby.
+    {
+        let (mut d_ws, _) = tokio_tungstenite::connect_async(&v2_url).await.unwrap();
+        let RelayV2ServerMsg::Challenge { nonce, host, .. } =
+            serde_json::from_str(&d_ws.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap()
+        else {
+            panic!("v2 dial challenge");
+        };
+        let n = b64url_decode_array::<32>(&nonce).unwrap();
+        let cid = [0x93; 16];
+        let tok = sign_v2_relay_dial(&mb, &host, &n, &cid).unwrap();
+        let mac = compute_relay_auth_hmac_b64(&secret, "dial", &host, &n, &mb.mailbox_id).unwrap();
+        d_ws.send(Message::Text(
+            serde_json::to_string(&RelayV2ClientMsg::Dial {
+                target_mailbox_id: mb.mailbox_id_b64url(),
+                epoch: mb.epoch,
+                conn_id: b64url_encode(&cid),
+                dial_token: b64url_encode(&tok),
+                auth: Some(RelayAuthProof::Hmac { mac }),
+                init_frame: Some(b64url_encode(&vec![0xBB; MAX_RELAY_FRAME_LEN + 1])),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayV2ServerMsg>(
+                &d_ws.next().await.unwrap().unwrap().into_text().unwrap()
+            )
+            .unwrap(),
+            RelayV2ServerMsg::Error {
+                code: "frame_too_large".to_owned()
+            }
+        );
+    }
+
+    // Standby socket still intact and receives valid Dial with MAX_RELAY_FRAME_LEN init_frame.
+    let (mut d_ok, _) = tokio_tungstenite::connect_async(&v2_url).await.unwrap();
+    let RelayV2ServerMsg::Challenge { nonce, host, .. } =
+        serde_json::from_str(&d_ok.next().await.unwrap().unwrap().into_text().unwrap()).unwrap()
+    else {
+        panic!("v2 dial ok challenge");
+    };
+    let n = b64url_decode_array::<32>(&nonce).unwrap();
+    let cid = [0x94; 16];
+    let tok = sign_v2_relay_dial(&mb, &host, &n, &cid).unwrap();
+    let mac = compute_relay_auth_hmac_b64(&secret, "dial", &host, &n, &mb.mailbox_id).unwrap();
+    let max_init_b64 = b64url_encode(&vec![0x55; MAX_RELAY_FRAME_LEN]);
+    d_ok.send(Message::Text(
+        serde_json::to_string(&RelayV2ClientMsg::Dial {
+            target_mailbox_id: mb.mailbox_id_b64url(),
+            epoch: mb.epoch,
+            conn_id: b64url_encode(&cid),
+            dial_token: b64url_encode(&tok),
+            auth: Some(RelayAuthProof::Hmac { mac }),
+            init_frame: Some(max_init_b64.clone()),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let inc: RelayV2ServerMsg =
+        serde_json::from_str(&v2_sb.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert!(matches!(
+        inc,
+        RelayV2ServerMsg::Incoming {
+            init_frame: Some(ref f),
+            ..
+        } if f == &max_init_b64
+    ));
+
+    // Dropping v2 control socket must evict and close remaining parked v2 standby sockets.
+    drop(ctrl_v2);
+    let evicted = tokio::time::timeout(Duration::from_secs(2), v2_sb_evict.next())
+        .await
+        .expect("v2 standby must close when v2 control disconnects");
+    assert!(matches!(
+        evicted,
+        None | Some(Ok(Message::Close(_))) | Some(Err(_))
+    ));
+
+    srv.stop().await.unwrap();
 }

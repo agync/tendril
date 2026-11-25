@@ -19,18 +19,21 @@ use tendril_core::v2::{
     sign_v2_relay_dial,
 };
 use tendril_core::wire::{Intent, Preamble, WIRE_VERSION_V2};
-use tendril_relay::{MAX_RELAY_FRAME_LEN, RelayV2ClientMsg, RelayV2ServerMsg};
+use tendril_relay::{
+    MAX_RELAY_FRAME_LEN, RelayClientMsg, RelayConfig, RelayServerMsg, RelayV2ClientMsg,
+    RelayV2ServerMsg,
+};
 use tendril_runtime::{
-    DEFAULT_PRE_AUTH_TIMEOUT, EmbeddedRelay, HttpWakeProvider, LocalDialer, LocalListener,
-    MemoryWakeProvider, NoopWakeProvider, PathDialer, PathListener, PathReader, PathStream,
-    PathWriter, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError, SessionEvent,
-    StateStore, V2ResponderConfig, V2ResponderState, V2SessionDriver, WakeAdapterKind,
-    WakeDialOptions, WakeOutcome, WakeProvider, WakeSecret, WakeTag, WakeTarget,
-    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_store,
-    drive_v2_pake_pair_initiator_with_store, drive_v2_pake_pair_responder,
-    drive_v2_pake_pair_responder_with_store, drive_v2_session_initiator,
-    drive_v2_session_responder, split_path_stream_fallback, verify_epoch_wake_tag_window,
-    wake_and_connect_v2_session, wake_and_dial_v2,
+    DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, EmbeddedRelay, HttpWakeProvider, LocalDialer,
+    LocalListener, MemoryWakeProvider, NoopWakeProvider, PathDialer, PathListener, PathReader,
+    PathStream, PathWriter, RelayDialer, RelayListener, RelayV2Dialer, RelayV2Listener,
+    RelayV2ListenerConfig, RuntimeError, SessionEvent, StateStore, V2ResponderConfig,
+    V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeDialOptions, WakeOutcome, WakeProvider,
+    WakeSecret, WakeTag, WakeTarget, drive_m2m_enroll_initiator_with_store,
+    drive_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_store,
+    drive_v2_pake_pair_responder, drive_v2_pake_pair_responder_with_store,
+    drive_v2_session_initiator, drive_v2_session_responder, split_path_stream_fallback,
+    verify_epoch_wake_tag_window, wake_and_connect_v2_session, wake_and_dial_v2,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -253,6 +256,7 @@ async fn live_v2_relay_pake_pair_session_rekey_padding_and_security_rejections()
                     conn_id: b64url_encode(&[0xFA; 16]),
                     dial_token: b64url_encode(&[0x00; 32]),
                     auth: None,
+                    init_frame: None,
                 })
                 .unwrap()
                 .into(),
@@ -425,6 +429,8 @@ async fn relay_v2_listener_drops_replayed_incoming_from_malicious_relay() {
                         epoch,
                         max_frame: MAX_RELAY_FRAME_LEN,
                         auth_required: None,
+                        fast_open: None,
+                        standby: None,
                     })
                     .unwrap()
                     .into(),
@@ -458,6 +464,7 @@ async fn relay_v2_listener_drops_replayed_incoming_from_malicious_relay() {
                                 conn_id: b64url_encode(&conn_id),
                                 dial_nonce: b64url_encode(&dial_nonce),
                                 dial_token: b64url_encode(&dial_token),
+                                init_frame: None,
                             };
                             let text = serde_json::to_string(&incoming).unwrap();
                             // Send authentic incoming once, then maliciously replay the exact same incoming!
@@ -477,7 +484,7 @@ async fn relay_v2_listener_drops_replayed_incoming_from_malicious_relay() {
                         .unwrap();
                         while let Some(Ok(_)) = ws.next().await {}
                     }
-                    RelayV2ClientMsg::Dial { .. } => {}
+                    RelayV2ClientMsg::Dial { .. } | RelayV2ClientMsg::Standby { .. } => {}
                 }
             });
             if !accepted_conn {
@@ -2294,4 +2301,292 @@ fn pinned_pairing_floor_takes_max_of_static_and_host_floors() {
         0,
     );
     assert_eq!(tendril_runtime::pinned_pairing_floor(&roster, &pin_none), 1);
+}
+
+#[tokio::test]
+async fn standby_pool_fast_open_replenishment_old_relay_fallback_and_forged_standby_rejection() {
+    let relay = EmbeddedRelay::start(RelayConfig {
+        host: "127.0.0.1".to_owned(),
+        ..RelayConfig::default()
+    })
+    .await
+    .unwrap();
+    let now_unix = now_unix_secs();
+
+    // 1. V1 standby pool + Dial init_frame + replenishment + subsequent binary traffic.
+    let v1_key = SigningKeypair::from_seed([0x71; 32])
+        .ed25519_signing_key()
+        .clone();
+    let mut v1_listener = RelayListener::bind(
+        relay.ws_url(),
+        Some("127.0.0.1".to_owned()),
+        v1_key,
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v1_listener.active_standby_socket_count(), 2);
+
+    let v1_dialer = RelayDialer::new().with_expected_host("127.0.0.1");
+    assert!(v1_dialer.supports_fast_open());
+    let init_payload = b"v1-0rtt-preamble-msg1";
+    let (mut dial_v1, fast_open_sent) = v1_dialer
+        .dial_with_init(&v1_listener.local_endpoint(), Some(init_payload))
+        .await
+        .unwrap();
+    assert!(fast_open_sent, "v1 dial must report fast_open_sent=true");
+    let mut acc_v1 = tokio::time::timeout(Duration::from_secs(2), v1_listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut buf = vec![0u8; 256];
+    let n = acc_v1.recv_chunk(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], init_payload);
+    acc_v1.send_chunk(b"v1-reply").await.unwrap();
+    let n2 = dial_v1.recv_chunk(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n2], b"v1-reply");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while v1_listener.active_standby_socket_count() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "v1 standby pool did not replenish to 2 (got {})",
+            v1_listener.active_standby_socket_count()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 2. V2 standby pool + Dial init_frame + replenishment + control count invariant.
+    let v2_secret = [0x72; 32];
+    let mut v2_listener = RelayV2Listener::bind_with_config(
+        &relay.ws_v2_url(),
+        v2_secret,
+        RelayV2ListenerConfig {
+            expected_host: Some("127.0.0.1".to_owned()),
+            unix_secs: Some(now_unix),
+            ..RelayV2ListenerConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(v2_listener.active_control_socket_count(), 3);
+    assert_eq!(v2_listener.active_standby_socket_count(), 2);
+
+    let v2_dialer = RelayV2Dialer::new(v2_secret).with_expected_host("127.0.0.1");
+    assert!(v2_dialer.supports_fast_open());
+    let (mut dial_v2, v2_fast_open) = v2_dialer
+        .connect_with_init(&relay.ws_v2_url(), Some(b"v2-0rtt"))
+        .await
+        .unwrap();
+    assert!(v2_fast_open, "v2 dial must report fast_open_sent=true");
+    let mut acc_v2 = tokio::time::timeout(Duration::from_secs(2), v2_listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let n = acc_v2.recv_chunk(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"v2-0rtt");
+    acc_v2.send_chunk(b"v2-reply").await.unwrap();
+    let n2 = dial_v2.recv_chunk(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n2], b"v2-reply");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while v2_listener.active_standby_socket_count() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "v2 standby pool did not replenish to 2 (got {})",
+            v2_listener.active_standby_socket_count()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 3. Old v1/v2 relay (fast_open: None, standby: None) falls back cleanly.
+    let v1_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let v1_mock_url = format!("ws://{}/v1/relay", v1_tcp.local_addr().unwrap());
+    let seen_dial_init = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen_c = Arc::clone(&seen_dial_init);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = v1_tcp.accept().await {
+            let seen_cc = Arc::clone(&seen_c);
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                ws.send(Message::Text(
+                    serde_json::to_string(&RelayServerMsg::Challenge {
+                        nonce: b64url_encode(&[0x31; 32]),
+                        host: "127.0.0.1".to_owned(),
+                        max_frame: MAX_RELAY_FRAME_LEN,
+                        auth_required: None,
+                        fast_open: None,
+                        standby: None,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+                let Some(Ok(Message::Text(msg))) = ws.next().await else {
+                    return;
+                };
+                match serde_json::from_str::<RelayClientMsg>(&msg).unwrap() {
+                    RelayClientMsg::Register { pub_key, .. } => {
+                        ws.send(Message::Text(
+                            serde_json::to_string(&RelayServerMsg::Registered { pub_key })
+                                .unwrap()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                        while let Some(Ok(_)) = ws.next().await {}
+                    }
+                    RelayClientMsg::Dial {
+                        conn_id,
+                        init_frame,
+                        ..
+                    } => {
+                        if init_frame.is_some() {
+                            seen_cc.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        ws.send(Message::Text(
+                            serde_json::to_string(&RelayServerMsg::Ready { conn_id })
+                                .unwrap()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+            });
+        }
+    });
+    let old_key = SigningKeypair::from_seed([0x73; 32])
+        .ed25519_signing_key()
+        .clone();
+    let old_v1_listener = RelayListener::bind(
+        &v1_mock_url,
+        Some("127.0.0.1".to_owned()),
+        old_key,
+        DEFAULT_WRITE_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(old_v1_listener.active_standby_socket_count(), 0);
+    let (_old_stream, sent) = v1_dialer
+        .dial_with_init(&old_v1_listener.local_endpoint(), Some(b"fallback"))
+        .await
+        .unwrap();
+    assert!(
+        !sent,
+        "old relay without Challenge.fast_open must return false"
+    );
+    assert!(
+        !seen_dial_init.load(std::sync::atomic::Ordering::SeqCst),
+        "Dial.init_frame must not be emitted to old relay"
+    );
+
+    // 4. Forged dial_token on v2 standby Incoming must be rejected before accept() emits stream.
+    let epoch = now_unix / 3600;
+    let mb = derive_epoch_mailbox(&[0x74; 32], epoch);
+    let forge_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forge_url = format!("ws://{}/v2/relay", forge_tcp.local_addr().unwrap());
+    let standby_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let standby_count_c = Arc::clone(&standby_count);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = forge_tcp.accept().await {
+            let mb_c = mb.clone();
+            let standby_cc = Arc::clone(&standby_count_c);
+            tokio::spawn(async move {
+                let mut ws = accept_async(stream).await.unwrap();
+                ws.send(Message::Text(
+                    serde_json::to_string(&RelayV2ServerMsg::Challenge {
+                        nonce: b64url_encode(&[0x20; 32]),
+                        host: canonical_relay_host("127.0.0.1").unwrap(),
+                        epoch,
+                        max_frame: MAX_RELAY_FRAME_LEN,
+                        auth_required: None,
+                        fast_open: Some(true),
+                        standby: Some(true),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+                let Some(Ok(Message::Text(msg))) = ws.next().await else {
+                    return;
+                };
+                match serde_json::from_str::<RelayV2ClientMsg>(&msg).unwrap() {
+                    RelayV2ClientMsg::Register {
+                        mailbox_id, epoch, ..
+                    } => {
+                        ws.send(Message::Text(
+                            serde_json::to_string(&RelayV2ServerMsg::Registered {
+                                mailbox_id,
+                                epoch,
+                            })
+                            .unwrap()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    RelayV2ClientMsg::Standby {
+                        mailbox_id,
+                        epoch: sb_epoch,
+                        ..
+                    } => {
+                        let nth = standby_cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        ws.send(Message::Text(
+                            serde_json::to_string(&RelayV2ServerMsg::StandbyReady {
+                                mailbox_id: mailbox_id.clone(),
+                                epoch: sb_epoch,
+                            })
+                            .unwrap()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                        // Send forged dial_token on every matching standby socket to prove Retry backoff (no tight spin).
+                        if sb_epoch == mb_c.epoch {
+                            let suffix = u8::try_from(nth % 64).unwrap_or(0);
+                            ws.send(Message::Text(
+                                serde_json::to_string(&RelayV2ServerMsg::Incoming {
+                                    mailbox_id,
+                                    epoch: sb_epoch,
+                                    conn_id: b64url_encode(&[0xA0_u8.wrapping_add(suffix); 16]),
+                                    dial_nonce: b64url_encode(&[0xBB; 32]),
+                                    dial_token: b64url_encode(&[0x00; 32]),
+                                    init_frame: None,
+                                })
+                                .unwrap()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+                while let Some(Ok(_)) = ws.next().await {}
+            });
+        }
+    });
+    let mut forged_listener = RelayV2Listener::bind_with_config(
+        &forge_url,
+        [0x74; 32],
+        RelayV2ListenerConfig {
+            unix_secs: Some(now_unix),
+            ..RelayV2ListenerConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(350), forged_listener.accept())
+            .await
+            .is_err(),
+        "forged standby dial_token must never reach accept()"
+    );
+    let total_sb = standby_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        total_sb <= 6,
+        "rejected standby Incoming must back off via Retry rather than spin (saw {total_sb} standby opens in 350ms)"
+    );
 }
