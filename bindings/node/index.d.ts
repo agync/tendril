@@ -196,6 +196,7 @@ export class Group {
 
 export class Session {
   private constructor();
+  readonly peerId: string;
   sendData(payload: Buffer): Promise<void>;
   pollEvent(timeoutMs?: number | null): Promise<string>;
   authorize(requestedCap: string): Promise<boolean>;

@@ -423,6 +423,14 @@ public final class TendrilJniConformanceTest {
         long sess = TendrilNative.sessionConnect(cliEp, epAddr, null, "rust-peer", Json.stringify(grantObj));
         try {
           check(Boolean.TRUE.equals(peer.recv().get("ok")), "peer connect failed");
+          boolean freedRejected = false;
+          try {
+            TendrilNative.sessionPeerId(0L);
+          } catch (IllegalStateException expected) {
+            freedRejected = true;
+          }
+          check(freedRejected, "sessionPeerId(0L) must throw IllegalStateException");
+          check("rust-peer".equals(TendrilNative.sessionPeerId(sess)), "expected rust-peer peerId on JNI client");
 
           TendrilNative.sessionSendData(sess, "hello-from-jni".getBytes(StandardCharsets.UTF_8));
           Map<String, Object> ev1 = peer.call(Map.of("op", "recv", "timeout_ms", 2000));
@@ -499,9 +507,11 @@ public final class TendrilJniConformanceTest {
         long hostSess = TendrilNative.sessionAccept(hostEp, 5000);
         try {
           check(Boolean.TRUE.equals(peer2.recv().get("ok")), "peer2 connect failed");
+          check(accId.equals(TendrilNative.sessionPeerId(hostSess)), "expected accId peerId on JNI host");
           check(TendrilNative.sessionAuthorize(hostSess, "fs.read"), "expected fs.read allowed on JNI host");
           check(!TendrilNative.sessionAuthorize(hostSess, "shell.exec"), "expected shell.exec denied on JNI host");
           TendrilNative.endpointRevokePeer(hostEp, accId);
+          check(accId.equals(TendrilNative.sessionPeerId(hostSess)), "expected accId peerId after revoke");
           check(!TendrilNative.sessionAuthorize(hostSess, "fs.read"), "expected fs.read denied after revoke");
           TendrilNative.sessionClose(hostSess, 1000, "revoked");
           peer2.call(Map.of("op", "shutdown"));
@@ -677,6 +687,8 @@ public final class TendrilJniConformanceTest {
       pollT.start();
       Thread.sleep(60);
       check(TendrilNative.sessionAuthorize(hostSess, "fs.read"), "authorize failed while polling");
+      check(devId.equals(TendrilNative.sessionPeerId(hostSess)), "hostSess.peerId while polling");
+      check("jni-sec17-host".equals(TendrilNative.sessionPeerId(cliSess)), "cliSess.peerId while polling");
       TendrilNative.sessionSendData(hostSess, "jni-duplex".getBytes(StandardCharsets.UTF_8));
       Map<String, Object> cliEv = asObj(Json.parse(TendrilNative.sessionPollEvent(cliSess, 2000)));
       check("data".equals(cliEv.get("event")), "expected duplex data event: " + cliEv);
@@ -803,6 +815,10 @@ public final class TendrilJniConformanceTest {
       try {
         check(TendrilNative.sessionAuthorize(hostSess, "fs.read"), "post-M2M authorize fs.read");
         check(!TendrilNative.sessionAuthorize(hostSess, "shell.exec"), "post-M2M deny shell.exec");
+        check("jni-m2m-host".equals(TendrilNative.sessionPeerId(cliSess)), "M2M cliSess.peerId mismatch");
+        check(
+            asStr(initRes.get("device_id")).equals(TendrilNative.sessionPeerId(hostSess)),
+            "M2M hostSess.peerId mismatch");
       } finally {
         TendrilNative.sessionFree(cliSess);
         TendrilNative.sessionFree(hostSess);
@@ -1116,6 +1132,12 @@ public final class TendrilJniConformanceTest {
             TendrilNative.sessionConnectV2(cliEp, v2Ep, "127.0.0.1", "jni-hmac-host", grantJson);
         sAccThread.join(5000);
         try {
+          check(
+              "jni-hmac-host".equals(TendrilNative.sessionPeerId(cliSess)),
+              "HMAC cliSess.peerId mismatch");
+          check(
+              asStr(accRes.get("device_id")).equals(TendrilNative.sessionPeerId(hostSess[0])),
+              "HMAC hostSess.peerId mismatch");
           TendrilNative.sessionSendData(cliSess, "jni-hmac-v2".getBytes(StandardCharsets.UTF_8));
           Map<String, Object> ev =
               asObj(Json.parse(TendrilNative.sessionPollEvent(hostSess[0], 3000)));
@@ -1204,6 +1226,12 @@ public final class TendrilJniConformanceTest {
               TendrilNative.sessionConnectV2(tCli, tV2Ep, "127.0.0.1", "jni-ticket-host", tGrant);
           tsAcc.join(5000);
           try {
+            check(
+                "jni-ticket-host".equals(TendrilNative.sessionPeerId(tCliSess)),
+                "ticket cliSess.peerId mismatch");
+            check(
+                asStr(tAcc.get("device_id")).equals(TendrilNative.sessionPeerId(tHostSess[0])),
+                "ticket hostSess.peerId mismatch");
             TendrilNative.sessionSendData(
                 tCliSess, "jni-ticket-v2".getBytes(StandardCharsets.UTF_8));
             Map<String, Object> tev =
@@ -1260,6 +1288,7 @@ public final class TendrilJniConformanceTest {
         long sess = TendrilNative.sessionConnectV2(cliEp, ep, null, "rust-jni-v2", grantJson);
         try {
           check(Boolean.TRUE.equals(peer.recv().get("ok")), "peer accept_v2 failed");
+          check("rust-jni-v2".equals(TendrilNative.sessionPeerId(sess)), "expected rust-jni-v2 peerId on v2 session");
           TendrilNative.sessionSendData(sess, "jni-v2-hello".getBytes(StandardCharsets.UTF_8));
           Map<String, Object> ev = peer.call(Map.of("op", "recv", "timeout_ms", 2000));
           check(

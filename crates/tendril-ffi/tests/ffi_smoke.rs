@@ -33,9 +33,10 @@ use tendril_ffi::{
     tendril_fingerprint_device, tendril_fingerprint_host, tendril_last_error, tendril_pairing_sas,
     tendril_session_accept, tendril_session_accept_v2, tendril_session_authorize,
     tendril_session_close, tendril_session_connect, tendril_session_connect_v2,
-    tendril_session_export_roster_json, tendril_session_free, tendril_session_poll_event,
-    tendril_session_rekey, tendril_session_send_data, tendril_session_shutdown,
-    tendril_string_free, tendril_verify_grant_json, tendril_verify_rotation_chain_json,
+    tendril_session_export_roster_json, tendril_session_free, tendril_session_peer_id,
+    tendril_session_poll_event, tendril_session_rekey, tendril_session_send_data,
+    tendril_session_shutdown, tendril_string_free, tendril_verify_grant_json,
+    tendril_verify_rotation_chain_json,
 };
 use tendril_runtime::{
     DirectListener, PathListener, PathStream, PrefixedPathStream, SessionDriver, StateStore,
@@ -461,6 +462,37 @@ fn ffi_full_lifecycle_and_session_outlives_endpoint() {
     // Drop client endpoint handle BEFORE using cli_sess to prove lifetime independence.
     unsafe { tendril_endpoint_free(cli_ep) };
 
+    // Null-pointer guards and authenticated peer identity accessors on both sides.
+    let sentinel_byte: c_char = 1;
+    let mut sentinel_buf: *mut c_char = (&raw const sentinel_byte).cast_mut();
+    assert_eq!(
+        unsafe { tendril_session_peer_id(ptr::null(), &raw mut sentinel_buf) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(sentinel_buf.is_null());
+    assert_eq!(
+        unsafe { tendril_session_peer_id(host_sess, ptr::null_mut()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    let mut peer_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_peer_id(host_sess, &raw mut peer_ptr) },
+        TENDRIL_OK,
+        "host_sess peer_id failed: {}",
+        read_last_err()
+    );
+    assert_eq!(
+        unsafe { take_cstr(peer_ptr) },
+        host_pair["device_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        unsafe { tendril_session_peer_id(cli_sess, &raw mut peer_ptr) },
+        TENDRIL_OK,
+        "cli_sess peer_id failed: {}",
+        read_last_err()
+    );
+    assert_eq!(unsafe { take_cstr(peer_ptr) }, "ffi-host");
+
     let cap_ok = CString::new("fs.read").unwrap();
     let cap_deny = CString::new("shell.exec").unwrap();
     let mut allowed = 0u8;
@@ -511,6 +543,15 @@ fn ffi_full_lifecycle_and_session_outlives_endpoint() {
         TENDRIL_OK
     );
     assert_eq!(allowed, 0);
+    // Revocation strips authority while preserving authenticated session peer identity.
+    assert_eq!(
+        unsafe { tendril_session_peer_id(host_sess, &raw mut peer_ptr) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { take_cstr(peer_ptr) },
+        host_pair["device_id"].as_str().unwrap()
+    );
 
     assert_eq!(
         unsafe { tendril_session_close(cli_sess, 1000, ptr::null()) },
@@ -1773,6 +1814,21 @@ fn batch2b_sec08_sec17_sec32_sec37_ffi_hardening() {
     thread::sleep(Duration::from_millis(60));
 
     let conc_t0 = Instant::now();
+    let mut conc_peer_ptr: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_peer_id(host_sess, &raw mut conc_peer_ptr) },
+        TENDRIL_OK
+    );
+    let conc_peer = unsafe { take_cstr(conc_peer_ptr) };
+    assert!(
+        conc_peer.starts_with("dev_"),
+        "unexpected peer id: {conc_peer}"
+    );
+    assert_eq!(
+        unsafe { tendril_session_peer_id(cli_sess, &raw mut conc_peer_ptr) },
+        TENDRIL_OK
+    );
+    assert_eq!(unsafe { take_cstr(conc_peer_ptr) }, "ffi-sec17-host");
     let cap_ok = CString::new("fs.read").unwrap();
     let mut allowed = 0u8;
     assert_eq!(
@@ -2282,6 +2338,23 @@ fn phase6_m2m_enrollment_and_replay_rejection() {
         TENDRIL_OK
     );
     assert_eq!(allowed, 1);
+    let mut m2m_peer_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_peer_id(sess2, &raw mut m2m_peer_p) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { take_cstr(m2m_peer_p) },
+        host_id_c.to_str().unwrap()
+    );
+    assert_eq!(
+        unsafe { tendril_session_peer_id(host_sess2, &raw mut m2m_peer_p) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { take_cstr(m2m_peer_p) },
+        cli1_dev_c.to_str().unwrap()
+    );
 
     // Invalid pin/key lengths must fail closed before reading beyond caller buffer.
     let short_buf = [0x11u8; 32];
@@ -3285,6 +3358,21 @@ fn ffi_wire_v2_pair_relay_v2_downgrade_guard_wake_rekey_and_revoke() {
 
     // Authorize check (allowed + denied), rekey, and roster export over v2 session.
     let mut allowed = 0u8;
+    let mut v2_peer_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_peer_id(cli_sess_v2, &raw mut v2_peer_p) },
+        TENDRIL_OK,
+        "v2 cli peer_id failed: {}",
+        read_last_err()
+    );
+    assert_eq!(unsafe { take_cstr(v2_peer_p) }, "ffi-v2-host");
+    assert_eq!(
+        unsafe { tendril_session_peer_id(host_sess_v2, &raw mut v2_peer_p) },
+        TENDRIL_OK,
+        "v2 host peer_id failed: {}",
+        read_last_err()
+    );
+    assert_eq!(unsafe { take_cstr(v2_peer_p) }, cli_dev_c.to_str().unwrap());
     let ok_cap_c = CString::new("fs.read:/v2/note").unwrap();
     assert_eq!(
         unsafe { tendril_session_authorize(host_sess_v2, ok_cap_c.as_ptr(), &raw mut allowed) },

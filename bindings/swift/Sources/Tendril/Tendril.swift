@@ -1434,6 +1434,18 @@ public final class TendrilSession {
     return try body(h)
   }
 
+  /// Authenticated roster peer identifier of this session. Evaluate capabilities separately via `authorize(_:)`.
+  public func peerId() throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = tendril_session_peer_id(h, &out)
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_session_peer_id failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
   public func sendData(_ data: Data) throws {
     try withHandle { h in
       let rc = data.withUnsafeBytes { raw in

@@ -278,6 +278,9 @@ func TestLiveInteropWithConformancePeer(t *testing.T) {
 	if ok, _ := peer.recv(t)["ok"].(bool); !ok {
 		t.Fatalf("peer connect failed")
 	}
+	if gotPeerID, err := sess.PeerID(); err != nil || gotPeerID != "rust-peer" {
+		t.Fatalf("Go sess.PeerID() = %q err=%v, want %q", gotPeerID, err, "rust-peer")
+	}
 
 	if err := sess.SendData([]byte("hello-from-go")); err != nil {
 		t.Fatalf("Go SendData: %v", err)
@@ -354,6 +357,9 @@ func TestLiveInteropWithConformancePeer(t *testing.T) {
 	if ok, _ := peer2.recv(t)["ok"].(bool); !ok {
 		t.Fatalf("peer2 connect failed")
 	}
+	if gotPeerID, err := hostSess.PeerID(); err != nil || gotPeerID != accPair.DeviceID {
+		t.Fatalf("Go hostSess.PeerID() = %q err=%v, want %q", gotPeerID, err, accPair.DeviceID)
+	}
 	if allowed, err := hostSess.Authorize("fs.read"); err != nil || !allowed {
 		t.Fatalf("Go Authorize fs.read failed: allowed=%v err=%v", allowed, err)
 	}
@@ -362,6 +368,9 @@ func TestLiveInteropWithConformancePeer(t *testing.T) {
 	}
 	if err := goHost.RevokePeer(accPair.DeviceID); err != nil {
 		t.Fatalf("Go RevokePeer: %v", err)
+	}
+	if gotPeerID, err := hostSess.PeerID(); err != nil || gotPeerID != accPair.DeviceID {
+		t.Fatalf("Go hostSess.PeerID() after revoke = %q err=%v, want %q", gotPeerID, err, accPair.DeviceID)
 	}
 	if allowed, err := hostSess.Authorize("fs.read"); err != nil || allowed {
 		t.Fatalf("Go Authorize after revoke expected false: allowed=%v err=%v", allowed, err)
@@ -492,6 +501,26 @@ func TestConcurrencyLifetimeRekeyAndWouldBlock(t *testing.T) {
 		ev2, err := hostSess.PollEvent(2000)
 		if err != nil || ev2.Event != "data" {
 			t.Fatalf("expected data event, got %+v err=%v", ev2, err)
+		}
+
+		pollDone := make(chan error, 1)
+		go func() {
+			_, perr := hostSess.PollEvent(350)
+			pollDone <- perr
+		}()
+		time.Sleep(30 * time.Millisecond)
+		if got, err := hostSess.PeerID(); err != nil || got != acc.DeviceID {
+			t.Fatalf("concurrent hostSess.PeerID() = %q err=%v, want %q", got, err, acc.DeviceID)
+		}
+		if got, err := cliSess.PeerID(); err != nil || got != "go-race-host" {
+			t.Fatalf("cliSess.PeerID() = %q err=%v, want %q", got, err, "go-race-host")
+		}
+		if perr := <-pollDone; !errors.Is(perr, tendril.ErrWouldBlock) {
+			t.Fatalf("expected ErrWouldBlock after concurrent PollEvent, got %v", perr)
+		}
+		_ = cliSess.Close()
+		if _, err := cliSess.PeerID(); err == nil {
+			t.Fatalf("expected PeerID() after Close() to fail")
 		}
 	}
 	wg.Wait()
@@ -849,6 +878,12 @@ func TestM2mEnrollmentAndReplay(t *testing.T) {
 	defer cliSess.Close()
 	srvSess := <-sessCh
 	defer srvSess.Close()
+	if gotPeerID, err := cliSess.PeerID(); err != nil || gotPeerID != "go-m2m-host" {
+		t.Fatalf("M2M cliSess.PeerID() = %q err=%v, want %q", gotPeerID, err, "go-m2m-host")
+	}
+	if gotPeerID, err := srvSess.PeerID(); err != nil || gotPeerID != initRes.DeviceID {
+		t.Fatalf("M2M srvSess.PeerID() = %q err=%v, want %q", gotPeerID, err, initRes.DeviceID)
+	}
 	if allowed, err := srvSess.Authorize("fs.read"); err != nil || !allowed {
 		t.Fatalf("Authorize fs.read failed: allowed=%v err=%v", allowed, err)
 	}
@@ -1292,6 +1327,9 @@ func TestWireV2ConformancePeerInterop(t *testing.T) {
 	if ok, _ := peer.recv(t)["ok"].(bool); !ok {
 		t.Fatalf("peer accept_v2 failed")
 	}
+	if gotPeerID, err := sess.PeerID(); err != nil || gotPeerID != "rust-v2-peer" {
+		t.Fatalf("Go v2 sess.PeerID() = %q err=%v, want %q", gotPeerID, err, "rust-v2-peer")
+	}
 
 	if err := sess.SendData([]byte("v2-hello-from-go")); err != nil {
 		t.Fatalf("Go SendData: %v", err)
@@ -1392,11 +1430,17 @@ func TestWireV2ConformancePeerInterop(t *testing.T) {
 	if ok, _ := peer2.recv(t)["ok"].(bool); !ok {
 		t.Fatalf("peer2 connect_v2 failed")
 	}
+	if gotPeerID, err := hostSess.PeerID(); err != nil || gotPeerID != accPair.DeviceID {
+		t.Fatalf("Go AcceptV2 hostSess.PeerID() = %q err=%v, want %q", gotPeerID, err, accPair.DeviceID)
+	}
 	if allowed, err := hostSess.Authorize("fs.read"); err != nil || !allowed {
 		t.Fatalf("Go AcceptV2 Authorize fs.read failed: allowed=%v err=%v", allowed, err)
 	}
 	if err := goHost.RevokePeer(accPair.DeviceID); err != nil {
 		t.Fatalf("Go RevokePeer: %v", err)
+	}
+	if gotPeerID, err := hostSess.PeerID(); err != nil || gotPeerID != accPair.DeviceID {
+		t.Fatalf("Go post-revoke PeerID() = %q err=%v, want %q", gotPeerID, err, accPair.DeviceID)
 	}
 	if allowed, err := hostSess.Authorize("fs.read"); err != nil || allowed {
 		t.Fatalf("Go Authorize after RevokePeer expected false: allowed=%v err=%v", allowed, err)

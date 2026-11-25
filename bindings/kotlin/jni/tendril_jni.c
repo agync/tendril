@@ -1485,6 +1485,22 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_sessionExportRosterJson
   return take_out_string(env, out);
 }
 
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_sessionPeerId(
+    JNIEnv *env, jclass cls, jlong ptr) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "session freed");
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_session_peer_id((const TendrilSession *)(uintptr_t)ptr, &out);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_session_peer_id failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
 JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_sessionFree(
     JNIEnv *env, jclass cls, jlong ptr) {
   (void)env;

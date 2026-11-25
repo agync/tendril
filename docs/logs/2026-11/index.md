@@ -21,3 +21,4 @@ Entries from November 2026.
 - [pairing: security and reliability fixes](23-pairing-security-and-reliability-fixes.md)
 - [Prepare v0.1.0 release workflow, package metadata, and install docs](24-prepare-v0-1-0-release-workflow.md)
 - [web: Happy Eyeballs dialing, /v2/relay priority, and broker+ws(s)](25-web-add-happy-eyeballs-multi-route.md)
+- [ffi: add tendril_session_peer_id and binding session peer accessors](25-ffi-add-tendril-session-peer-id.md)

@@ -863,6 +863,10 @@ class TendrilSession internal constructor(handle: Long) : Closeable {
       fn(ptr)
     }
 
+  /** Authenticated roster peer identifier of this session. Evaluate capabilities separately via [authorize]. */
+  fun peerId(): String =
+    withHandle { TendrilNative.sessionPeerId(it) }
+
   fun sendData(payload: ByteArray) =
     withHandle { TendrilNative.sessionSendData(it, payload) }
 

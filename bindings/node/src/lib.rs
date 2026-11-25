@@ -3270,6 +3270,13 @@ fn group_frame_outcome_json(outcome: &GroupFrameOutcome) -> serde_json::Value {
 
 #[napi]
 impl Session {
+    #[napi(getter)]
+    pub fn peer_id(&self) -> Result<String> {
+        self.session
+            .peer_device_id()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "session peer is not authenticated"))
+    }
+
     #[napi]
     pub async fn send_data(&self, payload: Buffer) -> Result<()> {
         self.session

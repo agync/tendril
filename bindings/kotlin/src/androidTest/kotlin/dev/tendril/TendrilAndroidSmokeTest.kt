@@ -582,7 +582,13 @@ class TendrilAndroidSmokeTest {
 
       val grant = grantFor(host, res.getString("device_id"))
       val (c, h) = connectStored(host, client, grant)
-      c.use { cs -> h.use { hs -> roundTrip(cs, hs, "over stored routes") } }
+      c.use { cs ->
+        h.use { hs ->
+          assertEquals(hostId, cs.peerId())
+          assertEquals(res.getString("device_id"), hs.peerId())
+          roundTrip(cs, hs, "over stored routes")
+        }
+      }
     }
   }
 

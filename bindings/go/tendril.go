@@ -1060,6 +1060,21 @@ func (s *Session) PollEvent(timeoutMs uint64) (*SessionEvent, error) {
 	return ev, err
 }
 
+// PeerID returns the authenticated roster peer identifier for this session.
+// Capability checks remain separate via Authorize.
+func (s *Session) PeerID() (string, error) {
+	var peerID string
+	err := s.withHandle(func(h *C.TendrilSession) error {
+		var out *C.char
+		if rc := C.tendril_session_peer_id(h, &out); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		peerID = takeOutCStr(out)
+		return nil
+	})
+	return peerID, err
+}
+
 // Authorize checks requestedCap via default-deny evaluation on the session's roster state.
 func (s *Session) Authorize(requestedCap string) (bool, error) {
 	var allowedBool bool
