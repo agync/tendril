@@ -23,4 +23,4 @@ Pin `ghcr.io/agync/tendril-relay:vX.Y.Z` in `fly.toml` before running unattended
 
 ## Cost note
 
-`min_machines_running = 1` keeps long-lived WebSocket control connections open continuously on one `shared-cpu-1x` (`256 MB`) machine rather than disconnecting idle listeners. See [the relay hosting guide](../../docs/usage/relay-hosting.md) for zero-cost serverless options.
+`min_machines_running = 1` keeps long-lived WebSocket control connections open continuously on one `shared-cpu-1x` (`256 MB`, ~USD 2/mo) machine rather than disconnecting idle listeners. Under the Fly.io Free plan, personal organizations receive a $1 one-time credit for 7 days without a card, or $5/mo of usage allowance once a card is added (which covers one single-machine relay, though exceeding $5 in a month automatically moves the organization to Pay As You Go and bills the entire month from the first cent). See [the relay hosting guide](../../docs/usage/relay-hosting.md) for zero-card serverless options.
