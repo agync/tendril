@@ -1,6 +1,7 @@
 //! Deterministic cryptographic primitives, key encodings, SAS, and pairing MACs.
 
 use std::fmt;
+use std::sync::Arc;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
@@ -452,11 +453,34 @@ impl fmt::Debug for StaticKeypair {
     }
 }
 
+/// External ML-DSA-65 signer boundary (for example, hardware Secure Enclave custody).
+///
+/// Implementations supply the 1952-byte FIPS 204 public key, produce 3309-byte ML-DSA-65
+/// signatures for the requested message and context, and MUST zeroize any temporary key,
+/// handle, or session material on `Drop`.
+///
+/// Callers MUST always sign through [`SigningKeypair::sign`] rather than calling
+/// [`ExternalMlDsaSigner::sign`] directly so the Ed25519 co-signature and mandatory post-sign
+/// [`HybridSigningPublicKey::verify`] self-check run before any signature is emitted.
+pub trait ExternalMlDsaSigner: Send + Sync {
+    /// Returns the raw 1952-byte ML-DSA-65 public key.
+    fn public_bytes(&self) -> &[u8; MLDSA65_PUBLIC_LEN];
+
+    /// Signs `message` using FIPS 204 ML-DSA-65 with `context`.
+    fn sign(&self, message: &[u8], context: &[u8]) -> Result<[u8; MLDSA65_SIG_LEN], CoreError>;
+}
+
+#[derive(Clone)]
+enum MlDsaSigningKey {
+    Software(Zeroizing<[u8; 32]>),
+    External(Arc<dyn ExternalMlDsaSigner>),
+}
+
 /// Hybrid `Ed25519 + ML-DSA-65` signing keypair whose seeds are zeroized on drop.
 #[derive(Clone)]
 pub struct SigningKeypair {
     ed25519_seed: Zeroizing<[u8; 32]>,
-    mldsa_seed: Zeroizing<[u8; 32]>,
+    mldsa: MlDsaSigningKey,
     public: HybridSigningPublicKey,
 }
 
@@ -471,6 +495,8 @@ impl SigningKeypair {
     /// Constructs a hybrid signing keypair from independent 32-byte Ed25519 and ML-DSA-65 seeds.
     #[must_use]
     pub fn from_seeds(ed25519_seed: [u8; 32], mldsa_seed: [u8; 32]) -> Self {
+        let ed25519_seed = Zeroizing::new(ed25519_seed);
+        let mldsa_seed = Zeroizing::new(mldsa_seed);
         let ed_sk = SigningKey::from_bytes(&ed25519_seed);
         let ed_pub = ed_sk.verifying_key().to_bytes();
         let (mldsa_pk, _mldsa_sk) = ml_dsa_65::KG::keygen_from_seed(&mldsa_seed);
@@ -480,10 +506,31 @@ impl SigningKeypair {
         combined[..ED25519_PUBLIC_LEN].copy_from_slice(&ed_pub);
         combined[ED25519_PUBLIC_LEN..].copy_from_slice(&mldsa_pub);
         Self {
-            ed25519_seed: Zeroizing::new(ed25519_seed),
-            mldsa_seed: Zeroizing::new(mldsa_seed),
+            ed25519_seed,
+            mldsa: MlDsaSigningKey::Software(mldsa_seed),
             public: HybridSigningPublicKey(combined),
         }
+    }
+
+    /// Constructs a hybrid signing keypair using an Ed25519 seed and an external ML-DSA-65 signer.
+    pub fn from_ed25519_and_external(
+        ed25519_seed: [u8; 32],
+        mldsa: Arc<dyn ExternalMlDsaSigner>,
+    ) -> Result<Self, CoreError> {
+        let ed25519_seed = Zeroizing::new(ed25519_seed);
+        let ed_sk = SigningKey::from_bytes(&ed25519_seed);
+        let ed_pub = ed_sk.verifying_key().to_bytes();
+
+        let mut combined = Box::new([0u8; HYBRID_SIGNING_PUB_LEN]);
+        combined[..ED25519_PUBLIC_LEN].copy_from_slice(&ed_pub);
+        combined[ED25519_PUBLIC_LEN..].copy_from_slice(mldsa.public_bytes());
+        let public = HybridSigningPublicKey::from_boxed(combined)?;
+
+        Ok(Self {
+            ed25519_seed,
+            mldsa: MlDsaSigningKey::External(mldsa),
+            public,
+        })
     }
 
     /// Deterministic single-seed constructor for tests and fixtures.
@@ -510,10 +557,29 @@ impl SigningKeypair {
         &self.ed25519_seed
     }
 
-    /// Returns the 32-byte ML-DSA-65 seed `xi`.
+    /// Returns the 32-byte ML-DSA-65 seed `xi`, or `None` when custody is external.
     #[must_use]
+    pub fn mldsa_seed_bytes_opt(&self) -> Option<&[u8; 32]> {
+        match &self.mldsa {
+            MlDsaSigningKey::Software(seed) => Some(seed),
+            MlDsaSigningKey::External(_) => None,
+        }
+    }
+
+    /// Reports whether ML-DSA-65 signing is delegated to an external signer.
+    #[must_use]
+    pub fn is_external_mldsa(&self) -> bool {
+        matches!(self.mldsa, MlDsaSigningKey::External(_))
+    }
+
+    /// Returns the 32-byte ML-DSA-65 seed `xi`.
+    ///
+    /// Panics if this keypair uses external ML-DSA-65 custody; prefer [`Self::mldsa_seed_bytes_opt`].
+    #[must_use]
+    #[track_caller]
     pub fn mldsa_seed_bytes(&self) -> &[u8; 32] {
-        &self.mldsa_seed
+        self.mldsa_seed_bytes_opt()
+            .expect("ML-DSA-65 seed is unavailable when using ExternalMlDsaSigner custody")
     }
 
     /// Returns the full 1984-byte [`HybridSigningPublicKey`].
@@ -541,37 +607,73 @@ impl SigningKeypair {
     }
 
     /// Signs `message` with hedged randomness (`Ed25519 || ML-DSA-65`, `3373` bytes).
+    ///
+    /// External ML-DSA-65 signatures are verified against [`Self::public_key`] before returning.
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CoreError> {
-        let hedging = Zeroizing::new(random_bytes::<32>()?);
-        self.sign_with_mldsa_rnd(message, &hedging)
+        match &self.mldsa {
+            MlDsaSigningKey::Software(mldsa_seed) => {
+                let hedging = Zeroizing::new(random_bytes::<32>()?);
+                self.sign_software_with_rnd(message, mldsa_seed, &hedging)
+            }
+            MlDsaSigningKey::External(signer) => {
+                let mldsa_sig = signer.sign(message, HYBRID_MLDSA_CTX)?;
+                let out = self.assemble_hybrid_signature(message, &mldsa_sig);
+                self.public.verify(message, &out)?;
+                Ok(out)
+            }
+        }
     }
 
     /// Deterministically signs `message` (`Ed25519 || ML-DSA-65` with zero ML-DSA hedging seed).
     pub fn sign_deterministic(&self, message: &[u8]) -> Result<Vec<u8>, CoreError> {
-        self.sign_with_mldsa_rnd(message, &[0u8; 32])
+        match &self.mldsa {
+            MlDsaSigningKey::Software(mldsa_seed) => {
+                self.sign_software_with_rnd(message, mldsa_seed, &[0u8; 32])
+            }
+            MlDsaSigningKey::External(_) => Err(CoreError::ProtocolViolation(
+                "deterministic signing requires software ML-DSA seed",
+            )),
+        }
     }
 
-    fn sign_with_mldsa_rnd(&self, message: &[u8], rnd: &[u8; 32]) -> Result<Vec<u8>, CoreError> {
-        let ed_sk = SigningKey::from_bytes(&self.ed25519_seed);
-        let ed_sig = ed_sk.sign(message);
-
-        let (_pk, mldsa_sk) = ml_dsa_65::KG::keygen_from_seed(&self.mldsa_seed);
+    fn sign_software_with_rnd(
+        &self,
+        message: &[u8],
+        mldsa_seed: &[u8; 32],
+        rnd: &[u8; 32],
+    ) -> Result<Vec<u8>, CoreError> {
+        let (_pk, mldsa_sk) = ml_dsa_65::KG::keygen_from_seed(mldsa_seed);
         let mldsa_sig = mldsa_sk
             .try_sign_with_seed(rnd, message, HYBRID_MLDSA_CTX)
             .map_err(|_| CoreError::InvalidSignature)?;
+        Ok(self.assemble_hybrid_signature(message, &mldsa_sig))
+    }
+
+    fn assemble_hybrid_signature(
+        &self,
+        message: &[u8],
+        mldsa_sig: &[u8; MLDSA65_SIG_LEN],
+    ) -> Vec<u8> {
+        let ed_sk = SigningKey::from_bytes(&self.ed25519_seed);
+        let ed_sig = ed_sk.sign(message);
 
         let mut out = Vec::with_capacity(HYBRID_SIG_LEN);
         out.extend_from_slice(&ed_sig.to_bytes());
-        out.extend_from_slice(&mldsa_sig);
-        Ok(out)
+        out.extend_from_slice(mldsa_sig);
+        out
     }
 }
 
 impl fmt::Debug for SigningKeypair {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mldsa = match &self.mldsa {
+            MlDsaSigningKey::Software(_) => "<redacted>",
+            MlDsaSigningKey::External(_) => "external",
+        };
         f.debug_struct("SigningKeypair")
             .field("public_hash", &b64url_encode(&self.signing_pub_hash()))
-            .field("seeds", &"<redacted>")
+            .field("ed25519_seed", &"<redacted>")
+            .field("mldsa", &mldsa)
             .finish()
     }
 }
@@ -655,5 +757,171 @@ mod tests {
         let json = serde_json::to_string(kp.public_key()).unwrap();
         let parsed: HybridSigningPublicKey = serde_json::from_str(&json).unwrap();
         assert_eq!(&parsed, kp.public_key());
+    }
+
+    #[derive(Clone)]
+    enum CryptoMockFault {
+        None,
+        FlipLastBit,
+        WrongContext,
+        WrongKey,
+        Fail(&'static str),
+    }
+
+    struct CryptoMockExternalSigner {
+        mldsa_seed: [u8; 32],
+        pub_bytes: [u8; MLDSA65_PUBLIC_LEN],
+        fault: CryptoMockFault,
+    }
+
+    impl CryptoMockExternalSigner {
+        fn new(mldsa_seed: [u8; 32], fault: CryptoMockFault) -> Self {
+            let (pk, _sk) = ml_dsa_65::KG::keygen_from_seed(&mldsa_seed);
+            Self {
+                mldsa_seed,
+                pub_bytes: pk.into_bytes(),
+                fault,
+            }
+        }
+    }
+
+    impl ExternalMlDsaSigner for CryptoMockExternalSigner {
+        fn public_bytes(&self) -> &[u8; MLDSA65_PUBLIC_LEN] {
+            &self.pub_bytes
+        }
+
+        fn sign(&self, message: &[u8], context: &[u8]) -> Result<[u8; MLDSA65_SIG_LEN], CoreError> {
+            assert_eq!(context, HYBRID_MLDSA_CTX);
+            let rnd = random_bytes::<32>()?;
+            match self.fault {
+                CryptoMockFault::None => {
+                    let (_pk, sk) = ml_dsa_65::KG::keygen_from_seed(&self.mldsa_seed);
+                    sk.try_sign_with_seed(&rnd, message, context)
+                        .map_err(|_| CoreError::InvalidSignature)
+                }
+                CryptoMockFault::FlipLastBit => {
+                    let (_pk, sk) = ml_dsa_65::KG::keygen_from_seed(&self.mldsa_seed);
+                    let mut sig = sk
+                        .try_sign_with_seed(&rnd, message, context)
+                        .map_err(|_| CoreError::InvalidSignature)?;
+                    sig[MLDSA65_SIG_LEN - 1] ^= 0x01;
+                    Ok(sig)
+                }
+                CryptoMockFault::WrongContext => {
+                    let (_pk, sk) = ml_dsa_65::KG::keygen_from_seed(&self.mldsa_seed);
+                    sk.try_sign_with_seed(&rnd, message, b"wrong-ctx")
+                        .map_err(|_| CoreError::InvalidSignature)
+                }
+                CryptoMockFault::WrongKey => {
+                    let mut other = self.mldsa_seed;
+                    other[0] ^= 0xFF;
+                    let (_pk, sk) = ml_dsa_65::KG::keygen_from_seed(&other);
+                    sk.try_sign_with_seed(&rnd, message, context)
+                        .map_err(|_| CoreError::InvalidSignature)
+                }
+                CryptoMockFault::Fail(msg) => Err(CoreError::ProtocolViolation(msg)),
+            }
+        }
+    }
+
+    struct InvalidPubkeySigner {
+        dummy_pub: [u8; MLDSA65_PUBLIC_LEN],
+        mismatch_seed: [u8; 32],
+    }
+
+    impl ExternalMlDsaSigner for InvalidPubkeySigner {
+        fn public_bytes(&self) -> &[u8; MLDSA65_PUBLIC_LEN] {
+            &self.dummy_pub
+        }
+
+        fn sign(&self, message: &[u8], context: &[u8]) -> Result<[u8; MLDSA65_SIG_LEN], CoreError> {
+            let rnd = random_bytes::<32>()?;
+            let (_pk, sk) = ml_dsa_65::KG::keygen_from_seed(&self.mismatch_seed);
+            sk.try_sign_with_seed(&rnd, message, context)
+                .map_err(|_| CoreError::InvalidSignature)
+        }
+    }
+
+    #[test]
+    fn external_mldsa_custody_validates_signs_verifies_and_fails_closed() {
+        let ed_seed = [0x31; 32];
+        let mldsa_seed = [0x42; 32];
+
+        // A dummy 1952-byte pubkey that does not match the signer's real signature fails closed
+        // via post-sign HybridSigningPublicKey::verify inside SigningKeypair::sign.
+        let dummy_pub = Arc::new(InvalidPubkeySigner {
+            dummy_pub: [0xFF; MLDSA65_PUBLIC_LEN],
+            mismatch_seed: [0x77; 32],
+        });
+        let dummy_kp = SigningKeypair::from_ed25519_and_external(ed_seed, dummy_pub).unwrap();
+        assert_eq!(dummy_kp.sign(b"msg"), Err(CoreError::InvalidSignature));
+
+        let signer = Arc::new(CryptoMockExternalSigner::new(
+            mldsa_seed,
+            CryptoMockFault::None,
+        ));
+        let kp = SigningKeypair::from_ed25519_and_external(ed_seed, signer).unwrap();
+        let soft = SigningKeypair::from_seeds(ed_seed, mldsa_seed);
+
+        assert!(kp.is_external_mldsa());
+        assert!(!soft.is_external_mldsa());
+        assert!(kp.mldsa_seed_bytes_opt().is_none());
+        assert_eq!(soft.mldsa_seed_bytes_opt(), Some(&mldsa_seed));
+        assert_eq!(kp.public_bytes(), soft.public_bytes());
+
+        let dbg = format!("{kp:?}");
+        assert!(dbg.contains("external"));
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains(&hex::encode(ed_seed)));
+
+        let msg = b"external-mldsa-test-message";
+        let sig = kp.sign(msg).unwrap();
+        assert_eq!(sig.len(), HYBRID_SIG_LEN);
+        kp.public_key().verify(msg, &sig).unwrap();
+        soft.public_key().verify(msg, &sig).unwrap();
+
+        assert_eq!(
+            kp.sign_deterministic(msg),
+            Err(CoreError::ProtocolViolation(
+                "deterministic signing requires software ML-DSA seed"
+            ))
+        );
+
+        for fault in [
+            CryptoMockFault::FlipLastBit,
+            CryptoMockFault::WrongContext,
+            CryptoMockFault::WrongKey,
+        ] {
+            let bad_kp = SigningKeypair::from_ed25519_and_external(
+                ed_seed,
+                Arc::new(CryptoMockExternalSigner::new(mldsa_seed, fault)),
+            )
+            .unwrap();
+            assert_eq!(bad_kp.sign(msg), Err(CoreError::InvalidSignature));
+        }
+
+        let err_kp = SigningKeypair::from_ed25519_and_external(
+            ed_seed,
+            Arc::new(CryptoMockExternalSigner::new(
+                mldsa_seed,
+                CryptoMockFault::Fail("sep unavailable"),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            err_kp.sign(msg),
+            Err(CoreError::ProtocolViolation("sep unavailable"))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ExternalMlDsaSigner")]
+    fn mldsa_seed_bytes_panics_on_external_custody() {
+        let signer = Arc::new(CryptoMockExternalSigner::new(
+            [0x43; 32],
+            CryptoMockFault::None,
+        ));
+        let kp = SigningKeypair::from_ed25519_and_external([0x33; 32], signer).unwrap();
+        let _ = kp.mldsa_seed_bytes();
     }
 }

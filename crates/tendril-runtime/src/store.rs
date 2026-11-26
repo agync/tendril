@@ -7,7 +7,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
-use tendril_core::crypto::{SigningKeypair, StaticKeypair, b64url_decode_array, b64url_encode};
+use subtle::ConstantTimeEq;
+use tendril_core::crypto::{
+    ExternalMlDsaSigner, MLDSA65_PUBLIC_LEN, SigningKeypair, StaticKeypair, b64url_decode_array,
+    b64url_encode,
+};
 use tendril_core::group::GroupBook;
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
 use tendril_core::roster::{PeerState, Roster};
@@ -27,6 +31,7 @@ const GROUPS_FILE: &str = "groups.json";
 const GROUPS_LOCK_FILE: &str = ".groups.lock";
 const SEALED_ROSTER_FILE: &str = "rt-roster.sealed";
 const SEALED_GROUPS_FILE: &str = "rt-groups.sealed";
+const EXTERNAL_MLDSA65_CUSTODY: &str = "external_mldsa65";
 
 /// Snapshot metadata identifying the on-disk state of `roster.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +48,12 @@ struct PersistedIdentity {
     host_id: String,
     static_secret_b64: String,
     signing_seed_b64: String,
-    pq_signing_seed_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_signing_seed_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_signing_custody: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_signing_pub_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rotation_chain: Vec<RotationRecord>,
     #[serde(default)]
@@ -54,7 +64,9 @@ impl Drop for PersistedIdentity {
     fn drop(&mut self) {
         self.static_secret_b64.zeroize();
         self.signing_seed_b64.zeroize();
-        self.pq_signing_seed_b64.zeroize();
+        if let Some(ref mut s) = self.pq_signing_seed_b64 {
+            s.zeroize();
+        }
     }
 }
 
@@ -62,15 +74,31 @@ impl Drop for PersistedIdentity {
 pub fn serialize_identity_json(
     identity: &EndpointIdentity,
 ) -> Result<Zeroizing<String>, RuntimeError> {
-    let static_b64 = Zeroizing::new(b64url_encode(identity.static_key().secret_bytes()));
-    let signing_b64 = Zeroizing::new(b64url_encode(identity.signing_key().seed_bytes()));
-    let pq_signing_b64 = Zeroizing::new(b64url_encode(identity.signing_key().mldsa_seed_bytes()));
+    let mut static_b64 = Zeroizing::new(b64url_encode(identity.static_key().secret_bytes()));
+    let mut signing_b64 = Zeroizing::new(b64url_encode(identity.signing_key().seed_bytes()));
+    let (version, pq_signing_seed_b64, pq_signing_custody, pq_signing_pub_b64) =
+        match identity.signing_key().mldsa_seed_bytes_opt() {
+            Some(mldsa_seed) => {
+                let mut pq_b64 = Zeroizing::new(b64url_encode(mldsa_seed));
+                (1, Some(std::mem::take(&mut *pq_b64)), None, None)
+            }
+            None => (
+                2,
+                None,
+                Some(EXTERNAL_MLDSA65_CUSTODY.to_owned()),
+                Some(b64url_encode(
+                    identity.signing_key().public_key().mldsa65_bytes(),
+                )),
+            ),
+        };
     let payload = PersistedIdentity {
-        version: 1,
+        version,
         host_id: identity.host_id().to_owned(),
-        static_secret_b64: static_b64.to_string(),
-        signing_seed_b64: signing_b64.to_string(),
-        pq_signing_seed_b64: pq_signing_b64.to_string(),
+        static_secret_b64: std::mem::take(&mut *static_b64),
+        signing_seed_b64: std::mem::take(&mut *signing_b64),
+        pq_signing_seed_b64,
+        pq_signing_custody,
+        pq_signing_pub_b64,
         rotation_chain: identity.rotation_chain().to_vec(),
         rotation_seq: identity.rotation_seq(),
     };
@@ -84,23 +112,74 @@ pub fn serialize_identity_json(
 
 /// Deserializes and validates a versioned [`EndpointIdentity`] JSON document.
 pub fn deserialize_identity_json(raw: &str) -> Result<EndpointIdentity, RuntimeError> {
+    deserialize_identity_json_with_signer(raw, None)
+}
+
+/// Deserializes and validates a versioned [`EndpointIdentity`] JSON document, attaching an
+/// optional external ML-DSA-65 signer for `version == 2` identities.
+pub fn deserialize_identity_json_with_signer(
+    raw: &str,
+    signer: Option<Arc<dyn ExternalMlDsaSigner>>,
+) -> Result<EndpointIdentity, RuntimeError> {
     let disk: PersistedIdentity = serde_json::from_str(raw).map_err(|err| {
         RuntimeError::Storage(format!(
             "invalid identity json: {}",
             redact_json_error(&err)
         ))
     })?;
-    if disk.version != 1 {
-        return Err(RuntimeError::Storage(format!(
-            "unsupported identity version {}",
-            disk.version
-        )));
-    }
+    let signing_key = match disk.version {
+        1 => {
+            if disk.pq_signing_custody.is_some() || disk.pq_signing_pub_b64.is_some() {
+                return Err(RuntimeError::Storage(
+                    "identity v1 must not include external ML-DSA-65 fields".to_owned(),
+                ));
+            }
+            if signer.is_some() {
+                return Err(RuntimeError::Storage(
+                    "software identity v1 cannot attach an external ML-DSA-65 signer".to_owned(),
+                ));
+            }
+            let pq_b64 = disk.pq_signing_seed_b64.as_deref().ok_or_else(|| {
+                RuntimeError::Storage("identity v1 missing pq_signing_seed_b64".to_owned())
+            })?;
+            let pq_signing_seed = Zeroizing::new(b64url_decode_array::<32>(pq_b64)?);
+            let signing_seed = Zeroizing::new(b64url_decode_array::<32>(&disk.signing_seed_b64)?);
+            SigningKeypair::from_seeds(*signing_seed, *pq_signing_seed)
+        }
+        2 => {
+            if disk.pq_signing_seed_b64.is_some() {
+                return Err(RuntimeError::Storage(
+                    "identity v2 must not contain pq_signing_seed_b64".to_owned(),
+                ));
+            }
+            if disk.pq_signing_custody.as_deref() != Some(EXTERNAL_MLDSA65_CUSTODY) {
+                return Err(RuntimeError::Storage(
+                    "identity v2 requires pq_signing_custody \"external_mldsa65\"".to_owned(),
+                ));
+            }
+            let pub_b64 = disk.pq_signing_pub_b64.as_deref().ok_or_else(|| {
+                RuntimeError::Storage("identity v2 missing pq_signing_pub_b64".to_owned())
+            })?;
+            let expected_mldsa_pub = b64url_decode_array::<MLDSA65_PUBLIC_LEN>(pub_b64)?;
+            let signer = signer.ok_or_else(|| {
+                RuntimeError::Storage("identity requires external ML-DSA-65 signer".to_owned())
+            })?;
+            if !bool::from(signer.public_bytes().ct_eq(&expected_mldsa_pub)) {
+                return Err(RuntimeError::Storage(
+                    "external ML-DSA-65 signer public key mismatch".to_owned(),
+                ));
+            }
+            let signing_seed = Zeroizing::new(b64url_decode_array::<32>(&disk.signing_seed_b64)?);
+            SigningKeypair::from_ed25519_and_external(*signing_seed, signer)?
+        }
+        other => {
+            return Err(RuntimeError::Storage(format!(
+                "unsupported identity version {other}"
+            )));
+        }
+    };
     let static_scalar = Zeroizing::new(b64url_decode_array::<32>(&disk.static_secret_b64)?);
-    let signing_seed = Zeroizing::new(b64url_decode_array::<32>(&disk.signing_seed_b64)?);
-    let pq_signing_seed = Zeroizing::new(b64url_decode_array::<32>(&disk.pq_signing_seed_b64)?);
     let static_key = StaticKeypair::from_scalar(*static_scalar);
-    let signing_key = SigningKeypair::from_seeds(*signing_seed, *pq_signing_seed);
     let identity = EndpointIdentity::from_persisted(
         disk.host_id.clone(),
         static_key,
@@ -264,11 +343,20 @@ impl StateStore {
 
     /// Loads [`EndpointIdentity`] from `identity.json`.
     pub fn load_identity(&self) -> Result<EndpointIdentity, RuntimeError> {
+        self.load_identity_with_signer(None)
+    }
+
+    /// Loads [`EndpointIdentity`] from `identity.json`, attaching an optional external ML-DSA-65
+    /// signer for `version == 2` identities.
+    pub fn load_identity_with_signer(
+        &self,
+        signer: Option<Arc<dyn ExternalMlDsaSigner>>,
+    ) -> Result<EndpointIdentity, RuntimeError> {
         self.refuse_identity_on_sealed()?;
         let path = self.identity_path();
         verify_private_file_0600(&path)?;
         let raw = Zeroizing::new(fs::read_to_string(&path)?);
-        deserialize_identity_json(&raw)
+        deserialize_identity_json_with_signer(&raw, signer)
     }
 
     /// Atomically persists [`EndpointIdentity`] with `0o600` file mode on Unix.
@@ -284,16 +372,39 @@ impl StateStore {
         &self,
         host_id: Option<&str>,
     ) -> Result<EndpointIdentity, RuntimeError> {
+        self.load_or_generate_identity_with_signer(host_id, None)
+    }
+
+    /// Loads the existing identity (attaching `signer` when `version == 2`), or generates and
+    /// persists a new identity under an exclusive `.identity.lock` advisory lock.
+    ///
+    /// When `identity.json` is absent:
+    /// - `signer == None` generates a software `version == 1` identity.
+    /// - `signer == Some(ext)` generates a `version == 2` identity with a fresh Ed25519 seed
+    ///   bound to `ext`.
+    pub fn load_or_generate_identity_with_signer(
+        &self,
+        host_id: Option<&str>,
+        signer: Option<Arc<dyn ExternalMlDsaSigner>>,
+    ) -> Result<EndpointIdentity, RuntimeError> {
         self.refuse_identity_on_sealed()?;
         let lock = open_lock_0600(&self.dir.join(IDENTITY_LOCK_FILE))?;
         flock(&lock, true)?;
         let path = self.identity_path();
         match fs::symlink_metadata(&path) {
-            Ok(_) => return self.load_identity(),
+            Ok(_) => return self.load_identity_with_signer(signer),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(RuntimeError::Io(err)),
         }
-        let mut identity = EndpointIdentity::generate()?;
+        let static_key = StaticKeypair::generate()?;
+        let signing_key = match signer {
+            Some(ext) => {
+                let ed_seed = Zeroizing::new(tendril_core::crypto::random_bytes::<32>()?);
+                SigningKeypair::from_ed25519_and_external(*ed_seed, ext)?
+            }
+            None => SigningKeypair::generate()?,
+        };
+        let mut identity = EndpointIdentity::from_keys(static_key, signing_key);
         if let Some(id) = host_id
             && !id.is_empty()
         {
@@ -728,4 +839,266 @@ fn open_temp_0600(path: &Path) -> Result<File, RuntimeError> {
 fn open_temp_0600(path: &Path) -> Result<File, RuntimeError> {
     let file = OpenOptions::new().write(true).create_new(true).open(path)?;
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tendril_core::crypto::{
+        ED25519_SIG_LEN, HYBRID_MLDSA_CTX, MLDSA65_PUBLIC_LEN, MLDSA65_SIG_LEN,
+    };
+    use tendril_core::error::CoreError;
+
+    struct StoreMockExternalSigner {
+        inner: SigningKeypair,
+        pub_bytes: [u8; MLDSA65_PUBLIC_LEN],
+    }
+
+    impl StoreMockExternalSigner {
+        fn new(mldsa_seed: [u8; 32]) -> Self {
+            let inner = SigningKeypair::from_seeds([0x05; 32], mldsa_seed);
+            let pub_bytes = *inner.public_key().mldsa65_bytes();
+            Self { inner, pub_bytes }
+        }
+    }
+
+    impl ExternalMlDsaSigner for StoreMockExternalSigner {
+        fn public_bytes(&self) -> &[u8; MLDSA65_PUBLIC_LEN] {
+            &self.pub_bytes
+        }
+
+        fn sign(&self, message: &[u8], context: &[u8]) -> Result<[u8; MLDSA65_SIG_LEN], CoreError> {
+            assert_eq!(context, HYBRID_MLDSA_CTX);
+            let full = self.inner.sign(message)?;
+            full[ED25519_SIG_LEN..]
+                .try_into()
+                .map_err(|_| CoreError::InvalidSignature)
+        }
+    }
+
+    fn storage_err_contains(err: RuntimeError, needle: &str) {
+        let msg = err.to_string();
+        assert!(msg.contains(needle), "{msg:?} does not contain {needle:?}");
+    }
+
+    #[test]
+    fn persisted_identity_v1_backward_compatibility_and_strict_checks() {
+        let soft = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x11; 32]),
+            SigningKeypair::from_seeds([0x22; 32], [0x33; 32]),
+        )
+        .with_host_id("v1-host");
+
+        let json = serialize_identity_json(&soft).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["version"], 1);
+        assert!(val.get("pq_signing_seed_b64").is_some());
+        assert!(val.get("pq_signing_custody").is_none());
+        assert!(val.get("pq_signing_pub_b64").is_none());
+
+        let reloaded = deserialize_identity_json(&json).unwrap();
+        assert_eq!(reloaded.host_id(), "v1-host");
+        assert_eq!(
+            reloaded.signing_key().public_key(),
+            soft.signing_key().public_key()
+        );
+        assert_eq!(
+            reloaded.signing_key().mldsa_seed_bytes_opt(),
+            Some(&[0x33; 32])
+        );
+
+        // v1 must fail closed if an external signer is supplied.
+        let signer = Arc::new(StoreMockExternalSigner::new([0x33; 32]));
+        storage_err_contains(
+            deserialize_identity_json_with_signer(&json, Some(signer)).unwrap_err(),
+            "software identity v1",
+        );
+
+        // v1 rejects missing seed and mixed v2 fields.
+        let mut missing_seed = val.clone();
+        missing_seed
+            .as_object_mut()
+            .unwrap()
+            .remove("pq_signing_seed_b64");
+        assert!(deserialize_identity_json(&missing_seed.to_string()).is_err());
+
+        let mut with_custody = val.clone();
+        with_custody["pq_signing_custody"] = serde_json::json!("external_mldsa65");
+        assert!(deserialize_identity_json(&with_custody.to_string()).is_err());
+
+        let mut with_pub = val;
+        with_pub["pq_signing_pub_b64"] = serde_json::json!(b64url_encode(
+            soft.signing_key().public_key().mldsa65_bytes()
+        ));
+        assert!(deserialize_identity_json(&with_pub.to_string()).is_err());
+    }
+
+    #[test]
+    fn persisted_identity_v2_external_mldsa_roundtrip_and_rejections() {
+        let signer0 = Arc::new(StoreMockExternalSigner::new([0x44; 32]));
+        let signer1 = Arc::new(StoreMockExternalSigner::new([0x55; 32]));
+        let kp0 = SigningKeypair::from_ed25519_and_external([0x41; 32], signer0).unwrap();
+        let kp1 = SigningKeypair::from_ed25519_and_external([0x51; 32], signer1).unwrap();
+
+        let mut id = EndpointIdentity::from_keys(StaticKeypair::from_scalar([0x40; 32]), kp0)
+            .with_host_id("v2-ext-host");
+        id.rotate(StaticKeypair::from_scalar([0x50; 32]), kp1, 1_795_564_800)
+            .unwrap();
+
+        let json = serialize_identity_json(&id).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["version"], 2);
+        assert!(val.get("pq_signing_seed_b64").is_none());
+        assert_eq!(val["pq_signing_custody"], "external_mldsa65");
+        assert_eq!(
+            val["pq_signing_pub_b64"],
+            b64url_encode(id.signing_key().public_key().mldsa65_bytes())
+        );
+
+        // Existing deserialize_identity_json fails closed on v2 without a signer.
+        storage_err_contains(
+            deserialize_identity_json(&json).unwrap_err(),
+            "identity requires external ML-DSA-65 signer",
+        );
+
+        // Matching signer restores full identity including rotation history.
+        let matching = Arc::new(StoreMockExternalSigner::new([0x55; 32]));
+        let restored = deserialize_identity_json_with_signer(&json, Some(matching)).unwrap();
+        assert_eq!(restored.host_id(), "v2-ext-host");
+        assert_eq!(restored.rotation_seq(), 1);
+        assert_eq!(restored.rotation_chain().len(), 1);
+        assert!(restored.signing_key().is_external_mldsa());
+        assert_eq!(
+            restored.signing_key().public_key(),
+            id.signing_key().public_key()
+        );
+        let sig = restored.signing_key().sign(b"hello-v2").unwrap();
+        restored
+            .signing_key()
+            .public_key()
+            .verify(b"hello-v2", &sig)
+            .unwrap();
+
+        // Mismatched external signer public key is rejected.
+        let wrong_signer = Arc::new(StoreMockExternalSigner::new([0x99; 32]));
+        storage_err_contains(
+            deserialize_identity_json_with_signer(&json, Some(wrong_signer)).unwrap_err(),
+            "mismatch",
+        );
+
+        // Mixed v1/v2 fields, bad custody, missing/short pubkey, and unknown version fail closed.
+        let mut with_seed = val.clone();
+        with_seed["pq_signing_seed_b64"] = serde_json::json!(b64url_encode(&[0x11; 32]));
+        assert!(
+            deserialize_identity_json_with_signer(
+                &with_seed.to_string(),
+                Some(Arc::new(StoreMockExternalSigner::new([0x55; 32]))),
+            )
+            .is_err()
+        );
+
+        let mut bad_custody = val.clone();
+        bad_custody["pq_signing_custody"] = serde_json::json!("other_custody");
+        assert!(
+            deserialize_identity_json_with_signer(
+                &bad_custody.to_string(),
+                Some(Arc::new(StoreMockExternalSigner::new([0x55; 32]))),
+            )
+            .is_err()
+        );
+
+        let mut missing_pub = val.clone();
+        missing_pub
+            .as_object_mut()
+            .unwrap()
+            .remove("pq_signing_pub_b64");
+        assert!(
+            deserialize_identity_json_with_signer(
+                &missing_pub.to_string(),
+                Some(Arc::new(StoreMockExternalSigner::new([0x55; 32]))),
+            )
+            .is_err()
+        );
+
+        let mut short_pub = val.clone();
+        short_pub["pq_signing_pub_b64"] = serde_json::json!(b64url_encode(&[0x22; 32]));
+        assert!(
+            deserialize_identity_json_with_signer(
+                &short_pub.to_string(),
+                Some(Arc::new(StoreMockExternalSigner::new([0x55; 32]))),
+            )
+            .is_err()
+        );
+
+        let mut bad_ver = val;
+        bad_ver["version"] = serde_json::json!(3);
+        storage_err_contains(
+            deserialize_identity_json(&bad_ver.to_string()).unwrap_err(),
+            "unsupported identity version 3",
+        );
+    }
+
+    #[test]
+    fn state_store_load_or_generate_identity_with_signer_roundtrips_v1_and_v2() {
+        let ext_dir = tempfile::tempdir().unwrap();
+        let ext_store = StateStore::open_or_create(ext_dir.path()).unwrap();
+        let signer = Arc::new(StoreMockExternalSigner::new([0x66; 32]));
+
+        // Absent on-disk identity + Some(signer) generates and persists version 2.
+        let created_v2 = ext_store
+            .load_or_generate_identity_with_signer(Some("sep-store-host"), Some(signer))
+            .unwrap();
+        assert_eq!(created_v2.host_id(), "sep-store-host");
+        assert!(created_v2.signing_key().is_external_mldsa());
+
+        // Reloading with matching signer returns the exact same persisted identity.
+        let reloaded_v2 = ext_store
+            .load_or_generate_identity_with_signer(
+                Some("ignored-host"),
+                Some(Arc::new(StoreMockExternalSigner::new([0x66; 32]))),
+            )
+            .unwrap();
+        assert_eq!(reloaded_v2.host_id(), "sep-store-host");
+        assert_eq!(reloaded_v2.device_id(), created_v2.device_id());
+        assert_eq!(
+            reloaded_v2.signing_key().public_key(),
+            created_v2.signing_key().public_key()
+        );
+
+        // Reloading an existing v2 identity without a signer or with a mismatched signer fails closed.
+        storage_err_contains(
+            ext_store.load_or_generate_identity(None).unwrap_err(),
+            "identity requires external ML-DSA-65 signer",
+        );
+        storage_err_contains(
+            ext_store
+                .load_or_generate_identity_with_signer(
+                    None,
+                    Some(Arc::new(StoreMockExternalSigner::new([0x77; 32]))),
+                )
+                .unwrap_err(),
+            "mismatch",
+        );
+
+        // Absent on-disk identity + None generates v1 and rejects attaching an external signer later.
+        let soft_dir = tempfile::tempdir().unwrap();
+        let soft_store = StateStore::open_or_create(soft_dir.path()).unwrap();
+        let created_v1 = soft_store
+            .load_or_generate_identity(Some("soft-store-host"))
+            .unwrap();
+        assert!(!created_v1.signing_key().is_external_mldsa());
+        let reloaded_v1 = soft_store
+            .load_or_generate_identity_with_signer(None, None)
+            .unwrap();
+        assert_eq!(reloaded_v1.device_id(), created_v1.device_id());
+        storage_err_contains(
+            soft_store
+                .load_or_generate_identity_with_signer(
+                    None,
+                    Some(Arc::new(StoreMockExternalSigner::new([0x66; 32]))),
+                )
+                .unwrap_err(),
+            "software identity v1",
+        );
+    }
 }

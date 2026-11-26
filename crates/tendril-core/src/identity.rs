@@ -183,6 +183,11 @@ impl EndpointIdentity {
         new_signing: SigningKeypair,
         now_unix: u64,
     ) -> Result<RotationRecord, CoreError> {
+        if self.signing_key.is_external_mldsa() && !new_signing.is_external_mldsa() {
+            return Err(CoreError::ProtocolViolation(
+                "cannot downgrade external ML-DSA-65 custody to software",
+            ));
+        }
         let next_seq = self
             .rotation_seq
             .checked_add(1)
@@ -901,7 +906,9 @@ mod tests {
             StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
             SigningKeypair::from_seeds(
                 *id.signing_key().seed_bytes(),
-                *id.signing_key().mldsa_seed_bytes(),
+                *id.signing_key()
+                    .mldsa_seed_bytes_opt()
+                    .expect("software ML-DSA seed"),
             ),
             id.rotation_chain().to_vec(),
             id.rotation_seq(),
@@ -929,7 +936,9 @@ mod tests {
             StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
             SigningKeypair::from_seeds(
                 *id.signing_key().seed_bytes(),
-                *id.signing_key().mldsa_seed_bytes(),
+                *id.signing_key()
+                    .mldsa_seed_bytes_opt()
+                    .expect("software ML-DSA seed"),
             ),
             id.rotation_chain().to_vec(),
             id.rotation_seq(),
@@ -945,7 +954,9 @@ mod tests {
                 StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
                 SigningKeypair::from_seeds(
                     *id.signing_key().seed_bytes(),
-                    *id.signing_key().mldsa_seed_bytes(),
+                    *id.signing_key()
+                        .mldsa_seed_bytes_opt()
+                        .expect("software ML-DSA seed"),
                 ),
                 id.rotation_chain().to_vec(),
                 1,
@@ -958,7 +969,9 @@ mod tests {
                 StaticKeypair::from_scalar([0x37; 32]),
                 SigningKeypair::from_seeds(
                     *id.signing_key().seed_bytes(),
-                    *id.signing_key().mldsa_seed_bytes(),
+                    *id.signing_key()
+                        .mldsa_seed_bytes_opt()
+                        .expect("software ML-DSA seed"),
                 ),
                 id.rotation_chain().to_vec(),
                 id.rotation_seq(),
@@ -980,7 +993,9 @@ mod tests {
             StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
             SigningKeypair::from_seeds(
                 *id.signing_key().seed_bytes(),
-                *id.signing_key().mldsa_seed_bytes(),
+                *id.signing_key()
+                    .mldsa_seed_bytes_opt()
+                    .expect("software ML-DSA seed"),
             ),
             id.rotation_chain().to_vec(),
             id.rotation_seq(),
@@ -999,5 +1014,170 @@ mod tests {
         .expect("rotate identity");
         let seed2 = id.derive_p2p_identity_seed();
         assert_ne!(&*seed1, &*seed2);
+    }
+
+    struct IdentityMockExternalSigner {
+        inner: SigningKeypair,
+        pub_bytes: [u8; crate::crypto::MLDSA65_PUBLIC_LEN],
+    }
+
+    impl IdentityMockExternalSigner {
+        fn new(mldsa_seed: [u8; 32]) -> Self {
+            let inner = SigningKeypair::from_seeds([0x01; 32], mldsa_seed);
+            let pub_bytes = *inner.public_key().mldsa65_bytes();
+            Self { inner, pub_bytes }
+        }
+    }
+
+    impl crate::crypto::ExternalMlDsaSigner for IdentityMockExternalSigner {
+        fn public_bytes(&self) -> &[u8; crate::crypto::MLDSA65_PUBLIC_LEN] {
+            &self.pub_bytes
+        }
+
+        fn sign(
+            &self,
+            message: &[u8],
+            context: &[u8],
+        ) -> Result<[u8; crate::crypto::MLDSA65_SIG_LEN], CoreError> {
+            assert_eq!(context, crate::crypto::HYBRID_MLDSA_CTX);
+            let full = self.inner.sign(message)?;
+            full[crate::crypto::ED25519_SIG_LEN..]
+                .try_into()
+                .map_err(|_| CoreError::InvalidSignature)
+        }
+    }
+
+    #[test]
+    fn endpoint_identity_external_mldsa_rotates_reloads_and_mints_tickets() {
+        use std::sync::Arc;
+
+        let ext0 = SigningKeypair::from_ed25519_and_external(
+            [0x51; 32],
+            Arc::new(IdentityMockExternalSigner::new([0x52; 32])),
+        )
+        .unwrap();
+        let ext1 = SigningKeypair::from_ed25519_and_external(
+            [0x61; 32],
+            Arc::new(IdentityMockExternalSigner::new([0x62; 32])),
+        )
+        .unwrap();
+
+        let mut id = EndpointIdentity::from_keys(StaticKeypair::from_scalar([0x50; 32]), ext0)
+            .with_host_id("apple-sep-host");
+        let genesis_pub = id.signing_key().public_key().clone();
+        let genesis_static = *id.static_key().public_bytes();
+
+        let target_pub = b64url_encode(id.signing_key().ed25519_public_bytes());
+        let ticket = id
+            .mint_relay_ticket(
+                "relay.example",
+                RelayAuthRole::Register,
+                &target_pub,
+                1_795_564_800,
+                300,
+            )
+            .unwrap();
+        assert_eq!(ticket.role, RelayAuthRole::Register);
+
+        let rec = id
+            .rotate(StaticKeypair::from_scalar([0x60; 32]), ext1, 1_795_564_860)
+            .unwrap();
+        assert_eq!(rec.seq, 1);
+        assert_eq!(id.rotation_seq(), 1);
+
+        let reloaded = EndpointIdentity::from_persisted(
+            id.host_id().to_owned(),
+            StaticKeypair::from_scalar(*id.static_key().secret_bytes()),
+            SigningKeypair::from_ed25519_and_external(
+                *id.signing_key().seed_bytes(),
+                Arc::new(IdentityMockExternalSigner::new([0x62; 32])),
+            )
+            .unwrap(),
+            id.rotation_chain().to_vec(),
+            id.rotation_seq(),
+        )
+        .unwrap();
+        assert_eq!(reloaded.rotation_seq(), 1);
+        assert_eq!(
+            verify_rotation_chain(
+                &genesis_pub,
+                &genesis_static,
+                0,
+                reloaded.rotation_chain(),
+                reloaded.static_key().public_bytes(),
+                reloaded.signing_key().public_key(),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn rotation_forbids_external_to_software_custody_downgrade() {
+        use std::sync::Arc;
+
+        // Software -> External custody upgrade succeeds.
+        let mut id = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x70; 32]),
+            SigningKeypair::from_seed([0x71; 32]),
+        )
+        .with_host_id("custody-upgrade-host");
+        let genesis_pub = id.signing_key().public_key().clone();
+        let genesis_static = *id.static_key().public_bytes();
+
+        let ext1 = SigningKeypair::from_ed25519_and_external(
+            [0x72; 32],
+            Arc::new(IdentityMockExternalSigner::new([0x73; 32])),
+        )
+        .unwrap();
+        let rec1 = id
+            .rotate(StaticKeypair::from_scalar([0x74; 32]), ext1, 1_795_564_800)
+            .unwrap();
+        assert_eq!(rec1.seq, 1);
+        assert!(id.signing_key().is_external_mldsa());
+
+        // External -> Software custody downgrade fails closed without mutating identity.
+        let static_before = *id.static_key().public_bytes();
+        let pub_before = id.signing_key().public_key().clone();
+        let err = id
+            .rotate(
+                StaticKeypair::from_scalar([0x75; 32]),
+                SigningKeypair::from_seed([0x76; 32]),
+                1_795_564_860,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CoreError::ProtocolViolation("cannot downgrade external ML-DSA-65 custody to software")
+        );
+        assert_eq!(id.rotation_seq(), 1);
+        assert_eq!(id.rotation_chain().len(), 1);
+        assert_eq!(id.static_key().public_bytes(), &static_before);
+        assert_eq!(id.signing_key().public_key(), &pub_before);
+        assert!(id.signing_key().is_external_mldsa());
+
+        // External -> External rotation continues cleanly.
+        let ext2 = SigningKeypair::from_ed25519_and_external(
+            [0x77; 32],
+            Arc::new(IdentityMockExternalSigner::new([0x78; 32])),
+        )
+        .unwrap();
+        let rec2 = id
+            .rotate(StaticKeypair::from_scalar([0x79; 32]), ext2, 1_795_564_920)
+            .unwrap();
+        assert_eq!(rec2.seq, 2);
+        assert!(id.signing_key().is_external_mldsa());
+        assert_eq!(
+            verify_rotation_chain(
+                &genesis_pub,
+                &genesis_static,
+                0,
+                id.rotation_chain(),
+                id.static_key().public_bytes(),
+                id.signing_key().public_key(),
+            )
+            .unwrap(),
+            2
+        );
     }
 }

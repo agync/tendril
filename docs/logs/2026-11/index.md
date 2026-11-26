@@ -29,3 +29,4 @@ Entries from November 2026.
 - [Add WebTransport direct path provider (wt://)](25-add-webtransport-direct-path-provider-wt.md)
 - [Add in-band WebRTC direct path upgrade](25-add-in-band-webrtc-direct-path.md)
 - [Add direct HTTP/2 APNs wake provider and MutableAlert mode](26-add-direct-http-2-apns-wake.md)
+- [core: add ExternalMlDsaSigner, identity v2, and ADR 0005](26-core-add-externalmldsasigner-identity-v2-and.md)

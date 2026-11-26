@@ -4065,3 +4065,292 @@ fn wt_redaction_and_policy_block_secrets_and_ssrf_hosts() {
         assert!(!is_valid_pairing_endpoint_hint(ssrf), "{ssrf}");
     }
 }
+
+#[test]
+fn external_mldsa_signer_roundtrip_and_fail_closed_adversarial_suite() {
+    use std::sync::{Arc, Mutex};
+
+    use tendril_core::crypto::{
+        ExternalMlDsaSigner, HYBRID_MLDSA_CTX, MLDSA65_PUBLIC_LEN, MLDSA65_SIG_LEN,
+    };
+    use tendril_core::grants::{sign_grant_deterministic, verify_grant_signature};
+    use tendril_core::group::{
+        GroupBuildParams, GroupMember, create_group, group_id_from_root, verify_group_manifest,
+    };
+    use tendril_core::identity::{sign_rotation_deterministic, verify_rotation_chain};
+    use tendril_core::pairing::{
+        sign_enroll_proof, sign_enroll_proof_deterministic, sign_pair_key_proof,
+        sign_pair_key_proof_deterministic, verify_enroll_proof, verify_pair_key_proof,
+    };
+    use tendril_core::routes::RouteSet;
+
+    #[derive(Clone, Copy)]
+    enum FaultMode {
+        Honest,
+        FlipSigBit,
+        WrongSigningKey,
+        WrongMessage,
+        Error(&'static str),
+    }
+
+    struct AdvExternalSigner {
+        backing: SigningKeypair,
+        other: SigningKeypair,
+        pub_bytes: [u8; MLDSA65_PUBLIC_LEN],
+        mode: FaultMode,
+        seen_contexts: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl AdvExternalSigner {
+        fn new(mldsa_seed: [u8; 32], mode: FaultMode) -> Self {
+            let backing = SigningKeypair::from_seeds([0x0A; 32], mldsa_seed);
+            let mut other_seed = mldsa_seed;
+            other_seed[0] ^= 0x5A;
+            let other = SigningKeypair::from_seeds([0x0B; 32], other_seed);
+            let pub_bytes = *backing.public_key().mldsa65_bytes();
+            Self {
+                backing,
+                other,
+                pub_bytes,
+                mode,
+                seen_contexts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn extract_mldsa(full_sig: &[u8]) -> [u8; MLDSA65_SIG_LEN] {
+            full_sig[ED25519_SIG_LEN..]
+                .try_into()
+                .expect("ML-DSA-65 signature length")
+        }
+    }
+
+    impl ExternalMlDsaSigner for AdvExternalSigner {
+        fn public_bytes(&self) -> &[u8; MLDSA65_PUBLIC_LEN] {
+            &self.pub_bytes
+        }
+
+        fn sign(&self, message: &[u8], context: &[u8]) -> Result<[u8; MLDSA65_SIG_LEN], CoreError> {
+            self.seen_contexts.lock().unwrap().push(context.to_vec());
+            match self.mode {
+                FaultMode::Honest => Ok(Self::extract_mldsa(&self.backing.sign(message)?)),
+                FaultMode::FlipSigBit => {
+                    let mut sig = Self::extract_mldsa(&self.backing.sign(message)?);
+                    sig[128] ^= 0x01;
+                    Ok(sig)
+                }
+                FaultMode::WrongSigningKey => Ok(Self::extract_mldsa(&self.other.sign(message)?)),
+                FaultMode::WrongMessage => {
+                    Ok(Self::extract_mldsa(&self.backing.sign(b"wrong-message")?))
+                }
+                FaultMode::Error(msg) => Err(CoreError::ProtocolViolation(msg)),
+            }
+        }
+    }
+
+    let signer = Arc::new(AdvExternalSigner::new([0x71; 32], FaultMode::Honest));
+    let ext_kp = SigningKeypair::from_ed25519_and_external([0x72; 32], signer.clone()).unwrap();
+    let next_kp = SigningKeypair::from_ed25519_and_external(
+        [0x73; 32],
+        Arc::new(AdvExternalSigner::new([0x74; 32], FaultMode::Honest)),
+    )
+    .unwrap();
+    let ext_static = StaticKeypair::from_scalar([0x75; 32]);
+    let peer_static = StaticKeypair::from_scalar([0x76; 32]);
+    let mut ext_id =
+        EndpointIdentity::from_keys(ext_static.clone(), ext_kp.clone()).with_host_id("ext-host");
+    let peer_id = EndpointIdentity::from_keys(peer_static.clone(), next_kp.clone());
+
+    // 1. Grants round-trip.
+    let grant_unsigned = GrantUnsigned {
+        v: 1,
+        issuer: ext_id.host_id().to_owned(),
+        subject: peer_id.device_id(),
+        caps: vec!["fs.read:/docs/*".to_owned()],
+        not_before: "2026-11-20T00:00:00Z".to_owned(),
+        not_after: "2026-12-20T00:00:00Z".to_owned(),
+        nonce: b64url_encode(&[0xC1; 16]),
+        delegated_from: vec![],
+        uses: None,
+        machine: None,
+    };
+    let grant = sign_grant(grant_unsigned.clone(), &ext_kp).unwrap();
+    verify_grant_signature(&grant, ext_kp.public_key()).unwrap();
+    assert_eq!(
+        sign_grant_deterministic(grant_unsigned, &ext_kp),
+        Err(CoreError::ProtocolViolation(
+            "deterministic signing requires software ML-DSA seed"
+        ))
+    );
+
+    // 2. GroupManifest round-trip.
+    let gid = group_id_from_root(ext_kp.public_key());
+    let root_member = GroupMember::new(
+        ext_static.public_bytes(),
+        "ext-root",
+        ext_kp.public_key(),
+        vec!["direct:127.0.0.1:7000".to_owned()],
+        vec![format!("group.recv:{gid}"), format!("group.send:{gid}")],
+    );
+    let (manifest, _secrets) = create_group(
+        &ext_kp,
+        "sep-group",
+        1,
+        root_member,
+        GroupBuildParams::new(NOW_UNIX),
+    )
+    .unwrap();
+    verify_group_manifest(&manifest, NOW_UNIX, None).unwrap();
+
+    // 3. RotationRecord round-trip and chain verification.
+    let rot = sign_rotation(
+        1,
+        &ext_kp,
+        next_kp.public_key(),
+        peer_static.public_bytes(),
+        NOW_UNIX,
+    )
+    .unwrap();
+    assert_eq!(
+        verify_rotation_chain(
+            ext_kp.public_key(),
+            ext_static.public_bytes(),
+            0,
+            &[rot],
+            peer_static.public_bytes(),
+            next_kp.public_key(),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sign_rotation_deterministic(
+            1,
+            &ext_kp,
+            next_kp.public_key(),
+            peer_static.public_bytes(),
+            NOW_UNIX,
+        ),
+        Err(CoreError::ProtocolViolation(
+            "deterministic signing requires software ML-DSA seed"
+        ))
+    );
+
+    // 4. RouteSet round-trip.
+    let route_set = RouteSet::sign(
+        &ext_id,
+        1,
+        NOW_UNIX,
+        vec!["direct:192.168.1.90:7000".to_owned()],
+    )
+    .unwrap();
+    let decoded_rs = RouteSet::decode(&route_set.encode()).unwrap();
+    decoded_rs.verify(ext_kp.public_key()).unwrap();
+    assert_eq!(
+        RouteSet::sign_deterministic(&ext_id, 2, NOW_UNIX, vec![]),
+        Err(CoreError::ProtocolViolation(
+            "deterministic signing requires software ML-DSA seed"
+        ))
+    );
+
+    // 5. PairKeyProof standalone + full PairingInitiator/PairingResponder flow.
+    let h = [0xAB; 32];
+    let key_proof = sign_pair_key_proof(&ext_kp, &h, ext_static.public_bytes()).unwrap();
+    verify_pair_key_proof(
+        ext_kp.public_key(),
+        &h,
+        ext_static.public_bytes(),
+        &key_proof,
+    )
+    .unwrap();
+    assert_eq!(
+        sign_pair_key_proof_deterministic(&ext_kp, &h, ext_static.public_bytes()),
+        Err(CoreError::ProtocolViolation(
+            "deterministic signing requires software ML-DSA seed"
+        ))
+    );
+
+    let host = mk_identity(0x81);
+    let mut host_roster = Roster::new();
+    let mut mgr = PairingManager::new(PairingConfig::default());
+    let code = mgr
+        .issue_code_with_entropy(PairingCodeKind::Lan2Group, NOW_UNIX, &[9u8; 32])
+        .unwrap();
+    let mut p_init = PairingInitiator::new(&ext_id, "Apple SEP", "ios", &code, None, None).unwrap();
+    let mut p_resp = PairingResponder::new(&host, PairingPathKind::Lan, None).unwrap();
+    let (_init_ev, _resp_ev) = run_pair_exchange(
+        &mut p_init,
+        &mut p_resp,
+        &mut mgr,
+        &mut host_roster,
+        NOW_UNIX + 1,
+        19,
+    );
+    let entry = host_roster.get(&ext_id.device_id()).unwrap();
+    assert_eq!(entry.signing_pub.as_ref(), Some(ext_kp.public_key()));
+
+    // 6. EnrollProof round-trip.
+    let enroll_proof =
+        sign_enroll_proof(&ext_kp, &h, ext_static.public_bytes(), "enroll-nonce-ext").unwrap();
+    verify_enroll_proof(
+        ext_kp.public_key(),
+        &h,
+        ext_static.public_bytes(),
+        "enroll-nonce-ext",
+        &enroll_proof,
+    )
+    .unwrap();
+    assert_eq!(
+        sign_enroll_proof_deterministic(&ext_kp, &h, ext_static.public_bytes(), "n"),
+        Err(CoreError::ProtocolViolation(
+            "deterministic signing requires software ML-DSA seed"
+        ))
+    );
+
+    // Verify every call received HYBRID_MLDSA_CTX (drop lock guard before rotating below).
+    {
+        let contexts = signer.seen_contexts.lock().unwrap();
+        assert!(contexts.len() >= 6);
+        assert!(
+            contexts
+                .iter()
+                .all(|ctx| ctx.as_slice() == HYBRID_MLDSA_CTX)
+        );
+    }
+
+    // 7. Adversarial external signers must fail closed before returning any signature.
+    for mode in [
+        FaultMode::FlipSigBit,
+        FaultMode::WrongSigningKey,
+        FaultMode::WrongMessage,
+    ] {
+        let bad_kp = SigningKeypair::from_ed25519_and_external(
+            [0x72; 32],
+            Arc::new(AdvExternalSigner::new([0x71; 32], mode)),
+        )
+        .unwrap();
+        assert_eq!(bad_kp.sign(b"payload"), Err(CoreError::InvalidSignature));
+    }
+
+    let err_kp = SigningKeypair::from_ed25519_and_external(
+        [0x72; 32],
+        Arc::new(AdvExternalSigner::new(
+            [0x71; 32],
+            FaultMode::Error("hardware key locked"),
+        )),
+    )
+    .unwrap();
+    assert_eq!(
+        err_kp.sign(b"payload"),
+        Err(CoreError::ProtocolViolation("hardware key locked"))
+    );
+
+    // Rotation on EndpointIdentity works with external signer too.
+    let rot2 = ext_id
+        .rotate(
+            StaticKeypair::from_scalar([0x79; 32]),
+            next_kp,
+            NOW_UNIX + 60,
+        )
+        .unwrap();
+    assert_eq!(rot2.seq, 1);
+}
