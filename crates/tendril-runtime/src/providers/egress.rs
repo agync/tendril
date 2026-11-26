@@ -36,8 +36,8 @@ pub const EGRESS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[serde(rename_all = "snake_case")]
 pub enum DestClass {
     /// Never dialed: unspecified, multicast, broadcast, link-local, `0.0.0.0/8`,
-    /// `240.0.0.0/4`, cloud metadata, site-local `fec0::/10` and local-use NAT64
-    /// `64:ff9b:1::/48`.
+    /// `240.0.0.0/4`, cloud metadata, site-local `fec0::/10`, local-use NAT64
+    /// `64:ff9b:1::/48` and Teredo `2001::/32`.
     Blocked,
     /// `127.0.0.0/8`, `::1`.
     Loopback,
@@ -61,7 +61,8 @@ pub enum DestClass {
 ///
 /// The local-use NAT64 prefix `64:ff9b:1::/48` (RFC 8215) has an operator-chosen RFC 6052
 /// prefix length, so its embedded IPv4 address cannot be located; [`classify_destination`]
-/// blocks that prefix outright.
+/// blocks that prefix outright, as it does Teredo `2001::/32`, whose embedded IPv4 address is
+/// obfuscated and not trustworthy.
 fn canonical(ip: IpAddr) -> IpAddr {
     let IpAddr::V6(v6) = ip else {
         return ip;
