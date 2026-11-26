@@ -143,6 +143,7 @@ function isBlockedHost(host) {
     if ((v6[0] & 0xffc0) === 0xfe80) return true;
     if ((v6[0] & 0xffc0) === 0xfec0) return true;
     if (v6[0] === 0x0064 && v6[1] === 0xff9b && v6[2] === 0x0001) return true;
+    if (v6[0] === 0x2001 && v6[1] === 0) return true;
     if (
       v6[0] === 0xfd00 &&
       v6[1] === 0x0ec2 &&

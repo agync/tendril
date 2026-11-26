@@ -2143,3 +2143,12 @@ test("validateRelayWsUrl rejects Teredo and local-use NAT64 but keeps adjacent p
     assert.doesNotThrow(() => validateRelayWsUrl(allowed), allowed);
   }
 });
+
+test("validateWtUrl rejects Teredo hosts but keeps adjacent public space", async () => {
+  const { validateWtUrl } = await import("../src/webtransport.js");
+  const hash = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  for (const blocked of ["[2001::1]", "[2001:0:4136:e378:8000:63bf:3fff:fdd2]"]) {
+    assert.throws(() => validateWtUrl(`wt://${blocked}:4433?certhash=${hash}`), /./, blocked);
+  }
+  assert.doesNotThrow(() => validateWtUrl(`wt://[2001:4860::1]:4433?certhash=${hash}`));
+});
