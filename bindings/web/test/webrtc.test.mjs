@@ -476,6 +476,7 @@ test("TendrilWebSession.upgradeToWebRtc handles not_negotiated, webrtc_unsupport
     const [sfA, sfB] = await Promise.all([
       s2.upgradeToWebRtc({ timeoutMs: 2000 }),
       s2.upgradeToWebRtc({ timeoutMs: 2000 }),
+      peer.call({ op: "recv", timeout_ms: 2000 }),
     ]);
     assert.equal(sfA.upgraded, false);
     assert.deepEqual(sfA, sfB);
@@ -490,7 +491,10 @@ test("TendrilWebSession.upgradeToWebRtc handles not_negotiated, webrtc_unsupport
 
     // Exhaust remaining 3 upgrade offers (total 4 offers), 5th triggers upgrade_limit_reached.
     for (let attempt = 2; attempt <= 4; attempt += 1) {
-      const r = await s2.upgradeToWebRtc({ timeoutMs: 2000 });
+      const [r] = await Promise.all([
+        s2.upgradeToWebRtc({ timeoutMs: 2000 }),
+        peer.call({ op: "recv", timeout_ms: 2000 }),
+      ]);
       assert.equal(r.upgraded, false);
     }
     const overLimit = await s2.upgradeToWebRtc({ timeoutMs: 2000 });

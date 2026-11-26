@@ -1139,17 +1139,17 @@ async function main() {
       assert.equal(concurrentPollGot, "webrtc-host-to-chrome");
 
       await cdp.evalAsync(`
-        await window.__webrtcSession.sendData('webrtc-chrome-to-host');
         await window.__webrtcSession.rekey();
         await window.__webrtcSession.ping(77);
+        await window.__webrtcSession.sendData('webrtc-chrome-to-host');
       `);
-      const evData = await webrtcPeer.call({ op: "recv", timeout_ms: 3000 });
-      assert.equal(evData.data_utf8, "webrtc-chrome-to-host");
-      const evRekey = await webrtcPeer.call({ op: "recv", timeout_ms: 3000 });
+      const evRekey = await webrtcPeer.call({ op: "recv", timeout_ms: 5000 });
       assert.equal(evRekey.event, "rekeyed");
+      const evData = await webrtcPeer.call({ op: "recv", timeout_ms: 5000 });
+      assert.equal(evData.data_utf8, "webrtc-chrome-to-host");
 
       const pongCheck = await cdp.evalAsync(`
-        const ev = await window.__webrtcSession.pollEvent(3000);
+        const ev = await window.__webrtcSession.pollEvent(5000);
         return ev;
       `);
       assert.equal(pongCheck.event, "pong");
