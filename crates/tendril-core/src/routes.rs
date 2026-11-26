@@ -9,7 +9,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::crypto::{HYBRID_SIG_LEN, HYBRID_SIGNING_HASH_LEN, HybridSigningPublicKey};
+use crate::crypto::{
+    HYBRID_SIG_LEN, HYBRID_SIGNING_HASH_LEN, HybridSigningPublicKey, SigningKeypair,
+};
 use crate::error::CoreError;
 use crate::identity::EndpointIdentity;
 use crate::pairing::is_valid_pairing_endpoint_hint;
@@ -90,11 +92,30 @@ impl RouteSet {
         routes: Vec<String>,
         deterministic: bool,
     ) -> Result<Self, CoreError> {
+        Self::sign_for(
+            identity.static_key().public_bytes(),
+            identity.signing_key(),
+            seq,
+            issued_at,
+            routes,
+            deterministic,
+        )
+    }
+
+    /// Signs a set for the host whose Noise static key is `static_pub` and whose current
+    /// signing key is `signing`.
+    pub(crate) fn sign_for(
+        static_pub: &[u8; 32],
+        signing: &SigningKeypair,
+        seq: u64,
+        issued_at: u64,
+        routes: Vec<String>,
+        deterministic: bool,
+    ) -> Result<Self, CoreError> {
         validate_seq(seq)?;
         validate_routes(&routes)?;
-        let signing = identity.signing_key();
         let mut set = Self {
-            static_pub: *identity.static_key().public_bytes(),
+            static_pub: *static_pub,
             sh: signing.signing_pub_hash(),
             seq,
             issued_at,

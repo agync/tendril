@@ -15,15 +15,18 @@ use tendril_core::grants::{AuditEvent, Grant, RevocationList};
 use tendril_core::group::{GroupManifest, GroupRendezvousFrame, GroupSeq, V2GroupSecrets};
 use tendril_core::identity::{EndpointIdentity, RotationRecord};
 use tendril_core::pairing::{
-    EnrollmentPolicy, PairAction, PairOutcome, PairRouteBinding, PairRouteVerdict, PairingCodeKind,
-    PairingInitiator, PairingManager, PairingPathKind, PairingResponder, PairingUri, PersistOpts,
-    PersistPlan, PinnedHost, RouteCheck, RoutePolicy, VerifiedRouteStatement, is_v2_relay_hint,
+    EnrollmentPolicy, EnrollmentRouteReject, EnrollmentRoutes, PairAction, PairOutcome,
+    PairRouteBinding, PairRouteVerdict, PairingCodeKind, PairingInitiator, PairingManager,
+    PairingPathKind, PairingResponder, PairingUri, PersistOpts, PersistPlan, PinnedHost,
+    RouteCheck, RoutePolicy, VerifiedHost, VerifiedRouteStatement, is_v2_relay_hint,
     persistable_routes,
 };
 use tendril_core::policy::{
     CandidateEndpoint, PathPlanner, PathPolicyConfig, PlannerAction, ProviderId,
 };
-use tendril_core::roster::{PeerState, PinSnapshot, Roster, StoredRoute};
+use tendril_core::roster::{
+    PeerState, PinSnapshot, Roster, RouteSetIgnored, RouteSetOutcome, RouteSource, StoredRoute,
+};
 use tendril_core::routes::RouteSet;
 use tendril_core::session::{
     RekeyDirection, RouteExpectation, SessionAction, SessionMachine, check_peer_allows_wire_v1,
@@ -40,7 +43,8 @@ use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, P
 use crate::providers::egress::{EgressKind, HintSource, HostResolver, SkipReason, SkippedHint};
 use crate::providers::hints::{
     CandidateSet, DialWire, HintDialers, HintInput, HintTarget, MultiDialOptions, RelayV2Gate,
-    build_pairing_candidates, normalize_operator_endpoint, session_hint_inputs,
+    build_pairing_candidates, normalize_operator_endpoint, normalize_peer_routes,
+    session_hint_inputs,
 };
 #[cfg(feature = "webrtc")]
 use crate::providers::webrtc::WebRtcUpgradeHandle;
@@ -216,9 +220,9 @@ pub async fn drive_pair_initiator_with_timeout(
     pinned_host: Option<PinnedHost>,
     handshake_timeout: Duration,
 ) -> Result<PairDriveResult, RuntimeError> {
-    let machine =
+    let mut machine =
         PairingInitiator::new(identity, device_name, device_kind, code, pinned_host, None)?;
-    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+    drive_pairing_initiator_machine(stream, &mut machine, handshake_timeout).await
 }
 
 /// Drives a v1 pairing initiator enforcing an explicit `min_wire_version` anti-downgrade floor.
@@ -233,7 +237,7 @@ pub async fn drive_pair_initiator_with_floor(
     min_wire_version: u8,
     handshake_timeout: Duration,
 ) -> Result<PairDriveResult, RuntimeError> {
-    let machine = PairingInitiator::new_with_min_wire_version(
+    let mut machine = PairingInitiator::new_with_min_wire_version(
         identity,
         device_name,
         device_kind,
@@ -242,7 +246,7 @@ pub async fn drive_pair_initiator_with_floor(
         min_wire_version,
         None,
     )?;
-    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+    drive_pairing_initiator_machine(stream, &mut machine, handshake_timeout).await
 }
 
 /// Drives a v1 pairing initiator while enforcing any persisted `min_wire_version` floor from `store`.
@@ -263,7 +267,7 @@ pub async fn drive_pair_initiator_with_store(
         .map_or(tendril_core::WIRE_VERSION, |pin| {
             pinned_pairing_floor(&roster, pin)
         });
-    let machine = PairingInitiator::new_with_min_wire_version(
+    let mut machine = PairingInitiator::new_with_min_wire_version(
         identity,
         device_name,
         device_kind,
@@ -273,7 +277,7 @@ pub async fn drive_pair_initiator_with_store(
         None,
     )?
     .with_roster_floors(&roster);
-    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+    drive_pairing_initiator_machine(stream, &mut machine, handshake_timeout).await
 }
 
 /// Drives an autonomous M2M enrollment initiator handshake to completion over `stream`
@@ -312,7 +316,7 @@ pub async fn drive_m2m_enroll_initiator_with_timeout(
     pinned_host: PinnedHost,
     handshake_timeout: Duration,
 ) -> Result<PairDriveResult, RuntimeError> {
-    let machine = PairingInitiator::new_m2m(
+    let mut machine = PairingInitiator::new_m2m(
         identity,
         device_name,
         device_kind,
@@ -320,7 +324,7 @@ pub async fn drive_m2m_enroll_initiator_with_timeout(
         pinned_host,
         None,
     )?;
-    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+    drive_pairing_initiator_machine(stream, &mut machine, handshake_timeout).await
 }
 
 /// Drives a v1 M2M enrollment initiator enforcing an explicit `min_wire_version` floor.
@@ -335,7 +339,7 @@ pub async fn drive_m2m_enroll_initiator_with_floor(
     min_wire_version: u8,
     handshake_timeout: Duration,
 ) -> Result<PairDriveResult, RuntimeError> {
-    let machine = PairingInitiator::new_m2m_with_min_wire_version(
+    let mut machine = PairingInitiator::new_m2m_with_min_wire_version(
         identity,
         device_name,
         device_kind,
@@ -344,10 +348,16 @@ pub async fn drive_m2m_enroll_initiator_with_floor(
         min_wire_version,
         None,
     )?;
-    drive_pairing_initiator_machine(stream, machine, handshake_timeout).await
+    drive_pairing_initiator_machine(stream, &mut machine, handshake_timeout).await
 }
 
-/// Drives a v1 M2M enrollment initiator while enforcing any persisted `min_wire_version` floor from `store`.
+/// Drives a v1 M2M enrollment initiator while enforcing any persisted `min_wire_version` floor
+/// from `store`, then pins the host in `store`.
+///
+/// [`drive_m2m_enroll_initiator_with_routes`] with [`RoutePolicy::None`] and no operator
+/// endpoint: no route set is requested (the claim carries no `route_seq`, so older hosts accept
+/// it) and no route is stored. Callers that want Day-2 routes use
+/// [`drive_m2m_enroll_initiator_with_routes`] with their route policy and endpoint.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_m2m_enroll_initiator_with_store(
     stream: &mut dyn PathStream,
@@ -359,24 +369,439 @@ pub async fn drive_m2m_enroll_initiator_with_store(
     store: &StateStore,
     handshake_timeout: Duration,
 ) -> Result<PairDriveResult, RuntimeError> {
-    let roster = store.load_roster()?;
-    let floor = pinned_pairing_floor(&roster, &pinned_host);
-    drive_m2m_enroll_initiator_with_floor(
+    let opts = M2mEnrollOptions {
+        operator_endpoint: None,
+        policy: RoutePolicy::None,
+        handshake_timeout,
+    };
+    let res = drive_m2m_enroll_initiator_with_routes(
         stream,
         identity,
         device_name,
         device_kind,
         enrollment_token,
         pinned_host,
-        floor,
-        handshake_timeout,
+        store,
+        opts,
     )
-    .await
+    .await?;
+    for warning in &res.route_warnings {
+        tracing::warn!(reason = warning.as_str(), %warning, "m2m enrolment route not stored");
+    }
+    Ok(res.drive)
+}
+
+/// Options of [`drive_m2m_enroll_initiator_with_routes`].
+#[derive(Debug, Clone)]
+pub struct M2mEnrollOptions {
+    /// The endpoint the operator dialed for this enrolment, exactly as typed. Unless `policy` is
+    /// [`RoutePolicy::None`] it is stored, after operator normalization, as the host's
+    /// `committed` route on every successful enrolment, replacing any earlier one. Never pass
+    /// a hint-derived or redirected endpoint.
+    pub operator_endpoint: Option<String>,
+    /// Route policy. The host's route set is requested only under [`RoutePolicy::AllSigned`];
+    /// [`RoutePolicy::None`] stores no route at all.
+    pub policy: RoutePolicy,
+    /// Budget for the whole pre-auth handshake, from `msg1` to `PairResponse`.
+    pub handshake_timeout: Duration,
+}
+
+impl Default for M2mEnrollOptions {
+    fn default() -> Self {
+        Self {
+            operator_endpoint: None,
+            policy: RoutePolicy::default(),
+            handshake_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+        }
+    }
+}
+
+/// A route of a successful M2M enrolment that was not stored. The enrolment stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollRouteWarning {
+    /// `PairResponse.route_set` failed verification and was dropped.
+    RouteSetRejected(EnrollmentRouteReject),
+    /// The verified set was not applied (`spec/pairing-v1.md` Section 6.11.3).
+    RouteSetIgnored(RouteSetIgnored),
+    /// The roster refused the verified set's routes.
+    RouteSetRefused(String),
+    /// The operator endpoint was not stored as the `committed` route.
+    OperatorEndpointRefused(String),
+}
+
+impl EnrollRouteWarning {
+    /// Snake-case reason.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::RouteSetRejected(r) => r.as_str(),
+            Self::RouteSetIgnored(r) => r.as_str(),
+            Self::RouteSetRefused(_) => "route_set_refused",
+            Self::OperatorEndpointRefused(_) => "operator_endpoint_refused",
+        }
+    }
+}
+
+impl std::fmt::Display for EnrollRouteWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RouteSetRejected(r) => write!(f, "route set rejected: {}", r.as_str()),
+            Self::RouteSetIgnored(r) => write!(f, "route set ignored: {}", r.as_str()),
+            Self::RouteSetRefused(detail) => write!(f, "route set refused: {detail}"),
+            Self::OperatorEndpointRefused(detail) => {
+                write!(f, "operator endpoint not stored: {detail}")
+            }
+        }
+    }
+}
+
+/// A completed M2M enrolment and the routes it stored.
+#[derive(Debug, Clone)]
+pub struct M2mEnrollResult {
+    /// The handshake outcome: `InitiatorEnrolled`, or `Rejected` with the host's error code.
+    pub drive: PairDriveResult,
+    /// The reply's route set result; `None` when it was not requested.
+    pub route_set: Option<EnrollmentRoutes>,
+    /// Routes this enrolment wrote for the host, `signed` first.
+    pub routes_persisted: Vec<StoredRoute>,
+    /// Routes that were not stored, with the reason; the enrolment succeeded regardless.
+    pub route_warnings: Vec<EnrollRouteWarning>,
+}
+
+/// Drives a v1 M2M enrollment initiator with `store`'s `min_wire_version` floor and, on success,
+/// pins the host as `Active` and stores its Day-2 routes in one roster transaction
+/// (`spec/pairing-v1.md` Section 7.5).
+///
+/// Before any byte is sent, the pin is checked against the stored roster (a revoked key or
+/// label, or keys that differ from an entry at the same or an older rotation), and a pin older
+/// than the stored entry is replaced by the stored keys. The claim is deferred: the host `msg2`
+/// authenticated is dry-run through the pin write before `msg3`, so a local conflict never
+/// spends the token. Under [`RoutePolicy::AllSigned`] the claim requests the
+/// host's route set; a set verified against the host keys checked at `msg2` is applied by the
+/// route announcement acceptance rules as `signed`. Unless the policy is [`RoutePolicy::None`],
+/// `opts.operator_endpoint` is stored as the `committed` route, replacing any earlier one.
+/// Route failures never fail the enrolment: they are returned as warnings and the pin is still
+/// written. A pin conflict found after the handshake is an error.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_m2m_enroll_initiator_with_routes(
+    stream: &mut dyn PathStream,
+    identity: &EndpointIdentity,
+    device_name: String,
+    device_kind: String,
+    enrollment_token: Grant,
+    pinned_host: PinnedHost,
+    store: &StateStore,
+    opts: M2mEnrollOptions,
+) -> Result<M2mEnrollResult, RuntimeError> {
+    let roster = store.load_roster()?;
+    check_enrollment_pin(&roster, &pinned_host)?;
+    let floor = pinned_pairing_floor(&roster, &pinned_host);
+    let request = (opts.policy == RoutePolicy::AllSigned).then(|| {
+        pinned_entry(&roster, &pinned_host)
+            .and_then(|e| e.hello_route_seq(opts.policy))
+            .unwrap_or(0)
+    });
+    let pinned_host = stricter_stored_pin(&roster, pinned_host);
+    drop(roster);
+    let mut machine = PairingInitiator::new_m2m_with_min_wire_version(
+        identity,
+        device_name,
+        device_kind,
+        enrollment_token,
+        pinned_host,
+        floor,
+        None,
+    )?
+    .with_deferred_claim();
+    if let Some(route_seq) = request {
+        machine = machine.with_enrollment_routes(route_seq)?;
+    }
+    let drive =
+        drive_enrollment_machine(stream, &mut machine, store, opts.handshake_timeout).await?;
+    let route_set = machine.enrollment_routes().cloned();
+    let PairOutcome::InitiatorEnrolled {
+        host_id,
+        host_static_pub,
+        host_signing_pub,
+        host_rotation_seq,
+        ..
+    } = &drive.outcome
+    else {
+        return Ok(M2mEnrollResult {
+            drive,
+            route_set,
+            routes_persisted: Vec::new(),
+            route_warnings: Vec::new(),
+        });
+    };
+    let now = current_unix_secs();
+    let (routes_persisted, route_warnings) = store.update_roster(|roster| {
+        let name = roster
+            .get(host_id)
+            .map_or_else(|| host_id.clone(), |e| e.name.clone());
+        roster.insert_pinned_host(
+            host_id.clone(),
+            name,
+            *host_static_pub,
+            Some(host_signing_pub.clone()),
+            *host_rotation_seq,
+            Vec::new(),
+        )?;
+        Ok(store_enrollment_routes(
+            roster,
+            host_id,
+            route_set.as_ref(),
+            opts.operator_endpoint.as_deref(),
+            opts.policy,
+            now,
+        ))
+    })?;
+    Ok(M2mEnrollResult {
+        drive,
+        route_set,
+        routes_persisted,
+        route_warnings,
+    })
+}
+
+/// Drives a deferred-claim M2M machine: after `msg2` verifies and before any `msg3` byte, the
+/// host the handshake actually authenticated is dry-run through the pin write on the latest
+/// roster, so a conflict (revoked label, keys or Ed25519 half, CRL, another key under the same
+/// `host_id`) ends the attempt with the token unspent.
+async fn drive_enrollment_machine(
+    stream: &mut dyn PathStream,
+    machine: &mut PairingInitiator,
+    store: &StateStore,
+    handshake_timeout: Duration,
+) -> Result<PairDriveResult, RuntimeError> {
+    let deadline = TokioInstant::now() + handshake_timeout;
+    let mut sas = None;
+    let start = machine.start()?;
+    match timeout_at(deadline, dispatch_pair_actions(stream, start, &mut sas)).await {
+        Ok(res) => {
+            res?;
+        }
+        Err(_) => {
+            let _ = stream.close().await;
+            return Err(RuntimeError::Timeout(
+                "pre-auth pairing handshake timed out",
+            ));
+        }
+    }
+    if let Some(outcome) = run_pair_machine(stream, machine, deadline, &mut sas, true).await? {
+        return Ok(PairDriveResult { outcome, sas });
+    }
+    let host = machine
+        .verified_host()
+        .ok_or(CoreError::HostKeyUnverified)?;
+    if let Err(err) = check_enrolled_host(&store.load_roster()?, &host) {
+        let _ = stream.close().await;
+        return Err(err);
+    }
+    let claim = machine.commit_claim()?;
+    let outcome = match timeout_at(deadline, dispatch_pair_actions(stream, claim, &mut sas)).await {
+        Ok(Ok(Some(outcome))) => outcome,
+        Ok(Ok(None)) => run_pair_machine(stream, machine, deadline, &mut sas, false)
+            .await?
+            .ok_or(RuntimeError::Closed)?,
+        Ok(Err(err)) => return Err(err),
+        Err(_) => {
+            let _ = stream.close().await;
+            return Err(RuntimeError::Timeout(
+                "pre-auth pairing handshake timed out",
+            ));
+        }
+    };
+    Ok(PairDriveResult { outcome, sas })
+}
+
+/// Dry-runs the post-enrolment pin write for the host `msg2` authenticated.
+fn check_enrolled_host(roster: &Roster, host: &VerifiedHost) -> Result<(), RuntimeError> {
+    let mut staged = roster.clone();
+    let name = staged
+        .get(&host.host_id)
+        .map_or_else(|| host.host_id.clone(), |e| e.name.clone());
+    staged.insert_pinned_host(
+        host.host_id.clone(),
+        name,
+        host.static_pub,
+        Some(host.signing_pub.clone()),
+        host.rotation_seq,
+        Vec::new(),
+    )?;
+    Ok(())
+}
+
+/// The stored entry's keys as the pin when the roster already holds the pinned host at a newer
+/// rotation: an older pin would accept a key the host has rotated away from.
+fn stricter_stored_pin(roster: &Roster, pin: PinnedHost) -> PinnedHost {
+    match pinned_entry(roster, &pin) {
+        Some(entry) if entry.rotation_seq > pin.rotation_seq => match &entry.signing_pub {
+            Some(signing) => PinnedHost::with_full_key(
+                pin.host_id.clone(),
+                entry.static_pub,
+                signing.clone(),
+                entry.rotation_seq,
+            ),
+            None => pin,
+        },
+        _ => pin,
+    }
+}
+
+/// The stored entry a pin names: by `host_id`, else the entry holding its static key.
+fn pinned_entry<'a>(
+    roster: &'a Roster,
+    pin: &PinnedHost,
+) -> Option<&'a tendril_core::roster::RosterEntry> {
+    match &pin.host_id {
+        Some(id) => roster.get(id),
+        None => roster
+            .entries()
+            .map(|(_, e)| e)
+            .find(|e| e.static_pub == pin.static_pub),
+    }
+}
+
+/// Refuses, before the handshake, a pin that the post-enrolment pin write is certain to refuse:
+/// a revoked entry, CRL or trust anchor sharing its label or keys, or a stored entry at the same
+/// or an older rotation whose keys differ. A pin older than the stored entry is replaced by the
+/// stored keys ([`stricter_stored_pin`]), and the host `msg2` authenticates is checked again
+/// before `msg3` ([`check_enrolled_host`]).
+fn check_enrollment_pin(roster: &Roster, pin: &PinnedHost) -> Result<(), RuntimeError> {
+    let label = pin
+        .host_id
+        .clone()
+        .unwrap_or_else(|| tendril_core::crypto::device_id(&pin.static_pub));
+    let shares_key = |entry: &tendril_core::roster::RosterEntry| {
+        entry.static_pub == pin.static_pub
+            || entry
+                .signing_pub
+                .as_ref()
+                .is_some_and(|s| pin.signing_pin.matches(s))
+    };
+    let revoked = roster
+        .entries()
+        .any(|(id, e)| e.state == PeerState::Revoked && (*id == label || shares_key(e)))
+        || roster.crl_revokes_identity(&label, &pin.static_pub)
+        || roster.trust_anchors().any(|(_, a)| {
+            a.state == tendril_core::roster::AnchorState::Revoked
+                && pin.signing_pin.matches(&a.signing_pub)
+        });
+    if revoked {
+        return Err(CoreError::PeerRevoked(label).into());
+    }
+    if let Some(entry) = pinned_entry(roster, pin)
+        && pin.rotation_seq >= entry.rotation_seq
+    {
+        let same_keys = entry.static_pub == pin.static_pub
+            && entry
+                .signing_pub
+                .as_ref()
+                .is_none_or(|s| pin.signing_pin.matches(s));
+        if !same_keys {
+            return Err(CoreError::ProtocolViolation(
+                "cannot overwrite pinned host keys; rotate or revoke existing pin first",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Applies an enrolment's routes to the freshly pinned `host_id`. Each step runs on a staged
+/// copy, so a refused step leaves the roster as the previous step wrote it.
+fn store_enrollment_routes(
+    roster: &mut Roster,
+    host_id: &str,
+    route_set: Option<&EnrollmentRoutes>,
+    operator_endpoint: Option<&str>,
+    policy: RoutePolicy,
+    now_unix: u64,
+) -> (Vec<StoredRoute>, Vec<EnrollRouteWarning>) {
+    let mut persisted = Vec::new();
+    let mut warnings = Vec::new();
+    match route_set {
+        Some(EnrollmentRoutes::Verified(_)) if policy != RoutePolicy::AllSigned => {}
+        Some(EnrollmentRoutes::Verified(set)) => {
+            let mut staged = roster.clone();
+            match staged.apply_route_announcement(host_id, set, now_unix) {
+                Ok(RouteSetOutcome::Applied { .. }) => {
+                    *roster = staged;
+                    persisted.extend(set.routes.iter().map(|hint| StoredRoute {
+                        hint: hint.clone(),
+                        source: RouteSource::Signed,
+                    }));
+                }
+                Ok(RouteSetOutcome::Ignored(reason)) => {
+                    warnings.push(EnrollRouteWarning::RouteSetIgnored(reason));
+                }
+                Err(err) => warnings.push(EnrollRouteWarning::RouteSetRefused(err.to_string())),
+            }
+        }
+        Some(EnrollmentRoutes::Rejected(reason)) => {
+            warnings.push(EnrollRouteWarning::RouteSetRejected(*reason));
+        }
+        Some(EnrollmentRoutes::Absent) | None => {}
+    }
+    if policy != RoutePolicy::None
+        && let Some(raw) = operator_endpoint
+    {
+        match store_committed_endpoint(roster, host_id, raw) {
+            Ok(hint) => persisted.push(StoredRoute {
+                hint,
+                source: RouteSource::Committed,
+            }),
+            Err(err) => {
+                warnings.push(EnrollRouteWarning::OperatorEndpointRefused(err.to_string()));
+            }
+        }
+    }
+    (persisted, warnings)
+}
+
+/// Stores the enrolment's operator endpoint as the `committed` route of `host_id`, replacing
+/// any earlier one, after the checks an operator route gets plus two Day-2 requirements: a
+/// `URL#key` must name the pinned host's Ed25519 key, and a `direct:` hint must be an IP literal.
+fn store_committed_endpoint(
+    roster: &mut Roster,
+    host_id: &str,
+    raw: &str,
+) -> Result<String, RuntimeError> {
+    let op = normalize_peer_routes(&[raw.to_owned()])?
+        .pop()
+        .ok_or_else(|| RuntimeError::Protocol("no operator endpoint".to_owned()))?;
+    if let Some(key) = op.relay_key {
+        let matches = roster
+            .get(host_id)
+            .and_then(|e| e.signing_pub.as_ref())
+            .is_some_and(|s| *s.ed25519_bytes() == key);
+        if !matches {
+            return Err(CoreError::InvalidPairingUri(
+                "relay key does not match the pinned host key".into(),
+            )
+            .into());
+        }
+    }
+    if let Some(target) = op.hint.strip_prefix("direct:")
+        && target.parse::<std::net::SocketAddr>().is_err()
+    {
+        return Err(CoreError::InvalidPairingUri(
+            "direct endpoint must be an IP literal to be dialed on Day 2".into(),
+        )
+        .into());
+    }
+    let mut plan = PersistPlan::default();
+    plan.committed = Some(op.hint.clone());
+    let mut staged = roster.clone();
+    staged.merge_pair_plan(host_id, &plan)?;
+    *roster = staged;
+    Ok(op.hint)
 }
 
 async fn drive_pairing_initiator_machine(
     stream: &mut dyn PathStream,
-    mut machine: PairingInitiator,
+    machine: &mut PairingInitiator,
     handshake_timeout: Duration,
 ) -> Result<PairDriveResult, RuntimeError> {
     let mut observed_sas = None;
@@ -2793,7 +3218,9 @@ pub struct PairPolicyOptions {
     pub uri: Option<PairingUri>,
     /// Endpoint typed by the local operator: dialed alone and persisted as `operator`.
     pub operator_endpoint: Option<String>,
-    /// Host pin for a pairing without a URI.
+    /// Host pin. Without `uri` it is the pin; with `uri` it must name the same host as the
+    /// URI pin, the stricter of the two is used, and a disagreement is `InvalidPairingUri`
+    /// before any dial.
     pub pinned_host: Option<PinnedHost>,
     /// Display name for the roster entry (default: the URI host name, else the host id).
     pub host_name: Option<String>,
@@ -3881,6 +4308,265 @@ mod tests {
             StaticKeypair::from_scalar([tag; 32]),
             SigningKeypair::from_seed([tag.wrapping_add(1); 32]),
         )
+    }
+
+    const NOW: u64 = 1_795_564_800;
+
+    /// A client roster with `host` pinned as `Active`.
+    fn pinned_roster(host: &EndpointIdentity) -> Roster {
+        let mut roster = Roster::new();
+        roster
+            .insert_pinned_host(
+                host.host_id().to_owned(),
+                "Studio".into(),
+                *host.static_key().public_bytes(),
+                Some(host.signing_key().public_key().clone()),
+                0,
+                Vec::new(),
+            )
+            .unwrap();
+        roster
+    }
+
+    fn verified(host: &EndpointIdentity, seq: u64, issued_at: u64) -> EnrollmentRoutes {
+        EnrollmentRoutes::Verified(
+            RouteSet::sign(
+                host,
+                seq,
+                issued_at,
+                vec!["direct:192.168.1.20:9100".into()],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn sourced(roster: &Roster, host: &EndpointIdentity, source: RouteSource) -> Vec<String> {
+        roster
+            .get(host.host_id())
+            .unwrap()
+            .routes_from(source)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn rejected_or_ignored_sets_still_store_the_operator_endpoint() {
+        let host = identity(0x31);
+        let endpoint = "10.0.0.8:7000";
+        let cases = [
+            (
+                EnrollmentRoutes::Rejected(EnrollmentRouteReject::BadSignature),
+                EnrollRouteWarning::RouteSetRejected(EnrollmentRouteReject::BadSignature),
+            ),
+            (
+                verified(&host, 3, NOW + 2 * 86_400),
+                EnrollRouteWarning::RouteSetIgnored(RouteSetIgnored::FutureIssuedAt),
+            ),
+        ];
+        for (set, warning) in cases {
+            let mut roster = pinned_roster(&host);
+            let (persisted, warnings) = store_enrollment_routes(
+                &mut roster,
+                host.host_id(),
+                Some(&set),
+                Some(endpoint),
+                RoutePolicy::AllSigned,
+                NOW,
+            );
+            assert_eq!(warnings, vec![warning]);
+            assert_eq!(persisted.len(), 1);
+            assert!(sourced(&roster, &host, RouteSource::Signed).is_empty());
+            assert_eq!(
+                sourced(&roster, &host, RouteSource::Committed),
+                vec!["direct:10.0.0.8:7000"]
+            );
+        }
+    }
+
+    #[test]
+    fn re_enrolment_with_route_meta_keeps_newer_signed_routes() {
+        let host = identity(0x32);
+        let mut roster = pinned_roster(&host);
+        store_enrollment_routes(
+            &mut roster,
+            host.host_id(),
+            Some(&verified(&host, 5, NOW)),
+            None,
+            RoutePolicy::AllSigned,
+            NOW,
+        );
+        let signed = sourced(&roster, &host, RouteSource::Signed);
+        let (persisted, warnings) = store_enrollment_routes(
+            &mut roster,
+            host.host_id(),
+            Some(&verified(&host, 4, NOW)),
+            Some("10.0.0.9:7000"),
+            RoutePolicy::AllSigned,
+            NOW,
+        );
+        assert_eq!(
+            warnings,
+            vec![EnrollRouteWarning::RouteSetIgnored(
+                RouteSetIgnored::StaleSeq
+            )]
+        );
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(sourced(&roster, &host, RouteSource::Signed), signed);
+        let meta = roster.get(host.host_id()).unwrap().route_meta.unwrap();
+        assert_eq!(meta.seq, 5);
+    }
+
+    #[test]
+    fn operator_endpoint_checks_before_it_is_stored() {
+        let host = identity(0x33);
+        let other = identity(0x34);
+        let key = |id: &EndpointIdentity| {
+            tendril_core::crypto::b64url_encode(id.signing_key().public_key().ed25519_bytes())
+        };
+        let refused = [
+            format!("wss://relay.example.com/v1/relay#{}", key(&other)),
+            "direct:relay.example.com:7000".to_owned(),
+            "direct:169.254.169.254:80".to_owned(),
+            "/run/tendril/host.sock".to_owned(),
+        ];
+        for raw in &refused {
+            let mut roster = pinned_roster(&host);
+            let before = serde_json::to_value(&roster).unwrap();
+            let (persisted, warnings) = store_enrollment_routes(
+                &mut roster,
+                host.host_id(),
+                None,
+                Some(raw),
+                RoutePolicy::AllSigned,
+                NOW,
+            );
+            assert!(persisted.is_empty(), "{raw}");
+            assert!(
+                matches!(
+                    warnings.as_slice(),
+                    [EnrollRouteWarning::OperatorEndpointRefused(_)]
+                ),
+                "{raw}: {warnings:?}"
+            );
+            assert_eq!(serde_json::to_value(&roster).unwrap(), before, "{raw}");
+        }
+
+        let mut roster = pinned_roster(&host);
+        let own = format!("wss://relay.example.com/v1/relay#{}", key(&host));
+        let (persisted, warnings) = store_enrollment_routes(
+            &mut roster,
+            host.host_id(),
+            None,
+            Some(&own),
+            RoutePolicy::CommittedOnly,
+            NOW,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(persisted[0].hint, "wss://relay.example.com/v1/relay");
+
+        let (persisted, warnings) = store_enrollment_routes(
+            &mut roster,
+            host.host_id(),
+            Some(&verified(&host, 1, NOW)),
+            Some("10.0.0.8:7000"),
+            RoutePolicy::None,
+            NOW,
+        );
+        assert!(persisted.is_empty() && warnings.is_empty());
+    }
+
+    #[test]
+    fn local_pin_conflicts_are_found_before_the_handshake() {
+        let host = identity(0x35);
+        let other = identity(0x36);
+        let pin = PinnedHost::with_hash(
+            Some(host.host_id().to_owned()),
+            *host.static_key().public_bytes(),
+            host.signing_key().signing_pub_hash(),
+            0,
+        );
+        assert!(check_enrollment_pin(&Roster::new(), &pin).is_ok());
+        assert!(check_enrollment_pin(&pinned_roster(&host), &pin).is_ok());
+
+        // Same label, other keys at the same rotation.
+        let mut clash = Roster::new();
+        clash
+            .insert_pinned_host(
+                host.host_id().to_owned(),
+                "Studio".into(),
+                *other.static_key().public_bytes(),
+                Some(other.signing_key().public_key().clone()),
+                0,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            check_enrollment_pin(&clash, &pin),
+            Err(RuntimeError::Core(CoreError::ProtocolViolation(_)))
+        ));
+        // A stored entry at a newer rotation: the chain from the older pin may reach it.
+        let mut older_pin = pin.clone();
+        older_pin.static_pub = *other.static_key().public_bytes();
+        let mut newer = pinned_roster(&host);
+        newer
+            .insert_pinned_host(
+                host.host_id().to_owned(),
+                "Studio".into(),
+                *host.static_key().public_bytes(),
+                Some(host.signing_key().public_key().clone()),
+                2,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(check_enrollment_pin(&newer, &older_pin).is_ok());
+
+        // Revoked label, or a revoked entry holding the key under another label.
+        let mut revoked = pinned_roster(&host);
+        revoked.revoke_peer(host.host_id()).unwrap();
+        assert!(matches!(
+            check_enrollment_pin(&revoked, &pin),
+            Err(RuntimeError::Core(CoreError::PeerRevoked(_)))
+        ));
+        let mut unscoped = pin.clone();
+        unscoped.host_id = None;
+        assert!(matches!(
+            check_enrollment_pin(&revoked, &unscoped),
+            Err(RuntimeError::Core(CoreError::PeerRevoked(_)))
+        ));
+    }
+
+    #[test]
+    fn unscoped_pins_find_the_entry_by_static_key() {
+        let host = identity(0x37);
+        let mut roster = pinned_roster(&host);
+        store_enrollment_routes(
+            &mut roster,
+            host.host_id(),
+            Some(&verified(&host, 7, NOW)),
+            None,
+            RoutePolicy::AllSigned,
+            NOW,
+        );
+        let unscoped = PinnedHost::with_hash(
+            None,
+            *host.static_key().public_bytes(),
+            host.signing_key().signing_pub_hash(),
+            0,
+        );
+        let entry = pinned_entry(&roster, &unscoped).expect("entry by static key");
+        assert_eq!(entry.hello_route_seq(RoutePolicy::AllSigned), Some(7));
+    }
+
+    #[test]
+    fn enrol_route_warnings_display_their_detail() {
+        let w = EnrollRouteWarning::OperatorEndpointRefused("invalid endpoint".into());
+        assert_eq!(
+            w.to_string(),
+            "operator endpoint not stored: invalid endpoint"
+        );
+        assert_eq!(w.as_str(), "operator_endpoint_refused");
+        let w = EnrollRouteWarning::RouteSetRejected(EnrollmentRouteReject::KeyMismatch);
+        assert_eq!(w.to_string(), "route set rejected: key_mismatch");
     }
 
     #[test]

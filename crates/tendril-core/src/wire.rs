@@ -9,6 +9,7 @@ use crate::group::{
     GROUP_RENDEZVOUS_FRAME_LEN, GroupSeq, MAX_GROUP_MANIFEST_LEN, validate_group_seqs,
 };
 use crate::identity::RotationRecord;
+use crate::pairing::MAX_ENROLLMENT_ROUTE_SET_B64_LEN;
 use crate::routes::MAX_ROUTE_SEQ;
 
 /// Fixed Noise protocol pattern for Tendril v1 and v2.
@@ -874,20 +875,150 @@ pub struct PairClaim {
     pub signing_pub: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enroll_proof: Option<String>,
+    /// M2M only: requests `PairResponse.route_set` above this sequence (pairing-v1 Section 7.5).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_route_seq"
+    )]
+    pub route_seq: Option<u64>,
 }
 
 /// Encrypted post-handshake response frame for `intent = pair` (`responder -> initiator`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+///
+/// Decoding is strict: unknown and duplicate fields are rejected, a success needs exactly
+/// `device_id`, `status` and `host_signing_pub` (plus an optional `route_set`), and an error
+/// needs exactly `error`. `route_set` never makes the reply undecodable (see [`RouteSetField`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
 pub enum PairResponse {
     Success {
         device_id: String,
         status: String,
         host_signing_pub: String,
+        /// M2M only, when requested: the host-signed route set (pairing-v1 Section 7.5).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        route_set: Option<RouteSetField>,
     },
     Error {
         error: String,
     },
+}
+
+/// `PairResponse.route_set` as received.
+///
+/// The value is taken as a raw JSON token and never built: a string token within the bound is
+/// unescaped, and anything else (a longer string, a number of any size, a value nested past any
+/// depth limit) is `Malformed`. No `route_set` value can make the reply undecodable after an
+/// enrolment token was burned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteSetField {
+    /// A JSON string of at most [`MAX_ENROLLMENT_ROUTE_SET_B64_LEN`] bytes, not yet decoded.
+    Encoded(String),
+    /// Any other value.
+    Malformed,
+}
+
+impl Serialize for RouteSetField {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Encoded(s) => serializer.serialize_str(s),
+            Self::Malformed => serializer.serialize_unit(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RouteSetField {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <&'de serde_json::value::RawValue>::deserialize(deserializer)?.get();
+        // Base64url needs no escaping, so a valid value is its quotes plus at most the bound.
+        if !raw.starts_with('"') || raw.len() > MAX_ENROLLMENT_ROUTE_SET_B64_LEN + 2 {
+            return Ok(Self::Malformed);
+        }
+        Ok(serde_json::from_str::<String>(raw)
+            .ok()
+            .filter(|s| s.len() <= MAX_ENROLLMENT_ROUTE_SET_B64_LEN)
+            .map_or(Self::Malformed, Self::Encoded))
+    }
+}
+
+impl<'de> Deserialize<'de> for PairResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ResponseVisitor;
+
+        fn set_once<T, E: serde::de::Error>(
+            slot: &mut Option<T>,
+            value: T,
+            name: &'static str,
+        ) -> Result<(), E> {
+            if slot.replace(value).is_some() {
+                return Err(E::duplicate_field(name));
+            }
+            Ok(())
+        }
+
+        impl<'de> serde::de::Visitor<'de> for ResponseVisitor {
+            type Value = PairResponse;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a PairResponse object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<PairResponse, A::Error> {
+                const FIELDS: &[&str] = &[
+                    "device_id",
+                    "status",
+                    "host_signing_pub",
+                    "route_set",
+                    "error",
+                ];
+                let mut device_id = None;
+                let mut status = None;
+                let mut host_signing_pub = None;
+                let mut route_set = None;
+                let mut error = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "device_id" => set_once(&mut device_id, map.next_value()?, "device_id")?,
+                        "status" => set_once(&mut status, map.next_value()?, "status")?,
+                        "host_signing_pub" => {
+                            set_once(&mut host_signing_pub, map.next_value()?, "host_signing_pub")?
+                        }
+                        "route_set" => {
+                            set_once(
+                                &mut route_set,
+                                map.next_value::<RouteSetField>()?,
+                                "route_set",
+                            )?;
+                        }
+                        "error" => set_once(&mut error, map.next_value()?, "error")?,
+                        other => return Err(serde::de::Error::unknown_field(other, FIELDS)),
+                    }
+                }
+                match (device_id, status, host_signing_pub, error) {
+                    (Some(device_id), Some(status), Some(host_signing_pub), None) => {
+                        Ok(PairResponse::Success {
+                            device_id,
+                            status,
+                            host_signing_pub,
+                            route_set,
+                        })
+                    }
+                    (None, None, None, Some(error)) if route_set.is_none() => {
+                        Ok(PairResponse::Error { error })
+                    }
+                    _ => Err(serde::de::Error::custom(
+                        "data did not match any variant of PairResponse",
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(ResponseVisitor)
+    }
 }
 
 /// Incremental, bounded decoder for Tendril preambles and `uint16_be len || body` frames.

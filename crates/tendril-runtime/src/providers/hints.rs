@@ -81,7 +81,9 @@ const fn source_rank(source: HintSource) -> u8 {
 }
 
 /// The stored routes of `entry`, one input per hint with its strongest source
-/// (`operator` > `signed` > `committed`), in first-stored order.
+/// (`operator` > `signed` > `committed`), ordered by that source and then by first-stored
+/// order. The order becomes the candidate id, the last tie-break of the candidate sort after
+/// the provider rung, the `/v2/relay` preference and the IP literal preference.
 ///
 /// Legacy `relay_hints` are never read.
 #[must_use]
@@ -93,6 +95,7 @@ pub fn stored_route_inputs(entry: &RosterEntry) -> Vec<HintInput> {
             HintInput::new(&route.hint, HintSource::Stored(route.source)),
         );
     }
+    out.sort_by_key(|input| source_rank(input.source));
     out
 }
 

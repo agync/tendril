@@ -1417,6 +1417,18 @@ func TestM2mEnrollment(t *testing.T) {
 		PairResponseJSON           string         `json:"pair_response_json"`
 		PairResponseFrameHex       string         `json:"pair_response_frame_hex"`
 		ReplayedResponseJSON       string         `json:"replayed_response_json"`
+		RouteRequestClaimJSON      string         `json:"route_request_claim_json"`
+		RouteSetReplies            []struct {
+			Name                   string   `json:"name"`
+			Seq                    uint64   `json:"seq"`
+			IssuedAt               uint64   `json:"issued_at"`
+			Routes                 []string `json:"routes"`
+			RouteSetSignedBytesHex string   `json:"route_set_signed_bytes_hex"`
+			RouteSetPayloadHex     string   `json:"route_set_payload_hex"`
+			SignerSigningPubHex    string   `json:"signer_signing_pub_hex"`
+			PairResponseJSON       string   `json:"pair_response_json"`
+			Expect                 string   `json:"expect"`
+		} `json:"route_set_replies"`
 	}
 	loadVector(t, "m2m_enrollment.json", &v)
 
@@ -1581,6 +1593,90 @@ func TestM2mEnrollment(t *testing.T) {
 	}
 	if repObj["error"] != "token_replayed" {
 		t.Fatalf("replayed error = %q, want token_replayed", repObj["error"])
+	}
+
+	// pairing-v1 Section 7.5: route request claim and reply route sets.
+	var request, base map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(v.RouteRequestClaimJSON), &request); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(v.PairClaimJSON), &base); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := base["route_seq"]; ok {
+		t.Fatalf("base claim must not request routes")
+	}
+	if string(request["route_seq"]) != "0" {
+		t.Fatalf("route request claim route_seq = %s, want 0", request["route_seq"])
+	}
+	delete(request, "route_seq")
+	if len(request) != len(base) {
+		t.Fatalf("route request claim differs from the base claim")
+	}
+	for k, val := range base {
+		if !bytes.Equal(request[k], val) {
+			t.Fatalf("route request claim field %s differs", k)
+		}
+	}
+
+	respStatic := mustHex(t, v.ResponderStaticPubHex)
+	respSigning := mustHex(t, v.ResponderSigningPubHex)
+	respSH := sha256.Sum256(respSigning)
+	if len(v.RouteSetReplies) != 2 {
+		t.Fatalf("expected two route set reply cases")
+	}
+	for _, c := range v.RouteSetReplies {
+		var reply map[string]string
+		if err := json.Unmarshal([]byte(c.PairResponseJSON), &reply); err != nil {
+			t.Fatalf("%s: %v", c.Name, err)
+		}
+		if reply["status"] != "active" || reply["device_id"] != v.InitiatorDeviceID ||
+			reply["host_signing_pub"] != base64.RawURLEncoding.EncodeToString(respSigning) {
+			t.Fatalf("%s: reply fields mismatch", c.Name)
+		}
+		if len(reply["route_set"]) > 6671 {
+			t.Fatalf("%s: route_set longer than 6671 characters", c.Name)
+		}
+		payload, err := base64.RawURLEncoding.Strict().DecodeString(reply["route_set"])
+		if err != nil {
+			t.Fatalf("%s: route_set base64url: %v", c.Name, err)
+		}
+		if hex.EncodeToString(payload) != c.RouteSetPayloadHex {
+			t.Fatalf("%s: payload mismatch", c.Name)
+		}
+		routes, err := decodeRouteSetStructure(payload)
+		if err != nil {
+			t.Fatalf("%s: structure: %v", c.Name, err)
+		}
+		if strings.Join(routes, "\n") != strings.Join(c.Routes, "\n") {
+			t.Fatalf("%s: routes mismatch", c.Name)
+		}
+		body := payload[:len(payload)-routeSetSigLen]
+		if !bytes.Equal(body, encodeRouteSetBody(respStatic, respSH[:], c.Seq, c.IssuedAt, c.Routes)) {
+			t.Fatalf("%s: body does not name the responder keys", c.Name)
+		}
+		signed := append([]byte(routeSetDomain), body...)
+		if hex.EncodeToString(signed) != c.RouteSetSignedBytesHex {
+			t.Fatalf("%s: signed bytes mismatch", c.Name)
+		}
+		sig := payload[len(body):]
+		signer := mustHex(t, c.SignerSigningPubHex)
+		if err := verifyHybridSig(signer, signed, sig); err != nil {
+			t.Fatalf("%s: not signed by the named signer: %v", c.Name, err)
+		}
+		hostErr := verifyHybridSig(respSigning, signed, sig)
+		switch c.Expect {
+		case "verified":
+			if !bytes.Equal(signer, respSigning) || hostErr != nil {
+				t.Fatalf("%s: want a valid responder signature: %v", c.Name, hostErr)
+			}
+		case "bad_signature":
+			if bytes.Equal(signer, respSigning) || hostErr == nil {
+				t.Fatalf("%s: want a signature that fails under the responder key", c.Name)
+			}
+		default:
+			t.Fatalf("%s: unknown expectation %q", c.Name, c.Expect)
+		}
 	}
 }
 

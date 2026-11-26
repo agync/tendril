@@ -26,13 +26,15 @@ pub use announce::{
 };
 pub use driver::{
     AttemptError, CandidateFailure, ConcurrentSession, ConnectOpts, ConnectResult,
-    DEFAULT_PRE_AUTH_TIMEOUT, PairDriveResult, PairPolicyOptions, PairPolicyResult, RecoveryRoutes,
-    SessionDriver, SessionEvent, dial_with_policy, dial_with_policy_verified,
-    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_store,
-    drive_pair_initiator_with_floor, drive_pair_initiator_with_policy,
-    drive_pair_initiator_with_store, drive_pair_responder, drive_pair_responder_with_options,
-    drive_pair_responder_with_policy, drive_pair_responder_with_policy_and_store,
-    drive_pair_responder_with_store, pairing_path_kind_for_provider, pinned_pairing_floor,
+    DEFAULT_PRE_AUTH_TIMEOUT, EnrollRouteWarning, M2mEnrollOptions, M2mEnrollResult,
+    PairDriveResult, PairPolicyOptions, PairPolicyResult, RecoveryRoutes, SessionDriver,
+    SessionEvent, dial_with_policy, dial_with_policy_verified,
+    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_routes,
+    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_floor,
+    drive_pair_initiator_with_policy, drive_pair_initiator_with_store, drive_pair_responder,
+    drive_pair_responder_with_options, drive_pair_responder_with_policy,
+    drive_pair_responder_with_policy_and_store, drive_pair_responder_with_store,
+    pairing_path_kind_for_provider, pinned_pairing_floor,
 };
 #[allow(deprecated)]
 pub use driver::{

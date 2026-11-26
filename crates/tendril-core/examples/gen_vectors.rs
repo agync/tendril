@@ -48,7 +48,8 @@ use tendril_core::v2::{
 };
 use tendril_core::wire::{
     HostHello, InnerFrameType, Intent, NOISE_PATTERN, PREAMBLE_FLAG_NONE, PairClaim, PairResponse,
-    Preamble, SessionHello, WIRE_VERSION_V2, decode_frame, encode_frame, encode_inner_frame,
+    Preamble, RouteSetField, SessionHello, WIRE_VERSION_V2, decode_frame, encode_frame,
+    encode_inner_frame,
 };
 
 #[derive(Serialize)]
@@ -260,6 +261,22 @@ struct M2mEnrollmentVector {
     pair_response_json: String,
     pair_response_frame_hex: String,
     replayed_response_json: String,
+    route_request_claim_json: String,
+    route_set_replies: Vec<RouteSetReplyCase>,
+}
+
+/// One `PairResponse.route_set` case (`spec/pairing-v1.md` Section 7.5).
+#[derive(Serialize)]
+struct RouteSetReplyCase {
+    name: String,
+    seq: u64,
+    issued_at: u64,
+    routes: Vec<String>,
+    route_set_signed_bytes_hex: String,
+    route_set_payload_hex: String,
+    signer_signing_pub_hex: String,
+    pair_response_json: String,
+    expect: String,
 }
 
 #[derive(Serialize)]
@@ -503,6 +520,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         enrollment_token: None,
         signing_pub: Some(kp_key.public_key().to_b64url()),
         enroll_proof: Some(b64url_encode(&kp_sig)),
+        route_seq: None,
     };
 
     let pairing_mac = PairingMacVector {
@@ -812,6 +830,7 @@ fn build_pair_transcript(
         enrollment_token: None,
         signing_pub: None,
         enroll_proof: None,
+        route_seq: None,
     };
     let pair_claim_json = serde_json::to_string(&claim)?;
     let n3 = initiator.write_message(pair_claim_json.as_bytes(), &mut buf)?;
@@ -831,6 +850,7 @@ fn build_pair_transcript(
         device_id: device_id(init_static_pub),
         status: "pending".to_string(),
         host_signing_pub: host_signing_pub_b64,
+        route_set: None,
     };
     let pair_response_json = serde_json::to_string(&pair_resp)?;
     let n4 = resp_tx.write_message(pair_response_json.as_bytes(), &mut buf)?;
@@ -1106,6 +1126,7 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
         enrollment_token: Some(enrollment_token.clone()),
         signing_pub: Some(init_signing_pub.to_b64url()),
         enroll_proof: Some(enroll_proof_b64url.clone()),
+        route_seq: None,
     };
     let pair_claim_json = serde_json::to_string(&claim)?;
     let n3 = initiator.write_message(pair_claim_json.as_bytes(), &mut buf)?;
@@ -1143,6 +1164,7 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
         device_id: initiator_device_id.clone(),
         status: "active".to_string(),
         host_signing_pub: resp_signing_pub.to_b64url(),
+        route_set: None,
     };
     let pair_response_json = serde_json::to_string(&pair_resp)?;
     let n4 = resp_tx.write_message(pair_response_json.as_bytes(), &mut buf)?;
@@ -1155,6 +1177,53 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
         error: "token_replayed".to_string(),
     };
     let replayed_response_json = serde_json::to_string(&replayed_resp)?;
+
+    let mut request_claim: PairClaim = serde_json::from_str(&pair_claim_json)?;
+    request_claim.route_seq = Some(0);
+    let route_request_claim_json = serde_json::to_string(&request_claim)?;
+    let route_seq = 1u64;
+    let route_hints = vec![
+        "direct:192.168.1.20:9100".to_string(),
+        "wss://relay.example.com/v1/relay".to_string(),
+    ];
+    let honest = tendril_core::routes::RouteSet::sign_deterministic(
+        &resp_id,
+        route_seq,
+        now_unix,
+        route_hints.clone(),
+    )?;
+    let rogue = SigningKeypair::from_seeds(seq_bytes(0x77), seq_bytes(0x78));
+    let honest_payload = honest.encode();
+    let body = &honest_payload[..honest_payload.len() - tendril_core::crypto::HYBRID_SIG_LEN];
+    let rogue_payload = [body, &rogue.sign_deterministic(&honest.signed_bytes())?].concat();
+    let reply_case = |name: &str, payload: &[u8], signer: &SigningKeypair, expect: &str| {
+        let resp = PairResponse::Success {
+            device_id: initiator_device_id.clone(),
+            status: "active".to_string(),
+            host_signing_pub: resp_signing_pub.to_b64url(),
+            route_set: Some(RouteSetField::Encoded(b64url_encode(payload))),
+        };
+        Ok::<_, serde_json::Error>(RouteSetReplyCase {
+            name: name.to_string(),
+            seq: route_seq,
+            issued_at: now_unix,
+            routes: route_hints.clone(),
+            route_set_signed_bytes_hex: hex::encode(honest.signed_bytes()),
+            route_set_payload_hex: hex::encode(payload),
+            signer_signing_pub_hex: hex::encode(signer.public_key().as_bytes()),
+            pair_response_json: serde_json::to_string(&resp)?,
+            expect: expect.to_string(),
+        })
+    };
+    let route_set_replies = vec![
+        reply_case(
+            "host_signed",
+            &honest_payload,
+            resp_id.signing_key(),
+            "verified",
+        )?,
+        reply_case("other_signer", &rogue_payload, &rogue, "bad_signature")?,
+    ];
 
     Ok(M2mEnrollmentVector {
         noise_pattern: NOISE_PATTERN.to_string(),
@@ -1196,6 +1265,8 @@ fn build_m2m_enrollment_vector() -> Result<M2mEnrollmentVector, Box<dyn std::err
         pair_response_json,
         pair_response_frame_hex: hex::encode(pair_response_frame),
         replayed_response_json,
+        route_request_claim_json,
+        route_set_replies,
     })
 }
 
@@ -1732,6 +1803,7 @@ fn build_v2_pake_vector(preamble: &[u8; 6]) -> Result<V2PakeVector, Box<dyn std:
         enrollment_token: None,
         signing_pub: None,
         enroll_proof: None,
+        route_seq: None,
     };
     let pair_claim_json = serde_json::to_string(&claim)?;
     let init_confirm_mac = compute_pake_init_mac(
@@ -1765,6 +1837,7 @@ fn build_v2_pake_vector(preamble: &[u8; 6]) -> Result<V2PakeVector, Box<dyn std:
         device_id: device_id(&init_static_pub),
         status: "pending".to_string(),
         host_signing_pub: resp_signing.public_key().to_b64url(),
+        route_set: None,
     };
     let pair_response_json = serde_json::to_string(&pair_resp)?;
     let pair_response_payload = pad_v2_pair_response(pair_response_json.as_bytes())?;

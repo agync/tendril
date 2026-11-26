@@ -2458,6 +2458,7 @@ fn batch2a_sec24_sec28_sec29_path_canon_zeroize_and_strict_pairing() {
         enrollment_token: None,
         signing_pub: None,
         enroll_proof: None,
+        route_seq: None,
     };
     let m3 = hs_i
         .write_message_vec(&serde_json::to_vec(&bad_claim).unwrap())
@@ -3267,6 +3268,7 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
         device_id: peer.device_id(),
         status: "pending".to_string(),
         host_signing_pub: host.signing_key().public_key().to_b64url(),
+        route_set: None,
     })
     .unwrap();
     let msg4 = tx_r.write_message_vec(&wrong_status).unwrap();
@@ -3303,6 +3305,7 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
         device_id: device_id(peer.static_key().public_bytes()),
         status: "active".to_string(),
         host_signing_pub: host.signing_key().public_key().to_b64url(),
+        route_set: None,
     })
     .unwrap();
     let hmsg4 = tx_r2.write_message_vec(&wrong_active).unwrap();
@@ -3350,6 +3353,7 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
         enrollment_token: Some(tok2.clone()),
         signing_pub: Some(peer.signing_key().public_key().to_b64url()),
         enroll_proof: Some(b64url_encode(&vec![0x42u8; HYBRID_SIG_LEN])),
+        route_seq: None,
     };
     let msg3 = raw_init
         .write_message_vec(&serde_json::to_vec(&forged_claim).unwrap())
@@ -3398,6 +3402,7 @@ fn phase6_m2m_status_mismatch_and_forged_proof_fail_closed() {
         enrollment_token: Some(tok2),
         signing_pub: Some(peer.signing_key().public_key().to_b64url()),
         enroll_proof: Some(b64url_encode(&vec![0x42u8; HYBRID_SIG_LEN])),
+        route_seq: None,
     };
     let cmsg3 = raw_init2
         .write_message_vec(&serde_json::to_vec(&conflict_claim).unwrap())
@@ -3652,6 +3657,7 @@ fn pq_hybrid_kem_and_half_tampered_signature_adversarial_suite() {
         device_id: peer.device_id(),
         status: "active".to_string(),
         host_signing_pub: rogue.signing_key().public_key().to_b64url(),
+        route_set: None,
     })
     .unwrap();
     let bad_m4 = tx_h.write_message_vec(&bad_resp).unwrap();
@@ -3942,6 +3948,7 @@ fn legacy_keyless_pair_v1(
         enrollment_token: None,
         signing_pub: None,
         enroll_proof: None,
+        route_seq: None,
     };
     let msg3 = raw
         .write_message_vec(&serde_json::to_vec(&claim).unwrap())

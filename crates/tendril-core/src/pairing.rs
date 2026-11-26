@@ -28,10 +28,10 @@ use crate::identity::{
 use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::policy::{ProviderId, is_numeric_host_addr};
 use crate::roster::{AnchorState, Roster};
-use crate::routes::MAX_ROUTE_SEQ;
+use crate::routes::{MAX_ROUTE_SEQ, MAX_ROUTE_SET_PAYLOAD, RouteSet};
 use crate::wire::{
-    HostHello, Intent, PairClaim, PairResponse, Preamble, ResumableFrameReader, WIRE_VERSION,
-    WIRE_VERSION_V2, encode_frame,
+    HostHello, Intent, MAX_TRANSPORT_PLAINTEXT, PairClaim, PairResponse, Preamble,
+    ResumableFrameReader, RouteSetField, WIRE_VERSION, WIRE_VERSION_V2, encode_frame,
 };
 
 /// Default lifetime of a newly issued pairing code (`15` minutes).
@@ -2677,6 +2677,66 @@ pub enum PairOutcome {
     },
 }
 
+/// Longest `PairResponse.route_set` value: base64url without padding of a 5003-byte payload.
+pub const MAX_ENROLLMENT_ROUTE_SET_B64_LEN: usize = (MAX_ROUTE_SET_PAYLOAD * 4).div_ceil(3);
+
+const _: () = assert!(MAX_ENROLLMENT_ROUTE_SET_B64_LEN == 6_671);
+
+/// Why an M2M initiator dropped `PairResponse.route_set`. The enrolment still succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentRouteReject {
+    /// Not a base64url string of a structurally valid route set payload.
+    Malformed,
+    /// The set names another static key, or a signing key other than the one verified at `msg2`.
+    KeyMismatch,
+    /// A signature half does not verify under the verified host signing key.
+    BadSignature,
+}
+
+impl EnrollmentRouteReject {
+    /// Snake-case reason.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::KeyMismatch => "key_mismatch",
+            Self::BadSignature => "bad_signature",
+        }
+    }
+}
+
+/// The `PairResponse.route_set` result of an M2M initiator that requested one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollmentRoutes {
+    /// The reply carried no route set (an older host, or one without route state).
+    Absent,
+    /// Decoded and verified under the host keys authenticated by this handshake.
+    Verified(RouteSet),
+    /// Dropped with the reason.
+    Rejected(EnrollmentRouteReject),
+}
+
+/// Decodes and verifies an enrolment reply route set (Section 7.5), in order: base64url and
+/// structure, key binding to `host_static_pub` and `SHA-256(host_signing_pub)`, then both
+/// signature halves under `host_signing_pub`. No set is returned unless every check passes.
+pub fn verify_enrollment_route_set(
+    encoded: &str,
+    host_static_pub: &[u8; 32],
+    host_signing_pub: &HybridSigningPublicKey,
+) -> Result<RouteSet, EnrollmentRouteReject> {
+    if encoded.len() > MAX_ENROLLMENT_ROUTE_SET_B64_LEN {
+        return Err(EnrollmentRouteReject::Malformed);
+    }
+    let payload = b64url_decode(encoded).map_err(|_| EnrollmentRouteReject::Malformed)?;
+    let set = RouteSet::decode(&payload).map_err(|_| EnrollmentRouteReject::Malformed)?;
+    if set.static_pub != *host_static_pub || set.sh != host_signing_pub.sha256_hash() {
+        return Err(EnrollmentRouteReject::KeyMismatch);
+    }
+    set.verify(host_signing_pub)
+        .map_err(|_| EnrollmentRouteReject::BadSignature)?;
+    Ok(set)
+}
+
 /// Mints a short-lived, single-use M2M enrollment token (`Grant` with `machine = true`, `uses = 1`).
 pub fn mint_enrollment_token(
     issuer: &EndpointIdentity,
@@ -2891,6 +2951,19 @@ pub enum KeyClaimTamper {
     MalformedProof,
     /// Neither field, as a pre-change initiator sends.
     Omit,
+    /// A valid key claim that also carries the M2M-only `route_seq`.
+    RouteSeq,
+}
+
+/// The `route_seq` of a human claim: always absent, except under the `RouteSeq` test tamper.
+pub(crate) fn claim_route_seq(
+    #[cfg(any(test, feature = "test-utils"))] tamper: Option<KeyClaimTamper>,
+) -> Option<u64> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if tamper == Some(KeyClaimTamper::RouteSeq) {
+        return Some(0);
+    }
+    None
 }
 
 /// Builds the `(signing_pub, enroll_proof)` pair a human `PairClaim` carries.
@@ -3142,6 +3215,7 @@ enum InitiatorAuth {
     M2m {
         token: Box<Grant>,
         signing_key: SigningKeypair,
+        route_seq: Option<u64>,
     },
 }
 
@@ -3159,6 +3233,7 @@ pub struct PairingInitiator {
     deferred_claim: bool,
     route_binding: PairRouteBinding,
     route_verdict: Option<PairRouteVerdict>,
+    enrollment_routes: Option<EnrollmentRoutes>,
     #[cfg(any(test, feature = "test-utils"))]
     key_claim_tamper: Option<KeyClaimTamper>,
 }
@@ -3288,6 +3363,7 @@ impl PairingInitiator {
             deferred_claim: false,
             route_binding: PairRouteBinding::default(),
             route_verdict: None,
+            enrollment_routes: None,
             #[cfg(any(test, feature = "test-utils"))]
             key_claim_tamper: None,
         })
@@ -3372,6 +3448,40 @@ impl PairingInitiator {
     #[must_use]
     pub const fn route_verdict(&self) -> Option<&PairRouteVerdict> {
         self.route_verdict.as_ref()
+    }
+
+    /// Requests the host's route set in the enrolment reply (`PairClaim.route_seq`, Section
+    /// 7.5): the host sends its set only when its sequence is above `route_seq`.
+    ///
+    /// M2M initiators only; fails with `ProtocolViolation` on a human initiator or once
+    /// started, and with `InvalidPairingUri` when `route_seq` is above `2^53 - 1`.
+    pub fn with_enrollment_routes(mut self, route_seq: u64) -> Result<Self, CoreError> {
+        if route_seq > MAX_ROUTE_SEQ {
+            return Err(CoreError::InvalidPairingUri(
+                "route sequence out of range".into(),
+            ));
+        }
+        if !matches!(self.phase, InitiatorPhase::Init(_)) {
+            return Err(CoreError::ProtocolViolation(
+                "enrolment routes are requested before start",
+            ));
+        }
+        match &mut self.auth {
+            InitiatorAuth::M2m { route_seq: req, .. } => *req = Some(route_seq),
+            InitiatorAuth::Human { .. } => {
+                return Err(CoreError::ProtocolViolation(
+                    "enrolment routes are an m2m request",
+                ));
+            }
+        }
+        Ok(self)
+    }
+
+    /// The verified or rejected `PairResponse.route_set` of a completed M2M enrolment that
+    /// requested it with [`Self::with_enrollment_routes`]; `None` otherwise.
+    #[must_use]
+    pub const fn enrollment_routes(&self) -> Option<&EnrollmentRoutes> {
+        self.enrollment_routes.as_ref()
     }
 
     /// Returns `true` while a verified `msg2` waits for [`Self::commit_claim`].
@@ -3459,9 +3569,17 @@ impl PairingInitiator {
                     enrollment_token: None,
                     signing_pub,
                     enroll_proof,
+                    route_seq: claim_route_seq(
+                        #[cfg(any(test, feature = "test-utils"))]
+                        self.key_claim_tamper,
+                    ),
                 }
             }
-            InitiatorAuth::M2m { token, signing_key } => {
+            InitiatorAuth::M2m {
+                token,
+                signing_key,
+                route_seq,
+            } => {
                 let proof =
                     sign_enroll_proof(signing_key, &h, &self.local_static_pub, &token.nonce)?;
                 PairClaim {
@@ -3471,6 +3589,7 @@ impl PairingInitiator {
                     enrollment_token: Some(token.as_ref().clone()),
                     signing_pub: Some(signing_key.public_key().to_b64url()),
                     enroll_proof: Some(b64url_encode(&proof)),
+                    route_seq: *route_seq,
                 }
             }
         };
@@ -3533,6 +3652,7 @@ impl PairingInitiator {
             auth: InitiatorAuth::M2m {
                 token: Box::new(enrollment_token),
                 signing_key: identity.signing_key().clone(),
+                route_seq: None,
             },
             device_name,
             device_kind,
@@ -3543,6 +3663,7 @@ impl PairingInitiator {
             deferred_claim: false,
             route_binding: PairRouteBinding::default(),
             route_verdict: None,
+            enrollment_routes: None,
             #[cfg(any(test, feature = "test-utils"))]
             key_claim_tamper: None,
         })
@@ -3783,6 +3904,7 @@ impl PairingInitiator {
                         device_id: resp_dev_id,
                         status,
                         host_signing_pub,
+                        route_set,
                     } => {
                         let expected_status = match &self.auth {
                             InitiatorAuth::Human { .. } => "pending",
@@ -3793,6 +3915,11 @@ impl PairingInitiator {
                         {
                             return Err(CoreError::ProtocolViolation(
                                 "unexpected pair response fields",
+                            ));
+                        }
+                        if route_set.is_some() && matches!(self.auth, InitiatorAuth::Human { .. }) {
+                            return Err(CoreError::ProtocolViolation(
+                                "route_set in a human pair response",
                             ));
                         }
                         let host_signing =
@@ -3809,6 +3936,29 @@ impl PairingInitiator {
                                 &host_signing,
                             )?,
                         };
+                        // Section 7.5: checked only when requested, after the keys above, and
+                        // never fatal: the enrolment token is already burned.
+                        if let InitiatorAuth::M2m {
+                            route_seq: Some(_), ..
+                        } = &self.auth
+                        {
+                            self.enrollment_routes = Some(match route_set {
+                                None => EnrollmentRoutes::Absent,
+                                Some(RouteSetField::Malformed) => {
+                                    EnrollmentRoutes::Rejected(EnrollmentRouteReject::Malformed)
+                                }
+                                Some(RouteSetField::Encoded(encoded)) => {
+                                    match verify_enrollment_route_set(
+                                        &encoded,
+                                        &host_static_pub,
+                                        &host_signing,
+                                    ) {
+                                        Ok(set) => EnrollmentRoutes::Verified(set),
+                                        Err(reason) => EnrollmentRoutes::Rejected(reason),
+                                    }
+                                }
+                            });
+                        }
                         let outcome = match &self.auth {
                             InitiatorAuth::Human { .. } => PairOutcome::InitiatorPending {
                                 device_id: resp_dev_id,
@@ -3873,6 +4023,9 @@ pub struct PairingResponder {
     host_signing_pub: HybridSigningPublicKey,
     path: PairingPathKind,
     enrollment_policy: EnrollmentPolicy,
+    /// Static key and signing key for the enrolment reply route set (Section 7.5); held only
+    /// while M2M is enabled.
+    route_signer: Option<([u8; 32], SigningKeypair)>,
 }
 
 impl fmt::Debug for PairingResponder {
@@ -3924,6 +4077,12 @@ impl PairingResponder {
             },
             host_signing_pub: identity.signing_key().public_key().clone(),
             path,
+            route_signer: enrollment_policy.enabled.then(|| {
+                (
+                    *identity.static_key().public_bytes(),
+                    identity.signing_key().clone(),
+                )
+            }),
             enrollment_policy,
         })
     }
@@ -3932,6 +4091,27 @@ impl PairingResponder {
     #[must_use]
     pub fn is_awaiting_claim(&self) -> bool {
         matches!(self.phase, ResponderPhase::AwaitMsg3 { .. })
+    }
+
+    /// The b64url route set of an enrolment reply (Section 7.5): the stored announced set when
+    /// its sequence is above the claim's `route_seq`, signed by the current key. Any failure
+    /// omits the set and leaves the enrolment unchanged.
+    fn enrollment_route_set(&self, roster: &Roster, route_seq: u64) -> Option<String> {
+        let (static_pub, signing) = self.route_signer.as_ref()?;
+        let state = roster.local_routes()?;
+        if state.seq() <= route_seq {
+            return None;
+        }
+        let set = RouteSet::sign_for(
+            static_pub,
+            signing,
+            state.seq(),
+            state.issued_at(),
+            state.routes().to_vec(),
+            false,
+        )
+        .ok()?;
+        Some(b64url_encode(&set.encode()))
     }
 
     /// Consumes inbound transport bytes, verifies `code_mac` against `manager`, and updates `roster`.
@@ -4074,6 +4254,7 @@ impl PairingResponder {
                     return write_pair_error(&mut transport, "protocol_error", actions);
                 }
 
+                let route_seq = claim.route_seq;
                 match (
                     claim.code_mac,
                     claim.enrollment_token,
@@ -4081,7 +4262,8 @@ impl PairingResponder {
                     claim.enroll_proof,
                 ) {
                     (Some(code_mac), None, signing_pub, enroll_proof)
-                        if signing_pub.is_some() == enroll_proof.is_some() =>
+                        if signing_pub.is_some() == enroll_proof.is_some()
+                            && route_seq.is_none() =>
                     {
                         let mac_bytes: [u8; 32] = match b64url_decode_array(&code_mac) {
                             Ok(m) => m,
@@ -4140,6 +4322,7 @@ impl PairingResponder {
                             &peer_id,
                             "pending",
                             &self.host_signing_pub,
+                            None,
                             PairOutcome::ResponderPending {
                                 device_id: peer_id.clone(),
                                 device_static_pub: peer_static,
@@ -4232,11 +4415,14 @@ impl PairingResponder {
                             }
                         };
 
+                        let route_set =
+                            route_seq.and_then(|seq| self.enrollment_route_set(roster, seq));
                         write_pair_success(
                             &mut transport,
                             &registered_id,
                             "active",
                             &self.host_signing_pub,
+                            route_set,
                             PairOutcome::ResponderEnrolled {
                                 device_id: registered_id.clone(),
                                 device_static_pub: peer_static,
@@ -4271,16 +4457,25 @@ fn write_pair_success(
     device_id: &str,
     status: &str,
     host_signing_pub: &HybridSigningPublicKey,
+    route_set: Option<String>,
     outcome: PairOutcome,
     actions: &mut Vec<PairAction>,
 ) -> Result<(), CoreError> {
-    let resp = PairResponse::Success {
-        device_id: device_id.to_string(),
-        status: status.to_string(),
-        host_signing_pub: host_signing_pub.to_b64url(),
+    let encode = |route_set: Option<String>| {
+        let resp = PairResponse::Success {
+            device_id: device_id.to_string(),
+            status: status.to_string(),
+            host_signing_pub: host_signing_pub.to_b64url(),
+            route_set: route_set.map(RouteSetField::Encoded),
+        };
+        serde_json::to_vec(&resp)
+            .map(Zeroizing::new)
+            .map_err(|err| CoreError::Json(err.to_string()))
     };
-    let resp_json =
-        Zeroizing::new(serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?);
+    let mut resp_json = encode(route_set)?;
+    if resp_json.len() > MAX_TRANSPORT_PLAINTEXT {
+        resp_json = encode(None)?;
+    }
     let out_ct = transport.write_message_vec(&resp_json)?;
     actions.push(PairAction::WriteBytes(encode_frame(&out_ct)?));
     actions.push(PairAction::Completed(outcome));

@@ -88,7 +88,8 @@ PairClaim = {
   "code_mac"?: string,              // b64url 32-byte HMAC-SHA256 proof (human pairing, pairing-v1)
   "enrollment_token"?: Grant,       // signed M2M enrollment Grant (grants-v1, pairing-v1 Section 7)
   "signing_pub"?: string,           // b64url 1984-byte hybrid Ed25519 || ML-DSA-65 peer signing key
-  "enroll_proof"?: string           // b64url 3373-byte hybrid Ed25519 || ML-DSA-65 channel-binding signature (pairing-v1 Section 4.1 or 7.2)
+  "enroll_proof"?: string,          // b64url 3373-byte hybrid Ed25519 || ML-DSA-65 channel-binding signature (pairing-v1 Section 4.1 or 7.2)
+  "route_seq"?: uint64              // M2M only, 0..=2^53-1: requests PairResponse.route_set (pairing-v1 Section 7.5); omitted otherwise
 }
 ```
 
@@ -101,7 +102,8 @@ When `intent == 0x02` (`pair`), after decrypting and processing `msg3`, the resp
 {
   "device_id": string,
   "status": "pending" | "active",
-  "host_signing_pub": string        // b64url 1984-byte hybrid Ed25519 || ML-DSA-65 public key to pin
+  "host_signing_pub": string,       // b64url 1984-byte hybrid Ed25519 || ML-DSA-65 public key to pin
+  "route_set"?: string              // M2M only, when the claim carried route_seq: b64url 0x0C payload (Section 5.2.1), pairing-v1 Section 7.5; a human initiator rejects a reply that carries it
 }
 
 // failure
@@ -126,7 +128,7 @@ For human pairing, confirming the peer (`pair.confirm`) and minting capabilities
 1. Validate the 6-byte preamble; drop and rate-limit on any invalid field.
 2. Execute Noise `msg1`..`msg3`. Any AEAD failure drops the connection before interpreting payload fields.
 3. For `intent = session`: verify the peer static key `s` from `msg3` belongs to an `active` roster entry and `SessionHello.device_id` equals the derived `device_id` of `s`. Reject `pending` or `revoked` peers. Reject `SessionHello.upgrade` if it contains any capability not advertised in `HostHello.upgrade`.
-4. For `intent = pair`: enforce mutual exclusion between `code_mac` and `enrollment_token`. For human claims, verify `PairClaim.code_mac` per `pairing-v1.md`, then verify the signing key claim (`signing_pub`, `enroll_proof`) per `pairing-v1.md` Section 4.1 when present, and record the peer per the Section 4.1 recording rules (a new entry, or an `active` entry the claim adds a key to, becomes `pending`; any other accepted claim keeps the entry's state). A Wire v1 responder built before that section rejects a keyed human claim as `protocol_error`; initiators MUST NOT retry without the proof (pre-1.0 break). For M2M claims (only when M2M enrollment is enabled by responder policy), verify the trust-anchored enrollment token, CRL, single-use nonce burn, and channel-bound `enroll_proof` per `pairing-v1.md` Section 7, burn the nonce atomically, and register the peer as `active` with zero application grants. Send `PairResponse` and close.
+4. For `intent = pair`: enforce mutual exclusion between `code_mac` and `enrollment_token`. For human claims, verify `PairClaim.code_mac` per `pairing-v1.md`, then verify the signing key claim (`signing_pub`, `enroll_proof`) per `pairing-v1.md` Section 4.1 when present, and record the peer per the Section 4.1 recording rules (a new entry, or an `active` entry the claim adds a key to, becomes `pending`; any other accepted claim keeps the entry's state). A Wire v1 responder built before that section rejects a keyed human claim as `protocol_error`; initiators MUST NOT retry without the proof (pre-1.0 break). For M2M claims (only when M2M enrollment is enabled by responder policy), verify the trust-anchored enrollment token, CRL, single-use nonce burn, and channel-bound `enroll_proof` per `pairing-v1.md` Section 7, burn the nonce atomically, and register the peer as `active` with zero application grants. When the claim carried `route_seq`, add the host-signed `route_set` per `pairing-v1.md` Section 7.5. Send `PairResponse` and close.
 
 ---
 
