@@ -21,6 +21,14 @@ export function verifyGrantJson(
   crlJson?: string | null
 ): boolean;
 
+/**
+ * Decodes a `0x0C ROUTE_SET` payload and verifies its hybrid signature against the 1984-byte
+ * `signingPub`. Returns JSON `{"seq","issued_at","routes"}` only when both succeed. Throws an
+ * `Error` whose message is `signing key invalid`, `route set decode failed` or
+ * `route set signature invalid`. There is no unverified decode.
+ */
+export function verifyRouteSet(payload: Buffer, signingPub: Buffer): string;
+
 export class Endpoint {
   constructor(stateDir?: string | null, hostId?: string | null);
   infoJson(): string;

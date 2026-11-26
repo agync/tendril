@@ -1,5 +1,7 @@
 //! Node.js N-API native addon over `tendril-core` and `tendril-runtime`.
 
+pub mod route_set;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
