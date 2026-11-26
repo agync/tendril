@@ -1,5 +1,7 @@
 //! Python PyO3 bindings over `tendril-core` and `tendril-runtime` with GIL release.
 
+mod route_set;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
@@ -3692,6 +3694,7 @@ fn _tendril(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_code_mac, m)?)?;
     m.add_function(wrap_pyfunction!(verify_rotation_chain_json, m)?)?;
     m.add_function(wrap_pyfunction!(verify_grant_json, m)?)?;
+    m.add_function(wrap_pyfunction!(route_set::verify_route_set, m)?)?;
     m.add_class::<Endpoint>()?;
     m.add_class::<Session>()?;
     m.add_class::<Group>()?;

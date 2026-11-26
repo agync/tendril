@@ -11,6 +11,7 @@ from tendril._tendril import (
     pairing_sas,
     verify_grant_json,
     verify_rotation_chain_json,
+    verify_route_set,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "pairing_sas",
     "verify_grant_json",
     "verify_rotation_chain_json",
+    "verify_route_set",
 ]
