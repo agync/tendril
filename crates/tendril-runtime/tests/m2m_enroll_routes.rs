@@ -432,6 +432,68 @@ async fn a_stale_pin_is_upgraded_to_the_stored_rotation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_unconfirmed_host_entry_never_replaces_the_enrolment_pin() {
+    let genuine = Host::new(0x84);
+    let other = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar([0x86; 32]),
+        SigningKeypair::from_seed([0x87; 32]),
+    );
+    let label = genuine.identity.host_id().to_owned();
+    let static_pub = *genuine.identity.static_key().public_bytes();
+    let port = genuine.serve().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = StateStore::open_or_create(dir.path()).expect("store");
+    let me = store.load_or_generate_identity(None).expect("identity");
+    store
+        .update_roster(|r| {
+            r.record_pending_host(
+                label.clone(),
+                "Studio".into(),
+                static_pub,
+                other.signing_key().public_key().clone(),
+                1000,
+                "sas".into(),
+                Vec::new(),
+            )
+            .map(|_| ())
+            .map_err(Into::into)
+        })
+        .unwrap();
+    let pin = PinnedHost::with_hash(
+        Some(label.clone()),
+        static_pub,
+        genuine.identity.signing_key().signing_pub_hash(),
+        0,
+    );
+    let mut stream = dial(port).await;
+    let res = drive_m2m_enroll_initiator_with_routes(
+        stream.as_mut(),
+        &me,
+        "runner".into(),
+        "machine".into(),
+        genuine.token(&me, 0x09),
+        pin,
+        &store,
+        M2mEnrollOptions::default(),
+    )
+    .await
+    .expect("the out-of-band pin decides");
+    let _ = stream.close().await;
+    assert!(matches!(
+        res.drive.outcome,
+        PairOutcome::InitiatorEnrolled { .. }
+    ));
+    let roster = store.load_roster().unwrap();
+    let entry = roster.get(&label).unwrap();
+    assert_eq!(entry.state, PeerState::Active);
+    assert_eq!(
+        entry.signing_pub.as_ref(),
+        Some(genuine.identity.signing_key().public_key())
+    );
+    assert_eq!(entry.rotation_seq, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_host_id_pinned_with_other_keys_aborts_before_msg3() {
     let identity = EndpointIdentity::from_keys(
         StaticKeypair::from_scalar([0x8C; 32]),

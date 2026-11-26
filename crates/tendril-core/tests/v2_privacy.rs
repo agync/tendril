@@ -1732,13 +1732,12 @@ fn initiator_v2_grant_revocation_post_rekey_crl_and_roster_rollback_and_pairing_
     let mut bad_roster = Roster::new();
     let conflict_id = "existing-conflict".to_string();
     bad_roster
-        .record_pending_host(
+        .insert_pinned_host(
             conflict_id.clone(),
             "Conflict".into(),
             [0x12; 32],
-            cli.signing_key().public_key().clone(),
+            Some(cli.signing_key().public_key().clone()),
             0,
-            "1234".into(),
             vec![],
         )
         .unwrap();

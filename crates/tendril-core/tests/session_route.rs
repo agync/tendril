@@ -1111,7 +1111,7 @@ fn v2_pair_outcome_applies_route_plan_atomically() {
             .unwrap();
         assert_eq!(id, host.host_id());
         assert_eq!(merged.reason, None);
-        let entry = roster.get(&id).unwrap();
+        let entry = roster.get_or_pending_host(&id).unwrap();
         let expected_state = if verified {
             PeerState::Active
         } else {
@@ -1168,7 +1168,7 @@ fn v2_pair_outcome_accepts_an_operator_v2_relay_route() {
                 &plan,
             )
             .unwrap();
-        let entry = roster.get(&id).unwrap();
+        let entry = roster.get_or_pending_host(&id).unwrap();
         assert_eq!(
             entry.routes_from(RouteSource::Operator).collect::<Vec<_>>(),
             vec![v2_relay]

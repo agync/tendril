@@ -17,7 +17,7 @@ use crate::grants::{
     verify_crl_signature,
 };
 use crate::identity::{
-    EndpointIdentity, RotationRecord, format_rfc3339_utc, verify_rotation_chain,
+    EndpointIdentity, RotationRecord, format_rfc3339_utc, is_valid_host_id, verify_rotation_chain,
 };
 use crate::identity::{detect_rotation_fork, verify_rotation_record};
 use crate::pairing::{
@@ -533,8 +533,81 @@ pub struct TrustAnchor {
     pub state: AnchorState,
 }
 
+/// Most unconfirmed host claims a roster holds; a new claim evicts the oldest.
+pub const MAX_PENDING_HOSTS: usize = 64;
+
+/// Where a host record lives: an entry under its key, or an unconfirmed claim by index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostSlot {
+    Entry(String),
+    Pending(usize),
+}
+
+/// The stored form of a [`Roster`]; loading it normalizes unconfirmed host entries.
+#[derive(Deserialize)]
+struct StoredRoster {
+    entries: BTreeMap<String, RosterEntry>,
+    crls: BTreeMap<String, RevocationList>,
+    #[serde(default)]
+    trust_anchors: BTreeMap<String, TrustAnchor>,
+    #[serde(default)]
+    burned_enrollment_nonces: BTreeMap<String, u64>,
+    #[serde(default, deserialize_with = "crate::pairing::deserialize_local_routes")]
+    local_routes: Option<Box<LocalRouteState>>,
+    #[serde(default)]
+    pending_hosts: Vec<RosterEntry>,
+}
+
+impl From<StoredRoster> for Roster {
+    /// Moves every `Pending` entry stored under a key other than `device_id(static_pub)` into the
+    /// pending host store under that label, then admits each stored claim that is `Pending`, has
+    /// a valid `host_id` and static key, and holds no revoked label or key. `Active` and `Revoked`
+    /// entries, and `Pending` entries under their own `device_id`, keep their keys and are never
+    /// overwritten.
+    fn from(stored: StoredRoster) -> Self {
+        let mut roster = Self {
+            entries: stored.entries,
+            crls: stored.crls,
+            trust_anchors: stored.trust_anchors,
+            burned_enrollment_nonces: stored.burned_enrollment_nonces,
+            local_routes: stored.local_routes,
+            ..Self::default()
+        };
+        let legacy: Vec<String> = roster
+            .entries
+            .iter()
+            .filter(|(key, e)| e.state == PeerState::Pending && **key != device_id(&e.static_pub))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut claims = Vec::with_capacity(legacy.len() + stored.pending_hosts.len());
+        for label in legacy {
+            if let Some(mut entry) = roster.entries.remove(&label) {
+                entry.device_id = label;
+                claims.push(entry);
+            }
+        }
+        claims.extend(stored.pending_hosts);
+        for entry in claims {
+            if entry.state == PeerState::Pending
+                && is_valid_host_id(&entry.device_id)
+                && is_valid_x25519_public_key(&entry.static_pub)
+                && !roster.revoked_key_conflict(
+                    "",
+                    &entry.device_id,
+                    &entry.static_pub,
+                    entry.signing_pub.as_ref(),
+                )
+            {
+                roster.push_pending_host(entry);
+            }
+        }
+        roster
+    }
+}
+
 /// Authoritative in-memory peer roster, trust anchors, burn log, and verified CRL store.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "StoredRoster")]
 pub struct Roster {
     entries: BTreeMap<String, RosterEntry>,
     crls: BTreeMap<String, RevocationList>,
@@ -542,12 +615,13 @@ pub struct Roster {
     trust_anchors: BTreeMap<String, TrustAnchor>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     burned_enrollment_nonces: BTreeMap<String, u64>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::pairing::deserialize_local_routes"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     local_routes: Option<Box<LocalRouteState>>,
+    /// Unconfirmed host claims from unpinned pairings, oldest first, each labelled by the
+    /// `host_id` it names (its `device_id` field) and unique per `(device_id(static_pub),
+    /// host_id)`. They hold no label until `pair.confirm` moves one into `entries`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_hosts: Vec<RosterEntry>,
     #[serde(skip)]
     signing_hash_pins: BTreeMap<String, [u8; 32]>,
     #[serde(skip)]
@@ -692,6 +766,34 @@ impl Roster {
         self.entries.get(id)
     }
 
+    /// Returns the entry under `id`, else the one unconfirmed host entry naming `id` as its
+    /// `host_id`. For operator display only: trust and routing lookups use [`Self::get`].
+    #[must_use]
+    pub fn get_or_pending_host(&self, id: &str) -> Option<&RosterEntry> {
+        self.get(id)
+            .or_else(|| match self.pending_host_claims(id).as_slice() {
+                [only] => self.pending_hosts.get(*only),
+                _ => None,
+            })
+    }
+
+    /// Iterates over the unconfirmed host claims, oldest first. Each entry's `device_id` is the
+    /// `host_id` it names.
+    pub fn pending_hosts(&self) -> impl Iterator<Item = &RosterEntry> {
+        self.pending_hosts.iter()
+    }
+
+    /// The error for a session or lookup target with no entry of its own: `PeerPending` while an
+    /// unconfirmed host entry names it, else `PeerNotFound`.
+    #[must_use]
+    pub fn missing_peer_error(&self, id: &str) -> CoreError {
+        if self.pending_host_claims(id).is_empty() {
+            CoreError::PeerNotFound(id.to_string())
+        } else {
+            CoreError::PeerPending(id.to_string())
+        }
+    }
+
     /// Iterates over all entries ordered by key.
     pub fn entries(&self) -> impl Iterator<Item = (&String, &RosterEntry)> {
         self.entries.iter()
@@ -753,9 +855,11 @@ impl Roster {
 
     /// Inserts or updates a verified client-side `Active` pin for a remote host before session connect.
     ///
-    /// Refuses to overwrite a `Revoked` entry or any existing entry whose `static_pub`,
-    /// `signing_pub`, or `rotation_seq` conflicts with the supplied pin, and never retains grants
-    /// across differing keys.
+    /// Refuses an invalid `host_id` ([`is_valid_host_id`]), a `Revoked` entry, and an `Active`
+    /// entry whose `static_pub`, `signing_pub`, or `rotation_seq` conflicts with the supplied
+    /// pin, and never retains grants across differing keys. An unconfirmed `Pending` entry under
+    /// the label is promoted when its keys match and replaced otherwise; its rotation is not
+    /// enforced. Drops the unconfirmed host claims naming `host_id`.
     pub fn insert_pinned_host(
         &mut self,
         host_id: String,
@@ -768,36 +872,54 @@ impl Roster {
         if host_id.is_empty() || !is_valid_x25519_public_key(&static_pub) {
             return Err(CoreError::IncompletePin(host_id));
         }
+        if !is_valid_host_id(&host_id) {
+            return Err(CoreError::ProtocolViolation("invalid host_id"));
+        }
         if self.revoked_key_conflict(&host_id, &host_id, &static_pub, signing_pub.as_ref()) {
             return Err(CoreError::PeerRevoked(host_id));
         }
+        let claim_floor = self
+            .pending_hosts
+            .iter()
+            .filter(|e| e.static_pub == static_pub)
+            .map(|e| e.min_wire_version)
+            .fold(WIRE_VERSION, u8::max);
         if let Some(existing) = self.entries.get_mut(&host_id) {
-            if existing.state == PeerState::Revoked {
-                return Err(CoreError::PeerRevoked(host_id));
-            }
             let signing_conflict = match (&existing.signing_pub, &signing_pub) {
                 (Some(prev), Some(next)) => prev != next,
                 (Some(_), None) => true,
                 _ => false,
             };
-            if existing.static_pub != static_pub
-                || signing_conflict
-                || rotation_seq < existing.rotation_seq
-            {
-                return Err(CoreError::ProtocolViolation(
-                    "cannot overwrite pinned host keys; rotate or revoke existing pin first",
-                ));
+            let same_keys = existing.static_pub == static_pub && !signing_conflict;
+            match existing.state {
+                PeerState::Revoked => return Err(CoreError::PeerRevoked(host_id)),
+                PeerState::Active if !same_keys || rotation_seq < existing.rotation_seq => {
+                    return Err(CoreError::ProtocolViolation(
+                        "cannot overwrite pinned host keys; rotate or revoke existing pin first",
+                    ));
+                }
+                PeerState::Pending if !same_keys => {
+                    self.entries.remove(&host_id);
+                }
+                PeerState::Active | PeerState::Pending => {
+                    existing.rotation_seq = if existing.state == PeerState::Active {
+                        existing.rotation_seq.max(rotation_seq)
+                    } else {
+                        rotation_seq
+                    };
+                    existing.name = name;
+                    if existing.signing_pub.is_none() {
+                        existing.signing_pub = signing_pub;
+                    }
+                    existing.state = PeerState::Active;
+                    existing.min_wire_version = existing.min_wire_version.max(claim_floor);
+                    if !relay_hints.is_empty() {
+                        existing.relay_hints = relay_hints;
+                    }
+                    self.drop_pending_host_claims(&host_id);
+                    return Ok(&self.entries[&host_id]);
+                }
             }
-            existing.name = name;
-            if existing.signing_pub.is_none() {
-                existing.signing_pub = signing_pub;
-            }
-            existing.rotation_seq = existing.rotation_seq.max(rotation_seq);
-            existing.state = PeerState::Active;
-            if !relay_hints.is_empty() {
-                existing.relay_hints = relay_hints;
-            }
-            return Ok(&self.entries[&host_id]);
         }
 
         let entry = RosterEntry {
@@ -811,20 +933,26 @@ impl Roster {
             last_pairing_sas: None,
             grants: Vec::new(),
             relay_hints,
-            min_wire_version: WIRE_VERSION,
+            min_wire_version: claim_floor,
             v2_secrets: None,
             routes: Vec::new(),
             route_meta: None,
             approved_signed: Vec::new(),
         };
+        self.drop_pending_host_claims(&host_id);
         self.entries.insert(host_id.clone(), entry);
         Ok(&self.entries[&host_id])
     }
 
-    /// Records an unpinned host from manual pairing in `Pending` state awaiting SAS confirmation.
+    /// Records an unpinned host from manual pairing as an unconfirmed claim awaiting SAS
+    /// confirmation.
     ///
-    /// Rejects `Revoked` entries and refuses to overwrite any existing entry carrying distinct keys.
-    /// Never auto-promotes `Pending` to `Active`.
+    /// The `host_id` from `HostHello` is unauthenticated until confirmed, so the claim goes to the
+    /// pending host store, never `entries`: it holds no label, and [`Self::confirm_peer`] with the
+    /// `host_id` and its SAS moves it there. A later claim for the same `(static_pub, host_id)`
+    /// replaces it, and past [`MAX_PENDING_HOSTS`] the oldest claim is evicted. Refuses an invalid
+    /// `host_id`, a revoked label or keys, and a label held by an `Active` entry with distinct
+    /// keys; an `Active` entry with the same keys is updated in place instead.
     #[allow(clippy::too_many_arguments)]
     pub fn record_pending_host(
         &mut self,
@@ -836,40 +964,71 @@ impl Roster {
         pairing_sas: String,
         relay_hints: Vec<String>,
     ) -> Result<&RosterEntry, CoreError> {
+        match self.record_pending_host_slot(
+            host_id,
+            name,
+            static_pub,
+            signing_pub,
+            rotation_seq,
+            pairing_sas,
+            relay_hints,
+        )? {
+            HostSlot::Entry(id) => Ok(&self.entries[&id]),
+            HostSlot::Pending(i) => Ok(&self.pending_hosts[i]),
+        }
+    }
+
+    /// [`Self::record_pending_host`], returning where the host was written.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_pending_host_slot(
+        &mut self,
+        host_id: String,
+        name: String,
+        static_pub: [u8; 32],
+        signing_pub: HybridSigningPublicKey,
+        rotation_seq: u64,
+        pairing_sas: String,
+        relay_hints: Vec<String>,
+    ) -> Result<HostSlot, CoreError> {
         if host_id.is_empty() || !is_valid_x25519_public_key(&static_pub) {
             return Err(CoreError::IncompletePin(host_id));
+        }
+        if !is_valid_host_id(&host_id) {
+            return Err(CoreError::ProtocolViolation("invalid host_id"));
         }
         if self.revoked_key_conflict(&host_id, &host_id, &static_pub, Some(&signing_pub)) {
             return Err(CoreError::PeerRevoked(host_id));
         }
         if let Some(existing) = self.entries.get_mut(&host_id) {
-            if existing.state == PeerState::Revoked {
-                return Err(CoreError::PeerRevoked(host_id));
+            match existing.state {
+                PeerState::Revoked => return Err(CoreError::PeerRevoked(host_id)),
+                PeerState::Active => {
+                    let signing_conflict = existing
+                        .signing_pub
+                        .as_ref()
+                        .is_some_and(|prev| prev != &signing_pub);
+                    if existing.static_pub != static_pub
+                        || signing_conflict
+                        || rotation_seq < existing.rotation_seq
+                    {
+                        return Err(CoreError::ProtocolViolation(
+                            "host_id collision with distinct pinned keys",
+                        ));
+                    }
+                    existing.name = name;
+                    existing.signing_pub = Some(signing_pub);
+                    existing.rotation_seq = existing.rotation_seq.max(rotation_seq);
+                    existing.last_pairing_sas = Some(pairing_sas);
+                    if !relay_hints.is_empty() {
+                        existing.relay_hints = relay_hints;
+                    }
+                    return Ok(HostSlot::Entry(host_id));
+                }
+                PeerState::Pending => {}
             }
-            let signing_conflict = existing
-                .signing_pub
-                .as_ref()
-                .is_some_and(|prev| prev != &signing_pub);
-            if existing.static_pub != static_pub
-                || signing_conflict
-                || rotation_seq < existing.rotation_seq
-            {
-                return Err(CoreError::ProtocolViolation(
-                    "host_id collision with distinct pinned keys",
-                ));
-            }
-            existing.name = name;
-            existing.signing_pub = Some(signing_pub);
-            existing.rotation_seq = existing.rotation_seq.max(rotation_seq);
-            existing.last_pairing_sas = Some(pairing_sas);
-            if !relay_hints.is_empty() {
-                existing.relay_hints = relay_hints;
-            }
-            return Ok(&self.entries[&host_id]);
         }
-
-        let entry = RosterEntry {
-            device_id: host_id.clone(),
+        self.push_pending_host(RosterEntry {
+            device_id: host_id,
             name,
             kind: "host".to_string(),
             static_pub,
@@ -884,25 +1043,118 @@ impl Roster {
             routes: Vec::new(),
             route_meta: None,
             approved_signed: Vec::new(),
-        };
-        self.entries.insert(host_id.clone(), entry);
-        Ok(&self.entries[&host_id])
+        });
+        Ok(HostSlot::Pending(self.pending_hosts.len() - 1))
     }
 
-    /// Removes a `Pending` (unconfirmed) peer or host entry, refusing to drop `Active` or `Revoked` entries.
-    pub fn remove_pending_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
-        let state = self
+    /// Appends `claim`, replacing any claim for the same `(static_pub, host_id)` and evicting the
+    /// oldest claims past [`MAX_PENDING_HOSTS`].
+    fn push_pending_host(&mut self, claim: RosterEntry) {
+        self.pending_hosts
+            .retain(|e| e.device_id != claim.device_id || e.static_pub != claim.static_pub);
+        self.pending_hosts.push(claim);
+        let excess = self.pending_hosts.len().saturating_sub(MAX_PENDING_HOSTS);
+        self.pending_hosts.drain(..excess);
+    }
+
+    /// Runs `f` against the host at `slot` under the label it names, so roster operations that
+    /// address an entry by key also apply to an unconfirmed claim.
+    pub(crate) fn with_host_slot<R>(
+        &mut self,
+        slot: &HostSlot,
+        f: impl FnOnce(&mut Self, &str) -> Result<R, CoreError>,
+    ) -> Result<R, CoreError> {
+        let i = match slot {
+            HostSlot::Entry(id) => return f(self, id),
+            HostSlot::Pending(i) => *i,
+        };
+        let claim = self
+            .pending_hosts
+            .get(i)
+            .cloned()
+            .ok_or(CoreError::NotReady("pending host claim missing"))?;
+        let label = claim.device_id.clone();
+        let mut scratch = Self {
+            crls: self.crls.clone(),
+            ..Self::default()
+        };
+        scratch.entries.insert(label.clone(), claim);
+        let out = f(&mut scratch, &label)?;
+        self.pending_hosts[i] = scratch
             .entries
-            .get(peer_id)
-            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?
-            .state;
-        match state {
-            PeerState::Pending => {
+            .remove(&label)
+            .ok_or(CoreError::NotReady("pending host claim missing"))?;
+        Ok(out)
+    }
+
+    /// Indexes of the unconfirmed host claims naming `host_id`.
+    fn pending_host_claims(&self, host_id: &str) -> Vec<usize> {
+        self.pending_hosts
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.device_id == host_id)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Drops the unconfirmed host claims naming `host_id`.
+    fn drop_pending_host_claims(&mut self, host_id: &str) {
+        self.pending_hosts.retain(|e| e.device_id != host_id);
+    }
+
+    /// Resolves an operator-supplied id. An `Active` or `Revoked` entry under `id` wins;
+    /// otherwise the candidates are a `Pending` entry under `id` and the claims naming it, and
+    /// exactly one (with `sas`, exactly one recording that SAS) must remain.
+    fn resolve_peer(&self, id: &str, sas: Option<&str>) -> Result<HostSlot, CoreError> {
+        let mut candidates = Vec::new();
+        match self.entries.get(id) {
+            Some(e) if e.state != PeerState::Pending => return Ok(HostSlot::Entry(id.to_string())),
+            Some(_) => candidates.push(HostSlot::Entry(id.to_string())),
+            None => {}
+        }
+        candidates.extend(
+            self.pending_host_claims(id)
+                .into_iter()
+                .map(HostSlot::Pending),
+        );
+        if candidates.is_empty() {
+            return Err(CoreError::PeerNotFound(id.to_string()));
+        }
+        let total = candidates.len();
+        if let Some(sas) = sas {
+            candidates
+                .retain(|slot| self.slot_entry(slot).last_pairing_sas.as_deref() == Some(sas));
+        }
+        match candidates.len() {
+            1 => Ok(candidates.remove(0)),
+            0 if total > 0 => Err(CoreError::ProtocolViolation("pairing SAS mismatch")),
+            _ => Err(CoreError::ProtocolViolation(
+                "several unconfirmed entries name this id",
+            )),
+        }
+    }
+
+    fn slot_entry(&self, slot: &HostSlot) -> &RosterEntry {
+        match slot {
+            HostSlot::Entry(id) => &self.entries[id],
+            HostSlot::Pending(i) => &self.pending_hosts[*i],
+        }
+    }
+
+    /// Removes a `Pending` (unconfirmed) peer or host entry and every unconfirmed host claim
+    /// naming `peer_id`, refusing to drop `Active` or `Revoked` entries. Nothing is revoked.
+    pub fn remove_pending_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
+        let claims = self.pending_host_claims(peer_id).len();
+        self.drop_pending_host_claims(peer_id);
+        match self.entries.get(peer_id).map(|e| e.state) {
+            Some(PeerState::Pending) => {
                 self.entries.remove(peer_id);
                 Ok(())
             }
-            PeerState::Revoked => Err(CoreError::PeerRevoked(peer_id.to_string())),
-            PeerState::Active => Err(CoreError::ProtocolViolation(
+            _ if claims > 0 => Ok(()),
+            None => Err(CoreError::PeerNotFound(peer_id.to_string())),
+            Some(PeerState::Revoked) => Err(CoreError::PeerRevoked(peer_id.to_string())),
+            Some(PeerState::Active) => Err(CoreError::ProtocolViolation(
                 "cannot remove active peer; revoke instead",
             )),
         }
@@ -940,7 +1192,7 @@ impl Roster {
             return Err(CoreError::PeerRevoked(id));
         }
         if let Some(claimed) = signing_pub.as_ref()
-            && self.entries.values().any(|e| {
+            && self.entries.values().chain(&self.pending_hosts).any(|e| {
                 e.state != PeerState::Revoked
                     && e.static_pub == static_pub
                     && e.signing_pub
@@ -1004,45 +1256,71 @@ impl Roster {
         expected_sas: Option<&str>,
         allow_skip_sas: bool,
     ) -> Result<&RosterEntry, CoreError> {
-        let (static_pub, signing_pub, device_id_str) = {
-            let entry = self
-                .entries
-                .get(peer_id)
-                .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
-            if entry.state == PeerState::Revoked {
-                return Err(CoreError::PeerRevoked(peer_id.to_string()));
-            }
-            entry.require_static_pin()?;
-            if !allow_skip_sas && entry.last_pairing_sas.is_some() && expected_sas.is_none() {
-                return Err(CoreError::ProtocolViolation(
-                    "pairing SAS confirmation required",
-                ));
-            }
-            if let Some(sas) = expected_sas
-                && entry.last_pairing_sas.as_deref() != Some(sas)
-            {
-                return Err(CoreError::ProtocolViolation("pairing SAS mismatch"));
-            }
-            (
-                entry.static_pub,
-                entry.signing_pub.clone(),
-                entry.device_id.clone(),
-            )
+        let slot = self.resolve_peer(peer_id, expected_sas)?;
+        let entry = self.slot_entry(&slot);
+        let label = match &slot {
+            HostSlot::Entry(key) => key.clone(),
+            HostSlot::Pending(_) => entry.device_id.clone(),
         };
-
-        let revoked_conflict =
-            self.revoked_key_conflict(peer_id, &device_id_str, &static_pub, signing_pub.as_ref())
-                || self.crl_revokes_identity(peer_id, &static_pub);
-        if revoked_conflict {
-            return Err(CoreError::PeerRevoked(peer_id.to_string()));
+        if entry.state == PeerState::Revoked {
+            return Err(CoreError::PeerRevoked(label));
+        }
+        entry.require_static_pin()?;
+        if !allow_skip_sas && entry.last_pairing_sas.is_some() && expected_sas.is_none() {
+            return Err(CoreError::ProtocolViolation(
+                "pairing SAS confirmation required",
+            ));
+        }
+        if let Some(sas) = expected_sas
+            && entry.last_pairing_sas.as_deref() != Some(sas)
+        {
+            return Err(CoreError::ProtocolViolation("pairing SAS mismatch"));
+        }
+        let skip_key = match &slot {
+            HostSlot::Entry(key) => key.as_str(),
+            HostSlot::Pending(_) => "",
+        };
+        if self.revoked_key_conflict(
+            skip_key,
+            &entry.device_id,
+            &entry.static_pub,
+            entry.signing_pub.as_ref(),
+        ) || self.crl_revokes_identity(&label, &entry.static_pub)
+        {
+            return Err(CoreError::PeerRevoked(label));
         }
 
-        let entry = self
-            .entries
-            .get_mut(peer_id)
-            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
-        entry.state = PeerState::Active;
-        Ok(&self.entries[peer_id])
+        match slot {
+            HostSlot::Entry(_) => {
+                if let Some(entry) = self.entries.get_mut(&label) {
+                    entry.state = PeerState::Active;
+                }
+            }
+            HostSlot::Pending(i) => {
+                let static_pub = self.pending_hosts[i].static_pub;
+                match self.entries.get(&label) {
+                    Some(e) if e.state == PeerState::Revoked => {
+                        return Err(CoreError::PeerRevoked(label));
+                    }
+                    Some(e) if e.state == PeerState::Active || e.static_pub != static_pub => {
+                        return Err(CoreError::ProtocolViolation(
+                            "host_id collision with distinct pinned keys",
+                        ));
+                    }
+                    _ => {}
+                }
+                let mut entry = self.pending_hosts.remove(i);
+                entry.state = PeerState::Active;
+                if let Some(replaced) = self.entries.remove(&label)
+                    && replaced.signing_pub == entry.signing_pub
+                {
+                    entry.grants = replaced.grants;
+                }
+                self.entries.insert(label.clone(), entry);
+            }
+        }
+        self.drop_pending_host_claims(&label);
+        Ok(&self.entries[&label])
     }
 
     /// Confirms a `Pending` peer (`pair.confirm`) and moves it to `Active` with zero
@@ -1154,6 +1432,16 @@ impl Roster {
                 other.v2_secrets = None;
             }
         }
+        self.pending_hosts.retain(|claim| {
+            let shares_static = revoked_static != [0u8; 32] && claim.static_pub == revoked_static;
+            let shares_signing = revoked_signing.is_some_and(|r| {
+                claim
+                    .signing_pub
+                    .as_ref()
+                    .is_some_and(|o| signing_keys_share_identity(r, o))
+            });
+            !(shares_static || shares_signing)
+        });
         if let Some(sig) = revoked_signing {
             for anchor in self.trust_anchors.values_mut() {
                 if signing_keys_share_identity(&anchor.signing_pub, sig) {
@@ -1165,12 +1453,66 @@ impl Roster {
 
     /// Marks `peer_id` (and any sibling entry sharing its cryptographic keys) as `Revoked`
     /// and clears any stored grants and v2 secrets.
+    ///
+    /// An `Active` or `Revoked` entry under `peer_id` is revoked directly. Otherwise `peer_id`
+    /// first names the unconfirmed host claims whose handshake-authenticated
+    /// `device_id(static_pub)` equals it ([`Self::revoke_pending_host`]); only when none does is
+    /// it resolved as in [`Self::confirm_peer`], against a `Pending` entry under it and the claims
+    /// naming it as their `host_id`. Revoking a claim drops it and revokes its keys, never the
+    /// `host_id` it named or an entry holding other keys. Unconfirmed claims sharing the revoked
+    /// keys are dropped.
     pub fn revoke_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
+        if self
+            .entries
+            .get(peer_id)
+            .is_some_and(|e| e.state != PeerState::Pending)
+        {
+            return self.revoke_entry(peer_id);
+        }
+        if self
+            .pending_hosts
+            .iter()
+            .any(|e| device_id(&e.static_pub) == peer_id)
+        {
+            return self.revoke_pending_host(peer_id);
+        }
+        match self.resolve_peer(peer_id, None)? {
+            HostSlot::Entry(key) => self.revoke_entry(&key),
+            HostSlot::Pending(i) => {
+                let claim = self.pending_hosts.remove(i);
+                self.revoke_claim_keys(claim);
+                Ok(())
+            }
+        }
+    }
+
+    /// Revokes the keys of every unconfirmed host claim whose `device_id(static_pub)` equals
+    /// `static_device_id`, matching only that handshake-authenticated id, never a claimed
+    /// `host_id`, and never revoking an entry that holds other keys or any label.
+    pub fn revoke_pending_host(&mut self, static_device_id: &str) -> Result<(), CoreError> {
+        let mut removed = Vec::new();
+        self.pending_hosts.retain(|e| {
+            let hit = device_id(&e.static_pub) == static_device_id;
+            if hit {
+                removed.push(e.clone());
+            }
+            !hit
+        });
+        if removed.is_empty() {
+            return Err(CoreError::PeerNotFound(static_device_id.to_string()));
+        }
+        for claim in removed {
+            self.revoke_claim_keys(claim);
+        }
+        Ok(())
+    }
+
+    fn revoke_entry(&mut self, key: &str) -> Result<(), CoreError> {
         let (revoked_static, revoked_signing) = {
             let entry = self
                 .entries
-                .get_mut(peer_id)
-                .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+                .get_mut(key)
+                .ok_or_else(|| CoreError::PeerNotFound(key.to_string()))?;
             entry.state = PeerState::Revoked;
             entry.grants.clear();
             entry.v2_secrets = None;
@@ -1178,6 +1520,41 @@ impl Roster {
         };
         self.revoke_siblings_by_keys(revoked_static, revoked_signing.as_ref());
         Ok(())
+    }
+
+    /// Records the keys of a dropped claim as `Revoked`. The entry under
+    /// `device_id(static_pub)` carries them only when it holds the same static key and no other
+    /// signing key (a missing one is filled from the claim); otherwise a revoked record is kept
+    /// under a key no `host_id` can take, so no label and no entry holding other keys is revoked.
+    fn revoke_claim_keys(&mut self, mut claim: RosterEntry) {
+        let own = device_id(&claim.static_pub);
+        match self.entries.get_mut(&own) {
+            Some(entry)
+                if entry.static_pub == claim.static_pub
+                    && (entry.signing_pub.is_none() || entry.signing_pub == claim.signing_pub) =>
+            {
+                if entry.signing_pub.is_none() {
+                    entry.signing_pub.clone_from(&claim.signing_pub);
+                }
+                entry.state = PeerState::Revoked;
+                entry.grants.clear();
+                entry.v2_secrets = None;
+            }
+            _ => {
+                let signing = claim.signing_pub.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |k| hex::encode(&k.sha256_hash()[..8]),
+                );
+                let key = format!("{own}#revoked-{signing}");
+                claim.device_id.clone_from(&key);
+                claim.state = PeerState::Revoked;
+                claim.grants.clear();
+                claim.v2_secrets = None;
+                claim.last_pairing_sas = None;
+                self.entries.insert(key, claim.clone());
+            }
+        }
+        self.revoke_siblings_by_keys(claim.static_pub, claim.signing_pub.as_ref());
     }
 
     /// Raises the minimum wire protocol version required for `peer_id` (anti-downgrade floor).
@@ -1214,6 +1591,7 @@ impl Roster {
     pub fn pairing_floor(&self, static_pub: &[u8; 32]) -> u8 {
         self.entries
             .values()
+            .chain(&self.pending_hosts)
             .filter(|e| &e.static_pub == static_pub)
             .map(|e| e.min_wire_version)
             .max()
@@ -1723,6 +2101,7 @@ impl Roster {
             existing.signing_pub = Some(signing_pub);
             existing.state = PeerState::Active;
             existing.last_pairing_sas = None;
+            self.drop_pending_host_claims(&id);
             return Ok(&self.entries[&id]);
         }
 
@@ -1743,6 +2122,7 @@ impl Roster {
             route_meta: None,
             approved_signed: Vec::new(),
         };
+        self.drop_pending_host_claims(&id);
         self.entries.insert(id.clone(), entry);
         Ok(&self.entries[&id])
     }
@@ -1818,7 +2198,7 @@ impl Roster {
         let entry = self
             .entries
             .get(peer_id)
-            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
+            .ok_or_else(|| self.missing_peer_error(peer_id))?;
         match entry.state {
             PeerState::Pending => Err(CoreError::PeerPending(peer_id.to_string())),
             PeerState::Revoked => Err(CoreError::PeerRevoked(peer_id.to_string())),
@@ -1855,14 +2235,20 @@ impl Roster {
         Ok(())
     }
 
-    /// Takes a [`PinSnapshot`] of a complete, non-revoked pin for a Day-2 connect.
+    /// Takes a [`PinSnapshot`] of a complete pin of an `Active` entry no CRL revokes, for a Day-2
+    /// connect.
     pub fn pin_snapshot(&self, peer_id: &str) -> Result<PinSnapshot, CoreError> {
         let entry = self
             .entries
             .get(peer_id)
-            .ok_or_else(|| CoreError::PeerNotFound(peer_id.to_string()))?;
-        if entry.state == PeerState::Revoked {
-            return Err(CoreError::PeerRevoked(peer_id.to_string()));
+            .ok_or_else(|| self.missing_peer_error(peer_id))?;
+        match entry.state {
+            PeerState::Pending => return Err(CoreError::PeerPending(peer_id.to_string())),
+            PeerState::Revoked => return Err(CoreError::PeerRevoked(peer_id.to_string())),
+            PeerState::Active if self.crl_revokes_entry(entry) => {
+                return Err(CoreError::PeerRevoked(peer_id.to_string()));
+            }
+            PeerState::Active => {}
         }
         let (static_pub, signing_pub) = entry.require_complete_pin()?;
         Ok(PinSnapshot {
@@ -1914,8 +2300,8 @@ impl Roster {
         plan: &PersistPlan,
     ) -> Result<PairMergeOutcome, CoreError> {
         let mut staged = self.clone();
-        staged.record_pending_host(
-            host_id.clone(),
+        let slot = staged.record_pending_host_slot(
+            host_id,
             name,
             static_pub,
             signing_pub,
@@ -1923,7 +2309,7 @@ impl Roster {
             pairing_sas,
             Vec::new(),
         )?;
-        let outcome = staged.merge_pair_plan(&host_id, plan)?;
+        let outcome = staged.with_host_slot(&slot, |r, id| r.merge_pair_plan(id, plan))?;
         *self = staged;
         Ok(outcome)
     }
@@ -2861,5 +3247,645 @@ mod tests {
         ));
         assert_eq!(roster.get("fork-a").unwrap().state, PeerState::Revoked);
         assert_eq!(roster.get("fork-b").unwrap().state, PeerState::Revoked);
+    }
+
+    fn host_keys(seed: u8) -> ([u8; 32], HybridSigningPublicKey) {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+        (
+            *StaticKeypair::from_scalar([seed; 32]).public_bytes(),
+            SigningKeypair::from_seed([seed.wrapping_add(1); 32])
+                .public_key()
+                .clone(),
+        )
+    }
+
+    #[test]
+    fn unconfirmed_host_claim_does_not_block_pairing_with_the_real_host() {
+        let (real_st, real_sig) = host_keys(0x71);
+        let (other_st, other_sig) = host_keys(0x73);
+
+        let mut base = Roster::new();
+        base.record_pending_host(
+            "host-x".into(),
+            "Host X".into(),
+            other_st,
+            other_sig,
+            0,
+            "other sas".into(),
+            vec![],
+        )
+        .unwrap();
+
+        // A later unpinned pairing with the real host records and confirms under its host_id.
+        let mut unpinned = base.clone();
+        unpinned
+            .record_pending_host(
+                "host-x".into(),
+                "Host X".into(),
+                real_st,
+                real_sig.clone(),
+                0,
+                "real sas".into(),
+                vec![],
+            )
+            .unwrap();
+        assert!(matches!(
+            unpinned.confirm_peer("host-x", Some("wrong sas")),
+            Err(CoreError::ProtocolViolation(_))
+        ));
+        let confirmed = unpinned.confirm_peer("host-x", Some("real sas")).unwrap();
+        assert_eq!(confirmed.state, PeerState::Active);
+        assert_eq!(confirmed.static_pub, real_st);
+        assert_eq!(confirmed.device_id, "host-x");
+        assert_eq!(unpinned.get("host-x").unwrap().static_pub, real_st);
+
+        // A later pinned pairing with the real host pins it directly.
+        let mut pinned = base;
+        pinned
+            .insert_pinned_host(
+                "host-x".into(),
+                "Host X".into(),
+                real_st,
+                Some(real_sig),
+                0,
+                vec![],
+            )
+            .unwrap();
+        let entry = pinned.get("host-x").unwrap();
+        assert_eq!(
+            (entry.state, entry.static_pub),
+            (PeerState::Active, real_st)
+        );
+    }
+
+    #[test]
+    fn rejecting_an_unconfirmed_host_claim_never_revokes_its_host_id() {
+        let (real_st, real_sig) = host_keys(0x75);
+        let (other_st, other_sig) = host_keys(0x77);
+        let claim = |r: &mut Roster| {
+            r.record_pending_host(
+                "host-x".into(),
+                "Host X".into(),
+                other_st,
+                other_sig.clone(),
+                0,
+                "other sas".into(),
+                vec![],
+            )
+            .map(|_| ())
+        };
+
+        // Revoking the claim revokes its keys, not the host_id it named.
+        let mut revoked = Roster::new();
+        claim(&mut revoked).unwrap();
+        revoked.revoke_peer("host-x").unwrap();
+        assert!(matches!(
+            revoked.record_pending_host(
+                "host-y".into(),
+                "Host Y".into(),
+                other_st,
+                other_sig.clone(),
+                0,
+                "again".into(),
+                vec![],
+            ),
+            Err(CoreError::PeerRevoked(_))
+        ));
+        revoked
+            .insert_pinned_host(
+                "host-x".into(),
+                "Host X".into(),
+                real_st,
+                Some(real_sig.clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(revoked.get("host-x").unwrap().state, PeerState::Active);
+
+        // Removing the claim leaves no trace.
+        let mut removed = Roster::new();
+        claim(&mut removed).unwrap();
+        removed.remove_pending_peer("host-x").unwrap();
+        assert_eq!(removed.entries().count(), 0);
+        removed
+            .record_pending_host(
+                "host-x".into(),
+                "Host X".into(),
+                real_st,
+                real_sig,
+                0,
+                "real sas".into(),
+                vec![],
+            )
+            .unwrap();
+        removed.confirm_peer("host-x", Some("real sas")).unwrap();
+        assert_eq!(removed.get("host-x").unwrap().static_pub, real_st);
+    }
+
+    #[test]
+    fn host_claims_wait_outside_entries_and_confirm_by_sas() {
+        let real = host_keys(0x79);
+        let other = host_keys(0x7b);
+        let mut roster = Roster::new();
+        record_claim(&mut roster, "named", &real, "sas n").unwrap();
+        record_claim(&mut roster, "named", &other, "sas o").unwrap();
+        assert_eq!(roster.entries().count(), 0);
+        assert_eq!(roster.pending_hosts().count(), 2);
+        assert!(roster.get("named").is_none());
+        assert!(roster.get_or_pending_host("named").is_none());
+        assert_eq!(
+            roster.missing_peer_error("named"),
+            CoreError::PeerPending("named".into())
+        );
+
+        // A repeat claim from the same key replaces its earlier one.
+        record_claim(&mut roster, "named", &real, "sas n2").unwrap();
+        assert_eq!(roster.pending_hosts().count(), 2);
+        assert!(matches!(
+            roster.confirm_peer("named", Some("sas n")),
+            Err(CoreError::ProtocolViolation(_))
+        ));
+
+        let promoted = roster.confirm_peer("named", Some("sas n2")).unwrap();
+        assert_eq!(
+            (promoted.state, promoted.static_pub),
+            (PeerState::Active, real.0)
+        );
+        assert_eq!(promoted.device_id, "named");
+        assert_eq!(roster.pending_hosts().count(), 0);
+
+        // The pending store survives a reload.
+        let mut stored = Roster::new();
+        record_claim(&mut stored, "named", &other, "sas o").unwrap();
+        let loaded = reload(&stored, |_| {});
+        assert_eq!(loaded.pending_hosts().count(), 1);
+        assert_eq!(
+            loaded.get_or_pending_host("named").unwrap().static_pub,
+            other.0
+        );
+    }
+
+    fn record_claim(
+        r: &mut Roster,
+        host_id: &str,
+        keys: &([u8; 32], HybridSigningPublicKey),
+        sas: &str,
+    ) -> Result<(), CoreError> {
+        r.record_pending_host(
+            host_id.into(),
+            "Host".into(),
+            keys.0,
+            keys.1.clone(),
+            0,
+            sas.into(),
+            vec![],
+        )
+        .map(|_| ())
+    }
+
+    /// `roster` as stored JSON with `edit` applied, loaded back.
+    fn reload(roster: &Roster, edit: impl FnOnce(&mut serde_json::Value)) -> Roster {
+        let mut json = serde_json::to_value(roster).unwrap();
+        edit(&mut json);
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn default_host_id_claims_are_held_like_any_other() {
+        let real = host_keys(0x81);
+        let other = host_keys(0x83);
+        let label = device_id(&real.0);
+        let mut base = Roster::new();
+        record_claim(&mut base, &label, &real, "real sas").unwrap();
+        record_claim(&mut base, &label, &other, "other sas").unwrap();
+        let other_id = device_id(&other.0);
+
+        let mut ambiguous = base.clone();
+        assert!(matches!(
+            ambiguous.confirm_peer_without_sas(&label),
+            Err(CoreError::ProtocolViolation(_))
+        ));
+        // Revoking by the id derived from a static key reaches only that key's claim.
+        ambiguous.revoke_peer(&label).unwrap();
+        let left: Vec<_> = ambiguous.pending_hosts().map(|e| e.static_pub).collect();
+        assert_eq!(left, vec![other.0]);
+
+        let mut removed = base.clone();
+        removed.remove_pending_peer(&label).unwrap();
+        assert!(removed.get_or_pending_host(&label).is_none());
+        assert_eq!(
+            removed.missing_peer_error(&label),
+            CoreError::PeerNotFound(label.clone())
+        );
+
+        let mut confirmed = base.clone();
+        confirmed.confirm_peer(&label, Some("real sas")).unwrap();
+        assert_eq!(confirmed.get(&label).unwrap().state, PeerState::Active);
+        assert!(
+            !serde_json::to_string(&confirmed)
+                .unwrap()
+                .contains(&other_id)
+        );
+
+        let mut enrolled = base;
+        enrolled
+            .record_enrolled_machine(real.0, real.1.clone(), "Host".into(), "host".into())
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&enrolled)
+                .unwrap()
+                .contains(&other_id)
+        );
+    }
+
+    #[test]
+    fn host_ids_are_hash_free_and_bounded() {
+        let keys = host_keys(0x85);
+        let longest = "h".repeat(256);
+        for bad in ["a#b".to_string(), "h".repeat(257)] {
+            let mut r = Roster::new();
+            assert!(record_claim(&mut r, &bad, &keys, "sas").is_err(), "{bad}");
+            assert!(
+                r.insert_pinned_host(
+                    bad.clone(),
+                    "H".into(),
+                    keys.0,
+                    Some(keys.1.clone()),
+                    0,
+                    vec![]
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
+        let mut r = Roster::new();
+        record_claim(&mut r, &longest, &keys, "sas").unwrap();
+        r.confirm_peer(&longest, Some("sas")).unwrap();
+    }
+
+    #[test]
+    fn pin_snapshot_requires_an_active_unrevoked_pin() {
+        use crate::crypto::SigningKeypair;
+        use crate::grants::{RevocationListUnsigned, sign_crl};
+
+        let peer = host_keys(0x87);
+        let id = device_id(&peer.0);
+        let mut pending = Roster::new();
+        pending
+            .record_pending_pair(
+                peer.0,
+                Some(peer.1.clone()),
+                "P".into(),
+                "cli".into(),
+                "s".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            pending.pin_snapshot(&id),
+            Err(CoreError::PeerPending(id.clone()))
+        );
+
+        let root = SigningKeypair::from_seed([0x89; 32]);
+        let mut revoked = Roster::new();
+        revoked
+            .insert_pinned_host(
+                "h".into(),
+                "H".into(),
+                peer.0,
+                Some(peer.1.clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: "root".into(),
+                seq: 1,
+                revoked_devices: vec!["h".into()],
+                revoked_nonces: vec![],
+                ts: "2026-11-20T00:00:00Z".into(),
+            },
+            &root,
+        )
+        .unwrap();
+        revoked.ingest_crl(crl, "root", root.public_key()).unwrap();
+        let crl_only = reload(&revoked, |j| j["entries"]["h"]["state"] = "active".into());
+        assert_eq!(crl_only.get("h").unwrap().state, PeerState::Active);
+        assert_eq!(
+            crl_only.pin_snapshot("h"),
+            Err(CoreError::PeerRevoked("h".into()))
+        );
+    }
+
+    #[test]
+    fn stored_pending_host_entries_are_normalized_on_load() {
+        let named = host_keys(0x8b);
+        let default = host_keys(0x8d);
+        let active = host_keys(0x8f);
+        let default_id = device_id(&default.0);
+        let mut seed = Roster::new();
+        for (label, keys) in [
+            ("named", &named),
+            (default_id.as_str(), &default),
+            ("bad", &named),
+        ] {
+            seed.insert_pinned_host(
+                label.into(),
+                "H".into(),
+                keys.0,
+                Some(keys.1.clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        }
+        seed.insert_pinned_host(
+            "kept".into(),
+            "K".into(),
+            active.0,
+            Some(active.1.clone()),
+            0,
+            vec![],
+        )
+        .unwrap();
+        let loaded = reload(&seed, |j| {
+            let entries = j["entries"].as_object_mut().unwrap();
+            for label in ["named", default_id.as_str(), "bad"] {
+                entries[label]["state"] = "pending".into();
+                entries[label]["last_pairing_sas"] = "sas".into();
+            }
+            let bad = entries.remove("bad").unwrap();
+            entries.insert("bad#x".into(), bad);
+        });
+        assert!(loaded.get("named").is_none());
+        assert_eq!(
+            loaded.get_or_pending_host("named").unwrap().state,
+            PeerState::Pending
+        );
+        // A Pending entry under its own device_id holds no foreign label and stays put.
+        assert_eq!(loaded.get(&default_id).unwrap().state, PeerState::Pending);
+        assert!(loaded.get("bad#x").is_none());
+        assert!(loaded.get_or_pending_host("bad#x").is_none());
+        assert_eq!(loaded.get("kept").unwrap().state, PeerState::Active);
+        let mut confirmed = loaded;
+        confirmed.confirm_peer("named", Some("sas")).unwrap();
+        assert_eq!(confirmed.get("named").unwrap().static_pub, named.0);
+    }
+
+    #[test]
+    fn pending_host_claims_are_capped_oldest_first() {
+        use crate::crypto::StaticKeypair;
+
+        let sig = host_keys(0x91).1;
+        let mut r = Roster::new();
+        for i in 0..=64u8 {
+            let st = *StaticKeypair::from_scalar([i.wrapping_add(0x10); 32]).public_bytes();
+            record_claim(&mut r, &format!("h{i}"), &(st, sig.clone()), "sas").unwrap();
+        }
+        assert!(r.get_or_pending_host("h0").is_none());
+        assert!(r.get_or_pending_host("h1").is_some());
+        assert!(r.get_or_pending_host("h64").is_some());
+    }
+
+    #[test]
+    fn revoking_a_claim_never_revokes_an_entry_holding_other_keys() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+        use crate::identity::sign_rotation;
+
+        let k0 = *StaticKeypair::from_scalar([0xA1; 32]).public_bytes();
+        let s0 = SigningKeypair::from_seed([0xA2; 32]);
+        let k1 = *StaticKeypair::from_scalar([0xA3; 32]).public_bytes();
+        let s1 = SigningKeypair::from_seed([0xA4; 32]);
+        let label = device_id(&k0);
+        let other_sig = host_keys(0xA5).1;
+
+        // The genuine host rotated from k0 to k1 and keeps its label.
+        let mut rotated = Roster::new();
+        rotated
+            .insert_pinned_host(
+                label.clone(),
+                "Studio".into(),
+                k0,
+                Some(s0.public_key().clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        let rec = sign_rotation(1, &s0, s1.public_key(), &k1, 1_795_133_000).unwrap();
+        rotated
+            .apply_verified_rotation(&label, &[rec], &k1, s1.public_key())
+            .unwrap();
+        record_claim(&mut rotated, "studio", &(k0, other_sig.clone()), "sas").unwrap();
+        rotated.revoke_peer("studio").unwrap();
+        let genuine = rotated.get(&label).unwrap();
+        assert_eq!((genuine.state, genuine.static_pub), (PeerState::Active, k1));
+        assert_eq!(
+            record_claim(&mut rotated, "x", &(k0, host_keys(0xA7).1), "s"),
+            Err(CoreError::PeerRevoked("x".into()))
+        );
+        assert_eq!(
+            record_claim(
+                &mut rotated,
+                "y",
+                &(host_keys(0xA9).0, other_sig.clone()),
+                "s"
+            ),
+            Err(CoreError::PeerRevoked("y".into()))
+        );
+        rotated
+            .insert_pinned_host(
+                label.clone(),
+                "Studio".into(),
+                k1,
+                Some(s1.public_key().clone()),
+                1,
+                vec![],
+            )
+            .unwrap();
+
+        // A keyless entry for the claim's static key takes the claim's signing key when revoked.
+        let peer = host_keys(0xB1);
+        let mut keyless = Roster::new();
+        keyless
+            .record_pending_pair(peer.0, None, "P".into(), "cli".into(), "p".into())
+            .unwrap();
+        record_claim(&mut keyless, "studio", &(peer.0, other_sig.clone()), "sas").unwrap();
+        keyless.revoke_peer("studio").unwrap();
+        assert_eq!(
+            record_claim(&mut keyless, "z", &(host_keys(0xB3).0, other_sig), "s"),
+            Err(CoreError::PeerRevoked("z".into()))
+        );
+    }
+
+    #[test]
+    fn migration_keeps_own_label_entries_and_drops_revoked_claims() {
+        let client = host_keys(0xB5);
+        let gone = host_keys(0xB7);
+        let mut roster = Roster::new();
+        roster
+            .record_pending_pair(
+                client.0,
+                Some(client.1.clone()),
+                "C".into(),
+                "host".into(),
+                "s".into(),
+            )
+            .unwrap();
+        roster
+            .insert_pinned_host(
+                "gone".into(),
+                "G".into(),
+                gone.0,
+                Some(gone.1.clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        roster.revoke_peer("gone").unwrap();
+        let mut claims = Roster::new();
+        record_claim(&mut claims, "other", &gone, "s").unwrap();
+        let claim = serde_json::to_value(&claims).unwrap()["pending_hosts"][0].clone();
+        let loaded = reload(&roster, |j| j["pending_hosts"] = serde_json::json!([claim]));
+        assert_eq!(
+            loaded.get(&device_id(&client.0)).unwrap().state,
+            PeerState::Pending
+        );
+        assert!(loaded.get_or_pending_host("other").is_none());
+    }
+
+    #[test]
+    fn responder_pairing_respects_a_claimed_signing_key() {
+        let host = host_keys(0xB9);
+        let mut roster = Roster::new();
+        record_claim(&mut roster, "studio", &host, "s").unwrap();
+        assert!(matches!(
+            roster.record_pending_pair(
+                host.0,
+                Some(host_keys(0xBB).1),
+                "P".into(),
+                "cli".into(),
+                "p".into()
+            ),
+            Err(CoreError::ProtocolViolation(_))
+        ));
+    }
+
+    #[test]
+    fn a_claim_is_revocable_by_its_device_id() {
+        let real = host_keys(0xC1);
+        let other = host_keys(0xC3);
+        let mut roster = Roster::new();
+        record_claim(&mut roster, "studio", &real, "real").unwrap();
+        record_claim(&mut roster, "studio", &other, "other").unwrap();
+        roster.revoke_peer(&device_id(&other.0)).unwrap();
+        assert_eq!(
+            record_claim(&mut roster, "q", &(other.0, host_keys(0xC5).1), "s"),
+            Err(CoreError::PeerRevoked("q".into()))
+        );
+        assert_eq!(
+            roster.get_or_pending_host("studio").unwrap().static_pub,
+            real.0
+        );
+        roster.confirm_peer("studio", Some("real")).unwrap();
+        assert_eq!(roster.get("studio").unwrap().state, PeerState::Active);
+    }
+
+    #[test]
+    fn claims_carry_their_wire_floor_by_static_key() {
+        let host = host_keys(0xC7);
+        let mut roster = Roster::new();
+        let slot = roster
+            .record_pending_host_slot(
+                "studio".into(),
+                "S".into(),
+                host.0,
+                host.1.clone(),
+                0,
+                "s".into(),
+                vec![],
+            )
+            .unwrap();
+        roster
+            .with_host_slot(&slot, |r, id| {
+                r.upgrade_peer_to_v2(id, V2PeerSecrets::new([1; 32], [2; 32]))
+            })
+            .unwrap();
+        assert_eq!(roster.pairing_floor(&host.0), WIRE_VERSION_V2);
+        let pinned = roster
+            .insert_pinned_host("other".into(), "O".into(), host.0, Some(host.1), 0, vec![])
+            .unwrap();
+        assert_eq!(pinned.min_wire_version, WIRE_VERSION_V2);
+    }
+
+    #[test]
+    fn revoking_by_device_id_never_follows_a_claimed_label() {
+        let k2 = host_keys(0xD1);
+        let k3 = host_keys(0xD3);
+        let k4 = host_keys(0xD5);
+        let id2 = device_id(&k2.0);
+
+        // Other keys claim the label equal to k2's device id: k2 is still revocable by it.
+        let mut cycle = Roster::new();
+        record_claim(&mut cycle, "studio", &k2, "a").unwrap();
+        record_claim(&mut cycle, &id2, &k3, "b").unwrap();
+        record_claim(&mut cycle, &id2, &k4, "c").unwrap();
+        cycle.revoke_peer(&id2).unwrap();
+        assert_eq!(
+            record_claim(&mut cycle, "q", &(k2.0, host_keys(0xD7).1), "s"),
+            Err(CoreError::PeerRevoked("q".into()))
+        );
+        assert_eq!(cycle.pending_hosts().count(), 2);
+
+        // A single decoy claiming that label is not what gets revoked.
+        let mut decoy = Roster::new();
+        record_claim(&mut decoy, "studio", &k2, "a").unwrap();
+        record_claim(&mut decoy, &id2, &k3, "b").unwrap();
+        decoy.revoke_peer(&id2).unwrap();
+        let left: Vec<_> = decoy.pending_hosts().map(|e| e.static_pub).collect();
+        assert_eq!(left, vec![k3.0]);
+    }
+
+    #[test]
+    fn revoke_pending_host_touches_only_claims_of_that_key() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+        use crate::identity::sign_rotation;
+
+        let k0 = *StaticKeypair::from_scalar([0xE1; 32]).public_bytes();
+        let s0 = SigningKeypair::from_seed([0xE2; 32]);
+        let k1 = *StaticKeypair::from_scalar([0xE3; 32]).public_bytes();
+        let s1 = SigningKeypair::from_seed([0xE4; 32]);
+        let label = device_id(&k0);
+        let mut roster = Roster::new();
+        roster
+            .insert_pinned_host(
+                label.clone(),
+                "Studio".into(),
+                k0,
+                Some(s0.public_key().clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        let rec = sign_rotation(1, &s0, s1.public_key(), &k1, 1_795_133_000).unwrap();
+        roster
+            .apply_verified_rotation(&label, &[rec], &k1, s1.public_key())
+            .unwrap();
+        let other_sig = host_keys(0xE5).1;
+        record_claim(&mut roster, "studio", &(k0, other_sig.clone()), "s").unwrap();
+
+        roster.revoke_pending_host(&label).unwrap();
+        let genuine = roster.get(&label).unwrap();
+        assert_eq!((genuine.state, genuine.static_pub), (PeerState::Active, k1));
+        assert_eq!(roster.pending_hosts().count(), 0);
+        assert_eq!(
+            record_claim(&mut roster, "x", &(k0, host_keys(0xE7).1), "s"),
+            Err(CoreError::PeerRevoked("x".into()))
+        );
+        assert_eq!(
+            roster.revoke_pending_host(&label),
+            Err(CoreError::PeerNotFound(label.clone()))
+        );
     }
 }

@@ -35,7 +35,9 @@ use crate::group::{
     GroupManifest, GroupRendezvousFrame, GroupSeq, decode_group_rendezvous_frame,
     validate_group_seqs,
 };
-use crate::identity::{EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain_pin};
+use crate::identity::{
+    EndpointIdentity, RotationRecord, SigningKeyPin, is_valid_host_id, verify_rotation_chain_pin,
+};
 use crate::noise::{MSG1_LEN, NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::pairing::KeyClaimTamper;
@@ -44,7 +46,7 @@ use crate::pairing::{
     PinnedHost, VerifiedHost, VerifiedRouteStatement, claim_route_seq, human_key_claim,
     verify_human_key_claim,
 };
-use crate::roster::{PairMergeOutcome, PeerState, Roster, V2PeerSecrets};
+use crate::roster::{HostSlot, PairMergeOutcome, PeerState, Roster, V2PeerSecrets};
 use crate::routes::RouteSet;
 use crate::session::{
     REKEY_MAX_AGE_MS, REKEY_MAX_FRAMES, RekeyDirection, RouteExpectation, SessionCloseCode,
@@ -228,7 +230,7 @@ impl Roster {
         };
         let mut staged = self.clone();
         let name = host_name.into();
-        if *host_pin_verified {
+        let slot = if *host_pin_verified {
             staged.insert_pinned_host(
                 host_id.clone(),
                 name,
@@ -237,8 +239,9 @@ impl Roster {
                 *host_rotation_seq,
                 relay_hints,
             )?;
+            HostSlot::Entry(host_id.clone())
         } else {
-            staged.record_pending_host(
+            staged.record_pending_host_slot(
                 host_id.clone(),
                 name,
                 *host_static_pub,
@@ -246,9 +249,9 @@ impl Roster {
                 *host_rotation_seq,
                 pairing_sas.clone(),
                 relay_hints,
-            )?;
-        }
-        staged.upgrade_peer_to_v2(host_id, v2_secrets.clone())?;
+            )?
+        };
+        staged.with_host_slot(&slot, |r, id| r.upgrade_peer_to_v2(id, v2_secrets.clone()))?;
         *self = staged;
         Ok(host_id.clone())
     }
@@ -284,7 +287,7 @@ impl Roster {
         };
         let mut staged = self.clone();
         let name = host_name.into();
-        if *host_pin_verified {
+        let slot = if *host_pin_verified {
             staged.insert_pinned_host(
                 host_id.clone(),
                 name,
@@ -293,8 +296,9 @@ impl Roster {
                 *host_rotation_seq,
                 Vec::new(),
             )?;
+            HostSlot::Entry(host_id.clone())
         } else {
-            staged.record_pending_host(
+            staged.record_pending_host_slot(
                 host_id.clone(),
                 name,
                 *host_static_pub,
@@ -302,12 +306,14 @@ impl Roster {
                 *host_rotation_seq,
                 pairing_sas.clone(),
                 Vec::new(),
-            )?;
-        }
+            )?
+        };
         // Upgrade before the merge so an operator `/v2/relay` route in the plan sees the
         // Wire v2 secrets this pairing produced.
-        staged.upgrade_peer_to_v2(host_id, v2_secrets.clone())?;
-        let merged = staged.merge_pair_plan(host_id, plan)?;
+        let merged = staged.with_host_slot(&slot, |r, id| {
+            r.upgrade_peer_to_v2(id, v2_secrets.clone())?;
+            r.merge_pair_plan(id, plan)
+        })?;
         *self = staged;
         Ok((host_id.clone(), merged))
     }
@@ -2315,8 +2321,7 @@ impl V2SessionInitiator {
                 }
                 self.presented_rotation.clone_from(&host_hello.rotation);
                 if host_hello.host_id != self.target_host_id
-                    || host_hello.host_id.is_empty()
-                    || has_control_chars(&host_hello.host_id)
+                    || !is_valid_host_id(&host_hello.host_id)
                 {
                     return Err(CoreError::HostKeyUnverified);
                 }
@@ -2518,7 +2523,7 @@ impl V2SessionInitiator {
     ) -> Result<(), CoreError> {
         let entry = roster
             .get(&self.target_host_id)
-            .ok_or_else(|| CoreError::PeerNotFound(self.target_host_id.clone()))?;
+            .ok_or_else(|| roster.missing_peer_error(&self.target_host_id))?;
         match entry.state {
             PeerState::Pending => return Err(CoreError::PeerPending(self.target_host_id.clone())),
             PeerState::Revoked => return Err(CoreError::PeerRevoked(self.target_host_id.clone())),
@@ -4496,7 +4501,7 @@ impl V2PakePairInitiator {
                 if host_hello.proto_version != WIRE_VERSION_V2 {
                     return Err(CoreError::UnsupportedVersion(host_hello.proto_version));
                 }
-                if host_hello.host_id.is_empty() || has_control_chars(&host_hello.host_id) {
+                if !is_valid_host_id(&host_hello.host_id) {
                     return Err(CoreError::ProtocolViolation("invalid host_id in HostHello"));
                 }
                 if !host_hello.upgrade.is_empty() {
@@ -5838,6 +5843,53 @@ mod tests {
             }
         }
         panic!("responder never completed");
+    }
+
+    #[test]
+    fn v2_pake_initiator_rejects_a_host_id_with_hash_or_over_the_length_bound() {
+        use crate::pairing::{PairingCodeKind, PairingConfig};
+
+        let dev = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0xA5; 32]),
+            SigningKeypair::from_seed([0xA6; 32]),
+        );
+        let params = PakeArgon2Params::for_testing_only();
+        for bad in ["studio#nas".to_string(), "h".repeat(257)] {
+            let host = EndpointIdentity::from_keys(
+                StaticKeypair::from_scalar([0x95; 32]),
+                SigningKeypair::from_seed([0x96; 32]),
+            )
+            .with_host_id(bad.clone());
+            let mut mgr = PairingManager::new(PairingConfig::default());
+            let code = mgr
+                .issue_code(PairingCodeKind::Remote3Group, TEST_NOW_UNIX)
+                .unwrap();
+            let mut roster = Roster::new();
+            let mut init =
+                V2PakePairInitiator::new(&dev, "Dev", "cli", &code, None, params).unwrap();
+            let mut resp =
+                V2PakePairResponder::new(&host, PairingPathKind::Remote, params).unwrap();
+            let mut to_resp = pake_wire(&init.start().unwrap());
+            let mut err = None;
+            for _ in 0..4 {
+                let Ok(acts) = resp.feed_bytes(&to_resp, TEST_NOW_UNIX, &mut mgr, &mut roster)
+                else {
+                    break;
+                };
+                match init.feed_bytes(&pake_wire(&acts)) {
+                    Ok(next) => to_resp = pake_wire(&next),
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                err,
+                Some(CoreError::ProtocolViolation("invalid host_id in HostHello")),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

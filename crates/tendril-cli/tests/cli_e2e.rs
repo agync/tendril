@@ -813,7 +813,7 @@ async fn batch1_sec04_cli_serve_enforces_live_revoke_and_flock_pair_safety() {
         after_pair.get("revoked-keep").unwrap().state,
         tendril_core::roster::PeerState::Revoked
     );
-    assert!(after_pair.get("host-second").is_some());
+    assert!(after_pair.get_or_pending_host("host-second").is_some());
 }
 
 #[test]

@@ -8,7 +8,7 @@ use subtle::ConstantTimeEq;
 use crate::crypto::{
     HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey,
     P2P_IDENTITY_HKDF_LABEL, SigningKeypair, StaticKeypair, b64url_decode, b64url_decode_array,
-    b64url_encode, hkdf_sha256_32, is_valid_x25519_public_key,
+    b64url_encode, has_control_chars, hkdf_sha256_32, is_valid_x25519_public_key,
 };
 use crate::error::CoreError;
 use crate::relay_auth::{RelayAuthRole, RelayTicket};
@@ -37,6 +37,19 @@ impl SigningKeyPin {
             Self::Hash(hash) => bool::from(key.sha256_hash().ct_eq(hash)),
         }
     }
+}
+
+/// Longest `host_id`, in bytes, accepted from a peer or stored on a roster.
+pub const MAX_HOST_ID_LEN: usize = 256;
+
+/// Reports whether `host_id` is a usable label: non-empty, at most [`MAX_HOST_ID_LEN`] bytes,
+/// and free of control characters and `#`.
+#[must_use]
+pub fn is_valid_host_id(host_id: &str) -> bool {
+    !host_id.is_empty()
+        && host_id.len() <= MAX_HOST_ID_LEN
+        && !host_id.contains('#')
+        && !has_control_chars(host_id)
 }
 
 /// Maximum formatted UTC timestamp supported (`9999-12-31T23:59:59Z`).
@@ -85,6 +98,9 @@ impl EndpointIdentity {
         if host_id.is_empty() {
             return Err(CoreError::IncompletePin("empty host_id".to_string()));
         }
+        if !is_valid_host_id(&host_id) {
+            return Err(CoreError::ProtocolViolation("invalid host_id"));
+        }
         if !is_valid_x25519_public_key(static_key.public_bytes()) {
             return Err(CoreError::IncompletePin(
                 "invalid or low-order public key".to_string(),
@@ -125,10 +141,22 @@ impl EndpointIdentity {
     }
 
     /// Overrides the stable `host_id` carried in `HostHello`.
+    ///
+    /// Peers refuse a `HostHello` whose `host_id` fails [`is_valid_host_id`]; use
+    /// [`Self::try_with_host_id`] to check it here.
     #[must_use]
     pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
         self.host_id = host_id.into();
         self
+    }
+
+    /// [`Self::with_host_id`], refusing a `host_id` that fails [`is_valid_host_id`].
+    pub fn try_with_host_id(self, host_id: impl Into<String>) -> Result<Self, CoreError> {
+        let host_id = host_id.into();
+        if !is_valid_host_id(&host_id) {
+            return Err(CoreError::ProtocolViolation("invalid host_id"));
+        }
+        Ok(self.with_host_id(host_id))
     }
 
     /// Returns the stable `host_id`.

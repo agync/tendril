@@ -845,7 +845,7 @@ impl V2TransportCore {
             } => {
                 let entry = roster
                     .get(target_host_id)
-                    .ok_or_else(|| CoreError::PeerNotFound(target_host_id.clone()))?;
+                    .ok_or_else(|| roster.missing_peer_error(target_host_id))?;
                 match entry.state {
                     PeerState::Pending => {
                         return Err(CoreError::PeerPending(target_host_id.clone()));
@@ -1354,7 +1354,7 @@ fn extract_v2_reconnect_secret(
 ) -> Result<Zeroizing<[u8; 32]>, RuntimeError> {
     let entry = roster
         .get(target_host_id)
-        .ok_or_else(|| CoreError::PeerNotFound(target_host_id.to_owned()))?;
+        .ok_or_else(|| roster.missing_peer_error(target_host_id))?;
     match entry.state {
         PeerState::Pending => return Err(CoreError::PeerPending(target_host_id.to_owned()).into()),
         PeerState::Revoked => return Err(CoreError::PeerRevoked(target_host_id.to_owned()).into()),
