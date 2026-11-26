@@ -4364,8 +4364,22 @@ fn enroll_and_list_routes(
     (enrolled, routes)
 }
 
+fn route_sources(routes: &serde_json::Value) -> Vec<(String, String)> {
+    routes["routes"]
+        .as_array()
+        .expect("routes")
+        .iter()
+        .map(|r| {
+            (
+                r["source"].as_str().expect("source").to_owned(),
+                r["hint"].as_str().expect("hint").to_owned(),
+            )
+        })
+        .collect()
+}
+
 #[test]
-fn cli_e2e_enroll_stores_routes_unless_route_policy_none() {
+fn cli_e2e_enroll_stores_routes_per_route_policy() {
     let host_dir = TempDir::new().expect("host dir");
     let host_info = json_out(&run_tendril(
         host_dir.path(),
@@ -4373,28 +4387,46 @@ fn cli_e2e_enroll_stores_routes_unless_route_policy_none() {
     ));
     let (_serve, _stdout, listening) = spawn_serve(
         host_dir.path(),
-        &["--listen", "127.0.0.1:0", "--allow-enroll"],
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--allow-enroll",
+            "--advertise-endpoint",
+            "direct:192.168.77.5:9",
+        ],
     );
     let endpoint = listening["direct_endpoint"]
         .as_str()
         .expect("direct endpoint")
         .to_owned();
 
+    // Default (all-signed): the host's signed set and the dialed endpoint.
     let (enrolled, routes) = enroll_and_list_routes(host_dir.path(), &host_info, &endpoint, &[]);
     assert_eq!(enrolled["status"], "active", "{enrolled}");
-    let stored = routes["routes"].as_array().expect("routes");
+    let stored = route_sources(&routes);
     assert!(
-        !stored.is_empty(),
-        "the default policy stores the operator endpoint: {routes}"
+        stored
+            .iter()
+            .any(|(src, hint)| src == "signed" && hint.contains("192.168.77.5:9")),
+        "all-signed stores the advertised signed route: {routes}"
     );
+    assert!(stored.iter().any(|(src, _)| src == "committed"), "{routes}");
+
+    // committed-only: the dialed endpoint alone, no signed route.
+    let (enrolled, routes) = enroll_and_list_routes(
+        host_dir.path(),
+        &host_info,
+        &endpoint,
+        &["--route-policy", "committed-only"],
+    );
+    assert_eq!(enrolled["status"], "active", "{enrolled}");
+    let stored = route_sources(&routes);
     assert!(
-        !enrolled["routes_persisted"]
-            .as_array()
-            .expect("routes_persisted")
-            .is_empty(),
-        "{enrolled}"
+        stored.iter().all(|(src, _)| src == "committed") && !stored.is_empty(),
+        "committed-only stores the endpoint only: {routes}"
     );
 
+    // none: nothing is requested or stored.
     let (enrolled, routes) = enroll_and_list_routes(
         host_dir.path(),
         &host_info,
@@ -4402,10 +4434,7 @@ fn cli_e2e_enroll_stores_routes_unless_route_policy_none() {
         &["--route-policy", "none"],
     );
     assert_eq!(enrolled["status"], "active", "{enrolled}");
-    assert!(
-        routes["routes"].as_array().expect("routes").is_empty(),
-        "--route-policy none stores no route: {routes}"
-    );
+    assert!(route_sources(&routes).is_empty(), "{routes}");
     assert!(
         enrolled["routes_persisted"]
             .as_array()

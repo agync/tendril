@@ -565,11 +565,18 @@ test("Node binding validates safe integers and runs full-duplex session ops conc
   }
 });
 
+const ADVERTISED_ROUTE = "direct:192.168.77.5:9";
+
 async function enrollInto(hostEp, cliEp, cfg) {
   if (cfg) cliEp.configureTransportsJson(JSON.stringify(cfg));
+  hostEp.configureTransportsJson(
+    JSON.stringify({ advertise: "explicit", advertised_endpoints: [ADVERTISED_ROUTE] }),
+  );
   const hostInfo = JSON.parse(hostEp.infoJson());
   const cliInfo = JSON.parse(cliEp.infoJson());
   const addr = await hostEp.serveDirect("127.0.0.1:0");
+  // The announcer starts on first use: publish the host's route set before enrolling.
+  await hostEp.refreshRoutes();
   const token = hostEp.mintEnrollmentToken(hostInfo.host_id, cliInfo.device_id, 900);
   const [res] = await Promise.all([
     cliEp.enrollInitiate(
@@ -598,11 +605,25 @@ test("Node enrollInitiate stores routes per route policy and none without a stat
     eps.push(ep);
     return ep;
   };
+  const sources = (routes) => routes.routes.map((r) => [r.source, r.hint]);
   try {
     let { res, routes } = await enrollInto(open(tmp(), "node-enr-host"), open(tmp(), null));
     assert.equal(res.status, "active");
     assert.ok(res.routes_persisted.length > 0, JSON.stringify(res));
-    assert.ok(routes.routes.some((r) => r.source === "committed"), JSON.stringify(routes));
+    assert.ok(
+      sources(routes).some(([s, h]) => s === "signed" && h === ADVERTISED_ROUTE),
+      JSON.stringify(routes),
+    );
+    assert.ok(sources(routes).some(([s]) => s === "committed"), JSON.stringify(routes));
+
+    ({ res, routes } = await enrollInto(open(tmp(), "node-enr-host"), open(tmp(), null), {
+      route_policy: "committed_only",
+    }));
+    assert.equal(res.status, "active");
+    assert.ok(
+      sources(routes).length > 0 && sources(routes).every(([s]) => s === "committed"),
+      JSON.stringify(routes),
+    );
 
     ({ res, routes } = await enrollInto(open(tmp(), "node-enr-host"), open(tmp(), null), {
       route_policy: "none",

@@ -59,6 +59,17 @@ export class Endpoint {
     subject?: string | null,
     ttlSecs?: number | null
   ): string;
+  /**
+   * Enrols as a machine under the endpoint's `route_policy` (default `all_signed`). With a state
+   * directory the host is pinned and its Day-2 routes are stored in one transaction: the host's
+   * signed set and the endpoint dialed as the `committed` route (`committed_only` keeps the
+   * endpoint alone, `none` requests and stores nothing). The result JSON adds `routes_persisted`
+   * (stored routes, `[]` under `none`), `route_warnings` (reasons a route was not stored; the
+   * enrolment still succeeded) and `routes_reason` (`null`, or `"no_state_dir"` on a memory-only
+   * endpoint, which stores no route). A host that predates route sets rejects `all_signed` as a
+   * protocol error before it spends the token: configure `route_policy` `"committed_only"` or
+   * `"none"` for it.
+   */
   enrollInitiate(
     endpoint: string,
     hostId: string,

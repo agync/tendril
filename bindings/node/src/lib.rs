@@ -2337,6 +2337,9 @@ impl Endpoint {
         };
 
         let cfg = self.snapshot_transport_cfg();
+        // The store-backed driver reads the on-disk roster for its pin checks: persist the CRLs
+        // only this endpoint's sessions hold first, so the driver sees them.
+        self.commit_session_roster().await?;
         self.sync_roster_from_store().await?;
         let (fallback_floor, v2_secret) = {
             let roster = self
@@ -2362,34 +2365,46 @@ impl Endpoint {
                 .map_err(to_generic_err)?;
         let device_name = name.unwrap_or_else(|| "node-machine".to_owned());
         let device_kind = kind.unwrap_or_else(|| "machine".to_owned());
-        let res = if let Some(ref store) = self.store {
+        let res = if let Some(store) = self.store.clone() {
             // With a state directory the runtime pins the host and stores its routes in one
-            // roster transaction, under this endpoint's route policy.
+            // roster transaction, under this endpoint's route policy. The driver takes the
+            // state directory lock and does disk I/O, so it runs on a blocking thread, never on
+            // a Tokio worker.
             let opts = M2mEnrollOptions {
                 operator_endpoint: Some(endpoint.clone()),
                 policy: cfg.route_policy,
                 handshake_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
             };
-            drive_m2m_enroll_initiator_with_routes(
-                stream.as_mut(),
-                &self.identity,
-                device_name,
-                device_kind,
-                token,
-                pinned_host,
-                store,
-                opts,
-            )
-            .await
-            .map(|r| {
-                let warnings: Vec<&'static str> =
-                    r.route_warnings.iter().map(|w| w.as_str()).collect();
-                (r.drive, r.routes_persisted, warnings)
+            let identity = Arc::clone(&self.identity);
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(async move {
+                    let res = drive_m2m_enroll_initiator_with_routes(
+                        stream.as_mut(),
+                        &identity,
+                        device_name,
+                        device_kind,
+                        token,
+                        pinned_host,
+                        &store,
+                        opts,
+                    )
+                    .await
+                    .map(|r| {
+                        let warnings: Vec<&'static str> =
+                            r.route_warnings.iter().map(|w| w.as_str()).collect();
+                        (r.drive, r.routes_persisted, warnings)
+                    });
+                    let _ = stream.close().await;
+                    res
+                })
             })
+            .await
+            .map_err(to_generic_err)?
         } else {
             // A memory-only endpoint has no store to hold routes: it pins the host in memory
             // below and requests and stores no route, whatever the route policy.
-            drive_m2m_enroll_initiator_with_floor(
+            let res = drive_m2m_enroll_initiator_with_floor(
                 stream.as_mut(),
                 &self.identity,
                 device_name,
@@ -2400,9 +2415,10 @@ impl Endpoint {
                 DEFAULT_PRE_AUTH_TIMEOUT,
             )
             .await
-            .map(|drive| (drive, Vec::new(), Vec::new()))
+            .map(|drive| (drive, Vec::new(), Vec::new()));
+            let _ = stream.close().await;
+            res
         };
-        let _ = stream.close().await;
         let (res, routes_persisted, route_warnings) = res.map_err(to_generic_err)?;
 
         match res.outcome {

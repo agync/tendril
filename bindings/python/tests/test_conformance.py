@@ -13,6 +13,8 @@ import unittest
 
 import tendril
 
+ADVERTISED_ROUTE = "direct:192.168.77.5:9"
+
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 VECTORS = ROOT / "spec" / "vectors"
 PEER_BIN = ROOT / "target" / "debug" / "tendril-conformance-peer"
@@ -563,9 +565,14 @@ class TendrilPythonTests(unittest.TestCase):
 
         if cfg is not None:
             cli_ep.configure_transports_json(json.dumps(cfg))
+        host_ep.configure_transports_json(
+            json.dumps({"advertise": "explicit", "advertised_endpoints": [ADVERTISED_ROUTE]})
+        )
         host_info = json.loads(host_ep.info_json())
         cli_info = json.loads(cli_ep.info_json())
         addr = host_ep.serve_direct("127.0.0.1:0")
+        # The announcer starts on first use: publish the host's route set before enrolling.
+        host_ep.refresh_routes(None)
         token = host_ep.mint_enrollment_token(host_info["host_id"], cli_info["device_id"], 900)
         t = threading.Thread(target=lambda: host_ep.pair_accept(5000))
         t.start()
@@ -585,29 +592,35 @@ class TendrilPythonTests(unittest.TestCase):
         return res, routes
 
     def test_enroll_initiate_stores_routes_per_route_policy(self) -> None:
-        with tempfile.TemporaryDirectory() as hd, tempfile.TemporaryDirectory() as cd:
-            host_ep = tendril.Endpoint(hd, "py-enr-host")
-            cli_ep = tendril.Endpoint(cd)
-            try:
-                res, routes = self._enroll_into(host_ep, cli_ep)
-                self.assertEqual(res["status"], "active")
-                self.assertTrue(res["routes_persisted"], res)
-                self.assertIn("committed", [r["source"] for r in routes["routes"]], routes)
-            finally:
-                host_ep.close()
-                cli_ep.close()
+        def sources(routes):
+            return [(r["source"], r["hint"]) for r in routes["routes"]]
 
-        with tempfile.TemporaryDirectory() as hd, tempfile.TemporaryDirectory() as cd:
-            host_ep = tendril.Endpoint(hd, "py-enr-host")
-            cli_ep = tendril.Endpoint(cd)
-            try:
-                res, routes = self._enroll_into(host_ep, cli_ep, {"route_policy": "none"})
-                self.assertEqual(res["status"], "active")
-                self.assertEqual(res["routes_persisted"], [])
-                self.assertEqual(routes["routes"], [])
-            finally:
-                host_ep.close()
-                cli_ep.close()
+        def run(cfg):
+            with tempfile.TemporaryDirectory() as hd, tempfile.TemporaryDirectory() as cd:
+                host_ep = tendril.Endpoint(hd, "py-enr-host")
+                cli_ep = tendril.Endpoint(cd)
+                try:
+                    return self._enroll_into(host_ep, cli_ep, cfg)
+                finally:
+                    host_ep.close()
+                    cli_ep.close()
+
+        res, routes = run(None)
+        self.assertEqual(res["status"], "active")
+        self.assertTrue(res["routes_persisted"], res)
+        stored = sources(routes)
+        self.assertIn(("signed", ADVERTISED_ROUTE), stored, routes)
+        self.assertIn("committed", [s for s, _ in stored], routes)
+
+        res, routes = run({"route_policy": "committed_only"})
+        self.assertEqual(res["status"], "active")
+        stored = sources(routes)
+        self.assertTrue(stored and all(s == "committed" for s, _ in stored), routes)
+
+        res, routes = run({"route_policy": "none"})
+        self.assertEqual(res["status"], "active")
+        self.assertEqual(res["routes_persisted"], [])
+        self.assertEqual(routes["routes"], [])
 
     def test_enroll_initiate_without_a_state_dir_stores_no_route(self) -> None:
         with tempfile.TemporaryDirectory() as hd:

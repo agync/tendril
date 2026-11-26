@@ -502,8 +502,8 @@ impl EndpointTransportConfig {
                 || input.p2p_pkarr == Some(true)
                 || input.p2p_advertise_direct_addrs == Some(true)
                 || input.p2p_allow_private_addrs == Some(true)
-                || input.p2p_port_mapping.is_some()
-                || input.p2p_bind_addrs.is_some()
+                || input.p2p_port_mapping == Some(false)
+                || input.p2p_bind_addrs.as_ref().is_some_and(|a| !a.is_empty())
             {
                 return Err((
                     TENDRIL_ERR_PROTOCOL,
@@ -3392,7 +3392,10 @@ pub unsafe extern "C" fn tendril_endpoint_mint_enrollment_token(
 /// transaction, under the endpoint's `route_policy`, with `endpoint` as the operator endpoint:
 /// `*out_json` carries `routes_persisted` (`[]` under `none`) and `route_warnings`. A
 /// memory-only endpoint has no store to hold routes: it requests and stores none, pins the host in
-/// memory, and reports `routes_reason: "no_state_dir"`.
+/// memory, and reports `routes_reason: "no_state_dir"` (`null` with a state directory). The
+/// default `all_signed` asks the host for its route set; a host that predates route sets rejects
+/// that as a protocol error before it spends the token, so configure `route_policy`
+/// `"committed_only"` or `"none"` to enrol against it.
 ///
 /// # Safety
 /// `ep`, `endpoint`, `host_id`, `host_static_pub_32`, `host_signing_pin`, `token_json`, and
@@ -3462,6 +3465,14 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
 
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
+        // The store-backed driver reads the on-disk roster for its pin checks: an empty update
+        // persists the CRLs only this endpoint's sessions hold, so the driver sees them.
+        if ep.store.is_some()
+            && let Err((rc, msg)) = ep.mutate_roster(|_| Ok(()))
+        {
+            set_last_error(msg);
+            return rc;
+        }
         if let Err(e) = ep.load_roster_from_store() {
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
@@ -6601,6 +6612,33 @@ mod p2p_net_option_tests {
     }
 }
 
+#[cfg(all(test, not(feature = "p2p-iroh")))]
+mod no_p2p_net_option_tests {
+    use super::*;
+
+    fn config(json: &str) -> Result<EndpointTransportConfig, (i32, String)> {
+        let input: TransportConfigInput = serde_json::from_str(json).expect("json");
+        EndpointTransportConfig::from_input(input)
+    }
+
+    #[test]
+    fn explicit_default_net_options_are_accepted_without_p2p_iroh() {
+        config(r#"{"p2p_port_mapping":true,"p2p_bind_addrs":[]}"#).expect("defaults");
+    }
+
+    #[test]
+    fn non_default_net_options_are_rejected_without_p2p_iroh() {
+        for raw in [
+            r#"{"p2p_port_mapping":false}"#,
+            r#"{"p2p_bind_addrs":["0.0.0.0:0"]}"#,
+        ] {
+            let (rc, msg) = config(raw).expect_err("non-default");
+            assert_eq!(rc, TENDRIL_ERR_PROTOCOL);
+            assert!(msg.contains("p2p-iroh"), "{msg}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod enroll_route_tests {
     use super::*;
@@ -6743,19 +6781,44 @@ mod enroll_route_tests {
         unsafe { take(out) }
     }
 
+    const ADVERTISED: &str = "direct:192.168.77.5:9";
+
+    fn advertising_host(dir: &std::path::Path) -> Ep {
+        let host = Ep::new(Some(dir), Some("ffi-enr-host"));
+        host.configure(&format!(
+            r#"{{"advertise":"explicit","advertised_endpoints":["{ADVERTISED}"]}}"#
+        ));
+        host
+    }
+
+    fn sources(routes: &serde_json::Value) -> Vec<(String, String)> {
+        routes["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .map(|r| {
+                (
+                    r["source"].as_str().expect("source").to_owned(),
+                    r["hint"].as_str().expect("hint").to_owned(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn default_policy_stores_the_operator_endpoint() {
+    fn all_signed_stores_the_signed_set_and_the_operator_endpoint() {
         let (hd, cd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let host = Ep::new(Some(hd.path()), Some("ffi-enr-host"));
+        let host = advertising_host(hd.path());
         let client = Ep::new(Some(cd.path()), None);
         let endpoint = serve(&host);
         let (result, routes) = enroll(&host, &endpoint, &client);
         assert_eq!(result["status"], "active", "{result}");
-        let stored = routes["routes"].as_array().expect("routes");
+        let stored = sources(&routes);
         assert!(
-            stored.iter().any(|r| r["source"] == "committed"),
-            "the dialed endpoint is stored as the committed route: {routes}"
+            stored.iter().any(|(s, h)| s == "signed" && h == ADVERTISED),
+            "the advertised route is stored as signed: {routes}"
         );
+        assert!(stored.iter().any(|(s, _)| s == "committed"), "{routes}");
         assert!(
             !result["routes_persisted"]
                 .as_array()
@@ -6765,9 +6828,25 @@ mod enroll_route_tests {
     }
 
     #[test]
+    fn committed_only_stores_the_endpoint_alone() {
+        let (hd, cd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let host = advertising_host(hd.path());
+        let client = Ep::new(Some(cd.path()), None);
+        client.configure(r#"{"route_policy":"committed_only"}"#);
+        let endpoint = serve(&host);
+        let (result, routes) = enroll(&host, &endpoint, &client);
+        assert_eq!(result["status"], "active", "{result}");
+        let stored = sources(&routes);
+        assert!(
+            !stored.is_empty() && stored.iter().all(|(s, _)| s == "committed"),
+            "{routes}"
+        );
+    }
+
+    #[test]
     fn route_policy_none_stores_no_route() {
         let (hd, cd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let host = Ep::new(Some(hd.path()), Some("ffi-enr-host"));
+        let host = advertising_host(hd.path());
         let client = Ep::new(Some(cd.path()), None);
         client.configure(r#"{"route_policy":"none"}"#);
         let endpoint = serve(&host);

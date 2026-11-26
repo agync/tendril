@@ -1327,18 +1327,40 @@ mod tests {
         assert_eq!(operator.bind_addrs, only);
     }
 
+    /// A dialer that only reports a provider id; it is never dialed.
+    struct IdOnlyDialer(ProviderId);
+
+    #[async_trait]
+    impl PathDialer for IdOnlyDialer {
+        fn provider_id(&self) -> ProviderId {
+            self.0
+        }
+
+        async fn dial(&self, _endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+            Err(RuntimeError::Closed)
+        }
+    }
+
     #[test]
     fn with_provider_dialer_rejects_p2p_and_relay_dialers() {
-        let relay: Arc<dyn PathDialer> = Arc::new(crate::providers::RelayDialer::new());
-        let err = HintDialers::new(HintDialerConfig::default())
-            .with_provider_dialer(relay)
-            .expect_err("relay dialer must be rejected");
-        assert!(err.to_string().contains("provider"), "{err}");
-        let direct: Arc<dyn PathDialer> = Arc::new(DirectDialer::new());
-        assert!(
-            HintDialers::new(HintDialerConfig::default())
-                .with_provider_dialer(direct)
-                .is_ok()
-        );
+        for id in [ProviderId::P2p, ProviderId::Relay] {
+            let err = HintDialers::new(HintDialerConfig::default())
+                .with_provider_dialer(Arc::new(IdOnlyDialer(id)))
+                .expect_err("p2p and relay dialers must be rejected");
+            assert!(err.to_string().contains("provider"), "{id:?}: {err}");
+        }
+        for id in [
+            ProviderId::Direct,
+            ProviderId::Local,
+            ProviderId::Overlay,
+            ProviderId::Broker,
+        ] {
+            assert!(
+                HintDialers::new(HintDialerConfig::default())
+                    .with_provider_dialer(Arc::new(IdOnlyDialer(id)))
+                    .is_ok(),
+                "{id:?}"
+            );
+        }
     }
 }

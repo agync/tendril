@@ -255,9 +255,18 @@ fn group_e2e_create_add_sync_broadcast_remove() {
     assert_eq!(listed["groups"][0]["seq"], 3);
 
     let b_serve = Serve::start(b_dir, &b_addr, &[]);
-    let c_serve = Serve::start(c_dir, &c_addr, &["--p2p-local"]);
+    let c_serve = Serve::start(c_dir, &c_addr, &["--p2p-local", "--p2p-no-port-mapping"]);
 
-    let synced = run_ok(a_dir, &["group", "sync", &gid, "--p2p-local"]);
+    let synced = run_ok(
+        a_dir,
+        &[
+            "group",
+            "sync",
+            &gid,
+            "--p2p-local",
+            "--p2p-no-port-mapping",
+        ],
+    );
     assert_eq!(synced["seq"], 3);
     let mut delivered = names(&synced, "delivered");
     delivered.sort();
@@ -281,6 +290,7 @@ fn group_e2e_create_add_sync_broadcast_remove() {
             "--message",
             "hello-mesh",
             "--p2p-local",
+            "--p2p-no-port-mapping",
         ],
     );
     assert_eq!(
@@ -536,4 +546,33 @@ fn group_e2e_relay_only_serve_member_registers_its_group_mailbox() {
     assert_eq!(data["utf8"], "over-the-relay");
     c_serve.stop();
     drop(relay);
+}
+
+#[test]
+fn group_dial_commands_reject_an_invalid_p2p_bind_without_enabling_p2p() {
+    let dir = TempDir::new().expect("state dir");
+    assert!(run(dir.path(), &["init"]).status.success());
+    for args in [
+        vec![
+            "group",
+            "sync",
+            "no-such-group",
+            "--p2p-bind",
+            "not-an-addr",
+        ],
+        vec![
+            "group",
+            "broadcast",
+            "no-such-group",
+            "--message",
+            "x",
+            "--p2p-bind",
+            "not-an-addr",
+        ],
+    ] {
+        let out = run(dir.path(), &args);
+        assert!(!out.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--p2p-bind"), "{args:?}: {stderr}");
+    }
 }

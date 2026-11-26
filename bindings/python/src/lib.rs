@@ -2439,6 +2439,16 @@ impl Endpoint {
 
         let cfg = self.snapshot_transport_cfg();
         py.detach(move || {
+            // The store-backed driver reads the on-disk roster for its pin checks: persist the
+            // CRLs only this endpoint's sessions hold first, so the driver sees them.
+            if let Some(store) = store.as_ref() {
+                let _guard = store_lock.blocking_lock();
+                commit_roster(store, &roster_arc, &identity_sync, |disk, mem| {
+                    merge_session_state(disk, mem, &identity_sync);
+                    Ok(())
+                })
+                .map_err(py_err)?;
+            }
             sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity_sync)?;
             let fallback_floor = pinned_pairing_floor(&lock_roster(&roster_arc), &pinned_host);
             let store_for_enroll = store.clone();

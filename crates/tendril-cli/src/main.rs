@@ -409,7 +409,10 @@ enum Command {
         relay_host: Option<String>,
         /// Which of the host's routes to keep: the host's signed set and the endpoint dialed
         /// (`all-signed`, the default), only the endpoint dialed (`committed-only`), or no
-        /// route (`none`: no route set is requested and nothing is stored).
+        /// route (`none`: no route set is requested and nothing is stored). `all-signed`
+        /// asks the host for its route set, which a host that predates route sets rejects
+        /// as a protocol error before it spends the token: enrol against such a host with
+        /// `committed-only` or `none`, or upgrade it.
         #[arg(long, value_enum, default_value_t)]
         route_policy: RoutePolicyArg,
         #[command(flatten)]
@@ -3331,6 +3334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "enrolled_host_id": host_id,
                         "routes_persisted": routes_persisted,
                         "route_warnings": route_warnings,
+                        "routes_reason": serde_json::Value::Null,
                         "status": "active",
                         "host_rotation_seq": host_rotation_seq,
                         "token_nonce": token_nonce,
