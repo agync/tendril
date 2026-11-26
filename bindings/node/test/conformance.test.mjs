@@ -565,6 +565,63 @@ test("Node binding validates safe integers and runs full-duplex session ops conc
   }
 });
 
+async function enrollInto(hostEp, cliEp, cfg) {
+  if (cfg) cliEp.configureTransportsJson(JSON.stringify(cfg));
+  const hostInfo = JSON.parse(hostEp.infoJson());
+  const cliInfo = JSON.parse(cliEp.infoJson());
+  const addr = await hostEp.serveDirect("127.0.0.1:0");
+  const token = hostEp.mintEnrollmentToken(hostInfo.host_id, cliInfo.device_id, 900);
+  const [res] = await Promise.all([
+    cliEp.enrollInitiate(
+      addr,
+      hostInfo.host_id,
+      Buffer.from(hostInfo.static_pub, "base64url"),
+      Buffer.from(hostInfo.signing_pub, "base64url"),
+      token,
+    ),
+    hostEp.pairAccept(5000),
+  ]);
+  const routes = JSON.parse(await cliEp.peerRoutes(hostInfo.host_id));
+  return { res: JSON.parse(res), routes };
+}
+
+test("Node enrollInitiate stores routes per route policy and none without a state dir", async () => {
+  const dirs = [];
+  const tmp = () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "tendril-node-enroll-"));
+    dirs.push(d);
+    return d;
+  };
+  const eps = [];
+  const open = (dir, name) => {
+    const ep = new tendril.Endpoint(dir, name);
+    eps.push(ep);
+    return ep;
+  };
+  try {
+    let { res, routes } = await enrollInto(open(tmp(), "node-enr-host"), open(tmp(), null));
+    assert.equal(res.status, "active");
+    assert.ok(res.routes_persisted.length > 0, JSON.stringify(res));
+    assert.ok(routes.routes.some((r) => r.source === "committed"), JSON.stringify(routes));
+
+    ({ res, routes } = await enrollInto(open(tmp(), "node-enr-host"), open(tmp(), null), {
+      route_policy: "none",
+    }));
+    assert.equal(res.status, "active");
+    assert.deepEqual(res.routes_persisted, []);
+    assert.deepEqual(routes.routes, []);
+
+    ({ res, routes } = await enrollInto(open(tmp(), "node-enr-host"), open(null, null)));
+    assert.equal(res.status, "active");
+    assert.deepEqual(res.routes_persisted, []);
+    assert.equal(res.routes_reason, "no_state_dir");
+    assert.deepEqual(routes.routes, []);
+  } finally {
+    for (const ep of eps) ep.close();
+    for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test("Node M2M enrollment, single-use replay, and anchor revocation", async () => {
   const hostEp = new tendril.Endpoint(null, "node-m2m-host");
   const anchorEp = new tendril.Endpoint(null, "node-m2m-anchor");

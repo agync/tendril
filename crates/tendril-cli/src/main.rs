@@ -36,16 +36,17 @@ use tendril_runtime::redact::{redact_error, redact_hint, redact_text, redact_url
 use tendril_runtime::{
     AddressSource, AdvertiseInputs, AdvertiseMode, ApnsPushMode, AttemptError, BrokerListener,
     BrokerServerConfig, CandidateFailure, ConnectOpts, ConnectResult, DEFAULT_PRE_AUTH_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT, DirectListener, EmbeddedRelay, HalfOpenGuard, InboundQueue,
-    InboundRouter, InboundSession, LastRouteSet, ListAddrSource, OverlayListener, P2pDialer,
-    P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, PairPolicyOptions, PathDialer,
-    PathListener, PathStream, PreAuthRateLimiter, RecoveryRoutes, RelayClientAuth, RelayListener,
-    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer,
-    RouteSetSink, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
-    V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeDialOptions, WakeOutcome, WakeSecret,
-    WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtListener, build_wake_provider,
-    connect_with_wake_policy, dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
-    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_policy,
+    DEFAULT_WRITE_TIMEOUT, DirectListener, EmbeddedRelay, EnrollRouteWarning, HalfOpenGuard,
+    InboundQueue, InboundRouter, InboundSession, LastRouteSet, ListAddrSource, M2mEnrollOptions,
+    OverlayListener, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode,
+    PairPolicyOptions, PathDialer, PathListener, PathStream, PreAuthRateLimiter, RecoveryRoutes,
+    RelayClientAuth, RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig,
+    RosterAccess, RouteAnnouncer, RouteSetSink, RuntimeError, SessionDriver, SessionEvent,
+    StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec,
+    WakeDialOptions, WakeOutcome, WakeSecret, WebRtcUpgradeEndpoint, WebRtcUpgradeHandle,
+    WtListener, build_wake_provider, connect_with_wake_policy,
+    dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
+    drive_m2m_enroll_initiator_with_routes, drive_pair_initiator_with_policy,
     drive_pair_responder_with_store, drive_v2_pair_initiator_with_policy,
     drive_v2_pake_pair_responder_with_store, parse_p2p_bind_addrs, parse_p2p_relay_mode,
     parse_p2p_relay_modes, recv_routed,
@@ -406,6 +407,11 @@ enum Command {
         kind: String,
         #[arg(long)]
         relay_host: Option<String>,
+        /// Which of the host's routes to keep: the host's signed set and the endpoint dialed
+        /// (`all-signed`, the default), only the endpoint dialed (`committed-only`), or no
+        /// route (`none`: no route set is requested and nothing is stored).
+        #[arg(long, value_enum, default_value_t)]
+        route_policy: RoutePolicyArg,
         #[command(flatten)]
         p2p_args: P2pTransportArgs,
         #[command(flatten)]
@@ -3262,6 +3268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name,
             kind,
             relay_host,
+            route_policy,
             p2p_args,
             relay_auth,
         } => {
@@ -3283,7 +3290,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
             )
             .await?;
-            let res = drive_m2m_enroll_initiator_with_store(
+            let opts = M2mEnrollOptions {
+                operator_endpoint: Some(endpoint.clone()),
+                policy: route_policy.into(),
+                handshake_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+            };
+            let res = drive_m2m_enroll_initiator_with_routes(
                 stream.as_mut(),
                 &identity,
                 name,
@@ -3291,12 +3303,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 token,
                 pinned_host,
                 &store,
-                DEFAULT_PRE_AUTH_TIMEOUT,
+                opts,
             )
             .await;
             let _ = stream.close().await;
             let res = res?;
-            match res.outcome {
+            let routes_persisted = res.routes_persisted;
+            let route_warnings: Vec<&str> = res
+                .route_warnings
+                .iter()
+                .map(EnrollRouteWarning::as_str)
+                .collect();
+            for warning in &res.route_warnings {
+                tracing::warn!(reason = warning.as_str(), %warning, "m2m enrolment route not stored");
+            }
+            match res.drive.outcome {
                 PairOutcome::InitiatorEnrolled {
                     device_id,
                     host_id,
@@ -3305,23 +3326,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     host_rotation_seq,
                     token_nonce,
                 } => {
-                    let host_id_out = host_id.clone();
-                    store.update_roster(|roster| {
-                        roster
-                            .insert_pinned_host(
-                                host_id,
-                                host_id_out.clone(),
-                                host_static_pub,
-                                Some(host_signing_pub.clone()),
-                                host_rotation_seq,
-                                Vec::new(),
-                            )
-                            .map(|_| ())
-                            .map_err(Into::into)
-                    })?;
                     print_json_line(&serde_json::json!({
                         "device_id": device_id,
-                        "enrolled_host_id": host_id_out,
+                        "enrolled_host_id": host_id,
+                        "routes_persisted": routes_persisted,
+                        "route_warnings": route_warnings,
                         "status": "active",
                         "host_rotation_seq": host_rotation_seq,
                         "token_nonce": token_nonce,

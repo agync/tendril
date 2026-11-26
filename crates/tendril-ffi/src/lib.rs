@@ -48,13 +48,14 @@ use tendril_runtime::{
     ConcurrentV2Session, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer,
     DirectListener, GroupEvent, GroupFrameKind, GroupFrameOutcome, GroupHub, GroupPool,
     GroupPoolConfig, InboundQueue, InboundRouter, InboundSession, LastRouteSet, LocalDialer,
-    MAX_OUTER_FRAME_LEN, NetworkSnapshot, OverlayDialer, PathDialer, PathListener, PathStream,
-    PreAuthRateLimiter, RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer,
-    RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer, RouteSetSink,
-    RuntimeError, ServedListener, SessionDriver, SessionEvent, StateStore, V2ResponderState,
-    V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeTag, WakeTransportSettings,
-    build_wake_provider, connect_with_wake_policy, deserialize_identity_json_with_signer,
-    dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
+    M2mEnrollOptions, MAX_OUTER_FRAME_LEN, NetworkSnapshot, OverlayDialer, PathDialer,
+    PathListener, PathStream, PreAuthRateLimiter, RelayClientAuth, RelayDialer, RelayListener,
+    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer,
+    RouteSetSink, RuntimeError, ServedListener, SessionDriver, SessionEvent, StateStore,
+    V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeTag,
+    WakeTransportSettings, build_wake_provider, connect_with_wake_policy,
+    deserialize_identity_json_with_signer, dial_endpoint_with_auth,
+    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_routes,
     drive_pair_responder_with_policy, drive_pair_responder_with_store,
     drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
     drive_v2_pake_pair_responder_with_store, group_add_member, group_create, group_ingest_manifest,
@@ -3387,6 +3388,12 @@ pub unsafe extern "C" fn tendril_endpoint_mint_enrollment_token(
 
 /// Initiates autonomous M2M enrollment toward a pinned host using `token_json`.
 ///
+/// With a state directory the host is pinned and its Day-2 routes are stored in one roster
+/// transaction, under the endpoint's `route_policy`, with `endpoint` as the operator endpoint:
+/// `*out_json` carries `routes_persisted` (`[]` under `none`) and `route_warnings`. A
+/// memory-only endpoint has no store to hold routes: it requests and stores none, pins the host in
+/// memory, and reports `routes_reason: "no_state_dir"`.
+///
 /// # Safety
 /// `ep`, `endpoint`, `host_id`, `host_static_pub_32`, `host_signing_pin`, `token_json`, and
 /// `out_json` must be valid non-null pointers (`host_signing_pin_len` must be `1984` or `32`);
@@ -3469,24 +3476,52 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
                 .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
             let device_name = name_s.unwrap_or("ffi-machine").to_owned();
             let device_kind = kind_s.unwrap_or("machine").to_owned();
-            let pair_res = drive_m2m_enroll_initiator_with_floor(
-                stream.as_mut(),
-                &ep.identity,
-                device_name,
-                device_kind,
-                token,
-                pinned_host,
-                pairing_floor,
-                DEFAULT_PRE_AUTH_TIMEOUT,
-            )
-            .await
+            let enrolled = if let Some(store) = ep.store.as_deref() {
+                // With a state directory the runtime pins the host and stores its routes in
+                // one roster transaction, under this endpoint's route policy.
+                let opts = M2mEnrollOptions {
+                    operator_endpoint: Some(endpoint_s.to_owned()),
+                    policy: cfg.route_policy,
+                    handshake_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+                };
+                drive_m2m_enroll_initiator_with_routes(
+                    stream.as_mut(),
+                    &ep.identity,
+                    device_name,
+                    device_kind,
+                    token,
+                    pinned_host,
+                    store,
+                    opts,
+                )
+                .await
+                .map(|r| {
+                    let warnings = r.route_warnings.iter().map(|w| w.as_str()).collect();
+                    (r.drive, r.routes_persisted, warnings)
+                })
+            } else {
+                // A memory-only endpoint has no store to hold routes: it pins the host in
+                // memory below and requests and stores no route, whatever the route policy.
+                drive_m2m_enroll_initiator_with_floor(
+                    stream.as_mut(),
+                    &ep.identity,
+                    device_name,
+                    device_kind,
+                    token,
+                    pinned_host,
+                    pairing_floor,
+                    DEFAULT_PRE_AUTH_TIMEOUT,
+                )
+                .await
+                .map(|drive| (drive, Vec::new(), Vec::new()))
+            }
             .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()));
             let _ = stream.close().await;
-            pair_res
+            enrolled
         });
 
         match res {
-            Ok(pair_res) => match pair_res.outcome {
+            Ok((pair_res, routes_persisted, route_warnings)) => match pair_res.outcome {
                 PairOutcome::InitiatorEnrolled {
                     device_id,
                     host_id,
@@ -3495,7 +3530,12 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
                     host_rotation_seq,
                     token_nonce,
                 } => {
-                    if let Err((rc, msg)) = ep.mutate_roster(|roster| {
+                    if ep.store.is_some() {
+                        if let Err(e) = ep.load_roster_from_store() {
+                            set_last_error(e);
+                            return TENDRIL_ERR_INTERNAL;
+                        }
+                    } else if let Err((rc, msg)) = ep.mutate_roster(|roster| {
                         roster
                             .insert_pinned_host(
                                 host_id.clone(),
@@ -3517,6 +3557,9 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
                         "status": "active",
                         "host_rotation_seq": host_rotation_seq,
                         "token_nonce": token_nonce,
+                        "routes_persisted": routes_json(&routes_persisted),
+                        "route_warnings": route_warnings,
+                        "routes_reason": ep.store.is_none().then_some("no_state_dir"),
                     });
                     unsafe { write_out_cstring(out_json, &out.to_string()) }
                 }
@@ -6555,6 +6598,206 @@ mod p2p_net_option_tests {
             !sockets.is_empty() && sockets.iter().all(|s| s.ip().is_loopback() && s.is_ipv4()),
             "{sockets:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod enroll_route_tests {
+    use super::*;
+    use std::ffi::{CStr, CString};
+
+    fn cs(s: &str) -> CString {
+        CString::new(s).expect("no interior NUL")
+    }
+
+    unsafe fn take(p: *mut c_char) -> String {
+        assert!(!p.is_null());
+        let s = unsafe { CStr::from_ptr(p) }
+            .to_str()
+            .expect("utf8")
+            .to_owned();
+        unsafe { tendril_string_free(p) };
+        s
+    }
+
+    struct Ep(*mut TendrilEndpoint);
+
+    impl Ep {
+        fn new(state_dir: Option<&std::path::Path>, host_id: Option<&str>) -> Self {
+            let dir = state_dir.map(|d| cs(d.to_str().expect("path")));
+            let host = host_id.map(cs);
+            let ep = unsafe {
+                tendril_endpoint_new(
+                    dir.as_ref().map_or(ptr::null(), |d| d.as_ptr()),
+                    host.as_ref().map_or(ptr::null(), |h| h.as_ptr()),
+                )
+            };
+            assert!(!ep.is_null());
+            Self(ep)
+        }
+
+        fn info(&self) -> serde_json::Value {
+            let mut out = ptr::null_mut();
+            assert_eq!(
+                unsafe { tendril_endpoint_info_json(self.0, &raw mut out) },
+                TENDRIL_OK
+            );
+            serde_json::from_str(&unsafe { take(out) }).expect("info json")
+        }
+
+        fn configure(&self, cfg: &str) {
+            let c = cs(cfg);
+            assert_eq!(
+                unsafe { tendril_endpoint_configure_transports_json(self.0, c.as_ptr()) },
+                TENDRIL_OK
+            );
+        }
+    }
+
+    impl Drop for Ep {
+        fn drop(&mut self) {
+            unsafe { tendril_endpoint_free(self.0) };
+        }
+    }
+
+    /// Enrols `client` into `host` once; returns the enrolment result and the client's routes
+    /// for the host.
+    fn enroll(host: &Ep, endpoint: &str, client: &Ep) -> (serde_json::Value, serde_json::Value) {
+        let host_info = host.info();
+        let host_id = host_info["host_id"].as_str().expect("host id").to_owned();
+        let static_pub: [u8; 32] =
+            tendril_core::crypto::b64url_decode_array(host_info["static_pub"].as_str().unwrap())
+                .expect("static pub");
+        let signing_pub =
+            tendril_core::crypto::b64url_decode(host_info["signing_pub"].as_str().unwrap())
+                .expect("signing pub");
+        let dev_id = client.info()["device_id"]
+            .as_str()
+            .expect("device id")
+            .to_owned();
+        let (host_id_c, dev_c) = (cs(&host_id), cs(&dev_id));
+        let mut tok = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                tendril_endpoint_mint_enrollment_token(
+                    host.0,
+                    host_id_c.as_ptr(),
+                    dev_c.as_ptr(),
+                    900,
+                    &raw mut tok,
+                )
+            },
+            TENDRIL_OK
+        );
+        let token = cs(&unsafe { take(tok) });
+        let host_addr = host.0 as usize;
+        let accept = std::thread::spawn(move || {
+            let mut out = ptr::null_mut();
+            let rc = unsafe {
+                tendril_endpoint_pair_accept(host_addr as *mut TendrilEndpoint, 5_000, &raw mut out)
+            };
+            if !out.is_null() {
+                unsafe { tendril_string_free(out) };
+            }
+            rc
+        });
+        let endpoint_c = cs(endpoint);
+        let mut out = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_enroll_initiate(
+                client.0,
+                endpoint_c.as_ptr(),
+                ptr::null(),
+                host_id_c.as_ptr(),
+                static_pub.as_ptr(),
+                signing_pub.as_ptr(),
+                signing_pub.len(),
+                0,
+                token.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &raw mut out,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK, "enroll failed");
+        assert_eq!(accept.join().expect("accept thread"), TENDRIL_OK);
+        let result: serde_json::Value = serde_json::from_str(&unsafe { take(out) }).expect("json");
+        let mut routes = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_peer_routes(client.0, host_id_c.as_ptr(), &raw mut routes) },
+            TENDRIL_OK
+        );
+        (
+            result,
+            serde_json::from_str(&unsafe { take(routes) }).expect("routes json"),
+        )
+    }
+
+    fn serve(host: &Ep) -> String {
+        let listen = cs("127.0.0.1:0");
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_serve_direct(host.0, listen.as_ptr(), &raw mut out) },
+            TENDRIL_OK
+        );
+        unsafe { take(out) }
+    }
+
+    #[test]
+    fn default_policy_stores_the_operator_endpoint() {
+        let (hd, cd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let host = Ep::new(Some(hd.path()), Some("ffi-enr-host"));
+        let client = Ep::new(Some(cd.path()), None);
+        let endpoint = serve(&host);
+        let (result, routes) = enroll(&host, &endpoint, &client);
+        assert_eq!(result["status"], "active", "{result}");
+        let stored = routes["routes"].as_array().expect("routes");
+        assert!(
+            stored.iter().any(|r| r["source"] == "committed"),
+            "the dialed endpoint is stored as the committed route: {routes}"
+        );
+        assert!(
+            !result["routes_persisted"]
+                .as_array()
+                .expect("persisted")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn route_policy_none_stores_no_route() {
+        let (hd, cd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let host = Ep::new(Some(hd.path()), Some("ffi-enr-host"));
+        let client = Ep::new(Some(cd.path()), None);
+        client.configure(r#"{"route_policy":"none"}"#);
+        let endpoint = serve(&host);
+        let (result, routes) = enroll(&host, &endpoint, &client);
+        assert_eq!(result["status"], "active", "{result}");
+        assert!(
+            routes["routes"].as_array().expect("routes").is_empty(),
+            "{routes}"
+        );
+        assert!(
+            result["routes_persisted"]
+                .as_array()
+                .expect("persisted")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn memory_only_endpoint_pins_the_host_and_stores_no_route() {
+        let hd = tempfile::tempdir().unwrap();
+        let host = Ep::new(Some(hd.path()), Some("ffi-enr-host"));
+        let client = Ep::new(None, None);
+        let endpoint = serve(&host);
+        let (result, routes) = enroll(&host, &endpoint, &client);
+        assert_eq!(result["status"], "active", "{result}");
+        assert!(
+            routes["routes"].as_array().expect("routes").is_empty(),
+            "{routes}"
+        );
+        assert_eq!(result["routes_reason"], "no_state_dir", "{result}");
     }
 }
 

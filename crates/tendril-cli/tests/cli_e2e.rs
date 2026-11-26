@@ -4312,3 +4312,105 @@ async fn cli_e2e_wake_apns_mutable_alert_p8_permissions_and_conformance_peer() {
     }));
     peer.call(serde_json::json!({ "op": "shutdown" }));
 }
+
+/// Enrols a fresh client into `host_dir`'s `serve` and returns the `enroll` result line and the
+/// client's `route list` for the host.
+fn enroll_and_list_routes(
+    host_dir: &std::path::Path,
+    host_info: &serde_json::Value,
+    endpoint: &str,
+    extra: &[&str],
+) -> (serde_json::Value, serde_json::Value) {
+    let client_dir = TempDir::new().expect("client dir");
+    let init: serde_json::Value = json_out(&run_tendril(client_dir.path(), &["init"]));
+    let dev_id = init["device_id"].as_str().expect("device id").to_owned();
+    let token_path = host_dir.join(format!("enroll-{dev_id}.json"));
+    let minted = run_tendril(
+        host_dir,
+        &[
+            "enroll-token",
+            "--target-host",
+            "host-enr",
+            "--subject",
+            &dev_id,
+            "--out",
+            token_path.to_str().expect("token path"),
+        ],
+    );
+    assert!(
+        minted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&minted.stderr)
+    );
+    let mut args = vec![
+        "enroll",
+        "--endpoint",
+        endpoint,
+        "--host-id",
+        "host-enr",
+        "--host-static-pub",
+        host_info["static_pub"].as_str().expect("static pub"),
+        "--host-signing-pub",
+        host_info["signing_pub"].as_str().expect("signing pub"),
+        "--token-file",
+        token_path.to_str().expect("token path"),
+    ];
+    args.extend_from_slice(extra);
+    let enrolled = json_out(&run_tendril(client_dir.path(), &args));
+    let routes = json_out(&run_tendril(
+        client_dir.path(),
+        &["route", "list", "--target", "host-enr"],
+    ));
+    (enrolled, routes)
+}
+
+#[test]
+fn cli_e2e_enroll_stores_routes_unless_route_policy_none() {
+    let host_dir = TempDir::new().expect("host dir");
+    let host_info = json_out(&run_tendril(
+        host_dir.path(),
+        &["init", "--host-id", "host-enr"],
+    ));
+    let (_serve, _stdout, listening) = spawn_serve(
+        host_dir.path(),
+        &["--listen", "127.0.0.1:0", "--allow-enroll"],
+    );
+    let endpoint = listening["direct_endpoint"]
+        .as_str()
+        .expect("direct endpoint")
+        .to_owned();
+
+    let (enrolled, routes) = enroll_and_list_routes(host_dir.path(), &host_info, &endpoint, &[]);
+    assert_eq!(enrolled["status"], "active", "{enrolled}");
+    let stored = routes["routes"].as_array().expect("routes");
+    assert!(
+        !stored.is_empty(),
+        "the default policy stores the operator endpoint: {routes}"
+    );
+    assert!(
+        !enrolled["routes_persisted"]
+            .as_array()
+            .expect("routes_persisted")
+            .is_empty(),
+        "{enrolled}"
+    );
+
+    let (enrolled, routes) = enroll_and_list_routes(
+        host_dir.path(),
+        &host_info,
+        &endpoint,
+        &["--route-policy", "none"],
+    );
+    assert_eq!(enrolled["status"], "active", "{enrolled}");
+    assert!(
+        routes["routes"].as_array().expect("routes").is_empty(),
+        "--route-policy none stores no route: {routes}"
+    );
+    assert!(
+        enrolled["routes_persisted"]
+            .as_array()
+            .expect("routes_persisted")
+            .is_empty(),
+        "{enrolled}"
+    );
+}

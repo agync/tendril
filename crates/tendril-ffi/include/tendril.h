@@ -190,6 +190,9 @@ int32_t tendril_endpoint_mint_enrollment_token(
     uint64_t ttl_secs,
     char **out_token_json
 );
+/* Enrols under the endpoint's route_policy. With a state directory the out_json gains
+ * routes_persisted and route_warnings; a memory-only endpoint stores no route and reports
+ * routes_reason "no_state_dir". */
 int32_t tendril_endpoint_enroll_initiate(
     TendrilEndpoint *ep,
     const char *endpoint,

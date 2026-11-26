@@ -56,13 +56,13 @@ use tendril_runtime::{
     ApnsPushMode, BroadcastReport, BrokerDialer, ConcurrentSession, ConcurrentV2Session,
     DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, GroupEvent,
     GroupFrameKind, GroupFrameOutcome, GroupPool, GroupPoolConfig, InboundRouter, LocalDialer,
-    MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth,
-    P2pRelayMode, PathDialer, PathListener, PathStream, RelayClientAuth, RelayDialer,
+    M2mEnrollOptions, MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pListener, P2pOptions,
+    P2pRelayAuth, P2pRelayMode, PathDialer, PathListener, PathStream, RelayClientAuth, RelayDialer,
     RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError,
     SessionDriver, SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind,
     WakeConfigSpec, WakeTag, WakeTransportSettings, build_wake_provider, connect_with_wake_policy,
     dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
-    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_store,
+    drive_m2m_enroll_initiator_with_routes, drive_pair_initiator_with_store,
     drive_pair_responder_with_policy_and_store, drive_pair_responder_with_store,
     drive_v2_pake_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_timeout,
     drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
@@ -2442,12 +2442,20 @@ impl Endpoint {
             sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity_sync)?;
             let fallback_floor = pinned_pairing_floor(&lock_roster(&roster_arc), &pinned_host);
             let store_for_enroll = store.clone();
-            let res = rt.block_on(async move {
+            let route_policy = cfg.route_policy;
+            let (res, routes_persisted, route_warnings) = rt.block_on(async move {
                 let mut stream = dial_endpoint_v2_with_options(&ep_s, rh_s.as_deref(), &cfg, None)
                     .await
                     .map_err(py_err)?;
                 let pair_res = if let Some(ref s) = store_for_enroll {
-                    drive_m2m_enroll_initiator_with_store(
+                    // With a state directory the runtime pins the host and stores its routes in
+                    // one roster transaction, under this endpoint's route policy.
+                    let opts = M2mEnrollOptions {
+                        operator_endpoint: Some(ep_s.clone()),
+                        policy: route_policy,
+                        handshake_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+                    };
+                    drive_m2m_enroll_initiator_with_routes(
                         stream.as_mut(),
                         &identity,
                         name_s,
@@ -2455,10 +2463,17 @@ impl Endpoint {
                         token,
                         pinned_host,
                         s,
-                        DEFAULT_PRE_AUTH_TIMEOUT,
+                        opts,
                     )
                     .await
+                    .map(|r| {
+                        let warnings: Vec<&'static str> =
+                            r.route_warnings.iter().map(|w| w.as_str()).collect();
+                        (r.drive, r.routes_persisted, warnings)
+                    })
                 } else {
+                    // A memory-only endpoint has no store to hold routes: it pins the host in
+                    // memory below and requests and stores no route, whatever the route policy.
                     drive_m2m_enroll_initiator_with_floor(
                         stream.as_mut(),
                         &identity,
@@ -2470,6 +2485,7 @@ impl Endpoint {
                         DEFAULT_PRE_AUTH_TIMEOUT,
                     )
                     .await
+                    .map(|drive| (drive, Vec::new(), Vec::new()))
                 }
                 .map_err(py_err);
                 let _ = stream.close().await;
@@ -2485,31 +2501,43 @@ impl Endpoint {
                     host_rotation_seq,
                     token_nonce,
                 } => {
-                    update_roster_blocking(
-                        store.as_ref(),
-                        &store_lock,
-                        &roster_arc,
-                        &identity_sync,
-                        |roster| {
-                            roster
-                                .insert_pinned_host(
-                                    host_id.clone(),
-                                    host_id.clone(),
-                                    host_static_pub,
-                                    Some(host_signing_pub),
-                                    host_rotation_seq,
-                                    Vec::new(),
-                                )
-                                .map(|_| ())
-                                .map_err(RuntimeError::from)
-                        },
-                    )?;
+                    if store.is_some() {
+                        sync_roster_blocking(
+                            store.as_ref(),
+                            &store_lock,
+                            &roster_arc,
+                            &identity_sync,
+                        )?;
+                    } else {
+                        update_roster_blocking(
+                            store.as_ref(),
+                            &store_lock,
+                            &roster_arc,
+                            &identity_sync,
+                            |roster| {
+                                roster
+                                    .insert_pinned_host(
+                                        host_id.clone(),
+                                        host_id.clone(),
+                                        host_static_pub,
+                                        Some(host_signing_pub),
+                                        host_rotation_seq,
+                                        Vec::new(),
+                                    )
+                                    .map(|_| ())
+                                    .map_err(RuntimeError::from)
+                            },
+                        )?;
+                    }
                     Ok(serde_json::json!({
                         "device_id": device_id,
                         "host_id": host_id,
                         "status": "active",
                         "host_rotation_seq": host_rotation_seq,
                         "token_nonce": token_nonce,
+                        "routes_persisted": routes_json_array(&routes_persisted),
+                        "route_warnings": route_warnings,
+                        "routes_reason": store.is_none().then_some("no_state_dir"),
                     })
                     .to_string())
                 }
