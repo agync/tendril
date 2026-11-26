@@ -284,14 +284,15 @@ pub trait AddrPolicy: Send + Sync + fmt::Debug {
     }
 }
 
-/// Policy of dials outside the egress layer: rejects cloud metadata, link-local and
-/// unspecified addresses.
+/// Policy of dials outside the egress layer: rejects the always-blocked set
+/// ([`DestClass::Blocked`]), the same destinations [`EgressAddrPolicy`] refuses. Loopback, LAN
+/// and overlay addresses stay allowed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultAddrPolicy;
 
 impl AddrPolicy for DefaultAddrPolicy {
     fn check(&self, ip: IpAddr) -> Result<(), SkipReason> {
-        if super::is_metadata_or_link_local_ip(ip) {
+        if classify_destination(ip) == DestClass::Blocked {
             Err(SkipReason::BlockedAddress)
         } else {
             Ok(())
@@ -975,6 +976,46 @@ mod tests {
         for (raw, want) in cases {
             let ip: IpAddr = raw.parse().expect("ip");
             assert_eq!(classify_destination(ip), *want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn default_policy_rejects_every_blocked_destination_and_keeps_local_ranges() {
+        for raw in [
+            "2001::1",
+            "64:ff9b:1::1",
+            "fec0::1",
+            "64:ff9b::a9fe:a9fe",
+            "2002:a9fe:a9fe::1",
+            "::ffff:0:a9fe:a9fe",
+            "::a9fe:a9fe",
+            "169.254.169.254",
+            "fe80::1",
+            "ff02::1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "0.1.2.3",
+            "255.255.255.255",
+        ] {
+            let ip: IpAddr = raw.parse().expect("ip");
+            assert_eq!(
+                DefaultAddrPolicy.check(ip),
+                Err(SkipReason::BlockedAddress),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "127.0.0.1",
+            "::1",
+            "10.1.2.3",
+            "192.168.1.20",
+            "fd34::9",
+            "100.64.0.1",
+            "203.0.113.7",
+            "2001:4860::1",
+        ] {
+            let ip: IpAddr = raw.parse().expect("ip");
+            assert_eq!(DefaultAddrPolicy.check(ip), Ok(()), "{raw}");
         }
     }
 

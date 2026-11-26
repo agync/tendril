@@ -960,7 +960,8 @@ fn parse_p2p_endpoint_trusting(
                     let sock: SocketAddr = val.parse().map_err(|err| {
                         RuntimeError::Protocol(format!("invalid iroh socket addr: {err}"))
                     })?;
-                    if super::is_metadata_or_link_local_ip(sock.ip())
+                    if classify_destination(sock.ip()) == DestClass::Blocked
+                        || super::is_metadata_or_link_local_ip(sock.ip())
                         || (!allow_private_addrs && super::is_private_or_reserved_ip(sock.ip()))
                     {
                         continue;
@@ -1522,7 +1523,8 @@ async fn check_relay_hosts_pinned(
         }
         for sock in resolved {
             let ip = sock.ip();
-            if super::is_metadata_or_link_local_ip(ip)
+            if classify_destination(ip) == DestClass::Blocked
+                || super::is_metadata_or_link_local_ip(ip)
                 || (!allow_private_addrs && !trusted && super::is_private_or_reserved_ip(ip))
             {
                 return Err(RuntimeError::Protocol(format!(
@@ -1874,6 +1876,103 @@ pub(crate) mod tests {
         assert!(parse_p2p_endpoint_filtered(&public, false).is_ok());
         let meta = format!("iroh://{ep_id}?relay=https://169.254.169.254/");
         assert!(parse_p2p_endpoint_filtered(&meta, true).is_err());
+    }
+
+    const BLOCKED_ADDRS: [&str; 6] = [
+        "[2001::1]:4433",
+        "[64:ff9b:1::1]:4433",
+        "[fec0::1]:4433",
+        "[64:ff9b::a9fe:a9fe]:4433",
+        "[2002:a9fe:a9fe::1]:4433",
+        "[::ffff:0:a9fe:a9fe]:4433",
+    ];
+
+    #[test]
+    fn direct_endpoint_parse_drops_blocked_addr_hints_even_when_private_is_allowed() {
+        let ep_id = iroh::SecretKey::from_bytes(&[31u8; 32]).public();
+        for sock in BLOCKED_ADDRS {
+            for allow_private in [false, true] {
+                let uri = format!("iroh://{ep_id}?addr={sock}");
+                let parsed = parse_p2p_endpoint_filtered(&uri, allow_private).expect("parse");
+                assert_eq!(parsed.ip_addrs().count(), 0, "{sock} allow={allow_private}");
+            }
+        }
+        let uri = format!("iroh://{ep_id}?addr=127.0.0.1:4433&addr=[::1]:4433&addr=10.0.0.5:4433");
+        let parsed = parse_p2p_endpoint_filtered(&uri, true).expect("parse");
+        assert_eq!(
+            parsed.ip_addrs().count(),
+            3,
+            "loopback and LAN stay allowed"
+        );
+    }
+
+    #[test]
+    fn direct_endpoint_parse_rejects_blocked_relay_literals() {
+        let ep_id = iroh::SecretKey::from_bytes(&[32u8; 32]).public();
+        for sock in BLOCKED_ADDRS {
+            let host = sock.rsplit_once(':').expect("port").0;
+            let uri = format!("iroh://{ep_id}?relay=https://{host}/");
+            for allow_private in [false, true] {
+                assert!(
+                    parse_p2p_endpoint_filtered(&uri, allow_private).is_err(),
+                    "{host} allow={allow_private}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_host_check_rejects_blocked_resolved_addresses() {
+        let relay = vec!["https://pinned-relay.invalid/".to_owned()];
+        for sock in BLOCKED_ADDRS {
+            let ip: IpAddr = sock.parse::<SocketAddr>().expect("sock").ip();
+            let pins = [("pinned-relay.invalid".to_owned(), vec![ip])];
+            for (allow_private, trusted) in [(false, &[][..]), (true, &[][..]), (true, &relay[..])]
+            {
+                assert!(
+                    check_relay_hosts_pinned(&relay, allow_private, trusted, &pins)
+                        .await
+                        .is_err(),
+                    "{sock} allow={allow_private} trusted={}",
+                    !trusted.is_empty()
+                );
+            }
+        }
+        for ip in ["127.0.0.1", "::1", "10.0.0.5", "fd34::9"] {
+            let ip: IpAddr = ip.parse().expect("ip");
+            let pins = [("pinned-relay.invalid".to_owned(), vec![ip])];
+            assert!(
+                check_relay_hosts_pinned(&relay, true, &relay, &pins)
+                    .await
+                    .is_ok(),
+                "{ip} stays allowed for a trusted relay"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_relay_binds_refuse_blocked_relay_hosts() {
+        for sock in BLOCKED_ADDRS {
+            let ip: IpAddr = sock.parse::<SocketAddr>().expect("sock").ip();
+            let literal = sock.rsplit_once(':').expect("port").0;
+            let by_literal = P2pDialer::bind_with_options(
+                P2pOptions::for_dialer(P2pRelayMode::Custom(format!("https://{literal}/")))
+                    .with_allow_private_addrs(true)
+                    .with_port_mapping(false),
+            )
+            .await;
+            assert!(by_literal.is_err(), "{sock} literal relay");
+            let by_pin = P2pDialer::bind_with_options(
+                P2pOptions::for_dialer(P2pRelayMode::Custom(
+                    "https://pinned-relay.invalid/".to_owned(),
+                ))
+                .with_allow_private_addrs(true)
+                .with_dns_pins(vec![("pinned-relay.invalid".to_owned(), vec![ip])])
+                .with_port_mapping(false),
+            )
+            .await;
+            assert!(by_pin.is_err(), "{sock} pinned relay");
+        }
     }
 
     #[test]

@@ -871,12 +871,17 @@ fn validate_url_host_safety(parsed: &url::Url) -> Result<&str, RuntimeError> {
             "cloud metadata hostname is not permitted".into(),
         ));
     }
-    if let Ok(ip) = bare.trim_end_matches('.').parse::<IpAddr>()
-        && is_metadata_or_link_local_ip(ip)
-    {
-        return Err(RuntimeError::Protocol(format!(
-            "link-local or metadata address '{ip}' is not permitted"
-        )));
+    if let Ok(ip) = bare.trim_end_matches('.').parse::<IpAddr>() {
+        if is_metadata_or_link_local_ip(ip) {
+            return Err(RuntimeError::Protocol(format!(
+                "link-local or metadata address '{ip}' is not permitted"
+            )));
+        }
+        if egress::classify_destination(ip) == egress::DestClass::Blocked {
+            return Err(RuntimeError::Protocol(format!(
+                "blocked address '{ip}' is not permitted"
+            )));
+        }
     }
     Ok(bare)
 }
@@ -1121,6 +1126,49 @@ mod tests {
         .expect("loopback stays permitted");
         assert!(stream.peer_addr().expect("peer").ip().is_loopback());
         assert!(accept.await.expect("join"));
+    }
+
+    #[tokio::test]
+    async fn connect_ws_resolved_fails_closed_on_every_blocked_destination() {
+        for host in [
+            "[2001::1]",
+            "[64:ff9b:1::1]",
+            "[fec0::1]",
+            "[64:ff9b::a9fe:a9fe]",
+            "[2002:a9fe:a9fe::1]",
+            "[::ffff:0:a9fe:a9fe]",
+            "224.0.0.1",
+            "240.0.0.1",
+        ] {
+            let err = connect_ws_resolved(format!("ws://{host}:9/"), None, "test connect")
+                .await
+                .expect_err("blocked relay must fail closed");
+            assert_eq!(
+                err.skip_reason(),
+                Some(egress::SkipReason::BlockedAddress),
+                "{host}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_host_safety_rejects_every_blocked_literal_and_keeps_local_ranges() {
+        for host in [
+            "[2001::1]",
+            "[64:ff9b:1::1]",
+            "[fec0::1]",
+            "[64:ff9b::a9fe:a9fe]",
+            "[2002:a9fe:a9fe::1]",
+            "[::ffff:0:a9fe:a9fe]",
+            "224.0.0.1",
+        ] {
+            let parsed = ws_url(&format!("wss://{host}:9/"));
+            assert!(validate_url_host_safety(&parsed).is_err(), "{host}");
+        }
+        for host in ["127.0.0.1", "[::1]", "10.0.0.5", "[fd34::9]", "100.64.0.1"] {
+            let parsed = ws_url(&format!("wss://{host}:9/"));
+            assert!(validate_url_host_safety(&parsed).is_ok(), "{host}");
+        }
     }
 
     #[tokio::test]
