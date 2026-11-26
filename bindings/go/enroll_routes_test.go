@@ -69,5 +69,16 @@ func TestEnrollInitiateReportsRouteFields(t *testing.T) {
 		if res.RoutesReason != "" {
 			t.Fatalf("routes_reason %q", res.RoutesReason)
 		}
+		want := tendril.Route{Hint: "direct:" + host.addr, Source: "committed"}
+		found := false
+		for _, r := range res.RoutesPersisted {
+			found = found || r == want
+		}
+		if !found {
+			t.Fatalf("routes_persisted %+v lacks %+v", res.RoutesPersisted, want)
+		}
+		if len(res.RouteWarnings) != 0 {
+			t.Fatalf("route_warnings %+v", res.RouteWarnings)
+		}
 	})
 }
