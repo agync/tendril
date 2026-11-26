@@ -2310,6 +2310,66 @@ impl Endpoint {
         })
     }
 
+    /// The unconfirmed host claims left by unpinned pairing, oldest first, as a JSON array of
+    /// `{"host_id", "device_id", "name", "static_pub", "signing_pub_hash", "rotation_seq",
+    /// "min_wire_version", "pairing_sas"}`. `host_id` is the unauthenticated label a claim names
+    /// and `device_id` the id derived from its static key in the handshake.
+    fn pending_hosts(&self, py: Python<'_>) -> PyResult<String> {
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let roster = Arc::clone(&self.roster);
+        let identity = Arc::clone(&self.identity);
+        py.detach(move || {
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
+            Ok(tendril_runtime::pending_hosts_json(&lock_roster(&roster)).to_string())
+        })
+    }
+
+    /// Drops every unconfirmed host claim naming `host_id` and revokes nothing.
+    fn remove_pending_peer(&self, py: Python<'_>, host_id: &str) -> PyResult<()> {
+        let identity = Arc::clone(&self.identity);
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let host = host_id.to_owned();
+        py.detach(move || {
+            update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster_arc,
+                &identity,
+                |roster| {
+                    roster
+                        .remove_pending_peer(&host)
+                        .map_err(RuntimeError::from)
+                },
+            )
+        })
+    }
+
+    /// Revokes the keys of the unconfirmed host claims whose handshake-derived `device_id`
+    /// equals `device_id`; a claimed `host_id` never matches.
+    fn revoke_pending_host(&self, py: Python<'_>, device_id: &str) -> PyResult<()> {
+        let identity = Arc::clone(&self.identity);
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let device = device_id.to_owned();
+        py.detach(move || {
+            update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster_arc,
+                &identity,
+                |roster| {
+                    roster
+                        .revoke_pending_host(&device)
+                        .map_err(RuntimeError::from)
+                },
+            )
+        })
+    }
+
     fn add_trust_anchor(
         &self,
         py: Python<'_>,

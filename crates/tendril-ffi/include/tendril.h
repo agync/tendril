@@ -175,6 +175,17 @@ int32_t tendril_endpoint_mint_grant(
     char **out_grant_json
 );
 int32_t tendril_endpoint_revoke_peer(TendrilEndpoint *ep, const char *peer_id);
+/* Unconfirmed host claims left by unpinned pairing. out_json: array, oldest first, of
+ * {"host_id", "device_id", "name", "static_pub", "signing_pub_hash", "rotation_seq",
+ * "min_wire_version", "pairing_sas"}; host_id is the unauthenticated label a claim names and
+ * device_id the id derived from its static key in the handshake. Free out_json with
+ * tendril_string_free. */
+int32_t tendril_endpoint_pending_hosts(TendrilEndpoint *ep, char **out_json);
+/* Drops every claim naming host_id and revokes nothing. TENDRIL_ERR_NOT_FOUND when none. */
+int32_t tendril_endpoint_remove_pending_peer(TendrilEndpoint *ep, const char *host_id);
+/* Revokes the keys of the claims whose device_id matches, never a claimed host_id.
+ * TENDRIL_ERR_NOT_FOUND when no claim has that device_id. */
+int32_t tendril_endpoint_revoke_pending_host(TendrilEndpoint *ep, const char *device_id);
 
 int32_t tendril_endpoint_add_trust_anchor(
     TendrilEndpoint *ep,

@@ -1160,8 +1160,27 @@ export class TendrilWebClient {
     await this.#mutateRoster(() => this.#roster.confirm_peer(peerId, sas));
   }
 
+  /** Drops every unconfirmed host claim naming `peerId` and revokes nothing. */
   async removePendingPeer(peerId) {
     await this.#mutateRoster(() => this.#roster.remove_pending_peer(peerId));
+  }
+
+  /**
+   * The unconfirmed host claims left by unpinned pairing, oldest first. `host_id` is the
+   * unauthenticated label a claim names and `device_id` the id derived from its static key in
+   * the handshake.
+   */
+  pendingHosts() {
+    this.#ensureOpen();
+    return JSON.parse(this.#roster.pending_hosts_json());
+  }
+
+  /**
+   * Revokes the keys of the claims whose handshake-derived `deviceId` matches. A claimed
+   * `host_id` never matches, and no roster entry holding other keys is touched.
+   */
+  async revokePendingHost(deviceId) {
+    await this.#mutateRoster(() => this.#roster.revoke_pending_host(deviceId));
   }
 
   async addTrustAnchor(anchorId, signingPubB64) {

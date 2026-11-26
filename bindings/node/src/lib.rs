@@ -2249,6 +2249,37 @@ impl Endpoint {
         Ok(())
     }
 
+    /// The unconfirmed host claims left by unpinned pairing, oldest first, as a JSON array of
+    /// `{"host_id", "device_id", "name", "static_pub", "signing_pub_hash", "rotation_seq",
+    /// "min_wire_version", "pairing_sas"}`. `host_id` is the unauthenticated label a claim names
+    /// and `device_id` the id derived from its static key in the handshake.
+    #[napi]
+    pub async fn pending_hosts(&self) -> Result<String> {
+        self.sync_roster_from_store().await?;
+        Ok(tendril_runtime::pending_hosts_json(&lock_roster(&self.roster)).to_string())
+    }
+
+    /// Drops every unconfirmed host claim naming `host_id` and revokes nothing.
+    #[napi]
+    pub fn remove_pending_peer(&self, host_id: String) -> Result<()> {
+        self.update_roster_sync(|roster| {
+            roster
+                .remove_pending_peer(&host_id)
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    /// Revokes the keys of the unconfirmed host claims whose handshake-derived `device_id`
+    /// equals `device_id`; a claimed `host_id` never matches.
+    #[napi]
+    pub fn revoke_pending_host(&self, device_id: String) -> Result<()> {
+        self.update_roster_sync(|roster| {
+            roster
+                .revoke_pending_host(&device_id)
+                .map_err(RuntimeError::from)
+        })
+    }
+
     #[napi]
     pub fn add_trust_anchor(&self, anchor_id: String, signing_pub: Buffer) -> Result<()> {
         let key = parse_hybrid_signing_pub(signing_pub.as_ref(), "signing_pub")?;

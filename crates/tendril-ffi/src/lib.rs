@@ -3257,6 +3257,103 @@ pub unsafe extern "C" fn tendril_endpoint_revoke_peer(
     })
 }
 
+/// Writes the unconfirmed host claims left by unpinned pairing, oldest first, as a JSON array of
+/// `{"host_id", "device_id", "name", "static_pub", "signing_pub_hash", "rotation_seq",
+/// "min_wire_version", "pairing_sas"}`. `host_id` is the unauthenticated label a claim names and
+/// `device_id` the id derived from its static key during the handshake.
+///
+/// # Safety
+/// `ep` and `out_json` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_pending_hosts(
+    ep: *mut TendrilEndpoint,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_json.is_null() {
+            set_last_error("null endpoint or out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let ep = unsafe { &*ep };
+        let roster = match ep.route_write(|access| access.load()) {
+            Ok(roster) => roster,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return runtime_error_code(&e);
+            }
+        };
+        let claims = tendril_runtime::pending_hosts_json(&roster);
+        unsafe { write_out_cstring(out_json, &claims.to_string()) }
+    })
+}
+
+/// Drops every unconfirmed host claim naming `host_id` and revokes nothing.
+/// Returns `TENDRIL_ERR_NOT_FOUND` when nothing is pending under that id.
+///
+/// # Safety
+/// `ep` and `host_id` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_remove_pending_peer(
+    ep: *mut TendrilEndpoint,
+    host_id: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(host_s) = (unsafe { cstr_to_str(host_id, "host_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let ep = unsafe { &*ep };
+        match ep.mutate_roster(|roster| {
+            roster
+                .remove_pending_peer(host_s)
+                .map_err(|e| (revoke_error_code(&e), e.to_string()))
+        }) {
+            Ok(()) => TENDRIL_OK,
+            Err((rc, msg)) => {
+                set_last_error(msg);
+                rc
+            }
+        }
+    })
+}
+
+/// Revokes the keys of the unconfirmed host claims whose handshake-derived `device_id` equals
+/// `device_id`. It matches no claimed `host_id` and touches no roster entry holding other keys.
+/// Returns `TENDRIL_ERR_NOT_FOUND` when no claim has that `device_id`.
+///
+/// # Safety
+/// `ep` and `device_id` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_revoke_pending_host(
+    ep: *mut TendrilEndpoint,
+    device_id: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(device_s) = (unsafe { cstr_to_str(device_id, "device_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let ep = unsafe { &*ep };
+        match ep.mutate_roster(|roster| {
+            roster
+                .revoke_pending_host(device_s)
+                .map_err(|e| (revoke_error_code(&e), e.to_string()))
+        }) {
+            Ok(()) => TENDRIL_OK,
+            Err((rc, msg)) => {
+                set_last_error(msg);
+                rc
+            }
+        }
+    })
+}
+
 /// Registers an active external hybrid signing trust anchor for M2M enrollment and enables M2M mode.
 ///
 /// # Safety
