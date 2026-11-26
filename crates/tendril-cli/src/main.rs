@@ -34,16 +34,16 @@ use tendril_runtime::providers::hints::{
 };
 use tendril_runtime::redact::{redact_error, redact_hint, redact_text, redact_url_str};
 use tendril_runtime::{
-    AddressSource, AdvertiseInputs, AdvertiseMode, AttemptError, BrokerListener,
+    AddressSource, AdvertiseInputs, AdvertiseMode, ApnsPushMode, AttemptError, BrokerListener,
     BrokerServerConfig, CandidateFailure, ConnectOpts, ConnectResult, DEFAULT_PRE_AUTH_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT, DirectListener, EmbeddedRelay, HalfOpenGuard, HttpWakeProvider,
-    InboundQueue, InboundRouter, InboundSession, LastRouteSet, ListAddrSource, OverlayListener,
-    P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, PairPolicyOptions, PathDialer,
+    DEFAULT_WRITE_TIMEOUT, DirectListener, EmbeddedRelay, HalfOpenGuard, InboundQueue,
+    InboundRouter, InboundSession, LastRouteSet, ListAddrSource, OverlayListener, P2pDialer,
+    P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, PairPolicyOptions, PathDialer,
     PathListener, PathStream, PreAuthRateLimiter, RecoveryRoutes, RelayClientAuth, RelayListener,
     RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer,
     RouteSetSink, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
-    V2SessionDriver, WakeAdapterKind, WakeDialOptions, WakeOutcome, WakeSecret, WakeTarget,
-    WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtListener,
+    V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeDialOptions, WakeOutcome, WakeSecret,
+    WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtListener, build_wake_provider,
     dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_policy,
     drive_pair_responder_with_store, drive_v2_pair_initiator_with_policy,
@@ -143,6 +143,8 @@ enum WakeAdapterArg {
     UnifiedPush,
     Webhook,
     Apns,
+    #[value(alias = "apns_h2")]
+    ApnsH2,
     Fcm,
 }
 
@@ -152,7 +154,24 @@ impl From<WakeAdapterArg> for WakeAdapterKind {
             WakeAdapterArg::UnifiedPush => Self::UnifiedPush,
             WakeAdapterArg::Webhook => Self::Webhook,
             WakeAdapterArg::Apns => Self::Apns,
+            WakeAdapterArg::ApnsH2 => Self::ApnsH2,
             WakeAdapterArg::Fcm => Self::Fcm,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ApnsPushModeArg {
+    Background,
+    #[value(alias = "mutable_alert")]
+    MutableAlert,
+}
+
+impl From<ApnsPushModeArg> for ApnsPushMode {
+    fn from(mode: ApnsPushModeArg) -> Self {
+        match mode {
+            ApnsPushModeArg::Background => Self::Background,
+            ApnsPushModeArg::MutableAlert => Self::MutableAlert,
         }
     }
 }
@@ -426,14 +445,26 @@ enum Command {
         relay_v2: bool,
         #[arg(long, value_name = "URL")]
         wake_url: Option<String>,
-        #[arg(long, value_enum, default_value_t = WakeAdapterArg::Webhook)]
-        wake_adapter: WakeAdapterArg,
+        #[arg(long, value_enum)]
+        wake_adapter: Option<WakeAdapterArg>,
         #[arg(long, value_name = "PATH")]
         wake_secret_file: Option<PathBuf>,
         #[arg(long, value_name = "PATH")]
         wake_auth_header_file: Option<PathBuf>,
         #[arg(long)]
         wake_pre_wake: bool,
+        #[arg(long, value_enum)]
+        wake_apns_mode: Option<ApnsPushModeArg>,
+        #[arg(long, value_name = "TOPIC")]
+        wake_apns_topic: Option<String>,
+        #[arg(long, value_name = "KEY")]
+        wake_apns_loc_key: Option<String>,
+        #[arg(long, value_name = "TEAM_ID")]
+        wake_apns_team_id: Option<String>,
+        #[arg(long, value_name = "KEY_ID")]
+        wake_apns_key_id: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        wake_apns_p8_file: Option<PathBuf>,
         #[command(flatten)]
         p2p_args: P2pTransportArgs,
         #[command(flatten)]
@@ -513,8 +544,17 @@ fn read_private_secret_bytes(
     path: &Path,
     label: &str,
 ) -> Result<Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
+    let link_meta = std::fs::symlink_metadata(path)?;
+    if link_meta.file_type().is_symlink() || !link_meta.is_file() {
+        return Err(format!(
+            "{label} file '{}' must be a regular non-symlink file",
+            path.display()
+        )
+        .into());
+    }
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(format!(
             "{label} file '{}' must be a regular non-symlink file",
             path.display()
@@ -540,7 +580,20 @@ fn read_private_secret_bytes(
             .into());
         }
     }
-    Ok(Zeroizing::new(std::fs::read(path)?))
+    let cap = usize::try_from(meta.len().min(MAX_CREDENTIAL_FILE_BYTES))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut buf = Zeroizing::new(Vec::with_capacity(cap));
+    file.take(MAX_CREDENTIAL_FILE_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_CREDENTIAL_FILE_BYTES {
+        return Err(format!(
+            "{label} file '{}' exceeds {MAX_CREDENTIAL_FILE_BYTES} bytes",
+            path.display()
+        )
+        .into());
+    }
+    Ok(buf)
 }
 
 fn read_trimmed_secret_line(
@@ -1131,6 +1184,17 @@ fn resolve_wake_auth_token(path: &Path) -> Result<Zeroizing<String>, Box<dyn std
         return Err("wake auth header token must not be empty".into());
     }
     Ok(Zeroizing::new(token.to_owned()))
+}
+
+fn resolve_wake_p8_pem(path: &Path) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    let raw = read_private_secret_bytes(path, "wake apns p8")?;
+    let text = Zeroizing::new(
+        String::from_utf8(raw.to_vec()).map_err(|_| "wake apns p8 file must be valid UTF-8")?,
+    );
+    if text.trim().is_empty() {
+        return Err("wake apns p8 file must not be empty".into());
+    }
+    Ok(text)
 }
 
 fn trim_secret_code(mut raw: String) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
@@ -3340,6 +3404,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             wake_secret_file,
             wake_auth_header_file,
             wake_pre_wake,
+            wake_apns_mode,
+            wake_apns_topic,
+            wake_apns_loc_key,
+            wake_apns_team_id,
+            wake_apns_key_id,
+            wake_apns_p8_file,
             p2p_args,
             relay_auth,
             grant,
@@ -3353,10 +3423,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("--wake-url requires --wire-v2".into());
             }
             if wake_url.is_none()
-                && (wake_secret_file.is_some() || wake_auth_header_file.is_some() || wake_pre_wake)
+                && (wake_adapter.is_some()
+                    || wake_secret_file.is_some()
+                    || wake_auth_header_file.is_some()
+                    || wake_pre_wake
+                    || wake_apns_mode.is_some()
+                    || wake_apns_topic.is_some()
+                    || wake_apns_loc_key.is_some()
+                    || wake_apns_team_id.is_some()
+                    || wake_apns_key_id.is_some()
+                    || wake_apns_p8_file.is_some())
             {
                 return Err(
-                    "--wake-secret-file, --wake-auth-header-file, and --wake-pre-wake require --wake-url"
+                    "--wake-adapter, --wake-secret-file, --wake-auth-header-file, --wake-pre-wake, and --wake-apns-* require --wake-url"
                         .into(),
                 );
             }
@@ -3374,16 +3453,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Err("--wake-url requires --endpoint".into());
                     }
                     let wake_secret = resolve_wake_secret(wake_secret_file.as_deref())?;
-                    let mut wake_target = WakeTarget::new(wake_adapter.into(), &wurl)?;
-                    if let Some(auth_path) = wake_auth_header_file.as_deref() {
-                        let tok = resolve_wake_auth_token(auth_path)?;
-                        wake_target = wake_target.with_auth_token(tok.as_str())?;
-                    }
-                    let wake_provider = Arc::new(HttpWakeProvider::new().with_cooldown_secs(0));
-                    Some(
-                        WakeDialOptions::new(wake_provider, wake_target, wake_secret)
-                            .with_pre_wake(wake_pre_wake),
-                    )
+                    let mut auth_token = wake_auth_header_file
+                        .as_deref()
+                        .map(resolve_wake_auth_token)
+                        .transpose()?;
+                    let mut p8_pem = wake_apns_p8_file
+                        .as_deref()
+                        .map(resolve_wake_p8_pem)
+                        .transpose()?;
+                    let mut secret_b64 = Zeroizing::new(b64url_encode(wake_secret.as_bytes()));
+                    let spec = WakeConfigSpec {
+                        wake_url: Some(wurl),
+                        wake_adapter: Some(wake_adapter.unwrap_or(WakeAdapterArg::Webhook).into()),
+                        wake_secret_b64: Some(std::mem::take(&mut *secret_b64)),
+                        wake_auth_token: auth_token.as_mut().map(|t| std::mem::take(&mut **t)),
+                        wake_pre_wake: Some(wake_pre_wake),
+                        wake_retry_delay_ms: None,
+                        wake_max_attempts: None,
+                        wake_timeout_ms: None,
+                        wake_coalesce_secs: None,
+                        wake_apns_mode: wake_apns_mode.map(Into::into),
+                        wake_apns_topic,
+                        wake_apns_loc_key,
+                        wake_apns_team_id,
+                        wake_apns_key_id,
+                        wake_apns_p8_pem: p8_pem.as_mut().map(|p| std::mem::take(&mut **p)),
+                        wake_apns_client_cert_pem: None,
+                        wake_apns_client_key_pem: None,
+                    };
+                    let settings = build_wake_provider(spec)
+                        .map_err(redacted_error)?
+                        .ok_or("wake configuration missing")?;
+                    Some(settings.to_dial_options())
                 }
                 None => None,
             };

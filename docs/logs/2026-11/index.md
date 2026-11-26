@@ -28,3 +28,4 @@ Entries from November 2026.
 - [pairing: core initiators enforce the URI route checks before msg3](25-pairing-initiators-enforce-the-uri-route.md)
 - [Add WebTransport direct path provider (wt://)](25-add-webtransport-direct-path-provider-wt.md)
 - [Add in-band WebRTC direct path upgrade](25-add-in-band-webrtc-direct-path.md)
+- [Add direct HTTP/2 APNs wake provider and MutableAlert mode](26-add-direct-http-2-apns-wake.md)

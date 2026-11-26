@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tendril_runtime::{
-    HttpWakeProvider, MAX_WAKE_ENDPOINT_URL_LEN, MemoryWakeProvider, NoopWakeProvider,
-    WAKE_EPOCH_SECS, WakeAdapterKind, WakeOutcome, WakeProvider, WakeSecret, WakeTag, WakeTarget,
-    derive_epoch_wake_tag, validate_wake_endpoint_url, verify_epoch_wake_tag_window, wake_epoch,
-    wake_epoch_start_secs,
+    ApnsPayload, ApnsPushMode, HttpWakeProvider, MAX_WAKE_ENDPOINT_URL_LEN, MemoryWakeProvider,
+    NoopWakeProvider, WAKE_EPOCH_SECS, WakeAdapterKind, WakeConfigSpec, WakeOutcome, WakeProvider,
+    WakeSecret, WakeTag, WakeTarget, build_wake_provider, derive_epoch_wake_tag,
+    validate_wake_endpoint_url, verify_epoch_wake_tag_window, wake_epoch, wake_epoch_start_secs,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -331,4 +331,96 @@ async fn notify_best_effort_skips_stalling_or_error_endpoint() {
         .notify_best_effort(&target, &tag, 1_700_000_000)
         .await;
     assert_eq!(outcome, WakeOutcome::Skipped);
+}
+
+#[tokio::test]
+async fn http_wake_provider_delivers_mutable_alert_apns_and_rejects_apns_h2() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provider = HttpWakeProvider::new().with_cooldown_secs(0);
+    let secret = WakeSecret::from_bytes([0x88; 32]);
+    let now = 1_700_050_000;
+    let tag = secret.derive_tag(now);
+    let expected_epoch_s = wake_epoch_start_secs(now);
+
+    let server = tokio::spawn(async move { read_one_http_request(&listener).await });
+
+    let target = WakeTarget::new(
+        WakeAdapterKind::Apns,
+        &format!("http://{addr}/3/device/opaque"),
+    )
+    .unwrap()
+    .with_apns_mode(ApnsPushMode::MutableAlert)
+    .unwrap()
+    .with_apns_loc_key("CUSTOM_WAKE_KEY")
+    .unwrap()
+    .with_apns_topic("dev.tendril.ios")
+    .unwrap();
+
+    assert_eq!(
+        provider.notify(&target, &tag, now).await.unwrap(),
+        WakeOutcome::Delivered
+    );
+
+    let (hdrs, body) = server.await.unwrap();
+    assert!(hdrs.contains("apns-push-type: alert\r\n"));
+    assert!(hdrs.contains("apns-priority: 10\r\n"));
+    assert!(hdrs.contains("apns-topic: dev.tendril.ios\r\n"));
+    let obj = body.as_object().unwrap();
+    assert_eq!(obj["v"], 1);
+    assert_eq!(obj["wake_tag"], tag.to_b64url());
+    assert_eq!(obj["epoch_s"], expected_epoch_s);
+    assert_eq!(obj["aps"]["mutable-content"], 1);
+    assert!(obj["aps"].get("content-available").is_none());
+    assert_eq!(obj["aps"]["alert"]["loc-key"], "CUSTOM_WAKE_KEY");
+
+    // HttpWakeProvider must fail closed if given an ApnsH2 target.
+    let h2_target = WakeTarget::new(
+        WakeAdapterKind::ApnsH2,
+        "https://api.push.apple.com/3/device/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    assert!(provider.notify(&h2_target, &tag, now).await.is_err());
+
+    // ApnsPayload::to_json_bytes validates loc-key even on manually constructed payloads.
+    let mut bad_payload = ApnsPayload::mutable_alert(&tag, now, "GOOD_KEY").unwrap();
+    bad_payload.aps.alert.as_mut().unwrap().loc_key = "bad space".to_owned();
+    assert!(bad_payload.to_json_bytes().is_err());
+}
+
+#[test]
+fn wake_config_spec_validation_and_defaults() {
+    assert!(
+        build_wake_provider(WakeConfigSpec::default())
+            .unwrap()
+            .is_none()
+    );
+
+    let mut orphan_opt = WakeConfigSpec::default();
+    orphan_opt.wake_pre_wake = Some(true);
+    assert!(build_wake_provider(orphan_opt).is_err());
+
+    let mut apns_fields_on_http1 = WakeConfigSpec::default();
+    apns_fields_on_http1.wake_url = Some("https://gateway.example/push".to_owned());
+    apns_fields_on_http1.wake_adapter = Some(WakeAdapterKind::Apns);
+    apns_fields_on_http1.wake_secret_b64 = Some(tendril_core::crypto::b64url_encode(&[0x12; 32]));
+    apns_fields_on_http1.wake_apns_team_id = Some("TEAM123".to_owned());
+    assert!(build_wake_provider(apns_fields_on_http1).is_err());
+
+    let mut valid_webhook = WakeConfigSpec::default();
+    valid_webhook.wake_url = Some("https://hook.example/wake".to_owned());
+    valid_webhook.wake_adapter = Some(WakeAdapterKind::Webhook);
+    valid_webhook.wake_secret_b64 = Some(tendril_core::crypto::b64url_encode(&[0x12; 32]));
+    valid_webhook.wake_pre_wake = Some(true);
+    valid_webhook.wake_retry_delay_ms = Some(250);
+    valid_webhook.wake_max_attempts = Some(4);
+    valid_webhook.wake_timeout_ms = Some(1_500);
+    valid_webhook.wake_coalesce_secs = Some(9);
+    let settings = build_wake_provider(valid_webhook).unwrap().unwrap();
+    let dial = settings.to_dial_options();
+    assert!(dial.pre_wake);
+    assert_eq!(dial.retry_delay, Duration::from_millis(250));
+    assert_eq!(dial.max_attempts, 4);
+    assert_eq!(dial.wake_timeout, Duration::from_millis(1_500));
+    assert_eq!(settings.coalesce_secs, 9);
 }
