@@ -2124,3 +2124,22 @@ test("PRIV-09 createIndexedDbVault encrypts with non-extractable AES-256-GCM and
 });
 import "./group.test.mjs";
 import "./webtransport.test.mjs";
+
+test("validateRelayWsUrl rejects Teredo and local-use NAT64 but keeps adjacent public space", () => {
+  for (const blocked of [
+    "wss://[2001::1]/v1/relay",
+    "wss://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/v1/relay",
+    "wss://[64:ff9b:1::1]/v1/relay",
+    "wss://[64:ff9b:1:ffff::1]/v1/relay",
+  ]) {
+    assert.throws(() => validateRelayWsUrl(blocked), /not permitted/i, blocked);
+  }
+  for (const allowed of [
+    "wss://[2001:4860::1]/v1/relay",
+    "wss://[2001:db8::1]/v1/relay",
+    "wss://[64:ff9b::cb00:7107]/v1/relay",
+    "wss://[64:ff9b:2::1]/v1/relay",
+  ]) {
+    assert.doesNotThrow(() => validateRelayWsUrl(allowed), allowed);
+  }
+});
