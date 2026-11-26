@@ -33,7 +33,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout, timeout_at};
+use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
@@ -309,13 +309,17 @@ pub struct RelayConfig {
     /// allowlist is the only admission control, since no proof could then admit a `dial`.
     pub auth_scope: RelayAuthScope,
     /// Test-only clock seam overriding wall-clock Unix seconds for deterministic expiry tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
     pub clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     /// Test-only seam awaited at each [`RelayTestPoint`] so tests can order racing handlers.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub test_hook: Option<RelayTestHook>,
 }
 
 /// Points at which the relay awaits [`RelayConfig::test_hook`].
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -330,14 +334,26 @@ pub enum RelayTestPoint {
     StandbyExpired,
 }
 
+/// Inert stand-in so handler call sites compile unchanged without `test-hooks`.
+#[cfg(not(feature = "test-hooks"))]
+#[derive(Clone, Copy)]
+enum RelayTestPoint {
+    AcceptClaimed,
+    DialTeardown,
+    RegistrationExpired,
+    StandbyExpired,
+}
+
 /// Hook type of [`RelayConfig::test_hook`].
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub type RelayTestHook =
     Arc<dyn Fn(RelayTestPoint) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 impl fmt::Debug for RelayConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RelayConfig")
+        let mut f = f.debug_struct("RelayConfig");
+        let f = f
             .field("listen_addr", &self.listen_addr)
             .field("host", &self.host)
             .field("max_pending_per_mailbox", &self.max_pending_per_mailbox)
@@ -362,10 +378,12 @@ impl fmt::Debug for RelayConfig {
                 &self.auth_secret.as_ref().map(|_| "<redacted>"),
             )
             .field("trusted_issuers", &self.trusted_issuers.len())
-            .field("auth_scope", &self.auth_scope)
+            .field("auth_scope", &self.auth_scope);
+        #[cfg(feature = "test-hooks")]
+        let f = f
             .field("clock", &self.clock.as_ref().map(|_| "<clock>"))
-            .field("test_hook", &self.test_hook.as_ref().map(|_| "<hook>"))
-            .finish()
+            .field("test_hook", &self.test_hook.as_ref().map(|_| "<hook>"));
+        f.finish()
     }
 }
 
@@ -394,7 +412,9 @@ impl Default for RelayConfig {
             auth_secret: None,
             trusted_issuers: Vec::new(),
             auth_scope: RelayAuthScope::All,
+            #[cfg(feature = "test-hooks")]
             clock: None,
+            #[cfg(feature = "test-hooks")]
             test_hook: None,
         }
     }
@@ -424,17 +444,29 @@ impl RelayConfig {
         }
     }
 
+    #[cfg(feature = "test-hooks")]
     fn now_unix_secs(&self) -> u64 {
         self.clock
             .as_ref()
             .map_or_else(current_unix_secs, |clock| clock())
     }
 
+    #[cfg(not(feature = "test-hooks"))]
+    #[allow(clippy::unused_self)]
+    fn now_unix_secs(&self) -> u64 {
+        current_unix_secs()
+    }
+
+    #[cfg(feature = "test-hooks")]
     async fn test_point(&self, point: RelayTestPoint) {
         if let Some(hook) = &self.test_hook {
             hook(point).await;
         }
     }
+
+    #[cfg(not(feature = "test-hooks"))]
+    #[allow(clippy::unused_async, clippy::unused_self)]
+    async fn test_point(&self, _point: RelayTestPoint) {}
 }
 
 /// Errors produced by [`RelayServer`] and [`RelayHandle`].
@@ -1382,13 +1414,17 @@ fn earliest_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 }
 
 /// Resolves once the relay clock reaches `deadline_unix`, or never when it is `None`.
-async fn unix_deadline(config: &RelayConfig, deadline_unix: Option<u64>) {
+async fn unix_deadline(
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] config: &RelayConfig,
+    deadline_unix: Option<u64>,
+) {
     let Some(deadline) = deadline_unix else {
         return std::future::pending().await;
     };
+    #[cfg(feature = "test-hooks")]
     if config.clock.is_some() {
         let mut poll = tokio::time::interval(Duration::from_millis(20));
-        poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         while config.now_unix_secs() < deadline {
             poll.tick().await;
         }
