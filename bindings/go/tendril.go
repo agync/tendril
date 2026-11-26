@@ -79,7 +79,7 @@ type EnrollInitiateResult struct {
 	TokenNonce      string `json:"token_nonce"`
 	// RoutesPersisted lists the Day-2 routes stored with the enrollment.
 	RoutesPersisted []Route `json:"routes_persisted"`
-	// RouteWarnings names route hints the host advertised that were not stored.
+	// RouteWarnings holds snake-case warning or reason codes for routes that were not stored.
 	RouteWarnings []string `json:"route_warnings"`
 	// RoutesReason is "no_state_dir" for a memory-only endpoint, which stores no routes,
 	// and empty otherwise.
