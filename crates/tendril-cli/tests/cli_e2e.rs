@@ -473,6 +473,7 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
                 "127.0.0.1:0",
                 "--embedded-relay",
                 "--p2p-local",
+                "--p2p-no-port-mapping",
                 "--overlay",
                 "127.0.0.1:0",
                 "--overlay-allow-non-tailnet",
@@ -528,6 +529,7 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
         &[
             "pair",
             "--p2p-local",
+            "--p2p-no-port-mapping",
             "--endpoint",
             &p2p_ep,
             "--code",
@@ -590,7 +592,7 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
         if expected_provider == "Relay" {
             args.extend(["--relay-host", "localhost"]);
         } else if expected_provider == "P2p" {
-            args.push("--p2p-local");
+            args.extend(["--p2p-local", "--p2p-no-port-mapping"]);
         }
         let dial_out = run_tendril(client_dir.path(), &args);
         assert!(
@@ -628,7 +630,13 @@ fn cli_e2e_embedded_relay_p2p_overlay_and_broker() {
         Command::new(tendril_bin())
             .arg("--state-dir")
             .arg(host_dir.path())
-            .args(["serve", "--listen", "127.0.0.1:0", "--p2p-local"])
+            .args([
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--p2p-local",
+                "--p2p-no-port-mapping",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -938,6 +946,7 @@ fn cli_e2e_p2p_ephemeral_and_local_env() {
                     "--listen",
                     "127.0.0.1:0",
                     "--p2p",
+                    "--p2p-no-port-mapping",
                     "--ephemeral-p2p",
                 ])
                 .stdout(Stdio::piped())

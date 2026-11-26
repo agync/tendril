@@ -1653,7 +1653,8 @@ impl SpyDialer {
     fn opts(&self, mut o: ConnectOpts) -> ConnectOpts {
         o.dialers = Arc::new(
             HintDialers::new(HintDialerConfig::default())
-                .with_provider_dialer(Arc::new(self.clone())),
+                .with_provider_dialer(Arc::new(self.clone()))
+                .expect("direct dialer replaces the base rung"),
         );
         o
     }

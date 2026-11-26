@@ -70,6 +70,15 @@ Every `P2pListener` and `P2pDialer` is one `iroh` endpoint and opens the sockets
 
 `bind_addrs` binds only the QUIC UDP sockets. It does not bind or restrict the relay TCP connections, DNS lookups, or the port mapping sockets. `P2pBindAddrs::Only { v4, v6 }` binds exactly the given sockets and none for a family left `None`, so a loopback-only bind limits direct UDP to loopback. It does not make the endpoint local-only: relay TCP/TLS connections, Pkarr and DNS lookups, and port mapping still apply unless the relay mode is `Disabled` and `port_mapping` is off. With no IPv4 socket the port mapping never starts. Relay mode `Disabled` and port mapping are independent: a `Disabled` endpoint still probes the gateway unless `port_mapping` is off. `P2pListener::bound_sockets` and `P2pDialer::bound_sockets` return the bound addresses.
 
+Every surface sets `port_mapping` and `bind_addrs` on each listener, dialer, group dialer and hint dialer it builds:
+
+| Surface | Port mapping off | Bind addresses |
+| --- | --- | --- |
+| CLI (`serve`, `pair`, `enroll`, `dial`, `group`) | `--p2p-no-port-mapping` | `--p2p-bind <addr>`, repeatable, at most one IPv4 and one IPv6 (`0.0.0.0:0`, `[::]:0`); a family left out gets no socket |
+| C ABI, Python, Node transport JSON | `"p2p_port_mapping": false` (Node also `p2pPortMapping`) | `"p2p_bind_addrs": ["0.0.0.0:0", "[::]:0"]` (Node also `p2pBindAddrs`) |
+
+An address that does not parse, or a second address of one family, is a configuration error that names the flag or key (`--p2p-bind`, `p2p_bind_addrs`); it never falls back to all interfaces. The relay mode of every surface accepts `n0` as an alias of `default` (n0's public relays). Swift and Kotlin do not expose these options yet.
+
 ## Relay ladder and legacy hint migration
 
 Applications can move between public relays, self-hosted `tendril-relay` containers (including Option 1A Tiers 1-3 admission with `--allow-mailbox` / `--allow-mailboxes-file`, `--auth-secret-file` / `TENDRIL_RELAY_AUTH_SECRET`, `--issuer-pub` + `RelayTicket`, and `--auth-scope <all|register-only>` across `/v1/relay` and `/v2/relay`), and in-process `EmbeddedRelay` instances without discarding existing Noise pins or signed grants. Rosters that predate multi-route pairing keep their hints for display only: they must re-pair, apply a signed URI, or pass an explicit endpoint, because `relay_hints` are never auto-dialed:

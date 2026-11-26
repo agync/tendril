@@ -864,10 +864,12 @@ impl PathStream for FaultStream {
 
 fn spied_dialers(fault: Fault, spy: &Spy) -> Arc<HintDialers> {
     Arc::new(
-        HintDialers::new(HintDialerConfig::default()).with_provider_dialer(Arc::new(FaultDialer {
-            fault,
-            spy: spy.clone(),
-        })),
+        HintDialers::new(HintDialerConfig::default())
+            .with_provider_dialer(Arc::new(FaultDialer {
+                fault,
+                spy: spy.clone(),
+            }))
+            .expect("direct dialer replaces the base rung"),
     )
 }
 

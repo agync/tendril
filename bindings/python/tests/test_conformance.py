@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import tempfile
@@ -350,6 +351,38 @@ class TendrilPythonTests(unittest.TestCase):
         finally:
             py_host.close()
             peer2.close()
+
+    def test_p2p_net_options_reach_the_listener(self) -> None:
+        ep = tendril.Endpoint(None, "py-p2p-net")
+        try:
+            ep.configure_transports_json(
+                json.dumps(
+                    {
+                        "p2p_port_mapping": False,
+                        "p2p_bind_addrs": ["127.0.0.1:0"],
+                    }
+                )
+            )
+            addr = ep.serve_p2p("disabled")
+            hints = re.findall(r"[?&]addr=([^&]+)", addr)
+            self.assertTrue(hints, addr)
+            for hint in hints:
+                self.assertTrue(hint.startswith("127.0.0.1:"), addr)
+        finally:
+            ep.close()
+
+    def test_p2p_net_keys_are_validated_and_name_the_key(self) -> None:
+        ep = tendril.Endpoint(None, "py-p2p-net-bad")
+        try:
+            for bad in (["not-an-addr"], ["127.0.0.1:0", "127.0.0.2:0"]):
+                with self.assertRaises(ValueError) as ctx:
+                    ep.configure_transports_json(json.dumps({"p2p_bind_addrs": bad}))
+                self.assertIn("p2p_bind_addrs", str(ctx.exception))
+            with self.assertRaises(ValueError):
+                ep.configure_transports_json('{"p2p_port_mapping": "no"}')
+            ep.configure_transports_json('{"p2p_relay_mode": "n0", "p2p_port_mapping": true}')
+        finally:
+            ep.close()
 
     def test_serve_p2p_disabled_loopback(self) -> None:
         host_ep = tendril.Endpoint(None, "py-p2p-host")

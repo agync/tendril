@@ -208,6 +208,12 @@ int32_t tendril_endpoint_enroll_initiate(
 /*
  * Pairing URIs and routes. Every out_json string is freed with tendril_string_free.
  *
+ * tendril_endpoint_configure_transports_json accepts p2p_port_mapping (bool, default true; false
+ * keeps a P2P endpoint from probing the router for a UPnP, NAT-PMP or PCP mapping) and
+ * p2p_bind_addrs (array of at most one IPv4 and one IPv6 "host:port" such as "0.0.0.0:0" and
+ * "[::]:0"; default every interface; an invalid entry is an error naming p2p_bind_addrs).
+ * p2p_relay_mode accepts "n0" as an alias of "default".
+ *
  * tendril_endpoint_configure_transports_json also accepts wake_* keys (wake_url, wake_adapter,
  * wake_secret_b64, wake_auth_token, wake_pre_wake, wake_retry_delay_ms, wake_max_attempts,
  * wake_timeout_ms, wake_coalesce_secs, wake_apns_mode, wake_apns_topic, wake_apns_loc_key,

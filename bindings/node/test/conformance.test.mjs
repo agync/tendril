@@ -663,6 +663,31 @@ test("Node M2M enrollment, single-use replay, and anchor revocation", async () =
   }
 });
 
+test("Node p2p_port_mapping and p2p_bind_addrs reach the listener and are validated", async () => {
+  const ep = new tendril.Endpoint(null, "node-p2p-net");
+  try {
+    ep.configureTransportsJson(
+      JSON.stringify({ p2pPortMapping: false, p2pBindAddrs: ["127.0.0.1:0"] }),
+    );
+    const addr = await ep.serveP2p("disabled");
+    const hints = [...addr.matchAll(/[?&]addr=([^&]+)/g)].map((m) => m[1]);
+    assert.ok(hints.length > 0, addr);
+    for (const hint of hints) {
+      assert.ok(hint.startsWith("127.0.0.1:"), addr);
+    }
+    for (const bad of [["not-an-addr"], ["127.0.0.1:0", "127.0.0.2:0"]]) {
+      assert.throws(
+        () => ep.configureTransportsJson(JSON.stringify({ p2p_bind_addrs: bad })),
+        /p2p_bind_addrs/,
+      );
+    }
+    assert.throws(() => ep.configureTransportsJson('{"p2p_port_mapping":"no"}'));
+    ep.configureTransportsJson('{"p2p_relay_mode":"n0","p2p_port_mapping":true}');
+  } finally {
+    ep.close();
+  }
+});
+
 test("Node binding configures transports strictly, redacts scalar secrets, and validates v2 bounds", async () => {
   const ep = new tendril.Endpoint(null, "node-cfg-host");
   try {

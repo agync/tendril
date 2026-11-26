@@ -69,7 +69,8 @@ pub use providers::{
 pub use providers::{
     MAX_P2P_CUSTOM_RELAYS, P2pBindAddrs, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth,
     P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint, format_p2p_endpoint_with_addrs,
-    parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
+    parse_p2p_bind_addrs, parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode,
+    parse_p2p_relay_modes,
 };
 #[cfg(feature = "webrtc")]
 pub use providers::{

@@ -311,6 +311,10 @@ struct TransportConfigInput {
     p2p_advertise_direct_addrs: Option<bool>,
     #[zeroize(skip)]
     p2p_allow_private_addrs: Option<bool>,
+    #[zeroize(skip)]
+    p2p_port_mapping: Option<bool>,
+    #[zeroize(skip)]
+    p2p_bind_addrs: Option<Vec<String>>,
     p2p_relay_auth_token: Option<String>,
     p2p_api_secret: Option<String>,
     #[zeroize(skip)]
@@ -361,6 +365,11 @@ struct EndpointTransportConfig {
     p2p_advertise_direct_addrs: Option<bool>,
     #[cfg(feature = "p2p-iroh")]
     p2p_allow_private_addrs: Option<bool>,
+    /// `None` keeps port mapping on.
+    #[cfg(feature = "p2p-iroh")]
+    p2p_port_mapping: Option<bool>,
+    #[cfg(feature = "p2p-iroh")]
+    p2p_bind_addrs: tendril_runtime::P2pBindAddrs,
     #[cfg(feature = "p2p-iroh")]
     p2p_relay_auth: Option<P2pRelayAuth>,
     wake: Option<WakeTransportSettings>,
@@ -387,6 +396,8 @@ impl fmt::Debug for EndpointTransportConfig {
                     &self.p2p_advertise_direct_addrs,
                 )
                 .field("p2p_allow_private_addrs", &self.p2p_allow_private_addrs)
+                .field("p2p_port_mapping", &self.p2p_port_mapping)
+                .field("p2p_bind_addrs", &self.p2p_bind_addrs)
                 .field("p2p_relay_auth", &self.p2p_relay_auth);
         }
         dbg.field("wake", &self.wake)
@@ -490,6 +501,8 @@ impl EndpointTransportConfig {
                 || input.p2p_pkarr == Some(true)
                 || input.p2p_advertise_direct_addrs == Some(true)
                 || input.p2p_allow_private_addrs == Some(true)
+                || input.p2p_port_mapping.is_some()
+                || input.p2p_bind_addrs.is_some()
             {
                 return Err((
                     TENDRIL_ERR_PROTOCOL,
@@ -497,6 +510,13 @@ impl EndpointTransportConfig {
                 ));
             }
         }
+
+        #[cfg(feature = "p2p-iroh")]
+        let p2p_bind_addrs = tendril_runtime::parse_p2p_bind_addrs(
+            "p2p_bind_addrs",
+            input.p2p_bind_addrs.as_deref().unwrap_or_default(),
+        )
+        .map_err(|e| (TENDRIL_ERR_INVALID_ARG, e.to_string()))?;
 
         #[cfg(feature = "p2p-iroh")]
         let (p2p_relay_mode, p2p_relay_auth) = {
@@ -608,6 +628,10 @@ impl EndpointTransportConfig {
             #[cfg(feature = "p2p-iroh")]
             p2p_allow_private_addrs: input.p2p_allow_private_addrs,
             #[cfg(feature = "p2p-iroh")]
+            p2p_port_mapping: input.p2p_port_mapping,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_bind_addrs,
+            #[cfg(feature = "p2p-iroh")]
             p2p_relay_auth,
             wake,
         })
@@ -650,9 +674,9 @@ impl EndpointTransportConfig {
             #[cfg(feature = "p2p-iroh")]
             p2p_pkarr: self.p2p_pkarr,
             #[cfg(feature = "p2p-iroh")]
-            p2p_port_mapping: true,
+            p2p_port_mapping: self.p2p_port_mapping.unwrap_or(true),
             #[cfg(feature = "p2p-iroh")]
-            p2p_bind_addrs: tendril_runtime::P2pBindAddrs::AllInterfaces,
+            p2p_bind_addrs: self.p2p_bind_addrs.clone(),
         };
         Ok(Arc::new(HintDialers::new(config)))
     }
@@ -680,7 +704,14 @@ impl EndpointTransportConfig {
             opts = opts.with_allow_private_addrs(allow_priv);
         }
         opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
-        Ok(opts)
+        Ok(self.with_p2p_net(opts))
+    }
+
+    /// Applies `p2p_port_mapping` and `p2p_bind_addrs` to `opts`.
+    #[cfg(feature = "p2p-iroh")]
+    fn with_p2p_net(&self, opts: P2pOptions) -> P2pOptions {
+        opts.with_port_mapping(self.p2p_port_mapping.unwrap_or(true))
+            .with_bind_addrs(self.p2p_bind_addrs.clone())
     }
 
     /// Options for the shared group `P2pDialer`, present only when a relay mode is configured
@@ -695,6 +726,7 @@ impl EndpointTransportConfig {
             self.p2p_allow_private_addrs,
             self.p2p_relay_auth.clone(),
         )
+        .map(|opts| self.with_p2p_net(opts))
     }
 
     #[cfg(feature = "p2p-iroh")]
@@ -721,7 +753,7 @@ impl EndpointTransportConfig {
             opts = opts.with_resolve_pkarr(pkarr);
         }
         opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
-        Ok(opts)
+        Ok(self.with_p2p_net(opts))
     }
 }
 
@@ -6428,6 +6460,101 @@ mod p2p_dialer_option_tests {
             .unwrap();
         let res = rt.block_on(P2pDialer::bind_with_options(opts));
         assert!(matches!(res, Err(RuntimeError::Protocol(ref m)) if m.contains("peer URI")));
+    }
+}
+
+#[cfg(all(test, feature = "p2p-iroh"))]
+mod p2p_net_option_tests {
+    use super::*;
+    use tendril_runtime::P2pBindAddrs;
+
+    const BASEPOINT_ID: &str = "5866666666666666666666666666666666666666666666666666666666666666";
+
+    fn config(json: &str) -> Result<EndpointTransportConfig, (i32, String)> {
+        let input: TransportConfigInput = serde_json::from_str(json).expect("json");
+        EndpointTransportConfig::from_input(input)
+    }
+
+    #[test]
+    fn defaults_keep_port_mapping_on_and_bind_everywhere() {
+        let cfg = config("{}").expect("config");
+        let opts = cfg.build_p2p_listener_options(None).expect("listener");
+        assert!(opts.port_mapping);
+        assert_eq!(opts.bind_addrs, P2pBindAddrs::AllInterfaces);
+    }
+
+    #[test]
+    fn keys_reach_every_option_set() {
+        let cfg = config(
+            r#"{"p2p_relay_mode":"disabled","p2p_port_mapping":false,
+                "p2p_bind_addrs":["127.0.0.1:0"]}"#,
+        )
+        .expect("config");
+        let only = P2pBindAddrs::Only {
+            v4: Some("127.0.0.1:0".parse().expect("addr")),
+            v6: None,
+        };
+        let endpoint = format!("iroh://{BASEPOINT_ID}");
+        let sets = [
+            ("listener", cfg.build_p2p_listener_options(None).expect("l")),
+            (
+                "dialer",
+                cfg.build_p2p_dialer_options(&endpoint, None).expect("d"),
+            ),
+            ("group", cfg.build_p2p_group_options().expect("g")),
+            (
+                "hint operator",
+                cfg.hint_dialers(Some(&endpoint), None)
+                    .expect("h")
+                    .operator_p2p_options(&endpoint)
+                    .expect("o"),
+            ),
+        ];
+        for (name, opts) in sets {
+            assert!(!opts.port_mapping, "{name}");
+            assert_eq!(opts.bind_addrs, only, "{name}");
+        }
+        let hints = cfg.hint_dialers(None, None).expect("hints");
+        assert!(!hints.config().p2p_port_mapping);
+        assert_eq!(hints.config().p2p_bind_addrs, only);
+    }
+
+    #[test]
+    fn invalid_bind_addr_is_a_config_error_naming_the_key() {
+        for bad in [r#"["nope"]"#, r#"["127.0.0.1:0","127.0.0.2:0"]"#] {
+            let (rc, msg) = config(&format!(r#"{{"p2p_bind_addrs":{bad}}}"#)).expect_err("bad");
+            assert_eq!(rc, TENDRIL_ERR_INVALID_ARG);
+            assert!(msg.contains("p2p_bind_addrs"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn n0_alias_selects_the_public_relays() {
+        let cfg = config(r#"{"p2p_relay_mode":"n0"}"#).expect("config");
+        let opts = cfg.build_p2p_listener_options(None).expect("listener");
+        assert!(matches!(opts.relay_mode, P2pRelayMode::N0Public));
+    }
+
+    #[test]
+    fn listener_binds_only_the_configured_socket() {
+        let cfg = config(
+            r#"{"p2p_relay_mode":"disabled","p2p_port_mapping":false,
+                "p2p_bind_addrs":["127.0.0.1:0"]}"#,
+        )
+        .expect("config");
+        let opts = cfg.build_p2p_listener_options(None).expect("listener");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let listener = rt
+            .block_on(P2pListener::bind_with_options(opts, None))
+            .expect("bind");
+        let sockets = listener.bound_sockets();
+        assert!(
+            !sockets.is_empty() && sockets.iter().all(|s| s.ip().is_loopback() && s.is_ipv4()),
+            "{sockets:?}"
+        );
     }
 }
 

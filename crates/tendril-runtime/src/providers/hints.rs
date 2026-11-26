@@ -418,19 +418,28 @@ impl HintDialers {
 
     /// Replaces the base dialer of `dialer.provider_id()` (`Direct`, `Local`, `Overlay` or
     /// `Broker`) with `dialer`, for custom transports and dial spies. Egress checks still run
-    /// first, so the dialer receives only checked targets. Other providers are unchanged: a
-    /// `P2p` or `Relay` dialer passed here is ignored, because the set builds those rungs
-    /// itself.
-    #[must_use]
-    pub fn with_provider_dialer(mut self, dialer: Arc<dyn PathDialer>) -> Self {
+    /// first, so the dialer receives only checked targets.
+    ///
+    /// # Errors
+    /// A `P2p` or `Relay` dialer is rejected: the set builds those rungs itself from its
+    /// [`HintDialerConfig`], so a replacement would be silently ignored.
+    pub fn with_provider_dialer(
+        mut self,
+        dialer: Arc<dyn PathDialer>,
+    ) -> Result<Self, RuntimeError> {
         match dialer.provider_id() {
             ProviderId::Direct => self.direct = dialer,
             ProviderId::Local => self.local = dialer,
             ProviderId::Overlay => self.overlay = dialer,
             ProviderId::Broker => self.broker = dialer,
-            ProviderId::Relay | ProviderId::P2p => {}
+            id @ (ProviderId::Relay | ProviderId::P2p) => {
+                return Err(RuntimeError::Protocol(format!(
+                    "with_provider_dialer cannot replace the {id:?} provider: the dialer set \
+                     builds it from its HintDialerConfig"
+                )));
+            }
         }
-        self
+        Ok(self)
     }
 
     /// The Iroh options an explicit operator `endpoint` is dialed with (relay mode, private
@@ -1316,5 +1325,20 @@ mod tests {
         let operator = dialers.operator_p2p_options(&endpoint).expect("options");
         assert!(!operator.port_mapping);
         assert_eq!(operator.bind_addrs, only);
+    }
+
+    #[test]
+    fn with_provider_dialer_rejects_p2p_and_relay_dialers() {
+        let relay: Arc<dyn PathDialer> = Arc::new(crate::providers::RelayDialer::new());
+        let err = HintDialers::new(HintDialerConfig::default())
+            .with_provider_dialer(relay)
+            .expect_err("relay dialer must be rejected");
+        assert!(err.to_string().contains("provider"), "{err}");
+        let direct: Arc<dyn PathDialer> = Arc::new(DirectDialer::new());
+        assert!(
+            HintDialers::new(HintDialerConfig::default())
+                .with_provider_dialer(direct)
+                .is_ok()
+        );
     }
 }

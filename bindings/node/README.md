@@ -42,6 +42,16 @@ const session = await host.acceptSession(5000);
 await session.authorize("notes.sync"); // true
 ```
 
+## P2P sockets
+
+A P2P endpoint probes the local router for a port mapping and binds its QUIC UDP sockets on every interface. Turn the probe off or pin the bind addresses in the transport configuration:
+
+```js
+host.configureTransportsJson('{"p2p_port_mapping": false, "p2p_bind_addrs": ["0.0.0.0:0"]}');
+```
+
+The sockets a P2P endpoint opens, and which option controls each, are listed in [Sockets a P2P endpoint opens](https://github.com/agync/tendril/blob/main/docs/design/providers-and-relay-ladder.md#sockets-a-p2p-endpoint-opens).
+
 ## Links
 
 - Documentation: https://tendril.agync.dev

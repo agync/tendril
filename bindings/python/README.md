@@ -30,6 +30,16 @@ session = host.accept_session(5000)
 assert session.authorize("notes.sync")
 ```
 
+## P2P sockets
+
+A P2P endpoint probes the local router for a port mapping and binds its QUIC UDP sockets on every interface. Turn the probe off or pin the bind addresses in the transport configuration:
+
+```python
+host.configure_transports_json('{"p2p_port_mapping": false, "p2p_bind_addrs": ["0.0.0.0:0"]}')
+```
+
+The sockets a P2P endpoint opens, and which option controls each, are listed in [Sockets a P2P endpoint opens](https://github.com/agync/tendril/blob/main/docs/design/providers-and-relay-ladder.md#sockets-a-p2p-endpoint-opens).
+
 ## Links
 
 - Documentation: https://tendril.agync.dev
