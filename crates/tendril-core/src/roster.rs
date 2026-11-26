@@ -1141,6 +1141,44 @@ impl Roster {
         }
     }
 
+    /// Drops every unconfirmed host claim naming `host_id` and nothing else: no roster entry is
+    /// touched or removed, whatever its state, and nothing is revoked. Fails with
+    /// [`CoreError::PeerNotFound`] when no claim names `host_id`.
+    pub fn remove_pending_host_claims(&mut self, host_id: &str) -> Result<(), CoreError> {
+        if self.pending_host_claims(host_id).is_empty() {
+            return Err(CoreError::PeerNotFound(host_id.to_string()));
+        }
+        self.drop_pending_host_claims(host_id);
+        Ok(())
+    }
+
+    /// The unconfirmed host claims, oldest first, as the JSON array every binding lists:
+    /// `host_id` is the unauthenticated label a claim names and `device_id` the id derived from
+    /// its static key in the handshake (the only id a claim revocation matches).
+    #[must_use]
+    pub fn pending_hosts_json(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.pending_hosts
+                .iter()
+                .map(|claim| {
+                    serde_json::json!({
+                        "host_id": claim.device_id,
+                        "device_id": device_id(&claim.static_pub),
+                        "name": claim.name,
+                        "static_pub": b64url_encode(&claim.static_pub),
+                        "signing_pub_hash": claim
+                            .signing_pub
+                            .as_ref()
+                            .map(|k| b64url_encode(&k.sha256_hash())),
+                        "rotation_seq": claim.rotation_seq,
+                        "min_wire_version": claim.min_wire_version,
+                        "pairing_sas": claim.last_pairing_sas,
+                    })
+                })
+                .collect(),
+        )
+    }
+
     /// Removes a `Pending` (unconfirmed) peer or host entry and every unconfirmed host claim
     /// naming `peer_id`, refusing to drop `Active` or `Revoked` entries. Nothing is revoked.
     pub fn remove_pending_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
@@ -3381,6 +3419,61 @@ mod tests {
             .unwrap();
         removed.confirm_peer("host-x", Some("real sas")).unwrap();
         assert_eq!(removed.get("host-x").unwrap().static_pub, real_st);
+    }
+
+    #[test]
+    fn removing_host_claims_never_touches_entries() {
+        let claimed = host_keys(0x3d);
+        let inbound = host_keys(0x3f);
+        let label = device_id(&inbound.0);
+        let mut roster = Roster::new();
+        roster
+            .record_pending_pair(
+                inbound.0,
+                Some(inbound.1.clone()),
+                "Inbound".into(),
+                "cli".into(),
+                "sas".into(),
+            )
+            .unwrap();
+        // A hostile host names the id of a real inbound device.
+        record_claim(&mut roster, &label, &claimed, "sas c").unwrap();
+        assert_eq!(roster.pending_hosts().count(), 1);
+
+        roster.remove_pending_host_claims(&label).unwrap();
+        assert_eq!(roster.pending_hosts().count(), 0);
+        assert_eq!(
+            roster.get(&label).map(|e| e.state),
+            Some(PeerState::Pending),
+            "the inbound device survives"
+        );
+        assert_eq!(
+            roster.remove_pending_host_claims(&label),
+            Err(CoreError::PeerNotFound(label.clone()))
+        );
+
+        // An active or revoked entry is no claim: not found, and untouched.
+        let active = host_keys(0x41);
+        roster
+            .insert_pinned_host(
+                "act".into(),
+                "A".into(),
+                active.0,
+                Some(active.1),
+                0,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            roster.remove_pending_host_claims("act"),
+            Err(CoreError::PeerNotFound("act".into()))
+        );
+        roster.revoke_peer("act").unwrap();
+        assert_eq!(
+            roster.remove_pending_host_claims("act"),
+            Err(CoreError::PeerNotFound("act".into()))
+        );
+        assert_eq!(roster.get("act").map(|e| e.state), Some(PeerState::Revoked));
     }
 
     #[test]

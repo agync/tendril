@@ -916,6 +916,11 @@ impl WasmIdentity {
     }
 
     fn serialize_json(&self) -> Result<Zeroizing<String>, WasmError> {
+        if !tendril_core::identity::is_valid_host_id(self.inner.host_id()) {
+            return Err(WasmError::from(
+                tendril_core::error::CoreError::ProtocolViolation("invalid host_id"),
+            ));
+        }
         let doc = PersistedWasmIdentity {
             host_id: self.inner.host_id().to_owned(),
             static_secret_b64: b64url_encode(self.inner.static_key().secret_bytes()),
@@ -2029,6 +2034,14 @@ impl WasmRoster {
         Ok(())
     }
 
+    /// Drops every unconfirmed host claim naming `host_id` and nothing else.
+    #[wasm_bindgen]
+    pub fn remove_pending_host_claims(&mut self, host_id: &str) -> Result<(), JsValue> {
+        self.inner
+            .remove_pending_host_claims(host_id)
+            .map_err(to_js_err)
+    }
+
     #[wasm_bindgen]
     pub fn remove_pending_peer(&mut self, peer_id: &str) -> Result<(), JsValue> {
         self.inner.remove_pending_peer(peer_id).map_err(to_js_err)
@@ -2066,24 +2079,7 @@ impl WasmRoster {
     #[wasm_bindgen]
     #[must_use]
     pub fn pending_hosts_json(&self) -> String {
-        let list: Vec<serde_json::Value> = self
-            .inner
-            .pending_hosts()
-            .map(|e| {
-                json!({
-                    "host_id": e.device_id,
-                    "device_id": tendril_core::crypto::device_id(&e.static_pub),
-                    "name": e.name,
-                    "state": e.state,
-                    "static_pub": b64url_encode(&e.static_pub),
-                    "signing_pub_hash": e.signing_pub.as_ref().map(|k| b64url_encode(&k.sha256_hash())),
-                    "rotation_seq": e.rotation_seq,
-                    "min_wire_version": e.min_wire_version,
-                    "pairing_sas": e.last_pairing_sas,
-                })
-            })
-            .collect();
-        serde_json::Value::Array(list).to_string()
+        self.inner.pending_hosts_json().to_string()
     }
 
     #[wasm_bindgen]
@@ -4682,6 +4678,21 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_tampered_identity_is_refused_on_load_and_save() {
+        let id = WasmIdentity::generate_inner(Some("wasm-ok")).unwrap();
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&id.serialize_json().unwrap()).unwrap();
+        doc["host_id"] = "has#hash".into();
+        assert!(WasmIdentity::parse_json(&doc.to_string()).is_err());
+        let forged = WasmIdentity {
+            inner: EndpointIdentity::generate()
+                .unwrap()
+                .with_host_id("has#hash"),
+        };
+        assert!(forged.serialize_json().is_err());
+    }
 
     #[test]
     fn an_invalid_host_id_cannot_be_configured() {
@@ -7504,7 +7515,6 @@ mod route_tests {
         let listed = to_json(&WasmRoster { inner: roster }.pending_hosts_json());
         assert_eq!(listed[0]["host_id"], "studio");
         assert_eq!(listed[0]["device_id"], host.device_id());
-        assert_eq!(listed[0]["state"], "pending");
         assert_eq!(listed.as_array().unwrap().len(), 1);
     }
 

@@ -22,7 +22,7 @@ use tendril_core::crypto::{
 use tendril_core::error::CoreError;
 use tendril_core::grants::{Grant, RevocationList, authorize_grant, canonical_json};
 use tendril_core::identity::{
-    EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
+    EndpointIdentity, RotationRecord, SigningKeyPin, is_valid_host_id, verify_rotation_chain,
 };
 use tendril_core::pairing::{
     DroppedHint, EnrollmentPolicy, IssueOptions, PairAction, PairOutcome, PairingCodeKind,
@@ -1243,14 +1243,52 @@ impl TendrilEndpoint {
 
     /// Persists the CRLs only this endpoint's sessions hold, under the store lock. Nothing is
     /// written (no `roster.json` created, no mtime bump) when the store already holds them.
+    ///
+    /// Each CRL is verified against the issuer's key as [`Self::persist_v1_crl_if_newer`] does:
+    /// the local signing key for this host's own CRL, else an active key or anchor on disk,
+    /// else the key the in-memory roster holds, so a CRL whose issuer was revoked on disk since
+    /// is kept.
     fn persist_session_crls(&self) -> Result<(), (i32, String)> {
         let Some(store) = self.store.as_ref() else {
             return Ok(());
         };
         let _store_guard = self.rt.block_on(self.store_lock.lock());
+        let local_id = self.identity.host_id();
+        let held: Vec<(String, RevocationList, Option<HybridSigningPublicKey>)> = {
+            let mem = lock_roster(&self.roster);
+            let mut issuers: Vec<&String> = mem.entries().map(|(id, _)| id).collect();
+            issuers.extend(mem.trust_anchors().map(|(id, _)| id));
+            let local = local_id.to_owned();
+            if !issuers.contains(&&local) {
+                issuers.push(&local);
+            }
+            issuers
+                .into_iter()
+                .filter_map(|id| {
+                    mem.crl(id).map(|crl| {
+                        let key = mem
+                            .get(id)
+                            .and_then(|e| e.signing_pub.clone())
+                            .or_else(|| mem.lookup_active_anchor_key(id));
+                        (id.clone(), crl.clone(), key)
+                    })
+                })
+                .collect()
+        };
         store
             .update_roster_if_changed(|disk| {
-                disk.merge_crl_evidence(&held_crls(&lock_roster(&self.roster)));
+                for (issuer, crl, memory_key) in &held {
+                    let key = if issuer == local_id {
+                        Some(self.identity.signing_key().public_key().clone())
+                    } else {
+                        disk.lookup_active_signing_key(issuer)
+                            .or_else(|| disk.lookup_active_anchor_key(issuer))
+                            .or_else(|| memory_key.clone())
+                    };
+                    if let Some(key) = key {
+                        let _ = disk.ingest_crl(crl.clone(), issuer, &key);
+                    }
+                }
                 Ok(())
             })
             .map(|_| ())
@@ -1491,6 +1529,10 @@ fn build_endpoint_handle(
     runtime_profile: RuntimeProfile,
     client_only: bool,
 ) -> *mut TendrilEndpoint {
+    if !is_valid_host_id(identity.host_id()) {
+        set_last_error("invalid local host_id");
+        return ptr::null_mut();
+    }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     if runtime_profile == RuntimeProfile::Extension {
         builder
@@ -3292,8 +3334,13 @@ pub unsafe extern "C" fn tendril_endpoint_pending_hosts(
     out_json: *mut *mut c_char,
 ) -> i32 {
     ffi_i32(|| {
-        if ep.is_null() || out_json.is_null() {
-            set_last_error("null endpoint or out_json");
+        if out_json.is_null() {
+            set_last_error("null out_json");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        unsafe { *out_json = ptr::null_mut() };
+        if ep.is_null() {
+            set_last_error("null endpoint");
             return TENDRIL_ERR_INVALID_ARG;
         }
         let ep = unsafe { &*ep };
@@ -3301,10 +3348,13 @@ pub unsafe extern "C" fn tendril_endpoint_pending_hosts(
             Ok(roster) => roster,
             Err(e) => {
                 set_last_error(e.to_string());
-                return runtime_error_code(&e);
+                return match e {
+                    RuntimeError::Io(_) | RuntimeError::Storage(_) => TENDRIL_ERR_INTERNAL,
+                    _ => runtime_error_code(&e),
+                };
             }
         };
-        let claims = tendril_runtime::pending_hosts_json(&roster);
+        let claims = roster.pending_hosts_json();
         unsafe { write_out_cstring(out_json, &claims.to_string()) }
     })
 }
@@ -3315,7 +3365,7 @@ pub unsafe extern "C" fn tendril_endpoint_pending_hosts(
 /// # Safety
 /// `ep` and `host_id` must be valid non-null pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tendril_endpoint_remove_pending_peer(
+pub unsafe extern "C" fn tendril_endpoint_remove_pending_host(
     ep: *mut TendrilEndpoint,
     host_id: *const c_char,
 ) -> i32 {
@@ -3330,7 +3380,7 @@ pub unsafe extern "C" fn tendril_endpoint_remove_pending_peer(
         let ep = unsafe { &*ep };
         match ep.mutate_roster(|roster| {
             roster
-                .remove_pending_peer(host_s)
+                .remove_pending_host_claims(host_s)
                 .map_err(|e| (revoke_error_code(&e), e.to_string()))
         }) {
             Ok(()) => TENDRIL_OK,
@@ -3367,7 +3417,11 @@ pub unsafe extern "C" fn tendril_endpoint_revoke_pending_host(
                 .revoke_pending_host(device_s)
                 .map_err(|e| (revoke_error_code(&e), e.to_string()))
         }) {
-            Ok(()) => TENDRIL_OK,
+            Ok(()) => {
+                // Revoking a claim's keys also revokes trust anchors sharing its signing key.
+                ep.refresh_m2m_enabled(&lock_roster(&ep.roster));
+                TENDRIL_OK
+            }
             Err((rc, msg)) => {
                 set_last_error(msg);
                 rc
@@ -7560,6 +7614,102 @@ mod route_state_tests {
             .ingest_crl(crl(&anchor, &anchor_id, 1), &anchor_id, &anchor_pub)
             .unwrap();
         [peer_id, anchor_id]
+    }
+
+    #[test]
+    fn revoking_a_pending_claim_refreshes_the_m2m_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ep = Ep::new(tmp.path(), None);
+        let signing = tendril_core::crypto::SigningKeypair::from_seed([0x61; 32]);
+        let static_pub =
+            *tendril_core::crypto::StaticKeypair::from_scalar([0x62; 32]).public_bytes();
+        let anchor_id = cs("anchor-a");
+        assert_eq!(
+            unsafe {
+                tendril_endpoint_add_trust_anchor(
+                    ep.0,
+                    anchor_id.as_ptr(),
+                    signing.public_key().as_bytes().as_ptr(),
+                    signing.public_key().as_bytes().len(),
+                )
+            },
+            TENDRIL_OK,
+            "{}",
+            last_err()
+        );
+        assert!(ep.get().m2m_enabled.load(Ordering::Acquire));
+        ep.get()
+            .mutate_roster(|r| {
+                r.record_pending_host(
+                    "claimed".to_owned(),
+                    "Claim".to_owned(),
+                    static_pub,
+                    signing.public_key().clone(),
+                    0,
+                    "123456".to_owned(),
+                    vec![],
+                )
+                .map(|_| ())
+                .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+            })
+            .unwrap();
+        let device = cs(&tendril_core::crypto::device_id(&static_pub));
+        assert_eq!(
+            unsafe { tendril_endpoint_revoke_pending_host(ep.0, device.as_ptr()) },
+            TENDRIL_OK,
+            "{}",
+            last_err()
+        );
+        assert!(
+            !ep.get().m2m_enabled.load(Ordering::Acquire),
+            "the sibling anchor is revoked, so M2M turns off"
+        );
+    }
+
+    #[test]
+    fn persisting_session_crls_keeps_local_and_revoked_issuer_crls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ep = Ep::new(tmp.path(), None);
+        let local = ep.get().identity.clone();
+        let local_id = local.host_id().to_owned();
+        let local_pub = local.signing_key().public_key().clone();
+        let peer = EndpointIdentity::generate().unwrap();
+        let peer_id = peer.host_id().to_owned();
+        let peer_pub = peer.signing_key().public_key().clone();
+        ep.get()
+            .mutate_roster(|r| {
+                r.insert_pinned_host(
+                    peer_id.clone(),
+                    "Peer".to_owned(),
+                    *peer.static_key().public_bytes(),
+                    Some(peer_pub.clone()),
+                    0,
+                    vec![],
+                )
+                .map(|_| ())
+                .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+            })
+            .unwrap();
+        {
+            let mut mem = lock_roster(&ep.get().roster);
+            mem.ingest_crl(crl(&local, &local_id, 1), &local_id, &local_pub)
+                .unwrap();
+            mem.ingest_crl(crl(&peer, &peer_id, 1), &peer_id, &peer_pub)
+                .unwrap();
+        }
+        // The peer is revoked on disk by another process before the CRLs are persisted.
+        ep.get()
+            .store
+            .as_ref()
+            .unwrap()
+            .update_roster(|r| r.revoke_peer(&peer_id).map_err(Into::into))
+            .unwrap();
+        assert_eq!(ep.disk_crl_seq(&local_id), None);
+        assert_eq!(ep.disk_crl_seq(&peer_id), None);
+
+        ep.get().persist_session_crls().unwrap();
+        assert_eq!(ep.disk_crl_seq(&local_id), Some(1), "the host's own CRL");
+        assert_eq!(ep.disk_crl_seq(&peer_id), Some(1), "a revoked issuer's CRL");
     }
 
     #[test]

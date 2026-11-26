@@ -60,7 +60,7 @@ export class Endpoint {
    */
   pendingHosts(): Promise<string>;
   /** Drops every unconfirmed host claim naming `hostId` and revokes nothing. */
-  removePendingPeer(hostId: string): void;
+  removePendingHost(hostId: string): void;
   /**
    * Revokes the keys of the claims whose handshake-derived `deviceId` matches; a claimed
    * `host_id` never matches.

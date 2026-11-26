@@ -142,9 +142,10 @@ impl EndpointIdentity {
 
     /// Overrides the stable `host_id` carried in `HostHello`, unchecked.
     ///
-    /// Peers refuse a `HostHello` whose `host_id` fails [`is_valid_host_id`], so this exists
-    /// for literals known to be valid and for tests that forge a hostile host. Production code
-    /// takes its `host_id` through [`Self::try_with_host_id`].
+    /// For tests that forge hostile hosts: peers refuse a `HostHello` whose `host_id` fails
+    /// [`is_valid_host_id`]. Production code takes its `host_id` through
+    /// [`Self::try_with_host_id`].
+    #[doc(hidden)]
     #[must_use]
     pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
         self.host_id = host_id.into();

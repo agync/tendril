@@ -18,3 +18,13 @@ test("an invalid host_id cannot be configured", () => {
     assert.equal(fs.existsSync(path.join(state, "identity.json")), false);
   }
 });
+
+test("a tampered identity file is refused", () => {
+  const state = tmpDir("tendril-node-tamper-");
+  new Endpoint(state, "good-host").close();
+  const file = path.join(state, "identity.json");
+  const doc = JSON.parse(fs.readFileSync(file, "utf8"));
+  doc.host_id = "has#hash";
+  fs.writeFileSync(file, JSON.stringify(doc), { mode: 0o600 });
+  assert.throws(() => new Endpoint(state, null));
+});

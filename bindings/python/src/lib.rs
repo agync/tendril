@@ -23,7 +23,7 @@ use tendril_core::error::CoreError;
 use tendril_core::grants::{AuditEvent, Grant, RevocationList, authorize_grant, canonical_json};
 use tendril_core::group::GroupManifest;
 use tendril_core::identity::{
-    EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
+    EndpointIdentity, RotationRecord, SigningKeyPin, is_valid_host_id, verify_rotation_chain,
 };
 use tendril_core::pairing::{
     EnrollmentPolicy, IssueOptions, PairAction, PairOutcome, PairingCodeKind, PairingConfig,
@@ -1587,6 +1587,9 @@ impl Endpoint {
             let has_active_anchor = roster
                 .trust_anchors()
                 .any(|(_, a)| a.state == AnchorState::Active);
+            if !is_valid_host_id(identity.host_id()) {
+                return Err(PyValueError::new_err("invalid local host_id"));
+            }
             let identity = Arc::new(identity);
             let roster = Arc::new(StdMutex::new(roster));
             let access_roster = if store.is_some() {
@@ -2332,12 +2335,12 @@ impl Endpoint {
         let identity = Arc::clone(&self.identity);
         py.detach(move || {
             sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
-            Ok(tendril_runtime::pending_hosts_json(&lock_roster(&roster)).to_string())
+            Ok(lock_roster(&roster).pending_hosts_json().to_string())
         })
     }
 
     /// Drops every unconfirmed host claim naming `host_id` and revokes nothing.
-    fn remove_pending_peer(&self, py: Python<'_>, host_id: &str) -> PyResult<()> {
+    fn remove_pending_host(&self, py: Python<'_>, host_id: &str) -> PyResult<()> {
         let identity = Arc::clone(&self.identity);
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
@@ -2351,7 +2354,7 @@ impl Endpoint {
                 &identity,
                 |roster| {
                     roster
-                        .remove_pending_peer(&host)
+                        .remove_pending_host_claims(&host)
                         .map_err(RuntimeError::from)
                 },
             )
@@ -2366,6 +2369,8 @@ impl Endpoint {
         let store = self.store.clone();
         let store_lock = Arc::clone(&self.store_lock);
         let device = device_id.to_owned();
+        let self_m2m = Arc::clone(&self.self_m2m_enabled);
+        let m2m = Arc::clone(&self.m2m_enabled);
         py.detach(move || {
             update_roster_blocking(
                 store.as_ref(),
@@ -2377,7 +2382,10 @@ impl Endpoint {
                         .revoke_pending_host(&device)
                         .map_err(RuntimeError::from)
                 },
-            )
+            )?;
+            // Revoking a claim's keys also revokes trust anchors sharing its signing key.
+            refresh_m2m_flags(&self_m2m, &m2m, &lock_roster(&roster_arc));
+            Ok(())
         })
     }
 

@@ -38,14 +38,14 @@ test("pendingHosts lists, revokes by device id and removes unconfirmed claims", 
 
     cli.revokePendingHost(deviceId);
     assert.deepEqual(JSON.parse(await cli.pendingHosts()), []);
-    assert.throws(() => cli.removePendingPeer("pend-host"));
+    assert.throws(() => cli.removePendingHost("pend-host"));
   } finally {
     host.close();
     cli.close();
   }
 });
 
-test("removePendingPeer drops the claim and survives a reopen", async () => {
+test("removePendingHost drops the claim and survives a reopen", async () => {
   const hostDir = tmpDir("tendril-node-rm-host-");
   const cliDir = tmpDir("tendril-node-rm-cli-");
   const host = new Endpoint(hostDir, "rm-host");
@@ -53,11 +53,39 @@ test("removePendingPeer drops the claim and survives a reopen", async () => {
   try {
     await pairUnpinned(host, cli);
     assert.equal(JSON.parse(await cli.pendingHosts()).length, 1);
-    cli.removePendingPeer("rm-host");
+    cli.removePendingHost("rm-host");
     assert.deepEqual(JSON.parse(await cli.pendingHosts()), []);
     const reopened = new Endpoint(cliDir, null);
     assert.deepEqual(JSON.parse(await reopened.pendingHosts()), []);
     reopened.close();
+  } finally {
+    host.close();
+    cli.close();
+  }
+});
+
+test("removePendingHost never touches an inbound pending device or an active entry", async () => {
+  const hostDir = tmpDir("tendril-node-inb-host-");
+  const cliDir = tmpDir("tendril-node-inb-cli-");
+  const host = new Endpoint(hostDir, "inb-host");
+  const cli = new Endpoint(cliDir, "inb-cli");
+  try {
+    const addr = await host.serveDirect("127.0.0.1:0");
+    const code = host.issueCode("lan");
+    const [accepted, paired] = await Promise.all([
+      host.pairAccept(5000),
+      cli.pairInitiate(addr, code),
+    ]);
+    const inbound = JSON.parse(accepted).device_id;
+    const sas = JSON.parse(paired).sas;
+
+    // The host holds the client as a pending device, not a claim.
+    assert.throws(() => host.removePendingHost(inbound));
+    host.confirmPeer(inbound, sas);
+
+    // An active entry is no claim either.
+    cli.confirmPeer("inb-host", sas);
+    assert.throws(() => cli.removePendingHost("inb-host"));
   } finally {
     host.close();
     cli.close();
