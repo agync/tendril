@@ -200,6 +200,8 @@ tendril --state-dir ./runner-state enroll \
   --host-static-pub "<b64url_host_static>" \
   --host-signing-pub "<b64url_host_signing_or_hash>" \
   --token-file ./token.json
+# (enroll also stores the host's signed routes and the endpoint dialed as Day-2 routes;
+#  pass --route-policy committed-only to keep only the endpoint, or --route-policy none to store no route)
 
 # Mint application grants after enrollment (still default deny), revoke unused nonces, or rotate keys
 tendril --state-dir ./host-state mint <runner_device_id> --cap fs.read

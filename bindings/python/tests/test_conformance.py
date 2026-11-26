@@ -557,6 +557,72 @@ class TendrilPythonTests(unittest.TestCase):
             host_ep.close()
             cli_ep.close()
 
+    def _enroll_into(self, host_ep, cli_ep, cfg=None):
+        def b64u_dec(s: str) -> bytes:
+            return base64.urlsafe_b64decode(s + "=" * ((4 - len(s) % 4) % 4))
+
+        if cfg is not None:
+            cli_ep.configure_transports_json(json.dumps(cfg))
+        host_info = json.loads(host_ep.info_json())
+        cli_info = json.loads(cli_ep.info_json())
+        addr = host_ep.serve_direct("127.0.0.1:0")
+        token = host_ep.mint_enrollment_token(host_info["host_id"], cli_info["device_id"], 900)
+        t = threading.Thread(target=lambda: host_ep.pair_accept(5000))
+        t.start()
+        try:
+            res = json.loads(
+                cli_ep.enroll_initiate(
+                    addr,
+                    host_info["host_id"],
+                    b64u_dec(host_info["static_pub"]),
+                    b64u_dec(host_info["signing_pub"]),
+                    token,
+                )
+            )
+        finally:
+            t.join(timeout=10)
+        routes = json.loads(cli_ep.peer_routes(host_info["host_id"]))
+        return res, routes
+
+    def test_enroll_initiate_stores_routes_per_route_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as hd, tempfile.TemporaryDirectory() as cd:
+            host_ep = tendril.Endpoint(hd, "py-enr-host")
+            cli_ep = tendril.Endpoint(cd)
+            try:
+                res, routes = self._enroll_into(host_ep, cli_ep)
+                self.assertEqual(res["status"], "active")
+                self.assertTrue(res["routes_persisted"], res)
+                self.assertIn("committed", [r["source"] for r in routes["routes"]], routes)
+            finally:
+                host_ep.close()
+                cli_ep.close()
+
+        with tempfile.TemporaryDirectory() as hd, tempfile.TemporaryDirectory() as cd:
+            host_ep = tendril.Endpoint(hd, "py-enr-host")
+            cli_ep = tendril.Endpoint(cd)
+            try:
+                res, routes = self._enroll_into(host_ep, cli_ep, {"route_policy": "none"})
+                self.assertEqual(res["status"], "active")
+                self.assertEqual(res["routes_persisted"], [])
+                self.assertEqual(routes["routes"], [])
+            finally:
+                host_ep.close()
+                cli_ep.close()
+
+    def test_enroll_initiate_without_a_state_dir_stores_no_route(self) -> None:
+        with tempfile.TemporaryDirectory() as hd:
+            host_ep = tendril.Endpoint(hd, "py-enr-host")
+            cli_ep = tendril.Endpoint(None)
+            try:
+                res, routes = self._enroll_into(host_ep, cli_ep)
+                self.assertEqual(res["status"], "active")
+                self.assertEqual(res["routes_persisted"], [])
+                self.assertEqual(res["routes_reason"], "no_state_dir")
+                self.assertEqual(routes["routes"], [])
+            finally:
+                host_ep.close()
+                cli_ep.close()
+
     def test_m2m_enrollment_and_replay(self) -> None:
         host_ep = tendril.Endpoint(None, "py-m2m-host")
         anchor_ep = tendril.Endpoint(None, "py-m2m-anchor")
