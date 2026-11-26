@@ -1318,13 +1318,112 @@ struct TendrilRouteTests {
       try routes(p.client, p.hostId, source: "operator")
         == ["direct:127.0.0.1:41002", "direct:127.0.0.1:41003"])
     #expect(throws: Error.self) { try p.client.setPeerRoutes(peerId: p.hostId, routes: ["a\u{0}b"]) }
-    #expect(throws: Error.self) { try p.client.setPeerRoutes(peerId: "dev_unknown", routes: []) }
+    expectFfiCode(TENDRIL_ERR_NOT_FOUND.rawValue) {
+      try p.client.setPeerRoutes(peerId: "dev_unknown", routes: ["direct:127.0.0.1:41005"])
+    }
+    expectFfiCode(TENDRIL_ERR_NOT_FOUND.rawValue) { _ = try p.client.peerRoutes(peerId: "dev_unknown") }
 
     try p.client.clearPeerRoutes(peerId: p.hostId)
     #expect(try routes(p.client, p.hostId, source: "operator").isEmpty)
     #expect(try routes(p.client, p.hostId, source: "signed").count == 1)
     try p.client.clearPeerRoutes(peerId: p.hostId, source: "all")
     #expect((try obj(p.client.peerRoutes(peerId: p.hostId))["routes"] as! [Any]).isEmpty)
+  }
+
+  /// Records an issue unless `body` throws the FFI error with `code`.
+  private func expectFfiCode(_ code: Int32, _ body: () throws -> Void) {
+    do {
+      try body()
+      Issue.record("expected FFI error \(code)")
+    } catch TendrilError.ffi(let got, let message) {
+      #expect(got == code, "\(message)")
+    } catch {
+      Issue.record("expected FFI error \(code), got \(error)")
+    }
+  }
+
+  @Test
+  func pairResultReportsRoutesReason() throws {
+    let p = try paired()
+    defer {
+      p.host.close()
+      p.client.close()
+    }
+    // A verified, persisted pairing has nothing to explain.
+    #expect(p.pair["route_check"] as? String == "verified")
+    #expect(p.pair["routes_reason"] is NSNull)
+
+    // An unsigned URI writes no routes unless asked, and says why.
+    let unsigned = try obj(p.host.issuePairingUri(signRoutes: false))["uri"] as! String
+    let second = try TendrilEndpoint(hostId: "swift-reason-client")
+    defer { second.close() }
+    let res = try pair(host: p.host, client: second, uri: unsigned).client
+    #expect(res["route_check"] as? String == "unsigned")
+    #expect((res["routes_persisted"] as! [Any]).isEmpty)
+    #expect(res["routes_reason"] as? String == "unsigned_uri")
+  }
+
+  @Test
+  func connectWithOptionsForwardsRelayHost() throws {
+    let p = try paired()
+    defer {
+      p.host.close()
+      p.client.close()
+    }
+    // For an `iroh://` endpoint `relayHost` selects the Iroh relay mode. The core's relay-mode
+    // parser rejects an unknown value, so this message proves the field reached the dialer.
+    do {
+      _ = try p.client.connectWithOptions(
+        targetHostId: p.hostId, grantJson: p.grant, endpoint: "iroh://peer",
+        relayHost: "not-a-relay-mode")
+      Issue.record("expected the relay mode to be rejected")
+    } catch TendrilError.ffi(_, let message) {
+      #expect(message.contains("invalid p2p relay mode"), "\(message)")
+    }
+    #expect(throws: TendrilError.invalidArgument("relay_host contains interior NUL byte")) {
+      _ = try p.client.connectWithOptions(
+        targetHostId: p.hostId, grantJson: p.grant, relayHost: "a\u{0}b")
+    }
+  }
+
+  @Test
+  func connectWithOptionsRelayHostDialsALocalP2pListener() throws {
+    let host = try TendrilEndpoint(hostId: "swift-p2p-host")
+    let client = try TendrilEndpoint(hostId: "swift-p2p-client")
+    defer {
+      host.close()
+      client.close()
+    }
+    let addr = try host.serveP2p(relayMode: "disabled")
+    // A LAN code is refused on a remote (iroh) path, so the code is a remote one.
+    let code = try host.issueCode(kind: "remote")
+    let hostBox = SendableBox<String>("")
+    let sem = DispatchSemaphore(value: 0)
+    onDedicatedThread {
+      hostBox.set((try? host.pairAccept(timeoutMs: 15_000)) ?? "")
+      sem.signal()
+    }
+    let clientRes = try obj(
+      client.pairInitiate(
+        endpoint: addr, relayHost: "disabled", code: code, deviceName: "swift-p2p", deviceKind: "swift"))
+    #expect(sem.wait(timeout: .now() + 15.0) == .success)
+    let hostRes = try obj(hostBox.get())
+    let peerId = hostRes["device_id"] as! String
+    #expect(clientRes["sas"] as? String == hostRes["sas"] as? String)
+    try host.confirmPeer(peerId: peerId, sas: hostRes["sas"] as? String)
+    try client.confirmPeer(peerId: "swift-p2p-host", sas: clientRes["sas"] as? String)
+    let grant = try host.mintGrant(peerId: peerId, capsJson: "[\"fs.read\"]", ttlSecs: 3600)
+
+    // `relayHost: "disabled"` selects the no-relay mode, so the local listener is reachable.
+    let (cli, srv) = try accepting(host: host) {
+      try client.connectWithOptions(
+        targetHostId: "swift-p2p-host", grantJson: grant, endpoint: addr, relayHost: "disabled")
+    }
+    defer {
+      cli.free()
+      srv.free()
+    }
+    try roundTrip(cli, srv, "over p2p with relayHost")
   }
 
   @Test
@@ -1624,6 +1723,66 @@ struct TendrilRouteTests {
     #expect(throws: Error.self) { try ep.configureRoutes(routePolicy: "a\u{0}b") }
     let uri = try obj(ep.issuePairingUri())["uri"] as! String
     #expect(uri.contains("192.168.40.1"))
+  }
+
+  @Test
+  func configureP2pReachesTheListenerAndIsValidated() throws {
+    let ep = try TendrilEndpoint(hostId: "swift-p2p-net")
+    defer { ep.close() }
+    try ep.configureRoutes(advertise: "explicit", routePolicy: "committed_only")
+    try ep.configureP2p(portMapping: false, bindAddrs: ["127.0.0.1:0"])
+    // The merge keeps the route keys sent before and adds the two P2P keys.
+    #expect(ep.cachedTransportKeyCount == 4)
+
+    let addr = try ep.serveP2p(relayMode: "disabled")
+    let hints = addr.components(separatedBy: CharacterSet(charactersIn: "?&"))
+      .filter { $0.hasPrefix("addr=") }
+      .map { String($0.dropFirst("addr=".count)) }
+    #expect(!hints.isEmpty, "\(addr)")
+    for hint in hints {
+      #expect(hint.hasPrefix("127.0.0.1:"), "\(addr)")
+    }
+
+    for bad in [["not-an-addr"], ["127.0.0.1:0", "127.0.0.2:0"]] {
+      do {
+        try ep.configureP2p(bindAddrs: bad)
+        Issue.record("expected \(bad) to be rejected")
+      } catch TendrilError.ffi(let code, let message) {
+        #expect(code == TENDRIL_ERR_INVALID_ARG.rawValue)
+        #expect(message.contains("p2p_bind_addrs"), "\(message)")
+      }
+    }
+    #expect(ep.cachedTransportKeyCount == 4)
+    #expect(throws: TendrilError.invalidArgument("p2p_bind_addrs contains interior NUL byte")) {
+      try ep.configureP2p(bindAddrs: ["127.0.0.1:0\u{0}"])
+    }
+    try ep.configureP2p(portMapping: true, bindAddrs: [])
+    #expect(ep.cachedTransportKeyCount == 4)
+  }
+
+  @Test
+  func configureP2pKeepsUnsetKeysAndWholeConfigurationKeys() throws {
+    let ep = try TendrilEndpoint(hostId: "swift-p2p-merge")
+    defer { ep.close() }
+    // A key sent through the whole-configuration call survives configureP2p.
+    try ep.configureTransportsJSON("{\"p2p_relay_mode\":\"disabled\",\"p2p_pkarr\":false}")
+    try ep.configureP2p(portMapping: false)
+    #expect(ep.cachedTransportKeyCount == 3)
+    // A nil argument keeps the earlier value of that key; setting the other changes only it.
+    try ep.configureP2p(bindAddrs: ["127.0.0.1:0"])
+    #expect(ep.cachedTransportKeyCount == 4)
+    #expect(ep.cachedTransportValue("p2p_port_mapping") as? Bool == false)
+    #expect(ep.cachedTransportValue("p2p_bind_addrs") as? [String] == ["127.0.0.1:0"])
+    #expect(ep.cachedTransportValue("p2p_relay_mode") as? String == "disabled")
+    try ep.configureP2p(portMapping: true)
+    #expect(ep.cachedTransportValue("p2p_port_mapping") as? Bool == true)
+    #expect(ep.cachedTransportValue("p2p_bind_addrs") as? [String] == ["127.0.0.1:0"])
+    // The kept bind address is still the one the listener uses.
+    let addr = try ep.serveP2p()
+    let hints = addr.components(separatedBy: CharacterSet(charactersIn: "?&"))
+      .filter { $0.hasPrefix("addr=") }
+    #expect(!hints.isEmpty, "\(addr)")
+    #expect(hints.allSatisfy { $0.hasPrefix("addr=127.0.0.1:") }, "\(addr)")
   }
 
   #if canImport(CryptoKit) && canImport(Security)
