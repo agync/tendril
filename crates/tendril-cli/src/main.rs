@@ -44,7 +44,7 @@ use tendril_runtime::{
     RouteSetSink, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
     V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeDialOptions, WakeOutcome, WakeSecret,
     WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtListener, build_wake_provider,
-    dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
+    connect_with_wake_policy, dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_policy,
     drive_pair_responder_with_store, drive_v2_pair_initiator_with_policy,
     drive_v2_pake_pair_responder_with_store, parse_p2p_relay_mode, parse_p2p_relay_modes,
@@ -976,35 +976,7 @@ async fn wake_connect_v2(
             make_opts(),
         )
     };
-    let notify = || async {
-        let now = now_unix();
-        let tag = wake.secret.derive_tag(now);
-        tokio::time::timeout(
-            wake.wake_timeout,
-            wake.provider.notify_best_effort(&wake.target, &tag, now),
-        )
-        .await
-        .unwrap_or(WakeOutcome::Skipped)
-    };
-    let outcome = if wake.pre_wake {
-        notify().await
-    } else {
-        match connect().await {
-            Ok(res) => return Ok((res, None)),
-            Err(err) if !err.is_wakeable_miss() => return Err(err),
-            Err(_) => notify().await,
-        }
-    };
-    let attempts = wake.max_attempts.max(1);
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match connect().await {
-            Ok(res) => return Ok((res, Some(outcome))),
-            Err(err) if attempt >= attempts || !err.is_wakeable_miss() => return Err(err),
-            Err(_) => tokio::time::sleep(wake.retry_delay).await,
-        }
-    }
+    connect_with_wake_policy(wake, connect).await
 }
 
 const ROUTE_STATUS_FILE: &str = "route-status.json";
