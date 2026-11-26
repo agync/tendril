@@ -27,13 +27,13 @@ use tendril_core::v2::{
 use tendril_core::wire::{FLAG_PAKE_PAIR, Intent, Preamble, WIRE_VERSION, WIRE_VERSION_V2};
 use tendril_core::{PREAMBLE_LEN, UPGRADE_CAP_WEBRTC_V1};
 use tendril_runtime::{
-    BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, HttpWakeProvider, LocalDialer,
-    MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode,
-    PathDialer, PathListener, PathStream, PrefixedPathStream, RelayClientAuth, RelayDialer,
-    RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, SessionDriver,
-    SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeDialOptions,
-    WakeSecret, WakeTarget, WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtDialer, WtListener,
+    ApnsPushMode, BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer, MAX_OUTER_FRAME_LEN,
+    OverlayDialer, P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode, PathDialer, PathListener,
+    PathStream, PrefixedPathStream, RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer,
+    RelayV2Listener, RelayV2ListenerConfig, SessionDriver, SessionEvent, StateStore,
+    V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeTransportSettings,
+    WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtDialer, WtListener, build_wake_provider,
     drive_pair_responder_with_policy, drive_v2_pake_pair_initiator, drive_v2_pake_pair_responder,
     parse_p2p_relay_mode, parse_p2p_relay_modes, peek_exact, pinned_pairing_floor,
     wake_and_connect_v2_session,
@@ -75,18 +75,22 @@ struct TransportConfigInput {
     wake_max_attempts: Option<usize>,
     #[zeroize(skip)]
     wake_timeout_ms: Option<u64>,
-}
-
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-struct WakeConfig {
     #[zeroize(skip)]
-    target: WakeTarget,
+    wake_coalesce_secs: Option<u64>,
     #[zeroize(skip)]
-    secret: WakeSecret,
-    pre_wake: bool,
-    retry_delay_ms: u64,
-    max_attempts: usize,
-    timeout_ms: u64,
+    wake_apns_mode: Option<ApnsPushMode>,
+    #[zeroize(skip)]
+    wake_apns_topic: Option<String>,
+    #[zeroize(skip)]
+    wake_apns_loc_key: Option<String>,
+    #[zeroize(skip)]
+    wake_apns_team_id: Option<String>,
+    #[zeroize(skip)]
+    wake_apns_key_id: Option<String>,
+    wake_apns_p8_pem: Option<String>,
+    #[zeroize(skip)]
+    wake_apns_client_cert_pem: Option<String>,
+    wake_apns_client_key_pem: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -96,7 +100,7 @@ struct PeerTransportConfig {
     p2p_pkarr: Option<bool>,
     p2p_allow_private_addrs: Option<bool>,
     p2p_relay_auth: Option<P2pRelayAuth>,
-    wake: Option<WakeConfig>,
+    wake: Option<WakeTransportSettings>,
 }
 
 impl PeerTransportConfig {
@@ -170,43 +174,30 @@ impl PeerTransportConfig {
             return Err("p2p relay auth is invalid when p2p_relay_mode is disabled".to_owned());
         }
 
-        let wake = if let Some(url) = input.wake_url.take() {
-            let adapter = input.wake_adapter.unwrap_or(WakeAdapterKind::Webhook);
-            let mut target = WakeTarget::new(adapter, &url).map_err(|e| e.to_string())?;
-            if let Some(tok) = input.wake_auth_token.take().map(Zeroizing::new) {
-                target = target
-                    .with_auth_token(tok.as_str())
-                    .map_err(|_| "invalid wake_auth_token".to_owned())?;
-            }
-            let secret_b64 = input
-                .wake_secret_b64
+        let has_wake_url = input.wake_url.is_some();
+        let wake = build_wake_provider(WakeConfigSpec {
+            wake_url: input.wake_url.take(),
+            wake_adapter: input.wake_adapter.take(),
+            wake_secret_b64: input.wake_secret_b64.take(),
+            wake_auth_token: input.wake_auth_token.take(),
+            wake_pre_wake: input.wake_pre_wake.take(),
+            wake_retry_delay_ms: input.wake_retry_delay_ms.take(),
+            wake_max_attempts: input.wake_max_attempts.take(),
+            wake_timeout_ms: input.wake_timeout_ms.take(),
+            wake_coalesce_secs: input
+                .wake_coalesce_secs
                 .take()
-                .map(Zeroizing::new)
-                .ok_or_else(|| "wake_secret_b64 is required when wake_url is set".to_owned())?;
-            let secret_bytes = Zeroizing::new(
-                b64url_decode_array::<32>(secret_b64.trim())
-                    .map_err(|_| "invalid wake_secret_b64".to_owned())?,
-            );
-            Some(WakeConfig {
-                target,
-                secret: WakeSecret::from_bytes(*secret_bytes),
-                pre_wake: input.wake_pre_wake.unwrap_or(false),
-                retry_delay_ms: input.wake_retry_delay_ms.unwrap_or(100),
-                max_attempts: input.wake_max_attempts.unwrap_or(10).max(1),
-                timeout_ms: input.wake_timeout_ms.unwrap_or(3_000),
-            })
-        } else if input.wake_adapter.is_some()
-            || input.wake_secret_b64.is_some()
-            || input.wake_auth_token.is_some()
-            || input.wake_pre_wake.is_some()
-            || input.wake_retry_delay_ms.is_some()
-            || input.wake_max_attempts.is_some()
-            || input.wake_timeout_ms.is_some()
-        {
-            return Err("wake_* options require wake_url".to_owned());
-        } else {
-            None
-        };
+                .or_else(|| has_wake_url.then_some(0)),
+            wake_apns_mode: input.wake_apns_mode.take(),
+            wake_apns_topic: input.wake_apns_topic.take(),
+            wake_apns_loc_key: input.wake_apns_loc_key.take(),
+            wake_apns_team_id: input.wake_apns_team_id.take(),
+            wake_apns_key_id: input.wake_apns_key_id.take(),
+            wake_apns_p8_pem: input.wake_apns_p8_pem.take(),
+            wake_apns_client_cert_pem: input.wake_apns_client_cert_pem.take(),
+            wake_apns_client_key_pem: input.wake_apns_client_key_pem.take(),
+        })
+        .map_err(|e| e.to_string())?;
 
         let _ = input.p2p_advertise_direct_addrs;
         Ok(Self {
@@ -1849,20 +1840,7 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                     Ok(d) => d,
                     Err(e) => return (err_json(e), false),
                 };
-                let http_wake = Arc::new(
-                    HttpWakeProvider::new()
-                        .with_cooldown_secs(0)
-                        .with_timeout(Duration::from_millis(wake_cfg.timeout_ms)),
-                );
-                let wake_opts = WakeDialOptions::new(
-                    http_wake,
-                    wake_cfg.target.clone(),
-                    wake_cfg.secret.clone(),
-                )
-                .with_pre_wake(wake_cfg.pre_wake)
-                .with_retry_delay(Duration::from_millis(wake_cfg.retry_delay_ms))
-                .with_max_attempts(wake_cfg.max_attempts)
-                .with_wake_timeout(Duration::from_millis(wake_cfg.timeout_ms));
+                let wake_opts = wake_cfg.to_dial_options();
                 wake_and_connect_v2_session(
                     &*dialer,
                     &endpoint,

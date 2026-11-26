@@ -2536,8 +2536,18 @@ async fn cli_e2e_conformance_peer_v2_relay_auth_and_wake() {
     let wake_secret = [0x5Au8; 32];
     let wake_sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let wake_addr = wake_sink.local_addr().unwrap();
+    let wake_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wake_hits_c = std::sync::Arc::clone(&wake_hits);
     let wake_task = tokio::spawn(async move {
-        let _ = accept_wake_post(&wake_sink, &wake_secret).await;
+        for _ in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                accept_wake_post(&wake_sink, &wake_secret),
+            )
+            .await
+            .expect("expected rapid conformance_peer connect_v2 dial not to coalesce");
+            wake_hits_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     });
 
     client.call(serde_json::json!({
@@ -2612,11 +2622,29 @@ async fn cli_e2e_conformance_peer_v2_relay_auth_and_wake() {
         assert_eq!(auth["allowed"], true);
         client.call(serde_json::json!({ "op": "rekey" }));
         client.call(serde_json::json!({ "op": "close" }));
+
+        // A second rapid connect_v2 within 5s must also deliver a wake hint when
+        // wake_coalesce_secs was omitted in configure_transports (default 0s cooldown).
+        host.send_cmd(&serde_json::json!({ "op": "accept_v2", "timeout_ms": 10000 }));
+        client.call(serde_json::json!({
+            "op": "connect_v2",
+            "endpoint": ep2,
+            "relay_host": "localhost",
+            "target_host_id": "peer-v2-host",
+            "grant": grant
+        }));
+        let acc_sess2 = host.recv_resp();
+        assert_eq!(
+            acc_sess2["ok"], true,
+            "second accept_v2 failed: {acc_sess2:?}"
+        );
+        client.call(serde_json::json!({ "op": "close" }));
     })
     .await
     .expect("spawn_blocking peer test");
 
     wake_task.await.unwrap();
+    assert_eq!(wake_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[cfg(unix)]
@@ -3948,4 +3976,330 @@ fn cli_e2e_lan_code_on_remote_uri_is_path_disallowed_without_dialing() {
     assert_eq!(report["committed"], false);
     assert_eq!(report["failures"], serde_json::json!([]));
     assert_eq!(report["skipped"][0]["reason"], "lan_code_remote_hint");
+}
+
+#[tokio::test]
+async fn cli_e2e_wake_apns_mutable_alert_p8_permissions_and_conformance_peer() {
+    use std::sync::Arc;
+    use tendril_core::crypto::b64url_encode;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    let host_dir = TempDir::new().expect("host dir");
+    let client_dir = TempDir::new().expect("client dir");
+
+    assert!(
+        run_tendril(host_dir.path(), &["init", "--host-id", "host-apns"])
+            .status
+            .success()
+    );
+    let init_cli = run_tendril(client_dir.path(), &["init"]);
+    assert!(init_cli.status.success());
+    let cli_info: serde_json::Value = serde_json::from_slice(&init_cli.stdout).unwrap();
+    let cli_dev_id = cli_info["device_id"].as_str().unwrap().to_owned();
+
+    let wake_secret = [0x47u8; 32];
+    let wake_secret_file = client_dir.path().join("wake-secret.txt");
+    write_mode_0600(&wake_secret_file, &b64url_encode(&wake_secret));
+
+    // Insecure 0644 --wake-apns-p8-file must be rejected.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bad_p8 = client_dir.path().join("bad-p8.pem");
+        std::fs::write(&bad_p8, "not-checked-before-mode").unwrap();
+        std::fs::set_permissions(&bad_p8, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let out = run_tendril(
+            client_dir.path(),
+            &[
+                "dial",
+                "--target",
+                "host-apns",
+                "--endpoint",
+                "direct:127.0.0.1:9",
+                "--wire-v2",
+                "--wake-url",
+                "https://127.0.0.1:8443/3/device/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "--wake-adapter",
+                "apns-h2",
+                "--wake-secret-file",
+                wake_secret_file.to_str().unwrap(),
+                "--wake-apns-topic",
+                "dev.tendril.ios",
+                "--wake-apns-team-id",
+                "TEAM123",
+                "--wake-apns-key-id",
+                "KEY123",
+                "--wake-apns-p8-file",
+                bad_p8.to_str().unwrap(),
+            ],
+        );
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("0600"), "{stderr}");
+    }
+
+    // --wake-adapter without --wake-url must be rejected.
+    let orphan_adapter = run_tendril(
+        client_dir.path(),
+        &[
+            "dial",
+            "--target",
+            "host-apns",
+            "--endpoint",
+            "direct:127.0.0.1:9",
+            "--wire-v2",
+            "--wake-adapter",
+            "apns",
+        ],
+    );
+    assert!(!orphan_adapter.status.success());
+
+    // Symlink --wake-apns-p8-file must be rejected.
+    #[cfg(unix)]
+    {
+        let real_p8 = client_dir.path().join("real-p8.pem");
+        let link_p8 = client_dir.path().join("link-p8.pem");
+        write_mode_0600(&real_p8, "placeholder");
+        std::os::unix::fs::symlink(&real_p8, &link_p8).unwrap();
+        let sym_out = run_tendril(
+            client_dir.path(),
+            &[
+                "dial",
+                "--target",
+                "host-apns",
+                "--endpoint",
+                "direct:127.0.0.1:9",
+                "--wire-v2",
+                "--wake-url",
+                "https://127.0.0.1:8443/3/device/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "--wake-adapter",
+                "apns-h2",
+                "--wake-secret-file",
+                wake_secret_file.to_str().unwrap(),
+                "--wake-apns-topic",
+                "dev.tendril.ios",
+                "--wake-apns-team-id",
+                "TEAM123",
+                "--wake-apns-key-id",
+                "KEY123",
+                "--wake-apns-p8-file",
+                link_p8.to_str().unwrap(),
+            ],
+        );
+        assert!(!sym_out.status.success());
+    }
+
+    // Invalid loc-key must fail closed.
+    let bad_loc = run_tendril(
+        client_dir.path(),
+        &[
+            "dial",
+            "--target",
+            "host-apns",
+            "--endpoint",
+            "direct:127.0.0.1:9",
+            "--wire-v2",
+            "--wake-url",
+            "http://127.0.0.1:9/push",
+            "--wake-adapter",
+            "apns",
+            "--wake-secret-file",
+            wake_secret_file.to_str().unwrap(),
+            "--wake-apns-mode",
+            "mutable-alert",
+            "--wake-apns-loc-key",
+            "bad dynamic %@",
+        ],
+    );
+    assert!(!bad_loc.status.success());
+
+    // End-to-end CLI dial with --wake-adapter apns --wake-apns-mode mutable-alert.
+    let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(None::<(String, serde_json::Value)>));
+    let captured_c = Arc::clone(&captured);
+    let sink_task = tokio::spawn(async move {
+        let (mut sock, _) = sink.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let mut hdr_end = None;
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                hdr_end = Some(pos + 4);
+                break;
+            }
+        }
+        let hdr_end = hdr_end.unwrap();
+        let hdrs = std::str::from_utf8(&buf[..hdr_end]).unwrap().to_owned();
+        let clen = hdrs
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        while buf.len() < hdr_end + clen {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&buf[hdr_end..hdr_end + clen]).unwrap();
+        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        *captured_c.lock().await = Some((hdrs, json));
+    });
+
+    let h_dir = host_dir.path().to_path_buf();
+    let c_dir = client_dir.path().to_path_buf();
+    let w_sec = wake_secret_file.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut serve = KillOnDrop(
+            Command::new(tendril_bin())
+                .arg("--state-dir")
+                .arg(&h_dir)
+                .args([
+                    "serve",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--wire-v2",
+                    "--issue-code",
+                    "lan",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn serve"),
+        );
+        let mut stdout = BufReader::new(serve.0.stdout.take().unwrap());
+        let listening = read_json_line(&mut stdout);
+        let ep = listening["direct_endpoint"].as_str().unwrap().to_owned();
+        let code = listening["pairing_code"].as_str().unwrap().to_owned();
+
+        let pair_out = run_tendril(
+            &c_dir,
+            &["pair", "--wire-v2", "--endpoint", &ep, "--code", &code],
+        );
+        assert!(pair_out.status.success());
+        let pair_json: serde_json::Value = serde_json::from_slice(&pair_out.stdout).unwrap();
+        let sas = pair_json["sas"].as_str().unwrap();
+        assert_eq!(read_json_line(&mut stdout)["event"], "paired");
+        assert!(
+            run_tendril(&c_dir, &["confirm", "host-apns", "--sas", sas])
+                .status
+                .success()
+        );
+        assert!(
+            run_tendril(&h_dir, &["confirm", &cli_dev_id, "--sas", sas])
+                .status
+                .success()
+        );
+        let mint = run_tendril(&h_dir, &["mint", &cli_dev_id, "--cap", "fs.read"]);
+        assert!(mint.status.success());
+        let grant = String::from_utf8(mint.stdout).unwrap();
+
+        let wake_url = format!("http://{sink_addr}/3/device/opaque");
+        let dial_out = Command::new(tendril_bin())
+            .arg("--state-dir")
+            .arg(&c_dir)
+            .args([
+                "dial",
+                "--target",
+                "host-apns",
+                "--endpoint",
+                &ep,
+                "--wire-v2",
+                "--wake-url",
+                &wake_url,
+                "--wake-adapter",
+                "apns",
+                "--wake-apns-mode",
+                "mutable-alert",
+                "--wake-apns-topic",
+                "dev.tendril.ios",
+                "--wake-apns-loc-key",
+                "CLI_ALERT_KEY",
+                "--wake-pre-wake",
+                "--wake-secret-file",
+            ])
+            .arg(&w_sec)
+            .args(["--grant", grant.trim(), "--message", "hello-apns-cli"])
+            .output()
+            .unwrap();
+        assert!(
+            dial_out.status.success(),
+            "dial stderr: {}",
+            String::from_utf8_lossy(&dial_out.stderr)
+        );
+        assert_eq!(read_json_line(&mut stdout)["event"], "session_established");
+        assert_eq!(read_json_line(&mut stdout)["utf8"], "hello-apns-cli");
+    })
+    .await
+    .unwrap();
+
+    sink_task.await.unwrap();
+    let (hdrs, json) = captured.lock().await.take().expect("captured wake");
+    assert!(hdrs.contains("apns-push-type: alert\r\n"), "{hdrs}");
+    assert!(hdrs.contains("apns-priority: 10\r\n"), "{hdrs}");
+    assert!(hdrs.contains("apns-topic: dev.tendril.ios\r\n"), "{hdrs}");
+    assert_eq!(json["aps"]["mutable-content"], 1);
+    assert_eq!(json["aps"]["alert"]["loc-key"], "CLI_ALERT_KEY");
+
+    // conformance_peer accepts valid apns_h2 + mutable_alert config and rejects invalid exclusions.
+    let mut peer = PeerProc::spawn();
+    peer.call(serde_json::json!({ "op": "init" }));
+    let valid_hex = "ab".repeat(32);
+    peer.call(serde_json::json!({
+        "op": "configure_transports",
+        "wake_url": format!("https://api.push.apple.com/3/device/{valid_hex}"),
+        "wake_adapter": "apns_h2",
+        "wake_secret_b64": b64url_encode(&wake_secret),
+        "wake_auth_token": "pre-minted-jwt",
+        "wake_apns_mode": "mutable_alert",
+        "wake_apns_topic": "dev.tendril.ios",
+        "wake_apns_loc_key": "PEER_WAKE_KEY",
+        "wake_coalesce_secs": 3
+    }));
+
+    peer.send_cmd(&serde_json::json!({
+        "op": "configure_transports",
+        "wake_url": format!("http://127.0.0.1:8080/3/device/{valid_hex}"),
+        "wake_adapter": "apns_h2",
+        "wake_secret_b64": b64url_encode(&wake_secret),
+        "wake_auth_token": "tok",
+        "wake_apns_topic": "dev.tendril.ios"
+    }));
+    assert_eq!(peer.recv_resp()["ok"], false);
+
+    // Arbitrary external host on apns_h2 must be rejected by default.
+    peer.send_cmd(&serde_json::json!({
+        "op": "configure_transports",
+        "wake_url": format!("https://evil.example/3/device/{valid_hex}"),
+        "wake_adapter": "apns_h2",
+        "wake_secret_b64": b64url_encode(&wake_secret),
+        "wake_auth_token": "tok",
+        "wake_apns_topic": "dev.tendril.ios"
+    }));
+    assert_eq!(peer.recv_resp()["ok"], false);
+
+    // Omitting wake_coalesce_secs in conformance_peer preserves default 0s cooldown.
+    peer.call(serde_json::json!({
+        "op": "configure_transports",
+        "wake_url": format!("https://api.sandbox.push.apple.com/3/device/{valid_hex}"),
+        "wake_adapter": "apns_h2",
+        "wake_secret_b64": b64url_encode(&wake_secret),
+        "wake_auth_token": "tok",
+        "wake_apns_topic": "dev.tendril.ios"
+    }));
+    peer.call(serde_json::json!({ "op": "shutdown" }));
 }

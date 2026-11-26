@@ -23,12 +23,17 @@ webrtc = ["dep:str0m", "dep:str0m-rust-crypto"]
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 data-encoding = { workspace = true, optional = true }
 ed25519-dalek.workspace = true
 futures-util.workspace = true
+h2.workspace = true
+http.workspace = true
 iroh = { workspace = true, optional = true }
 iroh-services = { workspace = true, optional = true }
+ring.workspace = true
 rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 socket2 = "0.6"
@@ -39,9 +44,11 @@ tendril-core.workspace = true
 tendril-relay.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 url.workspace = true
+webpki-roots.workspace = true
 wtransport = { workspace = true, optional = true }
 zeroize.workspace = true
 
@@ -54,6 +61,7 @@ rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 
 [dev-dependencies]
 iroh-relay = { version = "1.5", features = ["server"] }
+rcgen.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -91,11 +91,15 @@ pub use v2_driver::{
     set_initiator_argon2_permits, wake_and_connect_v2_session, wake_and_dial_v2,
 };
 pub use wake::{
-    ApnsAps, ApnsPayload, DEFAULT_WAKE_COALESCE_INTERVAL_SECS, DEFAULT_WAKE_TIMEOUT,
-    FcmAndroidConfig, FcmDataFields, FcmMessage, FcmPayload, HttpWakeProvider,
-    MAX_WAKE_COALESCE_TARGETS, MAX_WAKE_ENDPOINT_URL_LEN, MemoryWakeProvider, NoopWakeProvider,
-    RecordedWake, WAKE_EPOCH_SECS, WAKE_TAG_LEN, WakeAdapterKind, WakeChannel, WakeCoalescer,
-    WakeEnvelope, WakeOutcome, WakeProvider, WakeSecret, WakeTag, WakeTarget, build_wake_payload,
-    derive_epoch_wake_tag, validate_wake_endpoint_url, verify_epoch_wake_tag_window, wake_epoch,
-    wake_epoch_start_secs,
+    APNS_JWT_REFRESH_SECS, ApnsAlert, ApnsAps, ApnsH2Auth, ApnsH2WakeProvider, ApnsOptions,
+    ApnsPayload, ApnsPushMode, DEFAULT_APNS_LOC_KEY, DEFAULT_WAKE_COALESCE_INTERVAL_SECS,
+    DEFAULT_WAKE_TIMEOUT, FcmAndroidConfig, FcmDataFields, FcmMessage, FcmPayload,
+    HttpWakeProvider, MAX_WAKE_COALESCE_TARGETS, MAX_WAKE_ENDPOINT_URL_LEN, MAX_WAKE_PEM_BYTES,
+    MemoryWakeProvider, NoopWakeProvider, ParsedWakeConfig, RecordedWake, WAKE_EPOCH_SECS,
+    WAKE_TAG_LEN, WakeAdapterKind, WakeChannel, WakeCoalescer, WakeConfigSpec, WakeEnvelope,
+    WakeOutcome, WakeProvider, WakeSecret, WakeTag, WakeTarget, WakeTransportSettings,
+    build_wake_payload, build_wake_payload_for_target, build_wake_provider,
+    build_wake_provider_with_root_certs, default_wake_root_certs, derive_epoch_wake_tag,
+    validate_apns_h2_endpoint_url, validate_apns_loc_key, validate_apns_topic,
+    validate_wake_endpoint_url, verify_epoch_wake_tag_window, wake_epoch, wake_epoch_start_secs,
 };

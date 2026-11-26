@@ -5,6 +5,8 @@
 //! never carry plaintext, pairing codes, capability grants, `host_id`, or
 //! identity keys. Pull-only endpoints use [`NoopWakeProvider`] by default.
 
+pub mod apns_h2;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read as _, Write as _};
@@ -12,6 +14,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use apns_h2::validate_apns_h2_endpoint_host;
+pub use apns_h2::{
+    APNS_JWT_REFRESH_SECS, ApnsH2Auth, ApnsH2WakeProvider, validate_apns_h2_endpoint_url,
+    validate_apns_topic,
+};
 use async_trait::async_trait;
 use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
@@ -24,9 +31,12 @@ use url::Url;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::RuntimeError;
+use crate::providers::egress::{DestClass, classify_destination};
 use crate::providers::{
     ensure_rustls_ring_provider, is_loopback_host, is_metadata_or_link_local_ip,
 };
+use crate::redact::redact_url_str;
+use crate::v2_driver::WakeDialOptions;
 
 /// Byte length of an epoch-blinded [`WakeTag`].
 pub const WAKE_TAG_LEN: usize = 16;
@@ -46,8 +56,14 @@ pub const MAX_WAKE_ENDPOINT_URL_LEN: usize = 512;
 /// Maximum number of distinct targets tracked by [`WakeCoalescer`].
 pub const MAX_WAKE_COALESCE_TARGETS: usize = 1_024;
 
+/// Maximum accepted byte size for inline APNs PEM credentials/certificates.
+pub const MAX_WAKE_PEM_BYTES: usize = 16 * 1024;
+
+/// Default static localization key for `MutableAlert` APNs wake notifications.
+pub const DEFAULT_APNS_LOC_KEY: &str = "TENDRIL_WAKE_FALLBACK";
+
 /// Maximum HTTP response bytes read from a wake endpoint.
-const MAX_WAKE_RESPONSE_BYTES: usize = 4_096;
+pub(crate) const MAX_WAKE_RESPONSE_BYTES: usize = 4_096;
 
 /// HKDF-SHA256 domain separation label for epoch-blinded wake tags.
 const WAKE_TAG_HKDF_INFO: &[u8] = b"tendril/wake/epoch-tag/v1";
@@ -198,13 +214,85 @@ pub enum WakeAdapterKind {
     UnifiedPush,
     Webhook,
     Apns,
+    ApnsH2,
     Fcm,
 }
 
 /// Alias for [`WakeAdapterKind`].
 pub type WakeChannel = WakeAdapterKind;
 
-fn strip_host_brackets(host: &str) -> &str {
+/// APNs notification delivery mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApnsPushMode {
+    /// Silent background push (`apns-push-type: background`, `apns-priority: 5`, `content-available: 1`).
+    #[default]
+    Background,
+    /// User-visible NSE-wakeable alert (`apns-push-type: alert`, `apns-priority: 10`,
+    /// `mutable-content: 1`, static `alert.loc-key` only).
+    MutableAlert,
+}
+
+/// Validates a static APNs `loc-key` (`1..=64` ASCII `[A-Za-z0-9_.-]` bytes only).
+///
+/// Rejects dynamic text, format specifiers, arguments, whitespace, and peer identifiers.
+pub fn validate_apns_loc_key(key: &str) -> Result<&str, RuntimeError> {
+    if key.is_empty() || key.len() > 64 {
+        return Err(RuntimeError::Protocol(
+            "APNs loc-key must be 1..=64 ASCII characters".into(),
+        ));
+    }
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return Err(RuntimeError::Protocol(
+            "APNs loc-key must contain only ASCII [A-Za-z0-9_.-]".into(),
+        ));
+    }
+    Ok(key)
+}
+
+/// APNs push options attached to a [`WakeTarget`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApnsOptions {
+    pub mode: ApnsPushMode,
+    pub loc_key: String,
+}
+
+impl Default for ApnsOptions {
+    fn default() -> Self {
+        Self {
+            mode: ApnsPushMode::Background,
+            loc_key: DEFAULT_APNS_LOC_KEY.to_owned(),
+        }
+    }
+}
+
+impl ApnsOptions {
+    /// Constructs silent background APNs options.
+    #[must_use]
+    pub fn background() -> Self {
+        Self::default()
+    }
+
+    /// Constructs `MutableAlert` APNs options with a validated static `loc-key`.
+    pub fn mutable_alert(loc_key: &str) -> Result<Self, RuntimeError> {
+        validate_apns_loc_key(loc_key)?;
+        Ok(Self {
+            mode: ApnsPushMode::MutableAlert,
+            loc_key: loc_key.to_owned(),
+        })
+    }
+
+    /// Validates the stored `loc_key`.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        validate_apns_loc_key(&self.loc_key)?;
+        Ok(())
+    }
+}
+
+pub(crate) fn strip_host_brackets(host: &str) -> &str {
     let trimmed = host.trim();
     trimmed
         .strip_prefix('[')
@@ -280,22 +368,32 @@ pub fn validate_wake_endpoint_url(url_str: &str) -> Result<Url, RuntimeError> {
     Ok(parsed)
 }
 
-/// Validated wake push destination with optional redacted bearer token.
+/// Validated wake push destination with optional redacted bearer token and APNs options.
 #[derive(Clone)]
 pub struct WakeTarget {
     adapter: WakeAdapterKind,
     endpoint: Url,
     auth_token: Option<Zeroizing<String>>,
+    apns_mode: ApnsPushMode,
+    apns_loc_key: String,
+    apns_topic: Option<String>,
 }
 
 impl WakeTarget {
     /// Creates a validated [`WakeTarget`] for `adapter` and `endpoint_url`.
     pub fn new(adapter: WakeAdapterKind, endpoint_url: &str) -> Result<Self, RuntimeError> {
-        let endpoint = validate_wake_endpoint_url(endpoint_url)?;
+        let endpoint = if adapter == WakeAdapterKind::ApnsH2 {
+            validate_apns_h2_endpoint_url(endpoint_url)?
+        } else {
+            validate_wake_endpoint_url(endpoint_url)?
+        };
         Ok(Self {
             adapter,
             endpoint,
             auth_token: None,
+            apns_mode: ApnsPushMode::Background,
+            apns_loc_key: DEFAULT_APNS_LOC_KEY.to_owned(),
+            apns_topic: None,
         })
     }
 
@@ -309,6 +407,52 @@ impl WakeTarget {
         }
         self.auth_token = Some(Zeroizing::new(token));
         Ok(self)
+    }
+
+    /// Sets the APNs delivery mode (`Background` or `MutableAlert`).
+    pub fn with_apns_mode(mut self, mode: ApnsPushMode) -> Result<Self, RuntimeError> {
+        self.require_apns_adapter("apns_mode")?;
+        self.apns_mode = mode;
+        Ok(self)
+    }
+
+    /// Sets and validates the static APNs `alert.loc-key`.
+    pub fn with_apns_loc_key(mut self, loc_key: impl Into<String>) -> Result<Self, RuntimeError> {
+        self.require_apns_adapter("apns_loc_key")?;
+        let loc_key = loc_key.into();
+        validate_apns_loc_key(&loc_key)?;
+        self.apns_loc_key = loc_key;
+        Ok(self)
+    }
+
+    /// Sets and validates the APNs `apns-topic` header.
+    pub fn with_apns_topic(mut self, topic: impl Into<String>) -> Result<Self, RuntimeError> {
+        self.require_apns_adapter("apns_topic")?;
+        let topic = topic.into();
+        validate_apns_topic(&topic)?;
+        self.apns_topic = Some(topic);
+        Ok(self)
+    }
+
+    /// Applies validated [`ApnsOptions`] to this target.
+    pub fn with_apns_options(mut self, options: ApnsOptions) -> Result<Self, RuntimeError> {
+        self.require_apns_adapter("apns_options")?;
+        options.validate()?;
+        self.apns_mode = options.mode;
+        self.apns_loc_key = options.loc_key;
+        Ok(self)
+    }
+
+    fn require_apns_adapter(&self, field: &str) -> Result<(), RuntimeError> {
+        if !matches!(
+            self.adapter,
+            WakeAdapterKind::Apns | WakeAdapterKind::ApnsH2
+        ) {
+            return Err(RuntimeError::Protocol(format!(
+                "{field} is only valid for apns or apns_h2 wake targets"
+            )));
+        }
+        Ok(())
     }
 
     /// Returns the adapter kind.
@@ -334,17 +478,38 @@ impl WakeTarget {
     pub fn auth_token(&self) -> Option<&str> {
         self.auth_token.as_deref().map(String::as_str)
     }
+
+    /// Returns the configured APNs push mode.
+    #[must_use]
+    pub fn apns_mode(&self) -> ApnsPushMode {
+        self.apns_mode
+    }
+
+    /// Returns the configured static APNs `loc-key`.
+    #[must_use]
+    pub fn apns_loc_key(&self) -> &str {
+        &self.apns_loc_key
+    }
+
+    /// Returns the optional `apns-topic` override.
+    #[must_use]
+    pub fn apns_topic(&self) -> Option<&str> {
+        self.apns_topic.as_deref()
+    }
 }
 
 impl fmt::Debug for WakeTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WakeTarget")
             .field("adapter", &self.adapter)
-            .field("endpoint", &self.endpoint.as_str())
+            .field("endpoint", &redact_url_str(self.endpoint.as_str()))
             .field(
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("apns_mode", &self.apns_mode)
+            .field("apns_loc_key", &self.apns_loc_key)
+            .field("apns_topic", &self.apns_topic)
             .finish()
     }
 }
@@ -375,17 +540,25 @@ impl WakeEnvelope {
     }
 }
 
-/// Silent background APNs payload (`content-available: 1`) with zero user-visible text.
+/// Static localization-key alert block (`{"loc-key": "<KEY>"}`) for `MutableAlert` APNs pushes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApnsAps {
-    #[serde(rename = "content-available")]
-    pub content_available: u8,
+pub struct ApnsAlert {
+    #[serde(rename = "loc-key")]
+    pub loc_key: String,
 }
 
-/// APNs HTTP/1.1-gateway JSON envelope carrying only the opaque wake hint.
-///
-/// Note: [`HttpWakeProvider`] uses HTTP/1.1, so APNs targets require an HTTP/1.1
-/// push gateway or relay; direct Apple APNs requires HTTP/2 via a custom [`WakeProvider`].
+/// APNs `aps` dictionary supporting silent `Background` and NSE-wakeable `MutableAlert` pushes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApnsAps {
+    #[serde(rename = "content-available", skip_serializing_if = "Option::is_none")]
+    pub content_available: Option<u8>,
+    #[serde(rename = "mutable-content", skip_serializing_if = "Option::is_none")]
+    pub mutable_content: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alert: Option<ApnsAlert>,
+}
+
+/// APNs JSON envelope carrying only the opaque wake hint and optional static `loc-key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApnsPayload {
     pub aps: ApnsAps,
@@ -400,7 +573,9 @@ impl ApnsPayload {
     pub fn new(tag: &WakeTag, now_unix_secs: u64) -> Self {
         Self {
             aps: ApnsAps {
-                content_available: 1,
+                content_available: Some(1),
+                mutable_content: None,
+                alert: None,
             },
             v: 1,
             wake_tag: *tag,
@@ -408,8 +583,50 @@ impl ApnsPayload {
         }
     }
 
-    /// Serializes the APNs payload to JSON bytes.
+    /// Builds a `MutableAlert` APNs payload (`mutable-content: 1`, static `loc-key` only).
+    pub fn mutable_alert(
+        tag: &WakeTag,
+        now_unix_secs: u64,
+        loc_key: &str,
+    ) -> Result<Self, RuntimeError> {
+        validate_apns_loc_key(loc_key)?;
+        Ok(Self {
+            aps: ApnsAps {
+                content_available: None,
+                mutable_content: Some(1),
+                alert: Some(ApnsAlert {
+                    loc_key: loc_key.to_owned(),
+                }),
+            },
+            v: 1,
+            wake_tag: *tag,
+            epoch_s: wake_epoch_start_secs(now_unix_secs),
+        })
+    }
+
+    /// Builds an APNs payload for `mode` and optional `loc_key` (defaults to [`DEFAULT_APNS_LOC_KEY`]).
+    pub fn with_mode(
+        tag: &WakeTag,
+        now_unix_secs: u64,
+        mode: ApnsPushMode,
+        loc_key: Option<&str>,
+    ) -> Result<Self, RuntimeError> {
+        if let Some(key) = loc_key {
+            validate_apns_loc_key(key)?;
+        }
+        match mode {
+            ApnsPushMode::Background => Ok(Self::new(tag, now_unix_secs)),
+            ApnsPushMode::MutableAlert => {
+                Self::mutable_alert(tag, now_unix_secs, loc_key.unwrap_or(DEFAULT_APNS_LOC_KEY))
+            }
+        }
+    }
+
+    /// Serializes the APNs payload to JSON bytes after validating any static `loc-key`.
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, RuntimeError> {
+        if let Some(alert) = &self.aps.alert {
+            validate_apns_loc_key(&alert.loc_key)?;
+        }
         serde_json::to_vec(self)
             .map_err(|err| RuntimeError::Protocol(format!("apns payload serialize failed: {err}")))
     }
@@ -467,7 +684,7 @@ impl FcmPayload {
     }
 }
 
-/// Formats the adapter-specific JSON payload for `target.adapter()`.
+/// Formats the adapter-specific JSON payload for `adapter` using default options.
 pub fn build_wake_payload(
     adapter: WakeAdapterKind,
     tag: &WakeTag,
@@ -477,7 +694,30 @@ pub fn build_wake_payload(
         WakeAdapterKind::UnifiedPush | WakeAdapterKind::Webhook => {
             WakeEnvelope::new(tag, now_unix_secs).to_json_bytes()
         }
-        WakeAdapterKind::Apns => ApnsPayload::new(tag, now_unix_secs).to_json_bytes(),
+        WakeAdapterKind::Apns | WakeAdapterKind::ApnsH2 => {
+            ApnsPayload::new(tag, now_unix_secs).to_json_bytes()
+        }
+        WakeAdapterKind::Fcm => FcmPayload::new(tag, now_unix_secs).to_json_bytes(),
+    }
+}
+
+/// Formats the adapter-specific JSON payload for `target` (respecting [`ApnsPushMode`] and `loc-key`).
+pub fn build_wake_payload_for_target(
+    target: &WakeTarget,
+    tag: &WakeTag,
+    now_unix_secs: u64,
+) -> Result<Vec<u8>, RuntimeError> {
+    match target.adapter() {
+        WakeAdapterKind::UnifiedPush | WakeAdapterKind::Webhook => {
+            WakeEnvelope::new(tag, now_unix_secs).to_json_bytes()
+        }
+        WakeAdapterKind::Apns | WakeAdapterKind::ApnsH2 => ApnsPayload::with_mode(
+            tag,
+            now_unix_secs,
+            target.apns_mode(),
+            Some(target.apns_loc_key()),
+        )?
+        .to_json_bytes(),
         WakeAdapterKind::Fcm => FcmPayload::new(tag, now_unix_secs).to_json_bytes(),
     }
 }
@@ -527,24 +767,39 @@ pub trait WakeProvider: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct CoalesceEntry {
     last_secs: u64,
     seq: u64,
 }
 
 /// Bounded per-target rate limiter / coalescer preventing burst wake-hint spam.
-#[derive(Debug)]
 pub struct WakeCoalescer {
     cooldown_secs: u64,
     max_targets: usize,
     state: Mutex<CoalesceState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct CoalesceState {
     next_seq: u64,
     entries: HashMap<(WakeAdapterKind, String), CoalesceEntry>,
+}
+
+impl fmt::Debug for WakeCoalescer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let entry_count = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len();
+        f.debug_struct("WakeCoalescer")
+            .field("cooldown_secs", &self.cooldown_secs)
+            .field("max_targets", &self.max_targets)
+            .field("entry_count", &entry_count)
+            .finish()
+    }
 }
 
 impl Default for WakeCoalescer {
@@ -692,11 +947,18 @@ impl WakeProvider for MemoryWakeProvider {
     }
 }
 
+/// Builds the default Mozilla/WebPKI TLS root certificate store for HTTPS wake providers.
+#[must_use]
+pub fn default_wake_root_certs() -> rustls::RootCertStore {
+    rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+}
+
 /// SSRF-safe async HTTP/1.1 + rustls TLS wake-hint provider.
 #[derive(Debug)]
 pub struct HttpWakeProvider {
     timeout: Duration,
     coalescer: WakeCoalescer,
+    root_cert_count: usize,
     tls_config: Arc<rustls::ClientConfig>,
 }
 
@@ -708,19 +970,37 @@ impl Default for HttpWakeProvider {
 
 impl HttpWakeProvider {
     /// Creates an [`HttpWakeProvider`] with default timeout (`3s`), coalescing (`5s`),
-    /// and an empty TLS root store (use [`Self::with_root_certs`] or [`Self::with_tls_config`]
-    /// for HTTPS endpoints).
+    /// and Mozilla/WebPKI root certificates (`webpki-roots`) for HTTPS endpoints.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_roots(default_wake_root_certs())
+    }
+
+    /// Creates an [`HttpWakeProvider`] with an empty TLS root store (for negative HTTPS tests).
+    #[must_use]
+    pub fn with_empty_roots() -> Self {
+        Self::with_roots(rustls::RootCertStore::empty())
+    }
+
+    fn with_roots(root_certs: rustls::RootCertStore) -> Self {
         ensure_rustls_ring_provider();
+        let root_cert_count = root_certs.len();
         let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_root_certificates(root_certs)
             .with_no_client_auth();
         Self {
             timeout: DEFAULT_WAKE_TIMEOUT,
             coalescer: WakeCoalescer::default(),
+            root_cert_count,
             tls_config: Arc::new(tls_config),
         }
+    }
+
+    /// Returns the number of loaded TLS root certificates (when configured via `new`,
+    /// `with_empty_roots`, or `with_root_certs`).
+    #[must_use]
+    pub fn root_cert_count(&self) -> usize {
+        self.root_cert_count
     }
 
     /// Overrides the per-request timeout.
@@ -741,6 +1021,7 @@ impl HttpWakeProvider {
     #[must_use]
     pub fn with_root_certs(mut self, root_certs: rustls::RootCertStore) -> Self {
         ensure_rustls_ring_provider();
+        self.root_cert_count = root_certs.len();
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_certs)
             .with_no_client_auth();
@@ -751,6 +1032,7 @@ impl HttpWakeProvider {
     /// Configures a custom `rustls::ClientConfig` for `https://` wake endpoints.
     #[must_use]
     pub fn with_tls_config(mut self, tls_config: Arc<rustls::ClientConfig>) -> Self {
+        self.root_cert_count = 0;
         self.tls_config = tls_config;
         self
     }
@@ -764,12 +1046,17 @@ impl WakeProvider for HttpWakeProvider {
         tag: &WakeTag,
         now_unix_secs: u64,
     ) -> Result<WakeOutcome, RuntimeError> {
+        if target.adapter() == WakeAdapterKind::ApnsH2 {
+            return Err(RuntimeError::Protocol(
+                "wake adapter 'apns_h2' requires ApnsH2WakeProvider (HTTP/2)".into(),
+            ));
+        }
         let parsed = validate_wake_endpoint_url(target.endpoint_str())?;
+        let body = build_wake_payload_for_target(target, tag, now_unix_secs)?;
+        let req_bytes = build_http_post_request(&parsed, target, &body)?;
         if !self.coalescer.check_and_record(target, now_unix_secs) {
             return Ok(WakeOutcome::Coalesced);
         }
-        let body = build_wake_payload(target.adapter(), tag, now_unix_secs)?;
-        let req_bytes = build_http_post_request(&parsed, target, &body)?;
         let tls_config = Arc::clone(&self.tls_config);
 
         let status = timeout(
@@ -787,6 +1074,368 @@ impl WakeProvider for HttpWakeProvider {
             )))
         }
     }
+}
+
+/// Shared wake transport configuration specification across runtime, CLI, FFI, and bindings.
+#[derive(Clone, Default, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct WakeConfigSpec {
+    pub wake_url: Option<String>,
+    #[zeroize(skip)]
+    pub wake_adapter: Option<WakeAdapterKind>,
+    pub wake_secret_b64: Option<String>,
+    pub wake_auth_token: Option<String>,
+    #[zeroize(skip)]
+    pub wake_pre_wake: Option<bool>,
+    #[zeroize(skip)]
+    pub wake_retry_delay_ms: Option<u64>,
+    #[zeroize(skip)]
+    pub wake_max_attempts: Option<usize>,
+    #[zeroize(skip)]
+    pub wake_timeout_ms: Option<u64>,
+    #[zeroize(skip)]
+    pub wake_coalesce_secs: Option<u64>,
+    #[zeroize(skip)]
+    pub wake_apns_mode: Option<ApnsPushMode>,
+    pub wake_apns_topic: Option<String>,
+    pub wake_apns_loc_key: Option<String>,
+    pub wake_apns_team_id: Option<String>,
+    pub wake_apns_key_id: Option<String>,
+    pub wake_apns_p8_pem: Option<String>,
+    pub wake_apns_client_cert_pem: Option<String>,
+    pub wake_apns_client_key_pem: Option<String>,
+}
+
+impl WakeConfigSpec {
+    fn has_any_non_url_field(&self) -> bool {
+        self.wake_adapter.is_some()
+            || self.wake_secret_b64.is_some()
+            || self.wake_auth_token.is_some()
+            || self.wake_pre_wake.is_some()
+            || self.wake_retry_delay_ms.is_some()
+            || self.wake_max_attempts.is_some()
+            || self.wake_timeout_ms.is_some()
+            || self.wake_coalesce_secs.is_some()
+            || self.has_any_apns_field()
+    }
+
+    fn has_any_apns_field(&self) -> bool {
+        self.wake_apns_mode.is_some()
+            || self.wake_apns_topic.is_some()
+            || self.wake_apns_loc_key.is_some()
+            || self.wake_apns_team_id.is_some()
+            || self.wake_apns_key_id.is_some()
+            || self.wake_apns_p8_pem.is_some()
+            || self.wake_apns_client_cert_pem.is_some()
+            || self.wake_apns_client_key_pem.is_some()
+    }
+}
+
+impl fmt::Debug for WakeConfigSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WakeConfigSpec")
+            .field("wake_url", &self.wake_url.as_deref().map(redact_url_str))
+            .field("wake_adapter", &self.wake_adapter)
+            .field(
+                "wake_secret_b64",
+                &self.wake_secret_b64.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "wake_auth_token",
+                &self.wake_auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("wake_pre_wake", &self.wake_pre_wake)
+            .field("wake_retry_delay_ms", &self.wake_retry_delay_ms)
+            .field("wake_max_attempts", &self.wake_max_attempts)
+            .field("wake_timeout_ms", &self.wake_timeout_ms)
+            .field("wake_coalesce_secs", &self.wake_coalesce_secs)
+            .field("wake_apns_mode", &self.wake_apns_mode)
+            .field("wake_apns_topic", &self.wake_apns_topic)
+            .field("wake_apns_loc_key", &self.wake_apns_loc_key)
+            .field("wake_apns_team_id", &self.wake_apns_team_id)
+            .field("wake_apns_key_id", &self.wake_apns_key_id)
+            .field(
+                "wake_apns_p8_pem",
+                &self.wake_apns_p8_pem.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "wake_apns_client_cert_pem",
+                &self.wake_apns_client_cert_pem.as_ref().map(|_| "[CERT]"),
+            )
+            .field(
+                "wake_apns_client_key_pem",
+                &self.wake_apns_client_key_pem.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// Validated, endpoint-owned wake transport configuration with a persistent [`WakeProvider`].
+#[derive(Clone)]
+pub struct WakeTransportSettings {
+    pub provider: Arc<dyn WakeProvider>,
+    pub target: WakeTarget,
+    pub secret: WakeSecret,
+    pub pre_wake: bool,
+    pub retry_delay_ms: u64,
+    pub max_attempts: usize,
+    pub timeout_ms: u64,
+    pub coalesce_secs: u64,
+}
+
+/// Compatibility alias for [`WakeTransportSettings`].
+pub type ParsedWakeConfig = WakeTransportSettings;
+
+impl fmt::Debug for WakeTransportSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WakeTransportSettings")
+            .field("provider", &"<WakeProvider>")
+            .field("target", &self.target)
+            .field("secret", &self.secret)
+            .field("pre_wake", &self.pre_wake)
+            .field("retry_delay_ms", &self.retry_delay_ms)
+            .field("max_attempts", &self.max_attempts)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("coalesce_secs", &self.coalesce_secs)
+            .finish()
+    }
+}
+
+impl WakeTransportSettings {
+    /// Parses and validates a [`WakeConfigSpec`], returning `None` when `wake_url` is unset.
+    pub fn from_spec(spec: WakeConfigSpec) -> Result<Option<Self>, RuntimeError> {
+        build_wake_provider(spec)
+    }
+
+    /// Converts these endpoint settings into per-dial [`WakeDialOptions`] sharing the pooled provider.
+    #[must_use]
+    pub fn to_dial_options(&self) -> WakeDialOptions {
+        WakeDialOptions::new(
+            Arc::clone(&self.provider),
+            self.target.clone(),
+            self.secret.clone(),
+        )
+        .with_pre_wake(self.pre_wake)
+        .with_retry_delay(Duration::from_millis(self.retry_delay_ms))
+        .with_max_attempts(self.max_attempts)
+        .with_wake_timeout(Duration::from_millis(self.timeout_ms))
+    }
+}
+
+/// Validates a [`WakeConfigSpec`] and builds a persistent [`WakeTransportSettings`] with WebPKI roots.
+pub fn build_wake_provider(
+    spec: WakeConfigSpec,
+) -> Result<Option<WakeTransportSettings>, RuntimeError> {
+    build_wake_provider_with_root_certs(spec, None)
+}
+
+/// Validates a [`WakeConfigSpec`] and builds a persistent [`WakeTransportSettings`] with an
+/// optional custom TLS [`rustls::RootCertStore`].
+pub fn build_wake_provider_with_root_certs(
+    mut spec: WakeConfigSpec,
+    root_certs: Option<rustls::RootCertStore>,
+) -> Result<Option<WakeTransportSettings>, RuntimeError> {
+    let Some(url) = spec.wake_url.take() else {
+        if spec.has_any_non_url_field() {
+            return Err(RuntimeError::Protocol(
+                "wake_* options require wake_url".into(),
+            ));
+        }
+        return Ok(None);
+    };
+
+    let adapter = spec.wake_adapter.unwrap_or(WakeAdapterKind::Webhook);
+    let secret_b64 = spec
+        .wake_secret_b64
+        .take()
+        .map(Zeroizing::new)
+        .ok_or_else(|| {
+            RuntimeError::Protocol("wake_secret_b64 is required when wake_url is set".into())
+        })?;
+    let secret_bytes = Zeroizing::new(
+        b64url_decode_array::<32>(secret_b64.trim())
+            .map_err(|_| RuntimeError::Protocol("invalid wake_secret_b64".into()))?,
+    );
+    let secret = WakeSecret::from_bytes(*secret_bytes);
+
+    if !matches!(adapter, WakeAdapterKind::Apns | WakeAdapterKind::ApnsH2)
+        && spec.has_any_apns_field()
+    {
+        return Err(RuntimeError::Protocol(
+            "wake_apns_* options are only valid for apns or apns_h2 adapters".into(),
+        ));
+    }
+    if adapter == WakeAdapterKind::Apns
+        && (spec.wake_apns_team_id.is_some()
+            || spec.wake_apns_key_id.is_some()
+            || spec.wake_apns_p8_pem.is_some()
+            || spec.wake_apns_client_cert_pem.is_some()
+            || spec.wake_apns_client_key_pem.is_some())
+    {
+        return Err(RuntimeError::Protocol(
+            "APNs provider token and mTLS options require wake_adapter 'apns_h2'".into(),
+        ));
+    }
+
+    let mut target = WakeTarget::new(adapter, &url)?;
+    if adapter == WakeAdapterKind::ApnsH2 {
+        validate_apns_h2_endpoint_host(target.endpoint(), false)?;
+    }
+    let auth_token = spec.wake_auth_token.take().map(Zeroizing::new);
+    if let Some(ref tok) = auth_token {
+        if tok.is_empty() || tok.chars().any(char::is_control) {
+            return Err(RuntimeError::Protocol("invalid wake_auth_token".into()));
+        }
+        if adapter != WakeAdapterKind::ApnsH2 {
+            target = target
+                .with_auth_token(tok.as_str())
+                .map_err(|_| RuntimeError::Protocol("invalid wake_auth_token".into()))?;
+        }
+    }
+
+    if let Some(mode) = spec.wake_apns_mode {
+        target = target.with_apns_mode(mode)?;
+    }
+    if let Some(loc_key) = spec.wake_apns_loc_key.take() {
+        target = target.with_apns_loc_key(loc_key)?;
+    }
+    let apns_topic = spec.wake_apns_topic.take();
+    if let Some(ref topic) = apns_topic {
+        target = target.with_apns_topic(topic.as_str())?;
+    }
+
+    let pre_wake = spec.wake_pre_wake.unwrap_or(false);
+    let retry_delay_ms = spec.wake_retry_delay_ms.unwrap_or(100);
+    let max_attempts = spec.wake_max_attempts.unwrap_or(10).max(1);
+    let timeout_ms = spec.wake_timeout_ms.unwrap_or(3_000);
+    let coalesce_secs = spec
+        .wake_coalesce_secs
+        .unwrap_or(DEFAULT_WAKE_COALESCE_INTERVAL_SECS);
+    let timeout_dur = Duration::from_millis(timeout_ms);
+
+    let provider: Arc<dyn WakeProvider> = if adapter == WakeAdapterKind::ApnsH2 {
+        let topic = apns_topic.ok_or_else(|| {
+            RuntimeError::Protocol("wake_apns_topic is required for apns_h2".into())
+        })?;
+        let p8_pem = spec
+            .wake_apns_p8_pem
+            .take()
+            .map(|s| Zeroizing::new(s.into_bytes()));
+        let team_id = spec.wake_apns_team_id.take();
+        let key_id = spec.wake_apns_key_id.take();
+        let client_cert_pem = spec
+            .wake_apns_client_cert_pem
+            .take()
+            .map(|s| Zeroizing::new(s.into_bytes()));
+        let client_key_pem = spec
+            .wake_apns_client_key_pem
+            .take()
+            .map(|s| Zeroizing::new(s.into_bytes()));
+
+        if let Some(ref pem) = p8_pem
+            && pem.len() > MAX_WAKE_PEM_BYTES
+        {
+            return Err(RuntimeError::Protocol(format!(
+                "wake_apns_p8_pem exceeds {MAX_WAKE_PEM_BYTES} bytes"
+            )));
+        }
+        if let Some(ref pem) = client_cert_pem
+            && pem.len() > MAX_WAKE_PEM_BYTES
+        {
+            return Err(RuntimeError::Protocol(format!(
+                "wake_apns_client_cert_pem exceeds {MAX_WAKE_PEM_BYTES} bytes"
+            )));
+        }
+        if let Some(ref pem) = client_key_pem
+            && pem.len() > MAX_WAKE_PEM_BYTES
+        {
+            return Err(RuntimeError::Protocol(format!(
+                "wake_apns_client_key_pem exceeds {MAX_WAKE_PEM_BYTES} bytes"
+            )));
+        }
+
+        if (team_id.is_some() || key_id.is_some()) && p8_pem.is_none() {
+            return Err(RuntimeError::Protocol(
+                "wake_apns_team_id and wake_apns_key_id require wake_apns_p8_pem".into(),
+            ));
+        }
+        let has_p8 = p8_pem.is_some();
+        let has_bearer = auth_token.is_some();
+        let has_mtls = client_cert_pem.is_some() || client_key_pem.is_some();
+        let active_modes = u8::from(has_p8) + u8::from(has_bearer) + u8::from(has_mtls);
+        if active_modes == 0 {
+            return Err(RuntimeError::Protocol(
+                "apns_h2 requires wake_apns_p8_pem, wake_auth_token, or client mTLS cert+key"
+                    .into(),
+            ));
+        }
+        if active_modes > 1 {
+            return Err(RuntimeError::Protocol(
+                "apns_h2 auth modes (wake_apns_p8_pem, wake_auth_token, client mTLS) are mutually exclusive"
+                    .into(),
+            ));
+        }
+
+        let auth = if let Some(p8_pem) = p8_pem {
+            let team_id = team_id.ok_or_else(|| {
+                RuntimeError::Protocol(
+                    "wake_apns_team_id is required when wake_apns_p8_pem is set".into(),
+                )
+            })?;
+            let key_id = key_id.ok_or_else(|| {
+                RuntimeError::Protocol(
+                    "wake_apns_key_id is required when wake_apns_p8_pem is set".into(),
+                )
+            })?;
+            ApnsH2Auth::ProviderToken {
+                team_id,
+                key_id,
+                p8_pem,
+            }
+        } else if let Some(tok) = auth_token {
+            ApnsH2Auth::BearerToken(tok)
+        } else {
+            let cert_pem = client_cert_pem.ok_or_else(|| {
+                RuntimeError::Protocol(
+                    "wake_apns_client_cert_pem is required with wake_apns_client_key_pem".into(),
+                )
+            })?;
+            let key_pem = client_key_pem.ok_or_else(|| {
+                RuntimeError::Protocol(
+                    "wake_apns_client_key_pem is required with wake_apns_client_cert_pem".into(),
+                )
+            })?;
+            ApnsH2Auth::ClientCert { cert_pem, key_pem }
+        };
+
+        let mut apns = ApnsH2WakeProvider::new(auth)?;
+        if let Some(roots) = root_certs {
+            apns = apns.with_root_certs(roots)?;
+        }
+        apns = apns
+            .with_topic(topic)?
+            .with_timeout(timeout_dur)
+            .with_cooldown_secs(coalesce_secs);
+        Arc::new(apns)
+    } else {
+        let mut http = HttpWakeProvider::new()
+            .with_timeout(timeout_dur)
+            .with_cooldown_secs(coalesce_secs);
+        if let Some(roots) = root_certs {
+            http = http.with_root_certs(roots);
+        }
+        Arc::new(http)
+    };
+
+    Ok(Some(WakeTransportSettings {
+        provider,
+        target,
+        secret,
+        pre_wake,
+        retry_delay_ms,
+        max_attempts,
+        timeout_ms,
+        coalesce_secs,
+    }))
 }
 
 fn build_http_post_request(
@@ -819,7 +1468,18 @@ fn build_http_post_request(
         .as_bytes(),
     );
     if target.adapter() == WakeAdapterKind::Apns {
-        req.extend_from_slice(b"apns-push-type: background\r\napns-priority: 5\r\n");
+        match target.apns_mode() {
+            ApnsPushMode::Background => {
+                req.extend_from_slice(b"apns-push-type: background\r\napns-priority: 5\r\n");
+            }
+            ApnsPushMode::MutableAlert => {
+                req.extend_from_slice(b"apns-push-type: alert\r\napns-priority: 10\r\n");
+            }
+        }
+        if let Some(topic) = target.apns_topic() {
+            validate_apns_topic(topic)?;
+            req.extend_from_slice(format!("apns-topic: {topic}\r\n").as_bytes());
+        }
     }
     if let Some(token) = target.auth_token() {
         req.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
@@ -829,7 +1489,47 @@ fn build_http_post_request(
     Ok(req)
 }
 
-async fn resolve_and_connect(parsed: &Url) -> Result<TcpStream, RuntimeError> {
+pub(crate) fn check_resolved_wake_ip(
+    ip: IpAddr,
+    is_http: bool,
+    bare_host: &str,
+    require_public_non_loopback: bool,
+) -> Result<(), RuntimeError> {
+    if is_metadata_or_link_local_ip(ip) {
+        return Err(RuntimeError::Protocol(format!(
+            "resolved metadata or link-local address '{ip}' is not permitted"
+        )));
+    }
+    if is_http && !ip.is_loopback() {
+        return Err(RuntimeError::Protocol(format!(
+            "cleartext http:// wake endpoint resolved to non-loopback address '{ip}'"
+        )));
+    }
+    if require_public_non_loopback {
+        let class = classify_destination(ip);
+        if is_loopback_host(bare_host) {
+            if class != DestClass::Loopback {
+                return Err(RuntimeError::Protocol(format!(
+                    "loopback wake endpoint resolved to non-loopback address '{ip}'"
+                )));
+            }
+        } else if class != DestClass::Public {
+            return Err(RuntimeError::Protocol(format!(
+                "apns_h2 endpoint resolved to non-public address '{ip}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn resolve_and_connect(parsed: &Url) -> Result<TcpStream, RuntimeError> {
+    resolve_and_connect_with_policy(parsed, false).await
+}
+
+pub(crate) async fn resolve_and_connect_with_policy(
+    parsed: &Url,
+    require_public_non_loopback: bool,
+) -> Result<TcpStream, RuntimeError> {
     let host = parsed
         .host_str()
         .ok_or_else(|| RuntimeError::Protocol("wake URL missing host".into()))?;
@@ -847,18 +1547,7 @@ async fn resolve_and_connect(parsed: &Url) -> Result<TcpStream, RuntimeError> {
     }
 
     for addr in &addrs {
-        if is_metadata_or_link_local_ip(addr.ip()) {
-            return Err(RuntimeError::Protocol(format!(
-                "resolved metadata or link-local address '{}' is not permitted",
-                addr.ip()
-            )));
-        }
-        if is_http && !addr.ip().is_loopback() {
-            return Err(RuntimeError::Protocol(format!(
-                "cleartext http:// wake endpoint resolved to non-loopback address '{}'",
-                addr.ip()
-            )));
-        }
+        check_resolved_wake_ip(addr.ip(), is_http, bare, require_public_non_loopback)?;
     }
 
     let mut last_err = None;
