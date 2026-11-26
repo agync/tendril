@@ -432,6 +432,34 @@ pub(crate) fn scoped_addr_policy() -> Option<Arc<dyn AddrPolicy>> {
     WS_ADDR_POLICY.try_with(Arc::clone).ok()
 }
 
+/// The policy of a dial outside the hint dialer: the one scoped by [`with_addr_policy`], else
+/// [`DefaultAddrPolicy`].
+pub(crate) fn effective_addr_policy() -> Arc<dyn AddrPolicy> {
+    scoped_addr_policy().unwrap_or_else(|| Arc::new(DefaultAddrPolicy))
+}
+
+/// Resolves `host` once with the effective policy and checks every answer
+/// ([`resolve_checked`]); the caller connects to the returned checked addresses only.
+pub(crate) async fn resolve_dial_target(
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, RuntimeError> {
+    resolve_checked(host, port, &*effective_addr_policy()).await
+}
+
+/// Refuses a non-unspecified listener bind address in the always-blocked set. An unspecified
+/// address (`0.0.0.0`, `::`) binds every interface and stays allowed.
+pub(crate) fn check_bind_addr(addr: SocketAddr) -> Result<(), RuntimeError> {
+    let ip = addr.ip();
+    if ip.is_unspecified() || classify_destination(ip) != DestClass::Blocked {
+        return Ok(());
+    }
+    Err(egress_err(
+        SkipReason::BlockedAddress,
+        "listener bind address is not permitted",
+    ))
+}
+
 /// A [`PathDialer`] that dials through `inner` under an [`AddrPolicy`], so the WebSocket
 /// connect of `inner` checks its single lookup with that policy.
 pub struct EgressDialer {
@@ -892,7 +920,7 @@ pub async fn check_hint(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -905,6 +933,70 @@ mod tests {
                 return Err(RuntimeError::Protocol(format!("no such host {host}")));
             }
             Ok(self.0.clone())
+        }
+    }
+
+    /// [`DefaultAddrPolicy`] checks behind a stub resolver, so a host name reaches
+    /// [`DefaultAddrPolicy::check`] without a system lookup.
+    pub(crate) struct DefaultPolicyWithResolver(pub(crate) Arc<dyn HostResolver>);
+
+    impl fmt::Debug for DefaultPolicyWithResolver {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("DefaultPolicyWithResolver")
+        }
+    }
+
+    impl AddrPolicy for DefaultPolicyWithResolver {
+        fn check(&self, ip: IpAddr) -> Result<(), SkipReason> {
+            DefaultAddrPolicy.check(ip)
+        }
+
+        fn resolver(&self) -> &dyn HostResolver {
+            &*self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn default_policy_checks_every_answer_of_a_host_name() {
+        for blocked in [
+            "2001::1",
+            "64:ff9b:1::1",
+            "fec0::1",
+            "64:ff9b::a9fe:a9fe",
+            "2002:a9fe:a9fe::1",
+            "169.254.169.254",
+            "224.0.0.1",
+        ] {
+            let ip: IpAddr = blocked.parse().expect("ip");
+            let answers = vec![
+                SocketAddr::new("203.0.113.7".parse().expect("ip"), 0),
+                SocketAddr::new(ip, 0),
+            ];
+            let policy = DefaultPolicyWithResolver(Arc::new(EchoingResolver(answers)));
+            let err = resolve_checked("peer.example", 443, &policy)
+                .await
+                .expect_err(blocked);
+            assert_eq!(
+                err.skip_reason(),
+                Some(SkipReason::BlockedAddress),
+                "{blocked}"
+            );
+        }
+        for allowed in [
+            "127.0.0.1",
+            "::1",
+            "10.1.2.3",
+            "fd34::9",
+            "100.64.0.1",
+            "203.0.113.7",
+        ] {
+            let ip: IpAddr = allowed.parse().expect("ip");
+            let policy =
+                DefaultPolicyWithResolver(Arc::new(EchoingResolver(vec![SocketAddr::new(ip, 0)])));
+            let got = resolve_checked("peer.example", 443, &policy)
+                .await
+                .expect(allowed);
+            assert_eq!(got, vec![SocketAddr::new(ip, 443)], "{allowed}");
         }
     }
 

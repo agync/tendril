@@ -1172,6 +1172,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_ws_resolved_refuses_host_names_resolving_to_blocked_addresses() {
+        use std::net::SocketAddr;
+
+        struct Answers(Vec<SocketAddr>);
+
+        #[async_trait::async_trait]
+        impl egress::HostResolver for Answers {
+            async fn resolve(
+                &self,
+                _host: &str,
+                port: u16,
+            ) -> Result<Vec<SocketAddr>, RuntimeError> {
+                Ok(self
+                    .0
+                    .iter()
+                    .map(|a| SocketAddr::new(a.ip(), port))
+                    .collect())
+            }
+        }
+
+        for blocked in [
+            "2001::1",
+            "64:ff9b:1::1",
+            "fec0::1",
+            "64:ff9b::a9fe:a9fe",
+            "224.0.0.1",
+        ] {
+            let ip: std::net::IpAddr = blocked.parse().expect("ip");
+            let policy = std::sync::Arc::new(egress::tests::DefaultPolicyWithResolver(
+                std::sync::Arc::new(Answers(vec![SocketAddr::new(ip, 0)])),
+            ));
+            let err = egress::with_addr_policy(
+                policy,
+                connect_ws_resolved("wss://relay.example:9/", None, "test connect"),
+            )
+            .await
+            .expect_err("blocked answer");
+            assert_eq!(
+                err.skip_reason(),
+                Some(egress::SkipReason::BlockedAddress),
+                "{blocked}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn connect_ws_resolved_fails_closed_on_link_local_relay() {
         let err = connect_ws_resolved("ws://[fe80::1]:9/", None, "test connect")
             .await
