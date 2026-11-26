@@ -140,17 +140,19 @@ impl EndpointIdentity {
         })
     }
 
-    /// Overrides the stable `host_id` carried in `HostHello`.
+    /// Overrides the stable `host_id` carried in `HostHello`, unchecked.
     ///
-    /// Peers refuse a `HostHello` whose `host_id` fails [`is_valid_host_id`]; use
-    /// [`Self::try_with_host_id`] to check it here.
+    /// Peers refuse a `HostHello` whose `host_id` fails [`is_valid_host_id`], so this exists
+    /// for literals known to be valid and for tests that forge a hostile host. Production code
+    /// takes its `host_id` through [`Self::try_with_host_id`].
     #[must_use]
     pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
         self.host_id = host_id.into();
         self
     }
 
-    /// [`Self::with_host_id`], refusing a `host_id` that fails [`is_valid_host_id`].
+    /// [`Self::with_host_id`], returning an error for a `host_id` that fails
+    /// [`is_valid_host_id`].
     pub fn try_with_host_id(self, host_id: impl Into<String>) -> Result<Self, CoreError> {
         let host_id = host_id.into();
         if !is_valid_host_id(&host_id) {
@@ -684,6 +686,25 @@ mod tests {
             .public_bytes()
             .to_owned();
         (sk, pk, stat)
+    }
+
+    fn bad_host_ids() -> Vec<String> {
+        vec![
+            String::new(),
+            "has#hash".to_owned(),
+            "ctl\u{7}char".to_owned(),
+            "x".repeat(MAX_HOST_ID_LEN + 1),
+        ]
+    }
+
+    #[test]
+    fn try_with_host_id_refuses_invalid_ids() {
+        for bad in bad_host_ids() {
+            let id = EndpointIdentity::generate().unwrap();
+            assert!(id.try_with_host_id(bad.as_str()).is_err(), "{bad:?}");
+        }
+        let id = EndpointIdentity::generate().unwrap();
+        assert_eq!(id.try_with_host_id("ok-host").unwrap().host_id(), "ok-host");
     }
 
     #[test]

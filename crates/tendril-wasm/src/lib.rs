@@ -910,7 +910,7 @@ impl WasmIdentity {
         if let Some(h) = host_id
             && !h.is_empty()
         {
-            id = id.with_host_id(h);
+            id = id.try_with_host_id(h).map_err(WasmError::from)?;
         }
         Ok(Self { inner: id })
     }
@@ -4682,6 +4682,14 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn an_invalid_host_id_cannot_be_configured() {
+        for bad in ["has#hash", "ctl\u{7}char", &"x".repeat(257)] {
+            assert!(WasmIdentity::generate_inner(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert!(WasmIdentity::generate_inner(Some("")).is_ok());
+    }
 
     #[test]
     fn wasm_identity_roundtrip_and_full_pair_session_handshake() {
