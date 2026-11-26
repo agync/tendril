@@ -326,7 +326,9 @@ jobs:
   bindings-apple:
     name: Apple SwiftPM and iOS FFI
     needs: changes
-    if: needs.changes.outputs.apple != 'false'
+    if: >-
+      needs.changes.outputs.apple != 'false'
+      || (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--'))
     runs-on: macos-15
     timeout-minutes: 35
     permissions:
@@ -335,6 +337,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
@@ -348,8 +353,151 @@ jobs:
       - name: Verify macOS SwiftPM tests
         working-directory: bindings/swift
         run: swift test -Xlinker "-L../../target/aarch64-apple-darwin/release"
-      - run: cargo build --release --target aarch64-apple-ios -p tendril-ffi --lib
-      - run: cargo build --release --target aarch64-apple-ios-sim -p tendril-ffi --lib
+      - name: Verify root remote Package.swift manifest
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          env -u TENDRIL_LOCAL_FFI swift package dump-package > "$RUNNER_TEMP/remote-package.json"
+          python3 -I - "$RUNNER_TEMP/remote-package.json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          pkg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert pkg["name"] == "Tendril", pkg["name"]
+          targets = {t["name"]: t for t in pkg["targets"]}
+          ctendril = targets["CTendril"]
+          assert ctendril["type"] == "binary", ctendril
+
+          manifest = Path("Package.swift").read_text(encoding="utf-8")
+          ver_m = re.search(r'^let tendrilReleaseVersion = "([^"]+)"$', manifest, re.M)
+          sha_m = re.search(r'^let tendrilXCFrameworkChecksum = "([0-9a-f]{64})"$', manifest, re.M)
+          assert ver_m and sha_m, "missing release constants in Package.swift"
+          pkg_ver, pkg_sha = ver_m.group(1), sha_m.group(1)
+
+          expected_url = (
+              f"https://github.com/agync/tendril/releases/download/"
+              f"v{pkg_ver}/TendrilFFI.xcframework-{pkg_ver}.zip"
+          )
+          assert ctendril["url"] == expected_url, (ctendril.get("url"), expected_url)
+          assert ctendril["checksum"] == pkg_sha, (ctendril.get("checksum"), pkg_sha)
+          assert "unsafeFlags" not in json.dumps(pkg), "remote manifest must not contain unsafeFlags"
+
+          if os.environ.get("EVENT_NAME") == "pull_request" and os.environ.get("HEAD_REF", "").startswith("release-please--"):
+              rp_manifest = json.loads(Path(".release-please-manifest.json").read_text(encoding="utf-8"))
+              expected_ver = rp_manifest["."]
+              assert pkg_ver == expected_ver, (
+                  f"release PR Package.swift version {pkg_ver} != .release-please-manifest.json {expected_ver}"
+              )
+              assert re.fullmatch(r"[0-9a-f]{64}", pkg_sha) and pkg_sha != "0" * 64, (
+                  f"release PR Package.swift checksum must be finalized (got {pkg_sha})"
+              )
+          PY
+      - name: Verify root local SwiftPM tests
+        env:
+          TENDRIL_LOCAL_FFI: "1"
+        run: swift test -Xlinker "-Ltarget/aarch64-apple-darwin/release"
+      - name: Build and verify TendrilFFI.xcframework smoke link
+        run: |
+          set -euo pipefail
+          zip_path="$RUNNER_TEMP/TendrilFFI.xcframework-0.1.0.zip"
+          built_sha=$(scripts/build-xcframework.sh "0.1.0" "$zip_path")
+          swift_sha=$(swift package compute-checksum "$zip_path")
+          if [ "$built_sha" != "$swift_sha" ]; then
+            echo "checksum mismatch: packer=$built_sha swift=$swift_sha" >&2
+            exit 1
+          fi
+
+          smoke_dir="$RUNNER_TEMP/xcframework-smoke"
+          rm -rf "$smoke_dir"
+          mkdir -p "$smoke_dir/Sources"
+          unzip -q "$zip_path" -d "$smoke_dir"
+          fw_dir="$smoke_dir/TendrilFFI.xcframework"
+          test -f "$fw_dir/Info.plist"
+          python3 -I - "$fw_dir" <<'PY'
+          import plistlib
+          import sys
+          from pathlib import Path
+
+          fw = Path(sys.argv[1])
+          plist = plistlib.loads((fw / "Info.plist").read_bytes())
+          libs = plist.get("AvailableLibraries", [])
+          assert len(libs) == 3, libs
+          platforms = {
+              (entry.get("SupportedPlatform"), entry.get("SupportedPlatformVariant"))
+              for entry in libs
+          }
+          assert platforms == {("macos", None), ("ios", None), ("ios", "simulator")}, platforms
+          for entry in libs:
+              slice_dir = fw / entry["LibraryIdentifier"]
+              assert (slice_dir / entry["LibraryPath"]).is_file(), slice_dir
+              headers_dir = slice_dir / entry["HeadersPath"]
+              assert (headers_dir / "tendril.h").is_file(), headers_dir
+              assert (headers_dir / "tendril.h").read_bytes() == Path(
+                  "crates/tendril-ffi/include/tendril.h"
+              ).read_bytes(), headers_dir
+              mm = (headers_dir / "module.modulemap").read_text(encoding="utf-8")
+              assert mm == 'module CTendril [system] {\n  header "tendril.h"\n  export *\n}\n', mm
+              assert "module CTendril [system]" in mm, mm
+              assert 'header "tendril.h"' in mm, mm
+              assert "export *" in mm, mm
+          local_mm = Path(
+              "bindings/swift/Sources/CTendril/include/module.modulemap"
+          ).read_text(encoding="utf-8")
+          assert "module CTendril [system]" in local_mm, local_mm
+          PY
+
+          cat > "$smoke_dir/Package.swift" <<'SWIFT'
+          // swift-tools-version: 5.9
+          import PackageDescription
+
+          let package = Package(
+            name: "XCFrameworkSmoke",
+            platforms: [.macOS(.v13)],
+            targets: [
+              .binaryTarget(
+                name: "CTendril",
+                path: "TendrilFFI.xcframework"
+              ),
+              .executableTarget(
+                name: "XCFrameworkSmoke",
+                dependencies: ["CTendril"],
+                path: "Sources",
+                linkerSettings: [
+                  .linkedFramework("CoreFoundation"),
+                  .linkedFramework("Network"),
+                  .linkedFramework("Security"),
+                  .linkedFramework("SystemConfiguration"),
+                  .linkedLibrary("resolv"),
+                ]
+              ),
+            ]
+          )
+          SWIFT
+
+          cat > "$smoke_dir/Sources/main.swift" <<'SWIFT'
+          import CTendril
+          import Foundation
+
+          var key = [UInt8](repeating: 0x42, count: Int(TENDRIL_KEY_LEN))
+          var outPtr: UnsafeMutablePointer<CChar>?
+          let rc = key.withUnsafeBufferPointer { buf in
+            tendril_device_id(buf.baseAddress, &outPtr)
+          }
+          guard rc == TENDRIL_OK.rawValue, let ptr = outPtr else {
+            fatalError("tendril_device_id failed: \(rc)")
+          }
+          let id = String(cString: ptr)
+          tendril_string_free(ptr)
+          precondition(id.hasPrefix("dev_"), "unexpected device id: \(id)")
+          print("xcframework smoke ok: \(id)")
+          SWIFT
+
+          swift run --package-path "$smoke_dir"
 
   rust-platforms:
     name: cross-platform (${{ matrix.os }})
