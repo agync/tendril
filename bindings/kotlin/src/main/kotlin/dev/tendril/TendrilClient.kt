@@ -782,6 +782,25 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
     }
   }
 
+  /**
+   * Sets the P2P socket keys of the transport configuration, keeping every other key of the last
+   * configuration sent. [portMapping] (default `true` natively) false stops the endpoint from
+   * probing the router for a UPnP, NAT-PMP or PCP mapping. [bindAddrs] is at most one IPv4 and
+   * one IPv6 `host:port` such as `0.0.0.0:0` and `[::]:0` (default every interface); a bad entry
+   * throws an error naming `p2p_bind_addrs` and leaves the cached configuration unchanged. Call
+   * before [serveP2p].
+   */
+  fun configureP2p(portMapping: Boolean? = null, bindAddrs: List<String>? = null) {
+    val keys =
+      listOf("p2p_port_mapping" to portMapping, "p2p_bind_addrs" to bindAddrs)
+        .mapNotNull { (k, v) -> v?.let { k to it } }
+        .toMap()
+    if (keys.isEmpty()) return
+    transportConfig.merge(keys) { json ->
+      withHandle { TendrilNative.endpointConfigureTransportsJson(it, json) }
+    }
+  }
+
   fun acceptSession(timeoutMs: Long): TendrilSession =
     withHandle { TendrilSession(TendrilNative.sessionAccept(it, timeoutMs)) }
 

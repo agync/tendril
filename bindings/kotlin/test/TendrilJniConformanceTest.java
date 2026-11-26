@@ -770,6 +770,9 @@ public final class TendrilJniConformanceTest {
       activeBg[0] = null;
       Map<String, Object> accRes = asObj(Json.parse(acc[0]));
       check("active".equals(initRes.get("status")), "expected active init status: " + initRes);
+      check(
+          "no_state_dir".equals(initRes.get("routes_reason")),
+          "a memory-only enrolment stores no route: " + initRes);
       check("active".equals(accRes.get("status")), "expected active acc status: " + accRes);
       check(
           asStr(initRes.get("device_id")).equals(asStr(accRes.get("device_id"))),
@@ -2015,11 +2018,278 @@ public final class TendrilJniConformanceTest {
     }
   }
 
-  private static void verifyPairingUriRoutes() throws Exception {
+  // ---- spec/vectors/routes.json replay ----------------------------------------------------
+
+  private static final java.util.Set<String> ROUTES_COVERED_SECTIONS =
+      java.util.Set.of("pairing_route_statement", "pairing_route_check");
+
+  // Sections the Kotlin API cannot reach, with the reason.
+  private static final Map<String, String> ROUTES_SKIPPED_SECTIONS =
+      Map.of(
+          "route_set",
+          "verify_route_set is not in the C ABI, so the signed route set vectors cannot be replayed;"
+              + " only its host keys pin the vector host here",
+          "session_hello_route_seq",
+          "SessionHello is built inside the core handshake; no binding exposes the wire JSON.");
+
+  // URIs naming a host key the pinned vector host does not hold: the offline apply path can only
+  // report that no paired host matches.
+  private static final java.util.Set<String> ROUTES_NO_HOST_MATCH_CASES =
+      java.util.Set.of("route_key_rotated", "route_key_rotated_stale_rs", "unchained_key");
+
+  // Case fields the offline apply path does not model. A new field must fail the field check
+  // until it is covered or listed here with a reason.
+  private static final java.util.Set<String> ROUTES_COVERED_CASE_FIELDS =
+      java.util.Set.of("name", "uri", "route_check");
+  private static final Map<String, String> ROUTES_HANDSHAKE_ONLY_FIELDS =
+      Map.ofEntries(
+          Map.entry("pin_ok", "outcome of the host key pin check in the pairing handshake"),
+          Map.entry("commit_error", "error raised when the handshake commits the pairing"),
+          Map.entry("relay_pub_ok", "rp relay key check, made by the pairing initiator"),
+          Map.entry("operator_relay_key_hex", "operator relay key given to the pairing initiator"),
+          Map.entry("responder", "which identity answers the handshake in the replay"),
+          Map.entry("wires", "wire versions the handshake replay runs on"),
+          Map.entry("presented_static_pub_hex", "key material the responder presents"),
+          Map.entry("presented_ed25519_pub_hex", "key material the responder presents"),
+          Map.entry("presented_signing_pub_sha256_hex", "key material the responder presents"),
+          Map.entry("presented_rotation_seq", "rotation chain length the responder presents"));
+
+  private static String queryParam(String uri, String name) {
+    String query = uri.substring(uri.indexOf('?') + 1);
+    for (String pair : query.split("&")) {
+      if (pair.startsWith(name + "=")) {
+        return pair.substring(name.length() + 1);
+      }
+    }
+    throw new AssertionError("no " + name + " in " + uri);
+  }
+
+  /** A fresh endpoint pinned to the vector host through a hand-written roster.json. */
+  private static long vectorClient(Map<String, Object> routeSet, String hostId) throws IOException {
+    byte[] staticPub = hexDecode(asStr(routeSet.get("static_pub_hex")));
+    List<Object> staticList = new ArrayList<>();
+    for (byte b : staticPub) {
+      staticList.add(b & 0xff);
+    }
+    Map<String, Object> entry = new LinkedHashMap<>();
+    entry.put("device_id", hostId);
+    entry.put("name", "vector-host");
+    entry.put("kind", "host");
+    entry.put("static_pub", staticList);
+    entry.put("signing_pub", b64Url(hexDecode(asStr(routeSet.get("signing_pub_hex")))));
+    entry.put("rotation_seq", 0);
+    entry.put("state", "active");
+    entry.put("min_wire_version", 1);
+    Map<String, Object> roster = new LinkedHashMap<>();
+    roster.put("entries", Map.of(hostId, entry));
+    roster.put("crls", Map.of());
+    Path dir = Paths.get(tempStateDir("tendril-jni-rv-"));
+    Path file = dir.resolve("roster.json");
+    Files.writeString(file, Json.stringify(roster));
+    Files.setPosixFilePermissions(file, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+    return TendrilNative.endpointNew(dir.toString(), "jni-routes-vectors");
+  }
+
+  private static String applyError(long ep, String uri) {
+    try {
+      TendrilNative.endpointApplyRouteUri(ep, uri, null);
+    } catch (IllegalStateException e) {
+      return e.getMessage();
+    }
+    throw new AssertionError("apply_route_uri accepted " + uri);
+  }
+
+  private static void verifyRoutesVectorCoverage(Map<String, Object> vectors) {
+    java.util.Set<String> expected = new java.util.TreeSet<>(ROUTES_COVERED_SECTIONS);
+    expected.addAll(ROUTES_SKIPPED_SECTIONS.keySet());
+    check(
+        expected.equals(new java.util.TreeSet<>(vectors.keySet())),
+        "routes.json sections must be covered or skipped: " + vectors.keySet());
+    for (String reason : ROUTES_SKIPPED_SECTIONS.values()) {
+      check(!reason.isEmpty(), "skipped section needs a reason");
+    }
+    for (String reason : ROUTES_HANDSHAKE_ONLY_FIELDS.values()) {
+      check(!reason.isEmpty(), "handshake-only field needs a reason");
+    }
+    java.util.Set<String> known = new java.util.HashSet<>(ROUTES_COVERED_CASE_FIELDS);
+    known.addAll(ROUTES_HANDSHAKE_ONLY_FIELDS.keySet());
+    java.util.Set<String> names = new java.util.HashSet<>();
+    for (Object c : asArr(asObj(vectors.get("pairing_route_check")).get("cases"))) {
+      Map<String, Object> cs = asObj(c);
+      names.add(asStr(cs.get("name")));
+      check(known.containsAll(cs.keySet()), "unexpected case field in " + cs.get("name") + ": " + cs.keySet());
+    }
+    check(names.containsAll(ROUTES_NO_HOST_MATCH_CASES), "no-host-match cases must exist: " + names);
+  }
+
+  private static void verifyRoutesVectors(Path root) throws Exception {
+    Map<String, Object> vectors = loadVector(root, "routes.json");
+    verifyRoutesVectorCoverage(vectors);
+    Map<String, Object> routeSet = asObj(vectors.get("route_set"));
+    String hostId = TendrilNative.deviceId(hexDecode(asStr(routeSet.get("static_pub_hex"))));
+    String hostK = b64Url(hexDecode(asStr(routeSet.get("static_pub_hex"))));
+    Map<String, Object> stmt = asObj(vectors.get("pairing_route_statement"));
+    check(
+        b64Url(hexDecode(asStr(routeSet.get("sh_hex")))).equals(queryParam(asStr(stmt.get("uri")), "sh")),
+        "statement sh matches the vector host");
+
+    // Statement: every hint applies as a signed route.
+    long ep = vectorClient(routeSet, hostId);
+    try {
+      Map<String, Object> applied =
+          asObj(Json.parse(TendrilNative.endpointApplyRouteUri(ep, asStr(stmt.get("uri")), null)));
+      check(hostId.equals(applied.get("peer_id")), "applied peer: " + applied);
+      check(Boolean.TRUE.equals(applied.get("applied")), "applied: " + applied);
+      check(applied.get("reason") == null, "reason: " + applied);
+      check(seqOf(applied, "route_seq") == seqOf(stmt, "route_seq"), "route_seq: " + applied);
+      List<String> want = new ArrayList<>();
+      for (Object h : asArr(stmt.get("hints"))) {
+        want.add(asStr(h));
+      }
+      java.util.Collections.sort(want);
+      check(routesOf(ep, hostId, "signed").equals(want), "signed hints: " + routesOf(ep, hostId, "signed"));
+    } finally {
+      TendrilNative.endpointFree(ep);
+    }
+
+    // Statement with a tampered rq does not verify and stores nothing.
+    String uri = asStr(stmt.get("uri"));
+    String tampered = uri.replace("&rq=7", "&rq=8");
+    check(!uri.equals(tampered), "rq=7 present in the statement URI");
+    ep = vectorClient(routeSet, hostId);
+    try {
+      check(applyError(ep, tampered).contains("does not verify"), "tampered rq must not verify");
+      check(routesOf(ep, hostId, "signed").isEmpty(), "tampered rq stored routes");
+    } finally {
+      TendrilNative.endpointFree(ep);
+    }
+
+    // Check cases.
+    for (Object c : asArr(asObj(vectors.get("pairing_route_check")).get("cases"))) {
+      Map<String, Object> cs = asObj(c);
+      String name = asStr(cs.get("name"));
+      String caseUri = asStr(cs.get("uri"));
+      ep = vectorClient(routeSet, hostId);
+      try {
+        String uriK = queryParam(caseUri, "k");
+        if (ROUTES_NO_HOST_MATCH_CASES.contains(name)) {
+          check(!uriK.equals(hostK), name + " names another host key");
+          check(applyError(ep, caseUri).contains("no paired host matches"), name + " host match");
+          continue;
+        }
+        check(uriK.equals(hostK), name + " names the vector host key");
+        String outcome = asStr(cs.get("route_check"));
+        if ("verified".equals(outcome)) {
+          Map<String, Object> res =
+              asObj(Json.parse(TendrilNative.endpointApplyRouteUri(ep, caseUri, null)));
+          check(Boolean.TRUE.equals(res.get("applied")), name + " applied: " + res);
+          check(!routesOf(ep, hostId, "signed").isEmpty(), name + " stored signed routes");
+        } else if ("unsigned".equals(outcome)) {
+          check(applyError(ep, caseUri).contains("not host-signed"), name + " unsigned");
+        } else {
+          check("invalid".equals(outcome), name + " unknown outcome " + outcome);
+          check(applyError(ep, caseUri).contains("does not verify"), name + " invalid");
+        }
+      } finally {
+        TendrilNative.endpointFree(ep);
+      }
+    }
+  }
+
+  private static String failureOf(Runnable call) {
+    try {
+      call.run();
+    } catch (IllegalStateException e) {
+      return String.valueOf(e.getMessage());
+    }
+    throw new AssertionError("call did not fail");
+  }
+
+  /** relay_host reaches the dialer, routes_reason reports why a pairing wrote no route, unknown peers are NOT_FOUND. */
+  private static void verifyRelayHostRoutesReasonAndUnknownPeer() throws Exception {
+    long host = newEp("tendril-jni-rr-h-", "jni-rr-host");
+    long stateful = newEp("tendril-jni-rr-c-", null);
+    try {
+      TendrilNative.endpointServeDirect(host, "127.0.0.1:0");
+      String signed = asStr(issue(host, null).get("uri"));
+      Map<String, Object> res = pairViaUri(host, stateful, signed, false);
+      check(res.get("routes_reason") == null, "verified pairing routes_reason: " + res);
+      String hostId = hostIdOf(host);
+
+      // An unsigned URI persists nothing and says why.
+      long unsignedClient = newEp("tendril-jni-rr-u-", null);
+      try {
+        String plain = asStr(issue(host, "{\"sign_routes\":false}").get("uri"));
+        check(!plain.contains("&rs="), "sign_routes=false must not sign: " + plain);
+        Map<String, Object> uns = pairViaUri(host, unsignedClient, plain, false);
+        check("unsigned".equals(uns.get("route_check")), "unsigned route_check: " + uns);
+        check("unsigned_uri".equals(uns.get("routes_reason")), "unsigned routes_reason: " + uns);
+      } finally {
+        TendrilNative.endpointFree(unsignedClient);
+      }
+
+      // relay_host is a known connect option and reaches the iroh dialer, which rejects the value.
+      String grant =
+          TendrilNative.endpointMintGrant(host, deviceIdOf(stateful), Json.stringify(List.of("fs.read")), 3600);
+      String bad =
+          "{\"grant\":" + grant + ",\"endpoint\":\"iroh://peer\",\"relay_host\":\"not-a-relay-mode\"}";
+      String msg = failureOf(() -> TendrilNative.sessionConnectWithOptions(stateful, hostId, bad));
+      check(!msg.contains("unknown field"), "relay_host must be a known option: " + msg);
+
+      // An unknown peer is NOT_FOUND for the setter and the getter.
+      for (String unknown : List.of("dev_unknown")) {
+        String set =
+            failureOf(() -> TendrilNative.endpointSetPeerRoutes(stateful, unknown, Json.stringify(List.of("127.0.0.1:5"))));
+        check(set.contains("(-2)"), "setPeerRoutes unknown peer: " + set);
+        String get = failureOf(() -> TendrilNative.endpointPeerRoutes(stateful, unknown));
+        check(get.contains("(-2)"), "peerRoutes unknown peer: " + get);
+      }
+    } finally {
+      TendrilNative.endpointFree(host);
+      TendrilNative.endpointFree(stateful);
+    }
+  }
+
+  /** p2p_port_mapping and p2p_bind_addrs reach the listener and are validated. */
+  private static void verifyP2pNetOptions() {
+    long ep = TendrilNative.endpointNew(null, "jni-p2p-net");
+    try {
+      TendrilNative.endpointConfigureTransportsJson(
+          ep, "{\"p2p_port_mapping\":false,\"p2p_bind_addrs\":[\"127.0.0.1:0\"]}");
+      String addr = TendrilNative.endpointServeP2p(ep, "disabled");
+      java.util.regex.Matcher m = java.util.regex.Pattern.compile("[?&]addr=([^&]+)").matcher(addr);
+      int hints = 0;
+      while (m.find()) {
+        hints++;
+        check(m.group(1).startsWith("127.0.0.1:"), "p2p hint outside the bind address: " + addr);
+      }
+      check(hints > 0, "p2p endpoint carries address hints: " + addr);
+    } finally {
+      TendrilNative.endpointFree(ep);
+    }
+    long bad = TendrilNative.endpointNew(null, "jni-p2p-net-bad");
+    try {
+      for (String addrs : List.of("[\"not-an-addr\"]", "[\"127.0.0.1:0\",\"127.0.0.2:0\"]")) {
+        String msg =
+            failureOf(
+                () -> TendrilNative.endpointConfigureTransportsJson(bad, "{\"p2p_bind_addrs\":" + addrs + "}"));
+        check(msg.contains("p2p_bind_addrs"), "bind addrs error names the key: " + msg);
+      }
+      failureOf(() -> TendrilNative.endpointConfigureTransportsJson(bad, "{\"p2p_port_mapping\":\"no\"}"));
+      TendrilNative.endpointConfigureTransportsJson(bad, "{\"p2p_relay_mode\":\"n0\",\"p2p_port_mapping\":true}");
+    } finally {
+      TendrilNative.endpointFree(bad);
+    }
+  }
+
+  private static void verifyPairingUriRoutes(Path root) throws Exception {
     verifyPairingUriFlow(false);
     verifyPairingUriFlow(true);
     verifyRefreshRoutes();
     verifySealedRouteSeq();
+    verifyRoutesVectors(root);
+    verifyRelayHostRoutesReasonAndUnknownPeer();
+    verifyP2pNetOptions();
   }
 
   public static void main(String[] args) throws Exception {
@@ -2040,7 +2310,7 @@ public final class TendrilJniConformanceTest {
     System.out.println("JNI_GROUP_OK=true");
     verifySealedGroupState();
     System.out.println("JNI_SEALED_GROUP_OK=true");
-    verifyPairingUriRoutes();
+    verifyPairingUriRoutes(root);
     System.out.println("JNI_PAIRING_URI_ROUTES_OK=true");
   }
 }

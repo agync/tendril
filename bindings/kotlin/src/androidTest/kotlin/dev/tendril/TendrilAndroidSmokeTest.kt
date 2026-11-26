@@ -1009,4 +1009,146 @@ class TendrilAndroidSmokeTest {
     runAllGuarded({ ran += 4 })
     assertEquals(4, ran.last())
   }
+
+  // ---- relay_host, routes_reason, unknown peers and P2P net options -----------------------
+
+  @Test
+  fun connectWithOptionsTakesRelayHost() {
+    withNodes("host", "client") { (hostNode, clientNode) ->
+      val host = hostNode.open()
+      val client = clientNode.open()
+      host.serveDirect("127.0.0.1:0")
+      val res = pairViaUri(host, client, JSONObject(host.issuePairingUri()).getString("uri"))
+      val hostId = JSONObject(host.infoJson()).getString("host_id")
+      val grant = grantFor(host, res.getString("device_id"))
+      // relay_host is a known connect option: it reaches the iroh dialer, which rejects the value
+      // instead of the options parser rejecting the key.
+      val err =
+        runCatching {
+            client.connectWithOptions(
+              targetHostId = hostId,
+              grantJson = grant,
+              endpoint = "iroh://peer",
+              relayHost = "not-a-relay-mode",
+            )
+          }
+          .exceptionOrNull()
+      assertTrue("connect must fail", err != null)
+      assertFalse(err?.message.orEmpty(), err?.message.orEmpty().contains("unknown field"))
+    }
+  }
+
+  @Test
+  fun pairingReportsWhyNoRoutesWereWritten() {
+    withNodes("host", "client", "client2") { (hostNode, clientNode, client2Node) ->
+      val host = hostNode.open()
+      val client = clientNode.open()
+      val client2 = client2Node.open()
+      host.serveDirect("127.0.0.1:0")
+
+      val verified = pairViaUri(host, client, JSONObject(host.issuePairingUri()).getString("uri"))
+      assertEquals("verified", verified.getString("route_check"))
+      assertTrue(verified.toString(), verified.isNull("routes_reason"))
+
+      val plain = JSONObject(host.issuePairingUri(signRoutes = false)).getString("uri")
+      assertFalse(plain, plain.contains("&rs="))
+      val unsigned = pairViaUri(host, client2, plain)
+      assertEquals("unsigned", unsigned.getString("route_check"))
+      assertEquals(0, unsigned.getJSONArray("routes_persisted").length())
+      assertEquals("unsigned_uri", unsigned.getString("routes_reason"))
+    }
+  }
+
+  private fun enrol(host: TendrilEndpoint, anchor: TendrilEndpoint, client: TendrilEndpoint): JSONObject {
+    val hostInfo = JSONObject(host.infoJson())
+    val hostId = hostInfo.getString("host_id")
+    val endpoint = host.serveDirect("127.0.0.1:0")
+    val token = anchor.mintEnrollmentToken(targetHostId = hostId, ttlSecs = 300)
+    var failure: Throwable? = null
+    val accept = Thread {
+      try {
+        host.pairAccept(10_000)
+      } catch (t: Throwable) {
+        failure = t
+      }
+    }
+    accept.start()
+    val result =
+      try {
+        JSONObject(
+          client.enrollInitiate(
+            endpoint = endpoint,
+            hostId = hostId,
+            hostStaticPub = b64(hostInfo.getString("static_pub")),
+            hostSigningPub = b64(hostInfo.getString("signing_pub")),
+            tokenJson = token,
+            deviceName = "smoke-worker",
+          )
+        )
+      } finally {
+        accept.join(15_000)
+      }
+    failure?.let { throw it }
+    return result
+  }
+
+  @Test
+  fun enrolmentReportsNoStateDirRoutesReason() {
+    withNodes("host", "client") { (hostNode, clientNode) ->
+      TendrilEndpoint.create(stateDir = null, hostId = "smoke-enrol-anchor").use { anchor ->
+        val host = hostNode.open()
+        host.addTrustAnchor(
+          "smoke-enrol-anchor",
+          b64(JSONObject(anchor.infoJson()).getString("signing_pub")),
+        )
+        // A state directory gives the enrolment a store for routes.
+        val stored = enrol(host, anchor, clientNode.open())
+        assertEquals(stored.toString(), "active", stored.getString("status"))
+        assertTrue(stored.toString(), stored.isNull("routes_reason"))
+
+        // A memory-only endpoint requests and stores no route.
+        TendrilEndpoint.create(stateDir = null).use { memory ->
+          val res = enrol(host, anchor, memory)
+          assertEquals(res.toString(), "active", res.getString("status"))
+          assertEquals("no_state_dir", res.getString("routes_reason"))
+        }
+      }
+    }
+  }
+
+  @Test
+  fun setPeerRoutesRejectsAnUnknownPeerAsNotFound() {
+    withNodes("client") { (clientNode) ->
+      val client = clientNode.open()
+      val set = runCatching { client.setPeerRoutes("dev_unknown", listOf("127.0.0.1:5")) }
+      assertTrue(set.isFailure)
+      assertTrue(set.exceptionOrNull()?.message.orEmpty(), set.exceptionOrNull()?.message.orEmpty().contains("(-2)"))
+      val get = runCatching { client.peerRoutes("dev_unknown") }
+      assertTrue(get.exceptionOrNull()?.message.orEmpty().contains("(-2)"))
+    }
+  }
+
+  @Test
+  fun p2pNetOptionsReachTheListenerAndAreValidated() {
+    TendrilEndpoint.create(stateDir = null, hostId = "smoke-p2p-net").use { ep ->
+      ep.configureP2p(portMapping = false, bindAddrs = listOf("127.0.0.1:0"))
+      // A later merge of other keys keeps the P2P keys.
+      ep.configureRoutes(signRoutes = true)
+      val addr = ep.serveP2p("disabled")
+      val hints = Regex("[?&]addr=([^&]+)").findAll(addr).map { it.groupValues[1] }.toList()
+      assertTrue(addr, hints.isNotEmpty())
+      hints.forEach { assertTrue(addr, it.startsWith("127.0.0.1:")) }
+    }
+    TendrilEndpoint.create(stateDir = null, hostId = "smoke-p2p-net-bad").use { ep ->
+      for (bad in listOf(listOf("not-an-addr"), listOf("127.0.0.1:0", "127.0.0.2:0"))) {
+        val err = runCatching { ep.configureP2p(bindAddrs = bad) }.exceptionOrNull()
+        assertTrue("$bad must be rejected", err != null)
+        assertTrue(err?.message.orEmpty(), err?.message.orEmpty().contains("p2p_bind_addrs"))
+      }
+      // A rejected configuration is not cached: the next merge sends only valid keys.
+      ep.configureP2p(portMapping = true)
+      ep.configureTransportsJson("""{"p2p_relay_mode":"n0","p2p_port_mapping":true}""")
+      assertTrue(runCatching { ep.configureTransportsJson("""{"p2p_port_mapping":"no"}""") }.isFailure)
+    }
+  }
 }

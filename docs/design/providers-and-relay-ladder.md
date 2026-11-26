@@ -77,7 +77,7 @@ Every surface sets `port_mapping` and `bind_addrs` on each listener, dialer, gro
 | CLI (`serve`, `pair`, `enroll`, `dial`, `group`) | `--p2p-no-port-mapping` | `--p2p-bind <addr>`, repeatable, at most one IPv4 and one IPv6 (`0.0.0.0:0`, `[::]:0`); a family left out gets no socket |
 | C ABI, Python, Node transport JSON | `"p2p_port_mapping": false` (Node also `p2pPortMapping`) | `"p2p_bind_addrs": ["0.0.0.0:0", "[::]:0"]` (Node also `p2pBindAddrs`) |
 
-An address that does not parse, or a second address of one family, is a configuration error that names the flag or key (`--p2p-bind`, `p2p_bind_addrs`); it never falls back to all interfaces. The relay mode of every surface accepts `n0` as an alias of `default` (n0's public relays). Swift and Kotlin do not expose these options yet.
+An address that does not parse, or a second address of one family, is a configuration error that names the flag or key (`--p2p-bind`, `p2p_bind_addrs`); it never falls back to all interfaces. The relay mode of every surface accepts `n0` as an alias of `default` (n0's public relays). Swift and Kotlin set `p2p_port_mapping` and `p2p_bind_addrs` with `configureP2p`.
 
 ## Relay ladder and legacy hint migration
 
