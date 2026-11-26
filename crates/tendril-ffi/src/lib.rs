@@ -1241,6 +1241,22 @@ impl TendrilEndpoint {
         f(&self.route_access)
     }
 
+    /// Persists the CRLs only this endpoint's sessions hold, under the store lock. Nothing is
+    /// written (no `roster.json` created, no mtime bump) when the store already holds them.
+    fn persist_session_crls(&self) -> Result<(), (i32, String)> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(());
+        };
+        let _store_guard = self.rt.block_on(self.store_lock.lock());
+        store
+            .update_roster_if_changed(|disk| {
+                disk.merge_crl_evidence(&held_crls(&lock_roster(&self.roster)));
+                Ok(())
+            })
+            .map(|_| ())
+            .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+    }
+
     fn mutate_roster<T, F>(&self, f: F) -> Result<T, (i32, String)>
     where
         F: FnOnce(&mut Roster) -> Result<T, (i32, String)>,
@@ -3573,11 +3589,9 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
 
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
-        // The store-backed driver reads the on-disk roster for its pin checks: an empty update
-        // persists the CRLs only this endpoint's sessions hold, so the driver sees them.
-        if ep.store.is_some()
-            && let Err((rc, msg)) = ep.mutate_roster(|_| Ok(()))
-        {
+        // The store-backed driver reads the on-disk roster for its pin checks, so first
+        // persist the CRLs only this endpoint's sessions hold, if the store lacks any.
+        if let Err((rc, msg)) = ep.persist_session_crls() {
             set_last_error(msg);
             return rc;
         }
@@ -6977,6 +6991,127 @@ mod enroll_route_tests {
                 .as_array()
                 .expect("persisted")
                 .is_empty()
+        );
+    }
+
+    /// Enrols `client` towards a closed loopback port with a valid token, so the dial fails
+    /// after the pre-enrol persist step; returns the result code.
+    fn enroll_to_closed_port(client: &Ep) -> i32 {
+        let hd = tempfile::tempdir().unwrap();
+        let host = Ep::new(Some(hd.path()), Some("ffi-enr-host"));
+        let host_info = host.info();
+        let host_id = host_info["host_id"].as_str().expect("host id").to_owned();
+        let static_pub: [u8; 32] =
+            tendril_core::crypto::b64url_decode_array(host_info["static_pub"].as_str().unwrap())
+                .expect("static pub");
+        let signing_pub =
+            tendril_core::crypto::b64url_decode(host_info["signing_pub"].as_str().unwrap())
+                .expect("signing pub");
+        let dev_id = client.info()["device_id"].as_str().expect("id").to_owned();
+        let (host_id_c, dev_c) = (cs(&host_id), cs(&dev_id));
+        let mut tok = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                tendril_endpoint_mint_enrollment_token(
+                    host.0,
+                    host_id_c.as_ptr(),
+                    dev_c.as_ptr(),
+                    900,
+                    &raw mut tok,
+                )
+            },
+            TENDRIL_OK
+        );
+        let token = cs(&unsafe { take(tok) });
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = cs(&format!("direct:{}", closed.local_addr().unwrap()));
+        drop(closed);
+        let mut out = ptr::null_mut();
+        unsafe {
+            tendril_endpoint_enroll_initiate(
+                client.0,
+                endpoint.as_ptr(),
+                ptr::null(),
+                host_id_c.as_ptr(),
+                static_pub.as_ptr(),
+                signing_pub.as_ptr(),
+                signing_pub.len(),
+                0,
+                token.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &raw mut out,
+            )
+        }
+    }
+
+    #[test]
+    fn failed_enrol_without_new_state_leaves_the_roster_file_alone() {
+        let cd = tempfile::tempdir().unwrap();
+        let client = Ep::new(Some(cd.path()), None);
+        let roster = cd.path().join("roster.json");
+        assert!(!roster.exists(), "a fresh endpoint writes no roster");
+        assert_ne!(enroll_to_closed_port(&client), TENDRIL_OK);
+        assert!(!roster.exists(), "an enrol with nothing to persist");
+
+        std::fs::write(&roster, br#"{"entries":{},"crls":{}}"#).unwrap();
+        std::fs::set_permissions(&roster, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let before = std::fs::metadata(&roster).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_ne!(enroll_to_closed_port(&client), TENDRIL_OK);
+        assert_eq!(
+            std::fs::metadata(&roster).unwrap().modified().unwrap(),
+            before,
+            "an enrol with nothing to persist keeps the file as it is"
+        );
+    }
+
+    #[test]
+    fn enrol_persists_a_session_crl_only_the_endpoint_holds() {
+        use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+        let cd = tempfile::tempdir().unwrap();
+        let client = Ep::new(Some(cd.path()), None);
+        let peer = EndpointIdentity::generate().unwrap();
+        let peer_id = peer.host_id().to_owned();
+        let peer_pub = peer.signing_key().public_key().clone();
+        let ep = unsafe { &*client.0 };
+        ep.mutate_roster(|r| {
+            r.insert_pinned_host(
+                peer_id.clone(),
+                "Peer".to_owned(),
+                *peer.static_key().public_bytes(),
+                Some(peer_pub.clone()),
+                0,
+                vec![],
+            )
+            .map(|_| ())
+            .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+        })
+        .unwrap();
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: peer_id.clone(),
+                seq: 1,
+                revoked_devices: vec!["dev_other".to_owned()],
+                revoked_nonces: vec![],
+                ts: "2026-11-23T00:00:00Z".to_owned(),
+            },
+            peer.signing_key(),
+        )
+        .unwrap();
+        lock_roster(&ep.roster)
+            .ingest_crl(crl, &peer_id, &peer_pub)
+            .unwrap();
+        let store = ep.store.as_ref().unwrap();
+        assert!(store.load_roster().unwrap().crl(&peer_id).is_none());
+
+        assert_ne!(enroll_to_closed_port(&client), TENDRIL_OK);
+        assert_eq!(
+            store.load_roster().unwrap().crl(&peer_id).map(|c| c.seq),
+            Some(1),
+            "the driver reads the CRL from disk"
         );
     }
 

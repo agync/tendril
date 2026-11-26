@@ -471,6 +471,25 @@ impl StateStore {
         Ok((out, roster, stamp))
     }
 
+    /// Like [`Self::update_roster_with_state`], but writes only when `f` changed the roster
+    /// (compared by serialized form): an unchanged roster creates no `roster.json` and leaves an
+    /// existing one untouched, mtime included. Returns the result, the roster as it stands, and
+    /// whether it was written.
+    pub fn update_roster_if_changed<T, F>(&self, f: F) -> Result<(T, Roster, bool), RuntimeError>
+    where
+        F: FnOnce(&mut Roster) -> Result<T, RuntimeError>,
+    {
+        let _lock = self.lock_roster_file(true)?;
+        let mut roster = self.load_roster_unlocked()?;
+        let before = roster_fingerprint(&roster)?;
+        let out = f(&mut roster)?;
+        let changed = roster_fingerprint(&roster)? != before;
+        if changed {
+            self.save_roster_unlocked(&roster)?;
+        }
+        Ok((out, roster, changed))
+    }
+
     /// Executes `f` transactionally against the latest on-disk [`Roster`] under an exclusive
     /// advisory lock (`flock`), persisting updates atomically on `Ok`.
     pub fn update_roster<T, F>(&self, f: F) -> Result<T, RuntimeError>
@@ -710,6 +729,13 @@ pub fn pending_hosts_json(roster: &Roster) -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+/// The serialized form of `roster`, compared to tell whether a transaction changed it.
+fn roster_fingerprint(roster: &Roster) -> Result<Zeroizing<Vec<u8>>, RuntimeError> {
+    serde_json::to_vec(roster)
+        .map(Zeroizing::new)
+        .map_err(|err| RuntimeError::Storage(format!("serialize roster failed: {err}")))
 }
 
 /// Creates `dir` (`0o700`) if needed, then syncs `dir` and every ancestor of its canonical path
