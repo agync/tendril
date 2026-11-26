@@ -12,8 +12,9 @@ use tendril_core::crypto::{
     ExternalMlDsaSigner, MLDSA65_PUBLIC_LEN, SigningKeypair, StaticKeypair, b64url_decode_array,
     b64url_encode,
 };
+use tendril_core::error::CoreError;
 use tendril_core::group::GroupBook;
-use tendril_core::identity::{EndpointIdentity, RotationRecord};
+use tendril_core::identity::{EndpointIdentity, RotationRecord, is_valid_host_id};
 use tendril_core::roster::{PeerState, Roster};
 use tendril_core::state_seal::{StateKey, StateKind};
 use zeroize::{Zeroize, Zeroizing};
@@ -74,6 +75,9 @@ impl Drop for PersistedIdentity {
 pub fn serialize_identity_json(
     identity: &EndpointIdentity,
 ) -> Result<Zeroizing<String>, RuntimeError> {
+    if !is_valid_host_id(identity.host_id()) {
+        return Err(CoreError::ProtocolViolation("invalid host_id").into());
+    }
     let mut static_b64 = Zeroizing::new(b64url_encode(identity.static_key().secret_bytes()));
     let mut signing_b64 = Zeroizing::new(b64url_encode(identity.signing_key().seed_bytes()));
     let (version, pq_signing_seed_b64, pq_signing_custody, pq_signing_pub_b64) =
@@ -408,7 +412,7 @@ impl StateStore {
         if let Some(id) = host_id
             && !id.is_empty()
         {
-            identity = identity.with_host_id(id);
+            identity = identity.try_with_host_id(id)?;
         }
         self.save_identity(&identity)?;
         Ok(identity)
@@ -875,6 +879,24 @@ mod tests {
         ED25519_SIG_LEN, HYBRID_MLDSA_CTX, MLDSA65_PUBLIC_LEN, MLDSA65_SIG_LEN,
     };
     use tendril_core::error::CoreError;
+
+    #[test]
+    fn an_invalid_host_id_is_never_generated_or_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open_or_create(dir.path()).unwrap();
+        for bad in ["has#hash", "ctl\u{7}char", &"x".repeat(257)] {
+            assert!(
+                store.load_or_generate_identity(Some(bad)).is_err(),
+                "{bad:?}"
+            );
+            assert!(!store.identity_path().exists(), "{bad:?} left an identity");
+        }
+        let forged = EndpointIdentity::generate().unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serialize_identity_json(&forged).unwrap()).unwrap();
+        json["host_id"] = "has#hash".into();
+        assert!(deserialize_identity_json(&json.to_string()).is_err());
+    }
 
     struct StoreMockExternalSigner {
         inner: SigningKeypair,

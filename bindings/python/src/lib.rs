@@ -1568,7 +1568,7 @@ impl Endpoint {
                 if let Some(h) = host_owned.as_deref()
                     && !h.is_empty()
                 {
-                    identity = identity.with_host_id(h);
+                    identity = identity.try_with_host_id(h).map_err(py_err)?;
                 }
                 (None, identity, Roster::new())
             };

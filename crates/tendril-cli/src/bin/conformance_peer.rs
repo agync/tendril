@@ -847,9 +847,9 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 }
             } else {
                 EndpointIdentity::generate()
-                    .map(|id| match host_id {
-                        Some(h) if !h.is_empty() => id.with_host_id(h),
-                        _ => id,
+                    .and_then(|id| match host_id {
+                        Some(h) if !h.is_empty() => id.try_with_host_id(h),
+                        _ => Ok(id),
                     })
                     .map_err(|e| e.to_string())
             };

@@ -2170,7 +2170,13 @@ pub unsafe extern "C" fn tendril_endpoint_new(
             if let Some(h) = host_opt
                 && !h.is_empty()
             {
-                identity = identity.with_host_id(h);
+                identity = match identity.try_with_host_id(h) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        set_last_error(e.to_string());
+                        return ptr::null_mut();
+                    }
+                };
             }
             (None, identity, Roster::new())
         };
@@ -2381,7 +2387,7 @@ fn identity_from_json_or_generate(
     if let Some(h) = host_id
         && !h.is_empty()
     {
-        id = id.with_host_id(h);
+        id = id.try_with_host_id(h).map_err(|e| e.to_string())?;
     }
     Ok(id)
 }
