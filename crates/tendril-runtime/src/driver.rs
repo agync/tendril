@@ -2909,11 +2909,11 @@ pub(crate) async fn plan_pairing(
             return Err(CoreError::InvalidPairingUri("no pairing endpoint".into()).into());
         }
     };
-    let pinned = opts
-        .uri
-        .as_ref()
-        .map(PairingUri::to_pinned_host)
-        .or_else(|| opts.pinned_host.clone());
+    let pinned = match (&opts.uri, &opts.pinned_host) {
+        (Some(uri), Some(pin)) => Some(uri.merge_pin(pin)?),
+        (Some(uri), None) => Some(uri.to_pinned_host()),
+        (None, pin) => pin.clone(),
+    };
     let roster = store.load()?;
     let floor = pinned.as_ref().map_or(tendril_core::WIRE_VERSION, |pin| {
         pinned_pairing_floor(&roster, pin)
