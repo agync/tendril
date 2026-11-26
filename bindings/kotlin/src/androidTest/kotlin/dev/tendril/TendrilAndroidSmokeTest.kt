@@ -29,6 +29,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Rule
@@ -1021,8 +1022,8 @@ class TendrilAndroidSmokeTest {
       val res = pairViaUri(host, client, JSONObject(host.issuePairingUri()).getString("uri"))
       val hostId = JSONObject(host.infoJson()).getString("host_id")
       val grant = grantFor(host, res.getString("device_id"))
-      // relay_host is a known connect option: it reaches the iroh dialer, which rejects the value
-      // instead of the options parser rejecting the key.
+      // relay_host reaches the iroh dialer, whose relay mode parser rejects the value. A dropped
+      // key fails later (peer or route errors) and a misspelled one fails as invalid options.
       val err =
         runCatching {
             client.connectWithOptions(
@@ -1033,8 +1034,9 @@ class TendrilAndroidSmokeTest {
             )
           }
           .exceptionOrNull()
-      assertTrue("connect must fail", err != null)
-      assertFalse(err?.message.orEmpty(), err?.message.orEmpty().contains("unknown field"))
+      val msg = err?.message.orEmpty()
+      assertTrue(msg, msg.contains("invalid p2p relay mode"))
+      assertFalse(msg, msg.contains("invalid options_json"))
     }
   }
 
@@ -1048,7 +1050,7 @@ class TendrilAndroidSmokeTest {
 
       val verified = pairViaUri(host, client, JSONObject(host.issuePairingUri()).getString("uri"))
       assertEquals("verified", verified.getString("route_check"))
-      assertTrue(verified.toString(), verified.isNull("routes_reason"))
+      assertTrue(verified.toString(), verified.has("routes_reason") && verified.isNull("routes_reason"))
 
       val plain = JSONObject(host.issuePairingUri(signRoutes = false)).getString("uri")
       assertFalse(plain, plain.contains("&rs="))
@@ -1104,7 +1106,7 @@ class TendrilAndroidSmokeTest {
         // A state directory gives the enrolment a store for routes.
         val stored = enrol(host, anchor, clientNode.open())
         assertEquals(stored.toString(), "active", stored.getString("status"))
-        assertTrue(stored.toString(), stored.isNull("routes_reason"))
+        assertTrue(stored.toString(), stored.has("routes_reason") && stored.isNull("routes_reason"))
 
         // A memory-only endpoint requests and stores no route.
         TendrilEndpoint.create(stateDir = null).use { memory ->
@@ -1132,8 +1134,15 @@ class TendrilAndroidSmokeTest {
   fun p2pNetOptionsReachTheListenerAndAreValidated() {
     TendrilEndpoint.create(stateDir = null, hostId = "smoke-p2p-net").use { ep ->
       ep.configureP2p(portMapping = false, bindAddrs = listOf("127.0.0.1:0"))
+      val set = JSONObject(ep.transportConfigJson()!!)
+      assertFalse(set.toString(), set.getBoolean("p2p_port_mapping"))
+      assertEquals(listOf("127.0.0.1:0"), set.getJSONArray("p2p_bind_addrs").let { a -> (0 until a.length()).map { a.getString(it) } })
       // A later merge of other keys keeps the P2P keys.
       ep.configureRoutes(signRoutes = true)
+      val kept = JSONObject(ep.transportConfigJson()!!)
+      assertTrue(kept.toString(), kept.getBoolean("sign_routes"))
+      assertFalse(kept.toString(), kept.getBoolean("p2p_port_mapping"))
+      assertEquals(1, kept.getJSONArray("p2p_bind_addrs").length())
       val addr = ep.serveP2p("disabled")
       val hints = Regex("[?&]addr=([^&]+)").findAll(addr).map { it.groupValues[1] }.toList()
       assertTrue(addr, hints.isNotEmpty())
@@ -1145,8 +1154,12 @@ class TendrilAndroidSmokeTest {
         assertTrue("$bad must be rejected", err != null)
         assertTrue(err?.message.orEmpty(), err?.message.orEmpty().contains("p2p_bind_addrs"))
       }
-      // A rejected configuration is not cached: the next merge sends only valid keys.
+      // A rejected configuration is not cached: nothing was sent, so nothing is stored.
+      assertNull(ep.transportConfigJson())
       ep.configureP2p(portMapping = true)
+      val after = JSONObject(ep.transportConfigJson()!!)
+      assertTrue(after.toString(), after.getBoolean("p2p_port_mapping"))
+      assertFalse(after.toString(), after.has("p2p_bind_addrs"))
       ep.configureTransportsJson("""{"p2p_relay_mode":"n0","p2p_port_mapping":true}""")
       assertTrue(runCatching { ep.configureTransportsJson("""{"p2p_port_mapping":"no"}""") }.isFailure)
     }

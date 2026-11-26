@@ -2213,7 +2213,7 @@ public final class TendrilJniConformanceTest {
       TendrilNative.endpointServeDirect(host, "127.0.0.1:0");
       String signed = asStr(issue(host, null).get("uri"));
       Map<String, Object> res = pairViaUri(host, stateful, signed, false);
-      check(res.get("routes_reason") == null, "verified pairing routes_reason: " + res);
+      check(res.containsKey("routes_reason") && res.get("routes_reason") == null, "verified pairing routes_reason: " + res);
       String hostId = hostIdOf(host);
 
       // An unsigned URI persists nothing and says why.
@@ -2228,13 +2228,15 @@ public final class TendrilJniConformanceTest {
         TendrilNative.endpointFree(unsignedClient);
       }
 
-      // relay_host is a known connect option and reaches the iroh dialer, which rejects the value.
+      // relay_host reaches the iroh dialer, whose relay mode parser rejects the value. A dropped
+      // key fails later (peer or route errors) and a misspelled one fails as invalid options.
       String grant =
           TendrilNative.endpointMintGrant(host, deviceIdOf(stateful), Json.stringify(List.of("fs.read")), 3600);
       String bad =
           "{\"grant\":" + grant + ",\"endpoint\":\"iroh://peer\",\"relay_host\":\"not-a-relay-mode\"}";
       String msg = failureOf(() -> TendrilNative.sessionConnectWithOptions(stateful, hostId, bad));
-      check(!msg.contains("unknown field"), "relay_host must be a known option: " + msg);
+      check(msg.contains("invalid p2p relay mode"), "relay_host must reach the dialer: " + msg);
+      check(!msg.contains("invalid options_json"), "relay_host must be a known option: " + msg);
 
       // An unknown peer is NOT_FOUND for the setter and the getter.
       for (String unknown : List.of("dev_unknown")) {
