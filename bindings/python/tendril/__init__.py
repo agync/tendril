@@ -12,6 +12,7 @@ from tendril._tendril import (
     verify_grant_json,
     verify_rotation_chain_json,
     verify_route_set,
+    verify_wake_tag,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "verify_grant_json",
     "verify_rotation_chain_json",
     "verify_route_set",
+    "verify_wake_tag",
 ]

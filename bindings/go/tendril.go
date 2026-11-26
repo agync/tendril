@@ -30,6 +30,10 @@ const (
 	SigningPubLen = int(C.TENDRIL_SIGNING_PUB_LEN)
 	// SigningHashLen is the byte length of a SHA-256 signing public key hash pin.
 	SigningHashLen = int(C.TENDRIL_SIGNING_HASH_LEN)
+	// MlDsa65PubLen is the byte length of an ML-DSA-65 public key.
+	MlDsa65PubLen = int(C.TENDRIL_MLDSA65_PUB_LEN)
+	// MlDsa65SigLen is the byte length of an ML-DSA-65 signature.
+	MlDsa65SigLen = int(C.TENDRIL_MLDSA65_SIG_LEN)
 )
 
 // ErrWouldBlock indicates a polled FFI call timed out with no new event ready.
@@ -307,6 +311,32 @@ func VerifyGrantJSON(
 		return false, ffiErr(rc)
 	}
 	return allowed == 1, nil
+}
+
+// VerifyWakeTag verifies wakeTagB64 against wakeSecret across the +-1 hour epoch window around
+// nowUnixSecs.
+func VerifyWakeTag(wakeSecret [32]byte, wakeTagB64 string, nowUnixSecs uint64) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	ctag, err := toCStr(wakeTagB64, "wakeTagB64")
+	if err != nil {
+		return false, err
+	}
+	defer C.free(unsafe.Pointer(ctag))
+
+	var matched C.uint8_t
+	rc := C.tendril_verify_wake_tag(
+		(*C.uint8_t)(unsafe.Pointer(&wakeSecret[0])),
+		ctag,
+		C.uint64_t(nowUnixSecs),
+		&matched,
+	)
+	runtime.KeepAlive(wakeSecret)
+	if rc != C.TENDRIL_OK {
+		return false, ffiErr(rc)
+	}
+	return matched == 1, nil
 }
 
 // Endpoint wraps an opaque C TendrilEndpoint handle.

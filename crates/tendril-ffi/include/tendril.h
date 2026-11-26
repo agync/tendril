@@ -12,6 +12,8 @@ extern "C" {
 #define TENDRIL_KEY_LEN 32
 #define TENDRIL_SIGNING_PUB_LEN 1984
 #define TENDRIL_SIGNING_HASH_LEN 32
+#define TENDRIL_MLDSA65_PUB_LEN 1952
+#define TENDRIL_MLDSA65_SIG_LEN 3309
 
 typedef struct TendrilEndpoint TendrilEndpoint;
 typedef struct TendrilSession TendrilSession;
@@ -63,6 +65,12 @@ int32_t tendril_verify_grant_json(
     const char *crl_json_opt,
     uint8_t *out_allowed
 );
+int32_t tendril_verify_wake_tag(
+    const uint8_t *wake_secret_32,
+    const char *wake_tag_b64,
+    uint64_t now_unix_secs,
+    uint8_t *out_matched
+);
 
 /* Endpoint lifecycle and operations. */
 TendrilEndpoint *tendril_endpoint_new(const char *state_dir, const char *host_id);
@@ -71,6 +79,33 @@ TendrilEndpoint *tendril_endpoint_new_from_state(
     const char *roster_json_opt,
     const char *host_id_opt
 );
+
+/*
+ * External ML-DSA-65 signing custody descriptor.
+ * - `public_key` (`public_key_len == TENDRIL_MLDSA65_PUB_LEN`) is copied synchronously before
+ *   `tendril_endpoint_new_sealed_with_options` returns.
+ * - `sign` and `drop_ctx` may be called concurrently from arbitrary worker threads and must not
+ *   unwind across the C ABI.
+ * - Ownership of `ctx` transfers on entry to `tendril_endpoint_new_sealed_with_options`, and
+ *   `drop_ctx(ctx)` executes once iff both `drop_ctx != NULL` and `ctx != NULL` (on failure return
+ *   or final internal `Arc` drop).
+ */
+typedef struct TendrilMlDsa65Signer {
+    void *ctx;
+    const uint8_t *public_key;
+    size_t public_key_len;
+    int32_t (*sign)(
+        void *ctx,
+        const uint8_t *msg,
+        size_t msg_len,
+        const uint8_t *mldsa_ctx,
+        size_t mldsa_ctx_len,
+        uint8_t *out_sig,
+        size_t out_sig_len
+    );
+    void (*drop_ctx)(void *ctx);
+} TendrilMlDsa65Signer;
+
 /* Like tendril_endpoint_new_from_state, but the runtime persists roster and group state itself in
  * state_dir (rt-roster.sealed, rt-groups.sealed), sealed under a key derived from the identity.
  * Group secrets never cross this boundary. Without identity_json_opt an identity is generated and
@@ -81,7 +116,22 @@ TendrilEndpoint *tendril_endpoint_new_from_state(
  * (last error set) when state_dir is NULL or empty or the state cannot be opened. */
 TendrilEndpoint *tendril_endpoint_new_sealed(const char *state_dir, const char *identity_json_opt,
                                              const char *roster_json_opt, const char *host_id_opt);
+/* Like tendril_endpoint_new_sealed with optional JSON runtime/role options and external ML-DSA-65
+ * signer custody. options_json_opt may be NULL or {"runtime_profile": "default"|"extension",
+ * "client_only": bool}. When mldsa_signer_opt is non-NULL, ownership of mldsa_signer_opt->ctx
+ * transfers immediately on entry so drop_ctx(ctx) (if both drop_ctx and ctx are non-NULL) runs
+ * once on any failure (NULL return) or when the endpoint and all internal handles drop. */
+TendrilEndpoint *tendril_endpoint_new_sealed_with_options(
+    const char *state_dir,
+    const char *identity_json_opt,
+    const char *roster_json_opt,
+    const char *host_id_opt,
+    const char *options_json_opt,
+    const TendrilMlDsa65Signer *mldsa_signer_opt
+);
 int32_t tendril_endpoint_close(TendrilEndpoint *ep);
+/* Frees ep after closing its inbound router, stopping hosting and the route announcer, and
+ * shutting down the group hub. Any already-opened sessions remain valid independently. */
 void tendril_endpoint_free(TendrilEndpoint *ep);
 
 int32_t tendril_endpoint_export_identity_json(const TendrilEndpoint *ep, char **out_json);
@@ -158,11 +208,14 @@ int32_t tendril_endpoint_enroll_initiate(
 /*
  * Pairing URIs and routes. Every out_json string is freed with tendril_string_free.
  *
- * tendril_endpoint_configure_transports_json also accepts advertised_endpoints (array of
- * strings), relay_auth_origins (array of "scheme://host[:port]"; relay admission material is
- * attached only to these origins or to the explicit endpoint of a call), advertise ("auto",
- * default, or "explicit"), route_policy ("all_signed", default, "committed_only" or "none") and
- * sign_routes (default true).
+ * tendril_endpoint_configure_transports_json also accepts wake_* keys (wake_url, wake_adapter,
+ * wake_secret_b64, wake_auth_token, wake_pre_wake, wake_retry_delay_ms, wake_max_attempts,
+ * wake_timeout_ms, wake_coalesce_secs, wake_apns_mode, wake_apns_topic, wake_apns_loc_key,
+ * wake_apns_team_id, wake_apns_key_id, wake_apns_p8_pem, wake_apns_client_cert_pem,
+ * wake_apns_client_key_pem), advertised_endpoints (array of strings), relay_auth_origins
+ * (array of "scheme://host[:port]"; relay admission material is attached only to these origins
+ * or to the explicit endpoint of a call), advertise ("auto", default, or "explicit"), route_policy
+ * ("all_signed", default, "committed_only" or "none") and sign_routes (default true).
  */
 /* options_json_opt: NULL or {"kind": "auto"|"lan"|"remote", "host_name": str, "sign_routes": bool}.
  * out_json: {"uri", "code_kind", "dropped", "uri_len", "qr_version_m", "route_seq"}.

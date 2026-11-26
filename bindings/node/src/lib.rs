@@ -52,14 +52,14 @@ use tendril_runtime::providers::hints::{
 use tendril_runtime::redact::{redact_error, redact_hint, redact_json_error, redact_text};
 use tendril_runtime::v2_driver::drive_v2_pair_initiator_with_policy;
 use tendril_runtime::{
-    BroadcastReport, BrokerDialer, ConcurrentSession, ConcurrentV2Session,
+    ApnsPushMode, BroadcastReport, BrokerDialer, ConcurrentSession, ConcurrentV2Session,
     DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, GroupEvent,
-    GroupFrameKind, GroupFrameOutcome, GroupPool, GroupPoolConfig, HttpWakeProvider, InboundRouter,
-    LocalDialer, MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pListener, P2pOptions,
-    P2pRelayAuth, P2pRelayMode, PathDialer, PathListener, PathStream, RelayClientAuth, RelayDialer,
+    GroupFrameKind, GroupFrameOutcome, GroupPool, GroupPoolConfig, InboundRouter, LocalDialer,
+    MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth,
+    P2pRelayMode, PathDialer, PathListener, PathStream, RelayClientAuth, RelayDialer,
     RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError,
     SessionDriver, SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind,
-    WakeProvider, WakeSecret, WakeTarget, dial_endpoint_with_auth,
+    WakeConfigSpec, WakeTag, WakeTransportSettings, build_wake_provider, dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_store,
     drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
     drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_store,
@@ -68,7 +68,7 @@ use tendril_runtime::{
     group_create as rt_group_create, group_ingest_manifest as rt_group_ingest_manifest,
     group_remove_member as rt_group_remove_member, handle_session_group_frame,
     pairing_path_kind_for_provider, parse_p2p_relay_mode, parse_p2p_relay_modes,
-    pinned_pairing_floor,
+    pinned_pairing_floor, verify_epoch_wake_tag_window,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
@@ -398,6 +398,26 @@ struct TransportConfigInput {
     #[serde(alias = "wakeTimeoutMs")]
     wake_timeout_ms: Option<u64>,
     #[zeroize(skip)]
+    #[serde(alias = "wakeCoalesceSecs")]
+    wake_coalesce_secs: Option<u64>,
+    #[zeroize(skip)]
+    #[serde(alias = "wakeApnsMode")]
+    wake_apns_mode: Option<ApnsPushMode>,
+    #[serde(alias = "wakeApnsTopic")]
+    wake_apns_topic: Option<String>,
+    #[serde(alias = "wakeApnsLocKey")]
+    wake_apns_loc_key: Option<String>,
+    #[serde(alias = "wakeApnsTeamId")]
+    wake_apns_team_id: Option<String>,
+    #[serde(alias = "wakeApnsKeyId")]
+    wake_apns_key_id: Option<String>,
+    #[serde(alias = "wakeApnsP8Pem")]
+    wake_apns_p8_pem: Option<String>,
+    #[serde(alias = "wakeApnsClientCertPem")]
+    wake_apns_client_cert_pem: Option<String>,
+    #[serde(alias = "wakeApnsClientKeyPem")]
+    wake_apns_client_key_pem: Option<String>,
+    #[zeroize(skip)]
     #[serde(alias = "relayAuthOrigins")]
     relay_auth_origins: Option<Vec<String>>,
     #[zeroize(skip)]
@@ -413,31 +433,6 @@ struct TransportConfigInput {
     sign_routes: Option<bool>,
 }
 
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-struct WakeTransportConfig {
-    #[zeroize(skip)]
-    target: WakeTarget,
-    #[zeroize(skip)]
-    secret: WakeSecret,
-    pre_wake: bool,
-    retry_delay_ms: u64,
-    max_attempts: usize,
-    timeout_ms: u64,
-}
-
-impl fmt::Debug for WakeTransportConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WakeTransportConfig")
-            .field("target", &self.target)
-            .field("secret", &"<redacted>")
-            .field("pre_wake", &self.pre_wake)
-            .field("retry_delay_ms", &self.retry_delay_ms)
-            .field("max_attempts", &self.max_attempts)
-            .field("timeout_ms", &self.timeout_ms)
-            .finish()
-    }
-}
-
 #[derive(Clone)]
 struct EndpointTransportConfig {
     relay_auth: RelayClientAuth,
@@ -446,7 +441,7 @@ struct EndpointTransportConfig {
     p2p_advertise_direct_addrs: Option<bool>,
     p2p_allow_private_addrs: Option<bool>,
     p2p_relay_auth: Option<P2pRelayAuth>,
-    wake: Option<WakeTransportConfig>,
+    wake: Option<WakeTransportSettings>,
     relay_auth_origins: Vec<String>,
     advertise: AdvertiseMode,
     advertised_endpoints: Vec<String>,
@@ -579,45 +574,31 @@ impl EndpointTransportConfig {
             ));
         }
 
-        let wake = if let Some(url) = input.wake_url.take() {
-            let adapter = input.wake_adapter.unwrap_or(WakeAdapterKind::Webhook);
-            let mut target = WakeTarget::new(adapter, &url).map_err(to_invalid_arg)?;
-            if let Some(tok) = input.wake_auth_token.take().map(Zeroizing::new) {
-                target = target
-                    .with_auth_token(tok.as_str())
-                    .map_err(|_| to_invalid_arg("invalid wake_auth_token"))?;
-            }
-            let secret_b64 = input
-                .wake_secret_b64
-                .take()
-                .map(Zeroizing::new)
-                .ok_or_else(|| {
-                    to_invalid_arg("wake_secret_b64 is required when wake_url is set")
-                })?;
-            let secret_bytes = Zeroizing::new(
-                b64url_decode_array::<32>(secret_b64.trim())
-                    .map_err(|_| to_invalid_arg("invalid wake_secret_b64"))?,
-            );
-            Some(WakeTransportConfig {
-                target,
-                secret: WakeSecret::from_bytes(*secret_bytes),
-                pre_wake: input.wake_pre_wake.unwrap_or(false),
-                retry_delay_ms: input.wake_retry_delay_ms.unwrap_or(100),
-                max_attempts: input.wake_max_attempts.unwrap_or(10).max(1),
-                timeout_ms: input.wake_timeout_ms.unwrap_or(3_000),
-            })
-        } else if input.wake_adapter.is_some()
-            || input.wake_secret_b64.is_some()
-            || input.wake_auth_token.is_some()
-            || input.wake_pre_wake.is_some()
-            || input.wake_retry_delay_ms.is_some()
-            || input.wake_max_attempts.is_some()
-            || input.wake_timeout_ms.is_some()
-        {
-            return Err(to_invalid_arg("wake_* options require wake_url"));
-        } else {
-            None
+        let wake_coalesce_secs = match (input.wake_url.as_ref(), input.wake_adapter) {
+            (Some(_), Some(WakeAdapterKind::ApnsH2)) => input.wake_coalesce_secs,
+            (Some(_), _) => Some(input.wake_coalesce_secs.unwrap_or(0)),
+            (None, _) => input.wake_coalesce_secs,
         };
+        let wake_spec = WakeConfigSpec {
+            wake_url: input.wake_url.take(),
+            wake_adapter: input.wake_adapter.take(),
+            wake_secret_b64: input.wake_secret_b64.take(),
+            wake_auth_token: input.wake_auth_token.take(),
+            wake_pre_wake: input.wake_pre_wake.take(),
+            wake_retry_delay_ms: input.wake_retry_delay_ms.take(),
+            wake_max_attempts: input.wake_max_attempts.take(),
+            wake_timeout_ms: input.wake_timeout_ms.take(),
+            wake_coalesce_secs,
+            wake_apns_mode: input.wake_apns_mode.take(),
+            wake_apns_topic: input.wake_apns_topic.take(),
+            wake_apns_loc_key: input.wake_apns_loc_key.take(),
+            wake_apns_team_id: input.wake_apns_team_id.take(),
+            wake_apns_key_id: input.wake_apns_key_id.take(),
+            wake_apns_p8_pem: input.wake_apns_p8_pem.take(),
+            wake_apns_client_cert_pem: input.wake_apns_client_cert_pem.take(),
+            wake_apns_client_key_pem: input.wake_apns_client_key_pem.take(),
+        };
+        let wake = build_wake_provider(wake_spec).map_err(to_invalid_arg)?;
 
         let relay_auth_origins = input.relay_auth_origins.take().unwrap_or_default();
         if let Some(index) = relay_auth_origins
@@ -1051,6 +1032,18 @@ pub fn verify_grant_json(
     Ok(res.is_ok())
 }
 
+#[napi]
+pub fn verify_wake_tag(
+    wake_secret: Buffer,
+    wake_tag_b64: String,
+    now_unix_secs: f64,
+) -> Result<bool> {
+    let secret = Zeroizing::new(as_32(wake_secret.as_ref(), "wake_secret")?);
+    let now_u64 = f64_to_u64(now_unix_secs, "now_unix_secs")?;
+    let tag = WakeTag::from_b64url(&wake_tag_b64).map_err(to_invalid_arg)?;
+    Ok(verify_epoch_wake_tag_window(&secret, &tag, now_u64))
+}
+
 /// Arguments of one Day-2 connect.
 #[derive(Default)]
 struct ConnectArgs {
@@ -1178,15 +1171,12 @@ async fn policy_connect(
 
 /// Sends the best-effort epoch-blinded wake hint and waits for the provider at most
 /// `timeout_ms`; its outcome never fails the connect.
-async fn notify_wake(wake: &WakeTransportConfig) {
-    let provider = HttpWakeProvider::new()
-        .with_cooldown_secs(0)
-        .with_timeout(Duration::from_millis(wake.timeout_ms));
+async fn notify_wake(wake: &WakeTransportSettings) {
     let now = now_unix();
     let tag = wake.secret.derive_tag(now);
     let _ = tokio::time::timeout(
         Duration::from_millis(wake.timeout_ms),
-        provider.notify_best_effort(&wake.target, &tag, now),
+        wake.provider.notify_best_effort(&wake.target, &tag, now),
     )
     .await;
 }
@@ -1197,7 +1187,7 @@ async fn notify_wake(wake: &WakeTransportConfig) {
 /// miss ([`AttemptError::is_wakeable_miss`]) sends the wake hint and retries the same
 /// way. Any other failure is final and never wakes the host.
 async fn connect_with_wake<F, Fut>(
-    wake: &WakeTransportConfig,
+    wake: &WakeTransportSettings,
     mut connect: F,
 ) -> std::result::Result<SessionBackend, AttemptError>
 where
@@ -3549,20 +3539,22 @@ mod tests {
         }
     }
 
-    fn wake_config(pre_wake: bool, max_attempts: usize) -> WakeTransportConfig {
-        WakeTransportConfig {
-            target: WakeTarget::new(WakeAdapterKind::Webhook, "http://127.0.0.1:9/").unwrap(),
-            secret: WakeSecret::from_bytes([7u8; 32]),
-            pre_wake,
-            retry_delay_ms: 0,
-            max_attempts,
-            timeout_ms: 50,
-        }
+    fn wake_config(pre_wake: bool, max_attempts: usize) -> WakeTransportSettings {
+        let mut spec = WakeConfigSpec::default();
+        spec.wake_url = Some("http://127.0.0.1:9/".to_owned());
+        spec.wake_adapter = Some(WakeAdapterKind::Webhook);
+        spec.wake_secret_b64 = Some(b64url_encode(&[7u8; 32]));
+        spec.wake_pre_wake = Some(pre_wake);
+        spec.wake_retry_delay_ms = Some(0);
+        spec.wake_max_attempts = Some(max_attempts);
+        spec.wake_timeout_ms = Some(50);
+        spec.wake_coalesce_secs = Some(0);
+        build_wake_provider(spec).unwrap().unwrap()
     }
 
     /// Runs `connect_with_wake` against a connect that always fails with `attempts`' outcome
     /// and returns how many connects ran: the call site's retry decision.
-    async fn connects_run(wake: &WakeTransportConfig, make: impl Fn() -> AttemptError) -> usize {
+    async fn connects_run(wake: &WakeTransportSettings, make: impl Fn() -> AttemptError) -> usize {
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let res = connect_with_wake(wake, || {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

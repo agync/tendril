@@ -1,9 +1,9 @@
-//! Callback-free polled C ABI over `tendril-core` and `tendril-runtime`.
+//! Polled C ABI (callback-free except optional external ML-DSA-65 custody callbacks) over `tendril-core` and `tendril-runtime`.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use tendril_core::crypto::{
-    HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey, b64url_decode,
+    ExternalMlDsaSigner, HYBRID_SIGNING_HASH_LEN, HYBRID_SIGNING_PUB_LEN, HybridSigningPublicKey,
+    MLDSA65_PUBLIC_LEN, MLDSA65_SIG_LEN, SigningKeypair, StaticKeypair, b64url_decode,
     b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
     fingerprint_host, pairing_sas, random_bytes,
 };
@@ -43,27 +44,30 @@ use tendril_runtime::providers::hints::{
 };
 use tendril_runtime::redact::{redact_error, redact_hint, redact_json_error, redact_text};
 use tendril_runtime::{
-    AddressSource, AdvertiseInputs, AdvertiseMode, BrokerDialer, ConcurrentSession,
+    AddressSource, AdvertiseInputs, AdvertiseMode, ApnsPushMode, BrokerDialer, ConcurrentSession,
     ConcurrentV2Session, DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer,
     DirectListener, GroupEvent, GroupFrameKind, GroupFrameOutcome, GroupHub, GroupPool,
-    GroupPoolConfig, HttpWakeProvider, InboundQueue, InboundRouter, InboundSession, LastRouteSet,
-    LocalDialer, MAX_OUTER_FRAME_LEN, NetworkSnapshot, OverlayDialer, PathDialer, PathListener,
-    PathStream, PreAuthRateLimiter, RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer,
+    GroupPoolConfig, InboundQueue, InboundRouter, InboundSession, LastRouteSet, LocalDialer,
+    MAX_OUTER_FRAME_LEN, NetworkSnapshot, OverlayDialer, PathDialer, PathListener, PathStream,
+    PreAuthRateLimiter, RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer,
     RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer, RouteSetSink,
     RuntimeError, ServedListener, SessionDriver, SessionEvent, StateStore, V2ResponderState,
-    V2SessionDriver, WakeAdapterKind, WakeProvider, WakeSecret, WakeTarget,
-    deserialize_identity_json, dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
-    drive_pair_responder_with_policy, drive_pair_responder_with_store,
-    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
-    drive_v2_pake_pair_responder_with_store, group_add_member, group_create, group_ingest_manifest,
-    group_remove_member, handle_session_group_frame, pairing_path_kind_for_provider,
-    pinned_pairing_floor, recv_routed, serialize_identity_json,
+    V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeTag, WakeTransportSettings,
+    build_wake_provider, deserialize_identity_json_with_signer, dial_endpoint_with_auth,
+    drive_m2m_enroll_initiator_with_floor, drive_pair_responder_with_policy,
+    drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_timeout,
+    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
+    group_add_member, group_create, group_ingest_manifest, group_remove_member,
+    handle_session_group_frame, pairing_path_kind_for_provider, pinned_pairing_floor, recv_routed,
+    serialize_identity_json, verify_epoch_wake_tag_window,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{
     P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, parse_p2p_relay_mode,
     parse_p2p_relay_modes,
 };
+#[cfg(test)]
+use tendril_runtime::{build_wake_provider_with_root_certs, wake_epoch_start_secs};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
@@ -78,6 +82,8 @@ pub const TENDRIL_ERR_NOT_FOUND: i32 = -2;
 pub const TENDRIL_ERR_CLOSED: i32 = -5;
 pub const TENDRIL_ERR_PROTOCOL: i32 = -6;
 pub const TENDRIL_ERR_INTERNAL: i32 = -7;
+pub const TENDRIL_MLDSA65_PUB_LEN: usize = MLDSA65_PUBLIC_LEN;
+pub const TENDRIL_MLDSA65_SIG_LEN: usize = MLDSA65_SIG_LEN;
 
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
@@ -322,6 +328,17 @@ struct TransportConfigInput {
     #[zeroize(skip)]
     wake_timeout_ms: Option<u64>,
     #[zeroize(skip)]
+    wake_coalesce_secs: Option<u64>,
+    #[zeroize(skip)]
+    wake_apns_mode: Option<ApnsPushMode>,
+    wake_apns_topic: Option<String>,
+    wake_apns_loc_key: Option<String>,
+    wake_apns_team_id: Option<String>,
+    wake_apns_key_id: Option<String>,
+    wake_apns_p8_pem: Option<String>,
+    wake_apns_client_cert_pem: Option<String>,
+    wake_apns_client_key_pem: Option<String>,
+    #[zeroize(skip)]
     advertised_endpoints: Option<Vec<String>>,
     #[zeroize(skip)]
     relay_auth_origins: Option<Vec<String>>,
@@ -331,31 +348,6 @@ struct TransportConfigInput {
     route_policy: Option<RoutePolicy>,
     #[zeroize(skip)]
     sign_routes: Option<bool>,
-}
-
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-struct WakeTransportConfig {
-    #[zeroize(skip)]
-    target: WakeTarget,
-    #[zeroize(skip)]
-    secret: WakeSecret,
-    pre_wake: bool,
-    retry_delay_ms: u64,
-    max_attempts: usize,
-    timeout_ms: u64,
-}
-
-impl fmt::Debug for WakeTransportConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WakeTransportConfig")
-            .field("target", &self.target)
-            .field("secret", &"<redacted>")
-            .field("pre_wake", &self.pre_wake)
-            .field("retry_delay_ms", &self.retry_delay_ms)
-            .field("max_attempts", &self.max_attempts)
-            .field("timeout_ms", &self.timeout_ms)
-            .finish()
-    }
 }
 
 #[derive(Clone, Default)]
@@ -371,7 +363,7 @@ struct EndpointTransportConfig {
     p2p_allow_private_addrs: Option<bool>,
     #[cfg(feature = "p2p-iroh")]
     p2p_relay_auth: Option<P2pRelayAuth>,
-    wake: Option<WakeTransportConfig>,
+    wake: Option<WakeTransportSettings>,
     /// Developer-listed hints added to the announced route set.
     advertised_endpoints: Vec<String>,
     /// Relay origins that may receive admission material.
@@ -419,7 +411,27 @@ impl Drop for EndpointTransportConfig {
 }
 
 impl EndpointTransportConfig {
-    fn from_input(mut input: TransportConfigInput) -> Result<Self, (i32, String)> {
+    fn from_input(input: TransportConfigInput) -> Result<Self, (i32, String)> {
+        Self::from_input_with_builder(input, build_wake_provider)
+    }
+
+    #[cfg(test)]
+    fn from_input_with_root_certs(
+        input: TransportConfigInput,
+        root_certs: Option<rustls::RootCertStore>,
+    ) -> Result<Self, (i32, String)> {
+        Self::from_input_with_builder(input, move |spec| {
+            build_wake_provider_with_root_certs(spec, root_certs)
+        })
+    }
+
+    fn from_input_with_builder<F>(
+        mut input: TransportConfigInput,
+        build_wake: F,
+    ) -> Result<Self, (i32, String)>
+    where
+        F: FnOnce(WakeConfigSpec) -> Result<Option<WakeTransportSettings>, RuntimeError>,
+    {
         if input.relay_auth_secret.is_some() && input.relay_ticket.is_some() {
             return Err((
                 TENDRIL_ERR_INVALID_ARG,
@@ -539,58 +551,31 @@ impl EndpointTransportConfig {
             (mode, auth)
         };
 
-        let wake = if let Some(url) = input.wake_url.take() {
-            let adapter = input.wake_adapter.unwrap_or(WakeAdapterKind::Webhook);
-            let mut target = WakeTarget::new(adapter, &url)
-                .map_err(|e| (TENDRIL_ERR_INVALID_ARG, e.to_string()))?;
-            if let Some(tok) = input.wake_auth_token.take().map(Zeroizing::new) {
-                target = target.with_auth_token(tok.as_str()).map_err(|_| {
-                    (
-                        TENDRIL_ERR_INVALID_ARG,
-                        "invalid wake_auth_token".to_owned(),
-                    )
-                })?;
-            }
-            let secret_b64 = input
-                .wake_secret_b64
-                .take()
-                .map(Zeroizing::new)
-                .ok_or_else(|| {
-                    (
-                        TENDRIL_ERR_INVALID_ARG,
-                        "wake_secret_b64 is required when wake_url is set".to_owned(),
-                    )
-                })?;
-            let secret_bytes =
-                Zeroizing::new(b64url_decode_array::<32>(secret_b64.trim()).map_err(|_| {
-                    (
-                        TENDRIL_ERR_INVALID_ARG,
-                        "invalid wake_secret_b64".to_owned(),
-                    )
-                })?);
-            Some(WakeTransportConfig {
-                target,
-                secret: WakeSecret::from_bytes(*secret_bytes),
-                pre_wake: input.wake_pre_wake.unwrap_or(false),
-                retry_delay_ms: input.wake_retry_delay_ms.unwrap_or(100),
-                max_attempts: input.wake_max_attempts.unwrap_or(10).max(1),
-                timeout_ms: input.wake_timeout_ms.unwrap_or(3_000),
-            })
-        } else if input.wake_adapter.is_some()
-            || input.wake_secret_b64.is_some()
-            || input.wake_auth_token.is_some()
-            || input.wake_pre_wake.is_some()
-            || input.wake_retry_delay_ms.is_some()
-            || input.wake_max_attempts.is_some()
-            || input.wake_timeout_ms.is_some()
-        {
-            return Err((
-                TENDRIL_ERR_INVALID_ARG,
-                "wake_* options require wake_url".to_owned(),
-            ));
-        } else {
-            None
+        let wake_coalesce_secs = match (input.wake_url.as_ref(), input.wake_adapter) {
+            (Some(_), Some(WakeAdapterKind::ApnsH2)) => input.wake_coalesce_secs,
+            (Some(_), _) => Some(input.wake_coalesce_secs.unwrap_or(0)),
+            (None, _) => input.wake_coalesce_secs,
         };
+        let wake_spec = WakeConfigSpec {
+            wake_url: input.wake_url.take(),
+            wake_adapter: input.wake_adapter.take(),
+            wake_secret_b64: input.wake_secret_b64.take(),
+            wake_auth_token: input.wake_auth_token.take(),
+            wake_pre_wake: input.wake_pre_wake.take(),
+            wake_retry_delay_ms: input.wake_retry_delay_ms.take(),
+            wake_max_attempts: input.wake_max_attempts.take(),
+            wake_timeout_ms: input.wake_timeout_ms.take(),
+            wake_coalesce_secs,
+            wake_apns_mode: input.wake_apns_mode.take(),
+            wake_apns_topic: input.wake_apns_topic.take(),
+            wake_apns_loc_key: input.wake_apns_loc_key.take(),
+            wake_apns_team_id: input.wake_apns_team_id.take(),
+            wake_apns_key_id: input.wake_apns_key_id.take(),
+            wake_apns_p8_pem: input.wake_apns_p8_pem.take(),
+            wake_apns_client_cert_pem: input.wake_apns_client_cert_pem.take(),
+            wake_apns_client_key_pem: input.wake_apns_client_key_pem.take(),
+        };
+        let wake = build_wake(wake_spec).map_err(|e| (TENDRIL_ERR_INVALID_ARG, e.to_string()))?;
 
         let relay_auth_origins = input.relay_auth_origins.take().unwrap_or_default();
         if let Some(index) = relay_auth_origins
@@ -973,6 +958,22 @@ async fn drive_v1_pair_initiator_with_roster_floors(
     .map_err(|_| RuntimeError::Timeout("pre-auth pairing handshake timed out"))?
 }
 
+/// Endpoint Tokio threading preset selected by `options_json_opt`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeProfile {
+    #[default]
+    Default,
+    Extension,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SealedEndpointOptions {
+    runtime_profile: RuntimeProfile,
+    client_only: bool,
+}
+
 /// Opaque endpoint handle owning a Tokio runtime, identity, roster, and background listeners.
 pub struct TendrilEndpoint {
     rt: Arc<Runtime>,
@@ -1007,6 +1008,47 @@ pub struct TendrilEndpoint {
     served_endpoints: StdMutex<Vec<String>>,
     /// Pairing-capable TCP listeners (`tendril_endpoint_serve_direct`) for auto enumeration.
     served_listeners: StdMutex<Vec<ServedListener>>,
+    /// True when the endpoint is configured as an extension/client-only handle that must never serve.
+    client_only: bool,
+}
+
+impl Drop for TendrilEndpoint {
+    fn drop(&mut self) {
+        self.router.close();
+        let groups = self
+            .group_rt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(groups) = groups {
+            groups.shutdown();
+        }
+        self.stop_hosting();
+    }
+}
+
+impl TendrilEndpoint {
+    #[cfg(test)]
+    fn configure_transports_json_with_root_certs(
+        &self,
+        transport_config_json: &str,
+        root_certs: rustls::RootCertStore,
+    ) -> Result<(), (i32, String)> {
+        let input: TransportConfigInput =
+            serde_json::from_str(transport_config_json).map_err(|e| {
+                (
+                    TENDRIL_ERR_INVALID_ARG,
+                    json_error("transport_config_json", &e),
+                )
+            })?;
+        let parsed = EndpointTransportConfig::from_input_with_root_certs(input, Some(root_certs))?;
+        *self
+            .transport_cfg
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = parsed;
+        self.sync_advertising();
+        Ok(())
+    }
 }
 
 /// Hosting lifecycle of an endpoint: `Idle -> Running -> Closed`, with `Closed` terminal.
@@ -1046,6 +1088,10 @@ impl TendrilEndpoint {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &*state {
             HostingState::Closed => Err((TENDRIL_ERR_CLOSED, "endpoint is closed".to_owned())),
+            _ if self.client_only => Err((
+                TENDRIL_ERR_INVALID_ARG,
+                "endpoint configured as client_only".to_owned(),
+            )),
             HostingState::Running(_) => Ok(()),
             HostingState::Idle => {
                 let _guard = self.rt.enter();
@@ -1251,7 +1297,7 @@ impl TendrilEndpoint {
             Arc::new(self.identity.clone()),
             GroupPoolConfig::new(dialers)
                 .with_relay_auth(cfg.relay_auth.clone())
-                .with_relay_listen(true)
+                .with_relay_listen(!self.client_only)
                 .with_served_v1_relays(served_v1_relays),
             None,
         ));
@@ -1388,11 +1434,17 @@ fn build_endpoint_handle(
     store: Option<Arc<StateStore>>,
     identity: EndpointIdentity,
     roster: Roster,
+    runtime_profile: RuntimeProfile,
+    client_only: bool,
 ) -> *mut TendrilEndpoint {
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if runtime_profile == RuntimeProfile::Extension {
+        builder
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .thread_stack_size(512 * 1024);
+    }
+    let rt = match builder.enable_all().build() {
         Ok(rt) => Arc::new(rt),
         Err(e) => {
             set_last_error(format!("failed to create tokio runtime: {e}"));
@@ -1430,6 +1482,7 @@ fn build_endpoint_handle(
         hosting: StdMutex::new(HostingState::Idle),
         served_endpoints: StdMutex::new(Vec::new()),
         served_listeners: StdMutex::new(Vec::new()),
+        client_only,
     }))
 }
 
@@ -1987,6 +2040,47 @@ pub unsafe extern "C" fn tendril_verify_grant_json(
     })
 }
 
+/// Verifies an epoch-blinded wake tag against a 32-byte `wake_secret_32` across the `+-1` hour
+/// epoch window centered at `now_unix_secs`, writing `0` or `1` to `*out_matched`.
+///
+/// # Safety
+/// `wake_secret_32` must point to 32 readable bytes, `wake_tag_b64` must be a valid NUL-terminated
+/// UTF-8 C string, and `out_matched` must be writable for 1 byte.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_verify_wake_tag(
+    wake_secret_32: *const u8,
+    wake_tag_b64: *const c_char,
+    now_unix_secs: u64,
+    out_matched: *mut u8,
+) -> i32 {
+    ffi_i32(|| {
+        if out_matched.is_null() {
+            set_last_error("null out_matched");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(secret) = (unsafe { read_bytes32(wake_secret_32, "wake_secret_32") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let secret = Zeroizing::new(secret);
+        let Ok(tag_s) = (unsafe { cstr_to_str(wake_tag_b64, "wake_tag_b64") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let tag = match WakeTag::from_b64url(tag_s) {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let matched = verify_epoch_wake_tag_window(&secret, &tag, now_unix_secs);
+        // SAFETY: `out_matched` was verified non-null on entry and points to one writable `u8`.
+        unsafe {
+            *out_matched = u8::from(matched);
+        }
+        TENDRIL_OK
+    })
+}
+
 /// Creates an endpoint handle backed by `state_dir` or an ephemeral in-memory store.
 ///
 /// # Safety
@@ -2043,7 +2137,7 @@ pub unsafe extern "C" fn tendril_endpoint_new(
             (None, identity, Roster::new())
         };
 
-        build_endpoint_handle(store, identity, roster)
+        build_endpoint_handle(store, identity, roster, RuntimeProfile::Default, false)
     })
 }
 
@@ -2071,7 +2165,7 @@ pub unsafe extern "C" fn tendril_endpoint_new_from_state(
             return ptr::null_mut();
         };
 
-        let identity = match identity_from_json_or_generate(id_json, host_opt) {
+        let identity = match identity_from_json_or_generate(id_json, host_opt, None) {
             Ok(id) => id,
             Err(e) => {
                 set_last_error(e);
@@ -2086,18 +2180,166 @@ pub unsafe extern "C" fn tendril_endpoint_new_from_state(
             }
         };
 
-        build_endpoint_handle(None, identity, roster)
+        build_endpoint_handle(None, identity, roster, RuntimeProfile::Default, false)
     })
+}
+
+/// Signature callback invoked for external ML-DSA-65 signing custody.
+pub type TendrilMlDsa65SignFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    msg: *const u8,
+    msg_len: usize,
+    mldsa_ctx: *const u8,
+    mldsa_ctx_len: usize,
+    out_sig: *mut u8,
+    out_sig_len: usize,
+) -> i32;
+
+/// Finalizer callback invoked once when the endpoint's external ML-DSA-65 signer drops.
+pub type TendrilMlDsa65DropCtxFn = unsafe extern "C" fn(ctx: *mut c_void);
+
+/// C ABI descriptor for external hardware-backed or sandbox-delegated ML-DSA-65 signing custody.
+#[repr(C)]
+pub struct TendrilMlDsa65Signer {
+    pub ctx: *mut c_void,
+    pub public_key: *const u8,
+    pub public_key_len: usize,
+    pub sign: Option<TendrilMlDsa65SignFn>,
+    pub drop_ctx: Option<TendrilMlDsa65DropCtxFn>,
+}
+
+struct SignerCtxGuard {
+    raw: TendrilMlDsa65Signer,
+}
+
+impl Drop for SignerCtxGuard {
+    fn drop(&mut self) {
+        if !self.raw.ctx.is_null()
+            && let Some(drop_fn) = self.raw.drop_ctx
+        {
+            // SAFETY: Ownership of `self.raw.ctx` transferred on entry to
+            // `tendril_endpoint_new_sealed_with_options`; this drop runs once if initialization
+            // returns early before handing `drop_ctx` to `FfiMlDsa65Signer`.
+            unsafe { drop_fn(self.raw.ctx) };
+        }
+    }
+}
+
+struct MlDsaPubProbe([u8; MLDSA65_PUBLIC_LEN]);
+
+impl ExternalMlDsaSigner for MlDsaPubProbe {
+    fn public_bytes(&self) -> &[u8; MLDSA65_PUBLIC_LEN] {
+        &self.0
+    }
+
+    fn sign(&self, _message: &[u8], _context: &[u8]) -> Result<[u8; MLDSA65_SIG_LEN], CoreError> {
+        Err(CoreError::InvalidSignature)
+    }
+}
+
+struct FfiMlDsa65Signer {
+    ctx: *mut c_void,
+    public_key: [u8; MLDSA65_PUBLIC_LEN],
+    sign_fn: TendrilMlDsa65SignFn,
+    drop_ctx: Option<TendrilMlDsa65DropCtxFn>,
+}
+
+// SAFETY: By C ABI contract, `TendrilMlDsa65Signer.ctx`, `sign`, and `drop_ctx` must remain valid
+// and thread-safe for concurrent/cross-thread invocations until `drop_ctx(ctx)` returns.
+unsafe impl Send for FfiMlDsa65Signer {}
+// SAFETY: Same C callback thread-safety contract (`&self` invokes `sign_fn`).
+unsafe impl Sync for FfiMlDsa65Signer {}
+
+impl Drop for FfiMlDsa65Signer {
+    fn drop(&mut self) {
+        if !self.ctx.is_null()
+            && let Some(drop_fn) = self.drop_ctx
+        {
+            // SAFETY: `SignerCtxGuard` disarmed its own drop hook when transferring ownership here,
+            // so `drop_fn(self.ctx)` executes once when the final `Arc` clone drops.
+            unsafe { drop_fn(self.ctx) };
+        }
+    }
+}
+
+impl ExternalMlDsaSigner for FfiMlDsa65Signer {
+    fn public_bytes(&self) -> &[u8; MLDSA65_PUBLIC_LEN] {
+        &self.public_key
+    }
+
+    fn sign(&self, message: &[u8], context: &[u8]) -> Result<[u8; MLDSA65_SIG_LEN], CoreError> {
+        let mut out = [0u8; MLDSA65_SIG_LEN];
+        // SAFETY: `self.sign_fn` was verified non-null during signer validation; `message` and
+        // `context` are valid readable byte slices for their lengths and `out` has `3309` writable
+        // bytes for the synchronous duration of this FFI callback.
+        let rc = unsafe {
+            (self.sign_fn)(
+                self.ctx,
+                message.as_ptr(),
+                message.len(),
+                context.as_ptr(),
+                context.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        if rc != TENDRIL_OK {
+            return Err(CoreError::InvalidSignature);
+        }
+        Ok(out)
+    }
+}
+
+fn build_ffi_mldsa_signer(
+    mut guard: SignerCtxGuard,
+) -> Result<Arc<dyn ExternalMlDsaSigner>, String> {
+    let Some(sign_fn) = guard.raw.sign else {
+        return Err("mldsa_signer_opt.sign callback is required".to_owned());
+    };
+    if guard.raw.public_key.is_null() {
+        return Err("mldsa_signer_opt.public_key must be non-null".to_owned());
+    }
+    if guard.raw.public_key_len != MLDSA65_PUBLIC_LEN {
+        return Err(format!(
+            "mldsa_signer_opt.public_key_len must be {MLDSA65_PUBLIC_LEN}, got {}",
+            guard.raw.public_key_len
+        ));
+    }
+    let mut public_key = [0u8; MLDSA65_PUBLIC_LEN];
+    // SAFETY: `guard.raw.public_key` was just checked non-null and `public_key_len == 1952`.
+    let pk_slice = unsafe { std::slice::from_raw_parts(guard.raw.public_key, MLDSA65_PUBLIC_LEN) };
+    public_key.copy_from_slice(pk_slice);
+    // Validate ML-DSA-65 public key encoding synchronously before storing `FfiMlDsa65Signer`.
+    SigningKeypair::from_ed25519_and_external([1u8; 32], Arc::new(MlDsaPubProbe(public_key)))
+        .map_err(|e| format!("invalid ML-DSA-65 public key: {e}"))?;
+
+    let drop_ctx = guard.raw.drop_ctx.take();
+    Ok(Arc::new(FfiMlDsa65Signer {
+        ctx: guard.raw.ctx,
+        public_key,
+        sign_fn,
+        drop_ctx,
+    }))
 }
 
 fn identity_from_json_or_generate(
     identity_json: Option<&str>,
     host_id: Option<&str>,
+    mldsa_signer: Option<Arc<dyn ExternalMlDsaSigner>>,
 ) -> Result<EndpointIdentity, String> {
     if let Some(raw) = identity_json.filter(|s| !s.is_empty()) {
-        return deserialize_identity_json(raw).map_err(|e| e.to_string());
+        return deserialize_identity_json_with_signer(raw, mldsa_signer).map_err(|e| e.to_string());
     }
-    let mut id = EndpointIdentity::generate().map_err(|e| e.to_string())?;
+    let mut id = match mldsa_signer {
+        Some(signer) => {
+            let static_kp = StaticKeypair::generate().map_err(|e| e.to_string())?;
+            let ed_seed = Zeroizing::new(random_bytes::<32>().map_err(|e| e.to_string())?);
+            let signing_kp = SigningKeypair::from_ed25519_and_external(*ed_seed, signer)
+                .map_err(|e| e.to_string())?;
+            EndpointIdentity::from_keys(static_kp, signing_kp)
+        }
+        None => EndpointIdentity::generate().map_err(|e| e.to_string())?,
+    };
     if let Some(h) = host_id
         && !h.is_empty()
     {
@@ -2121,6 +2363,7 @@ fn open_sealed_endpoint_state(
     identity_json: Option<&str>,
     roster_json: Option<&str>,
     host_id: Option<&str>,
+    mldsa_signer: Option<Arc<dyn ExternalMlDsaSigner>>,
 ) -> Result<(StateStore, EndpointIdentity, Roster), String> {
     let seed = roster_json.filter(|s| !s.is_empty());
     if identity_json.is_none_or(str::is_empty) {
@@ -2131,7 +2374,7 @@ fn open_sealed_endpoint_state(
             return Err("sealed runtime state exists but no identity was supplied".to_owned());
         }
     }
-    let identity = identity_from_json_or_generate(identity_json, host_id)?;
+    let identity = identity_from_json_or_generate(identity_json, host_id, mldsa_signer)?;
     let store = StateStore::open_sealed(dir, &identity).map_err(|e| e.to_string())?;
     if seed.is_some() {
         store
@@ -2158,7 +2401,46 @@ pub unsafe extern "C" fn tendril_endpoint_new_sealed(
     roster_json_opt: *const c_char,
     host_id_opt: *const c_char,
 ) -> *mut TendrilEndpoint {
+    unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            state_dir,
+            identity_json_opt,
+            roster_json_opt,
+            host_id_opt,
+            ptr::null(),
+            ptr::null(),
+        )
+    }
+}
+
+/// Creates a sealed endpoint with optional JSON runtime/role options (`runtime_profile`,
+/// `client_only`) and optional external ML-DSA-65 signing custody.
+///
+/// Ownership of `mldsa_signer_opt->ctx` transfers immediately on entry when `mldsa_signer_opt` is
+/// non-null, guaranteeing `drop_ctx(ctx)` runs once both on initialization errors and when the
+/// endpoint drops.
+///
+/// # Safety
+/// String parameters must be null or valid NUL-terminated UTF-8 C strings; `mldsa_signer_opt`
+/// must be null or point to a valid [`TendrilMlDsa65Signer`] struct.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_new_sealed_with_options(
+    state_dir: *const c_char,
+    identity_json_opt: *const c_char,
+    roster_json_opt: *const c_char,
+    host_id_opt: *const c_char,
+    options_json_opt: *const c_char,
+    mldsa_signer_opt: *const TendrilMlDsa65Signer,
+) -> *mut TendrilEndpoint {
     ffi_ptr(|| {
+        let mut ctx_guard = if mldsa_signer_opt.is_null() {
+            None
+        } else {
+            // SAFETY: Caller guarantees non-null `mldsa_signer_opt` points to a readable struct,
+            // and immediate guard capture ensures `drop_ctx(ctx)` runs on any early error return.
+            let raw = unsafe { ptr::read(mldsa_signer_opt) };
+            Some(SignerCtxGuard { raw })
+        };
         let Ok(dir_opt) = (unsafe { opt_cstr_to_str(state_dir, "state_dir") }) else {
             return ptr::null_mut();
         };
@@ -2173,14 +2455,42 @@ pub unsafe extern "C" fn tendril_endpoint_new_sealed(
         let Ok(host_opt) = (unsafe { opt_cstr_to_str(host_id_opt, "host_id_opt") }) else {
             return ptr::null_mut();
         };
+        let Ok(opts_raw) = (unsafe { opt_cstr_to_str(options_json_opt, "options_json_opt") })
+        else {
+            return ptr::null_mut();
+        };
+        let opts: SealedEndpointOptions = match opts_raw.map(str::trim).filter(|s| !s.is_empty()) {
+            None => SealedEndpointOptions::default(),
+            Some(raw) => match serde_json::from_str(raw) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    set_last_error(json_error("options_json_opt", &e));
+                    return ptr::null_mut();
+                }
+            },
+        };
+        let mldsa_signer = match ctx_guard.take() {
+            None => None,
+            Some(guard) => match build_ffi_mldsa_signer(guard) {
+                Ok(signer) => Some(signer),
+                Err(msg) => {
+                    set_last_error(msg);
+                    return ptr::null_mut();
+                }
+            },
+        };
         let Some(dir) = dir_opt.filter(|d| !d.is_empty()) else {
             set_last_error("state_dir is required for a sealed endpoint");
             return ptr::null_mut();
         };
-        match open_sealed_endpoint_state(dir, id_json, roster_json, host_opt) {
-            Ok((store, identity, roster)) => {
-                build_endpoint_handle(Some(Arc::new(store)), identity, roster)
-            }
+        match open_sealed_endpoint_state(dir, id_json, roster_json, host_opt, mldsa_signer) {
+            Ok((store, identity, roster)) => build_endpoint_handle(
+                Some(Arc::new(store)),
+                identity,
+                roster,
+                opts.runtime_profile,
+                opts.client_only,
+            ),
             Err(e) => {
                 set_last_error(e);
                 ptr::null_mut()
@@ -2329,6 +2639,10 @@ pub unsafe extern "C" fn tendril_endpoint_serve_direct(
             }
         };
         let ep = unsafe { &*ep };
+        if ep.client_only {
+            set_last_error("endpoint configured as client_only");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
         match ep.rt.block_on(DirectListener::bind(addr, None)) {
             Ok(listener) => {
                 let local_ep = listener.local_endpoint();
@@ -2370,6 +2684,10 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay(
             Err(rc) => return rc,
         };
         let ep = unsafe { &*ep };
+        if ep.client_only {
+            set_last_error("endpoint configured as client_only");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
         let cfg = ep.snapshot_transport_cfg();
         let signing_key = ep.identity.signing_key().ed25519_signing_key();
         match ep.rt.block_on(RelayListener::bind_with_auth(
@@ -2419,6 +2737,10 @@ pub unsafe extern "C" fn tendril_endpoint_serve_p2p(
             Err(rc) => return rc,
         };
         let ep = unsafe { &*ep };
+        if ep.client_only {
+            set_last_error("endpoint configured as client_only");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
         #[cfg(feature = "p2p-iroh")]
         {
             let cfg = ep.snapshot_transport_cfg();
@@ -3301,7 +3623,7 @@ async fn policy_connect(
 /// miss a wake can fix ([`AttemptError::is_wakeable_miss`]). Then up to `max_attempts` connects
 /// `retry_delay_ms` apart, retried only on such a miss; any other failure is final.
 async fn connect_with_wake<T, F, Fut>(
-    wake: &WakeTransportConfig,
+    wake: &WakeTransportSettings,
     mut connect: F,
 ) -> Result<T, AttemptError>
 where
@@ -3318,12 +3640,9 @@ where
     let now = now_unix();
     let tag = wake.secret.derive_tag(now);
     let wake_timeout = Duration::from_millis(wake.timeout_ms);
-    let provider = HttpWakeProvider::new()
-        .with_cooldown_secs(0)
-        .with_timeout(wake_timeout);
     let _ = timeout(
         wake_timeout,
-        provider.notify_best_effort(&wake.target, &tag, now),
+        wake.provider.notify_best_effort(&wake.target, &tag, now),
     )
     .await;
     let attempts = wake.max_attempts.max(1);
@@ -3997,6 +4316,10 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay_v2(
             return TENDRIL_ERR_INVALID_ARG;
         };
         let ep = unsafe { &*ep };
+        if ep.client_only {
+            set_last_error("endpoint configured as client_only");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
         let cfg = ep.snapshot_transport_cfg();
         if let Err(e) = ep.load_roster_from_store() {
             set_last_error(e);
@@ -5727,6 +6050,10 @@ pub unsafe extern "C" fn tendril_group_open(
                 return TENDRIL_ERR_INVALID_ARG;
             }
         };
+        if listen.is_some() && ep.client_only {
+            set_last_error("endpoint configured as client_only");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
         let groups = match ep.ensure_group_runtime() {
             Ok(g) => g,
             Err((rc, msg)) => {
@@ -6616,15 +6943,17 @@ mod route_state_tests {
         }
     }
 
-    fn wake_config(url: &str, pre_wake: bool) -> WakeTransportConfig {
-        WakeTransportConfig {
-            target: WakeTarget::new(WakeAdapterKind::Webhook, url).unwrap(),
-            secret: WakeSecret::from_bytes([7; 32]),
-            pre_wake,
-            retry_delay_ms: 1,
-            max_attempts: 3,
-            timeout_ms: 2_000,
-        }
+    fn wake_config(url: &str, pre_wake: bool) -> WakeTransportSettings {
+        let mut spec = WakeConfigSpec::default();
+        spec.wake_url = Some(url.to_owned());
+        spec.wake_adapter = Some(WakeAdapterKind::Webhook);
+        spec.wake_secret_b64 = Some(b64url_encode(&[7; 32]));
+        spec.wake_pre_wake = Some(pre_wake);
+        spec.wake_retry_delay_ms = Some(1);
+        spec.wake_max_attempts = Some(3);
+        spec.wake_timeout_ms = Some(2_000);
+        spec.wake_coalesce_secs = Some(0);
+        build_wake_provider(spec).unwrap().unwrap()
     }
 
     /// A loopback webhook counting `POST` requests (a host service may probe new loopback
@@ -7039,5 +7368,346 @@ mod route_state_tests {
             }
             assert_eq!(hosting_call(ep.0, 0), TENDRIL_ERR_CLOSED);
         }
+    }
+
+    fn b64_std_encode(input: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+        for chunk in input.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                TABLE[((triple >> 6) & 0x3f) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                TABLE[(triple & 0x3f) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    fn generate_runtime_p8_pem() -> String {
+        use ring::rand::SystemRandom;
+        use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+
+        let rng = SystemRandom::new();
+        let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+            .expect("generate p256 pkcs8");
+        let body = b64_std_encode(doc.as_ref());
+        let mut pem = String::new();
+        pem.push_str(concat!("-----BEGIN ", "PRIVATE KEY-----\n"));
+        for chunk in body.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).expect("ascii b64"));
+            pem.push('\n');
+        }
+        pem.push_str(concat!("-----END ", "PRIVATE KEY-----\n"));
+        pem
+    }
+
+    #[test]
+    fn apns_h2_mutable_alert_h2_delivery_and_coalesce_via_ffi_session_connect() {
+        use std::sync::atomic::AtomicUsize;
+
+        use http::{Response, StatusCode};
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+            KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+        };
+        use rustls::RootCertStore;
+        use rustls::pki_types::PrivateKeyDer;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        #[derive(Debug)]
+        struct CapturedH2 {
+            method: String,
+            path: String,
+            headers: Vec<(String, String)>,
+            body: serde_json::Value,
+        }
+
+        impl CapturedH2 {
+            fn header(&self, name: &str) -> Option<&str> {
+                self.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut srv_params =
+            CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()]).unwrap();
+        srv_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        srv_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let srv_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let srv_cert = srv_params.signed_by(&srv_key, &issuer).unwrap();
+
+        let mut root_store = RootCertStore::empty();
+        root_store.add(ca_cert.der().clone()).unwrap();
+        let mut server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![srv_cert.der().clone()],
+                PrivateKeyDer::try_from(srv_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        server_cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Ep::new(&tmp.path().join("host"), Some("h2-wake-host"));
+        let client = Ep::new(&tmp.path().join("client"), Some("h2-wake-cli"));
+
+        let req_count = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(AsyncMutex::new(Vec::<CapturedH2>::new()));
+        let req_count_bg = Arc::clone(&req_count);
+        let captured_bg = Arc::clone(&captured);
+
+        let (h2_addr, srv_task) = host.get().rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let acceptor = acceptor.clone();
+                    let req_count = Arc::clone(&req_count_bg);
+                    let captured = Arc::clone(&captured_bg);
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(tcp).await else {
+                            return;
+                        };
+                        let Ok(mut h2_conn) = h2::server::handshake(tls).await else {
+                            return;
+                        };
+                        while let Some(Ok((req, mut respond))) = h2_conn.accept().await {
+                            let req_count = Arc::clone(&req_count);
+                            let captured = Arc::clone(&captured);
+                            tokio::spawn(async move {
+                                let method = req.method().to_string();
+                                let path = req.uri().path().to_owned();
+                                let headers: Vec<(String, String)> = req
+                                    .headers()
+                                    .iter()
+                                    .map(|(k, v)| {
+                                        (
+                                            k.as_str().to_owned(),
+                                            v.to_str().unwrap_or("<non-utf8>").to_owned(),
+                                        )
+                                    })
+                                    .collect();
+                                let mut body_stream = req.into_body();
+                                let mut raw_body = Vec::new();
+                                while let Some(Ok(chunk)) = body_stream.data().await {
+                                    raw_body.extend_from_slice(&chunk);
+                                    let _ =
+                                        body_stream.flow_control().release_capacity(chunk.len());
+                                }
+                                let body: serde_json::Value = serde_json::from_slice(&raw_body)
+                                    .unwrap_or(serde_json::Value::Null);
+                                captured.lock().await.push(CapturedH2 {
+                                    method,
+                                    path,
+                                    headers,
+                                    body,
+                                });
+                                req_count.fetch_add(1, Ordering::SeqCst);
+                                let resp =
+                                    Response::builder().status(StatusCode::OK).body(()).unwrap();
+                                let _ = respond.send_response(resp, true);
+                            });
+                        }
+                    });
+                }
+            });
+            (addr, task)
+        });
+
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _srv_guard = AbortOnDrop(srv_task);
+
+        let p8_pem = generate_runtime_p8_pem();
+        let secret = [0x6b; 32];
+        let device_hex = "a".repeat(64);
+        let cfg_json = serde_json::json!({
+            "wake_url": format!("https://127.0.0.1:{}/3/device/{device_hex}", h2_addr.port()),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": b64url_encode(&secret),
+            "wake_pre_wake": true,
+            "wake_retry_delay_ms": 20,
+            "wake_max_attempts": 2,
+            "wake_coalesce_secs": 60,
+            "wake_apns_mode": "mutable_alert",
+            "wake_apns_topic": "app.tendril.ffi.h2",
+            "wake_apns_loc_key": "TENDRIL_WAKE_H2",
+            "wake_apns_team_id": "TEAM123456",
+            "wake_apns_key_id": "KEY1234567",
+            "wake_apns_p8_pem": p8_pem,
+        })
+        .to_string();
+        client
+            .get()
+            .configure_transports_json_with_root_certs(&cfg_json, root_store)
+            .expect("configure apns_h2 with test root certs");
+
+        let bind_c = cs("127.0.0.1:0");
+        let mut ep_p: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_serve_direct(host.0, bind_c.as_ptr(), &raw mut ep_p) },
+            TENDRIL_OK,
+            "{}",
+            last_err()
+        );
+        let listen_ep = unsafe { take(ep_p) };
+
+        let kind_c = cs("lan");
+        let mut code_p: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_issue_code(host.0, kind_c.as_ptr(), &raw mut code_p) },
+            TENDRIL_OK
+        );
+        let code_c = cs(&unsafe { take(code_p) });
+
+        let host_addr = host.0 as usize;
+        let acc_thr = thread::spawn(move || {
+            let mut out: *mut c_char = ptr::null_mut();
+            let rc = unsafe {
+                tendril_endpoint_pair_v2_accept(
+                    host_addr as *mut TendrilEndpoint,
+                    5_000,
+                    &raw mut out,
+                )
+            };
+            assert_eq!(rc, TENDRIL_OK, "{}", last_err());
+            serde_json::from_str::<serde_json::Value>(&unsafe { take(out) }).unwrap()
+        });
+        let dep_c = cs(&listen_ep);
+        let cli_name_c = cs("h2-wake-cli");
+        let dev_kind_c = cs("ios");
+        let mut pair_p: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                tendril_endpoint_pair_v2_initiate(
+                    client.0,
+                    dep_c.as_ptr(),
+                    ptr::null(),
+                    code_c.as_ptr(),
+                    cli_name_c.as_ptr(),
+                    dev_kind_c.as_ptr(),
+                    ptr::null(),
+                    &raw mut pair_p,
+                )
+            },
+            TENDRIL_OK,
+            "{}",
+            last_err()
+        );
+        drop(unsafe { take(pair_p) });
+        let acc_val = acc_thr.join().unwrap();
+
+        let cli_dev_c = cs(acc_val["device_id"].as_str().unwrap());
+        let sas_c = cs(acc_val["sas"].as_str().unwrap());
+        let host_name_c = cs("h2-wake-host");
+        assert_eq!(
+            unsafe { tendril_endpoint_confirm_peer(host.0, cli_dev_c.as_ptr(), sas_c.as_ptr()) },
+            TENDRIL_OK
+        );
+        assert_eq!(
+            unsafe {
+                tendril_endpoint_confirm_peer(client.0, host_name_c.as_ptr(), sas_c.as_ptr())
+            },
+            TENDRIL_OK
+        );
+
+        let caps_c = cs("[\"fs.read\"]");
+        let mut grant_p: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                tendril_endpoint_mint_grant(
+                    host.0,
+                    cli_dev_c.as_ptr(),
+                    caps_c.as_ptr(),
+                    300,
+                    &raw mut grant_p,
+                )
+            },
+            TENDRIL_OK
+        );
+        let grant_c = cs(&unsafe { take(grant_p) });
+
+        for _ in 0..2 {
+            let sess_acc = thread::spawn(move || unsafe {
+                tendril_session_accept_v2(host_addr as *mut TendrilEndpoint, 5_000) as usize
+            });
+            let cs_raw = unsafe {
+                tendril_session_connect_v2(
+                    client.0,
+                    dep_c.as_ptr(),
+                    ptr::null(),
+                    host_name_c.as_ptr(),
+                    grant_c.as_ptr(),
+                )
+            };
+            assert!(!cs_raw.is_null(), "{}", last_err());
+            let _cs = Sess(cs_raw);
+            let hs_raw = sess_acc.join().unwrap() as *mut TendrilSession;
+            assert!(!hs_raw.is_null());
+            let _hs = Sess(hs_raw);
+        }
+
+        assert_eq!(req_count.load(Ordering::SeqCst), 1);
+        let reqs = host.get().rt.block_on(async { captured.lock().await });
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, format!("/3/device/{device_hex}"));
+        assert_eq!(req.header("apns-push-type"), Some("alert"));
+        assert_eq!(req.header("apns-priority"), Some("10"));
+        assert_eq!(req.header("apns-topic"), Some("app.tendril.ffi.h2"));
+        let auth = req.header("authorization").expect("authorization header");
+        let jwt = auth.strip_prefix("bearer ").expect("bearer prefix");
+        assert_eq!(jwt.split('.').count(), 3, "compact JWT has 3 segments");
+
+        assert_eq!(req.body["aps"]["mutable-content"], 1);
+        assert!(req.body["aps"].get("content-available").is_none());
+        assert_eq!(req.body["aps"]["alert"]["loc-key"], "TENDRIL_WAKE_H2");
+        assert_eq!(req.body["v"], 1);
+        let epoch_s = req.body["epoch_s"].as_u64().expect("epoch_s");
+        assert_eq!(epoch_s, wake_epoch_start_secs(epoch_s));
+        let tag_c = cs(req.body["wake_tag"].as_str().expect("wake_tag"));
+        let mut matched = 0u8;
+        assert_eq!(
+            unsafe {
+                tendril_verify_wake_tag(secret.as_ptr(), tag_c.as_ptr(), epoch_s, &raw mut matched)
+            },
+            TENDRIL_OK
+        );
+        assert_eq!(matched, 1);
     }
 }

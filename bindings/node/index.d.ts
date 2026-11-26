@@ -20,6 +20,11 @@ export function verifyGrantJson(
   nowUnixSecs: number,
   crlJson?: string | null
 ): boolean;
+export function verifyWakeTag(
+  wakeSecret: Buffer,
+  wakeTagB64: string,
+  nowUnixSecs: number
+): boolean;
 
 /**
  * Decodes a `0x0C ROUTE_SET` payload and verifies its hybrid signature against the 1984-byte
@@ -74,10 +79,14 @@ export class Endpoint {
   ): Promise<Session>;
   acceptSession(timeoutMs?: number | null): Promise<Session>;
   /**
-   * Every key is accepted in snake_case (`relay_auth_secret`, `wake_pre_wake`,
-   * `relay_auth_origins`, ...) and in camelCase (`relayAuthSecret`, `wakePreWake`,
-   * `relayAuthOrigins`, ...). Besides the relay, p2p and wake keys: `relay_auth_origins`
-   * (string[] of scheme://host[:port]), `advertise` ("auto" | "explicit"),
+   * Every key is accepted in snake_case (`relay_auth_secret`, `wake_pre_wake`, `wake_coalesce_secs`,
+   * `wake_apns_mode`, `wake_apns_topic`, `wake_apns_loc_key`, `wake_apns_team_id`,
+   * `wake_apns_key_id`, `wake_apns_p8_pem`, `wake_apns_client_cert_pem`,
+   * `wake_apns_client_key_pem`, `relay_auth_origins`, ...) and in camelCase (`relayAuthSecret`,
+   * `wakePreWake`, `wakeCoalesceSecs`, `wakeApnsMode`, `wakeApnsTopic`, `wakeApnsLocKey`,
+   * `wakeApnsTeamId`, `wakeApnsKeyId`, `wakeApnsP8Pem`, `wakeApnsClientCertPem`,
+   * `wakeApnsClientKeyPem`, `relayAuthOrigins`, ...). Besides the relay, p2p and wake keys:
+   * `relay_auth_origins` (string[] of scheme://host[:port]), `advertise` ("auto" | "explicit"),
    * `advertised_endpoints` (string[]), `route_policy` ("all_signed" | "committed_only" |
    * "none") and `sign_routes` (boolean). A changed advertise set is published off the calling
    * thread, and the next `issuePairingUri` or `refreshRoutes` waits for that publish; a

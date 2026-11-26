@@ -4,11 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/ecdh"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net/url"
@@ -2672,5 +2679,125 @@ func TestRefreshRoutesDeliversRouteSetToLiveSession(t *testing.T) {
 	}
 	if _, err := host.RefreshRoutes(nil); err != nil {
 		t.Fatalf("native refresh: %v", err)
+	}
+}
+
+func deriveWakeTagB64(secret [32]byte, unixSecs uint64) string {
+	var salt [8]byte
+	binary.BigEndian.PutUint64(salt[:], unixSecs/3600)
+	extract := hmac.New(sha256.New, salt[:])
+	_, _ = extract.Write(secret[:])
+	prk := extract.Sum(nil)
+
+	expand := hmac.New(sha256.New, prk)
+	_, _ = expand.Write([]byte("tendril/wake/epoch-tag/v1\x01"))
+	okm := expand.Sum(nil)
+	return base64.RawURLEncoding.EncodeToString(okm[:16])
+}
+
+func TestVerifyWakeTagAndApnsWakeConfig(t *testing.T) {
+	if tendril.MlDsa65PubLen != 1952 {
+		t.Fatalf("MlDsa65PubLen = %d, want 1952", tendril.MlDsa65PubLen)
+	}
+	if tendril.MlDsa65SigLen != 3309 {
+		t.Fatalf("MlDsa65SigLen = %d, want 3309", tendril.MlDsa65SigLen)
+	}
+
+	var secret [32]byte
+	for i := range secret {
+		secret[i] = byte(0x30 + i)
+	}
+	var wrong [32]byte
+	wrong[0] = 0xff
+
+	const nowUnix = uint64(1764115200)
+	tagB64 := deriveWakeTagB64(secret, nowUnix)
+
+	for _, checkNow := range []uint64{nowUnix - 3600, nowUnix, nowUnix + 3600} {
+		ok, err := tendril.VerifyWakeTag(secret, tagB64, checkNow)
+		if err != nil || !ok {
+			t.Fatalf("VerifyWakeTag(%d) = (%v, %v), want (true, nil)", checkNow, ok, err)
+		}
+	}
+	for _, checkNow := range []uint64{nowUnix - 7200, nowUnix + 7200} {
+		ok, err := tendril.VerifyWakeTag(secret, tagB64, checkNow)
+		if err != nil || ok {
+			t.Fatalf("VerifyWakeTag(%d) = (%v, %v), want (false, nil)", checkNow, ok, err)
+		}
+	}
+	if ok, err := tendril.VerifyWakeTag(wrong, tagB64, nowUnix); err != nil || ok {
+		t.Fatalf("VerifyWakeTag(wrong) = (%v, %v), want (false, nil)", ok, err)
+	}
+	if _, err := tendril.VerifyWakeTag(secret, "bad-tag", nowUnix); err == nil {
+		t.Fatal("VerifyWakeTag must fail on malformed wake_tag_b64")
+	}
+	if _, err := tendril.VerifyWakeTag(secret, tagB64+"\x00x", nowUnix); err == nil {
+		t.Fatal("VerifyWakeTag must reject embedded NUL bytes")
+	}
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
+	}
+	p8Pem := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+
+	ep, err := tendril.NewEndpoint("", "go-apns-wake")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer ep.Close()
+
+	deviceToken := strings.Repeat("a", 64)
+	validCfg, err := json.Marshal(map[string]any{
+		"wake_url":           "https://api.sandbox.push.apple.com/3/device/" + deviceToken,
+		"wake_adapter":       "apns_h2",
+		"wake_secret_b64":    base64.RawURLEncoding.EncodeToString(secret[:]),
+		"wake_apns_mode":     "mutable_alert",
+		"wake_apns_topic":    "app.tendril.go",
+		"wake_apns_loc_key":  "TENDRIL_WAKE_GO",
+		"wake_apns_team_id":  "TEAM123456",
+		"wake_apns_key_id":   "KEY1234567",
+		"wake_apns_p8_pem":   p8Pem,
+		"wake_coalesce_secs": 15,
+	})
+	if err != nil {
+		t.Fatalf("Marshal validCfg: %v", err)
+	}
+	if err := ep.ConfigureTransportsJSON(string(validCfg)); err != nil {
+		t.Fatalf("ConfigureTransportsJSON(apns_h2): %v", err)
+	}
+
+	for _, bad := range []map[string]any{
+		{
+			"wake_url":        "http://127.0.0.1:8080/3/device/" + deviceToken,
+			"wake_adapter":    "apns_h2",
+			"wake_secret_b64": base64.RawURLEncoding.EncodeToString(secret[:]),
+			"wake_auth_token": "tok",
+			"wake_apns_topic": "app.tendril.go",
+		},
+		{
+			"wake_url":        "https://api.push.apple.com/3/device/" + deviceToken,
+			"wake_adapter":    "apns_h2",
+			"wake_secret_b64": base64.RawURLEncoding.EncodeToString(secret[:]),
+			"wake_auth_token": "tok",
+		},
+		{
+			"wake_url":          "https://api.push.apple.com/3/device/" + deviceToken,
+			"wake_adapter":      "apns_h2",
+			"wake_secret_b64":   base64.RawURLEncoding.EncodeToString(secret[:]),
+			"wake_auth_token":   "tok",
+			"wake_apns_topic":   "app.tendril.go",
+			"wake_apns_mode":    "mutable_alert",
+			"wake_apns_loc_key": "BAD KEY",
+		},
+	} {
+		raw, _ := json.Marshal(bad)
+		if err := ep.ConfigureTransportsJSON(string(raw)); err == nil {
+			t.Fatalf("expected failure for %v", bad)
+		}
 	}
 }

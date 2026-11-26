@@ -78,7 +78,10 @@ pub use providers::{
 pub use providers::{WtDialer, WtListener};
 pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
-pub use store::{RosterStamp, StateStore, deserialize_identity_json, serialize_identity_json};
+pub use store::{
+    RosterStamp, StateStore, deserialize_identity_json, deserialize_identity_json_with_signer,
+    serialize_identity_json,
+};
 pub use v2_driver::{
     ConcurrentV2Session, DEFAULT_ARGON2_ACQUIRE_TIMEOUT, DEFAULT_ARGON2_CONCURRENCY,
     DEFAULT_INITIATOR_ARGON2_PERMITS, V2_RUNG_BUDGET_FAR, V2_RUNG_BUDGET_NEAR, V2PairDriveResult,
