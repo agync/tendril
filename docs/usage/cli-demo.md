@@ -112,7 +112,7 @@ tendril --state-dir ./cli-state dial --target my-host --grant '<grant_json>' --m
 | `--issue-code auto` | `serve` | Picks the long code whenever any non-LAN route is advertised or none survives, else the short one. `lan` and `remote` force a kind; `lan` with remote listeners issues a LAN-only URI and reports the dropped hints. |
 | `--advertise-endpoint <HINT>` | `serve` (repeatable) | Adds a route to the announced set and to URIs. |
 | `--no-route-signature` | `serve` | Issues URIs without `rq` and `rs`. For interop tests with old clients only. |
-| `--route-policy all-signed\|committed-only\|none` | `pair`, `dial`, `route apply` | Which routes to keep. Default `all-signed`. |
+| `--route-policy all-signed\|committed-only\|none` | `pair`, `dial`, `enroll`, `route apply` | Which routes to keep. Default `all-signed`. On `enroll`, `all-signed` also asks the host for its route set and stores the endpoint dialed as the `committed` route; `committed-only` stores that endpoint alone; `none` requests and stores nothing. |
 | `--save-route` | `pair` | Keeps the route that carried an unsigned pairing. Conflicts with `--route-policy none`. |
 | `--relay-auth-origin <scheme://host:port>` | `pair`, `dial` (repeatable) | Origins that may receive relay admission material. An explicit `--endpoint` is always allowed. |
 | `--pairing-uri <URI>` | `dial` | Uses a fresh URI of this peer as a recovery URI. Its keys are checked before the session commits and its code is never sent. |
@@ -201,7 +201,11 @@ tendril --state-dir ./runner-state enroll \
   --host-signing-pub "<b64url_host_signing_or_hash>" \
   --token-file ./token.json
 # (enroll also stores the host's signed routes and the endpoint dialed as Day-2 routes;
-#  pass --route-policy committed-only to keep only the endpoint, or --route-policy none to store no route)
+#  pass --route-policy committed-only to keep only the endpoint, or --route-policy none to store no route.
+#  The default all-signed asks the host for its route set, so a host built before route sets rejects the claim
+#  as a protocol error (the token is not spent): enroll with --route-policy committed-only or none until the host
+#  is upgraded. Upgrade note: after upgrading the host, re-run enroll with a fresh token and the default policy
+#  to learn its signed routes.)
 
 # Mint application grants after enrollment (still default deny), revoke unused nonces, or rotate keys
 tendril --state-dir ./host-state mint <runner_device_id> --cap fs.read
@@ -229,7 +233,7 @@ tendril --state-dir ./a-state group show <group_id>
 - `add` defaults member caps to `group.send:<group_id>` and `group.recv:<group_id>`; repeat `--cap` to override.
 - `remove` revokes the member and rotates the rendezvous key. Run `sync` afterwards so reachable members ingest the new manifest and drop the revoked peer.
 - `sync` pushes the manifest (and the rendezvous key from the root) and prints `{group_id, seq, delivered, offline, failed}`; `broadcast` prints the `BroadcastReport`. `list` and `show` never print the rendezvous key.
-- `sync` and `broadcast` dial siblings over direct, local, relay (`--relay-auth-secret-file` or `--relay-ticket-file`), overlay, and broker endpoints, and over p2p (`iroh://`) when `--p2p` or any other `--p2p-*` option is given; `serve` adds p2p to its group dialers under the same rule as it enables its own p2p listener. A `/v2/relay` sibling endpoint is dialed on the sibling's group mailbox while the current group key is held, and other relay endpoints with the sibling's manifest `relay_pub`. `serve` registers the local member's own relay mailboxes on the relay endpoints of its manifest entry, except the `/v1/relay` URL it already serves with `--relay`; `sync` and `broadcast` never register, so they cannot displace `serve`.
+- `sync` and `broadcast` dial siblings over direct, local, relay (`--relay-auth-secret-file` or `--relay-ticket-file`), overlay, and broker endpoints, and over p2p (`iroh://`) when `--p2p`, `--p2p-local`, `--p2p-relay`, `--p2p-pkarr`, `--p2p-relay-token-file` or `--p2p-api-secret-file` is given (`--p2p-bind` and `--p2p-no-port-mapping` only tune p2p and never enable it, but an invalid `--p2p-bind` is an error on every group dial command); `serve` adds p2p to its group dialers under the same rule as it enables its own p2p listener. A `/v2/relay` sibling endpoint is dialed on the sibling's group mailbox while the current group key is held, and other relay endpoints with the sibling's manifest `relay_pub`. `serve` registers the local member's own relay mailboxes on the relay endpoints of its manifest entry, except the `/v1/relay` URL it already serves with `--relay`; `sync` and `broadcast` never register, so they cannot displace `serve`.
 - `tendril serve` ingests pushed `0x0A` and `0x0B` frames from confirmed peers. An unknown group is pinned only when the sender is the manifest signer, an `Active` paired peer whose pinned signing key signed the manifest, and the manifest lists the local device; one peer can pin at most 4 stored groups this way, including groups the local device was later removed from. Once stored groups include the local device, every inbound session passes the pre-auth limiter and is routed after the handshake: a session advertising one local group goes to that group's pool, any other session must come from an `Active` paired peer. Group siblings never enter the roster, so they cannot open ordinary sessions or receive grants without pairing. It prints `group_session_established`, `group_data`, `group_manifest_updated`, `group_member_joined`, `group_member_revoked`, and `group_audit` JSON events.
 
 ## JSON stdio conformance peer (`tendril-conformance-peer`)

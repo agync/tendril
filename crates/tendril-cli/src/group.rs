@@ -148,6 +148,7 @@ async fn open_pool(
     dial: &GroupDialArgs,
     timeout_secs: u64,
 ) -> Result<GroupPool, Box<dyn Error>> {
+    validate_explicit_p2p_args(&dial.p2p_args)?;
     let auth = resolve_relay_auth(&dial.relay_auth)?;
     let dialers = build_dialers(auth.clone(), dial.p2p_enabled().then_some(&dial.p2p_args)).await?;
     let config = GroupPoolConfig::new(dialers)

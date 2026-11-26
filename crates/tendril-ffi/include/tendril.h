@@ -190,9 +190,11 @@ int32_t tendril_endpoint_mint_enrollment_token(
     uint64_t ttl_secs,
     char **out_token_json
 );
-/* Enrols under the endpoint's route_policy. With a state directory the out_json gains
- * routes_persisted and route_warnings; a memory-only endpoint stores no route and reports
- * routes_reason "no_state_dir". */
+/* Enrols under the endpoint's route_policy. out_json gains routes_persisted, route_warnings and
+ * routes_reason: routes_reason is null with a state directory and "no_state_dir" on a memory-only
+ * endpoint, which requests and stores no route. The default all_signed asks the host for its route
+ * set; a host that predates route sets rejects that as a protocol error before it spends the
+ * token, so configure route_policy "committed_only" or "none" to enrol against it. */
 int32_t tendril_endpoint_enroll_initiate(
     TendrilEndpoint *ep,
     const char *endpoint,

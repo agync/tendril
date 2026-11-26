@@ -1017,6 +1017,7 @@ fn p2p_relay_and_relay_host_errors_never_echo_the_url() {
             iroh,
             "--p2p-relay",
             secret_url,
+            "--p2p-no-port-mapping",
         ],
         vec![
             "dial",
@@ -1035,6 +1036,7 @@ fn p2p_relay_and_relay_host_errors_never_echo_the_url() {
             "TND-WXYZ-QRST",
             "--p2p-relay",
             secret_url,
+            "--p2p-no-port-mapping",
         ],
     ] {
         let out = run_tendril(client.path(), &args);
