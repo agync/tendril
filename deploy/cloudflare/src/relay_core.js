@@ -25,6 +25,8 @@ const DEFAULT_CONTROL_MAX_BYTES = 131_072;
 const DEFAULT_ACCEPT_TIMEOUT_MS = 15_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
 const ACTIVITY_PERSIST_INTERVAL_MS = 15_000;
+// Ticket clock skew tolerance from spec/relay-v1.md Section 2.5.
+const RELAY_TICKET_CLOCK_SKEW_SECS = 30;
 
 const textEncoder = new TextEncoder();
 
@@ -54,6 +56,13 @@ function constantTimeEqual32(a, b) {
     diff |= a[i] ^ b[i];
   }
   return diff === 0;
+}
+
+function earliestMs(a, b) {
+  if (typeof a !== "number") {
+    return typeof b === "number" ? b : null;
+  }
+  return typeof b === "number" ? Math.min(a, b) : a;
 }
 
 function isPlainObject(value) {
@@ -109,16 +118,22 @@ export function parseRelayConfig(env = {}) {
   const allowMailboxStrs = parseCsvList(env.TENDRIL_RELAY_ALLOW_MAILBOXES);
   const allowedMailboxes = allowMailboxStrs.map((key) => validateEd25519PubB64(key));
 
+  const hasTier2Or3 = authSecretBytes !== null || issuerStrs.length > 0;
+  const requiresRegister = allowedMailboxes.length > 0 || hasTier2Or3;
+
   const scopeRaw = env.TENDRIL_RELAY_AUTH_SCOPE;
   const hasExplicitScope =
     scopeRaw !== undefined && scopeRaw !== null && String(scopeRaw).trim() !== "";
-  const scopeStr = hasExplicitScope ? String(scopeRaw).trim() : "all";
+  const defaultScope = requiresRegister && !hasTier2Or3 ? "register-only" : "all";
+  const scopeStr = hasExplicitScope ? String(scopeRaw).trim() : defaultScope;
   if (scopeStr !== "all" && scopeStr !== "register-only") {
     throw new Error(`invalid TENDRIL_RELAY_AUTH_SCOPE: ${scopeStr}`);
   }
-
-  const hasTier2Or3 = authSecretBytes !== null || issuerStrs.length > 0;
-  const requiresRegister = allowedMailboxes.length > 0 || hasTier2Or3;
+  if (hasExplicitScope && scopeStr === "all" && requiresRegister && !hasTier2Or3) {
+    throw new Error(
+      "TENDRIL_RELAY_AUTH_SCOPE=all requires TENDRIL_RELAY_AUTH_SECRET or TENDRIL_RELAY_ISSUER_PUBS",
+    );
+  }
   if (hasExplicitScope && !requiresRegister) {
     throw new Error(
       "TENDRIL_RELAY_AUTH_SCOPE requires TENDRIL_RELAY_AUTH_SECRET, TENDRIL_RELAY_ISSUER_PUBS, or TENDRIL_RELAY_ALLOW_MAILBOXES",
@@ -551,6 +566,13 @@ export class TendrilRelayCore {
         }
         case "listener": {
           this._bumpNextId(att.regId);
+          if (this._isExpired(att)) {
+            this._cleanedMark(ws);
+            this._decrementIp(ip);
+            this._setAttachment(ws, null);
+            this._safeClose(ws, 1000, "expired");
+            break;
+          }
           const maps = this._getMaps(Boolean(att.isV2));
           const existing = maps.mailboxes.get(att.keyHex);
           if (existing) {
@@ -558,12 +580,14 @@ export class TendrilRelayCore {
               this._cleanedMark(existing.ws);
               this._decrementIp(existing.att.ip);
               this._setAttachment(existing.ws, null);
+              this._sendJson(existing.ws, { op: "error", code: "replaced" });
               this._safeClose(existing.ws, 1000, "replaced");
               maps.mailboxes.set(att.keyHex, { ws, att, regId: att.regId });
             } else {
               this._cleanedMark(ws);
               this._decrementIp(ip);
               this._setAttachment(ws, null);
+              this._sendJson(ws, { op: "error", code: "replaced" });
               this._safeClose(ws, 1000, "replaced");
             }
           } else {
@@ -605,12 +629,16 @@ export class TendrilRelayCore {
     for (const { ws, att } of candidateStandby) {
       const maps = this._getMaps(Boolean(att.isV2));
       const mailbox = maps.mailboxes.get(att.keyHex);
-      if (!mailbox || mailbox.regId !== att.regId || (att.isV2 && mailbox.att.epoch !== att.epoch)) {
+      if (
+        !mailbox ||
+        mailbox.regId !== att.regId ||
+        (att.isV2 && mailbox.att.epoch !== att.epoch) ||
+        this._isExpired(att)
+      ) {
         this._cleanedMark(ws);
         this._decrementIp(att.ip);
         this._setAttachment(ws, null);
-        this._sendJson(ws, { op: "error", code: "offline" });
-        this._safeClose(ws, 1000, "offline");
+        this._safeClose(ws, 1000, "listener closed");
         continue;
       }
       let pool = maps.standby.get(att.keyHex);
@@ -833,10 +861,10 @@ export class TendrilRelayCore {
     for (const entry of this.v2Pending.values()) {
       consider(entry.att.deadlineMs);
     }
-    for (const entry of this.v2Mailboxes.values()) {
+    for (const entry of [...this.v1Mailboxes.values(), ...this.v2Mailboxes.values()]) {
       consider(entry.att.expiryMs);
     }
-    for (const pool of this.v2Standby.values()) {
+    for (const pool of [...this.v1Standby.values(), ...this.v2Standby.values()]) {
       for (const slot of pool) {
         consider(slot.att.expiryMs);
       }
@@ -917,6 +945,39 @@ export class TendrilRelayCore {
       }
     }
     return false;
+  }
+
+  _isExpired(att) {
+    return typeof att.expiryMs === "number" && this._now() >= att.expiryMs;
+  }
+
+  _purgeExpiredMailboxes() {
+    for (const entry of [...this.v1Mailboxes.values(), ...this.v2Mailboxes.values()]) {
+      if (this._isExpired(entry.att)) {
+        this._expireSocket(entry.ws);
+      }
+    }
+  }
+
+  /** Ends an expired registration or standby socket found at lookup, before its alarm runs. */
+  _expireSocket(ws) {
+    this._cleanupSocket(ws);
+    this._safeClose(ws, 1000, "expired");
+  }
+
+  /**
+   * Returns the time in ms at which a `register` or `standby` admitted by a ticket stops being
+   * valid (the first second after `not_after` plus clock skew), or null when no ticket bounds it.
+   */
+  _admissionExpiryMs(keyBytes, auth) {
+    if (!this.config.requiresRegister || this._mailboxAllowlisted(keyBytes)) {
+      return null;
+    }
+    if (!auth || auth.kind !== "ticket") {
+      return null;
+    }
+    const notAfter = JSON.parse(auth.ticketJson).not_after;
+    return (notAfter + RELAY_TICKET_CLOCK_SKEW_SECS + 1) * 1000;
   }
 
   async fetch(request) {
@@ -1198,27 +1259,35 @@ export class TendrilRelayCore {
 
     const keyHex = bytesToHex(keyBytes);
     const maps = this._getMaps(isV2);
-    const totalMailboxes = this.v1Mailboxes.size + this.v2Mailboxes.size;
-    if (!maps.mailboxes.has(keyHex) && totalMailboxes >= this.config.maxMailboxes) {
+    const totalMailboxes = () => this.v1Mailboxes.size + this.v2Mailboxes.size;
+    if (!maps.mailboxes.has(keyHex) && totalMailboxes() >= this.config.maxMailboxes) {
+      this._purgeExpiredMailboxes();
+    }
+    if (!maps.mailboxes.has(keyHex) && totalMailboxes() >= this.config.maxMailboxes) {
       this._closeWithError(ws, "capacity_exceeded");
       return;
     }
 
     const prev = maps.mailboxes.get(keyHex);
-    if (prev) {
+    if (prev && this._isExpired(prev.att)) {
+      // An expired registration is ended quietly; only a live one is told `replaced`.
+      this._expireSocket(prev.ws);
+    } else if (prev) {
       maps.mailboxes.delete(keyHex);
       this._evictStandbyPool(isV2, keyHex, prev.regId);
       this._failPendingForMailbox(isV2, keyHex, prev.regId, "offline");
       this._cleanedMark(prev.ws);
       this._decrementIp(prev.att.ip);
       this._setAttachment(prev.ws, null);
+      this._sendJson(prev.ws, { op: "error", code: "replaced" });
       this._safeClose(prev.ws, 1000, "replaced");
     }
 
     const regId = this._allocId();
-    const expiryMs = isV2
-      ? (epoch + 2) * this.constants.v2_epoch_secs * 1000
-      : null;
+    const expiryMs = earliestMs(
+      isV2 ? (epoch + 2) * this.constants.v2_epoch_secs * 1000 : null,
+      this._admissionExpiryMs(keyBytes, auth),
+    );
 
     this.awaitingCmd.delete(ws);
     const nextAtt = {
@@ -1306,13 +1375,23 @@ export class TendrilRelayCore {
     const keyHex = bytesToHex(keyBytes);
     const maps = this._getMaps(isV2);
     const mailbox = maps.mailboxes.get(keyHex);
+    if (mailbox && this._isExpired(mailbox.att)) {
+      this._expireSocket(mailbox.ws);
+      this._closeWithError(ws, "offline");
+      return;
+    }
     if (!mailbox || (isV2 && mailbox.att.epoch !== epoch)) {
       this._closeWithError(ws, "offline");
       return;
     }
 
     let pool = maps.standby.get(keyHex) ?? [];
-    pool = pool.filter((slot) => slot.regId === mailbox.regId && !this.cleanedSockets.has(slot.ws));
+    for (const slot of pool.filter((s) => this._isExpired(s.att))) {
+      this._expireSocket(slot.ws);
+    }
+    pool = (maps.standby.get(keyHex) ?? []).filter(
+      (slot) => slot.regId === mailbox.regId && !this.cleanedSockets.has(slot.ws),
+    );
     if (pool.length >= this.constants.max_standby_per_mailbox) {
       maps.standby.set(keyHex, pool);
       this._closeWithError(ws, "rate_limited");
@@ -1330,7 +1409,7 @@ export class TendrilRelayCore {
       regId: mailbox.regId,
       standbyId,
       epoch,
-      expiryMs: mailbox.att.expiryMs,
+      expiryMs: earliestMs(mailbox.att.expiryMs, this._admissionExpiryMs(keyBytes, auth)),
     };
     this._setAttachment(ws, nextAtt);
     pool.push({ ws, att: nextAtt, regId: mailbox.regId, standbyId });
@@ -1421,6 +1500,11 @@ export class TendrilRelayCore {
     const connIdB64 = msg.conn_id;
     const maps = this._getMaps(isV2);
     const mailbox = maps.mailboxes.get(keyHex);
+    if (mailbox && this._isExpired(mailbox.att)) {
+      this._expireSocket(mailbox.ws);
+      this._closeWithError(ws, "offline");
+      return;
+    }
     if (!mailbox || (isV2 && mailbox.att.epoch !== epoch)) {
       this._closeWithError(ws, "offline");
       return;
@@ -1462,7 +1546,17 @@ export class TendrilRelayCore {
     if (pool && pool.length > 0) {
       while (pool.length > 0) {
         const candidate = pool.shift();
-        if (candidate.regId === mailbox.regId && !this.cleanedSockets.has(candidate.ws)) {
+        if (this.cleanedSockets.has(candidate.ws)) {
+          continue;
+        }
+        if (this._isExpired(candidate.att)) {
+          this._cleanedMark(candidate.ws);
+          this._decrementIp(candidate.att.ip);
+          this._setAttachment(candidate.ws, null);
+          this._safeClose(candidate.ws, 1000, "expired");
+          continue;
+        }
+        if (candidate.regId === mailbox.regId) {
           if (this._sendJson(candidate.ws, incomingMsg)) {
             standbySlot = candidate;
             break;
@@ -1616,6 +1710,17 @@ export class TendrilRelayCore {
       this._closeWithError(ws, "unauthorized");
       return;
     }
+    const owner = maps.mailboxes.get(acceptorKeyHex);
+    if (!owner || owner.regId !== pending.att.regId || this._isExpired(owner.att)) {
+      // The dial's registration has ended or expired: end it, which fails the dial offline.
+      if (owner && owner.regId === pending.att.regId) {
+        this._expireSocket(owner.ws);
+      } else {
+        this._failPendingForMailbox(isV2, acceptorKeyHex, pending.att.regId, "offline");
+      }
+      this._closeWithError(ws, "invalid_request");
+      return;
+    }
     if ((maps.activeCounts.get(acceptorKeyHex) ?? 0) >= this.config.maxActivePerMailbox) {
       this._closeWithError(ws, "rate_limited");
       return;
@@ -1748,18 +1853,18 @@ export class TendrilRelayCore {
       }
     }
 
-    for (const entry of Array.from(this.v2Mailboxes.values())) {
+    for (const entry of [...this.v1Mailboxes.values(), ...this.v2Mailboxes.values()]) {
       if (typeof entry.att.expiryMs === "number" && nowMs >= entry.att.expiryMs) {
         this._cleanupSocket(entry.ws);
-        this._safeClose(entry.ws, 1000, "epoch expired");
+        this._safeClose(entry.ws, 1000, "expired");
       }
     }
 
-    for (const pool of Array.from(this.v2Standby.values())) {
+    for (const pool of [...this.v1Standby.values(), ...this.v2Standby.values()]) {
       for (const slot of Array.from(pool)) {
         if (typeof slot.att.expiryMs === "number" && nowMs >= slot.att.expiryMs) {
           this._cleanupSocket(slot.ws);
-          this._safeClose(slot.ws, 1000, "epoch expired");
+          this._safeClose(slot.ws, 1000, "expired");
         }
       }
     }

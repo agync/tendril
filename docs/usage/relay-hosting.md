@@ -62,7 +62,7 @@ npx wrangler deploy
 
 `deploy/cloudflare/wrangler.jsonc` declares `new_sqlite_classes: ["TendrilRelay"]`, which satisfies Cloudflare Free's requirement that Durable Objects use SQLite storage. Quiet registered `/v1/relay`, `/v2/relay`, and `standby` control sockets hibernate with zero wall-clock duration billing until a frame arrives, and Durable Object alarms never close quiet listeners at the `300 s` stream-idle ceiling. Incoming WebSocket frames count against the Free `100,000` requests/day cap at a `20:1` ratio, and Tendril only uses the relay when `local`, `direct`, `overlay`, and `p2p` links cannot connect.
 
-Set `TENDRIL_RELAY_AUTH_SECRET` for Tier 2 HMAC, `TENDRIL_RELAY_ISSUER_PUBS` for Tier 3 signed `RelayTicket` issuers (comma-separated base64url Ed25519 keys), `TENDRIL_RELAY_ALLOW_MAILBOXES` for Tier 1 allowlisted keys, and `TENDRIL_RELAY_AUTH_SCOPE` (`"all"` default or `"register-only"`). On `dial`, `TendrilRelay` verifies admission inside `tendril-core` WASM before decoding `init_frame`, checking epoch skew, or looking up mailboxes so unauthenticated callers cannot probe peer presence.
+Set `TENDRIL_RELAY_AUTH_SECRET` for Tier 2 HMAC, `TENDRIL_RELAY_ISSUER_PUBS` for Tier 3 signed `RelayTicket` issuers (comma-separated base64url Ed25519 keys), `TENDRIL_RELAY_ALLOW_MAILBOXES` for Tier 1 allowlisted keys, and `TENDRIL_RELAY_AUTH_SCOPE` (`"all"` or `"register-only"`; the default is `"register-only"` when only `TENDRIL_RELAY_ALLOW_MAILBOXES` is set and `"all"` otherwise, and `"all"` with only an allowlist fails closed). On `dial`, `TendrilRelay` verifies admission inside `tendril-core` WASM before decoding `init_frame`, checking epoch skew, or looking up mailboxes so unauthenticated callers cannot probe peer presence.
 
 Socket attachments stay under `1 KiB` across hibernations. Classic non-`fast_open` `init_frame` payloads up to `65,521` bytes live transiently in Durable Object SQLite (`pending_init_frames`) until claimed, withdrawn, or timed out. When serving behind a custom domain whose internal request hostname differs from what clients expect in `challenge.host`, set `TENDRIL_RELAY_HOST` in Wrangler variables.
 
@@ -146,7 +146,9 @@ Always configure at least one admission rule on a public HTTPS endpoint so unaut
 | Shared or multi-tenant app relay | Tier 3 signed `RelayTicket` | Set `--issuer-pub <b64url_pub>` on the relay and mint short-lived tickets (`1..=86400 s`) with `tendril relay-ticket`. |
 | Closed hardware fleet | Tier 1 mailbox allowlist | Pass `--allow-mailbox <b64url_pub>` or `--allow-mailboxes-file <path>` for fixed `/v1/relay` keys. |
 
-Default `--auth-scope all` requires admission on `register`, `accept`, and `dial`. On `dial`, the relay checks `auth` before mailbox lookup so callers without valid credentials cannot probe whether a peer is online.
+With a shared secret or ticket issuer configured, the default `--auth-scope all` requires admission on `register`, `accept`, and `dial`. On `dial`, the relay checks `auth` before mailbox lookup so callers without valid credentials cannot probe whether a peer is online. With only a Tier 1 allowlist the default is `register-only`, and the relay refuses to start if `all` is set explicitly. Allowlist keys must be valid Ed25519 public keys; the relay refuses to start otherwise.
+
+A registration admitted by a `RelayTicket` lasts until the ticket's `not_after` plus the `30 s` clock skew. At that point the relay closes the listener's control and standby sockets, so listeners need a fresh ticket to register again; streams already bridged keep running until they close.
 
 ## Host and client setup
 

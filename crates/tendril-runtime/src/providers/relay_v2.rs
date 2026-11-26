@@ -7,7 +7,7 @@
 //! with `verify_and_record_v2_relay_dial` before opening an accept data socket.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -206,6 +206,23 @@ impl Default for RelayV2ListenerConfig {
     }
 }
 
+/// Listener-wide state an epoch control task updates when the relay reports `replaced`.
+#[derive(Clone)]
+struct EpochTakeover {
+    replaced: Arc<AtomicBool>,
+    listener_stop: watch::Sender<bool>,
+}
+
+impl EpochTakeover {
+    /// Records the takeover and stops the whole listener: every epoch control task, the standby
+    /// pool, and with them `accept`, so it does not re-register and displace the other listener.
+    fn trigger(&self) {
+        self.replaced.store(true, Ordering::Release);
+        tracing::warn!("v2 relay mailbox registration replaced by another listener");
+        self.listener_stop.send_replace(true);
+    }
+}
+
 struct EpochSocketHandle {
     shutdown_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
@@ -256,6 +273,7 @@ pub struct RelayV2Listener {
     standby_pool: Arc<Mutex<Option<StandbyPoolHandle>>>,
     shutdown_tx: watch::Sender<bool>,
     manager_task: Option<JoinHandle<()>>,
+    replaced: Arc<AtomicBool>,
 }
 
 impl RelayV2Listener {
@@ -323,6 +341,11 @@ impl RelayV2Listener {
         let accept_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_ACCEPTS));
         let epoch_tasks = Arc::new(Mutex::new(HashMap::<u64, EpochSocketHandle>::new()));
         let standby_pool = Arc::new(Mutex::new(None));
+        let replaced = Arc::new(AtomicBool::new(false));
+        let takeover = EpochTakeover {
+            replaced: Arc::clone(&replaced),
+            listener_stop: shutdown_tx.clone(),
+        };
         let mut bind_guard = BindCleanupGuard {
             shutdown_tx: shutdown_tx.clone(),
             epoch_tasks: Arc::clone(&epoch_tasks),
@@ -346,6 +369,7 @@ impl RelayV2Listener {
                 Arc::clone(&auth),
                 config.write_timeout,
                 Some(ready_tx),
+                takeover.clone(),
             );
             epoch_tasks
                 .lock()
@@ -390,7 +414,7 @@ impl RelayV2Listener {
             return Err(first_err.unwrap_or(RuntimeError::Closed));
         }
 
-        if center_standby {
+        if center_standby && !*shutdown_tx.borrow() {
             let (pool_handle, sb_ready_rxs) = spawn_v2_standby_pool(
                 relay_url.clone(),
                 required_host.clone(),
@@ -420,6 +444,7 @@ impl RelayV2Listener {
         let standby_pool_c = Arc::clone(&standby_pool);
         let standby_shutdown_tx = shutdown_tx.clone();
         let url_c = relay_url.clone();
+        let takeover_c = takeover.clone();
         let mut shut_rx = shutdown_rx;
         let manager_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(EPOCH_ROTATE_POLL_INTERVAL);
@@ -427,6 +452,7 @@ impl RelayV2Listener {
             let mut active_center = center_epoch;
             loop {
                 tokio::select! {
+                    biased;
                     _ = shut_rx.changed() => {
                         tasks_c
                             .lock()
@@ -470,7 +496,7 @@ impl RelayV2Listener {
                             for h in removed {
                                 h.stop();
                             }
-                            if center_standby {
+                            if center_standby && !*standby_shutdown_tx.borrow() {
                                 let old_sb = standby_pool_c
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -524,6 +550,7 @@ impl RelayV2Listener {
                                     Arc::clone(&auth),
                                     write_timeout,
                                     None,
+                                    takeover_c.clone(),
                                 );
                                 let old = tasks_c
                                     .lock()
@@ -549,6 +576,7 @@ impl RelayV2Listener {
             standby_pool,
             shutdown_tx,
             manager_task: Some(manager_task),
+            replaced,
         })
     }
 
@@ -581,6 +609,15 @@ impl RelayV2Listener {
     #[must_use]
     pub fn active_standby_socket_count(&self) -> usize {
         self.active_standby_sockets.load(Ordering::Acquire)
+    }
+
+    /// Reports whether the relay ended one of this listener's epoch registrations because another
+    /// listener registered the same mailbox (error code `replaced`). Once
+    /// [`PathListener::accept`] has returned [`RuntimeError::Closed`], a `true` result means the
+    /// listener stopped on purpose instead of re-registering and displacing the other one.
+    #[must_use]
+    pub fn was_replaced(&self) -> bool {
+        self.replaced.load(Ordering::Acquire)
     }
 
     /// Returns the shared [`RelayDialReplayCache`] guarding `incoming` dial notifications.
@@ -929,6 +966,7 @@ fn spawn_epoch_control_task(
     auth: Arc<RelayClientAuth>,
     write_timeout: Duration,
     ready_tx: Option<oneshot::Sender<Result<bool, RuntimeError>>>,
+    takeover: EpochTakeover,
 ) -> EpochSocketHandle {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(async move {
@@ -1119,6 +1157,14 @@ fn spawn_epoch_control_task(
                                 ping_sleep
                                     .as_mut()
                                     .reset(TokioInstant::now() + jittered_ping_delay());
+                                if matches!(
+                                    serde_json::from_str::<RelayV2ServerMsg>(&text),
+                                    Ok(RelayV2ServerMsg::Error { code }) if code == "replaced"
+                                ) {
+                                    takeover.trigger();
+                                    let _ = timeout(write_timeout, control_ws.close(None)).await;
+                                    break false;
+                                }
                                 if let Ok(RelayV2ServerMsg::Incoming {
                                     mailbox_id: inc_mailbox_b64,
                                     epoch: inc_epoch,
@@ -1528,6 +1574,40 @@ mod tests {
     use tendril_core::v2::RELAY_V2_EPOCH_SECS;
 
     use super::*;
+
+    #[tokio::test]
+    async fn replaced_v2_listener_returns_closed_without_reregistering() {
+        let relay = crate::providers::EmbeddedRelay::bind_local("127.0.0.1")
+            .await
+            .expect("relay");
+        let secret = [0x6B; 32];
+        let mut old = RelayV2Listener::bind(relay.ws_v2_url(), None, secret, DEFAULT_WRITE_TIMEOUT)
+            .await
+            .expect("bind old v2 listener");
+        let mut new = RelayV2Listener::bind(relay.ws_v2_url(), None, secret, DEFAULT_WRITE_TIMEOUT)
+            .await
+            .expect("bind displacing v2 listener");
+
+        let ended = timeout(Duration::from_secs(5), old.accept())
+            .await
+            .expect("replaced v2 listener kept waiting for streams");
+        assert!(matches!(ended, Err(RuntimeError::Closed)));
+        assert!(old.was_replaced());
+        assert_eq!(old.active_control_socket_count(), 0);
+        assert_eq!(old.active_standby_socket_count(), 0);
+
+        let _stream = RelayV2Dialer::new(secret)
+            .connect(&relay.ws_v2_url())
+            .await
+            .expect("dial displacing v2 listener");
+        timeout(Duration::from_secs(5), new.accept())
+            .await
+            .expect("displacing v2 listener accepts in time")
+            .expect("displacing v2 listener stream");
+        assert!(!new.was_replaced());
+        assert_eq!(new.active_control_socket_count(), 3);
+        relay.shutdown().await.expect("stop relay");
+    }
 
     #[test]
     fn control_ping_delay_is_jittered_within_bounds() {

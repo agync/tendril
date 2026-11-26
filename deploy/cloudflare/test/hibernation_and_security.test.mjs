@@ -795,3 +795,396 @@ test("config defaults match spec, orphan auth scope fails closed, open relay che
   assert.notEqual(d.client.closed, null);
   assert.notEqual(acc.client.closed, null);
 });
+
+test("ticket-admitted registrations and standby sockets end after not_after plus skew while bridged streams run on", async () => {
+  const issuer = genEd25519Identity();
+  const listener = genEd25519Identity();
+  const v2Listener = genEd25519Identity();
+  const nowUnix = 1_760_000_000;
+  const h = createHibernatingHarness(
+    { TENDRIL_RELAY_ISSUER_PUBS: issuer.pubB64, TENDRIL_RELAY_AUTH_SCOPE: "register-only" },
+    nowUnix * 1000,
+  );
+  const notAfter = nowUnix + 60;
+  const deadlineMs = (notAfter + 30 + 1) * 1000;
+  const ticket = mintTicket(issuer, "relay.example", "register", listener.pubB64, nowUnix - 10, notAfter);
+
+  const l = await h.connect("/v1/relay");
+  await l.sendJson({
+    op: "register",
+    pub: listener.pubB64,
+    sig: signV1Register(listener, "relay.example", l.challenge.nonce),
+    auth: ticket,
+  });
+  assert.deepEqual(l.client.drainJson(), [{ op: "registered", pub: listener.pubB64 }]);
+  const standbys = [];
+  for (let i = 0; i < 2; i += 1) {
+    const sb = await h.connect("/v1/relay");
+    await sb.sendJson({
+      op: "standby",
+      pub: listener.pubB64,
+      sig: signV1Register(listener, "relay.example", sb.challenge.nonce),
+      auth: ticket,
+    });
+    assert.deepEqual(sb.client.drainJson(), [{ op: "standby_ready" }]);
+    standbys.push(sb);
+  }
+
+  const v2 = await h.connect("/v2/relay");
+  const epoch = v2.challenge.epoch;
+  const v2Ticket = mintTicket(issuer, "relay.example", "register", v2Listener.pubB64, nowUnix - 10, notAfter);
+  await v2.sendJson({
+    op: "register",
+    mailbox_id: v2Listener.pubB64,
+    epoch,
+    sig: signV2Register(v2Listener, "relay.example", v2.challenge.nonce, epoch),
+    auth: v2Ticket,
+  });
+  assert.deepEqual(v2.client.drainJson(), [
+    { op: "registered", mailbox_id: v2Listener.pubB64, epoch },
+  ]);
+  const v2Sb = await h.connect("/v2/relay");
+  await v2Sb.sendJson({
+    op: "standby",
+    mailbox_id: v2Listener.pubB64,
+    epoch,
+    sig: signV2Register(v2Listener, "relay.example", v2Sb.challenge.nonce, epoch),
+    auth: v2Ticket,
+  });
+  assert.deepEqual(v2Sb.client.drainJson(), [
+    { op: "standby_ready", mailbox_id: v2Listener.pubB64, epoch },
+  ]);
+
+  // A stream bridged before expiry runs until it closes.
+  const conn = b64url(randomBytes(16));
+  const d = await h.connect("/v1/relay");
+  await d.sendJson({ op: "dial", target_pub: listener.pubB64, conn_id: conn });
+  assert.deepEqual(d.client.drainJson(), [{ op: "ready", conn_id: conn }]);
+  assert.deepEqual(standbys[0].client.drainJson(), [{ op: "incoming", conn_id: conn }]);
+
+  assert.ok(h.alarmMs !== null && h.alarmMs <= deadlineMs, `alarm ${h.alarmMs} after ${deadlineMs}`);
+  h.setNow(deadlineMs - 1000);
+  await h.triggerAlarm();
+  for (const s of [l, standbys[1], v2, v2Sb]) {
+    assert.equal(s.client.closed, null);
+  }
+
+  h.setNow(deadlineMs);
+  await h.triggerAlarm();
+  for (const s of [l, standbys[1], v2, v2Sb]) {
+    assert.notEqual(s.client.closed, null);
+  }
+  assert.equal(d.client.closed, null);
+  assert.equal(standbys[0].client.closed, null);
+  const payload = Uint8Array.from([9, 8, 7]);
+  await d.sendRaw(payload);
+  assert.deepEqual(standbys[0].client.drainAll(), [payload]);
+
+  const late = await h.connect("/v1/relay");
+  await late.sendJson({ op: "dial", target_pub: listener.pubB64, conn_id: b64url(randomBytes(16)) });
+  assert.deepEqual(late.client.drainJson(), [{ op: "error", code: "offline" }]);
+});
+
+test("a replaced registration fails its pending dials offline and closes with replaced", async () => {
+  const h = createHibernatingHarness();
+  const listener = genEd25519Identity();
+
+  const old = await h.connect("/v1/relay");
+  await old.sendJson({
+    op: "register",
+    pub: listener.pubB64,
+    sig: signV1Register(listener, "relay.example", old.challenge.nonce),
+  });
+  assert.deepEqual(old.client.drainJson(), [{ op: "registered", pub: listener.pubB64 }]);
+  const conn = b64url(randomBytes(16));
+  const d = await h.connect("/v1/relay");
+  await d.sendJson({ op: "dial", target_pub: listener.pubB64, conn_id: conn });
+  assert.deepEqual(old.client.drainJson(), [{ op: "incoming", conn_id: conn }]);
+
+  const next = await h.connect("/v1/relay");
+  await next.sendJson({
+    op: "register",
+    pub: listener.pubB64,
+    sig: signV1Register(listener, "relay.example", next.challenge.nonce),
+  });
+  assert.deepEqual(next.client.drainJson(), [{ op: "registered", pub: listener.pubB64 }]);
+  assert.deepEqual(d.client.drainJson(), [{ op: "error", code: "offline" }]);
+  assert.deepEqual(old.client.drainJson(), [{ op: "error", code: "replaced" }]);
+  assert.notEqual(old.client.closed, null);
+  assert.equal(next.client.closed, null);
+});
+
+test("auth scope defaults to register-only when only a mailbox allowlist is configured", () => {
+  const key = genEd25519Identity().pubB64;
+  const tier1 = parseRelayConfig({ TENDRIL_RELAY_ALLOW_MAILBOXES: key });
+  assert.equal(tier1.authScope, "register-only");
+  assert.deepEqual(tier1.authRequired, ["register"]);
+  const tier3 = parseRelayConfig({ TENDRIL_RELAY_ISSUER_PUBS: key });
+  assert.equal(tier3.authScope, "all");
+  assert.deepEqual(tier3.authRequired, ["register", "dial"]);
+  const tier1And2 = parseRelayConfig({
+    TENDRIL_RELAY_ALLOW_MAILBOXES: key,
+    TENDRIL_RELAY_AUTH_SECRET: "shared-secret",
+  });
+  assert.equal(tier1And2.authScope, "all");
+  assert.throws(
+    () => parseRelayConfig({ TENDRIL_RELAY_ALLOW_MAILBOXES: b64url(new Uint8Array(32)) }),
+    /./,
+  );
+});
+
+test("expired registrations and standby sockets are refused at lookup before the alarm runs", async () => {
+  const issuer = genEd25519Identity();
+  const listener = genEd25519Identity();
+  const other = genEd25519Identity();
+  const nowUnix = 1_760_000_000;
+  const h = createHibernatingHarness(
+    { TENDRIL_RELAY_ISSUER_PUBS: issuer.pubB64, TENDRIL_RELAY_AUTH_SCOPE: "register-only" },
+    nowUnix * 1000,
+  );
+  const ticket = mintTicket(issuer, "relay.example", "register", listener.pubB64, nowUnix - 10, nowUnix + 60);
+  const l = await h.connect("/v1/relay");
+  await l.sendJson({
+    op: "register",
+    pub: listener.pubB64,
+    sig: signV1Register(listener, "relay.example", l.challenge.nonce),
+    auth: ticket,
+  });
+  assert.deepEqual(l.client.drainJson(), [{ op: "registered", pub: listener.pubB64 }]);
+
+  // A registration that no dial will touch, so its standby lookup meets the expiry itself.
+  const third = genEd25519Identity();
+  const thirdTicket = mintTicket(issuer, "relay.example", "register", third.pubB64, nowUnix - 10, nowUnix + 60);
+  const t = await h.connect("/v1/relay");
+  await t.sendJson({
+    op: "register",
+    pub: third.pubB64,
+    sig: signV1Register(third, "relay.example", t.challenge.nonce),
+    auth: thirdTicket,
+  });
+  assert.deepEqual(t.client.drainJson(), [{ op: "registered", pub: third.pubB64 }]);
+
+  // A second listener keeps a long registration with a short-lived standby socket.
+  const long = mintTicket(issuer, "relay.example", "register", other.pubB64, nowUnix - 10, nowUnix + 3600);
+  const short = mintTicket(issuer, "relay.example", "register", other.pubB64, nowUnix - 10, nowUnix + 60);
+  const o = await h.connect("/v1/relay");
+  await o.sendJson({
+    op: "register",
+    pub: other.pubB64,
+    sig: signV1Register(other, "relay.example", o.challenge.nonce),
+    auth: long,
+  });
+  assert.deepEqual(o.client.drainJson(), [{ op: "registered", pub: other.pubB64 }]);
+  const sb = await h.connect("/v1/relay");
+  await sb.sendJson({
+    op: "standby",
+    pub: other.pubB64,
+    sig: signV1Register(other, "relay.example", sb.challenge.nonce),
+    auth: short,
+  });
+  assert.deepEqual(sb.client.drainJson(), [{ op: "standby_ready" }]);
+
+  // Past the deadline, without running the alarm.
+  h.setNow((nowUnix + 60 + 30 + 1) * 1000);
+  const d = await h.connect("/v1/relay");
+  await d.sendJson({ op: "dial", target_pub: listener.pubB64, conn_id: b64url(randomBytes(16)) });
+  assert.deepEqual(d.client.drainJson(), [{ op: "error", code: "offline" }]);
+  assert.notEqual(l.client.closed, null);
+
+  assert.equal(t.client.closed, null);
+  const lateSb = await h.connect("/v1/relay");
+  const fresh = mintTicket(issuer, "relay.example", "register", third.pubB64, nowUnix + 80, nowUnix + 150);
+  await lateSb.sendJson({
+    op: "standby",
+    pub: third.pubB64,
+    sig: signV1Register(third, "relay.example", lateSb.challenge.nonce),
+    auth: fresh,
+  });
+  assert.deepEqual(lateSb.client.drainJson(), [{ op: "error", code: "offline" }]);
+  assert.notEqual(t.client.closed, null);
+
+  const conn = b64url(randomBytes(16));
+  const d2 = await h.connect("/v1/relay");
+  await d2.sendJson({ op: "dial", target_pub: other.pubB64, conn_id: conn });
+  assert.deepEqual(d2.client.drainJson(), []);
+  assert.deepEqual(o.client.drainJson(), [{ op: "incoming", conn_id: conn }]);
+  assert.deepEqual(sb.client.drainJson(), []);
+  assert.notEqual(sb.client.closed, null);
+});
+
+test("v2 replacement closes parked standbys and sends replaced", async () => {
+  const h = createHibernatingHarness();
+  const listener = genEd25519Identity();
+
+  const old = await h.connect("/v2/relay");
+  const epoch = old.challenge.epoch;
+  await old.sendJson({
+    op: "register",
+    mailbox_id: listener.pubB64,
+    epoch,
+    sig: signV2Register(listener, "relay.example", old.challenge.nonce, epoch),
+  });
+  assert.deepEqual(old.client.drainJson(), [{ op: "registered", mailbox_id: listener.pubB64, epoch }]);
+  const sb = await h.connect("/v2/relay");
+  await sb.sendJson({
+    op: "standby",
+    mailbox_id: listener.pubB64,
+    epoch,
+    sig: signV2Register(listener, "relay.example", sb.challenge.nonce, epoch),
+  });
+  assert.deepEqual(sb.client.drainJson(), [{ op: "standby_ready", mailbox_id: listener.pubB64, epoch }]);
+
+  const next = await h.connect("/v2/relay");
+  await next.sendJson({
+    op: "register",
+    mailbox_id: listener.pubB64,
+    epoch,
+    sig: signV2Register(listener, "relay.example", next.challenge.nonce, epoch),
+  });
+  assert.deepEqual(next.client.drainJson(), [{ op: "registered", mailbox_id: listener.pubB64, epoch }]);
+  assert.deepEqual(old.client.drainJson(), [{ op: "error", code: "replaced" }]);
+  assert.notEqual(old.client.closed, null);
+  assert.notEqual(sb.client.closed, null);
+  assert.equal(next.client.closed, null);
+});
+
+test("v1 replacement closes the replaced registration's parked standby sockets", async () => {
+  const h = createHibernatingHarness();
+  const listener = genEd25519Identity();
+  const old = await h.connect("/v1/relay");
+  await old.sendJson({
+    op: "register",
+    pub: listener.pubB64,
+    sig: signV1Register(listener, "relay.example", old.challenge.nonce),
+  });
+  assert.deepEqual(old.client.drainJson(), [{ op: "registered", pub: listener.pubB64 }]);
+  const sb = await h.connect("/v1/relay");
+  await sb.sendJson({
+    op: "standby",
+    pub: listener.pubB64,
+    sig: signV1Register(listener, "relay.example", sb.challenge.nonce),
+  });
+  assert.deepEqual(sb.client.drainJson(), [{ op: "standby_ready" }]);
+
+  const next = await h.connect("/v1/relay");
+  await next.sendJson({
+    op: "register",
+    pub: listener.pubB64,
+    sig: signV1Register(listener, "relay.example", next.challenge.nonce),
+  });
+  assert.deepEqual(old.client.drainJson(), [{ op: "error", code: "replaced" }]);
+  assert.notEqual(sb.client.closed, null);
+  const conn = b64url(randomBytes(16));
+  const d = await h.connect("/v1/relay");
+  await d.sendJson({ op: "dial", target_pub: listener.pubB64, conn_id: conn });
+  assert.deepEqual(d.client.drainJson(), []);
+  assert.deepEqual(next.client.drainJson(), [
+    { op: "registered", pub: listener.pubB64 },
+    { op: "incoming", conn_id: conn },
+  ]);
+});
+
+test("explicit auth scope all fails closed when only a mailbox allowlist is configured", () => {
+  const key = genEd25519Identity().pubB64;
+  assert.throws(
+    () => parseRelayConfig({ TENDRIL_RELAY_ALLOW_MAILBOXES: key, TENDRIL_RELAY_AUTH_SCOPE: "all" }),
+    /TENDRIL_RELAY_AUTH_SCOPE/,
+  );
+  const ok = parseRelayConfig({
+    TENDRIL_RELAY_ALLOW_MAILBOXES: key,
+    TENDRIL_RELAY_AUTH_SECRET: "shared-secret",
+    TENDRIL_RELAY_AUTH_SCOPE: "all",
+  });
+  assert.deepEqual(ok.authRequired, ["register", "dial"]);
+});
+
+test("an expired registration accepted against or taken over ends quietly", async () => {
+  const issuer = genEd25519Identity();
+  const nowUnix = 1_760_000_000;
+  const later = nowUnix + 60 + 30 + 1;
+  const h = createHibernatingHarness(
+    {
+      TENDRIL_RELAY_ISSUER_PUBS: issuer.pubB64,
+      TENDRIL_RELAY_AUTH_SCOPE: "register-only",
+      TENDRIL_RELAY_MAX_MAILBOXES: "2",
+    },
+    nowUnix * 1000,
+  );
+  const register = async (id, notBefore, notAfter) => {
+    const s = await h.connect("/v1/relay");
+    await s.sendJson({
+      op: "register",
+      pub: id.pubB64,
+      sig: signV1Register(id, "relay.example", s.challenge.nonce),
+      auth: mintTicket(issuer, "relay.example", "register", id.pubB64, notBefore, notAfter),
+    });
+    return s;
+  };
+
+  const a = genEd25519Identity();
+  const b = genEd25519Identity();
+  const oldA = await register(a, nowUnix - 10, nowUnix + 60);
+  assert.deepEqual(oldA.client.drainJson(), [{ op: "registered", pub: a.pubB64 }]);
+  const oldB = await register(b, nowUnix - 10, nowUnix + 60);
+  assert.deepEqual(oldB.client.drainJson(), [{ op: "registered", pub: b.pubB64 }]);
+  const conn = b64url(randomBytes(16));
+  const d = await h.connect("/v1/relay");
+  await d.sendJson({ op: "dial", target_pub: b.pubB64, conn_id: conn });
+  assert.deepEqual(oldB.client.drainJson(), [{ op: "incoming", conn_id: conn }]);
+
+  // Past the deadline, without running the alarm.
+  h.setNow(later * 1000);
+
+  // The accept carries its own valid ticket; only the registration has expired.
+  const acc = await h.connect("/v1/relay");
+  await acc.sendJson({
+    op: "accept",
+    pub: b.pubB64,
+    conn_id: conn,
+    sig: signV1Accept(b, "relay.example", acc.challenge.nonce, conn),
+    auth: mintTicket(issuer, "relay.example", "register", b.pubB64, later - 5, later + 60),
+  });
+  assert.deepEqual(acc.client.drainJson(), [{ op: "error", code: "invalid_request" }]);
+  assert.deepEqual(d.client.drainJson(), [{ op: "error", code: "offline" }]);
+  assert.notEqual(oldB.client.closed, null);
+
+  // Registering again ends the expired registration without telling it `replaced`.
+  const newA = await register(a, later - 5, later + 60);
+  assert.deepEqual(newA.client.drainJson(), [{ op: "registered", pub: a.pubB64 }]);
+  assert.deepEqual(oldA.client.drainJson(), []);
+  assert.notEqual(oldA.client.closed, null);
+});
+
+test("expired registrations do not count against mailbox capacity", async () => {
+  const issuer = genEd25519Identity();
+  const nowUnix = 1_760_000_000;
+  const later = nowUnix + 60 + 30 + 1;
+  const h = createHibernatingHarness(
+    {
+      TENDRIL_RELAY_ISSUER_PUBS: issuer.pubB64,
+      TENDRIL_RELAY_AUTH_SCOPE: "register-only",
+      TENDRIL_RELAY_MAX_MAILBOXES: "1",
+    },
+    nowUnix * 1000,
+  );
+  const register = async (id, notBefore, notAfter) => {
+    const s = await h.connect("/v1/relay");
+    await s.sendJson({
+      op: "register",
+      pub: id.pubB64,
+      sig: signV1Register(id, "relay.example", s.challenge.nonce),
+      auth: mintTicket(issuer, "relay.example", "register", id.pubB64, notBefore, notAfter),
+    });
+    return s;
+  };
+  const a = genEd25519Identity();
+  const oldA = await register(a, nowUnix - 10, nowUnix + 60);
+  assert.deepEqual(oldA.client.drainJson(), [{ op: "registered", pub: a.pubB64 }]);
+
+  h.setNow(later * 1000);
+  const b = genEd25519Identity();
+  const newB = await register(b, later - 5, later + 60);
+  assert.deepEqual(newB.client.drainJson(), [{ op: "registered", pub: b.pubB64 }]);
+  assert.deepEqual(oldA.client.drainJson(), []);
+  assert.notEqual(oldA.client.closed, null);
+});

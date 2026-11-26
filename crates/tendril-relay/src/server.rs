@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,10 +17,12 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
-use tendril_core::crypto::{b64url_decode_array, b64url_encode, random_bytes};
+use tendril_core::crypto::{
+    b64url_decode_array, b64url_encode, is_valid_ed25519_public_key, random_bytes,
+};
 use tendril_core::relay_auth::{
-    RelayAuthProof, RelayAuthRole, RelayAuthScope, validate_relay_auth_secret,
-    verify_relay_auth_hmac, verify_relay_ticket,
+    RELAY_TICKET_CLOCK_SKEW_SECS, RelayAuthProof, RelayAuthRole, RelayAuthScope,
+    validate_relay_auth_secret, verify_relay_auth_hmac, verify_relay_ticket,
 };
 use tendril_core::v2::{
     RELAY_V2_EPOCH_SECS, canonical_relay_host, epoch_for_unix, epoch_within_skew,
@@ -29,7 +31,7 @@ use tendril_core::v2::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
@@ -303,6 +305,8 @@ pub struct RelayConfig {
     pub allowed_mailboxes: Vec<[u8; 32]>,
     pub auth_secret: Option<Zeroizing<Vec<u8>>>,
     pub trusted_issuers: Vec<[u8; 32]>,
+    /// Option 1A scope. [`RelayServer::bind`] rejects [`RelayAuthScope::All`] when a mailbox
+    /// allowlist is the only admission control, since no proof could then admit a `dial`.
     pub auth_scope: RelayAuthScope,
     /// Test-only clock seam overriding wall-clock Unix seconds for deterministic expiry tests.
     pub clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
@@ -320,6 +324,10 @@ pub enum RelayTestPoint {
     AcceptClaimed,
     /// A pending dial saw its control connection end or its accept deadline pass.
     DialTeardown,
+    /// A registration reached its admission deadline and has not been torn down yet.
+    RegistrationExpired,
+    /// A parked standby socket reached its admission deadline and has not closed yet.
+    StandbyExpired,
 }
 
 /// Hook type of [`RelayConfig::test_hook`].
@@ -552,6 +560,12 @@ struct MailboxEntry {
     reg_id: u64,
     fast_open: bool,
     incoming_tx: mpsc::Sender<IncomingV1Notification>,
+    /// Notified when the relay ends this registration from another handler.
+    ended: Arc<Notify>,
+    /// Set before `ended` is notified when a live registration was displaced by a newer one.
+    displaced: Arc<AtomicBool>,
+    /// Unix second from which this registration has expired, if its admission bounds it.
+    deadline_unix: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -570,16 +584,24 @@ struct MailboxV2Entry {
     epoch: u64,
     fast_open: bool,
     incoming_tx: mpsc::Sender<IncomingV2Notification>,
+    /// Notified when the relay ends this registration from another handler.
+    ended: Arc<Notify>,
+    /// Set before `ended` is notified when a live registration was displaced by a newer one.
+    displaced: Arc<AtomicBool>,
+    /// Unix second from which this registration has expired.
+    deadline_unix: Option<u64>,
 }
 
 struct PendingDial {
     dial_id: u64,
+    reg_id: u64,
     target_pub: [u8; 32],
     match_tx: oneshot::Sender<AcceptorTransfer>,
 }
 
 struct PendingV2Dial {
     dial_id: u64,
+    reg_id: u64,
     target_mailbox: [u8; 32],
     epoch: u64,
     match_tx: oneshot::Sender<AcceptorTransfer>,
@@ -603,7 +625,21 @@ struct StandbyDispatch<N> {
 struct StandbySlot<N> {
     id: u64,
     reg_id: u64,
+    deadline_unix: Option<u64>,
     dispatch_tx: oneshot::Sender<StandbyDispatch<N>>,
+}
+
+impl<N> StandbySlot<N> {
+    /// Reports whether this slot can still take a dial for registration `reg_id` at `now_unix`.
+    fn usable(&self, reg_id: u64, now_unix: u64) -> bool {
+        self.reg_id == reg_id
+            && !self.dispatch_tx.is_closed()
+            && !deadline_passed(self.deadline_unix, now_unix)
+    }
+}
+
+fn deadline_passed(deadline_unix: Option<u64>, now_unix: u64) -> bool {
+    deadline_unix.is_some_and(|deadline| now_unix >= deadline)
 }
 
 struct RelayTables {
@@ -645,6 +681,69 @@ impl RelayTables {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         id
+    }
+
+    /// Ends `/v1/relay` registration `reg_id` of `key`: removes it if it is still current, its
+    /// parked standby sockets, and its pending dials. Dropping a pending dial's `match_tx` fails
+    /// that dial with `offline`.
+    fn end_v1_registration(&mut self, key: &[u8; 32], reg_id: u64) {
+        if self
+            .mailboxes
+            .get(key)
+            .is_some_and(|entry| entry.reg_id == reg_id)
+        {
+            self.mailboxes.remove(key);
+            self.standby.remove(key);
+        }
+        let before = self.pending.len();
+        self.pending
+            .retain(|_, dial| !(dial.target_pub == *key && dial.reg_id == reg_id));
+        for _ in self.pending.len()..before {
+            decrement_count(&mut self.pending_counts, key);
+        }
+    }
+
+    /// Ends every registration whose deadline has passed at `now_unix`, signalling each owner
+    /// to close without `replaced`.
+    fn purge_expired(&mut self, now_unix: u64) {
+        let v1: Vec<_> = self
+            .mailboxes
+            .iter()
+            .filter(|(_, entry)| deadline_passed(entry.deadline_unix, now_unix))
+            .map(|(key, entry)| (*key, entry.reg_id, Arc::clone(&entry.ended)))
+            .collect();
+        for (key, reg_id, ended) in v1 {
+            ended.notify_one();
+            self.end_v1_registration(&key, reg_id);
+        }
+        let v2: Vec<_> = self
+            .v2_mailboxes
+            .iter()
+            .filter(|(_, entry)| deadline_passed(entry.deadline_unix, now_unix))
+            .map(|(key, entry)| (*key, entry.reg_id, Arc::clone(&entry.ended)))
+            .collect();
+        for (key, reg_id, ended) in v2 {
+            ended.notify_one();
+            self.end_v2_registration(&key, reg_id);
+        }
+    }
+
+    /// `/v2/relay` counterpart of [`Self::end_v1_registration`].
+    fn end_v2_registration(&mut self, key: &[u8; 32], reg_id: u64) {
+        if self
+            .v2_mailboxes
+            .get(key)
+            .is_some_and(|entry| entry.reg_id == reg_id)
+        {
+            self.v2_mailboxes.remove(key);
+            self.v2_standby.remove(key);
+        }
+        let before = self.v2_pending.len();
+        self.v2_pending
+            .retain(|_, dial| !(dial.target_mailbox == *key && dial.reg_id == reg_id));
+        for _ in self.v2_pending.len()..before {
+            decrement_count(&mut self.v2_pending_counts, key);
+        }
     }
 }
 
@@ -758,15 +857,12 @@ struct MailboxRegGuard {
 
 impl Drop for MailboxRegGuard {
     fn drop(&mut self) {
-        let mut tables = self.state.tables.lock().expect("tables mutex poisoned");
-        if tables
-            .mailboxes
-            .get(&self.mailbox_pub)
-            .is_some_and(|entry| entry.reg_id == self.reg_id)
-        {
-            tables.mailboxes.remove(&self.mailbox_pub);
-            tables.standby.remove(&self.mailbox_pub);
-        }
+        let mut tables = self
+            .state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tables.end_v1_registration(&self.mailbox_pub, self.reg_id);
     }
 }
 
@@ -834,14 +930,7 @@ impl Drop for MailboxV2RegGuard {
             .tables
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if tables
-            .v2_mailboxes
-            .get(&self.mailbox_id)
-            .is_some_and(|entry| entry.reg_id == self.reg_id)
-        {
-            tables.v2_mailboxes.remove(&self.mailbox_id);
-            tables.v2_standby.remove(&self.mailbox_id);
-        }
+        tables.end_v2_registration(&self.mailbox_id, self.reg_id);
     }
 }
 
@@ -934,6 +1023,26 @@ pub struct RelayServer {
 impl RelayServer {
     /// Binds a TCP listener using `config`, optionally enabling native `rustls` TLS.
     pub async fn bind(config: RelayConfig) -> Result<Self, RelayError> {
+        for (label, keys) in [
+            ("allowed_mailboxes", &config.allowed_mailboxes),
+            ("trusted_issuers", &config.trusted_issuers),
+        ] {
+            if !keys.iter().all(is_valid_ed25519_public_key) {
+                return Err(RelayError::InvalidConfig(format!(
+                    "{label} must contain only valid Ed25519 public keys"
+                )));
+            }
+        }
+        if !config.allowed_mailboxes.is_empty()
+            && !config.has_tier2_or_3()
+            && config.auth_scope.includes_dial()
+        {
+            return Err(RelayError::InvalidConfig(
+                "auth_scope all needs a shared secret or trusted issuers; a mailbox allowlist \
+                 alone admits only register"
+                    .to_owned(),
+            ));
+        }
         if let Some(secret) = &config.auth_secret {
             validate_relay_auth_secret(secret)
                 .map_err(|err| RelayError::InvalidConfig(err.to_string()))?;
@@ -1127,7 +1236,7 @@ async fn send_error_and_close(
         write_timeout,
     )
     .await;
-    let _ = timeout(write_timeout, ws.close(None)).await;
+    close_after_error(ws, write_timeout).await;
 }
 
 async fn send_v2_error_and_close(
@@ -1143,7 +1252,21 @@ async fn send_v2_error_and_close(
         write_timeout,
     )
     .await;
+    close_after_error(ws, write_timeout).await;
+}
+
+/// Closes `ws` and briefly reads what the peer still sends, so the error frame written just
+/// before is not discarded by a reset when unread input is pending at close.
+async fn close_after_error(
+    ws: &mut WebSocketStream<PrefixedStream<RelayTcpStream>>,
+    write_timeout: Duration,
+) {
+    const ERROR_DRAIN: Duration = Duration::from_millis(250);
     let _ = timeout(write_timeout, ws.close(None)).await;
+    let _ = timeout(ERROR_DRAIN, async {
+        while let Some(Ok(_)) = ws.next().await {}
+    })
+    .await;
 }
 
 fn is_mailbox_allowlisted(config: &RelayConfig, key: &[u8; 32]) -> bool {
@@ -1222,6 +1345,69 @@ fn verify_dial_admission(
         return true;
     }
     verify_admission_proof(config, "dial", RelayAuthRole::Dial, nonce, target_key, auth)
+}
+
+/// Returns the Unix second at which an admitted `register` or `standby` stops being valid: the
+/// first second after `not_after + RELAY_TICKET_CLOCK_SKEW_SECS` when a ticket admitted it.
+fn admission_deadline_unix(
+    config: &RelayConfig,
+    mailbox_key: &[u8; 32],
+    auth: Option<&RelayAuthProof>,
+) -> Option<u64> {
+    if !config.requires_register_admission() || is_mailbox_allowlisted(config, mailbox_key) {
+        return None;
+    }
+    match auth {
+        Some(RelayAuthProof::Ticket { ticket }) => Some(
+            ticket
+                .not_after
+                .saturating_add(RELAY_TICKET_CLOCK_SKEW_SECS)
+                .saturating_add(1),
+        ),
+        _ => None,
+    }
+}
+
+/// Unix second at which a `/v2/relay` registration for `epoch` rotates out of the window.
+fn v2_epoch_deadline_unix(epoch: u64) -> u64 {
+    epoch.saturating_add(2).saturating_mul(RELAY_V2_EPOCH_SECS)
+}
+
+/// Earliest of two optional Unix deadlines.
+fn earliest_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Resolves once the relay clock reaches `deadline_unix`, or never when it is `None`.
+async fn unix_deadline(config: &RelayConfig, deadline_unix: Option<u64>) {
+    let Some(deadline) = deadline_unix else {
+        return std::future::pending().await;
+    };
+    if config.clock.is_some() {
+        let mut poll = tokio::time::interval(Duration::from_millis(20));
+        poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        while config.now_unix_secs() < deadline {
+            poll.tick().await;
+        }
+        return;
+    }
+    // Sleep in short chunks against the sub-second wall clock so neither second truncation
+    // nor a wall-clock jump delays the deadline by more than one chunk.
+    let deadline_ms = u128::from(deadline).saturating_mul(1000);
+    loop {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let Some(left_ms) = deadline_ms.checked_sub(now_ms).filter(|left| *left > 0) else {
+            return;
+        };
+        let chunk = u64::try_from(left_ms.min(1000)).unwrap_or(1000);
+        tokio::time::sleep(Duration::from_millis(chunk)).await;
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1702,6 +1888,7 @@ async fn handle_register(
         send_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
         return;
     }
+    let deadline = admission_deadline_unix(&state.config, &mailbox_pub, auth.as_ref());
 
     let chan_cap = state
         .config
@@ -1709,23 +1896,46 @@ async fn handle_register(
         .saturating_mul(2)
         .max(8);
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<IncomingV1Notification>(chan_cap);
+    let ended = Arc::new(Notify::new());
+    let displaced = Arc::new(AtomicBool::new(false));
     let reg_id_opt = {
-        let mut tables = state.tables.lock().expect("tables mutex poisoned");
+        let now = state.config.now_unix_secs();
+        let mut tables = state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let max_mailboxes = state.config.max_mailboxes.max(1);
         if !tables.mailboxes.contains_key(&mailbox_pub)
-            && tables.total_mailbox_count() >= state.config.max_mailboxes.max(1)
+            && tables.total_mailbox_count() >= max_mailboxes
+        {
+            tables.purge_expired(now);
+        }
+        if !tables.mailboxes.contains_key(&mailbox_pub)
+            && tables.total_mailbox_count() >= max_mailboxes
         {
             None
         } else {
             let reg_id = tables.alloc_id();
             tables.standby.remove(&mailbox_pub);
-            tables.mailboxes.insert(
+            let previous = tables.mailboxes.insert(
                 mailbox_pub,
                 MailboxEntry {
                     reg_id,
                     fast_open,
                     incoming_tx,
+                    ended: Arc::clone(&ended),
+                    displaced: Arc::clone(&displaced),
+                    deadline_unix: deadline,
                 },
             );
+            if let Some(previous) = previous {
+                // An expired registration is ended quietly; only a live one is displaced.
+                if !deadline_passed(previous.deadline_unix, now) {
+                    previous.displaced.store(true, Ordering::Release);
+                }
+                previous.ended.notify_one();
+                tables.end_v1_registration(&mailbox_pub, previous.reg_id);
+            }
             Some(reg_id)
         }
     };
@@ -1751,12 +1961,19 @@ async fn handle_register(
         return;
     }
 
+    let expiry = unix_deadline(&state.config, deadline);
+    tokio::pin!(expiry);
     let idle_sleep = tokio::time::sleep(state.config.idle_timeout.max(Duration::from_millis(1)));
     tokio::pin!(idle_sleep);
     let mut awaiting_pong = false;
-
     loop {
         tokio::select! {
+            biased;
+            () = ended.notified() => break,
+            () = &mut expiry => {
+                state.config.test_point(RelayTestPoint::RegistrationExpired).await;
+                break;
+            }
             () = &mut idle_sleep => {
                 if awaiting_pong {
                     break;
@@ -1807,7 +2024,13 @@ async fn handle_register(
     }
     drop(reg_guard);
     drop(incoming_rx);
-    let _ = timeout(state.config.write_timeout, ws.close(None)).await;
+    // The flag is set under the tables lock before the newer registration's entry drops this
+    // one's sender, so it is visible here whichever branch ended the loop.
+    if displaced.load(Ordering::Acquire) {
+        send_error_and_close(&mut ws, "replaced", state.config.write_timeout).await;
+    } else {
+        let _ = timeout(state.config.write_timeout, ws.close(None)).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1819,7 +2042,7 @@ async fn park_standby_socket<N, AckMsg, IncMsg>(
     standby_guard: StandbySlotGuard,
     mut dispatch_rx: oneshot::Receiver<StandbyDispatch<N>>,
     ack_msg: &AckMsg,
-    v2_epoch: Option<u64>,
+    deadline_unix: Option<u64>,
     build_incoming: impl FnOnce(N) -> IncMsg,
 ) where
     AckMsg: Serialize,
@@ -1829,37 +2052,18 @@ async fn park_standby_socket<N, AckMsg, IncMsg>(
         return;
     }
 
-    let expiry_unix = v2_epoch.map_or(u64::MAX, |ep| {
-        ep.saturating_add(2).saturating_mul(RELAY_V2_EPOCH_SECS)
-    });
-    let expire_secs = if v2_epoch.is_some() {
-        expiry_unix.saturating_sub(state.config.now_unix_secs())
-    } else {
-        u64::MAX
-    };
-    let wall_expiry = tokio::time::sleep(if v2_epoch.is_some() {
-        Duration::from_secs(expire_secs)
-    } else {
-        Duration::from_secs(86_400)
-    });
-    tokio::pin!(wall_expiry);
-    let has_v2_expiry = v2_epoch.is_some();
-    let has_custom_clock = has_v2_expiry && state.config.clock.is_some();
-    let mut clock_poll = tokio::time::interval(Duration::from_millis(20));
-    clock_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let expiry = unix_deadline(&state.config, deadline_unix);
+    tokio::pin!(expiry);
     let idle_sleep = tokio::time::sleep(state.config.idle_timeout.max(Duration::from_millis(1)));
     tokio::pin!(idle_sleep);
     let mut awaiting_pong = false;
 
     loop {
         tokio::select! {
-            () = &mut wall_expiry, if has_v2_expiry && !has_custom_clock => {
+            biased;
+            () = &mut expiry => {
+                state.config.test_point(RelayTestPoint::StandbyExpired).await;
                 break;
-            }
-            _ = clock_poll.tick(), if has_custom_clock => {
-                if state.config.now_unix_secs() >= expiry_unix {
-                    break;
-                }
             }
             () = &mut idle_sleep => {
                 if awaiting_pong {
@@ -1941,27 +2145,38 @@ async fn handle_standby(
         send_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
         return;
     }
+    let deadline = admission_deadline_unix(&state.config, &mailbox_pub, auth.as_ref());
 
     let (dispatch_tx, dispatch_rx) = oneshot::channel();
     let enqueue: Result<u64, &'static str> = {
-        let mut tables = state.tables.lock().expect("tables mutex poisoned");
-        if let Some(entry) = tables.mailboxes.get(&mailbox_pub) {
-            let reg_id = entry.reg_id;
-            let standby_id = tables.alloc_id();
-            let pool = tables.standby.entry(mailbox_pub).or_default();
-            pool.retain(|slot| slot.reg_id == reg_id && !slot.dispatch_tx.is_closed());
-            if pool.len() >= MAX_STANDBY_PER_MAILBOX {
-                Err("rate_limited")
-            } else {
-                pool.push_back(StandbySlot {
-                    id: standby_id,
-                    reg_id,
-                    dispatch_tx,
-                });
-                Ok(standby_id)
+        let now = state.config.now_unix_secs();
+        let mut tables = state
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match tables.mailboxes.get(&mailbox_pub).cloned() {
+            Some(entry) if deadline_passed(entry.deadline_unix, now) => {
+                tables.end_v1_registration(&mailbox_pub, entry.reg_id);
+                Err("offline")
             }
-        } else {
-            Err("offline")
+            Some(entry) => {
+                let reg_id = entry.reg_id;
+                let standby_id = tables.alloc_id();
+                let pool = tables.standby.entry(mailbox_pub).or_default();
+                pool.retain(|slot| slot.usable(reg_id, now));
+                if pool.len() >= MAX_STANDBY_PER_MAILBOX {
+                    Err("rate_limited")
+                } else {
+                    pool.push_back(StandbySlot {
+                        id: standby_id,
+                        reg_id,
+                        deadline_unix: deadline,
+                        dispatch_tx,
+                    });
+                    Ok(standby_id)
+                }
+            }
+            None => Err("offline"),
         }
     };
     let standby_id = match enqueue {
@@ -1986,7 +2201,7 @@ async fn handle_standby(
         guard,
         dispatch_rx,
         &RelayServerMsg::StandbyReady,
-        None,
+        deadline,
         |note| RelayServerMsg::Incoming {
             conn_id: note.conn_id,
             init_frame: note.init_frame,
@@ -2079,8 +2294,18 @@ async fn handle_dial(
         }
 
         let step = {
-            let mut tables = state.tables.lock().expect("tables mutex poisoned");
-            if let Some(mailbox) = tables.mailboxes.get(&target_pub).cloned() {
+            let now = state.config.now_unix_secs();
+            let mut tables = state
+                .tables
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut current = tables.mailboxes.get(&target_pub).cloned();
+            if let Some(expired) =
+                current.take_if(|mailbox| deadline_passed(mailbox.deadline_unix, now))
+            {
+                tables.end_v1_registration(&target_pub, expired.reg_id);
+            }
+            if let Some(mailbox) = current {
                 let active_count = tables
                     .active_per_mailbox
                     .get(&target_pub)
@@ -2097,7 +2322,7 @@ async fn handle_dial(
                     let mut popped = None;
                     if let Some(pool) = tables.standby.get_mut(&target_pub) {
                         while let Some(slot) = pool.pop_front() {
-                            if slot.reg_id == mailbox.reg_id && !slot.dispatch_tx.is_closed() {
+                            if slot.usable(mailbox.reg_id, now) {
                                 popped = Some(slot);
                                 break;
                             }
@@ -2128,6 +2353,7 @@ async fn handle_dial(
                             conn_id,
                             PendingDial {
                                 dial_id,
+                                reg_id: mailbox.reg_id,
                                 target_pub,
                                 match_tx: match_tx_opt.take().expect("single fallback insert"),
                             },
@@ -2329,9 +2555,26 @@ async fn handle_accept(
             .tables
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = state.config.now_unix_secs();
         match tables.pending.get(&conn_id) {
             None => ClaimResult::NotFound,
             Some(entry) if entry.target_pub != acceptor_pub => ClaimResult::WrongOwner,
+            Some(entry)
+                if !tables
+                    .mailboxes
+                    .get(&entry.target_pub)
+                    .is_some_and(|owner| {
+                        owner.reg_id == entry.reg_id && !deadline_passed(owner.deadline_unix, now)
+                    }) =>
+            {
+                // The dial's registration has ended or expired: end it, which fails the dial.
+                let (key, reg_id) = (entry.target_pub, entry.reg_id);
+                if let Some(owner) = tables.mailboxes.get(&key).filter(|o| o.reg_id == reg_id) {
+                    owner.ended.notify_one();
+                }
+                tables.end_v1_registration(&key, reg_id);
+                ClaimResult::NotFound
+            }
             Some(entry) => {
                 let active_count = tables
                     .active_per_mailbox
@@ -2577,6 +2820,10 @@ async fn handle_v2_register(
         send_v2_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
         return;
     }
+    let deadline = earliest_deadline(
+        Some(v2_epoch_deadline_unix(epoch)),
+        admission_deadline_unix(&state.config, &mailbox_id, auth.as_ref()),
+    );
 
     let chan_cap = state
         .config
@@ -2584,27 +2831,46 @@ async fn handle_v2_register(
         .saturating_mul(2)
         .max(8);
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<IncomingV2Notification>(chan_cap);
+    let ended = Arc::new(Notify::new());
+    let displaced = Arc::new(AtomicBool::new(false));
     let reg_id_opt = {
+        let now = state.config.now_unix_secs();
         let mut tables = state
             .tables
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let max_mailboxes = state.config.max_mailboxes.max(1);
         if !tables.v2_mailboxes.contains_key(&mailbox_id)
-            && tables.total_mailbox_count() >= state.config.max_mailboxes.max(1)
+            && tables.total_mailbox_count() >= max_mailboxes
+        {
+            tables.purge_expired(now);
+        }
+        if !tables.v2_mailboxes.contains_key(&mailbox_id)
+            && tables.total_mailbox_count() >= max_mailboxes
         {
             None
         } else {
             let reg_id = tables.alloc_id();
             tables.v2_standby.remove(&mailbox_id);
-            tables.v2_mailboxes.insert(
+            let previous = tables.v2_mailboxes.insert(
                 mailbox_id,
                 MailboxV2Entry {
                     reg_id,
                     epoch,
                     fast_open,
                     incoming_tx,
+                    ended: Arc::clone(&ended),
+                    displaced: Arc::clone(&displaced),
+                    deadline_unix: deadline,
                 },
             );
+            if let Some(previous) = previous {
+                if !deadline_passed(previous.deadline_unix, now) {
+                    previous.displaced.store(true, Ordering::Release);
+                }
+                previous.ended.notify_one();
+                tables.end_v2_registration(&mailbox_id, previous.reg_id);
+            }
             Some(reg_id)
         }
     };
@@ -2631,26 +2897,18 @@ async fn handle_v2_register(
         return;
     }
 
-    let expiry_unix = epoch.saturating_add(2).saturating_mul(RELAY_V2_EPOCH_SECS);
-    let expire_secs = expiry_unix.saturating_sub(state.config.now_unix_secs());
-    let wall_expiry = tokio::time::sleep(Duration::from_secs(expire_secs));
-    tokio::pin!(wall_expiry);
-    let has_custom_clock = state.config.clock.is_some();
-    let mut clock_poll = tokio::time::interval(Duration::from_millis(20));
-    clock_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let expiry = unix_deadline(&state.config, deadline);
+    tokio::pin!(expiry);
     let idle_sleep = tokio::time::sleep(state.config.idle_timeout.max(Duration::from_millis(1)));
     tokio::pin!(idle_sleep);
     let mut awaiting_pong = false;
-
     loop {
         tokio::select! {
-            () = &mut wall_expiry, if !has_custom_clock => {
+            biased;
+            () = ended.notified() => break,
+            () = &mut expiry => {
+                state.config.test_point(RelayTestPoint::RegistrationExpired).await;
                 break;
-            }
-            _ = clock_poll.tick(), if has_custom_clock => {
-                if state.config.now_unix_secs() >= expiry_unix {
-                    break;
-                }
             }
             () = &mut idle_sleep => {
                 if awaiting_pong {
@@ -2706,7 +2964,11 @@ async fn handle_v2_register(
     }
     drop(reg_guard);
     drop(incoming_rx);
-    let _ = timeout(state.config.write_timeout, ws.close(None)).await;
+    if displaced.load(Ordering::Acquire) {
+        send_v2_error_and_close(&mut ws, "replaced", state.config.write_timeout).await;
+    } else {
+        let _ = timeout(state.config.write_timeout, ws.close(None)).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2743,6 +3005,10 @@ async fn handle_v2_standby(
         send_v2_error_and_close(&mut ws, "unauthorized", state.config.write_timeout).await;
         return;
     }
+    let deadline = earliest_deadline(
+        Some(v2_epoch_deadline_unix(epoch)),
+        admission_deadline_unix(&state.config, &mailbox_id, auth.as_ref()),
+    );
 
     let (dispatch_tx, dispatch_rx) = oneshot::channel();
     let enqueue: Result<u64, &'static str> = {
@@ -2750,27 +3016,31 @@ async fn handle_v2_standby(
             .tables
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = tables.v2_mailboxes.get(&mailbox_id) {
-            if entry.epoch != epoch {
+        let now = state.config.now_unix_secs();
+        match tables.v2_mailboxes.get(&mailbox_id).cloned() {
+            Some(entry) if deadline_passed(entry.deadline_unix, now) => {
+                tables.end_v2_registration(&mailbox_id, entry.reg_id);
                 Err("offline")
-            } else {
+            }
+            Some(entry) if entry.epoch != epoch => Err("offline"),
+            Some(entry) => {
                 let reg_id = entry.reg_id;
                 let standby_id = tables.alloc_id();
                 let pool = tables.v2_standby.entry(mailbox_id).or_default();
-                pool.retain(|slot| slot.reg_id == reg_id && !slot.dispatch_tx.is_closed());
+                pool.retain(|slot| slot.usable(reg_id, now));
                 if pool.len() >= MAX_STANDBY_PER_MAILBOX {
                     Err("rate_limited")
                 } else {
                     pool.push_back(StandbySlot {
                         id: standby_id,
                         reg_id,
+                        deadline_unix: deadline,
                         dispatch_tx,
                     });
                     Ok(standby_id)
                 }
             }
-        } else {
-            Err("offline")
+            None => Err("offline"),
         }
     };
     let standby_id = match enqueue {
@@ -2798,7 +3068,7 @@ async fn handle_v2_standby(
             mailbox_id: mailbox_id_b64,
             epoch,
         },
-        Some(epoch),
+        deadline,
         |note| RelayV2ServerMsg::Incoming {
             mailbox_id: note.mailbox_id,
             epoch: note.epoch,
@@ -2868,11 +3138,18 @@ async fn handle_v2_dial(
         }
 
         let step = {
+            let now = state.config.now_unix_secs();
             let mut tables = state
                 .tables
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(mailbox) = tables.v2_mailboxes.get(&target_mailbox).cloned() {
+            let mut current = tables.v2_mailboxes.get(&target_mailbox).cloned();
+            if let Some(expired) =
+                current.take_if(|mailbox| deadline_passed(mailbox.deadline_unix, now))
+            {
+                tables.end_v2_registration(&target_mailbox, expired.reg_id);
+            }
+            if let Some(mailbox) = current {
                 if mailbox.epoch != epoch {
                     Step::Err("offline")
                 } else {
@@ -2896,7 +3173,7 @@ async fn handle_v2_dial(
                         let mut popped = None;
                         if let Some(pool) = tables.v2_standby.get_mut(&target_mailbox) {
                             while let Some(slot) = pool.pop_front() {
-                                if slot.reg_id == mailbox.reg_id && !slot.dispatch_tx.is_closed() {
+                                if slot.usable(mailbox.reg_id, now) {
                                     popped = Some(slot);
                                     break;
                                 }
@@ -2930,6 +3207,7 @@ async fn handle_v2_dial(
                                 conn_id,
                                 PendingV2Dial {
                                     dial_id,
+                                    reg_id: mailbox.reg_id,
                                     target_mailbox,
                                     epoch,
                                     match_tx: match_tx_opt.take().expect("single fallback insert"),
@@ -3154,10 +3432,26 @@ async fn handle_v2_accept(
             .tables
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = state.config.now_unix_secs();
         match tables.v2_pending.get(&conn_id) {
             None => ClaimResult::NotFound,
             Some(entry) if entry.target_mailbox != acceptor_mailbox || entry.epoch != epoch => {
                 ClaimResult::WrongOwner
+            }
+            Some(entry)
+                if !tables
+                    .v2_mailboxes
+                    .get(&entry.target_mailbox)
+                    .is_some_and(|owner| {
+                        owner.reg_id == entry.reg_id && !deadline_passed(owner.deadline_unix, now)
+                    }) =>
+            {
+                let (key, reg_id) = (entry.target_mailbox, entry.reg_id);
+                if let Some(owner) = tables.v2_mailboxes.get(&key).filter(|o| o.reg_id == reg_id) {
+                    owner.ended.notify_one();
+                }
+                tables.end_v2_registration(&key, reg_id);
+                ClaimResult::NotFound
             }
             Some(entry) => {
                 let active_count = tables
