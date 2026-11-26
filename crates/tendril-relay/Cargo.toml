@@ -30,8 +30,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 zeroize.workspace = true
 
+[features]
+# Test seams (fake clock, ordering hooks). Never enable outside test targets.
+test-hooks = []
+
 [dev-dependencies]
 tempfile.workspace = true
+tendril-relay = { path = ".", features = ["test-hooks"] }
 
 [lints]
 workspace = true
