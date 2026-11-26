@@ -140,6 +140,22 @@ fn publish_roster(mem: &mut Roster, disk: Roster, identity: &EndpointIdentity) {
     *mem = next;
 }
 
+/// Persists the revocations and CRLs live sessions learned in memory, under the roster file
+/// lock. Nothing is written when the store already holds them: no `roster.json` is created and
+/// an existing one keeps its mtime.
+fn commit_session_state(
+    store: &StateStore,
+    roster: &StdMutex<Roster>,
+    identity: &EndpointIdentity,
+) -> Result<(), RuntimeError> {
+    let (_, disk, _) = store.update_roster_if_changed(|disk| {
+        merge_session_state(disk, &lock_roster(roster), identity);
+        Ok(())
+    })?;
+    publish_roster(&mut lock_roster(roster), disk, identity);
+    Ok(())
+}
+
 /// Folds revocations and CRLs learned in memory by a live session into the on-disk roster
 /// without overwriting any other committed state.
 fn merge_session_state(disk: &mut Roster, mem: &Roster, identity: &EndpointIdentity) {
@@ -240,14 +256,9 @@ async fn commit_session_async(
         let store = Arc::clone(store);
         let roster = Arc::clone(roster);
         let identity = Arc::clone(identity);
-        tokio::task::spawn_blocking(move || {
-            commit_roster(&store, &roster, &identity, |disk, mem| {
-                merge_session_state(disk, mem, &identity);
-                Ok(())
-            })
-        })
-        .await
-        .map_err(|e| RuntimeError::Protocol(e.to_string()))??;
+        tokio::task::spawn_blocking(move || commit_session_state(&store, &roster, &identity))
+            .await
+            .map_err(|e| RuntimeError::Protocol(e.to_string()))??;
     }
     Ok(())
 }
@@ -2503,11 +2514,7 @@ impl Endpoint {
             // CRLs only this endpoint's sessions hold first, so the driver sees them.
             if let Some(store) = store.as_ref() {
                 let _guard = store_lock.blocking_lock();
-                commit_roster(store, &roster_arc, &identity_sync, |disk, mem| {
-                    merge_session_state(disk, mem, &identity_sync);
-                    Ok(())
-                })
-                .map_err(py_err)?;
+                commit_session_state(store, &roster_arc, &identity_sync).map_err(py_err)?;
             }
             sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity_sync)?;
             let fallback_floor = pinned_pairing_floor(&lock_roster(&roster_arc), &pinned_host);

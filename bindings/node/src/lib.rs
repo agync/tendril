@@ -170,6 +170,22 @@ fn publish_roster(mem: &mut Roster, disk: Roster, identity: &EndpointIdentity) {
     *mem = next;
 }
 
+/// Persists the revocations and CRLs live sessions learned in memory, under the roster file
+/// lock. Nothing is written when the store already holds them: no `roster.json` is created and
+/// an existing one keeps its mtime.
+fn commit_session_state(
+    store: &StateStore,
+    roster: &StdMutex<Roster>,
+    identity: &EndpointIdentity,
+) -> std::result::Result<(), RuntimeError> {
+    let (_, disk, _) = store.update_roster_if_changed(|disk| {
+        merge_session_state(disk, &lock_roster(roster), identity);
+        Ok(())
+    })?;
+    publish_roster(&mut lock_roster(roster), disk, identity);
+    Ok(())
+}
+
 /// Folds revocations and CRLs learned in memory by a live session into the on-disk roster
 /// without overwriting any other committed state.
 fn merge_session_state(disk: &mut Roster, mem: &Roster, identity: &EndpointIdentity) {
@@ -270,15 +286,10 @@ async fn commit_session_async(
         let store = Arc::clone(store);
         let roster = Arc::clone(roster);
         let identity = Arc::clone(identity);
-        tokio::task::spawn_blocking(move || {
-            commit_roster(&store, &roster, &identity, |disk, mem| {
-                merge_session_state(disk, mem, &identity);
-                Ok(())
-            })
-        })
-        .await
-        .map_err(to_generic_err)?
-        .map_err(to_generic_err)?;
+        tokio::task::spawn_blocking(move || commit_session_state(&store, &roster, &identity))
+            .await
+            .map_err(to_generic_err)?
+            .map_err(to_generic_err)?;
     }
     Ok(())
 }
