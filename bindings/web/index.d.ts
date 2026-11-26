@@ -80,7 +80,6 @@ export interface PendingHostClaim {
   host_id: string;
   device_id: string;
   name: string;
-  state: string;
   static_pub: string;
   signing_pub_hash: string | null;
   rotation_seq: number;
@@ -705,8 +704,13 @@ export class TendrilWebClient {
     options?: { routePolicy?: RoutePolicy; replaceRoutes?: boolean }
   ): Promise<RouteApplyResult>;
   confirmPeer(peerId: string, sas?: string | null): Promise<void>;
-  /** Drops every unconfirmed host claim naming `peerId` and revokes nothing. */
+  /** Removes a `pending` peer entry and every unconfirmed host claim naming `peerId`; revokes nothing. */
   removePendingPeer(peerId: string): Promise<void>;
+  /**
+   * Drops every unconfirmed host claim naming `hostId`, touching no roster entry and revoking
+   * nothing. Rejects when no claim names it.
+   */
+  removePendingHost(hostId: string): Promise<void>;
   /**
    * The unconfirmed host claims left by unpinned pairing, oldest first. `host_id` is the
    * unauthenticated label a claim names and `device_id` the id derived from its static key in

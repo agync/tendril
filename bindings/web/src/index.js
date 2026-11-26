@@ -1160,9 +1160,17 @@ export class TendrilWebClient {
     await this.#mutateRoster(() => this.#roster.confirm_peer(peerId, sas));
   }
 
-  /** Drops every unconfirmed host claim naming `peerId` and revokes nothing. */
+  /** Removes a `pending` peer entry and every unconfirmed host claim naming `peerId`; revokes nothing. */
   async removePendingPeer(peerId) {
     await this.#mutateRoster(() => this.#roster.remove_pending_peer(peerId));
+  }
+
+  /**
+   * Drops every unconfirmed host claim naming `hostId`, touching no roster entry and revoking
+   * nothing. Rejects when no claim names it.
+   */
+  async removePendingHost(hostId) {
+    await this.#mutateRoster(() => this.#roster.remove_pending_host_claims(hostId));
   }
 
   /**

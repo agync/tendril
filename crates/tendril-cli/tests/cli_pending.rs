@@ -105,3 +105,57 @@ fn pending_list_remove_and_revoke_by_device_id() {
         "removing claims revokes nothing"
     );
 }
+
+#[test]
+fn removing_claims_never_touches_roster_entries() {
+    let dir = TempDir::new().expect("dir");
+    assert!(run_tendril(dir.path(), &["init"]).status.success());
+    let store = StateStore::open_or_create(dir.path()).expect("store");
+    let inbound_key = *StaticKeypair::from_scalar([0x71; 32]).public_bytes();
+    let inbound = device_id(&inbound_key);
+    store
+        .update_roster(|roster| {
+            roster
+                .record_pending_pair(
+                    inbound_key,
+                    Some(SigningKeypair::from_seed([0x72; 32]).public_key().clone()),
+                    "Inbound".to_owned(),
+                    "cli".to_owned(),
+                    "654321".to_owned(),
+                )
+                .expect("inbound pending device");
+            // A hostile host names the id of the real inbound device.
+            claim(roster, &inbound, 0x41);
+            let active_key = *StaticKeypair::from_scalar([0x75; 32]).public_bytes();
+            let active_signing = SigningKeypair::from_seed([0x76; 32]).public_key().clone();
+            roster
+                .insert_pinned_host(
+                    "act".to_owned(),
+                    "Active".to_owned(),
+                    active_key,
+                    Some(active_signing),
+                    0,
+                    Vec::new(),
+                )
+                .expect("pin");
+            Ok(())
+        })
+        .expect("seed");
+
+    let removed = json_out(&run_tendril(dir.path(), &["pending", "remove", &inbound]));
+    assert_eq!(removed["removed_pending"], inbound.as_str());
+    let roster = store.load_roster().expect("roster");
+    assert_eq!(roster.pending_hosts().count(), 0);
+    assert_eq!(
+        roster.get(&inbound).map(|e| e.state),
+        Some(PeerState::Pending),
+        "the inbound device survives"
+    );
+
+    // An entry is no claim: not found, and untouched.
+    let out = run_tendril(dir.path(), &["pending", "remove", "act"]);
+    assert!(!out.status.success());
+    let roster = store.load_roster().expect("roster");
+    assert_eq!(roster.get("act").map(|e| e.state), Some(PeerState::Active));
+    assert!(roster.get(&inbound).is_some());
+}

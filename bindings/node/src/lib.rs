@@ -22,7 +22,7 @@ use tendril_core::error::CoreError;
 use tendril_core::grants::{Grant, RevocationList, authorize_grant, canonical_json};
 use tendril_core::group::GroupManifest;
 use tendril_core::identity::{
-    EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
+    EndpointIdentity, RotationRecord, SigningKeyPin, is_valid_host_id, verify_rotation_chain,
 };
 use tendril_core::pairing::{
     EnrollmentPolicy, IssueOptions, PairAction, PairOutcome, PairingCodeKind, PairingConfig,
@@ -1752,6 +1752,9 @@ impl Endpoint {
         let has_active_anchor = roster
             .trust_anchors()
             .any(|(_, a)| a.state == AnchorState::Active);
+        if !is_valid_host_id(identity.host_id()) {
+            return Err(to_generic_err("invalid local host_id"));
+        }
         let identity = Arc::new(identity);
         let roster = Arc::new(StdMutex::new(roster));
         let access_roster = if store.is_some() {
@@ -2267,15 +2270,15 @@ impl Endpoint {
     #[napi]
     pub async fn pending_hosts(&self) -> Result<String> {
         self.sync_roster_from_store().await?;
-        Ok(tendril_runtime::pending_hosts_json(&lock_roster(&self.roster)).to_string())
+        Ok(lock_roster(&self.roster).pending_hosts_json().to_string())
     }
 
     /// Drops every unconfirmed host claim naming `host_id` and revokes nothing.
     #[napi]
-    pub fn remove_pending_peer(&self, host_id: String) -> Result<()> {
+    pub fn remove_pending_host(&self, host_id: String) -> Result<()> {
         self.update_roster_sync(|roster| {
             roster
-                .remove_pending_peer(&host_id)
+                .remove_pending_host_claims(&host_id)
                 .map_err(RuntimeError::from)
         })
     }
@@ -2288,7 +2291,10 @@ impl Endpoint {
             roster
                 .revoke_pending_host(&device_id)
                 .map_err(RuntimeError::from)
-        })
+        })?;
+        // Revoking a claim's keys also revokes trust anchors sharing its signing key.
+        self.refresh_m2m_enabled(&lock_roster(&self.roster));
+        Ok(())
     }
 
     #[napi]

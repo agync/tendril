@@ -704,33 +704,6 @@ impl StateStore {
     }
 }
 
-/// The unconfirmed host claims of `roster`, oldest first, as the JSON array every binding lists:
-/// `host_id` is the unauthenticated label a claim names, `device_id` the id derived from its
-/// static key in the handshake (the only id a claim revocation matches).
-#[must_use]
-pub fn pending_hosts_json(roster: &Roster) -> serde_json::Value {
-    serde_json::Value::Array(
-        roster
-            .pending_hosts()
-            .map(|claim| {
-                serde_json::json!({
-                    "host_id": claim.device_id,
-                    "device_id": tendril_core::crypto::device_id(&claim.static_pub),
-                    "name": claim.name,
-                    "static_pub": b64url_encode(&claim.static_pub),
-                    "signing_pub_hash": claim
-                        .signing_pub
-                        .as_ref()
-                        .map(|k| b64url_encode(&k.sha256_hash())),
-                    "rotation_seq": claim.rotation_seq,
-                    "min_wire_version": claim.min_wire_version,
-                    "pairing_sas": claim.last_pairing_sas,
-                })
-            })
-            .collect(),
-    )
-}
-
 /// The serialized form of `roster`, compared to tell whether a transaction changed it.
 fn roster_fingerprint(roster: &Roster) -> Result<Zeroizing<Vec<u8>>, RuntimeError> {
     serde_json::to_vec(roster)

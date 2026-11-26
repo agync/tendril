@@ -3635,12 +3635,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Pending { cmd } => match cmd {
             PendingCommand::List => {
                 let roster = store.load_roster()?;
-                let claims = tendril_runtime::pending_hosts_json(&roster);
+                let claims = roster.pending_hosts_json();
                 print_json_line(&serde_json::json!({ "pending_hosts": claims }));
             }
             PendingCommand::Remove { host_id } => {
                 store.update_roster(|roster| {
-                    roster.remove_pending_peer(&host_id).map_err(Into::into)
+                    roster
+                        .remove_pending_host_claims(&host_id)
+                        .map_err(Into::into)
                 })?;
                 print_json_line(&serde_json::json!({ "removed_pending": host_id }));
             }

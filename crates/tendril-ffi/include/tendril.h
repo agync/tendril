@@ -182,7 +182,7 @@ int32_t tendril_endpoint_revoke_peer(TendrilEndpoint *ep, const char *peer_id);
  * tendril_string_free. */
 int32_t tendril_endpoint_pending_hosts(TendrilEndpoint *ep, char **out_json);
 /* Drops every claim naming host_id and revokes nothing. TENDRIL_ERR_NOT_FOUND when none. */
-int32_t tendril_endpoint_remove_pending_peer(TendrilEndpoint *ep, const char *host_id);
+int32_t tendril_endpoint_remove_pending_host(TendrilEndpoint *ep, const char *host_id);
 /* Revokes the keys of the claims whose device_id matches, never a claimed host_id.
  * TENDRIL_ERR_NOT_FOUND when no claim has that device_id. */
 int32_t tendril_endpoint_revoke_pending_host(TendrilEndpoint *ep, const char *device_id);

@@ -84,7 +84,7 @@ pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
 pub use store::{
     RosterStamp, StateStore, deserialize_identity_json, deserialize_identity_json_with_signer,
-    pending_hosts_json, serialize_identity_json,
+    serialize_identity_json,
 };
 pub use v2_driver::{
     ConcurrentV2Session, DEFAULT_ARGON2_ACQUIRE_TIMEOUT, DEFAULT_ARGON2_CONCURRENCY,

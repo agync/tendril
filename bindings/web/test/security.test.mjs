@@ -566,6 +566,11 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
     assert.equal(client.pendingHosts().length, 1);
 
     await assert.rejects(
+      () => client.removePendingHost("sec-host"),
+      /storage quota exceeded/
+    );
+    assert.equal(client.pendingHosts().length, 1);
+    await assert.rejects(
       () => client.removePendingPeer("sec-host"),
       /storage quota exceeded/
     );
