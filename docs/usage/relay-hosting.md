@@ -36,7 +36,7 @@ Tendril tries `local`, `direct`, `overlay`, and `p2p` (`iroh`) links before fall
 | **Oracle Cloud Always Free** | Developers and self-hosters | Always Free E2.1.Micro (card required for signup verification) | Yes | [Oracle Cloud stack](https://github.com/agync/tendril/tree/main/deploy/oracle) |
 | **Render Blueprint (`free`)** | Testing and wake-assisted peers | Free web service, sleeps after 15 min idle | Sleeps on `free` (paid `starter` stays up) | [Render Blueprint](https://github.com/agync/tendril/tree/main/deploy/render) |
 | **Railway Docker image** | Developers and small teams | Usage trial then Hobby credit tier, bills active CPU and RAM | Yes while credit covers runtime | [Railway config](https://github.com/agync/tendril/tree/main/deploy/railway) |
-| **Fly.io (`--ha=false`)** | Developers wanting regional placement | Paid per machine (~USD 2/mo for one shared-cpu 256 MB machine) | Yes with `min_machines_running = 1` | [Fly.io config](https://github.com/agync/tendril/tree/main/deploy/fly) |
+| **Fly.io (`--ha=false`)** | Developers wanting regional placement | Free plan: $5/mo credit with card ($1 for 7 days without card; over $5 bills full month) | Yes with `min_machines_running = 1` | [Fly.io config](https://github.com/agync/tendril/tree/main/deploy/fly) |
 
 > [!IMPORTANT]
 > Run `tendril-relay` as a single instance (`numReplicas: 1`, `numInstances: 1`, or `fly launch --ha=false`), and keep the Cloudflare Worker routed to one named Durable Object (`global`). Registered mailboxes live in single-instance memory or attached sockets, so load-balancing across two replicas causes dials to fail `"offline"`.
@@ -95,7 +95,7 @@ fly secrets set TENDRIL_RELAY_AUTH_SECRET="$(openssl rand -hex 32)"
 fly deploy --ha=false
 ```
 
-`tendril-relay` detects `FLY_APP_NAME` automatically and binds challenge nonces to `<app>.fly.dev`. Pin a release tag (`ghcr.io/agync/tendril-relay:vX.Y.Z`) matching a release that includes PaaS env support instead of `:latest` for production deployments.
+`tendril-relay` detects `FLY_APP_NAME` automatically and binds challenge nonces to `<app>.fly.dev`. One `shared-cpu-1x` (`256 MB`) machine (~USD 2/mo) fits within Fly.io's Free plan ($5/mo allowance once a card is added, or a $1 one-time 7-day credit without a card; exceeding $5 in a month moves the organization to Pay As You Go and bills the entire month from the first cent). Pin a release tag (`ghcr.io/agync/tendril-relay:vX.Y.Z`) matching a release that includes PaaS env support instead of `:latest` for production deployments.
 
 ### Railway container service
 
