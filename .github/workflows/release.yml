@@ -348,34 +348,44 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.ref }}
           persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
-      - name: Build XCFramework zip
+      - name: Build XCFramework zip and verify Package.swift checksum
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           set -euo pipefail
-          for target in aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim; do
-            cargo build --locked --release --target "$target" -p tendril-ffi --lib
-          done
-          hdrs="$RUNNER_TEMP/xcframework-headers"
-          mkdir -p "$hdrs" dist-apple
-          cp crates/tendril-ffi/include/tendril.h "$hdrs/tendril.h"
-          cat > "$hdrs/module.modulemap" <<'EOF'
-          module TendrilFFI {
-            header "tendril.h"
-            export *
-          }
-          EOF
-          xcodebuild -create-xcframework \
-            -library target/aarch64-apple-darwin/release/libtendril_ffi.a -headers "$hdrs" \
-            -library target/aarch64-apple-ios/release/libtendril_ffi.a -headers "$hdrs" \
-            -library target/aarch64-apple-ios-sim/release/libtendril_ffi.a -headers "$hdrs" \
-            -output "$RUNNER_TEMP/TendrilFFI.xcframework"
-          ditto -c -k --sequesterRsrc --keepParent \
-            "$RUNNER_TEMP/TendrilFFI.xcframework" \
-            "dist-apple/TendrilFFI.xcframework-${VERSION}.zip"
+          zip_path="dist-apple/TendrilFFI.xcframework-${VERSION}.zip"
+          actual_sha=$(scripts/build-xcframework.sh "$VERSION" "$zip_path")
+          swift_sha=$(swift package compute-checksum "$zip_path")
+          if [ "$actual_sha" != "$swift_sha" ]; then
+            echo "checksum mismatch between packer ($actual_sha) and SwiftPM ($swift_sha)" >&2
+            exit 1
+          fi
+          if [ -n "$TAG" ]; then
+            python3 -I - "$VERSION" "$actual_sha" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version, actual_sha = sys.argv[1], sys.argv[2]
+          manifest = Path("Package.swift").read_text(encoding="utf-8")
+          ver_m = re.search(r'^let tendrilReleaseVersion = "([^"]+)"$', manifest, re.M)
+          sha_m = re.search(r'^let tendrilXCFrameworkChecksum = "([0-9a-f]{64})"$', manifest, re.M)
+          if not ver_m or not sha_m:
+              raise SystemExit("Package.swift missing tendrilReleaseVersion or tendrilXCFrameworkChecksum")
+          if ver_m.group(1) != version:
+              raise SystemExit(f"Package.swift version {ver_m.group(1)} != release version {version}")
+          if sha_m.group(1) != actual_sha:
+              raise SystemExit(f"Package.swift checksum {sha_m.group(1)} != built {actual_sha}")
+          print(f"Verified Package.swift matches {version} ({actual_sha})")
+          PY
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-apple
