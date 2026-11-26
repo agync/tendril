@@ -119,6 +119,9 @@ function isMetadataOrLinkLocalHost(host) {
     }
     if (v6.every((w) => w === 0)) return true;
     if ((v6[0] & 0xffc0) === 0xfe80) return true;
+    // Teredo 2001::/32 and local-use NAT64 64:ff9b:1::/48 embed an unverifiable IPv4 target.
+    if (v6[0] === 0x2001 && v6[1] === 0) return true;
+    if (v6[0] === 0x0064 && v6[1] === 0xff9b && v6[2] === 0x0001) return true;
     if (
       v6[0] === 0xfd00 &&
       v6[1] === 0x0ec2 &&

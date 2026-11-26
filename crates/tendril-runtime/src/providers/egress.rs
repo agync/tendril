@@ -112,7 +112,8 @@ pub fn classify_destination(ip: IpAddr) -> DestClass {
             let s = v6.segments();
             let nat64_local = s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001;
             let site_local = (s[0] & 0xffc0) == 0xfec0;
-            if v6.is_multicast() || nat64_local || site_local {
+            let teredo = s[0] == 0x2001 && s[1] == 0;
+            if v6.is_multicast() || nat64_local || site_local || teredo {
                 DestClass::Blocked
             } else if v6.is_loopback() {
                 DestClass::Loopback
@@ -947,6 +948,11 @@ mod tests {
             ("100.128.0.1", DestClass::Public),
             ("203.0.113.7", DestClass::Public),
             ("2001:db8::1", DestClass::Public),
+            ("2001:4860::1", DestClass::Public),
+            ("2001:1::1", DestClass::Public),
+            // Teredo 2001::/32 embeds an unverifiable IPv4 address: blocked outright.
+            ("2001::1", DestClass::Blocked),
+            ("2001:0:4136:e378:8000:63bf:3fff:fdd2", DestClass::Blocked),
             // IPv6 forms with a fixed IPv4 embedding take the embedded address's class.
             ("64:ff9b::a9fe:a9fe", DestClass::Blocked),
             ("64:ff9b::f000:1", DestClass::Blocked),
