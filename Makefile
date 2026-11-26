@@ -104,6 +104,7 @@ bindings/web: bindings/wasm bindings/wasm-p2p ## Run Web SDK security tests, con
 	node --test bindings/web/test/group.test.mjs
 	node --test bindings/web/test/pairing_uri.test.mjs
 	node --test bindings/web/test/connect_lock.test.mjs
+	node --test bindings/web/test/routes_vectors.test.mjs
 	node bindings/web/test/browser_e2e.mjs
 
 relay/cloudflare: bindings/wasm ## Build and test Cloudflare Workers Durable Object relay
