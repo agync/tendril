@@ -63,6 +63,7 @@ rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 iroh-relay = { version = "1.5", features = ["server"] }
 rcgen.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

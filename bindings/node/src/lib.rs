@@ -59,13 +59,14 @@ use tendril_runtime::{
     P2pRelayMode, PathDialer, PathListener, PathStream, RelayClientAuth, RelayDialer,
     RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError,
     SessionDriver, SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind,
-    WakeConfigSpec, WakeTag, WakeTransportSettings, build_wake_provider, dial_endpoint_with_auth,
-    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_store,
-    drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
-    drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_store,
-    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
-    drive_v2_pake_pair_responder_with_store, group_add_member as rt_group_add_member,
-    group_create as rt_group_create, group_ingest_manifest as rt_group_ingest_manifest,
+    WakeConfigSpec, WakeTag, WakeTransportSettings, build_wake_provider, connect_with_wake_policy,
+    dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
+    drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_store,
+    drive_pair_responder_with_policy_and_store, drive_pair_responder_with_store,
+    drive_v2_pake_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_timeout,
+    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
+    group_add_member as rt_group_add_member, group_create as rt_group_create,
+    group_ingest_manifest as rt_group_ingest_manifest,
     group_remove_member as rt_group_remove_member, handle_session_group_frame,
     pairing_path_kind_for_provider, parse_p2p_relay_mode, parse_p2p_relay_modes,
     pinned_pairing_floor, verify_epoch_wake_tag_window,
@@ -1169,51 +1170,6 @@ async fn policy_connect(
     }
 }
 
-/// Sends the best-effort epoch-blinded wake hint and waits for the provider at most
-/// `timeout_ms`; its outcome never fails the connect.
-async fn notify_wake(wake: &WakeTransportSettings) {
-    let now = now_unix();
-    let tag = wake.secret.derive_tag(now);
-    let _ = tokio::time::timeout(
-        Duration::from_millis(wake.timeout_ms),
-        wake.provider.notify_best_effort(&wake.target, &tag, now),
-    )
-    .await;
-}
-
-/// The wake flow around a whole policy connect. With
-/// `pre_wake` the wake hint goes first, then the connect runs with up to `max_attempts` tries
-/// `retry_delay_ms` apart. Without it one connect runs first; only a transient pre-commit
-/// miss ([`AttemptError::is_wakeable_miss`]) sends the wake hint and retries the same
-/// way. Any other failure is final and never wakes the host.
-async fn connect_with_wake<F, Fut>(
-    wake: &WakeTransportSettings,
-    mut connect: F,
-) -> std::result::Result<SessionBackend, AttemptError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<SessionBackend, AttemptError>>,
-{
-    if !wake.pre_wake {
-        match connect().await {
-            Err(err) if err.is_wakeable_miss() => {}
-            done => return done,
-        }
-    }
-    notify_wake(wake).await;
-    let attempts = wake.max_attempts.max(1);
-    let mut attempt = 1;
-    loop {
-        match connect().await {
-            Err(err) if attempt < attempts && err.is_wakeable_miss() => {
-                tokio::time::sleep(Duration::from_millis(wake.retry_delay_ms)).await;
-                attempt += 1;
-            }
-            done => return done,
-        }
-    }
-}
-
 /// Folds an exhausted attempt into one error: the most severe cause, then the hints that were
 /// never dialed and each candidate's failure. `committed` means the pairing code may be spent.
 fn attempt_err(err: AttemptError) -> Error {
@@ -1616,7 +1572,9 @@ impl Endpoint {
             handle.block_on(async move {
                 let connect = || policy_connect(wire, &identity, &target, &access, opts.clone());
                 match &wake {
-                    Some(w) => connect_with_wake(w, connect).await,
+                    Some(w) => connect_with_wake_policy(&w.to_dial_options(), connect)
+                        .await
+                        .map(|(backend, _)| backend),
                     None => connect().await,
                 }
             })
@@ -3552,16 +3510,17 @@ mod tests {
         build_wake_provider(spec).unwrap().unwrap()
     }
 
-    /// Runs `connect_with_wake` against a connect that always fails with `attempts`' outcome
-    /// and returns how many connects ran: the call site's retry decision.
+    /// Runs `connect_with_wake_policy` against a connect that always fails with `attempts`'
+    /// outcome and returns how many connects ran: the call site's retry decision.
     async fn connects_run(wake: &WakeTransportSettings, make: impl Fn() -> AttemptError) -> usize {
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let res = connect_with_wake(wake, || {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let err = make();
-            async move { Err(err) }
-        })
-        .await;
+        let res: std::result::Result<((), _), AttemptError> =
+            connect_with_wake_policy(&wake.to_dial_options(), || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let err = make();
+                async move { Err(err) }
+            })
+            .await;
         assert!(res.is_err());
         calls.load(std::sync::atomic::Ordering::SeqCst)
     }

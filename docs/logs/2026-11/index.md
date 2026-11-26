@@ -33,3 +33,4 @@ Entries from November 2026.
 - [ffi: add external ML-DSA custody, extension profile, and APNs wake](26-ffi-add-external-ml-dsa-custody.md)
 - [swift: add Secure Enclave custody and background APIs](26-swift-add-secure-enclave-custody-app.md)
 - [apple: add remote SwiftPM Package.swift and release automation](26-apple-add-remote-swiftpm-package-swift.md)
+- [runtime: share one wake-and-retry loop across the CLI, C ABI, Python, and Node](26-runtime-share-one-wake-and-retry.md)

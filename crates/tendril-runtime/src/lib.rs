@@ -13,6 +13,7 @@ pub mod router;
 pub mod store;
 pub mod v2_driver;
 pub mod wake;
+pub mod wake_retry;
 
 pub use advertise::{
     AdvertiseInputs, AdvertiseMode, ListAddrSource, LocalAddr, LocalAddrSource, NativeAddrSource,
@@ -108,3 +109,4 @@ pub use wake::{
     validate_apns_h2_endpoint_url, validate_apns_loc_key, validate_apns_topic,
     validate_wake_endpoint_url, verify_epoch_wake_tag_window, wake_epoch, wake_epoch_start_secs,
 };
+pub use wake_retry::{connect_with_wake, connect_with_wake_policy};

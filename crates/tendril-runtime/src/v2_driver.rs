@@ -34,7 +34,7 @@ use tendril_core::wire::{
     Preamble, ResumableFrameReader, WIRE_VERSION_V2, encode_frame,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
-use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
+use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
 use zeroize::Zeroizing;
 
 use crate::announce::{RosterAccess, RouteSetSink};
@@ -3643,46 +3643,8 @@ pub async fn wake_and_dial_v2(
     wake: &WakeDialOptions,
     now_unix: u64,
 ) -> Result<(Box<dyn PathStream>, Option<WakeOutcome>), RuntimeError> {
-    let tag = wake.secret.derive_tag(now_unix);
-    let wake_outcome = if wake.pre_wake {
-        Some(
-            timeout(
-                wake.wake_timeout,
-                wake.provider
-                    .notify_best_effort(&wake.target, &tag, now_unix),
-            )
-            .await
-            .unwrap_or(WakeOutcome::Skipped),
-        )
-    } else {
-        match dialer.dial(endpoint).await {
-            Ok(stream) => return Ok((stream, None)),
-            Err(_first_err) => Some(
-                timeout(
-                    wake.wake_timeout,
-                    wake.provider
-                        .notify_best_effort(&wake.target, &tag, now_unix),
-                )
-                .await
-                .unwrap_or(WakeOutcome::Skipped),
-            ),
-        }
-    };
-
-    let attempts = wake.max_attempts.max(1);
-    let mut last_err = None;
-    for attempt in 0..attempts {
-        match dialer.dial(endpoint).await {
-            Ok(stream) => return Ok((stream, wake_outcome)),
-            Err(err) => {
-                last_err = Some(err);
-                if attempt + 1 < attempts {
-                    sleep(wake.retry_delay).await;
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or(RuntimeError::Closed))
+    crate::wake_retry::connect_with_wake_at(wake, || now_unix, |_| true, || dialer.dial(endpoint))
+        .await
 }
 
 /// Dials `endpoint` with [`wake_and_dial_v2`] and establishes an authenticated [`V2SessionDriver`].
