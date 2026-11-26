@@ -564,6 +564,65 @@ async fn v2_code_guards_dial_nothing() {
     guards_dial_nothing(Wire::V2).await;
 }
 
+fn full_pin(host: &Host) -> tendril_core::pairing::PinnedHost {
+    tendril_core::pairing::PinnedHost::with_full_key(
+        Some(host.identity.host_id().to_owned()),
+        *host.identity.static_key().public_bytes(),
+        host.identity.signing_key().public_key().clone(),
+        0,
+    )
+}
+
+/// A caller pin of host A with a URI of host B is refused before any dial (`InvalidPairingUri`),
+/// whichever host the URI hints reach; a pin that agrees with the URI pairs.
+async fn caller_pin_must_match_the_uri_pin(wire: Wire) {
+    let host_a = Host::new(0x1A, wire);
+    let host_b = Host::new(0x1B, wire);
+    let port_a = host_a.serve().await;
+    let port_b = host_b.serve().await;
+    let (_, store) = client();
+
+    for port in [port_a, port_b] {
+        let code = host_b.issue();
+        let mut opts = options(&code, Some(signed_uri(&host_b, &code, &[direct(port)], 1)));
+        opts.pinned_host = Some(full_pin(&host_a));
+        let err = pair(wire, &store, opts)
+            .await
+            .expect_err("pin A with URI B");
+        assert!(
+            matches!(
+                err.error,
+                RuntimeError::Core(CoreError::InvalidPairingUri(_))
+            ),
+            "{err}"
+        );
+        assert!(!err.committed);
+        assert!(err.failures.is_empty());
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(host_a.preambles.load(Ordering::SeqCst), 0, "zero dials");
+    assert_eq!(host_b.preambles.load(Ordering::SeqCst), 0, "zero dials");
+
+    let code = host_b.issue();
+    let mut opts = options(
+        &code,
+        Some(signed_uri(&host_b, &code, &[direct(port_b)], 1)),
+    );
+    opts.pinned_host = Some(full_pin(&host_b));
+    pair(wire, &store, opts).await.expect("matching pin pairs");
+    assert_eq!(host_b.claims(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v1_caller_pin_must_match_the_uri_pin() {
+    caller_pin_must_match_the_uri_pin(Wire::V1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_caller_pin_must_match_the_uri_pin() {
+    caller_pin_must_match_the_uri_pin(Wire::V2).await;
+}
+
 /// Forwards each connection to `upstream` and drops every host byte once the client has written
 /// after the host's first reply (its `msg3`), so the `PairResponse` is lost and the client sees
 /// the stream close.

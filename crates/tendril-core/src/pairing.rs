@@ -779,6 +779,16 @@ impl PairingUri {
         )
     }
 
+    /// The host pin of a pairing given both this URI and a separately supplied `pin`: the
+    /// stricter of the two when they name the same host (Section 6.5 step 4).
+    ///
+    /// Fails with `InvalidPairingUri` when they disagree on `k`, the signing key, `id` or `seq`.
+    pub fn merge_pin(&self, pin: &PinnedHost) -> Result<PinnedHost, CoreError> {
+        merge_uri_pin(pin, self).ok_or_else(|| {
+            CoreError::InvalidPairingUri("pairing URI does not match the pinned host".into())
+        })
+    }
+
     /// Route sequence `rq` of a parsed signed URI (display only).
     #[must_use]
     pub const fn route_seq(&self) -> Option<u64> {
