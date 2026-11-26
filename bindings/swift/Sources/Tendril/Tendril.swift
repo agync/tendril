@@ -773,7 +773,7 @@ public final class TendrilEndpoint: @unchecked Sendable {
   private var pathRefreshes = 0
   private var monitorClosed = false
   /// Last full transport configuration sent, as top-level JSON values. The C ABI replaces the
-  /// whole configuration per call, so `configureRoutes` merges into this cache. Held across the
+  /// whole configuration per call, so `configureRoutes` and `configureP2p` merge into this cache. Held across the
   /// FFI call to serialize configuration. The cache holds relay tickets and secrets, so
   /// `close()` clears it; Swift cannot zeroize the freed strings, so they linger until reused.
   private let configLock = NSLock()
@@ -1094,7 +1094,8 @@ public final class TendrilEndpoint: @unchecked Sendable {
     }
   }
 
-  /// Replaces the whole transport configuration. `configureRoutes` merges into the last one sent.
+  /// Replaces the whole transport configuration. `configureRoutes` and `configureP2p` merge into
+  /// the last one sent.
   public func configureTransportsJSON(_ transportConfigJson: String) throws {
     configLock.lock()
     defer { configLock.unlock() }
@@ -1480,7 +1481,7 @@ public final class TendrilEndpoint: @unchecked Sendable {
     hostName: String? = nil,
     signRoutes: Bool? = nil
   ) throws -> String {
-    let options = try routeOptionsJSON([
+    let options = try transportOptionsJSON([
       "kind": kind, "host_name": hostName, "sign_routes": signRoutes,
     ])
     return try withExpiringStateActivityIfNeeded {
@@ -1545,7 +1546,7 @@ public final class TendrilEndpoint: @unchecked Sendable {
     _ endpoint: String?,
     _ code: String?
   ) throws -> String {
-    let options = try routeOptionsJSON([
+    let options = try transportOptionsJSON([
       "route_policy": routePolicy, "save_route": saveRoute, "endpoint": endpoint, "code": code,
     ])
     return try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
@@ -1597,7 +1598,7 @@ public final class TendrilEndpoint: @unchecked Sendable {
       }
       fields["grant"] = obj
     }
-    let options = try routeOptionsJSON(fields)
+    let options = try transportOptionsJSON(fields)
     return try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
       try self.withHandle { h in
         let raw = try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
@@ -1679,7 +1680,7 @@ public final class TendrilEndpoint: @unchecked Sendable {
     replaceRoutes: Bool? = nil,
     routePolicy: String? = nil
   ) throws -> String {
-    let options = try routeOptionsJSON(["replace_routes": replaceRoutes, "route_policy": routePolicy])
+    let options = try transportOptionsJSON(["replace_routes": replaceRoutes, "route_policy": routePolicy])
     return try withExpiringStateActivityIfNeeded {
       try self.withHandle { h in
         var out: UnsafeMutablePointer<CChar>?
@@ -1728,18 +1729,33 @@ public final class TendrilEndpoint: @unchecked Sendable {
     routePolicy: String? = nil,
     signRoutes: Bool? = nil
   ) throws {
-    let routes = try routeOptions([
+    try mergeTransportConfig([
       "advertised_endpoints": advertisedEndpoints, "relay_auth_origins": relayAuthOrigins,
       "advertise": advertise, "route_policy": routePolicy, "sign_routes": signRoutes,
     ])
+  }
+
+  /// Sets the network keys of the P2P transport configuration. `portMapping` (`p2p_port_mapping`,
+  /// default `true` in the core) set to `false` stops a P2P endpoint from probing the router for
+  /// a UPnP, NAT-PMP or PCP mapping. `bindAddrs` (`p2p_bind_addrs`) holds at most one IPv4 and
+  /// one IPv6 socket address such as `"0.0.0.0:0"` and `"[::]:0"`; an empty list means every
+  /// interface. An invalid entry throws an error naming `p2p_bind_addrs`. Only the arguments
+  /// passed change; every other key of the last transport configuration sent is kept.
+  public func configureP2p(portMapping: Bool? = nil, bindAddrs: [String]? = nil) throws {
+    try mergeTransportConfig(["p2p_port_mapping": portMapping, "p2p_bind_addrs": bindAddrs])
+  }
+
+  /// Merges `fields` into the last full transport configuration and sends the result.
+  private func mergeTransportConfig(_ fields: [String: Any?]) throws {
+    let changes = try transportOptions(fields)
     configLock.lock()
     defer { configLock.unlock() }
-    let merged = transportConfig.merging(routes) { _, new in new }
+    let merged = transportConfig.merging(changes) { _, new in new }
     let data = try JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])
     try configureTransportsLocked(String(decoding: data, as: UTF8.self))
   }
 
-  private func routeOptions(_ fields: [String: Any?]) throws -> [String: Any] {
+  private func transportOptions(_ fields: [String: Any?]) throws -> [String: Any] {
     var obj: [String: Any] = [:]
     for (key, value) in fields {
       guard let value else { continue }
@@ -1754,8 +1770,8 @@ public final class TendrilEndpoint: @unchecked Sendable {
     return obj
   }
 
-  private func routeOptionsJSON(_ fields: [String: Any?]) throws -> String? {
-    let obj = try routeOptions(fields)
+  private func transportOptionsJSON(_ fields: [String: Any?]) throws -> String? {
+    let obj = try transportOptions(fields)
     if obj.isEmpty {
       return nil
     }
@@ -1837,6 +1853,13 @@ public final class TendrilEndpoint: @unchecked Sendable {
     configLock.lock()
     defer { configLock.unlock() }
     return transportConfig.count
+  }
+
+  /// Cached value of one transport configuration key, if set.
+  internal func cachedTransportValue(_ key: String) -> Any? {
+    configLock.lock()
+    defer { configLock.unlock() }
+    return transportConfig[key]
   }
 
   /// True while a path monitor is running.
