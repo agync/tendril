@@ -353,12 +353,16 @@ struct TendrilConformanceTests {
     #if canImport(CryptoKit) && canImport(Security)
     let realKc = TendrilKeychainStore(service: service, account: account)
     defer {
-      let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
-      ]
-      SecItemDelete(query as CFDictionary)
+      for (suffix, isSepOrV2) in [
+        ("", false),
+        (TendrilKeychainStore.sepP256AccountSuffix, true),
+        (TendrilKeychainStore.v2CommittedAccountSuffix, true),
+        (".sep-mldsa65", true),
+      ] {
+        SecItemDelete(
+          realKc.keychainQueryBase(accountSuffix: suffix, isSepOrV2: isSepOrV2) as CFDictionary
+        )
+      }
     }
     let kc: TendrilKeychainStore
     do {
@@ -1077,12 +1081,16 @@ struct TendrilConformanceTests {
     let account = "real-kc-\(UUID().uuidString)"
     let store = TendrilKeychainStore(service: service, account: account)
     defer {
-      let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
-      ]
-      SecItemDelete(query as CFDictionary)
+      for (suffix, isSepOrV2) in [
+        ("", false),
+        (TendrilKeychainStore.sepP256AccountSuffix, true),
+        (TendrilKeychainStore.v2CommittedAccountSuffix, true),
+        (".sep-mldsa65", true),
+      ] {
+        SecItemDelete(
+          store.keychainQueryBase(accountSuffix: suffix, isSepOrV2: isSepOrV2) as CFDictionary
+        )
+      }
     }
     do {
       let key1 = try store.loadOrCreateMasterKey()

@@ -31,3 +31,4 @@ Entries from November 2026.
 - [Add direct HTTP/2 APNs wake provider and MutableAlert mode](26-add-direct-http-2-apns-wake.md)
 - [core: add ExternalMlDsaSigner, identity v2, and ADR 0005](26-core-add-externalmldsasigner-identity-v2-and.md)
 - [ffi: add external ML-DSA custody, extension profile, and APNs wake](26-ffi-add-external-ml-dsa-custody.md)
+- [swift: add Secure Enclave custody and background APIs](26-swift-add-secure-enclave-custody-app.md)

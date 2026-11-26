@@ -1,15 +1,179 @@
 import CTendril
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 #if canImport(Network)
 import Network
 #endif
 
-public enum TendrilError: Error, Equatable {
+public enum TendrilError: Error, Equatable, Sendable {
   case wouldBlock
   case eof
   case invalidArgument(String)
   case closed
   case ffi(code: Int32, message: String)
+}
+
+public enum TendrilRuntimeProfile: String, Sendable, Equatable {
+  case `default` = "default"
+  case `extension` = "extension"
+}
+
+public struct TendrilEndpointOptions: Sendable {
+  public var runtimeProfile: TendrilRuntimeProfile
+  public var clientOnly: Bool
+  public var mldsaSigner: (any TendrilMlDsa65Provider)?
+  public var useHardwareMlDsaIfAvailable: Bool
+
+  public init(
+    runtimeProfile: TendrilRuntimeProfile = .default,
+    clientOnly: Bool = false,
+    mldsaSigner: (any TendrilMlDsa65Provider)? = nil,
+    useHardwareMlDsaIfAvailable: Bool = false
+  ) {
+    self.runtimeProfile = runtimeProfile
+    self.clientOnly = clientOnly
+    self.mldsaSigner = mldsaSigner
+    self.useHardwareMlDsaIfAvailable = useHardwareMlDsaIfAvailable
+  }
+
+  public static let extensionClientOnly = TendrilEndpointOptions(
+    runtimeProfile: .extension,
+    clientOnly: true
+  )
+}
+
+private struct SealedEndpointOptionsPayload: Encodable {
+  let runtimeProfile: String
+  let clientOnly: Bool
+
+  enum CodingKeys: String, CodingKey {
+    case runtimeProfile = "runtime_profile"
+    case clientOnly = "client_only"
+  }
+}
+
+internal func encodeSealedEndpointOptionsJson(_ options: TendrilEndpointOptions) throws -> String {
+  let payload = SealedEndpointOptionsPayload(
+    runtimeProfile: options.runtimeProfile.rawValue,
+    clientOnly: options.clientOnly
+  )
+  let encoder = JSONEncoder()
+  encoder.outputFormatting = [.sortedKeys]
+  let data = try encoder.encode(payload)
+  return String(decoding: data, as: UTF8.self)
+}
+
+internal final class TendrilExpiringActivityState<T>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var started = false
+  private var finished = false
+  private var expiredBeforeStart = false
+  private var result: Result<T, Error>?
+  private let sem = DispatchSemaphore(value: 0)
+  private let onExpire: (@Sendable () -> Void)?
+
+  init(onExpire: (@Sendable () -> Void)? = nil) {
+    self.onExpire = onExpire
+  }
+
+  func handleEvent(expired: Bool, _ body: () throws -> T) {
+    if expired {
+      var triggerExpire = false
+      var signalNow = false
+      lock.lock()
+      if !finished {
+        if started {
+          triggerExpire = true
+        } else {
+          expiredBeforeStart = true
+          finished = true
+          result = .failure(TendrilError.closed)
+          signalNow = true
+        }
+      }
+      lock.unlock()
+      if triggerExpire {
+        onExpire?()
+      } else if signalNow {
+        onExpire?()
+        sem.signal()
+      }
+      return
+    }
+
+    lock.lock()
+    if finished || started || expiredBeforeStart {
+      lock.unlock()
+      return
+    }
+    started = true
+    lock.unlock()
+
+    let outcome = Result<T, Error>(catching: body)
+
+    lock.lock()
+    if !finished {
+      result = outcome
+      finished = true
+      sem.signal()
+    }
+    lock.unlock()
+  }
+
+  func wait() throws -> T {
+    sem.wait()
+    lock.lock()
+    let outcome = result
+    lock.unlock()
+    guard let outcome else {
+      throw TendrilError.closed
+    }
+    return try outcome.get()
+  }
+}
+
+private let tendrilExpiringCloseQueue = DispatchQueue(
+  label: "dev.tendril.expiring-close",
+  qos: .userInitiated
+)
+
+internal func withExpiringStateActivity<T>(
+  reason: String = "dev.tendril.state-lock",
+  onExpire: (@Sendable () -> Void)? = nil,
+  _ body: @escaping @Sendable () throws -> T
+) throws -> T {
+  #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+  let coordinator = TendrilExpiringActivityState<T>(onExpire: onExpire)
+  ProcessInfo.processInfo.performExpiringActivity(withReason: reason) { expired in
+    coordinator.handleEvent(expired: expired, body)
+  }
+  return try coordinator.wait()
+  #else
+  _ = (reason, onExpire)
+  return try body()
+  #endif
+}
+
+internal func withExpiringActivityGuard<T>(
+  active: Bool,
+  allowExpireClose: Bool = false,
+  onAsyncClose: (@Sendable () -> Void)? = nil,
+  _ body: @escaping @Sendable () throws -> T
+) throws -> T {
+  guard active else {
+    return try body()
+  }
+  let onExpire: (@Sendable () -> Void)?
+  if allowExpireClose, let onAsyncClose {
+    onExpire = {
+      tendrilExpiringCloseQueue.async(execute: onAsyncClose)
+    }
+  } else {
+    onExpire = nil
+  }
+  return try withExpiringStateActivity(onExpire: onExpire, body)
 }
 
 private func lastFfiError() -> String {
@@ -72,7 +236,10 @@ private func withOptionalValidatedCString<R>(
 }
 
 #if canImport(CryptoKit) && canImport(Security)
-internal final class SealedSwiftStateStore {
+import CryptoKit
+import Security
+
+internal final class SealedSwiftStateStore: @unchecked Sendable {
   private static let identityFile = "identity.sealed"
   private static let rosterFile = "roster.sealed"
   private static let bootstrapLockFile = ".identity.lock"
@@ -82,11 +249,21 @@ internal final class SealedSwiftStateStore {
 
   private let lock = NSLock()
   private let dirUrl: URL
-  private let keychain: TendrilKeychainStore
+  internal let keychain: TendrilKeychainStore
+  private let writeObserver: (@Sendable (String, Data) throws -> Void)?
+  private let syncDirObserver: (@Sendable () throws -> Void)?
+  private var pendingV2Commit = false
 
-  init(dirPath: String, keychain: TendrilKeychainStore) throws {
+  init(
+    dirPath: String,
+    keychain: TendrilKeychainStore,
+    writeObserver: (@Sendable (String, Data) throws -> Void)? = nil,
+    syncDirObserver: (@Sendable () throws -> Void)? = nil
+  ) throws {
     self.dirUrl = URL(fileURLWithPath: dirPath, isDirectory: true)
     self.keychain = keychain
+    self.writeObserver = writeObserver
+    self.syncDirObserver = syncDirObserver
     let fm = FileManager.default
     var isDir: ObjCBool = false
     if fm.fileExists(atPath: dirUrl.path, isDirectory: &isDir) {
@@ -98,13 +275,20 @@ internal final class SealedSwiftStateStore {
         throw TendrilError.invalidArgument("stateDir must be a directory")
       }
     } else {
+      var createAttrs: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+      #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+      createAttrs[.protectionKey] = FileProtectionType.completeUntilFirstUserAuthentication
+      #endif
       try fm.createDirectory(
         at: dirUrl,
         withIntermediateDirectories: true,
-        attributes: [.posixPermissions: 0o700]
+        attributes: createAttrs
       )
     }
     try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dirUrl.path)
+    #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+    try Self.applyClassCProtection(toDirectory: dirUrl)
+    #endif
     // Restoring an older runtime state file would roll back group membership and revocations,
     // so the directory never enters a backup.
     var values = URLResourceValues()
@@ -113,31 +297,150 @@ internal final class SealedSwiftStateStore {
     try url.setResourceValues(values)
   }
 
-  private func readSealed(fileName: String, aad: Data) throws -> String? {
+  #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+  internal static func applyClassCProtection(toDirectory dirUrl: URL) throws {
+    let fm = FileManager.default
+    try fm.setAttributes(
+      [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+      ofItemAtPath: dirUrl.path
+    )
+    try applyClassCProtectionToExistingFiles(in: dirUrl)
+  }
+
+  internal static func applyClassCProtectionToExistingFiles(in dirUrl: URL) throws {
+    let fm = FileManager.default
+    let items = try fm.contentsOfDirectory(
+      at: dirUrl,
+      includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+      options: []
+    )
+    for item in items {
+      let attrs = try fm.attributesOfItem(atPath: item.path)
+      guard let fileType = attrs[.type] as? FileAttributeType, fileType == .typeRegular else {
+        continue
+      }
+      try fm.setAttributes(
+        [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+        ofItemAtPath: item.path
+      )
+    }
+  }
+  #endif
+
+  private func readSealed(
+    fileName: String,
+    aad: Data,
+    upgradeIfNeeded: Bool = false,
+    deferCommit: Bool = false
+  ) throws -> (json: String?, upgradedToV2: Bool) {
     let url = dirUrl.appendingPathComponent(fileName, isDirectory: false)
     let fm = FileManager.default
     guard fm.fileExists(atPath: url.path) else {
-      return nil
+      return (nil, false)
     }
     let attrs = try fm.attributesOfItem(atPath: url.path)
     if let fileType = attrs[.type] as? FileAttributeType, fileType == .typeSymbolicLink {
       throw TendrilError.invalidArgument("\(fileName) must not be a symlink")
     }
     let sealed = try Data(contentsOf: url)
-    var plain = try keychain.openState(sealed, authenticating: aad)
+    var plain: Data
+    let upgradedToV2: Bool
+    if upgradeIfNeeded && sealed.first == TendrilKeychainStore.formatVersionV1 {
+      let (maybeUpgraded, didUpgrade, decodedPlain) = try keychain.beginUpgradeV1ToV2(
+        sealed,
+        authenticating: aad
+      )
+      plain = decodedPlain
+      do {
+        if didUpgrade {
+          try writeSealedBytes(fileName: fileName, sealed: maybeUpgraded)
+          if deferCommit {
+            pendingV2Commit = true
+          } else {
+            try keychain.commitV2Custody()
+            pendingV2Commit = false
+          }
+        }
+      } catch {
+        if !plain.isEmpty {
+          plain.resetBytes(in: 0..<plain.count)
+        }
+        throw error
+      }
+      upgradedToV2 = didUpgrade
+    } else {
+      let isV2 = (sealed.first == TendrilKeychainStore.formatVersionV2)
+      plain = try keychain.openStateWithoutCommit(sealed, authenticating: aad)
+      if isV2 {
+        if deferCommit {
+          pendingV2Commit = true
+        } else {
+          do {
+            try syncDirectory()
+            try keychain.commitV2Custody()
+            pendingV2Commit = false
+          } catch {
+            if !plain.isEmpty {
+              plain.resetBytes(in: 0..<plain.count)
+            }
+            throw error
+          }
+        }
+      }
+      upgradedToV2 = isV2
+    }
     defer { plain.resetBytes(in: 0..<plain.count) }
     guard let s = String(data: plain, encoding: .utf8) else {
       throw TendrilKeychainError.invalidData
     }
-    return s
+    return (s, upgradedToV2)
   }
 
-  private func writeSealed(fileName: String, json: String, aad: Data) throws {
+  private func writeSealed(
+    fileName: String,
+    json: String,
+    aad: Data,
+    deferCommit: Bool = false
+  ) throws {
     var plain = Data(json.utf8)
     let sealed = try {
       defer { plain.resetBytes(in: 0..<plain.count) }
-      return try keychain.sealState(plain, authenticating: aad)
+      return try keychain.sealStateWithoutCommit(plain, authenticating: aad)
     }()
+    try writeSealedBytes(fileName: fileName, sealed: sealed)
+    if sealed.first == TendrilKeychainStore.formatVersionV2 {
+      if deferCommit {
+        pendingV2Commit = true
+      } else {
+        try keychain.commitV2Custody()
+        pendingV2Commit = false
+      }
+    }
+  }
+
+  private func syncDirectory() throws {
+    try syncDirObserver?()
+    #if canImport(Darwin)
+    let fd = Darwin.open(dirUrl.path, O_RDONLY | O_CLOEXEC)
+    guard fd >= 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    defer { _ = Darwin.close(fd) }
+    if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
+      let syncErr = errno
+      if syncErr == ENOTSUP || syncErr == EINVAL || syncErr == ENOTTY {
+        guard Darwin.fsync(fd) == 0 else {
+          throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+      } else {
+        throw POSIXError(POSIXErrorCode(rawValue: syncErr) ?? .EIO)
+      }
+    }
+    #endif
+  }
+
+  private func writeSealedBytes(fileName: String, sealed: Data) throws {
+    try writeObserver?(fileName, sealed)
     let target = dirUrl.appendingPathComponent(fileName, isDirectory: false)
     let tmp = dirUrl.appendingPathComponent(".\(fileName).\(UUID().uuidString).tmp")
     let fm = FileManager.default
@@ -157,29 +460,83 @@ internal final class SealedSwiftStateStore {
       } else {
         try fm.moveItem(at: tmp, to: target)
       }
+      #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+      try fm.setAttributes(
+        [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+        ofItemAtPath: target.path
+      )
+      #endif
+      try syncDirectory()
     } catch {
       try? fm.removeItem(at: tmp)
       throw error
     }
   }
 
-  func loadIdentityJson() throws -> String? {
+  func loadIdentityJson(deferCommit: Bool = false) throws -> String? {
     lock.lock()
     defer { lock.unlock() }
-    return try readSealed(fileName: Self.identityFile, aad: Self.identityAad)
+    let shouldDefer = deferCommit || legacyRosterNeedsMigration()
+    return try readSealed(
+      fileName: Self.identityFile,
+      aad: Self.identityAad,
+      upgradeIfNeeded: true,
+      deferCommit: shouldDefer
+    ).json
   }
 
-  func saveIdentityJson(_ json: String) throws {
+  func saveIdentityJson(_ json: String, deferCommit: Bool = false) throws {
     lock.lock()
     defer { lock.unlock() }
-    try writeSealed(fileName: Self.identityFile, json: json, aad: Self.identityAad)
+    let shouldDefer = deferCommit || legacyRosterNeedsMigration()
+    try writeSealed(
+      fileName: Self.identityFile,
+      json: json,
+      aad: Self.identityAad,
+      deferCommit: shouldDefer
+    )
   }
 
   /// Reads the pre-runtime binding roster, kept only to seed a directory once.
-  func loadRosterJson() throws -> String? {
+  func loadRosterJson(upgradeIfNeeded: Bool = false, deferCommit: Bool = false) throws -> String? {
     lock.lock()
     defer { lock.unlock() }
-    return try readSealed(fileName: Self.rosterFile, aad: Self.rosterAad)
+    return try readSealed(
+      fileName: Self.rosterFile,
+      aad: Self.rosterAad,
+      upgradeIfNeeded: upgradeIfNeeded,
+      deferCommit: deferCommit
+    ).json
+  }
+
+  func commitV2CustodyIfNeeded() throws {
+    lock.lock()
+    defer { lock.unlock() }
+    let identityUrl = dirUrl.appendingPathComponent(Self.identityFile, isDirectory: false)
+    let identityExists = FileManager.default.fileExists(atPath: identityUrl.path)
+    let identityIsV2: Bool
+    if identityExists {
+      let attrs = try FileManager.default.attributesOfItem(atPath: identityUrl.path)
+      if let fileType = attrs[.type] as? FileAttributeType, fileType == .typeSymbolicLink {
+        throw TendrilError.invalidArgument("\(Self.identityFile) must not be a symlink")
+      }
+      identityIsV2 = (try Data(contentsOf: identityUrl).first) == TendrilKeychainStore.formatVersionV2
+    } else {
+      identityIsV2 = false
+    }
+    if identityIsV2 || (pendingV2Commit && !identityExists) {
+      try syncDirectory()
+      try keychain.commitV2Custody()
+      pendingV2Commit = false
+    } else if identityExists && !identityIsV2 {
+      pendingV2Commit = false
+    }
+  }
+
+  func hasIdentityFile() -> Bool {
+    FileManager.default.fileExists(
+      atPath: dirUrl.appendingPathComponent(Self.identityFile, isDirectory: false).path
+    )
   }
 
   /// Whether the legacy roster still needs migrating: it exists and the runtime has no state.
@@ -196,7 +553,9 @@ internal final class SealedSwiftStateStore {
     lock.lock()
     defer { lock.unlock() }
     let path = dirUrl.appendingPathComponent(Self.rosterFile, isDirectory: false).path
-    if Darwin.unlink(path) != 0 && errno != ENOENT {
+    if Darwin.unlink(path) == 0 {
+      try syncDirectory()
+    } else if errno != ENOENT {
       throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
   }
@@ -215,7 +574,18 @@ internal final class SealedSwiftStateStore {
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
       }
     }
-    return try body()
+    do {
+      let result = try body()
+      #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+      try Self.applyClassCProtectionToExistingFiles(in: dirUrl)
+      #endif
+      return result
+    } catch {
+      #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+      try? Self.applyClassCProtectionToExistingFiles(in: dirUrl)
+      #endif
+      throw error
+    }
   }
 }
 #endif
@@ -357,16 +727,43 @@ public enum TendrilCrypto {
     }
     return allowed == 1
   }
+
+  public static func verifyWakeTag(
+    secret: Data,
+    tagB64: String,
+    nowUnixSecs: UInt64 = UInt64(max(0, Int64(Date().timeIntervalSince1970)))
+  ) throws -> Bool {
+    guard secret.count == Int(TENDRIL_KEY_LEN) else {
+      throw TendrilError.invalidArgument("expected \(TENDRIL_KEY_LEN)-byte wake secret")
+    }
+    var matched: UInt8 = 0
+    let rc: Int32 = try withValidatedCString(tagB64, name: "tagB64") { cTag in
+      secret.withUnsafeBytes { raw in
+        tendril_verify_wake_tag(
+          raw.bindMemory(to: UInt8.self).baseAddress,
+          cTag,
+          nowUnixSecs,
+          &matched
+        )
+      }
+    }
+    guard rc == TENDRIL_OK.rawValue else {
+      throw ffiError(rc, fallback: "tendril_verify_wake_tag failed")
+    }
+    return matched == 1
+  }
 }
 
 /// A Tendril endpoint. With a `stateDir`, the identity is sealed by the Keychain in
 /// `identity.sealed` and the runtime persists roster and group state itself in `rt-roster.sealed`
 /// and `rt-groups.sealed`, sealed under a key derived from that identity.
-public final class TendrilEndpoint {
+public final class TendrilEndpoint: @unchecked Sendable {
   private let cond = NSCondition()
   private var handle: OpaquePointer?
   private var activeCalls: Int = 0
   private var closing: Bool = false
+  private let hasSealedStore: Bool
+  private let isExtensionProfile: Bool
   /// Guards `pathMonitor`, `pathRefreshes` and `monitorClosed`. A monitor is swapped in or out
   /// with this lock held, and `start()` and `cancel()` run outside it. `close()` sets
   /// `monitorClosed` under it, so no monitor survives a close, and a monitor that was cancelled
@@ -386,17 +783,26 @@ public final class TendrilEndpoint {
   public init(
     stateDir: String? = nil,
     hostId: String? = nil,
-    keychainStore: TendrilKeychainStore? = nil
+    keychainStore: TendrilKeychainStore? = nil,
+    options: TendrilEndpointOptions = TendrilEndpointOptions()
   ) throws {
+    self.isExtensionProfile = options.runtimeProfile == .extension
     if let stateDir, !stateDir.isEmpty {
+      self.hasSealedStore = true
       let store = try SealedSwiftStateStore(
         dirPath: stateDir,
         keychain: keychainStore ?? TendrilKeychainStore()
       )
-      self.handle = try store.withBootstrapLock {
-        try Self.openSealed(store, stateDir: stateDir, hostId: hostId)
+      self.handle = try withExpiringStateActivity {
+        try store.withBootstrapLock {
+          try Self.openSealed(store, stateDir: stateDir, hostId: hostId, options: options)
+        }
       }
     } else {
+      if options.runtimeProfile != .default || options.clientOnly || options.mldsaSigner != nil {
+        throw TendrilError.invalidArgument("TendrilEndpointOptions require a non-empty stateDir")
+      }
+      self.hasSealedStore = false
       let raw = try withOptionalValidatedCString(hostId, name: "hostId") { cHost in
         tendril_endpoint_new_from_state(nil, nil, cHost)
       }
@@ -407,47 +813,151 @@ public final class TendrilEndpoint {
     }
   }
   #else
-  public init(stateDir: String? = nil, hostId: String? = nil) throws {
-    let raw = try withOptionalValidatedCString(stateDir, name: "stateDir") { cd in
-      try withOptionalValidatedCString(hostId, name: "hostId") { ch in
-        tendril_endpoint_new(cd, ch)
+  public init(
+    stateDir: String? = nil,
+    hostId: String? = nil,
+    options: TendrilEndpointOptions = TendrilEndpointOptions()
+  ) throws {
+    self.isExtensionProfile = options.runtimeProfile == .extension
+    if options.runtimeProfile != .default || options.clientOnly || options.mldsaSigner != nil {
+      guard let stateDir, !stateDir.isEmpty else {
+        throw TendrilError.invalidArgument("TendrilEndpointOptions require a non-empty stateDir")
       }
+      self.hasSealedStore = true
+      let optionsJson = try encodeSealedEndpointOptionsJson(options)
+      self.handle = try Self.newSealedWithOptions(
+        stateDir, nil, nil, hostId, optionsJson, options.mldsaSigner
+      )
+    } else {
+      self.hasSealedStore = (stateDir != nil && !stateDir!.isEmpty)
+      let raw = try withOptionalValidatedCString(stateDir, name: "stateDir") { cd in
+        try withOptionalValidatedCString(hostId, name: "hostId") { ch in
+          tendril_endpoint_new(cd, ch)
+        }
+      }
+      guard let raw else {
+        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new failed")
+      }
+      self.handle = raw
     }
-    guard let raw else {
-      throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new failed")
-    }
-    self.handle = raw
   }
   #endif
 
-  #if canImport(CryptoKit) && canImport(Security)
-  private static func newSealed(
-    _ stateDir: String, _ identityJson: String?, _ rosterJson: String?, _ hostId: String?
+  private static func newSealedWithOptions(
+    _ stateDir: String,
+    _ identityJson: String?,
+    _ rosterJson: String?,
+    _ hostId: String?,
+    _ optionsJson: String?,
+    _ mldsaSigner: (any TendrilMlDsa65Provider)?
   ) throws -> OpaquePointer {
-    let raw = try withValidatedCString(stateDir, name: "stateDir") { cDir in
+    let raw: OpaquePointer? = try withValidatedCString(stateDir, name: "stateDir") { cDir in
       try withOptionalValidatedCString(identityJson, name: "identityJson") { cId in
         try withOptionalValidatedCString(rosterJson, name: "rosterJson") { cRoster in
           try withOptionalValidatedCString(hostId, name: "hostId") { cHost in
-            tendril_endpoint_new_sealed(cDir, cId, cRoster, cHost)
+            try withOptionalValidatedCString(optionsJson, name: "optionsJson") { cOpts in
+              guard let mldsaSigner else {
+                return tendril_endpoint_new_sealed_with_options(
+                  cDir, cId, cRoster, cHost, cOpts, nil
+                )
+              }
+              let bridge = CTendrilMlDsa65Bridge(provider: mldsaSigner)
+              return try bridge.withCSigner { cSignerPtr, markTransferred -> OpaquePointer? in
+                markTransferred()
+                return tendril_endpoint_new_sealed_with_options(
+                  cDir, cId, cRoster, cHost, cOpts, cSignerPtr
+                )
+              }
+            }
           }
         }
       }
     }
     guard let raw else {
-      throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new_sealed failed")
+      throw ffiError(
+        TENDRIL_ERR_INTERNAL.rawValue,
+        fallback: "tendril_endpoint_new_sealed_with_options failed"
+      )
     }
     return raw
+  }
+
+  #if canImport(CryptoKit) && canImport(Security)
+  private static func resolveHardwareMlDsa65Signer(
+    forExistingIdentity identity: String?,
+    keychain: TendrilKeychainStore,
+    options: TendrilEndpointOptions
+  ) throws -> (any TendrilMlDsa65Provider)? {
+    if let explicit = options.mldsaSigner {
+      return explicit
+    }
+    if let identity {
+      let parsed = try? JSONSerialization.jsonObject(with: Data(identity.utf8)) as? [String: Any]
+      let version = (parsed?["version"] as? NSNumber)?.intValue
+      guard version == 2 else {
+        return nil
+      }
+      #if compiler(>=6.2)
+      if #available(iOS 26.0, macOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, *),
+        keychain.allowsHardwareMlDsaCustody
+      {
+        return try SecureEnclaveMlDsa65Provider.loadExisting(configuration: keychain.configuration)
+      }
+      #endif
+      return nil
+    }
+    guard options.useHardwareMlDsaIfAvailable, keychain.allowsHardwareMlDsaCustody else {
+      return nil
+    }
+    #if compiler(>=6.2)
+    if #available(iOS 26.0, macOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, *),
+      SecureEnclave.isAvailable
+    {
+      do {
+        return try SecureEnclaveMlDsa65Provider(configuration: keychain.configuration)
+      } catch {
+        if keychain.configuration.custody == .secureEnclaveRequired
+          || keychain.configuration.accessGroup != nil
+          || !TendrilKeychainStore.isFallbackEntitlementOrAvailabilityError(error)
+        {
+          throw error
+        }
+        return nil
+      }
+    }
+    #endif
+    return nil
   }
 
   /// Saves a generated identity before any runtime state exists under it, then opens with it.
   /// The reopen syncs the directory, so `identity.sealed` is durable before the first runtime
   /// write, and seeds the runtime roster from a legacy `roster.sealed` only when needed.
   private static func openSealed(
-    _ store: SealedSwiftStateStore, stateDir: String, hostId: String?
+    _ store: SealedSwiftStateStore,
+    stateDir: String,
+    hostId: String?,
+    options: TendrilEndpointOptions
   ) throws -> OpaquePointer {
-    var identity = try store.loadIdentityJson()
+    let optionsJson = try encodeSealedEndpointOptionsJson(options)
+    // Upgrade/read legacy roster.sealed and identity.sealed unconditionally with deferred v2
+    // commitment so .sep-v2-committed persists only after writeSealedBytes directory sync,
+    // runtime storage initialization, and legacy roster unlink+sync all succeed. If
+    // identity.sealed is missing, an orphaned roster.sealed cannot belong to a freshly
+    // generated identity and is discarded unread by deleteLegacyRoster() without seeding.
+    let needsLegacyRoster = store.hasIdentityFile() && store.legacyRosterNeedsMigration()
+    let seed: String? = needsLegacyRoster
+      ? try store.loadRosterJson(upgradeIfNeeded: true, deferCommit: true)
+      : nil
+    var identity = try store.loadIdentityJson(deferCommit: true)
+    let mldsaSigner = try resolveHardwareMlDsa65Signer(
+      forExistingIdentity: identity,
+      keychain: store.keychain,
+      options: options
+    )
     if identity == nil {
-      let fresh = try newSealed(stateDir, nil, nil, hostId)
+      let fresh = try newSealedWithOptions(
+        stateDir, nil, nil, hostId, optionsJson, mldsaSigner
+      )
       defer { tendril_endpoint_free(fresh) }
       var out: UnsafeMutablePointer<CChar>?
       let rc = tendril_endpoint_export_identity_json(fresh, &out)
@@ -455,13 +965,15 @@ public final class TendrilEndpoint {
         throw ffiError(rc, fallback: "tendril_endpoint_export_identity_json failed")
       }
       let generated = takeOutCString(out)
-      try store.saveIdentityJson(generated)
+      try store.saveIdentityJson(generated, deferCommit: true)
       identity = generated
     }
-    let seed: String? = try store.legacyRosterNeedsMigration() ? store.loadRosterJson() : nil
-    let raw = try newSealed(stateDir, identity, seed, hostId)
+    let raw = try newSealedWithOptions(
+      stateDir, identity, seed, hostId, optionsJson, mldsaSigner
+    )
     do {
       try store.deleteLegacyRoster()
+      try store.commitV2CustodyIfNeeded()
     } catch {
       tendril_endpoint_free(raw)
       throw error
@@ -469,6 +981,18 @@ public final class TendrilEndpoint {
     return raw
   }
   #endif
+
+  private func withExpiringStateActivityIfNeeded<T>(
+    allowExpireClose: Bool = false,
+    _ body: @escaping @Sendable () throws -> T
+  ) throws -> T {
+    try withExpiringActivityGuard(
+      active: hasSealedStore,
+      allowExpireClose: allowExpireClose && isExtensionProfile,
+      onAsyncClose: { [weak self] in self?.close() },
+      body
+    )
+  }
 
   deinit {
     close()
@@ -579,12 +1103,14 @@ public final class TendrilEndpoint {
 
   /// Sends `transportConfigJson` and caches it on success. `configLock` must be held.
   private func configureTransportsLocked(_ transportConfigJson: String) throws {
-    try withHandle { h in
-      let rc = try withValidatedCString(transportConfigJson, name: "transportConfigJson") { cCfg in
-        tendril_endpoint_configure_transports_json(h, cCfg)
-      }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_configure_transports_json failed")
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(transportConfigJson, name: "transportConfigJson") { cCfg in
+          tendril_endpoint_configure_transports_json(h, cCfg)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_configure_transports_json failed")
+        }
       }
     }
     let parsed = try? JSONSerialization.jsonObject(with: Data(transportConfigJson.utf8))
@@ -648,15 +1174,17 @@ public final class TendrilEndpoint {
   }
 
   public func issueCode(kind: String = "remote") throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withValidatedCString(kind, name: "kind") { cKind in
-        tendril_endpoint_issue_code(h, cKind, &out)
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withValidatedCString(kind, name: "kind") { cKind in
+          tendril_endpoint_issue_code(h, cKind, &out)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_issue_code failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_issue_code failed")
-      }
-      return takeOutCString(out)
     }
   }
 
@@ -667,34 +1195,38 @@ public final class TendrilEndpoint {
     deviceName: String,
     deviceKind: String = "ios"
   ) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withValidatedCString(endpoint, name: "endpoint") { cEp in
-        try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
-          try withValidatedCString(code, name: "code") { cCode in
-            try withValidatedCString(deviceName, name: "deviceName") { cName in
-              try withValidatedCString(deviceKind, name: "deviceKind") { cKind in
-                tendril_endpoint_pair_initiate(h, cEp, cRh, cCode, cName, cKind, &out)
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withValidatedCString(endpoint, name: "endpoint") { cEp in
+          try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
+            try withValidatedCString(code, name: "code") { cCode in
+              try withValidatedCString(deviceName, name: "deviceName") { cName in
+                try withValidatedCString(deviceKind, name: "deviceKind") { cKind in
+                  tendril_endpoint_pair_initiate(h, cEp, cRh, cCode, cName, cKind, &out)
+                }
               }
             }
           }
         }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_pair_initiate failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_pair_initiate failed")
-      }
-      return takeOutCString(out)
     }
   }
 
   public func pairAccept(timeoutMs: UInt64) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = tendril_endpoint_pair_accept(h, timeoutMs, &out)
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = tendril_endpoint_pair_accept(h, timeoutMs, &out)
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_pair_accept failed")
+        }
+        return takeOutCString(out)
       }
-      return takeOutCString(out)
     }
   }
 
@@ -706,74 +1238,84 @@ public final class TendrilEndpoint {
     deviceKind: String = "ios",
     pinnedHostJson: String? = nil
   ) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withValidatedCString(endpoint, name: "endpoint") { cEp in
-        try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
-          try withValidatedCString(code, name: "code") { cCode in
-            try withValidatedCString(deviceName, name: "deviceName") { cName in
-              try withValidatedCString(deviceKind, name: "deviceKind") { cKind in
-                try withOptionalValidatedCString(pinnedHostJson, name: "pinnedHostJson") { cPinned in
-                  tendril_endpoint_pair_v2_initiate(h, cEp, cRh, cCode, cName, cKind, cPinned, &out)
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withValidatedCString(endpoint, name: "endpoint") { cEp in
+          try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
+            try withValidatedCString(code, name: "code") { cCode in
+              try withValidatedCString(deviceName, name: "deviceName") { cName in
+                try withValidatedCString(deviceKind, name: "deviceKind") { cKind in
+                  try withOptionalValidatedCString(pinnedHostJson, name: "pinnedHostJson") { cPinned in
+                    tendril_endpoint_pair_v2_initiate(h, cEp, cRh, cCode, cName, cKind, cPinned, &out)
+                  }
                 }
               }
             }
           }
         }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_pair_v2_initiate failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_pair_v2_initiate failed")
-      }
-      return takeOutCString(out)
     }
   }
 
   public func pairV2Accept(timeoutMs: UInt64) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = tendril_endpoint_pair_v2_accept(h, timeoutMs, &out)
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_pair_v2_accept failed")
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = tendril_endpoint_pair_v2_accept(h, timeoutMs, &out)
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_pair_v2_accept failed")
+        }
+        return takeOutCString(out)
       }
-      return takeOutCString(out)
     }
   }
 
   public func confirmPeer(peerId: String, sas: String? = nil) throws {
-    try withHandle { h in
-      let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
-        try withOptionalValidatedCString(sas, name: "sas") { cSas in
-          tendril_endpoint_confirm_peer(h, cPeer, cSas)
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+          try withOptionalValidatedCString(sas, name: "sas") { cSas in
+            tendril_endpoint_confirm_peer(h, cPeer, cSas)
+          }
         }
-      }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_confirm_peer failed")
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_confirm_peer failed")
+        }
       }
     }
   }
 
   public func mintGrant(peerId: String, capsJson: String, ttlSecs: UInt64 = 3600) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
-        try withValidatedCString(capsJson, name: "capsJson") { cCaps in
-          tendril_endpoint_mint_grant(h, cPeer, cCaps, ttlSecs, &out)
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+          try withValidatedCString(capsJson, name: "capsJson") { cCaps in
+            tendril_endpoint_mint_grant(h, cPeer, cCaps, ttlSecs, &out)
+          }
         }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_mint_grant failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_mint_grant failed")
-      }
-      return takeOutCString(out)
     }
   }
 
   public func revokePeer(peerId: String) throws {
-    try withHandle { h in
-      let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
-        tendril_endpoint_revoke_peer(h, cPeer)
-      }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_revoke_peer failed")
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+          tendril_endpoint_revoke_peer(h, cPeer)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_revoke_peer failed")
+        }
       }
     }
   }
@@ -784,27 +1326,31 @@ public final class TendrilEndpoint {
         "signingPub must be \(TENDRIL_SIGNING_PUB_LEN) bytes"
       )
     }
-    try withHandle { h in
-      let rc = try withValidatedCString(anchorId, name: "anchorId") { cAnchor in
-        signingPub.withUnsafeBytes { keyRaw in
-          tendril_endpoint_add_trust_anchor(
-            h, cAnchor, keyRaw.bindMemory(to: UInt8.self).baseAddress, signingPub.count
-          )
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(anchorId, name: "anchorId") { cAnchor in
+          signingPub.withUnsafeBytes { keyRaw in
+            tendril_endpoint_add_trust_anchor(
+              h, cAnchor, keyRaw.bindMemory(to: UInt8.self).baseAddress, signingPub.count
+            )
+          }
         }
-      }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_add_trust_anchor failed")
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_add_trust_anchor failed")
+        }
       }
     }
   }
 
   public func revokeTrustAnchor(anchorId: String) throws {
-    try withHandle { h in
-      let rc = try withValidatedCString(anchorId, name: "anchorId") { cAnchor in
-        tendril_endpoint_revoke_trust_anchor(h, cAnchor)
-      }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_revoke_trust_anchor failed")
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(anchorId, name: "anchorId") { cAnchor in
+          tendril_endpoint_revoke_trust_anchor(h, cAnchor)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_revoke_trust_anchor failed")
+        }
       }
     }
   }
@@ -814,17 +1360,19 @@ public final class TendrilEndpoint {
     subject: String? = nil,
     ttlSecs: UInt64 = 900
   ) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
-        try withOptionalValidatedCString(subject, name: "subject") { cSubj in
-          tendril_endpoint_mint_enrollment_token(h, cTarget, cSubj, ttlSecs, &out)
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
+          try withOptionalValidatedCString(subject, name: "subject") { cSubj in
+            tendril_endpoint_mint_enrollment_token(h, cTarget, cSubj, ttlSecs, &out)
+          }
         }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_mint_enrollment_token failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_mint_enrollment_token failed")
-      }
-      return takeOutCString(out)
     }
   }
 
@@ -849,30 +1397,32 @@ public final class TendrilEndpoint {
         "hostSigningPub must be \(TENDRIL_SIGNING_PUB_LEN) or \(TENDRIL_SIGNING_HASH_LEN) bytes"
       )
     }
-    return try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withValidatedCString(endpoint, name: "endpoint") { cEp in
-        try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
-          try withValidatedCString(hostId, name: "hostId") { cHost in
-            try withValidatedCString(tokenJson, name: "tokenJson") { cToken in
-              try withValidatedCString(name, name: "name") { cName in
-                try withValidatedCString(kind, name: "kind") { cKind in
-                  hostStaticPub.withUnsafeBytes { stRaw in
-                    hostSigningPub.withUnsafeBytes { sgRaw in
-                      tendril_endpoint_enroll_initiate(
-                        h,
-                        cEp,
-                        cRh,
-                        cHost,
-                        stRaw.bindMemory(to: UInt8.self).baseAddress,
-                        sgRaw.bindMemory(to: UInt8.self).baseAddress,
-                        hostSigningPub.count,
-                        hostRotationSeq,
-                        cToken,
-                        cName,
-                        cKind,
-                        &out
-                      )
+    return try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withValidatedCString(endpoint, name: "endpoint") { cEp in
+          try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
+            try withValidatedCString(hostId, name: "hostId") { cHost in
+              try withValidatedCString(tokenJson, name: "tokenJson") { cToken in
+                try withValidatedCString(name, name: "name") { cName in
+                  try withValidatedCString(kind, name: "kind") { cKind in
+                    hostStaticPub.withUnsafeBytes { stRaw in
+                      hostSigningPub.withUnsafeBytes { sgRaw in
+                        tendril_endpoint_enroll_initiate(
+                          h,
+                          cEp,
+                          cRh,
+                          cHost,
+                          stRaw.bindMemory(to: UInt8.self).baseAddress,
+                          sgRaw.bindMemory(to: UInt8.self).baseAddress,
+                          hostSigningPub.count,
+                          hostRotationSeq,
+                          cToken,
+                          cName,
+                          cKind,
+                          &out
+                        )
+                      }
                     }
                   }
                 }
@@ -880,11 +1430,11 @@ public final class TendrilEndpoint {
             }
           }
         }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_enroll_initiate failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_enroll_initiate failed")
-      }
-      return takeOutCString(out)
     }
   }
 
@@ -896,20 +1446,26 @@ public final class TendrilEndpoint {
     targetHostId: String,
     grantJson: String? = nil
   ) throws -> TendrilSession {
-    try withHandle { h in
-      let raw = try withOptionalValidatedCString(endpoint, name: "endpoint") { cEp in
-        try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
-          try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
-            try withOptionalValidatedCString(grantJson, name: "grantJson") { cGrant in
-              tendril_session_connect(h, cEp, cRh, cTarget, cGrant)
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        let raw = try withOptionalValidatedCString(endpoint, name: "endpoint") { cEp in
+          try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
+            try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
+              try withOptionalValidatedCString(grantJson, name: "grantJson") { cGrant in
+                tendril_session_connect(h, cEp, cRh, cTarget, cGrant)
+              }
             }
           }
         }
+        guard let raw else {
+          throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect failed")
+        }
+        return TendrilSession(
+          handle: raw,
+          hasSealedStore: self.hasSealedStore,
+          isExtensionProfile: self.isExtensionProfile
+        )
       }
-      guard let raw else {
-        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect failed")
-      }
-      return TendrilSession(handle: raw)
     }
   }
 
@@ -927,15 +1483,17 @@ public final class TendrilEndpoint {
     let options = try routeOptionsJSON([
       "kind": kind, "host_name": hostName, "sign_routes": signRoutes,
     ])
-    return try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withOptionalValidatedCString(options, name: "options") { cOpts in
-        tendril_endpoint_issue_pairing_uri(h, cOpts, &out)
+    return try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withOptionalValidatedCString(options, name: "options") { cOpts in
+          tendril_endpoint_issue_pairing_uri(h, cOpts, &out)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_issue_pairing_uri failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_issue_pairing_uri failed")
-      }
-      return takeOutCString(out)
     }
   }
 
@@ -952,7 +1510,7 @@ public final class TendrilEndpoint {
     code: String? = nil
   ) throws -> String {
     try pairUriCall(
-      "tendril_endpoint_pair_uri", tendril_endpoint_pair_uri, pairingUri, name, deviceKind,
+      "tendril_endpoint_pair_uri", .v1, pairingUri, name, deviceKind,
       routePolicy, saveRoute, endpoint, code)
   }
 
@@ -967,18 +1525,18 @@ public final class TendrilEndpoint {
     code: String? = nil
   ) throws -> String {
     try pairUriCall(
-      "tendril_endpoint_pair_v2_uri", tendril_endpoint_pair_v2_uri, pairingUri, name, deviceKind,
+      "tendril_endpoint_pair_v2_uri", .v2, pairingUri, name, deviceKind,
       routePolicy, saveRoute, endpoint, code)
   }
 
-  private typealias PairUriFn = (
-    OpaquePointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?,
-    UnsafePointer<CChar>?, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
-  ) -> Int32
+  private enum PairUriWire: Sendable {
+    case v1
+    case v2
+  }
 
   private func pairUriCall(
     _ fnName: String,
-    _ fn: PairUriFn,
+    _ wire: PairUriWire,
     _ pairingUri: String,
     _ name: String?,
     _ deviceKind: String?,
@@ -990,21 +1548,28 @@ public final class TendrilEndpoint {
     let options = try routeOptionsJSON([
       "route_policy": routePolicy, "save_route": saveRoute, "endpoint": endpoint, "code": code,
     ])
-    return try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withValidatedCString(pairingUri, name: "pairingUri") { cUri in
-        try withOptionalValidatedCString(name, name: "name") { cName in
-          try withOptionalValidatedCString(deviceKind, name: "deviceKind") { cKind in
-            try withOptionalValidatedCString(options, name: "options") { cOpts in
-              fn(h, cUri, cName, cKind, cOpts, &out)
+    return try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withValidatedCString(pairingUri, name: "pairingUri") { cUri in
+          try withOptionalValidatedCString(name, name: "name") { cName in
+            try withOptionalValidatedCString(deviceKind, name: "deviceKind") { cKind in
+              try withOptionalValidatedCString(options, name: "options") { cOpts in
+                switch wire {
+                case .v1:
+                  return tendril_endpoint_pair_uri(h, cUri, cName, cKind, cOpts, &out)
+                case .v2:
+                  return tendril_endpoint_pair_v2_uri(h, cUri, cName, cKind, cOpts, &out)
+                }
+              }
             }
           }
         }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "\(fnName) failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "\(fnName) failed")
-      }
-      return takeOutCString(out)
     }
   }
 
@@ -1033,17 +1598,23 @@ public final class TendrilEndpoint {
       fields["grant"] = obj
     }
     let options = try routeOptionsJSON(fields)
-    return try withHandle { h in
-      let raw = try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
-        try withOptionalValidatedCString(options, name: "options") { cOpts in
-          tendril_session_connect_with_options(h, cTarget, cOpts)
+    return try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        let raw = try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
+          try withOptionalValidatedCString(options, name: "options") { cOpts in
+            tendril_session_connect_with_options(h, cTarget, cOpts)
+          }
         }
+        guard let raw else {
+          throw ffiError(
+            TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect_with_options failed")
+        }
+        return TendrilSession(
+          handle: raw,
+          hasSealedStore: self.hasSealedStore,
+          isExtensionProfile: self.isExtensionProfile
+        )
       }
-      guard let raw else {
-        throw ffiError(
-          TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect_with_options failed")
-      }
-      return TendrilSession(handle: raw)
     }
   }
 
@@ -1055,14 +1626,16 @@ public final class TendrilEndpoint {
     }
     let data = try JSONSerialization.data(withJSONObject: routes)
     let json = String(decoding: data, as: UTF8.self)
-    try withHandle { h in
-      let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
-        try withValidatedCString(json, name: "routes") { cRoutes in
-          tendril_endpoint_set_peer_routes(h, cPeer, cRoutes)
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+          try withValidatedCString(json, name: "routes") { cRoutes in
+            tendril_endpoint_set_peer_routes(h, cPeer, cRoutes)
+          }
         }
-      }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_set_peer_routes failed")
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_set_peer_routes failed")
+        }
       }
     }
   }
@@ -1085,14 +1658,16 @@ public final class TendrilEndpoint {
   /// Clears stored routes of `peerId`. `source` is `nil` or `"operator"` (operator routes),
   /// `"signed"`, `"committed"` or `"all"`. The route metadata is kept.
   public func clearPeerRoutes(peerId: String, source: String? = nil) throws {
-    try withHandle { h in
-      let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
-        try withOptionalValidatedCString(source, name: "source") { cSource in
-          tendril_endpoint_clear_peer_routes(h, cPeer, cSource)
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+          try withOptionalValidatedCString(source, name: "source") { cSource in
+            tendril_endpoint_clear_peer_routes(h, cPeer, cSource)
+          }
         }
-      }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_clear_peer_routes failed")
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_clear_peer_routes failed")
+        }
       }
     }
   }
@@ -1105,17 +1680,19 @@ public final class TendrilEndpoint {
     routePolicy: String? = nil
   ) throws -> String {
     let options = try routeOptionsJSON(["replace_routes": replaceRoutes, "route_policy": routePolicy])
-    return try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withValidatedCString(pairingUri, name: "pairingUri") { cUri in
-        try withOptionalValidatedCString(options, name: "options") { cOpts in
-          tendril_endpoint_apply_route_uri(h, cUri, cOpts, &out)
+    return try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withValidatedCString(pairingUri, name: "pairingUri") { cUri in
+          try withOptionalValidatedCString(options, name: "options") { cOpts in
+            tendril_endpoint_apply_route_uri(h, cUri, cOpts, &out)
+          }
         }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_apply_route_uri failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_apply_route_uri failed")
-      }
-      return takeOutCString(out)
     }
   }
 
@@ -1125,15 +1702,17 @@ public final class TendrilEndpoint {
   /// `{"route_seq", "changed"}` as JSON.
   @discardableResult
   public func refreshRoutes(snapshotJson: String? = nil) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withOptionalValidatedCString(snapshotJson, name: "snapshotJson") { cSnap in
-        tendril_endpoint_refresh_routes(h, cSnap, &out)
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withOptionalValidatedCString(snapshotJson, name: "snapshotJson") { cSnap in
+          tendril_endpoint_refresh_routes(h, cSnap, &out)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_refresh_routes failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_endpoint_refresh_routes failed")
-      }
-      return takeOutCString(out)
     }
   }
 
@@ -1268,11 +1847,17 @@ public final class TendrilEndpoint {
   }
 
   public func acceptSession(timeoutMs: UInt64) throws -> TendrilSession {
-    try withHandle { h in
-      guard let raw = tendril_session_accept(h, timeoutMs) else {
-        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept failed")
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        guard let raw = tendril_session_accept(h, timeoutMs) else {
+          throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept failed")
+        }
+        return TendrilSession(
+          handle: raw,
+          hasSealedStore: self.hasSealedStore,
+          isExtensionProfile: self.isExtensionProfile
+        )
       }
-      return TendrilSession(handle: raw)
     }
   }
 
@@ -1283,44 +1868,56 @@ public final class TendrilEndpoint {
     targetHostId: String,
     grantJson: String? = nil
   ) throws -> TendrilSession {
-    try withHandle { h in
-      let raw = try withOptionalValidatedCString(endpoint, name: "endpoint") { cEp in
-        try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
-          try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
-            try withOptionalValidatedCString(grantJson, name: "grantJson") { cGrant in
-              tendril_session_connect_v2(h, cEp, cRh, cTarget, cGrant)
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        let raw = try withOptionalValidatedCString(endpoint, name: "endpoint") { cEp in
+          try withOptionalValidatedCString(relayHost, name: "relayHost") { cRh in
+            try withValidatedCString(targetHostId, name: "targetHostId") { cTarget in
+              try withOptionalValidatedCString(grantJson, name: "grantJson") { cGrant in
+                tendril_session_connect_v2(h, cEp, cRh, cTarget, cGrant)
+              }
             }
           }
         }
+        guard let raw else {
+          throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect_v2 failed")
+        }
+        return TendrilSession(
+          handle: raw,
+          hasSealedStore: self.hasSealedStore,
+          isExtensionProfile: self.isExtensionProfile
+        )
       }
-      guard let raw else {
-        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_connect_v2 failed")
-      }
-      return TendrilSession(handle: raw)
     }
   }
 
   public func acceptV2(timeoutMs: UInt64) throws -> TendrilSession {
-    try withHandle { h in
-      guard let raw = tendril_session_accept_v2(h, timeoutMs) else {
-        throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept_v2 failed")
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        guard let raw = tendril_session_accept_v2(h, timeoutMs) else {
+          throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_session_accept_v2 failed")
+        }
+        return TendrilSession(
+          handle: raw,
+          hasSealedStore: self.hasSealedStore,
+          isExtensionProfile: self.isExtensionProfile
+        )
       }
-      return TendrilSession(handle: raw)
     }
   }
 }
 
 /// Calls `onChange` for every `NWPathMonitor` path update, on `queue`.
-internal final class TendrilPathMonitor {
+internal final class TendrilPathMonitor: @unchecked Sendable {
   #if canImport(Network)
   private let monitor = NWPathMonitor()
   #endif
   private let queue: DispatchQueue
-  private let onChange: () -> Void
+  private let onChange: @Sendable () -> Void
   private let lock = NSLock()
   private var cancelled = false
 
-  init(queue: DispatchQueue, onChange: @escaping () -> Void) {
+  init(queue: DispatchQueue, onChange: @escaping @Sendable () -> Void) {
     self.queue = queue
     self.onChange = onChange
   }
@@ -1367,14 +1964,34 @@ internal final class TendrilPathMonitor {
   }
 }
 
-public final class TendrilSession {
+public final class TendrilSession: @unchecked Sendable {
   private let cond = NSCondition()
   private var handle: OpaquePointer?
   private var activeCalls: Int = 0
   private var closing: Bool = false
+  private let hasSealedStore: Bool
+  private let isExtensionProfile: Bool
 
-  internal init(handle: OpaquePointer) {
+  internal init(
+    handle: OpaquePointer,
+    hasSealedStore: Bool = false,
+    isExtensionProfile: Bool = false
+  ) {
     self.handle = handle
+    self.hasSealedStore = hasSealedStore
+    self.isExtensionProfile = isExtensionProfile
+  }
+
+  private func withExpiringStateActivityIfNeeded<T>(
+    allowExpireClose: Bool = false,
+    _ body: @escaping @Sendable () throws -> T
+  ) throws -> T {
+    try withExpiringActivityGuard(
+      active: hasSealedStore,
+      allowExpireClose: allowExpireClose && isExtensionProfile,
+      onAsyncClose: { [weak self] in self?.free() },
+      body
+    )
   }
 
   deinit {
@@ -1447,24 +2064,28 @@ public final class TendrilSession {
   }
 
   public func sendData(_ data: Data) throws {
-    try withHandle { h in
-      let rc = data.withUnsafeBytes { raw in
-        tendril_session_send_data(h, raw.bindMemory(to: UInt8.self).baseAddress, data.count)
-      }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_session_send_data failed")
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = data.withUnsafeBytes { raw in
+          tendril_session_send_data(h, raw.bindMemory(to: UInt8.self).baseAddress, data.count)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_session_send_data failed")
+        }
       }
     }
   }
 
   public func pollEvent(timeoutMs: UInt64) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = tendril_session_poll_event(h, timeoutMs, &out)
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_session_poll_event failed")
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = tendril_session_poll_event(h, timeoutMs, &out)
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_session_poll_event failed")
+        }
+        return takeOutCString(out)
       }
-      return takeOutCString(out)
     }
   }
 
@@ -1482,35 +2103,44 @@ public final class TendrilSession {
   }
 
   public func rekey() throws {
-    try withHandle { h in
-      let rc = tendril_session_rekey(h)
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_session_rekey failed")
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = tendril_session_rekey(h)
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_session_rekey failed")
+        }
       }
     }
   }
 
   public func close(code: UInt16 = 1000, reason: String = "") throws {
-    try withHandle { h in
-      let rc = try withValidatedCString(reason, name: "reason") { cReason in
-        tendril_session_close(h, code, cReason)
-      }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_session_close failed")
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(reason, name: "reason") { cReason in
+          tendril_session_close(h, code, cReason)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_session_close failed")
+        }
       }
     }
   }
 }
 
 extension TendrilEndpoint {
-  private func manifestCall(_ name: String, _ call: (OpaquePointer, inout UnsafeMutablePointer<CChar>?) throws -> Int32) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try call(h, &out)
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "\(name) failed")
+  private func manifestCall(
+    _ name: String,
+    _ call: @escaping @Sendable (OpaquePointer, inout UnsafeMutablePointer<CChar>?) throws -> Int32
+  ) throws -> String {
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try call(h, &out)
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "\(name) failed")
+        }
+        return takeOutCString(out)
       }
-      return takeOutCString(out)
     }
   }
 
@@ -1573,29 +2203,55 @@ extension TendrilEndpoint {
   /// for calls that returned before it, and a later `serveRelay` on a relay host in the member's own
   /// entry competes with the group.
   public func openGroup(groupId: String, listenAddr: String? = nil) throws -> TendrilGroup {
-    try withHandle { h in
-      var raw: OpaquePointer?
-      let rc = try withValidatedCString(groupId, name: "groupId") { cGroup in
-        try withOptionalValidatedCString(listenAddr, name: "listenAddr") { cListen in
-          tendril_group_open(h, cGroup, cListen, &raw)
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var raw: OpaquePointer?
+        let rc = try withValidatedCString(groupId, name: "groupId") { cGroup in
+          try withOptionalValidatedCString(listenAddr, name: "listenAddr") { cListen in
+            tendril_group_open(h, cGroup, cListen, &raw)
+          }
         }
+        guard rc == TENDRIL_OK.rawValue, let raw else {
+          throw ffiError(rc, fallback: "tendril_group_open failed")
+        }
+        return TendrilGroup(
+          handle: raw,
+          hasSealedStore: self.hasSealedStore,
+          isExtensionProfile: self.isExtensionProfile
+        )
       }
-      guard rc == TENDRIL_OK.rawValue, let raw else {
-        throw ffiError(rc, fallback: "tendril_group_open failed")
-      }
-      return TendrilGroup(handle: raw)
     }
   }
 }
 
-public final class TendrilGroup {
+public final class TendrilGroup: @unchecked Sendable {
   private let cond = NSCondition()
   private var handle: OpaquePointer?
   private var activeCalls: Int = 0
   private var closing: Bool = false
+  private let hasSealedStore: Bool
+  private let isExtensionProfile: Bool
 
-  internal init(handle: OpaquePointer) {
+  internal init(
+    handle: OpaquePointer,
+    hasSealedStore: Bool = false,
+    isExtensionProfile: Bool = false
+  ) {
     self.handle = handle
+    self.hasSealedStore = hasSealedStore
+    self.isExtensionProfile = isExtensionProfile
+  }
+
+  private func withExpiringStateActivityIfNeeded<T>(
+    allowExpireClose: Bool = false,
+    _ body: @escaping @Sendable () throws -> T
+  ) throws -> T {
+    try withExpiringActivityGuard(
+      active: hasSealedStore,
+      allowExpireClose: allowExpireClose && isExtensionProfile,
+      onAsyncClose: { [weak self] in self?.close() },
+      body
+    )
   }
 
   deinit {
@@ -1660,30 +2316,34 @@ public final class TendrilGroup {
   /// Sends `data` to every reachable member and returns the `{delivered, offline, failed}` JSON.
   /// A nil `requiredCap` uses the group's default send capability.
   public func broadcast(_ data: Data, requiredCap: String? = nil) throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = try withOptionalValidatedCString(requiredCap, name: "requiredCap") { cCap in
-        data.withUnsafeBytes { raw in
-          tendril_group_broadcast(h, cCap, raw.bindMemory(to: UInt8.self).baseAddress, data.count, &out)
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = try withOptionalValidatedCString(requiredCap, name: "requiredCap") { cCap in
+          data.withUnsafeBytes { raw in
+            tendril_group_broadcast(h, cCap, raw.bindMemory(to: UInt8.self).baseAddress, data.count, &out)
+          }
         }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_group_broadcast failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_group_broadcast failed")
-      }
-      return takeOutCString(out)
     }
   }
 
   /// Pushes the stored manifest (and, for an admin, the rendezvous key) to members and returns the
   /// report JSON. Wire v2 groups need it; the runtime refuses non-admins.
   public func sync() throws -> String {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = tendril_group_sync(h, &out)
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_group_sync failed")
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = tendril_group_sync(h, &out)
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_group_sync failed")
+        }
+        return takeOutCString(out)
       }
-      return takeOutCString(out)
     }
   }
 
@@ -1706,16 +2366,18 @@ public final class TendrilGroup {
   /// `member_joined`, `member_revoked`, `audit`) and returns nil on timeout. Throws `.eof` once the
   /// pool is closed or the handle is closed while the call is waiting.
   public func pollEvent(timeoutMs: UInt64) throws -> String? {
-    try withHandle { h in
-      var out: UnsafeMutablePointer<CChar>?
-      let rc = tendril_group_poll_event(h, timeoutMs, &out)
-      if rc == TENDRIL_WOULD_BLOCK.rawValue {
-        return nil
+    try withExpiringStateActivityIfNeeded(allowExpireClose: true) {
+      try self.withHandle { h in
+        var out: UnsafeMutablePointer<CChar>?
+        let rc = tendril_group_poll_event(h, timeoutMs, &out)
+        if rc == TENDRIL_WOULD_BLOCK.rawValue {
+          return nil
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_group_poll_event failed")
+        }
+        return takeOutCString(out)
       }
-      guard rc == TENDRIL_OK.rawValue else {
-        throw ffiError(rc, fallback: "tendril_group_poll_event failed")
-      }
-      return takeOutCString(out)
     }
   }
 
