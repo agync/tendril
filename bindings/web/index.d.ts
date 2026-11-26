@@ -75,6 +75,19 @@ export interface TendrilAttemptError extends Error {
   failures?: CandidateFailure[];
 }
 
+/** One unconfirmed host claim, as listed by `TendrilWebClient.pendingHosts`. */
+export interface PendingHostClaim {
+  host_id: string;
+  device_id: string;
+  name: string;
+  state: string;
+  static_pub: string;
+  signing_pub_hash: string | null;
+  rotation_seq: number;
+  min_wire_version: number;
+  pairing_sas: string | null;
+}
+
 export interface PeerRoutes {
   peer_id: string;
   routes: StoredRoute[];
@@ -692,7 +705,19 @@ export class TendrilWebClient {
     options?: { routePolicy?: RoutePolicy; replaceRoutes?: boolean }
   ): Promise<RouteApplyResult>;
   confirmPeer(peerId: string, sas?: string | null): Promise<void>;
+  /** Drops every unconfirmed host claim naming `peerId` and revokes nothing. */
   removePendingPeer(peerId: string): Promise<void>;
+  /**
+   * The unconfirmed host claims left by unpinned pairing, oldest first. `host_id` is the
+   * unauthenticated label a claim names and `device_id` the id derived from its static key in
+   * the handshake.
+   */
+  pendingHosts(): PendingHostClaim[];
+  /**
+   * Revokes the keys of the claims whose handshake-derived `deviceId` matches. A claimed
+   * `host_id` never matches, and no roster entry holding other keys is touched.
+   */
+  revokePendingHost(deviceId: string): Promise<void>;
   addTrustAnchor(anchorId: string, signingPubB64: string): Promise<void>;
   revokeTrustAnchor(anchorId: string): Promise<void>;
   mintEnrollmentToken(options: {

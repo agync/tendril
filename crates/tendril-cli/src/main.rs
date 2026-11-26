@@ -235,6 +235,16 @@ enum AnchorCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum PendingCommand {
+    /// List the unconfirmed host claims left by unpinned pairing, oldest first.
+    List,
+    /// Drop every claim naming `host_id`; revokes nothing.
+    Remove { host_id: String },
+    /// Revoke the keys of the claims whose handshake-derived `device_id` matches (never a `host_id`).
+    Revoke { device_id: String },
+}
+
+#[derive(Debug, Subcommand)]
 enum RouteCommand {
     /// Replace the peer's operator routes (`--endpoint` repeatable; `--clear` with none).
     Set {
@@ -492,6 +502,11 @@ enum Command {
     },
     /// Revoke an existing peer (`pair.revoke`), failing closed on all future sessions.
     Revoke { peer_id: String },
+    /// List, remove or revoke unconfirmed host claims from unpinned pairing.
+    Pending {
+        #[command(subcommand)]
+        cmd: PendingCommand,
+    },
     /// Inspect and manage a paired peer's stored Day-2 routes.
     Route {
         #[command(subcommand)]
@@ -3617,6 +3632,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store.update_roster(|roster| roster.revoke_peer(&peer_id).map_err(Into::into))?;
             print_json_line(&serde_json::json!({ "revoked": peer_id }));
         }
+        Command::Pending { cmd } => match cmd {
+            PendingCommand::List => {
+                let roster = store.load_roster()?;
+                let claims = tendril_runtime::pending_hosts_json(&roster);
+                print_json_line(&serde_json::json!({ "pending_hosts": claims }));
+            }
+            PendingCommand::Remove { host_id } => {
+                store.update_roster(|roster| {
+                    roster.remove_pending_peer(&host_id).map_err(Into::into)
+                })?;
+                print_json_line(&serde_json::json!({ "removed_pending": host_id }));
+            }
+            PendingCommand::Revoke { device_id } => {
+                store.update_roster(|roster| {
+                    roster.revoke_pending_host(&device_id).map_err(Into::into)
+                })?;
+                print_json_line(&serde_json::json!({ "revoked_pending": device_id }));
+            }
+        },
         Command::Route { cmd } => {
             let access = RosterAccess::from_store(Arc::clone(&store))?;
             match cmd {

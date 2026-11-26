@@ -547,7 +547,24 @@ test("SEC-18, SEC-22, and SEC-33 live WASM client/session concurrency, persisten
     assert.equal(paired.sas, hostPair.sas);
     assert.equal(client.getPeer("sec-host")?.state, "pending");
 
+    // Pending host claims list by label and by the handshake-derived device id, and revoking
+    // one rolls back with the rest of the roster when persistence fails.
+    const claims = client.pendingHosts();
+    assert.deepEqual(
+      claims.map((c) => c.host_id),
+      ["sec-host"]
+    );
+    assert.equal(claims[0].device_id, peerInit.device_id);
     failPersist = true;
+    await assert.rejects(
+      () => client.revokePendingHost(peerInit.device_id),
+      /storage quota exceeded/
+    );
+    assert.equal(client.pendingHosts().length, 1);
+    // A claimed host_id is not an authenticated id.
+    await assert.rejects(() => client.revokePendingHost("sec-host"));
+    assert.equal(client.pendingHosts().length, 1);
+
     await assert.rejects(
       () => client.removePendingPeer("sec-host"),
       /storage quota exceeded/

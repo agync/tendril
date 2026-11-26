@@ -52,6 +52,20 @@ export class Endpoint {
   confirmPeer(peerId: string, sas?: string | null): void;
   mintGrant(peerId: string, caps: string[], ttlSecs?: number | null): string;
   revokePeer(peerId: string): void;
+  /**
+   * Resolves to the unconfirmed host claims left by unpinned pairing, oldest first, as a JSON
+   * array of `{"host_id", "device_id", "name", "static_pub", "signing_pub_hash", "rotation_seq",
+   * "min_wire_version", "pairing_sas"}`. `host_id` is the unauthenticated label a claim names and
+   * `device_id` the id derived from its static key in the handshake.
+   */
+  pendingHosts(): Promise<string>;
+  /** Drops every unconfirmed host claim naming `hostId` and revokes nothing. */
+  removePendingPeer(hostId: string): void;
+  /**
+   * Revokes the keys of the claims whose handshake-derived `deviceId` matches; a claimed
+   * `host_id` never matches.
+   */
+  revokePendingHost(deviceId: string): void;
   addTrustAnchor(anchorId: string, signingPub: Buffer): void;
   revokeTrustAnchor(anchorId: string): void;
   mintEnrollmentToken(

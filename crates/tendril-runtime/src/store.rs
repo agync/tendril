@@ -681,6 +681,33 @@ impl StateStore {
     }
 }
 
+/// The unconfirmed host claims of `roster`, oldest first, as the JSON array every binding lists:
+/// `host_id` is the unauthenticated label a claim names, `device_id` the id derived from its
+/// static key in the handshake (the only id a claim revocation matches).
+#[must_use]
+pub fn pending_hosts_json(roster: &Roster) -> serde_json::Value {
+    serde_json::Value::Array(
+        roster
+            .pending_hosts()
+            .map(|claim| {
+                serde_json::json!({
+                    "host_id": claim.device_id,
+                    "device_id": tendril_core::crypto::device_id(&claim.static_pub),
+                    "name": claim.name,
+                    "static_pub": b64url_encode(&claim.static_pub),
+                    "signing_pub_hash": claim
+                        .signing_pub
+                        .as_ref()
+                        .map(|k| b64url_encode(&k.sha256_hash())),
+                    "rotation_seq": claim.rotation_seq,
+                    "min_wire_version": claim.min_wire_version,
+                    "pairing_sas": claim.last_pairing_sas,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Creates `dir` (`0o700`) if needed, then syncs `dir` and every ancestor of its canonical path
 /// up to the filesystem root, on every open. Existence is not proof of durability: an earlier
 /// open may have created the tree and died before syncing it. The walk stops without error at

@@ -2052,8 +2052,6 @@ impl WasmRoster {
         self.inner.revoke_trust_anchor(anchor_id).map_err(to_js_err)
     }
 
-    /// The unconfirmed host claims, oldest first, as a JSON array. `host_id` is the label each
-    /// names and `device_id` the id derived from its static key.
     /// Revokes the keys of the unconfirmed host claims whose static key derives
     /// `static_device_id`, never a claimed `host_id` or a roster entry holding other keys.
     #[wasm_bindgen]
@@ -2063,6 +2061,8 @@ impl WasmRoster {
             .map_err(to_js_err)
     }
 
+    /// The unconfirmed host claims, oldest first, as a JSON array. `host_id` is the label each
+    /// names and `device_id` the id derived from its static key.
     #[wasm_bindgen]
     #[must_use]
     pub fn pending_hosts_json(&self) -> String {
