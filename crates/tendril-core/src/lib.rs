@@ -22,6 +22,7 @@ pub mod state_seal;
 pub mod v2;
 pub mod wire;
 
+pub use crypto::ExternalMlDsaSigner;
 pub use grants::{
     authorize_path_capability, canonicalize_capability_path, verify_enrollment_grant_chain,
 };

@@ -597,4 +597,67 @@ mod tests {
         ingest(&replayed, &newer);
         assert!(!is_member(&replayed, &group.gid, &removed));
     }
+
+    #[test]
+    fn sealed_store_supports_external_mldsa_identity() {
+        use std::sync::Arc;
+        use tendril_core::crypto::{
+            ED25519_SIG_LEN, ExternalMlDsaSigner, HYBRID_MLDSA_CTX, MLDSA65_PUBLIC_LEN,
+            MLDSA65_SIG_LEN,
+        };
+        use tendril_core::error::CoreError;
+
+        struct SealedMockExternalSigner {
+            inner: SigningKeypair,
+            pub_bytes: [u8; MLDSA65_PUBLIC_LEN],
+        }
+
+        impl SealedMockExternalSigner {
+            fn new(seed: [u8; 32]) -> Self {
+                let inner = SigningKeypair::from_seeds([0x07; 32], seed);
+                let pub_bytes = *inner.public_key().mldsa65_bytes();
+                Self { inner, pub_bytes }
+            }
+        }
+
+        impl ExternalMlDsaSigner for SealedMockExternalSigner {
+            fn public_bytes(&self) -> &[u8; MLDSA65_PUBLIC_LEN] {
+                &self.pub_bytes
+            }
+
+            fn sign(
+                &self,
+                message: &[u8],
+                context: &[u8],
+            ) -> Result<[u8; MLDSA65_SIG_LEN], CoreError> {
+                assert_eq!(context, HYBRID_MLDSA_CTX);
+                let full = self.inner.sign(message)?;
+                full[ED25519_SIG_LEN..]
+                    .try_into()
+                    .map_err(|_| CoreError::InvalidSignature)
+            }
+        }
+
+        let (_tmp, dir) = state_dir();
+        let ext_kp = SigningKeypair::from_ed25519_and_external(
+            [0x61; 32],
+            Arc::new(SealedMockExternalSigner::new([0x62; 32])),
+        )
+        .unwrap();
+        let me = EndpointIdentity::from_keys(StaticKeypair::from_scalar([0x41; 32]), ext_kp);
+        let peer = ident(4);
+        let store = StateStore::open_sealed(&dir, &me).unwrap();
+        store.update_roster(|r| pin(r, &peer)).unwrap();
+
+        let reopened = StateStore::open_sealed(&dir, &me).unwrap();
+        assert!(
+            reopened
+                .load_roster()
+                .unwrap()
+                .get(&peer.device_id())
+                .is_some()
+        );
+        storage_err(reopened.load_identity(), "binding-sealed");
+        storage_err(reopened.save_identity(&me), "binding-sealed");
+    }
 }
