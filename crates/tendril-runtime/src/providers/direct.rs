@@ -26,6 +26,7 @@ impl DirectListener {
         addr: SocketAddr,
         allow_ips: Option<HashSet<IpAddr>>,
     ) -> Result<Self, RuntimeError> {
+        super::egress::check_bind_addr(addr)?;
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         Ok(Self {
@@ -122,8 +123,13 @@ impl DirectDialer {
         self
     }
 
-    /// Connects directly to `addr`.
+    /// Connects directly to `addr`, refusing the always-blocked set before any connect.
     pub async fn connect(&self, addr: SocketAddr) -> Result<Box<dyn PathStream>, RuntimeError> {
+        let addr = super::egress::resolve_dial_target(&addr.ip().to_string(), addr.port())
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(RuntimeError::Closed)?;
         let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| RuntimeError::Timeout("direct tcp connect timed out"))??;

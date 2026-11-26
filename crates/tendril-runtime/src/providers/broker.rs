@@ -57,6 +57,7 @@ pub struct BrokerListener {
 impl BrokerListener {
     /// Binds a broker listener according to `config`.
     pub async fn bind(config: BrokerServerConfig) -> Result<Self, RuntimeError> {
+        super::egress::check_bind_addr(config.listen_addr)?;
         let listener = TcpListener::bind(config.listen_addr).await?;
         let local_addr = listener.local_addr()?;
         let path = config.path.clone();

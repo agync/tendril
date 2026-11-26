@@ -202,6 +202,7 @@ impl WtListener {
 
     /// Binds a WebTransport listener at `addr` with explicit certificate SANs.
     pub async fn bind_with_san(addr: SocketAddr, sans: Vec<String>) -> Result<Self, RuntimeError> {
+        super::egress::check_bind_addr(addr)?;
         ensure_rustls_ring_provider();
         let not_before = OffsetDateTime::now_utc() - TimeDuration::hours(1);
         let identity = Identity::self_signed_builder()
