@@ -4361,3 +4361,108 @@ fn external_mldsa_signer_roundtrip_and_fail_closed_adversarial_suite() {
         .unwrap();
     assert_eq!(rot2.seq, 1);
 }
+
+#[test]
+fn pairing_initiators_reject_a_host_id_with_hash_or_over_the_length_bound() {
+    let cli = mk_identity(111);
+    for bad in ["studio#nas".to_string(), "h".repeat(257)] {
+        let host = mk_identity(112).with_host_id(bad.clone());
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr
+            .issue_code_with_entropy(PairingCodeKind::Remote3Group, NOW_UNIX, &[7u8; 32])
+            .unwrap();
+        let mut init = PairingInitiator::new(&cli, "Phone", "ios", &code, None, None).unwrap();
+        let mut resp = PairingResponder::new(&host, PairingPathKind::Remote, None).unwrap();
+        let mut roster = Roster::new();
+        let msg1 = collect_pair_writes(&init.start().unwrap());
+        let acts = resp
+            .feed_bytes(&msg1, NOW_UNIX + 1, &mut mgr, &mut roster)
+            .unwrap();
+        assert_eq!(
+            init.feed_bytes(&collect_pair_writes(&acts)).unwrap_err(),
+            CoreError::ProtocolViolation("invalid host_id in HostHello"),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn pairing_uris_reject_a_host_id_with_hash_or_over_the_length_bound() {
+    let host = mk_identity(113);
+    let k_b64 = b64url_encode(host.static_key().public_bytes());
+    let sh_b64 = b64url_encode(&host.signing_key().signing_pub_hash());
+    let uri = |id: &str| {
+        format!("tendril://pair?v=1&host=h&code=TND-AAAA-BBBB&k={k_b64}&sh={sh_b64}&id={id}")
+    };
+    assert!(PairingUri::parse(&uri(&"h".repeat(256))).is_ok());
+    for bad in ["studio%23nas".to_string(), "h".repeat(257)] {
+        assert!(PairingUri::parse(&uri(&bad)).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn wire_floors_follow_static_keys_of_claims_not_unconfirmed_labels() {
+    use tendril_core::crypto::device_id;
+    use tendril_core::roster::V2PeerSecrets;
+    use tendril_core::v2::V2PairOutcome;
+
+    let cli = mk_identity(114);
+    let first_msg2 = |host: &EndpointIdentity, roster: &Roster| {
+        let mut mgr = PairingManager::new(PairingConfig::default());
+        let code = mgr
+            .issue_code_with_entropy(PairingCodeKind::Remote3Group, NOW_UNIX, &[8u8; 32])
+            .unwrap();
+        let mut init = PairingInitiator::new(&cli, "Phone", "ios", &code, None, None)
+            .unwrap()
+            .with_roster_floors(roster);
+        let mut resp = PairingResponder::new(host, PairingPathKind::Remote, None).unwrap();
+        let msg1 = collect_pair_writes(&init.start().unwrap());
+        let acts = resp
+            .feed_bytes(&msg1, NOW_UNIX + 1, &mut mgr, &mut Roster::new())
+            .unwrap();
+        init.feed_bytes(&collect_pair_writes(&acts)).map(|_| ())
+    };
+
+    // A host first paired over Wire v2, still unconfirmed, is not paired again over Wire v1.
+    let host = mk_identity(115).with_host_id("studio");
+    let mut roster = Roster::new();
+    roster
+        .apply_v2_pair_initiator_outcome(
+            &V2PairOutcome::InitiatorPending {
+                device_id: cli.device_id(),
+                host_id: "studio".into(),
+                host_static_pub: *host.static_key().public_bytes(),
+                host_signing_pub: host.signing_key().public_key().clone(),
+                host_rotation_seq: 0,
+                pairing_sas: "sas".into(),
+                host_pin_verified: false,
+                v2_secrets: V2PeerSecrets::new([1; 32], [2; 32]),
+            },
+            "Studio",
+            vec![],
+        )
+        .unwrap();
+    assert!(matches!(
+        first_msg2(&host, &roster),
+        Err(CoreError::VersionDowngrade { .. })
+    ));
+
+    // An unconfirmed entry does not floor the label it sits under for other keys.
+    let other = mk_identity(116);
+    let mut pending = Roster::new();
+    pending
+        .record_pending_pair(
+            *other.static_key().public_bytes(),
+            None,
+            "Peer".into(),
+            "cli".into(),
+            "sas".into(),
+        )
+        .unwrap();
+    let label = device_id(other.static_key().public_bytes());
+    pending
+        .upgrade_peer_to_v2(&label, V2PeerSecrets::new([3; 32], [4; 32]))
+        .unwrap();
+    let squatter = mk_identity(117).with_host_id(label);
+    first_msg2(&squatter, &pending).unwrap();
+}

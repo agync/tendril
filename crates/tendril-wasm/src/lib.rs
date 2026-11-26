@@ -1505,7 +1505,7 @@ fn session_candidates_value(
     use tendril_core::error::CoreError;
     let entry = roster
         .get(peer_id)
-        .ok_or_else(|| WasmError::from(CoreError::PeerNotFound(peer_id.to_owned())))?;
+        .ok_or_else(|| WasmError::from(roster.missing_peer_error(peer_id)))?;
     match entry.state {
         PeerState::Pending => {
             return Err(WasmError::from(CoreError::PeerPending(peer_id.to_owned())));
@@ -1730,19 +1730,27 @@ impl WasmRoster {
     fn peer_entry(&self, peer_id: &str) -> Result<&tendril_core::roster::RosterEntry, WasmError> {
         self.inner
             .get(peer_id)
-            .ok_or_else(|| tendril_core::error::CoreError::PeerNotFound(peer_id.to_owned()).into())
+            .ok_or_else(|| self.inner.missing_peer_error(peer_id).into())
     }
 
+    /// The v2 secrets of an `Active` peer no stored CRL revokes.
     fn peer_v2_secrets(
         &self,
         peer_id: &str,
     ) -> Result<&tendril_core::roster::V2PeerSecrets, WasmError> {
-        self.peer_entry(peer_id)?
-            .v2_secrets
-            .as_ref()
-            .ok_or_else(|| {
-                tendril_core::error::CoreError::NotReady("peer has no v2 secrets").into()
-            })
+        use tendril_core::error::CoreError;
+        let entry = self.peer_entry(peer_id)?;
+        match entry.state {
+            PeerState::Pending => return Err(CoreError::PeerPending(peer_id.to_owned()).into()),
+            PeerState::Revoked => return Err(CoreError::PeerRevoked(peer_id.to_owned()).into()),
+            PeerState::Active if self.inner.crl_revokes_entry(entry) => {
+                return Err(CoreError::PeerRevoked(peer_id.to_owned()).into());
+            }
+            PeerState::Active => {}
+        }
+        entry.v2_secrets.as_ref().ok_or_else(|| {
+            tendril_core::error::CoreError::NotReady("peer has no v2 secrets").into()
+        })
     }
 
     fn pin_snapshot_inner(&self, peer_id: &str) -> Result<WasmPinSnapshot, WasmError> {
@@ -1782,7 +1790,7 @@ impl WasmRoster {
                 let entry = self
                     .inner
                     .get(peer_id)
-                    .ok_or_else(|| tendril_core::error::CoreError::PeerNotFound(peer_id.to_owned()))
+                    .ok_or_else(|| self.inner.missing_peer_error(peer_id))
                     .map_err(WasmError::from)?;
                 entry.require_complete_pin().map_err(WasmError::from)?
             }
@@ -2044,11 +2052,45 @@ impl WasmRoster {
         self.inner.revoke_trust_anchor(anchor_id).map_err(to_js_err)
     }
 
+    /// The unconfirmed host claims, oldest first, as a JSON array. `host_id` is the label each
+    /// names and `device_id` the id derived from its static key.
+    /// Revokes the keys of the unconfirmed host claims whose static key derives
+    /// `static_device_id`, never a claimed `host_id` or a roster entry holding other keys.
+    #[wasm_bindgen]
+    pub fn revoke_pending_host(&mut self, static_device_id: &str) -> Result<(), JsValue> {
+        self.inner
+            .revoke_pending_host(static_device_id)
+            .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn pending_hosts_json(&self) -> String {
+        let list: Vec<serde_json::Value> = self
+            .inner
+            .pending_hosts()
+            .map(|e| {
+                json!({
+                    "host_id": e.device_id,
+                    "device_id": tendril_core::crypto::device_id(&e.static_pub),
+                    "name": e.name,
+                    "state": e.state,
+                    "static_pub": b64url_encode(&e.static_pub),
+                    "signing_pub_hash": e.signing_pub.as_ref().map(|k| b64url_encode(&k.sha256_hash())),
+                    "rotation_seq": e.rotation_seq,
+                    "min_wire_version": e.min_wire_version,
+                    "pairing_sas": e.last_pairing_sas,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(list).to_string()
+    }
+
     #[wasm_bindgen]
     #[must_use]
     pub fn get_peer_json(&self, peer_id: &str) -> Option<String> {
         self.inner
-            .get(peer_id)
+            .get_or_pending_host(peer_id)
             .and_then(|entry| serde_json::to_string(entry).ok())
     }
 
@@ -7412,6 +7454,103 @@ mod route_tests {
             .unwrap_err();
         assert_eq!(err.code, "invalid_pairing_uri");
         assert!(!err.message.contains(SECRET), "{err}");
+    }
+
+    /// `roster` with `label` revoked by a stored CRL while its entry still reads `Active`.
+    fn crl_revoked_but_active(mut roster: Roster, label: &str) -> Roster {
+        use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+        let root = tendril_core::crypto::SigningKeypair::from_seed([0x5A; 32]);
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: "root".into(),
+                seq: 1,
+                revoked_devices: vec![label.into()],
+                revoked_nonces: vec![],
+                ts: "2026-11-20T00:00:00Z".into(),
+            },
+            &root,
+        )
+        .unwrap();
+        roster.ingest_crl(crl, "root", root.public_key()).unwrap();
+        let mut json = serde_json::to_value(&roster).unwrap();
+        json["entries"][label]["state"] = "active".into();
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn pending_host_claims_are_listed() {
+        let host = identity(0x47);
+        let mut roster = Roster::new();
+        roster
+            .record_pending_host(
+                "studio".into(),
+                "Studio".into(),
+                *host.static_key().public_bytes(),
+                host.signing_key().public_key().clone(),
+                0,
+                "sas".into(),
+                vec![],
+            )
+            .unwrap();
+        let listed = to_json(&WasmRoster { inner: roster }.pending_hosts_json());
+        assert_eq!(listed[0]["host_id"], "studio");
+        assert_eq!(listed[0]["device_id"], host.device_id());
+        assert_eq!(listed[0]["state"], "pending");
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_host_claims_are_revocable_by_device_id() {
+        let host = identity(0x49);
+        let mut roster = Roster::new();
+        roster
+            .record_pending_host(
+                "studio".into(),
+                "Studio".into(),
+                *host.static_key().public_bytes(),
+                host.signing_key().public_key().clone(),
+                0,
+                "sas".into(),
+                vec![],
+            )
+            .unwrap();
+        let mut roster = WasmRoster { inner: roster };
+        roster.revoke_pending_host(&host.device_id()).unwrap();
+        assert_eq!(to_json(&roster.pending_hosts_json()), serde_json::json!([]));
+        assert!(roster.inner.pin_snapshot(&host.device_id()).is_err());
+    }
+
+    #[test]
+    fn v2_secrets_are_released_only_for_an_active_unrevoked_peer() {
+        let peer = identity(0x45);
+        let mut pending = Roster::new();
+        pending
+            .record_pending_pair(
+                *peer.static_key().public_bytes(),
+                Some(peer.signing_key().public_key().clone()),
+                "Peer".into(),
+                "cli".into(),
+                "sas".into(),
+            )
+            .unwrap();
+        pending
+            .set_peer_v2_secrets(&peer.device_id(), secrets())
+            .unwrap();
+        let pending = WasmRoster { inner: pending };
+        assert_eq!(
+            pending.peer_v2_secrets(&peer.device_id()).unwrap_err().code,
+            "peer_pending"
+        );
+
+        let (active, _host) = roster_with_routes();
+        let revoked = WasmRoster {
+            inner: crl_revoked_but_active(active.inner, "host-l6a"),
+        };
+        assert_eq!(
+            revoked.peer_v2_secrets("host-l6a").unwrap_err().code,
+            "peer_revoked"
+        );
     }
 
     #[test]

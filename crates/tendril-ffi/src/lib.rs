@@ -818,10 +818,10 @@ fn lookup_v2_mailbox_secret_for_target(
             format!("target {target_host_id} not found in roster"),
         )
     })?;
-    if entry.state == PeerState::Revoked {
+    if !usable_v2_entry(roster, entry) {
         return Err((
             TENDRIL_ERR_PROTOCOL,
-            format!("target {target_host_id} is revoked"),
+            format!("target {target_host_id} is not active"),
         ));
     }
     entry
@@ -836,6 +836,11 @@ fn lookup_v2_mailbox_secret_for_target(
         })
 }
 
+/// An entry whose v2 secrets may be used: `Active` and not revoked by a stored CRL.
+fn usable_v2_entry(roster: &Roster, entry: &tendril_core::roster::RosterEntry) -> bool {
+    entry.state == PeerState::Active && !roster.crl_revokes_entry(entry)
+}
+
 fn lookup_v2_mailbox_secret_for_pair(
     roster: &Roster,
     pinned: Option<&PinnedHost>,
@@ -845,13 +850,13 @@ fn lookup_v2_mailbox_secret_for_pair(
     if let Some(pin) = pinned {
         if let Some(ref hid) = pin.host_id
             && let Some(entry) = roster.get(hid)
-            && entry.state != PeerState::Revoked
+            && usable_v2_entry(roster, entry)
             && let Some(ref secrets) = entry.v2_secrets
         {
             return Ok(*secrets.mailbox_secret());
         }
         for (_, entry) in roster.entries() {
-            if entry.state != PeerState::Revoked
+            if usable_v2_entry(roster, entry)
                 && entry.static_pub == pin.static_pub
                 && let Some(ref secrets) = entry.v2_secrets
             {
@@ -863,7 +868,7 @@ fn lookup_v2_mailbox_secret_for_pair(
         && !frag.is_empty()
     {
         for (_, entry) in roster.entries() {
-            if entry.state != PeerState::Revoked
+            if usable_v2_entry(roster, entry)
                 && let Some(ref secrets) = entry.v2_secrets
             {
                 let win = derive_epoch_mailbox_window(secrets.mailbox_secret(), now_unix);
@@ -3242,7 +3247,7 @@ pub unsafe extern "C" fn tendril_endpoint_revoke_peer(
         if let Err((rc, msg)) = ep.mutate_roster(|roster| {
             roster
                 .revoke_peer(peer_s)
-                .map_err(|e| (TENDRIL_ERR_NOT_FOUND, e.to_string()))
+                .map_err(|e| (revoke_error_code(&e), e.to_string()))
         }) {
             set_last_error(msg);
             return rc;
@@ -4982,6 +4987,14 @@ fn last_route_set_json(last: Option<LastRouteSet>) -> serde_json::Value {
         serde_json::Value::Null,
         |l| serde_json::json!({"outcome": l.outcome, "seq": l.seq}),
     )
+}
+
+/// Result code of a failed revocation: only an unknown peer is `NOT_FOUND`.
+const fn revoke_error_code(err: &CoreError) -> i32 {
+    match err {
+        CoreError::PeerNotFound(_) => TENDRIL_ERR_NOT_FOUND,
+        _ => TENDRIL_ERR_PROTOCOL,
+    }
 }
 
 /// Result code of a runtime route or pairing error.
@@ -8121,5 +8134,114 @@ mod route_state_tests {
             TENDRIL_OK
         );
         assert_eq!(matched, 1);
+    }
+}
+
+#[cfg(test)]
+mod roster_lookup_tests {
+    use super::*;
+    use tendril_core::crypto::{SigningKeypair, StaticKeypair};
+    use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+    use tendril_core::roster::V2PeerSecrets;
+
+    fn keys(tag: u8) -> ([u8; 32], HybridSigningPublicKey) {
+        (
+            *StaticKeypair::from_scalar([tag; 32]).public_bytes(),
+            SigningKeypair::from_seed([tag.wrapping_add(1); 32])
+                .public_key()
+                .clone(),
+        )
+    }
+
+    fn secrets() -> V2PeerSecrets {
+        V2PeerSecrets::new([0x31; 32], [0x32; 32])
+    }
+
+    fn pin(host_id: &str, (st, sig): &([u8; 32], HybridSigningPublicKey)) -> PinnedHost {
+        PinnedHost::with_full_key(Some(host_id.to_owned()), *st, sig.clone(), 0)
+    }
+
+    #[test]
+    fn v2_mailbox_secrets_come_only_from_active_unrevoked_entries() {
+        let peer = keys(0x51);
+        let id = tendril_core::crypto::device_id(&peer.0);
+        let mut pending = Roster::new();
+        pending
+            .record_pending_pair(
+                peer.0,
+                Some(peer.1.clone()),
+                "P".into(),
+                "cli".into(),
+                "s".into(),
+            )
+            .unwrap();
+        pending.set_peer_v2_secrets(&id, secrets()).unwrap();
+        assert!(lookup_v2_mailbox_secret_for_target(&pending, &id).is_err());
+        assert!(
+            lookup_v2_mailbox_secret_for_pair(
+                &pending,
+                Some(&pin(&id, &peer)),
+                "wss://r/v2/relay",
+                0
+            )
+            .is_err()
+        );
+
+        let host = keys(0x53);
+        let mut active = Roster::new();
+        active
+            .insert_pinned_host(
+                "h".into(),
+                "H".into(),
+                host.0,
+                Some(host.1.clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        active.set_peer_v2_secrets("h", secrets()).unwrap();
+        assert!(lookup_v2_mailbox_secret_for_target(&active, "h").is_ok());
+        let root = SigningKeypair::from_seed([0x55; 32]);
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: "root".into(),
+                seq: 1,
+                revoked_devices: vec!["h".into()],
+                revoked_nonces: vec![],
+                ts: "2026-11-20T00:00:00Z".into(),
+            },
+            &root,
+        )
+        .unwrap();
+        active.ingest_crl(crl, "root", root.public_key()).unwrap();
+        let mut json = serde_json::to_value(&active).unwrap();
+        json["entries"]["h"]["state"] = "active".into();
+        let crl_only: Roster = serde_json::from_value(json).unwrap();
+        assert!(lookup_v2_mailbox_secret_for_target(&crl_only, "h").is_err());
+        assert!(
+            lookup_v2_mailbox_secret_for_pair(
+                &crl_only,
+                Some(&pin("h", &host)),
+                "wss://r/v2/relay",
+                0
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_revocation_is_a_protocol_error() {
+        let mut roster = Roster::new();
+        for (tag, sas) in [(0x57, "a"), (0x59, "b")] {
+            let (st, sig) = keys(tag);
+            roster
+                .record_pending_host("h".into(), "H".into(), st, sig, 0, sas.into(), vec![])
+                .unwrap();
+        }
+        let err = roster.revoke_peer("h").unwrap_err();
+        assert_eq!(revoke_error_code(&err), TENDRIL_ERR_PROTOCOL);
+        let err = roster.revoke_peer("nobody").unwrap_err();
+        assert_eq!(revoke_error_code(&err), TENDRIL_ERR_NOT_FOUND);
     }
 }

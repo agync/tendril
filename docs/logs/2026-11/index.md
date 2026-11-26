@@ -35,3 +35,4 @@ Entries from November 2026.
 - [apple: add remote SwiftPM Package.swift and release automation](26-apple-add-remote-swiftpm-package-swift.md)
 - [runtime: share one wake-and-retry loop across the CLI, C ABI, Python, and Node](26-runtime-share-one-wake-and-retry.md)
 - [relay: ticket expiry, replaced registrations, and allowlist key checks](26-relay-ticket-expiry-replaced-registrations-and.md)
+- [roster: unconfirmed host pins stay off the host_id they name](26-roster-unconfirmed-host-pins-stay-off.md)

@@ -174,7 +174,9 @@ pub(crate) async fn write_protocol_bytes(
     Ok(())
 }
 
-/// Resolves the highest persisted `min_wire_version` floor matching `pin` in `roster`.
+/// Resolves the highest persisted `min_wire_version` floor matching `pin`: every entry and
+/// unconfirmed host claim holding its static key ([`Roster::pairing_floor`]), and a confirmed
+/// entry under its label.
 #[must_use]
 pub fn pinned_pairing_floor(roster: &Roster, pin: &PinnedHost) -> u8 {
     let static_floor = roster.pairing_floor(&pin.static_pub);
@@ -182,8 +184,14 @@ pub fn pinned_pairing_floor(roster: &Roster, pin: &PinnedHost) -> u8 {
         .host_id
         .as_deref()
         .and_then(|id| roster.get(id))
+        .filter(|e| confirmed_entry(roster, e))
         .map_or(tendril_core::WIRE_VERSION, |e| e.min_wire_version);
     static_floor.max(host_floor)
+}
+
+/// An entry an enrolment pin may rely on: `Active` and not revoked by a stored CRL.
+fn confirmed_entry(roster: &Roster, entry: &tendril_core::roster::RosterEntry) -> bool {
+    entry.state == PeerState::Active && !roster.crl_revokes_entry(entry)
 }
 
 /// Drives a pairing initiator handshake to completion over `stream` within `DEFAULT_PRE_AUTH_TIMEOUT`.
@@ -649,17 +657,18 @@ fn stricter_stored_pin(roster: &Roster, pin: PinnedHost) -> PinnedHost {
     }
 }
 
-/// The stored entry a pin names: by `host_id`, else the entry holding its static key.
+/// The confirmed stored entry a pin names: by `host_id`, else the entry holding its static key.
+/// Unconfirmed and CRL-revoked entries never shape a pin.
 fn pinned_entry<'a>(
     roster: &'a Roster,
     pin: &PinnedHost,
 ) -> Option<&'a tendril_core::roster::RosterEntry> {
     match &pin.host_id {
-        Some(id) => roster.get(id),
+        Some(id) => roster.get(id).filter(|e| confirmed_entry(roster, e)),
         None => roster
             .entries()
             .map(|(_, e)| e)
-            .find(|e| e.static_pub == pin.static_pub),
+            .find(|e| e.static_pub == pin.static_pub && confirmed_entry(roster, e)),
     }
 }
 
@@ -3835,7 +3844,7 @@ pub(crate) async fn plan_connect(
     let roster = store.load()?;
     let entry = roster
         .get(target)
-        .ok_or_else(|| CoreError::PeerNotFound(target.to_owned()))?;
+        .ok_or_else(|| roster.missing_peer_error(target))?;
     // Pre-dial gate: nothing is dialed for a peer the final check would refuse anyway.
     match entry.state {
         PeerState::Pending => return Err(CoreError::PeerPending(target.to_owned()).into()),
@@ -4533,6 +4542,68 @@ mod tests {
             check_enrollment_pin(&revoked, &unscoped),
             Err(RuntimeError::Core(CoreError::PeerRevoked(_)))
         ));
+    }
+
+    #[test]
+    fn unconfirmed_entries_never_shape_an_enrolment_pin() {
+        let host = identity(0x38);
+        let label = host.host_id().to_owned();
+        let static_pub = *host.static_key().public_bytes();
+        let other_signing = identity(0x39).signing_key().public_key().clone();
+        let scoped = PinnedHost::with_hash(
+            Some(label.clone()),
+            static_pub,
+            host.signing_key().signing_pub_hash(),
+            0,
+        );
+        let mut unscoped = scoped.clone();
+        unscoped.host_id = None;
+        let genuine = VerifiedHost {
+            host_id: label.clone(),
+            static_pub,
+            signing_pub: host.signing_key().public_key().clone(),
+            rotation_seq: 0,
+        };
+
+        // An unconfirmed host claim for the same key at a far newer rotation.
+        let mut claimed = Roster::new();
+        claimed
+            .record_pending_host(
+                label.clone(),
+                "Studio".into(),
+                static_pub,
+                other_signing.clone(),
+                1000,
+                "sas".into(),
+                Vec::new(),
+            )
+            .unwrap();
+        // An unconfirmed responder-side entry for the same key, stored with the same values.
+        let mut peer = Roster::new();
+        peer.record_pending_pair(
+            static_pub,
+            Some(other_signing),
+            "Peer".into(),
+            "cli".into(),
+            "sas".into(),
+        )
+        .unwrap();
+        let mut json = serde_json::to_value(&peer).unwrap();
+        json["entries"][&label]["rotation_seq"] = 1000.into();
+        json["entries"][&label]["min_wire_version"] = 2.into();
+        let peer: Roster = serde_json::from_value(json).unwrap();
+
+        for roster in [&claimed, &peer] {
+            for pin in [&scoped, &unscoped] {
+                assert_eq!(&stricter_stored_pin(roster, pin.clone()), pin);
+                assert!(check_enrollment_pin(roster, pin).is_ok());
+                assert_eq!(
+                    pinned_pairing_floor(roster, pin),
+                    roster.pairing_floor(&static_pub)
+                );
+            }
+            check_enrolled_host(roster, &genuine).unwrap();
+        }
     }
 
     #[test]

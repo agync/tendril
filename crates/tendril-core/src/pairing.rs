@@ -22,12 +22,12 @@ use crate::grants::{
     sign_grant, sign_grant_deterministic, verify_enrollment_grant_chain,
 };
 use crate::identity::{
-    EndpointIdentity, RotationRecord, SigningKeyPin, format_rfc3339_utc, parse_rfc3339_utc,
-    verify_rotation_chain_pin,
+    EndpointIdentity, RotationRecord, SigningKeyPin, format_rfc3339_utc, is_valid_host_id,
+    parse_rfc3339_utc, verify_rotation_chain_pin,
 };
 use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::policy::{ProviderId, is_numeric_host_addr};
-use crate::roster::{AnchorState, Roster};
+use crate::roster::{AnchorState, PeerState, Roster};
 use crate::routes::{MAX_ROUTE_SEQ, MAX_ROUTE_SET_PAYLOAD, RouteSet};
 use crate::wire::{
     HostHello, Intent, MAX_TRANSPORT_PLAINTEXT, PairClaim, PairResponse, Preamble,
@@ -897,7 +897,7 @@ impl PairingUri {
             ));
         }
         if let Some(ref id) = self.host_id
-            && (id.is_empty() || has_control_chars(id))
+            && !is_valid_host_id(id)
         {
             return Err(CoreError::InvalidPairingUri("invalid id parameter".into()));
         }
@@ -3708,14 +3708,22 @@ impl PairingInitiator {
         Ok(self)
     }
 
-    /// Collects every peer in `roster` with `min_wire_version >= 2` so unpinned v1 pairing
-    /// aborts at `msg2` before transmitting `PairClaim`.
+    /// Collects every static key in `roster` (entries and unconfirmed host claims) with
+    /// `min_wire_version >= 2`, and the labels of such non-`Pending` entries, so unpinned v1
+    /// pairing aborts at `msg2` before transmitting `PairClaim`.
     #[must_use]
     pub fn with_roster_floors(mut self, roster: &Roster) -> Self {
         for (id, entry) in roster.entries() {
             if entry.min_wire_version >= WIRE_VERSION_V2 {
-                self.v2_floored_host_ids.insert(id.clone());
+                if entry.state != PeerState::Pending {
+                    self.v2_floored_host_ids.insert(id.clone());
+                }
                 self.v2_floored_static_pubs.insert(entry.static_pub);
+            }
+        }
+        for claim in roster.pending_hosts() {
+            if claim.min_wire_version >= WIRE_VERSION_V2 {
+                self.v2_floored_static_pubs.insert(claim.static_pub);
             }
         }
         self
@@ -3786,7 +3794,7 @@ impl PairingInitiator {
                 if host_hello.proto_version != 1 {
                     return Err(CoreError::UnsupportedVersion(host_hello.proto_version));
                 }
-                if host_hello.host_id.is_empty() || has_control_chars(&host_hello.host_id) {
+                if !is_valid_host_id(&host_hello.host_id) {
                     return Err(CoreError::ProtocolViolation("invalid host_id in HostHello"));
                 }
                 if !host_hello.upgrade.is_empty() {

@@ -290,7 +290,12 @@ fn verify_host_pin(
                 }
             }
         }
-        None => return Err(CoreError::HostKeyUnverified),
+        None => {
+            return Err(match roster.missing_peer_error(target_id) {
+                CoreError::PeerNotFound(_) => CoreError::HostKeyUnverified,
+                pending => pending,
+            });
+        }
     };
 
     if roster.is_manifest_pinned(target_id) {
@@ -1366,7 +1371,7 @@ impl SessionMachine {
                     .ok_or(CoreError::NotReady("target host missing"))?;
                 let entry = roster
                     .get(host_id)
-                    .ok_or_else(|| CoreError::PeerNotFound(host_id.to_string()))?;
+                    .ok_or_else(|| roster.missing_peer_error(host_id))?;
                 match entry.state {
                     PeerState::Pending => Err(CoreError::PeerPending(host_id.to_string())),
                     PeerState::Revoked => Err(CoreError::PeerRevoked(host_id.to_string())),

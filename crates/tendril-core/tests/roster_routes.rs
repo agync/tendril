@@ -1053,7 +1053,8 @@ fn pairing_with_plan_is_one_transaction() {
         )
         .unwrap();
     assert_eq!(out.persisted.len(), 2);
-    let entry = roster.get(&peer).unwrap();
+    assert!(roster.get(&peer).is_none());
+    let entry = roster.get_or_pending_host(&peer).unwrap();
     assert_eq!(entry.state, PeerState::Pending);
     assert!(entry.relay_hints.is_empty());
     assert_eq!(entry.route_meta.unwrap().seq, 3);
