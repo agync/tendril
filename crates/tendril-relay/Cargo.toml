@@ -38,5 +38,21 @@ test-hooks = []
 tempfile.workspace = true
 tendril-relay = { path = ".", features = ["test-hooks"] }
 
+[[test]]
+name = "relay_hardening"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "relay_lifecycle"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "relay_server"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "relay_v2"
+required-features = ["test-hooks"]
+
 [lints]
 workspace = true

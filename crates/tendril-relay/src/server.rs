@@ -281,6 +281,19 @@ pub enum TrustedProxyHeader {
     Forwarded,
 }
 
+/// Awaits the configured test hook at `$point`; expands to nothing without `test-hooks`.
+#[cfg(feature = "test-hooks")]
+macro_rules! test_point {
+    ($config:expr, $point:ident) => {
+        $config.test_point(RelayTestPoint::$point).await
+    };
+}
+
+#[cfg(not(feature = "test-hooks"))]
+macro_rules! test_point {
+    ($config:expr, $point:ident) => {};
+}
+
 /// Configuration for [`RelayServer`].
 #[derive(Clone)]
 pub struct RelayConfig {
@@ -331,16 +344,6 @@ pub enum RelayTestPoint {
     /// A registration reached its admission deadline and has not been torn down yet.
     RegistrationExpired,
     /// A parked standby socket reached its admission deadline and has not closed yet.
-    StandbyExpired,
-}
-
-/// Inert stand-in so handler call sites compile unchanged without `test-hooks`.
-#[cfg(not(feature = "test-hooks"))]
-#[derive(Clone, Copy)]
-enum RelayTestPoint {
-    AcceptClaimed,
-    DialTeardown,
-    RegistrationExpired,
     StandbyExpired,
 }
 
@@ -463,10 +466,6 @@ impl RelayConfig {
             hook(point).await;
         }
     }
-
-    #[cfg(not(feature = "test-hooks"))]
-    #[allow(clippy::unused_async, clippy::unused_self)]
-    async fn test_point(&self, _point: RelayTestPoint) {}
 }
 
 /// Errors produced by [`RelayServer`] and [`RelayHandle`].
@@ -2007,7 +2006,7 @@ async fn handle_register(
             biased;
             () = ended.notified() => break,
             () = &mut expiry => {
-                state.config.test_point(RelayTestPoint::RegistrationExpired).await;
+                test_point!(state.config, RegistrationExpired);
                 break;
             }
             () = &mut idle_sleep => {
@@ -2098,7 +2097,7 @@ async fn park_standby_socket<N, AckMsg, IncMsg>(
         tokio::select! {
             biased;
             () = &mut expiry => {
-                state.config.test_point(RelayTestPoint::StandbyExpired).await;
+                test_point!(state.config, StandbyExpired);
                 break;
             }
             () = &mut idle_sleep => {
@@ -2505,7 +2504,7 @@ async fn handle_dial(
                 }
             },
             () = incoming_tx.closed(), if !claimed => {
-                state.config.test_point(RelayTestPoint::DialTeardown).await;
+                test_point!(state.config, DialTeardown);
                 if pending_guard.withdraw() {
                     send_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
                     return;
@@ -2513,7 +2512,7 @@ async fn handle_dial(
                 claimed = true;
             }
             () = &mut accept_deadline, if !claimed => {
-                state.config.test_point(RelayTestPoint::DialTeardown).await;
+                test_point!(state.config, DialTeardown);
                 if pending_guard.withdraw() {
                     send_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
                     return;
@@ -2659,7 +2658,7 @@ async fn handle_accept(
         key: target_pub,
         is_v2: false,
     };
-    state.config.test_point(RelayTestPoint::AcceptClaimed).await;
+    test_point!(state.config, AcceptClaimed);
 
     if !send_json(
         &mut ws,
@@ -2943,7 +2942,7 @@ async fn handle_v2_register(
             biased;
             () = ended.notified() => break,
             () = &mut expiry => {
-                state.config.test_point(RelayTestPoint::RegistrationExpired).await;
+                test_point!(state.config, RegistrationExpired);
                 break;
             }
             () = &mut idle_sleep => {
@@ -3369,7 +3368,7 @@ async fn handle_v2_dial(
                 }
             },
             () = incoming_tx.closed(), if !claimed => {
-                state.config.test_point(RelayTestPoint::DialTeardown).await;
+                test_point!(state.config, DialTeardown);
                 if pending_guard.withdraw() {
                     send_v2_error_and_close(&mut ws, "offline", state.config.write_timeout).await;
                     return;
@@ -3377,7 +3376,7 @@ async fn handle_v2_dial(
                 claimed = true;
             }
             () = &mut accept_deadline, if !claimed => {
-                state.config.test_point(RelayTestPoint::DialTeardown).await;
+                test_point!(state.config, DialTeardown);
                 if pending_guard.withdraw() {
                     send_v2_error_and_close(&mut ws, "timeout", state.config.write_timeout).await;
                     return;
@@ -3540,7 +3539,7 @@ async fn handle_v2_accept(
         key: target_mailbox,
         is_v2: true,
     };
-    state.config.test_point(RelayTestPoint::AcceptClaimed).await;
+    test_point!(state.config, AcceptClaimed);
 
     if !send_json(
         &mut ws,
