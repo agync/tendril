@@ -68,7 +68,10 @@ tendril --state-dir ./host-state serve --listen 127.0.0.1:0 --issue-code lan
 #  pass --wake-url (requires --wire-v2 and --endpoint), --wake-adapter <webhook|apns|fcm|unified-push> (default webhook),
 #  --wake-secret-file (or TENDRIL_WAKE_SECRET), --wake-auth-header-file, and --wake-pre-wake on dial for opaque wake hints;
 #  CLI secret files and --relay-ticket-file enforce regular non-symlink files <= 16 KiB with Unix 0600 permissions (mode & 0o077 == 0);
-#  pass --no-pkarr on default relay mode to opt out of Pkarr/DNS, or --include-direct-addrs for non-metadata ?addr= hints.)
+#  pass --no-pkarr on default relay mode to opt out of Pkarr/DNS, or --include-direct-addrs for non-metadata ?addr= hints;
+#  pass --p2p-no-port-mapping to keep a P2P endpoint from probing the router (UPnP, NAT-PMP, PCP), and --p2p-bind <addr>
+#  (repeatable: one IPv4 and one IPv6) to bind the QUIC UDP sockets to given addresses instead of every interface;
+#  --p2p-relay also accepts n0 as an alias of default. See "Sockets a P2P endpoint opens" in docs/design/providers-and-relay-ladder.md.)
 
 # 3. Pair client using printed endpoint and code (prefer --code-stdin, --code-file, or TENDRIL_PAIR_CODE
 #    over --code in multi-user environments), then confirm SAS on both host and client

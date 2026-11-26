@@ -87,7 +87,9 @@ export class Endpoint {
    * `wakeApnsTeamId`, `wakeApnsKeyId`, `wakeApnsP8Pem`, `wakeApnsClientCertPem`,
    * `wakeApnsClientKeyPem`, `relayAuthOrigins`, ...). Besides the relay, p2p and wake keys:
    * `relay_auth_origins` (string[] of scheme://host[:port]), `advertise` ("auto" | "explicit"),
-   * `advertised_endpoints` (string[]), `route_policy` ("all_signed" | "committed_only" |
+   * `advertised_endpoints` (string[]), `p2p_port_mapping` (boolean, default true; false stops P2P
+   * endpoints from probing the router), `p2p_bind_addrs` (string[] of at most one IPv4 and one IPv6
+   * address such as "0.0.0.0:0"; camelCase `p2pPortMapping`, `p2pBindAddrs`), `route_policy` ("all_signed" | "committed_only" |
    * "none") and `sign_routes` (boolean). A changed advertise set is published off the calling
    * thread, and the next `issuePairingUri` or `refreshRoutes` waits for that publish; a
    * publish error is not an error of this call (the issuance or refresh reports it).

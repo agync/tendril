@@ -61,8 +61,8 @@ pub use overlay::{
 pub use p2p::{
     MAX_P2P_CUSTOM_RELAYS, P2pBindAddrs, P2pDialer, P2pHintAddr, P2pListener, P2pOptions,
     P2pRelayAuth, P2pRelayMode, TENDRIL_P2P_ALPN, extract_p2p_relay_urls_from_endpoint,
-    filter_p2p_hint, format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_endpoint,
-    parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
+    filter_p2p_hint, format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_bind_addrs,
+    parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
 };
 pub use relay::{EmbeddedRelay, RelayClientAuth, RelayDialer, RelayListener};
 pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};

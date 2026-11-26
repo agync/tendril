@@ -47,8 +47,8 @@ use tendril_runtime::{
     connect_with_wake_policy, dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_store, drive_pair_initiator_with_policy,
     drive_pair_responder_with_store, drive_v2_pair_initiator_with_policy,
-    drive_v2_pake_pair_responder_with_store, parse_p2p_relay_mode, parse_p2p_relay_modes,
-    recv_routed,
+    drive_v2_pake_pair_responder_with_store, parse_p2p_bind_addrs, parse_p2p_relay_mode,
+    parse_p2p_relay_modes, recv_routed,
 };
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use zeroize::{Zeroize, Zeroizing};
@@ -192,7 +192,7 @@ struct RelayOriginArgs {
     relay_auth_origins: Vec<String>,
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 struct P2pTransportArgs {
     #[arg(long)]
     p2p_local: bool,
@@ -210,6 +210,13 @@ struct P2pTransportArgs {
     p2p_pkarr: bool,
     #[arg(long, conflicts_with = "p2p_pkarr")]
     no_pkarr: bool,
+    /// Do not probe the local router for a UPnP, NAT-PMP or PCP port mapping.
+    #[arg(long)]
+    p2p_no_port_mapping: bool,
+    /// Local UDP address the P2P endpoint binds for QUIC (repeatable, at most one IPv4 and one
+    /// IPv6, for example `0.0.0.0:0` or `[::]:0`). A family left out gets no socket.
+    #[arg(long = "p2p-bind", value_name = "ADDR")]
+    p2p_bind: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -720,6 +727,7 @@ fn resolve_p2p_relay_auth(
 }
 
 fn validate_explicit_p2p_args(args: &P2pTransportArgs) -> Result<(), Box<dyn std::error::Error>> {
+    parse_p2p_bind_addrs("--p2p-bind", &args.p2p_bind)?;
     if let Some(ref path) = args.p2p_relay_token_file {
         let _ = read_trimmed_secret_line(path, "p2p relay token")?;
     }
@@ -760,6 +768,16 @@ const fn pkarr_override(args: &P2pTransportArgs) -> Option<bool> {
     }
 }
 
+/// Applies `--p2p-no-port-mapping` and `--p2p-bind` to `opts`.
+fn apply_p2p_net_args(
+    opts: P2pOptions,
+    args: &P2pTransportArgs,
+) -> Result<P2pOptions, Box<dyn std::error::Error>> {
+    Ok(opts
+        .with_port_mapping(!args.p2p_no_port_mapping)
+        .with_bind_addrs(parse_p2p_bind_addrs("--p2p-bind", &args.p2p_bind)?))
+}
+
 fn build_p2p_listener_options(
     args: &P2pTransportArgs,
     resolved_p2p_auth: Option<P2pRelayAuth>,
@@ -774,7 +792,7 @@ fn build_p2p_listener_options(
     if include_direct_addrs {
         opts = opts.with_advertise_direct_addrs(true);
     }
-    Ok(opts)
+    apply_p2p_net_args(opts, args)
 }
 
 fn resolve_explicit_p2p_relay_mode(
@@ -892,8 +910,8 @@ fn build_hint_dialers(
         p2p_relay_auth: resolve_p2p_relay_auth(p2p_args)?,
         p2p_allow_private_addrs,
         p2p_pkarr: pkarr_override(p2p_args),
-        p2p_port_mapping: true,
-        p2p_bind_addrs: tendril_runtime::P2pBindAddrs::AllInterfaces,
+        p2p_port_mapping: !p2p_args.p2p_no_port_mapping,
+        p2p_bind_addrs: parse_p2p_bind_addrs("--p2p-bind", &p2p_args.p2p_bind)?,
     })))
 }
 
@@ -1073,7 +1091,7 @@ fn build_p2p_dialer_options(
     };
     let pkarr = resolve_pkarr_enabled(&opts.relay_mode, p2p_args.p2p_pkarr, p2p_args.no_pkarr);
     opts = opts.with_resolve_pkarr(pkarr).with_relay_auth(p2p_auth);
-    Ok(opts)
+    apply_p2p_net_args(opts, p2p_args)
 }
 
 async fn dial_endpoint_cli(
@@ -3692,6 +3710,8 @@ mod tests {
             p2p_api_secret_file: None,
             p2p_pkarr: false,
             no_pkarr: false,
+            p2p_no_port_mapping: false,
+            p2p_bind: Vec::new(),
         };
         let listener_default =
             build_p2p_listener_options(&default_args, None, false).expect("default listener");
@@ -3734,6 +3754,105 @@ mod tests {
             build_p2p_dialer_options(&custom_opt_in, "direct://127.0.0.1:1", None)
                 .expect("custom dialer opt-in");
         assert!(dialer_custom_pkarr.resolve_pkarr);
+    }
+
+    #[test]
+    fn p2p_net_flags_parse_and_reach_every_option_set() {
+        let cli = Cli::try_parse_from([
+            "tendril",
+            "dial",
+            "--target",
+            "peer",
+            "--p2p-no-port-mapping",
+            "--p2p-bind",
+            "127.0.0.1:0",
+            "--p2p-bind",
+            "[::1]:0",
+        ])
+        .expect("flags parse");
+        let Command::Dial { p2p_args, .. } = cli.cmd else {
+            panic!("expected dial");
+        };
+        assert!(p2p_args.p2p_no_port_mapping);
+        assert_eq!(p2p_args.p2p_bind, ["127.0.0.1:0", "[::1]:0"]);
+        let only = tendril_runtime::P2pBindAddrs::Only {
+            v4: Some("127.0.0.1:0".parse().expect("v4")),
+            v6: Some("[::1]:0".parse().expect("v6")),
+        };
+
+        let listener = build_p2p_listener_options(&p2p_args, None, false).expect("listener");
+        assert!(!listener.port_mapping);
+        assert_eq!(listener.bind_addrs, only);
+        let dialer =
+            build_p2p_dialer_options(&p2p_args, "direct://127.0.0.1:1", None).expect("dialer");
+        assert!(!dialer.port_mapping);
+        assert_eq!(dialer.bind_addrs, only);
+        let ep_id: String = SigningKeypair::generate()
+            .expect("gen signing key")
+            .ed25519_public_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let endpoint = format!("iroh://{ep_id}");
+        let endpoint_dialer =
+            build_p2p_dialer_options(&p2p_args, &endpoint, None).expect("endpoint dialer");
+        assert!(!endpoint_dialer.port_mapping);
+        assert_eq!(endpoint_dialer.bind_addrs, only);
+        let hints = build_hint_dialers(RelayClientAuth::None, None, &p2p_args, Some(&endpoint))
+            .expect("hint dialers");
+        assert!(!hints.config().p2p_port_mapping);
+        assert_eq!(hints.config().p2p_bind_addrs, only);
+        let operator = hints.operator_p2p_options(&endpoint).expect("operator");
+        assert!(!operator.port_mapping);
+        assert_eq!(operator.bind_addrs, only);
+    }
+
+    #[test]
+    fn p2p_net_defaults_map_and_bind_everywhere() {
+        let args = P2pTransportArgs::default();
+        let listener = build_p2p_listener_options(&args, None, false).expect("listener");
+        assert!(listener.port_mapping);
+        assert_eq!(
+            listener.bind_addrs,
+            tendril_runtime::P2pBindAddrs::AllInterfaces
+        );
+        let hints = build_hint_dialers(RelayClientAuth::None, None, &args, None).expect("hints");
+        assert!(hints.config().p2p_port_mapping);
+    }
+
+    #[test]
+    fn invalid_p2p_bind_is_an_error_naming_the_flag() {
+        let args = P2pTransportArgs {
+            p2p_bind: vec!["not-an-addr".to_owned()],
+            ..P2pTransportArgs::default()
+        };
+        for err in [
+            build_p2p_listener_options(&args, None, false)
+                .expect_err("listener")
+                .to_string(),
+            build_p2p_dialer_options(&args, "direct://127.0.0.1:1", None)
+                .expect_err("dialer")
+                .to_string(),
+            build_hint_dialers(RelayClientAuth::None, None, &args, None)
+                .map(|_| ())
+                .expect_err("hints")
+                .to_string(),
+            validate_explicit_p2p_args(&args)
+                .expect_err("validate")
+                .to_string(),
+        ] {
+            assert!(err.contains("--p2p-bind"), "{err}");
+        }
+    }
+
+    #[test]
+    fn n0_alias_is_accepted_as_the_relay_mode() {
+        let args = P2pTransportArgs {
+            p2p_relay: vec!["n0".to_owned()],
+            ..P2pTransportArgs::default()
+        };
+        let opts = build_p2p_listener_options(&args, None, false).expect("listener");
+        assert_eq!(opts.relay_mode, P2pRelayMode::N0Public);
     }
 
     fn test_crl(
@@ -4120,6 +4239,8 @@ mod tests {
             p2p_api_secret_file: None,
             p2p_pkarr: false,
             no_pkarr: false,
+            p2p_no_port_mapping: false,
+            p2p_bind: Vec::new(),
         };
         let ep_id: String = SigningKeypair::generate()
             .expect("gen signing key")
@@ -4166,6 +4287,8 @@ mod tests {
             p2p_api_secret_file: None,
             p2p_pkarr: false,
             no_pkarr: false,
+            p2p_no_port_mapping: false,
+            p2p_bind: Vec::new(),
         };
         // Valid 32-byte Ed25519 hex iroh endpoint ID.
         let ep_id: String = SigningKeypair::generate()

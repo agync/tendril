@@ -458,6 +458,37 @@ pub fn parse_p2p_relay_mode(mode: Option<&str>) -> Result<P2pRelayMode, RuntimeE
     }
 }
 
+/// Parses the `bind_addrs` setting of a surface into a [`P2pBindAddrs`].
+///
+/// An empty list is [`P2pBindAddrs::AllInterfaces`]. Otherwise each entry is a `host:port`
+/// socket address (`0.0.0.0:0`, `[::]:0`); at most one IPv4 and one IPv6 entry are allowed, and
+/// a family left out gets no socket. `key` names the setting in the error (`p2p_bind_addrs`,
+/// `--p2p-bind`).
+pub fn parse_p2p_bind_addrs(key: &str, addrs: &[String]) -> Result<P2pBindAddrs, RuntimeError> {
+    if addrs.is_empty() {
+        return Ok(P2pBindAddrs::AllInterfaces);
+    }
+    let mut v4 = None;
+    let mut v6 = None;
+    for raw in addrs {
+        let addr = SocketAddr::from_str(raw.trim()).map_err(|_| {
+            RuntimeError::Protocol(format!(
+                "invalid {key} entry: expected a socket address such as 0.0.0.0:0 or [::]:0"
+            ))
+        })?;
+        let duplicate = match addr {
+            SocketAddr::V4(a) => v4.replace(a).is_some(),
+            SocketAddr::V6(a) => v6.replace(a).is_some(),
+        };
+        if duplicate {
+            return Err(RuntimeError::Protocol(format!(
+                "invalid {key}: at most one IPv4 and one IPv6 address"
+            )));
+        }
+    }
+    Ok(P2pBindAddrs::Only { v4, v6 })
+}
+
 /// Parses one or more custom `iroh-relay` URLs (`1..=8`) into [`P2pRelayMode::Custom`] or
 /// [`P2pRelayMode::CustomMany`].
 pub fn parse_p2p_relay_modes(urls: &[String]) -> Result<P2pRelayMode, RuntimeError> {
@@ -2225,6 +2256,51 @@ pub(crate) mod tests {
                 .is_err()
         );
         assert!(P2pDialer::bind_with_options(opts).await.is_err());
+    }
+
+    #[test]
+    fn parse_bind_addrs_empty_is_all_interfaces() {
+        assert_eq!(
+            parse_p2p_bind_addrs("p2p_bind_addrs", &[]).expect("empty"),
+            P2pBindAddrs::AllInterfaces
+        );
+    }
+
+    #[test]
+    fn parse_bind_addrs_selects_families() {
+        let v4 = parse_p2p_bind_addrs("p2p_bind_addrs", &["127.0.0.1:0".to_owned()]).expect("v4");
+        assert_eq!(
+            v4,
+            P2pBindAddrs::Only {
+                v4: Some("127.0.0.1:0".parse().expect("addr")),
+                v6: None
+            }
+        );
+        let both = parse_p2p_bind_addrs(
+            "p2p_bind_addrs",
+            &["[::1]:4433".to_owned(), "0.0.0.0:0".to_owned()],
+        )
+        .expect("both");
+        assert_eq!(
+            both,
+            P2pBindAddrs::Only {
+                v4: Some("0.0.0.0:0".parse().expect("addr")),
+                v6: Some("[::1]:4433".parse().expect("addr"))
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bind_addrs_rejects_bad_entries_naming_the_key() {
+        for bad in [
+            vec!["not-an-addr".to_owned()],
+            vec!["127.0.0.1".to_owned()],
+            vec!["127.0.0.1:0".to_owned(), "127.0.0.2:0".to_owned()],
+            vec!["[::1]:0".to_owned(), "[::2]:0".to_owned()],
+        ] {
+            let err = parse_p2p_bind_addrs("--p2p-bind", &bad).expect_err("invalid");
+            assert!(err.to_string().contains("--p2p-bind"), "{err}");
+        }
     }
 
     #[test]
