@@ -757,19 +757,21 @@ fn independent_provenance_per_source() {
         owned(&[h])
     );
 
+    // An empty operator write keeps the committed record; a non-empty one replaces it.
+    roster.set_routes(&peer, vec![]).unwrap();
+    assert_eq!(
+        hints_of(&roster, &peer, RouteSource::Committed),
+        owned(&[h])
+    );
     roster.set_routes(&peer, vec![op(B[0])]).unwrap();
-    assert_eq!(roster.get(&peer).unwrap().routes.len(), 4);
+    assert_eq!(roster.get(&peer).unwrap().routes.len(), 3);
+    assert!(hints_of(&roster, &peer, RouteSource::Committed).is_empty());
     roster
         .clear_routes(&peer, Some(RouteSource::Signed))
         .unwrap();
     assert_eq!(
         hints_of(&roster, &peer, RouteSource::Operator),
         owned(&[B[0]])
-    );
-    roster.set_routes(&peer, vec![]).unwrap();
-    assert_eq!(
-        hints_of(&roster, &peer, RouteSource::Committed),
-        owned(&[h])
     );
 }
 

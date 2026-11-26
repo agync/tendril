@@ -23,9 +23,10 @@ use tendril_core::identity::{
 };
 use tendril_core::noise::{NoiseHfsHandshakeBuilder, NoiseHfsSeeds};
 use tendril_core::pairing::{
-    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, PAIR_KEY_PROOF_DOMAIN, enroll_proof_bytes,
-    pair_key_proof_bytes, sign_enroll_proof_deterministic, sign_pair_key_proof_deterministic,
-    verify_enroll_proof, verify_enrollment_token, verify_pair_key_proof,
+    ENROLL_PROOF_DOMAIN, EnrollmentPolicy, EnrollmentRouteReject, PAIR_KEY_PROOF_DOMAIN,
+    enroll_proof_bytes, pair_key_proof_bytes, sign_enroll_proof_deterministic,
+    sign_pair_key_proof_deterministic, verify_enroll_proof, verify_enrollment_route_set,
+    verify_enrollment_token, verify_pair_key_proof,
 };
 use tendril_core::relay_auth::{
     RelayAuthProof, RelayAuthRole, RelayTicket, compute_relay_auth_hmac,
@@ -33,6 +34,7 @@ use tendril_core::relay_auth::{
     relay_ticket_signed_bytes, verify_relay_auth_hmac, verify_relay_ticket,
 };
 use tendril_core::roster::Roster;
+use tendril_core::routes::RouteSet;
 use tendril_core::v2::{
     PAKE_ARGON2_MEMORY_KIB, PAKE_ARGON2_PARALLELISM, PAKE_ARGON2_TIME, PaddingPolicy,
     PakeArgon2Params, V2_PAKE_SALT_LEN, V2InnerFrame, canonical_relay_host, compute_pake_init_mac,
@@ -48,7 +50,7 @@ use tendril_core::v2::{
 };
 use tendril_core::wire::{
     HostHello, InnerFrameType, Intent, NOISE_PATTERN, PREAMBLE_FLAG_NONE, PairClaim, PairResponse,
-    Preamble, WIRE_VERSION_V2, decode_frame, decode_inner_frame, encode_frame,
+    Preamble, RouteSetField, WIRE_VERSION_V2, decode_frame, decode_inner_frame, encode_frame,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -777,6 +779,21 @@ struct M2mEnrollmentVector {
     pair_response_json: String,
     pair_response_frame_hex: String,
     replayed_response_json: String,
+    route_request_claim_json: String,
+    route_set_replies: Vec<RouteSetReplyCase>,
+}
+
+#[derive(Deserialize)]
+struct RouteSetReplyCase {
+    name: String,
+    seq: u64,
+    issued_at: u64,
+    routes: Vec<String>,
+    route_set_signed_bytes_hex: String,
+    route_set_payload_hex: String,
+    signer_signing_pub_hex: String,
+    pair_response_json: String,
+    expect: String,
 }
 
 #[test]
@@ -954,6 +971,7 @@ fn m2m_enrollment_vectors_match() {
         ),
         Err(CoreError::EnrollmentTokenReplayed)
     );
+    m2m_route_set_replies_match(&v, &resp_static_pub, &resp_signing_pub);
     assert_eq!(
         serde_json::from_str::<PairResponse>(&v.replayed_response_json).unwrap(),
         PairResponse::Error {
@@ -2369,6 +2387,74 @@ mod route_vectors {
                     }
                 }
             }
+        }
+    }
+}
+
+/// `spec/pairing-v1.md` Section 7.5: the route request claim and the reply route set cases.
+fn m2m_route_set_replies_match(
+    v: &M2mEnrollmentVector,
+    resp_static_pub: &[u8; 32],
+    resp_signing_pub: &HybridSigningPublicKey,
+) {
+    let request: PairClaim = serde_json::from_str(&v.route_request_claim_json).unwrap();
+    let base: PairClaim = serde_json::from_str(&v.pair_claim_json).unwrap();
+    assert_eq!(base.route_seq, None);
+    assert_eq!(request.route_seq, Some(0));
+    assert_eq!(
+        PairClaim {
+            route_seq: None,
+            ..request
+        },
+        base
+    );
+
+    let names: Vec<&str> = v
+        .route_set_replies
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["host_signed", "other_signer"]);
+    for case in &v.route_set_replies {
+        let resp: PairResponse = serde_json::from_str(&case.pair_response_json).unwrap();
+        let PairResponse::Success {
+            device_id: dev,
+            status,
+            host_signing_pub,
+            route_set: Some(RouteSetField::Encoded(encoded)),
+        } = resp
+        else {
+            panic!("{}: success reply with route_set", case.name);
+        };
+        assert_eq!(dev, v.initiator_device_id);
+        assert_eq!(status, "active");
+        assert_eq!(host_signing_pub, resp_signing_pub.to_b64url());
+        let payload = hex::decode(&case.route_set_payload_hex).unwrap();
+        assert_eq!(b64url_decode(&encoded).unwrap(), payload, "{}", case.name);
+
+        let set = RouteSet::decode(&payload).unwrap();
+        assert_eq!(set.static_pub, *resp_static_pub);
+        assert_eq!(set.sh, resp_signing_pub.sha256_hash());
+        assert_eq!((set.seq, set.issued_at), (case.seq, case.issued_at));
+        assert_eq!(set.routes, case.routes);
+        assert_eq!(
+            hex::encode(set.signed_bytes()),
+            case.route_set_signed_bytes_hex
+        );
+        let signer = decode_hybrid_pub(&case.signer_signing_pub_hex);
+        set.verify(&signer).expect("signed by the named signer");
+
+        let result = verify_enrollment_route_set(&encoded, resp_static_pub, resp_signing_pub);
+        match case.expect.as_str() {
+            "verified" => {
+                assert_eq!(&signer, resp_signing_pub);
+                assert_eq!(result, Ok(set));
+            }
+            "bad_signature" => {
+                assert_ne!(&signer, resp_signing_pub);
+                assert_eq!(result, Err(EnrollmentRouteReject::BadSignature));
+            }
+            other => panic!("unknown expectation {other}"),
         }
     }
 }

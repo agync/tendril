@@ -2091,6 +2091,7 @@ fn new_claim_fits_pre_change_v2_responder() {
         enrollment_token: None,
         signing_pub: None,
         enroll_proof: None,
+        route_seq: None,
     })
     .unwrap();
     assert_eq!(pad_pake_msg3_payload(&mac, &keyless).unwrap().len(), 4096);

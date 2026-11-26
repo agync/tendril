@@ -254,9 +254,11 @@ impl RosterEntry {
 pub enum RouteSource {
     /// Typed by the local operator or developer.
     Operator,
-    /// Listed in a verified host route statement or route set.
+    /// Listed in a verified host route statement or route set, including the route set of an
+    /// M2M enrolment reply.
     Signed,
-    /// The route that carried an unsigned pairing commit, kept on opt-in.
+    /// The route that carried an unsigned pairing commit, kept on opt-in, or the explicit
+    /// operator endpoint that carried an M2M enrolment.
     Committed,
 }
 
@@ -2022,8 +2024,10 @@ impl Roster {
     /// Replaces the `operator` routes of an `Active` peer with already-normalized endpoints.
     ///
     /// A `relay_key` must equal the Ed25519 component of this entry's pinned signing key, checked
-    /// on the same pin this call writes under. `signed` and `committed` routes and `route_meta`
-    /// are untouched. Returns the entry's full route list.
+    /// on the same pin this call writes under. A non-empty list also removes the `committed`
+    /// record: the operator's routes supersede the route a past commit carried, so a stale
+    /// enrolment endpoint never sticks. `signed` routes and `route_meta` are untouched. Returns
+    /// the entry's full route list.
     pub fn set_routes(
         &mut self,
         peer_id: &str,
@@ -2049,6 +2053,9 @@ impl Roster {
             entry,
         )?;
         let entry = self.entry_mut(peer_id)?;
+        if !hints.is_empty() {
+            entry.routes.retain(|r| r.source != RouteSource::Committed);
+        }
         entry.replace_source(RouteSource::Operator, hints);
         Ok(&entry.routes)
     }

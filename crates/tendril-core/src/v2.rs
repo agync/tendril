@@ -41,7 +41,8 @@ use crate::noise::{MSG1_LEN, NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseT
 use crate::pairing::KeyClaimTamper;
 use crate::pairing::{
     PairRouteBinding, PairRouteVerdict, PairingManager, PairingPathKind, PairingUri, PersistPlan,
-    PinnedHost, VerifiedHost, VerifiedRouteStatement, human_key_claim, verify_human_key_claim,
+    PinnedHost, VerifiedHost, VerifiedRouteStatement, claim_route_seq, human_key_claim,
+    verify_human_key_claim,
 };
 use crate::roster::{PairMergeOutcome, PeerState, Roster, V2PeerSecrets};
 use crate::routes::RouteSet;
@@ -4347,6 +4348,10 @@ impl V2PakePairInitiator {
             enrollment_token: None,
             signing_pub,
             enroll_proof,
+            route_seq: claim_route_seq(
+                #[cfg(any(test, feature = "test-utils"))]
+                self.key_claim_tamper,
+            ),
         };
         let claim_json = Zeroizing::new(
             serde_json::to_vec(&claim).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -4597,8 +4602,12 @@ impl V2PakePairInitiator {
                         device_id: resp_dev_id,
                         status,
                         host_signing_pub,
+                        route_set,
                     } => {
-                        if resp_dev_id != device_id(&self.local_static_pub) || status != "pending" {
+                        if resp_dev_id != device_id(&self.local_static_pub)
+                            || status != "pending"
+                            || route_set.is_some()
+                        {
                             return Err(CoreError::ProtocolViolation(
                                 "unexpected v2 pair response fields",
                             ));
@@ -4765,6 +4774,8 @@ pub struct V2PakePairResponder {
     params: PakeArgon2Params,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_ephemeral: Option<[u8; 32]>,
+    #[cfg(test)]
+    route_set_injection: Option<crate::wire::RouteSetField>,
 }
 
 impl fmt::Debug for V2PakePairResponder {
@@ -4803,6 +4814,8 @@ impl V2PakePairResponder {
             params,
             #[cfg(any(test, feature = "test-utils"))]
             fixed_ephemeral: None,
+            #[cfg(test)]
+            route_set_injection: None,
         })
     }
 
@@ -4811,6 +4824,18 @@ impl V2PakePairResponder {
     #[must_use]
     pub fn with_fixed_ephemeral_for_testing_only(mut self, eph_seed: [u8; 32]) -> Self {
         self.fixed_ephemeral = Some(eph_seed);
+        self
+    }
+
+    /// Adds `route_set` to the success response, which a conforming host never sends on
+    /// Wire v2, strictly in tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_route_set_for_testing_only(
+        mut self,
+        route_set: crate::wire::RouteSetField,
+    ) -> Self {
+        self.route_set_injection = Some(route_set);
         self
     }
 
@@ -5138,7 +5163,9 @@ impl V2PakePairResponder {
                 {
                     return write_v2_pair_error(&mut transport, "protocol_error", actions);
                 }
-                if claim.signing_pub.is_some() != claim.enroll_proof.is_some() {
+                if claim.signing_pub.is_some() != claim.enroll_proof.is_some()
+                    || claim.route_seq.is_some()
+                {
                     return write_v2_pair_error(&mut transport, "protocol_error", actions);
                 }
 
@@ -5182,6 +5209,10 @@ impl V2PakePairResponder {
                     device_id: peer_id.clone(),
                     status: "pending".to_string(),
                     host_signing_pub: self.host_signing_pub.to_b64url(),
+                    #[cfg(not(test))]
+                    route_set: None,
+                    #[cfg(test)]
+                    route_set: self.route_set_injection.clone(),
                 };
                 let json = Zeroizing::new(pad_v2_pair_response(
                     &serde_json::to_vec(&resp).map_err(|err| CoreError::Json(err.to_string()))?,
@@ -5810,6 +5841,58 @@ mod tests {
     }
 
     #[test]
+    fn v2_initiator_rejects_a_route_set_in_the_pair_response() {
+        use crate::pairing::{PairingCodeKind, PairingConfig};
+        use crate::wire::RouteSetField;
+
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0x93; 32]),
+            SigningKeypair::from_seed([0x94; 32]),
+        );
+        let dev = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar([0xA3; 32]),
+            SigningKeypair::from_seed([0xA4; 32]),
+        );
+        let params = PakeArgon2Params::for_testing_only();
+        for injected in [
+            RouteSetField::Encoded("AAAA".into()),
+            RouteSetField::Malformed,
+        ] {
+            let mut roster = Roster::new();
+            let mut mgr = PairingManager::new(PairingConfig::default());
+            let code = mgr
+                .issue_code(PairingCodeKind::Remote3Group, TEST_NOW_UNIX)
+                .unwrap();
+            let mut init =
+                V2PakePairInitiator::new(&dev, "Dev", "cli", &code, None, params).unwrap();
+            let mut resp = V2PakePairResponder::new(&host, PairingPathKind::Remote, params)
+                .unwrap()
+                .with_route_set_for_testing_only(injected.clone());
+            let mut to_resp = pake_wire(&init.start().unwrap());
+            let mut result = None;
+            for _ in 0..4 {
+                let acts = resp
+                    .feed_bytes(&to_resp, TEST_NOW_UNIX, &mut mgr, &mut roster)
+                    .unwrap();
+                let done = acts.iter().any(|a| matches!(a, V2PairAction::Completed(_)));
+                let fed = init.feed_bytes(&pake_wire(&acts));
+                if done {
+                    result = Some(fed.map(|_| ()));
+                    break;
+                }
+                to_resp = pake_wire(&fed.unwrap());
+            }
+            assert_eq!(
+                result.expect("exchange completed"),
+                Err(CoreError::ProtocolViolation(
+                    "unexpected v2 pair response fields"
+                )),
+                "{injected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn v2_key_claim_binding_fails_closed() {
         use crate::pairing::{KeyClaimTamper, PairingCodeKind, PairingConfig};
 
@@ -5832,6 +5915,7 @@ mod tests {
             (KeyClaimTamper::MalformedKey, "protocol_error", true),
             (KeyClaimTamper::MalformedProof, "protocol_error", true),
             (KeyClaimTamper::KeyOnly, "protocol_error", false),
+            (KeyClaimTamper::RouteSeq, "protocol_error", false),
         ];
         for (tamper, code_str, burns) in cases {
             let mut roster = Roster::new();
