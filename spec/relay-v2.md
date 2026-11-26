@@ -161,7 +161,7 @@ When admission covers `dial`, the relay MUST validate `dial.auth` first, then va
 If `target_mailbox_id` has an active control connection for `epoch` and `active_count` / `pending_count` are below cap:
 
 1. **Standby hit:** If a live standby socket is parked for `target_mailbox_id` (skipping any dead standby socket found at dequeue), the relay pops it atomically, sends `incoming` (with `"init_frame"` if the listener registered `"fast_open": true`) directly on that standby socket, sends `{ "op": "ready", "conn_id": string }` to the dialer, and enters binary bridge mode immediately on both sockets. If the dialer supplied `init_frame` while the listener did not register `"fast_open": true`, the relay injects the decoded bytes as the first WebSocket binary frame toward the standby socket immediately after stream transition.
-2. **Classic fallback:** If no live standby socket is parked, the relay pushes `incoming` on the control WebSocket (including `"init_frame"` only when `"fast_open": true` was registered) and holds the dial waiting for `accept`. If that control connection ends before the dial is accepted, the relay MUST fail the dial with `"offline"` at once rather than hold it until `accept_timeout`:
+2. **Classic fallback:** If no live standby socket is parked, the relay pushes `incoming` on the control WebSocket (including `"init_frame"` only when `"fast_open": true` was registered) and holds the dial waiting for `accept`. If that registration ends before the dial is accepted, the relay MUST fail the dial with `"offline"` at once rather than hold it until `accept_timeout`. A registration ends when its control connection closes, when its epoch rotates out of the window, when a later `register` for the same `mailbox_id` replaces it (Section 3.4), or when its admission ticket expires (Section 3.5):
 
 ```jsonc
 // Server -> Listener (control socket or consumed standby socket)
@@ -223,7 +223,9 @@ Control errors prior to binary bridge mode return one JSON text frame and close 
 { "op": "error", "code": string }
 ```
 
-Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"capacity_exceeded"`, `"invalid_request"`, `"bad_request"`, `"frame_too_large"`, `"timeout"`.
+Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"capacity_exceeded"`, `"invalid_request"`, `"bad_request"`, `"frame_too_large"`, `"timeout"`, `"replaced"`.
+
+Registration of a `mailbox_id` is last writer wins with the same effects as `spec/relay-v1.md` Section 2.4: the earlier registration's pending dials fail with `"offline"`, its parked standby sockets close, and its control socket receives `{ "op": "error", "code": "replaced" }` before it closes.
 
 ### 3.5 Stateless Admission Tiers 1-3 and Option 1A Scoping on `/v2/relay`
 
@@ -237,6 +239,7 @@ Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `
   - Tier 1 static mailbox allowlists match concrete epoch `mailbox_id` keys and therefore only apply when explicitly configured per epoch (default `auth_scope = "register-only"` when only an allowlist is configured).
   - Tier 2 (shared HMAC secret, `1..=4096` bytes) and Tier 3 (Ed25519 `RelayTicket` with `target_pub = "*"` or epoch `mailbox_id`) operate statelessly without per-epoch relay configuration or long-term client identity disclosure. Both default to Option 1A `auth_scope = "all"` (`challenge.auth_required = ["register", "dial"]`).
   - **Tier 3 wildcard tickets are cross-epoch linkable.** A `RelayTicket` with `target_pub = "*"` is a bearer credential presented verbatim for every mailbox it is used on, so a relay can link all epochs and mailboxes that present the same ticket for its whole TTL (up to `86400` s, i.e. up to 25 epochs). Deployments that require cross-epoch unlinkability MUST NOT use wildcard Tier 3 tickets across epoch boundaries. They MUST use either Tier 2 HMAC, whose proof is bound to the per-epoch `mailbox_id` and a fresh challenge nonce, or per-epoch Tier 3 tickets whose `target_pub` is a concrete epoch `mailbox_id` and whose validity does not leave that epoch (`mint_v2_epoch_relay_ticket` clamps `not_after` below the epoch boundary; `RelayTicket::spans_multiple_v2_epochs` reports whether a ticket crosses one).
+- **Ticket lifetime:** A registration or standby socket admitted by a ticket ends at the earlier of its epoch rotation and the ticket deadline of `spec/relay-v1.md` Section 2.5 (`not_after + 30`). Streams bridged before that point run until they close.
 - **Zero Mailbox Presence Leak on `dial`:** When `auth_scope` covers `dial` (`"all"`), the relay MUST verify `dial.auth` BEFORE checking whether `target_mailbox_id` is registered or online. Missing or invalid `dial.auth` MUST return `{ "op": "error", "code": "unauthorized" }` and close the socket without revealing mailbox presence.
 
 ---

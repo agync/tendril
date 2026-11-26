@@ -106,7 +106,7 @@ When admission covers `dial`, the relay MUST verify `dial.auth` before decoding 
 If `target_pub` has an active control connection and `active_count` / `pending_count` are below cap:
 
 1. **Standby hit:** If a live standby socket is parked for `target_pub` (skipping any dead standby socket found at dequeue), the relay pops it atomically, sends `{ "op": "incoming", "conn_id": string }` (adding `"init_frame"` when the listener registered `"fast_open": true`) on that standby socket, sends `{ "op": "ready", "conn_id": string }` to the dialer, and enters binary bridge mode immediately on both sockets without an `accept` round-trip. If the dialer supplied `init_frame` but the listener did not register `"fast_open": true`, the relay injects the decoded bytes as the first WebSocket binary frame toward the acceptor immediately after stream transition.
-2. **Classic fallback:** When no live standby socket is parked, the relay holds the dial pending, pushes `incoming` on the primary control WebSocket (carrying `"init_frame"` only when the listener registered `"fast_open": true`), and waits for `accept`. If that control connection ends before the dial is accepted, the relay MUST fail the dial with `"offline"` at once rather than hold it until `accept_timeout`:
+2. **Classic fallback:** When no live standby socket is parked, the relay holds the dial pending, pushes `incoming` on the primary control WebSocket (carrying `"init_frame"` only when the listener registered `"fast_open": true`), and waits for `accept`. If that registration ends before the dial is accepted, the relay MUST fail the dial with `"offline"` at once rather than hold it until `accept_timeout`. A registration ends when its control connection closes, when a later `register` for the same `pub` replaces it (Section 2.4), or when its admission ticket expires (Section 2.5):
 
 ```jsonc
 // Server -> Listener (control socket or consumed standby socket)
@@ -159,7 +159,9 @@ Before entering binary forwarding mode, control errors return one JSON text fram
 { "op": "error", "code": string }
 ```
 
-Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"capacity_exceeded"`, `"invalid_request"`, `"bad_request"`, `"frame_too_large"`, `"timeout"`.
+Standard error `code` values: `"unauthorized"`, `"offline"`, `"rate_limited"`, `"capacity_exceeded"`, `"invalid_request"`, `"bad_request"`, `"frame_too_large"`, `"timeout"`, `"replaced"`.
+
+Mailbox registration is last writer wins. When a valid `register` arrives for a `pub` that is already registered, the relay binds `pub` to the new control socket and ends the earlier registration: it fails that registration's pending dials with `"offline"` (Section 2.2), closes its parked standby sockets, and sends `{ "op": "error", "code": "replaced" }` on its control socket before closing it. If the earlier registration has already expired (Section 2.5), the relay ends it the same way but closes its control socket without `"replaced"`. A listener that receives `"replaced"` SHOULD stop accepting on that registration and SHOULD NOT re-register automatically, since doing so would displace the newer listener in turn.
 
 ### 2.5 Stateless Admission Tiers 1-3 and Option 1A Scoping
 
@@ -209,10 +211,13 @@ Relays MAY enforce admission control without maintaining user accounts or per-se
    - Issuer trust: `trusted_issuers` MUST be non-empty and contain decoded `issuer_pub` (constant-time match), verified with strict Ed25519 (`verify_strict`).
    - Unknown JSON fields inside `auth` or `ticket` MUST be rejected (`deny_unknown_fields`).
 
+   Ticket lifetime binds the state it admits. A registration admitted by a ticket (rather than by the Tier 1 allowlist or a Tier 2 HMAC) ends once the relay clock passes `not_after + 30`, the last second at which the ticket still verifies: the relay closes its control socket, which fails its pending dials with `"offline"` (Section 2.2). A parked standby socket admitted by a ticket closes at the same point for its own ticket, and every standby socket also closes when its registration ends. The deadline holds even before the relay has torn that state down: from that second on, a `dial` MUST NOT be delivered to the expired registration (it fails with `"offline"`), a `standby` for it fails with `"offline"`, an expired standby socket MUST NOT be handed a dial, and an `accept` for a pending dial of the expired registration fails with `"invalid_request"` while the dial fails with `"offline"`. Expired registrations do not count toward `max_mailboxes`. A stream already bridged before that point is not cut: it runs until either side closes it or `idle_timeout` passes. Each `accept` is checked against its own proof when it arrives, so expiry also stops new accepts that present the expired ticket.
+
 **Option 1A Admission Scoping (`auth_scope`):**
 
-- `auth_scope = "all"` (default whenever a shared HMAC secret or trusted ticket issuers are configured): requires valid admission proof on `register`, `accept`, AND `dial`. `challenge.auth_required` MUST be `["register", "dial"]`.
+- `auth_scope = "all"` (default whenever a shared HMAC secret or trusted ticket issuers are configured, with or without a Tier 1 allowlist): requires valid admission proof on `register`, `accept`, AND `dial`. `challenge.auth_required` MUST be `["register", "dial"]`.
 - `auth_scope = "register-only"` (default when ONLY a Tier 1 mailbox allowlist is configured, or explicitly configured for Tier 2/3 when open dialing is desired): requires admission on `register` (and `accept` when Tier 2/3 is active); `dial` does not require `auth`. `challenge.auth_required` MUST be `["register"]`.
+- A relay configured with `auth_scope = "all"` and only a Tier 1 allowlist MUST refuse to start, since no proof could then admit a `dial`.
 - When no admission controls are configured (open relay), `auth_required` is omitted from `challenge`.
 - **Zero Mailbox Presence Leak on `dial`:** Whenever `auth_scope` covers `dial` (`"all"`), the relay MUST validate `dial.auth` right after frame decode, BEFORE mailbox lookup (`target_pub` in the active mailbox table) or epoch skew checks. Any missing or invalid proof MUST fail closed immediately with `{ "op": "error", "code": "unauthorized" }` so unauthenticated callers cannot probe whether a mailbox is currently online (`"offline"` vs `"unauthorized"`).
 

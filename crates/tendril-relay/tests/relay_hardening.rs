@@ -550,6 +550,7 @@ async fn relay_stateless_admission_tiers_and_option_1a_on_v1_and_v2() {
 
         let cfg = RelayConfig {
             allowed_mailboxes: vec![allowed_v1_pub, allowed_v2_mb.mailbox_id],
+            auth_scope: RelayAuthScope::RegisterOnly,
             ..RelayConfig::default()
         };
         let srv = RelayServer::bind(cfg).await.unwrap().spawn();

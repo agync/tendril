@@ -94,14 +94,23 @@ struct Args {
     auth_scope: Option<CliAuthScope>,
 }
 
-fn decode_32b_key(raw: &str, label: &str, require_ed25519: bool) -> Result<[u8; 32], String> {
+fn decode_ed25519_key(raw: &str, label: &str) -> Result<[u8; 32], String> {
     let trimmed = raw.trim();
     let bytes = b64url_decode_array::<32>(trimmed)
         .map_err(|err| format!("invalid {label} base64url 32-byte key: {err}"))?;
-    if require_ed25519 && !is_valid_ed25519_public_key(&bytes) {
+    if !is_valid_ed25519_public_key(&bytes) {
         return Err(format!("invalid Ed25519 public key in {label}"));
     }
     Ok(bytes)
+}
+
+/// Option 1A default: `register-only` when a mailbox allowlist is the only admission control.
+fn default_auth_scope(allowlist_only: bool) -> RelayAuthScope {
+    if allowlist_only {
+        RelayAuthScope::RegisterOnly
+    } else {
+        RelayAuthScope::All
+    }
 }
 
 fn parse_allow_mailboxes_file(path: &Path) -> Result<Vec<[u8; 32]>, String> {
@@ -137,11 +146,7 @@ fn parse_allow_mailboxes_file(path: &Path) -> Result<Vec<[u8; 32]>, String> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let key = decode_32b_key(
-            trimmed,
-            &format!("allow-mailboxes-file line {}", idx + 1),
-            false,
-        )?;
+        let key = decode_ed25519_key(trimmed, &format!("allow-mailboxes-file line {}", idx + 1))?;
         keys.push(key);
     }
     if keys.is_empty() {
@@ -276,7 +281,7 @@ where
 
     let mut allowed_mailboxes = Vec::with_capacity(args.allow_mailboxes.len());
     for raw in &args.allow_mailboxes {
-        allowed_mailboxes.push(decode_32b_key(raw, "--allow-mailbox", false)?);
+        allowed_mailboxes.push(decode_ed25519_key(raw, "--allow-mailbox")?);
     }
     if let Some(path) = &args.allow_mailboxes_file {
         allowed_mailboxes.extend(parse_allow_mailboxes_file(path)?);
@@ -284,14 +289,21 @@ where
 
     let mut trusted_issuers = Vec::with_capacity(args.issuer_pubs.len());
     for raw in &args.issuer_pubs {
-        trusted_issuers.push(decode_32b_key(raw, "--issuer-pub", true)?);
+        trusted_issuers.push(decode_ed25519_key(raw, "--issuer-pub")?);
     }
 
-    let has_admission =
-        !allowed_mailboxes.is_empty() || auth_secret.is_some() || !trusted_issuers.is_empty();
+    let has_proof_tier = auth_secret.is_some() || !trusted_issuers.is_empty();
+    let has_admission = !allowed_mailboxes.is_empty() || has_proof_tier;
+    let allowlist_only = has_admission && !has_proof_tier;
     if args.auth_scope.is_some() && !has_admission {
         return Err(
             "--auth-scope requires at least one admission option (--allow-mailbox, --allow-mailboxes-file, --auth-secret-file, TENDRIL_RELAY_AUTH_SECRET, or --issuer-pub)"
+                .to_owned(),
+        );
+    }
+    if allowlist_only && args.auth_scope == Some(CliAuthScope::All) {
+        return Err(
+            "--auth-scope all requires --auth-secret-file, TENDRIL_RELAY_AUTH_SECRET, or --issuer-pub; a mailbox allowlist alone admits only register"
                 .to_owned(),
         );
     }
@@ -311,7 +323,9 @@ where
         allowed_mailboxes,
         auth_secret,
         trusted_issuers,
-        auth_scope: args.auth_scope.unwrap_or(CliAuthScope::All).into(),
+        auth_scope: args
+            .auth_scope
+            .map_or_else(|| default_auth_scope(allowlist_only), Into::into),
         ..RelayConfig::default()
     })
 }
@@ -433,6 +447,70 @@ mod tests {
                 .expect("parse forwarded header selector");
         let fwd_cfg = build_relay_config(fwd_args, None).unwrap();
         assert_eq!(fwd_cfg.trusted_proxy_header, TrustedProxyHeader::Forwarded);
+    }
+
+    #[test]
+    fn allow_mailbox_requires_valid_ed25519_points_and_tier1_defaults_register_only() {
+        let no_env = |_: &str| -> Result<Option<String>, String> { Ok(None) };
+        let build = |argv: &[&str], secret: Option<&[u8]>| {
+            let args = Args::try_parse_from(argv).expect("parse args");
+            build_relay_config_with_env(args, secret.map(|s| Zeroizing::new(s.to_vec())), no_env)
+        };
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let off_curve = (2u8..=255)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i;
+                b
+            })
+            .find(|b| ed25519_dalek::VerifyingKey::from_bytes(b).is_err())
+            .expect("an off-curve encoding");
+        for bad in [[0u8; 32], identity, off_curve] {
+            assert!(!is_valid_ed25519_public_key(&bad));
+            let bad_b64 = b64url_encode(&bad);
+            assert!(
+                build(&["tendril-relay", "--allow-mailbox", &bad_b64], None).is_err(),
+                "--allow-mailbox must reject {bad_b64}"
+            );
+            let file = NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), format!("{bad_b64}\n")).unwrap();
+            assert!(
+                parse_allow_mailboxes_file(file.path()).is_err(),
+                "--allow-mailboxes-file must reject {bad_b64}"
+            );
+        }
+
+        let key = b64url_encode(
+            &SigningKey::from_bytes(&[0x43; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let tier1 = ["tendril-relay", "--allow-mailbox", &key];
+        assert_eq!(
+            build(&tier1, None).unwrap().auth_scope,
+            RelayAuthScope::RegisterOnly
+        );
+        let tier3 = ["tendril-relay", "--issuer-pub", &key];
+        assert_eq!(build(&tier3, None).unwrap().auth_scope, RelayAuthScope::All);
+        assert_eq!(
+            build(&tier1, Some(b"valid-shared-secret"))
+                .unwrap()
+                .auth_scope,
+            RelayAuthScope::All
+        );
+        let tier1_all = [
+            "tendril-relay",
+            "--allow-mailbox",
+            &key,
+            "--auth-scope",
+            "all",
+        ];
+        assert!(
+            build(&tier1_all, None).is_err(),
+            "--auth-scope all needs a secret or issuer"
+        );
+        assert!(build(&tier1_all, Some(b"valid-shared-secret")).is_ok());
     }
 
     #[cfg(unix)]

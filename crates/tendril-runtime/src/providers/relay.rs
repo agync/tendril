@@ -3,7 +3,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ use tendril_relay::protocol::{
 use tendril_relay::server::{ClientWsStream, RelayConfig, RelayHandle, RelayServer};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant as TokioInstant, timeout};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -41,6 +41,22 @@ pub(crate) const CONTROL_PING_MIN_MS: u64 = 22_500;
 pub(crate) const CONTROL_PING_MAX_MS: u64 = 37_500;
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_ACCEPTS: usize = 16;
+
+/// Keepalive timing of a [`RelayListener`] control socket.
+#[derive(Clone, Copy)]
+struct ControlTimings {
+    idle_timeout: Duration,
+    ping_delay: fn() -> Duration,
+}
+
+impl Default for ControlTimings {
+    fn default() -> Self {
+        Self {
+            idle_timeout: CONTROL_IDLE_TIMEOUT,
+            ping_delay: jittered_ping_delay,
+        }
+    }
+}
 
 pub(crate) fn jittered_ping_delay() -> Duration {
     let raw = u32::from_le_bytes(random_bytes::<4>().unwrap_or([0; 4]));
@@ -326,8 +342,9 @@ pub struct RelayListener {
     endpoint: String,
     mailbox_pub_b64: String,
     active_standby_sockets: Arc<AtomicUsize>,
+    replaced: Arc<AtomicBool>,
     standby_pool: Option<StandbyPoolHandle>,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
     control_task: Option<JoinHandle<()>>,
 }
 
@@ -357,6 +374,25 @@ impl RelayListener {
         signing_key: SigningKey,
         write_timeout: Duration,
         auth: RelayClientAuth,
+    ) -> Result<Self, RuntimeError> {
+        Self::bind_with_timings(
+            relay_url,
+            expected_host,
+            signing_key,
+            write_timeout,
+            auth,
+            ControlTimings::default(),
+        )
+        .await
+    }
+
+    async fn bind_with_timings(
+        relay_url: impl Into<String>,
+        expected_host: Option<String>,
+        signing_key: SigningKey,
+        write_timeout: Duration,
+        auth: RelayClientAuth,
+        timings: ControlTimings,
     ) -> Result<Self, RuntimeError> {
         let parsed = super::validate_ws_url(&relay_url.into(), false)?;
         let relay_url = parsed.as_str().to_owned();
@@ -409,12 +445,131 @@ impl RelayListener {
         let mailbox_pub_b64 = pub_b64.clone();
         let (accepted_tx, accepted_rx) = mpsc::channel(32);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let shutdown_tx = Arc::new(shutdown_tx);
+        let replaced = Arc::new(AtomicBool::new(false));
         let accept_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_ACCEPTS));
         let active_standby_sockets = Arc::new(AtomicUsize::new(0));
         let signing_key = Arc::new(signing_key);
         let auth = Arc::new(auth);
 
-        let standby_pool = if server_standby {
+        // Watch the control socket before waiting on standby readiness, so a registration that
+        // ends during that wait (replaced, expired, or dropped) stops the pool at once.
+        let pool_stop = Arc::clone(&shutdown_tx);
+        let replaced_flag = Arc::clone(&replaced);
+        let ctl_accept_sem = Arc::clone(&accept_sem);
+        let ctl_key = Arc::clone(&signing_key);
+        let ctl_auth = Arc::clone(&auth);
+        let ctl_url = relay_url.clone();
+        let ctl_host = expected_host.clone();
+        let ctl_pub = pub_b64.clone();
+        let ctl_accepted_tx = accepted_tx.clone();
+        let control_task = tokio::spawn(async move {
+            let mut accept_tasks: JoinSet<()> = JoinSet::new();
+            let idle_sleep = tokio::time::sleep(timings.idle_timeout);
+            tokio::pin!(idle_sleep);
+            let ping_sleep = tokio::time::sleep((timings.ping_delay)());
+            tokio::pin!(ping_sleep);
+            let mut shut_down = false;
+            loop {
+                if *shutdown_rx.borrow() {
+                    shut_down = true;
+                    break;
+                }
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        shut_down = true;
+                        break;
+                    }
+                    () = &mut idle_sleep => break,
+                    () = &mut ping_sleep => {
+                        ping_sleep
+                            .as_mut()
+                            .reset(TokioInstant::now() + (timings.ping_delay)());
+                        if !timeout(write_timeout, control_ws.send(Message::Ping(Vec::new().into())))
+                            .await
+                            .is_ok_and(|res| res.is_ok())
+                        {
+                            break;
+                        }
+                    }
+                    Some(_) = accept_tasks.join_next(), if !accept_tasks.is_empty() => {}
+                    maybe_msg = control_ws.next() => {
+                        match maybe_msg {
+                            Some(Ok(Message::Text(text))) => {
+                                idle_sleep
+                                    .as_mut()
+                                    .reset(TokioInstant::now() + timings.idle_timeout);
+                                let msg = serde_json::from_str::<RelayServerMsg>(&text);
+                                if let Ok(RelayServerMsg::Error { code }) = msg {
+                                    if code == "replaced" {
+                                        replaced_flag.store(true, Ordering::Release);
+                                        tracing::warn!(
+                                            "relay mailbox registration replaced by a newer listener"
+                                        );
+                                    }
+                                    break;
+                                }
+                                if let Ok(RelayServerMsg::Incoming { conn_id, init_frame }) = msg
+                                {
+                                    let Ok(permit) = Arc::clone(&ctl_accept_sem).try_acquire_owned() else {
+                                        tracing::warn!("relay listener dropping incoming dial at accept cap");
+                                        continue;
+                                    };
+                                    let relay_url_c = ctl_url.clone();
+                                    let exp_host_c = ctl_host.clone();
+                                    let key_c = Arc::clone(&ctl_key);
+                                    let auth_c = Arc::clone(&ctl_auth);
+                                    let pub_c = ctl_pub.clone();
+                                    let tx_c = ctl_accepted_tx.clone();
+                                    accept_tasks.spawn(async move {
+                                        let _permit = permit;
+                                        if let Ok(stream) = accept_one_stream(
+                                            &relay_url_c,
+                                            exp_host_c.as_deref(),
+                                            &key_c,
+                                            &pub_c,
+                                            &conn_id,
+                                            init_frame.as_deref(),
+                                            &auth_c,
+                                            write_timeout,
+                                        )
+                                        .await
+                                        {
+                                            let _ = timeout(CONTROL_TIMEOUT, tx_c.send(stream)).await;
+                                        }
+                                    });
+                                }
+                            }
+                            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                                idle_sleep
+                                    .as_mut()
+                                    .reset(TokioInstant::now() + timings.idle_timeout);
+                            }
+                            None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                            Some(Ok(_)) => {}
+                        }
+                    }
+                }
+            }
+            let _ = timeout(write_timeout, control_ws.close(None)).await;
+            // Without a registration no stream can arrive: stop the standby pool so it does not
+            // park sockets for whoever holds the mailbox now, and let `accept` end once every
+            // in-flight accept has been delivered.
+            pool_stop.send_replace(true);
+            drop(ctl_accepted_tx);
+            if shut_down {
+                accept_tasks.abort_all();
+            }
+            while accept_tasks.join_next().await.is_some() {}
+        });
+
+        // Until bind returns, dropping this guard (bind cancelled) stops the control task.
+        let mut bind_guard = ControlTaskGuard {
+            shutdown_tx: Arc::clone(&shutdown_tx),
+            control_task: Some(control_task),
+        };
+
+        let standby_pool = if server_standby && !*shutdown_tx.borrow() {
             let (pool_handle, sb_ready_rxs) = spawn_v1_standby_pool(
                 relay_url.clone(),
                 expected_host.clone(),
@@ -432,70 +587,17 @@ impl RelayListener {
         } else {
             None
         };
-
-        let control_task = tokio::spawn(async move {
-            loop {
-                if *shutdown_rx.borrow() {
-                    let _ = timeout(write_timeout, control_ws.close(None)).await;
-                    break;
-                }
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        let _ = timeout(write_timeout, control_ws.close(None)).await;
-                        break;
-                    }
-                    maybe_msg = control_ws.next() => {
-                        match maybe_msg {
-                            Some(Ok(Message::Text(text))) => {
-                                if let Ok(RelayServerMsg::Incoming { conn_id, init_frame }) =
-                                    serde_json::from_str::<RelayServerMsg>(&text)
-                                {
-                                    let Ok(permit) = Arc::clone(&accept_sem).try_acquire_owned() else {
-                                        tracing::warn!("relay listener dropping incoming dial at accept cap");
-                                        continue;
-                                    };
-                                    let relay_url_c = relay_url.clone();
-                                    let exp_host_c = expected_host.clone();
-                                    let key_c = Arc::clone(&signing_key);
-                                    let auth_c = Arc::clone(&auth);
-                                    let pub_c = pub_b64.clone();
-                                    let tx_c = accepted_tx.clone();
-                                    tokio::spawn(async move {
-                                        let _permit = permit;
-                                        if let Ok(stream) = accept_one_stream(
-                                            &relay_url_c,
-                                            exp_host_c.as_deref(),
-                                            &key_c,
-                                            &pub_c,
-                                            &conn_id,
-                                            init_frame.as_deref(),
-                                            &auth_c,
-                                            write_timeout,
-                                        )
-                                        .await
-                                        {
-                                            let _ = tx_c.send(stream).await;
-                                        }
-                                    });
-                                }
-                            }
-                            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                            None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
-                            Some(Ok(_)) => {}
-                        }
-                    }
-                }
-            }
-        });
+        drop(accepted_tx);
 
         Ok(Self {
             accepted_rx,
             endpoint,
             mailbox_pub_b64,
             active_standby_sockets,
+            replaced,
             standby_pool,
             shutdown_tx,
-            control_task: Some(control_task),
+            control_task: bind_guard.control_task.take(),
         })
     }
 
@@ -509,6 +611,31 @@ impl RelayListener {
     #[must_use]
     pub fn active_standby_socket_count(&self) -> usize {
         self.active_standby_sockets.load(Ordering::Acquire)
+    }
+
+    /// Reports whether the relay ended this registration because a newer listener registered the
+    /// same mailbox key (error code `replaced`), as opposed to a transport drop or expiry.
+    ///
+    /// Once [`PathListener::accept`] has returned [`RuntimeError::Closed`], a `true` result means
+    /// another listener now owns the mailbox and re-registering would displace it in turn.
+    #[must_use]
+    pub fn was_replaced(&self) -> bool {
+        self.replaced.load(Ordering::Acquire)
+    }
+}
+
+/// Stops a [`RelayListener`] control task unless bind completed and took it over.
+struct ControlTaskGuard {
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    control_task: Option<JoinHandle<()>>,
+}
+
+impl Drop for ControlTaskGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.control_task.take() {
+            self.shutdown_tx.send_replace(true);
+            task.abort();
+        }
     }
 }
 
@@ -1180,5 +1307,257 @@ impl EmbeddedRelay {
             .stop()
             .await
             .map_err(|err| RuntimeError::Protocol(err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replaced_listener_returns_closed_and_stops_its_standby_pool() {
+        let relay = EmbeddedRelay::bind_local("127.0.0.1").await.expect("relay");
+        let key = SigningKey::from_bytes(&[0x5A; 32]);
+        let mut old = RelayListener::bind(relay.ws_url(), None, key.clone(), DEFAULT_WRITE_TIMEOUT)
+            .await
+            .expect("bind old listener");
+        assert!(old.active_standby_socket_count() > 0);
+
+        let mut new = RelayListener::bind(relay.ws_url(), None, key, DEFAULT_WRITE_TIMEOUT)
+            .await
+            .expect("bind displacing listener");
+        let ended = timeout(Duration::from_secs(5), old.accept())
+            .await
+            .expect("replaced listener kept waiting for streams");
+        assert!(matches!(ended, Err(RuntimeError::Closed)));
+        assert!(old.was_replaced());
+        assert!(!new.was_replaced());
+        // `Closed` means every task that could hand over a stream has ended, the standby slots
+        // included, so none of them can park on the displacing registration any more.
+        assert_eq!(old.active_standby_socket_count(), 0);
+
+        let dialer = RelayDialer::new().with_allow_insecure_ws(true);
+        let _stream = dialer
+            .dial(&new.local_endpoint())
+            .await
+            .expect("dial displacing listener");
+        timeout(Duration::from_secs(5), new.accept())
+            .await
+            .expect("displacing listener accepts in time")
+            .expect("displacing listener stream");
+        relay.shutdown().await.expect("stop relay");
+    }
+
+    #[tokio::test]
+    async fn listener_closes_without_replacement_when_its_ticket_expires() {
+        use std::sync::atomic::AtomicU64;
+
+        use tendril_core::relay_auth::{RELAY_TICKET_CLOCK_SKEW_SECS, RelayAuthRole};
+        use tendril_relay::RelayAuthScope;
+
+        let now = 1_760_000_000;
+        let clock = Arc::new(AtomicU64::new(now));
+        let read = Arc::clone(&clock);
+        let issuer = SigningKey::from_bytes(&[0x5B; 32]);
+        let relay = EmbeddedRelay::start(RelayConfig {
+            host: "127.0.0.1".to_owned(),
+            trusted_issuers: vec![issuer.verifying_key().to_bytes()],
+            auth_scope: RelayAuthScope::RegisterOnly,
+            clock: Some(Arc::new(move || read.load(Ordering::Acquire))),
+            ..RelayConfig::default()
+        })
+        .await
+        .expect("relay");
+        let key = SigningKey::from_bytes(&[0x5C; 32]);
+        let ticket = tendril_core::relay_auth::mint_relay_ticket(
+            &issuer,
+            "127.0.0.1",
+            RelayAuthRole::Register,
+            &b64url_encode(&key.verifying_key().to_bytes()),
+            now - 10,
+            70,
+        )
+        .expect("ticket");
+        let deadline = ticket.not_after + RELAY_TICKET_CLOCK_SKEW_SECS + 1;
+        let mut listener = RelayListener::bind_with_auth(
+            relay.ws_url(),
+            None,
+            key,
+            DEFAULT_WRITE_TIMEOUT,
+            RelayClientAuth::Ticket(ticket),
+        )
+        .await
+        .expect("bind listener");
+
+        clock.store(deadline, Ordering::Release);
+        let ended = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("expired listener kept waiting for streams");
+        assert!(matches!(ended, Err(RuntimeError::Closed)));
+        assert!(!listener.was_replaced());
+        relay.shutdown().await.expect("stop relay");
+    }
+
+    #[tokio::test]
+    async fn silent_relay_ends_the_listener_after_the_idle_timeout() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let url = format!("ws://{}/v1/relay", tcp.local_addr().expect("addr"));
+        let (ping_tx, ping_rx) = oneshot::channel::<()>();
+        let (silence_tx, mut silence_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            // Skip stray non-WebSocket connections to the loopback port.
+            let mut ws = loop {
+                let Ok((stream, _)) = tcp.accept().await else {
+                    return;
+                };
+                if let Ok(ws) = accept_async(stream).await {
+                    break ws;
+                }
+            };
+            let challenge = RelayServerMsg::Challenge {
+                nonce: b64url_encode(&[0x5D; 32]),
+                host: "127.0.0.1".to_owned(),
+                max_frame: MAX_RELAY_FRAME_LEN,
+                auth_required: None,
+                fast_open: None,
+                standby: None,
+            };
+            let text = serde_json::to_string(&challenge).expect("json");
+            ws.send(Message::Text(text.into()))
+                .await
+                .expect("challenge");
+            let Some(Ok(Message::Text(msg))) = ws.next().await else {
+                return;
+            };
+            let Ok(RelayClientMsg::Register { pub_key, .. }) = serde_json::from_str(&msg) else {
+                return;
+            };
+            let reply =
+                serde_json::to_string(&RelayServerMsg::Registered { pub_key }).expect("json");
+            ws.send(Message::Text(reply.into()))
+                .await
+                .expect("registered");
+            // Reading answers each ping with a pong, which keeps the listener alive.
+            let mut ping_tx = Some(ping_tx);
+            loop {
+                tokio::select! {
+                    _ = &mut silence_rx => break,
+                    frame = ws.next() => match frame {
+                        Some(Ok(Message::Ping(_))) => {
+                            if let Some(tx) = ping_tx.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    },
+                }
+            }
+            // Then hold the socket without reading, so pings go unanswered.
+            std::future::pending::<()>().await;
+            drop(ws);
+        });
+
+        let timings = ControlTimings {
+            idle_timeout: Duration::from_millis(300),
+            ping_delay: || Duration::from_millis(100),
+        };
+        let mut listener = RelayListener::bind_with_timings(
+            url,
+            None,
+            SigningKey::from_bytes(&[0x5E; 32]),
+            DEFAULT_WRITE_TIMEOUT,
+            RelayClientAuth::None,
+            timings,
+        )
+        .await
+        .expect("bind listener");
+        timeout(Duration::from_secs(5), ping_rx)
+            .await
+            .expect("listener pings its control socket")
+            .expect("mock relay saw a ping");
+        assert!(
+            timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .is_err(),
+            "answered pings keep the listener open past its idle timeout"
+        );
+        silence_tx.send(()).expect("silence the mock relay");
+        let ended = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("listener on a silent relay kept waiting");
+        assert!(matches!(ended, Err(RuntimeError::Closed)));
+        assert!(!listener.was_replaced());
+    }
+
+    #[tokio::test]
+    async fn cancelled_bind_closes_its_control_socket() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let url = format!("ws://{}/v1/relay", tcp.local_addr().expect("addr"));
+        let (control_closed_tx, control_closed_rx) = oneshot::channel::<()>();
+        let control_closed_tx = Arc::new(std::sync::Mutex::new(Some(control_closed_tx)));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = tcp.accept().await {
+                let closed_tx = Arc::clone(&control_closed_tx);
+                tokio::spawn(async move {
+                    let Ok(mut ws) = accept_async(stream).await else {
+                        return;
+                    };
+                    let challenge = RelayServerMsg::Challenge {
+                        nonce: b64url_encode(&[0x5F; 32]),
+                        host: "127.0.0.1".to_owned(),
+                        max_frame: MAX_RELAY_FRAME_LEN,
+                        auth_required: None,
+                        fast_open: None,
+                        standby: Some(true),
+                    };
+                    let text = serde_json::to_string(&challenge).expect("json");
+                    ws.send(Message::Text(text.into()))
+                        .await
+                        .expect("challenge");
+                    let Some(Ok(Message::Text(msg))) = ws.next().await else {
+                        return;
+                    };
+                    match serde_json::from_str::<RelayClientMsg>(&msg) {
+                        Ok(RelayClientMsg::Register { pub_key, .. }) => {
+                            let reply =
+                                serde_json::to_string(&RelayServerMsg::Registered { pub_key })
+                                    .expect("json");
+                            ws.send(Message::Text(reply.into()))
+                                .await
+                                .expect("registered");
+                            while let Some(Ok(_)) = ws.next().await {}
+                            let tx = closed_tx.lock().expect("mock lock").take();
+                            if let Some(tx) = tx {
+                                let _ = tx.send(());
+                            }
+                        }
+                        // Standby requests never get an answer, so bind waits on them.
+                        _ => std::future::pending::<()>().await,
+                    }
+                });
+            }
+        });
+
+        let bind = RelayListener::bind(
+            url,
+            None,
+            SigningKey::from_bytes(&[0x60; 32]),
+            DEFAULT_WRITE_TIMEOUT,
+        );
+        assert!(
+            timeout(Duration::from_millis(500), bind).await.is_err(),
+            "bind waits for standby readiness"
+        );
+        timeout(Duration::from_secs(5), control_closed_rx)
+            .await
+            .expect("cancelled bind left its control socket open")
+            .expect("mock relay saw the control socket close");
     }
 }

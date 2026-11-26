@@ -294,6 +294,17 @@ where
         + 'static,
 {
     let (pool_shutdown_tx, mut pool_shutdown_rx) = watch::channel(false);
+    if *parent_shutdown.borrow() {
+        // The owner already stopped: start no slots.
+        pool_shutdown_tx.send_replace(true);
+        return (
+            StandbyPoolHandle {
+                shutdown_tx: pool_shutdown_tx,
+                supervisor: tokio::spawn(async {}),
+            },
+            Vec::new(),
+        );
+    }
     let (replenish_tx, mut replenish_rx) = mpsc::channel::<u64>(pool_size.saturating_mul(4).max(8));
     let mut slots: JoinSet<(u64, StandbySlotOutcome)> = JoinSet::new();
     let mut live_ids: HashSet<u64> = HashSet::new();
