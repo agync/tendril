@@ -1,6 +1,6 @@
 [package]
 name = "tendril-ffi"
-description = "Callback-free polled C ABI over tendril-core and tendril-runtime."
+description = "Polled C ABI (callback-free except optional external ML-DSA-65 custody callbacks) over tendril-core and tendril-runtime."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -31,9 +31,17 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
+h2.workspace = true
+http.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 tempfile.workspace = true
 tendril-relay.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls.workspace = true
 
 [lints.rust]
 unsafe_code = "allow"

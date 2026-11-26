@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,7 +11,8 @@ use tempfile::TempDir;
 use tendril_core::MAX_FRAME_LEN;
 use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::{
-    HYBRID_SIGNING_PUB_LEN, SigningKeypair, StaticKeypair, b64url_decode, b64url_encode,
+    ED25519_SIG_LEN, HYBRID_MLDSA_CTX, HYBRID_SIGNING_PUB_LEN, SigningKeypair, StaticKeypair,
+    b64url_decode, b64url_encode,
 };
 use tendril_core::grants::{Grant, RevocationListUnsigned, sign_crl};
 use tendril_core::identity::sign_rotation;
@@ -17,30 +20,33 @@ use tendril_core::noise::NoiseHfsHandshakeBuilder;
 use tendril_core::roster::PeerState;
 use tendril_core::wire::{HostHello, Intent, Preamble, ResumableFrameReader, encode_frame};
 use tendril_ffi::{
-    TENDRIL_EOF, TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_ERR_PROTOCOL, TENDRIL_OK,
-    TENDRIL_WOULD_BLOCK, tendril_compute_code_mac, tendril_device_id,
+    TENDRIL_EOF, TENDRIL_ERR_INVALID_ARG, TENDRIL_ERR_NOT_FOUND, TENDRIL_ERR_PROTOCOL,
+    TENDRIL_MLDSA65_PUB_LEN, TENDRIL_MLDSA65_SIG_LEN, TENDRIL_OK, TENDRIL_WOULD_BLOCK,
+    TendrilGroup, TendrilMlDsa65Signer, tendril_compute_code_mac, tendril_device_id,
     tendril_endpoint_add_trust_anchor, tendril_endpoint_close,
     tendril_endpoint_configure_transports_json, tendril_endpoint_confirm_peer,
     tendril_endpoint_enroll_initiate, tendril_endpoint_export_identity_json,
     tendril_endpoint_export_roster_json, tendril_endpoint_free, tendril_endpoint_info_json,
-    tendril_endpoint_issue_code, tendril_endpoint_mint_enrollment_token,
-    tendril_endpoint_mint_grant, tendril_endpoint_mint_relay_ticket, tendril_endpoint_new,
-    tendril_endpoint_new_from_state, tendril_endpoint_new_sealed, tendril_endpoint_pair_accept,
-    tendril_endpoint_pair_initiate, tendril_endpoint_pair_v2_accept,
-    tendril_endpoint_pair_v2_initiate, tendril_endpoint_revoke_peer,
-    tendril_endpoint_revoke_trust_anchor, tendril_endpoint_serve_direct,
-    tendril_endpoint_serve_p2p, tendril_endpoint_serve_relay, tendril_endpoint_serve_relay_v2,
-    tendril_fingerprint_device, tendril_fingerprint_host, tendril_last_error, tendril_pairing_sas,
-    tendril_session_accept, tendril_session_accept_v2, tendril_session_authorize,
-    tendril_session_close, tendril_session_connect, tendril_session_connect_v2,
-    tendril_session_export_roster_json, tendril_session_free, tendril_session_peer_id,
-    tendril_session_poll_event, tendril_session_rekey, tendril_session_send_data,
-    tendril_session_shutdown, tendril_string_free, tendril_verify_grant_json,
-    tendril_verify_rotation_chain_json,
+    tendril_endpoint_issue_code, tendril_endpoint_issue_pairing_uri,
+    tendril_endpoint_mint_enrollment_token, tendril_endpoint_mint_grant,
+    tendril_endpoint_mint_relay_ticket, tendril_endpoint_new, tendril_endpoint_new_from_state,
+    tendril_endpoint_new_sealed, tendril_endpoint_new_sealed_with_options,
+    tendril_endpoint_pair_accept, tendril_endpoint_pair_initiate, tendril_endpoint_pair_v2_accept,
+    tendril_endpoint_pair_v2_initiate, tendril_endpoint_refresh_routes,
+    tendril_endpoint_revoke_peer, tendril_endpoint_revoke_trust_anchor,
+    tendril_endpoint_serve_direct, tendril_endpoint_serve_p2p, tendril_endpoint_serve_relay,
+    tendril_endpoint_serve_relay_v2, tendril_fingerprint_device, tendril_fingerprint_host,
+    tendril_group_close, tendril_group_create, tendril_group_free, tendril_group_open,
+    tendril_last_error, tendril_pairing_sas, tendril_session_accept, tendril_session_accept_v2,
+    tendril_session_authorize, tendril_session_close, tendril_session_connect,
+    tendril_session_connect_v2, tendril_session_export_roster_json, tendril_session_free,
+    tendril_session_peer_id, tendril_session_poll_event, tendril_session_rekey,
+    tendril_session_send_data, tendril_session_shutdown, tendril_string_free,
+    tendril_verify_grant_json, tendril_verify_rotation_chain_json, tendril_verify_wake_tag,
 };
 use tendril_runtime::{
     DirectListener, PathListener, PathStream, PrefixedPathStream, SessionDriver, StateStore,
-    peek_exact, recv_tendril_frame,
+    derive_epoch_wake_tag, peek_exact, recv_tendril_frame,
 };
 
 unsafe fn take_cstr(ptr: *mut c_char) -> String {
@@ -3717,4 +3723,1178 @@ fn ffi_v2_pinned_pair_wrong_code_and_mid_session_crl_revocation() {
     assert!(crl_nonces.iter().any(|v| v == &expected_nonce));
 
     unsafe { tendril_endpoint_free(cli_ep2) };
+}
+
+struct MockMlDsaCtx {
+    inner: SigningKeypair,
+    sign_calls: AtomicUsize,
+    drop_calls: AtomicUsize,
+    fail_sign: bool,
+}
+
+unsafe extern "C" fn mock_mldsa_sign(
+    ctx: *mut c_void,
+    msg: *const u8,
+    msg_len: usize,
+    mldsa_ctx: *const u8,
+    mldsa_ctx_len: usize,
+    out_sig: *mut u8,
+    out_sig_len: usize,
+) -> i32 {
+    if ctx.is_null() || out_sig.is_null() || out_sig_len != TENDRIL_MLDSA65_SIG_LEN {
+        return TENDRIL_ERR_INVALID_ARG;
+    }
+    let state = unsafe { &*(ctx as *const MockMlDsaCtx) };
+    state.sign_calls.fetch_add(1, Ordering::SeqCst);
+    if state.fail_sign {
+        return TENDRIL_ERR_PROTOCOL;
+    }
+    let msg_slice = if msg_len == 0 {
+        &[]
+    } else if msg.is_null() {
+        return TENDRIL_ERR_INVALID_ARG;
+    } else {
+        unsafe { std::slice::from_raw_parts(msg, msg_len) }
+    };
+    let ctx_slice = if mldsa_ctx_len == 0 {
+        &[]
+    } else if mldsa_ctx.is_null() {
+        return TENDRIL_ERR_INVALID_ARG;
+    } else {
+        unsafe { std::slice::from_raw_parts(mldsa_ctx, mldsa_ctx_len) }
+    };
+    if ctx_slice != HYBRID_MLDSA_CTX {
+        return TENDRIL_ERR_INVALID_ARG;
+    }
+    let Ok(hybrid) = state.inner.sign(msg_slice) else {
+        return TENDRIL_ERR_PROTOCOL;
+    };
+    let out = unsafe { std::slice::from_raw_parts_mut(out_sig, out_sig_len) };
+    out.copy_from_slice(&hybrid[ED25519_SIG_LEN..]);
+    TENDRIL_OK
+}
+
+unsafe extern "C" fn mock_mldsa_drop(ctx: *mut c_void) {
+    if ctx.is_null() {
+        return;
+    }
+    let state = unsafe { Arc::from_raw(ctx as *const MockMlDsaCtx) };
+    state.drop_calls.fetch_add(1, Ordering::SeqCst);
+}
+
+fn build_c_signer(
+    state: &Arc<MockMlDsaCtx>,
+    pub_buf: &mut [u8; TENDRIL_MLDSA65_PUB_LEN],
+) -> TendrilMlDsa65Signer {
+    pub_buf.copy_from_slice(&state.inner.public_bytes()[32..]);
+    TendrilMlDsa65Signer {
+        ctx: Arc::into_raw(Arc::clone(state)).cast_mut().cast(),
+        public_key: pub_buf.as_ptr(),
+        public_key_len: pub_buf.len(),
+        sign: Some(mock_mldsa_sign),
+        drop_ctx: Some(mock_mldsa_drop),
+    }
+}
+
+#[test]
+fn sealed_external_mldsa_drop_ctx_runs_once_on_errors_and_free() {
+    let tmp = TempDir::new().unwrap();
+    let dir_c = CString::new(tmp.path().join("state").to_str().unwrap()).unwrap();
+    let kp = SigningKeypair::from_seeds([0x31; 32], [0x41; 32]);
+
+    let make_state = || {
+        Arc::new(MockMlDsaCtx {
+            inner: kp.clone(),
+            sign_calls: AtomicUsize::new(0),
+            drop_calls: AtomicUsize::new(0),
+            fail_sign: false,
+        })
+    };
+
+    let mut pub_buf = [0u8; TENDRIL_MLDSA65_PUB_LEN];
+
+    // 1. Null state_dir: drop_ctx still runs exactly once.
+    let s1 = make_state();
+    let c1 = build_c_signer(&s1, &mut pub_buf);
+    let ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c1,
+        )
+    };
+    assert!(ep.is_null());
+    assert_eq!(s1.drop_calls.load(Ordering::SeqCst), 1);
+
+    // 2. Malformed / unknown / invalid runtime_profile options_json_opt: drop_ctx runs once.
+    for bad_opts in [
+        "{not json",
+        r#"{"unknown":true}"#,
+        r#"{"runtime_profile":"tiny"}"#,
+    ] {
+        let s = make_state();
+        let c = build_c_signer(&s, &mut pub_buf);
+        let opts_c = CString::new(bad_opts).unwrap();
+        let ep = unsafe {
+            tendril_endpoint_new_sealed_with_options(
+                dir_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                opts_c.as_ptr(),
+                &raw const c,
+            )
+        };
+        assert!(ep.is_null(), "bad_opts={bad_opts}");
+        assert_eq!(
+            s.drop_calls.load(Ordering::SeqCst),
+            1,
+            "bad_opts={bad_opts}"
+        );
+    }
+
+    // 3. Missing sign function pointer: drop_ctx runs once.
+    let s3 = make_state();
+    let mut c3 = build_c_signer(&s3, &mut pub_buf);
+    c3.sign = None;
+    let ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            dir_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c3,
+        )
+    };
+    assert!(ep.is_null());
+    assert_eq!(s3.drop_calls.load(Ordering::SeqCst), 1);
+
+    // 4. Null public_key and wrong public_key_len: drop_ctx runs once.
+    let s4 = make_state();
+    let mut c4 = build_c_signer(&s4, &mut pub_buf);
+    c4.public_key = ptr::null();
+    let ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            dir_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c4,
+        )
+    };
+    assert!(ep.is_null());
+    assert_eq!(s4.drop_calls.load(Ordering::SeqCst), 1);
+
+    let s5 = make_state();
+    let mut c5 = build_c_signer(&s5, &mut pub_buf);
+    c5.public_key_len = TENDRIL_MLDSA65_PUB_LEN - 1;
+    let ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            dir_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c5,
+        )
+    };
+    assert!(ep.is_null());
+    assert_eq!(s5.drop_calls.load(Ordering::SeqCst), 1);
+
+    // 5. v1 software identity JSON paired with external signer fails and runs drop_ctx once.
+    let v1_json = serde_json::json!({
+        "version": 1,
+        "static_secret_b64": b64url_encode(&[0x10; 32]),
+        "signing_seed_b64": b64url_encode(&[0x20; 32]),
+        "host_id": "v1-host"
+    })
+    .to_string();
+    let v1_c = CString::new(v1_json).unwrap();
+    let s6 = make_state();
+    let c6 = build_c_signer(&s6, &mut pub_buf);
+    let ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            dir_c.as_ptr(),
+            v1_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c6,
+        )
+    };
+    assert!(ep.is_null());
+    assert_eq!(s6.drop_calls.load(Ordering::SeqCst), 1);
+
+    // 6. Null ctx guard: drop_ctx must NOT be invoked when ctx == NULL (on error or free).
+    static NULL_CTX_DROPS: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn record_null_ctx_drop(_ctx: *mut c_void) {
+        NULL_CTX_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+    let bad_null_opts = CString::new("{\"unknown\":1}").unwrap();
+    let null_ctx_bad = TendrilMlDsa65Signer {
+        ctx: ptr::null_mut(),
+        public_key: pub_buf.as_ptr(),
+        public_key_len: pub_buf.len(),
+        sign: Some(mock_mldsa_sign),
+        drop_ctx: Some(record_null_ctx_drop),
+    };
+    let ep_null_bad = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            dir_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            bad_null_opts.as_ptr(),
+            &raw const null_ctx_bad,
+        )
+    };
+    assert!(ep_null_bad.is_null());
+    assert_eq!(NULL_CTX_DROPS.load(Ordering::SeqCst), 0);
+
+    let null_dir_c = CString::new(tmp.path().join("null_ctx_state").to_str().unwrap()).unwrap();
+    let null_ctx_ok = TendrilMlDsa65Signer {
+        ctx: ptr::null_mut(),
+        public_key: pub_buf.as_ptr(),
+        public_key_len: pub_buf.len(),
+        sign: Some(mock_mldsa_sign),
+        drop_ctx: Some(record_null_ctx_drop),
+    };
+    let ep_null_ok = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            null_dir_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const null_ctx_ok,
+        )
+    };
+    assert!(!ep_null_ok.is_null(), "{}", read_last_err());
+    unsafe { tendril_endpoint_free(ep_null_ok) };
+    assert_eq!(NULL_CTX_DROPS.load(Ordering::SeqCst), 0);
+
+    // 7. Keystore / sealed-state failure (regular file path instead of directory): drop_ctx runs once.
+    let bad_store_path = tmp.path().join("not_a_dir");
+    std::fs::write(&bad_store_path, b"not-a-directory").unwrap();
+    let bad_store_c = CString::new(bad_store_path.to_str().unwrap()).unwrap();
+    let s7 = make_state();
+    let c7 = build_c_signer(&s7, &mut pub_buf);
+    let ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            bad_store_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c7,
+        )
+    };
+    assert!(ep.is_null());
+    assert_eq!(s7.drop_calls.load(Ordering::SeqCst), 1);
+
+    // 8. Forged 1952-byte ML-DSA public key (all 0xFF): fails post-sign verify and drops once.
+    let s8 = make_state();
+    let mut forged_pub = [0xffu8; TENDRIL_MLDSA65_PUB_LEN];
+    let mut c8 = build_c_signer(&s8, &mut pub_buf);
+    c8.public_key = forged_pub.as_ptr();
+    c8.public_key_len = forged_pub.len();
+    let forged_dir_c = CString::new(tmp.path().join("forged_pub_state").to_str().unwrap()).unwrap();
+    let ep_forged = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            forged_dir_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c8,
+        )
+    };
+    assert!(!ep_forged.is_null(), "{}", read_last_err());
+    let mut uri_p: *mut c_char = ptr::null_mut();
+    assert_ne!(
+        unsafe { tendril_endpoint_issue_pairing_uri(ep_forged, ptr::null(), &raw mut uri_p) },
+        TENDRIL_OK
+    );
+    assert!(uri_p.is_null());
+    assert_eq!(s8.drop_calls.load(Ordering::SeqCst), 0);
+    unsafe { tendril_endpoint_free(ep_forged) };
+    assert_eq!(s8.drop_calls.load(Ordering::SeqCst), 1);
+
+    // Also test wrong all-zero 1952-byte key against an exported v2 identity JSON: drops once.
+    forged_pub.fill(0);
+
+    // 9. Success path (creating initialized sealed state) + reopening existing sealed state without
+    // identity (sealed-state mismatch failure): drop_ctx runs once in both cases.
+    let s_ok = make_state();
+    let c_ok = build_c_signer(&s_ok, &mut pub_buf);
+    let ok_dir_c = CString::new(tmp.path().join("ok_state").to_str().unwrap()).unwrap();
+    let ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            ok_dir_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c_ok,
+        )
+    };
+    assert!(!ep.is_null(), "{}", read_last_err());
+    let mut saved_id_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_identity_json(ep, &raw mut saved_id_p) },
+        TENDRIL_OK
+    );
+    let saved_id_c = CString::new(unsafe { take_cstr(saved_id_p) }).unwrap();
+    assert_eq!(s_ok.drop_calls.load(Ordering::SeqCst), 0);
+    unsafe { tendril_endpoint_free(ep) };
+    assert_eq!(s_ok.drop_calls.load(Ordering::SeqCst), 1);
+
+    // Seed sealed state once, then reopening without identity_json_opt fails and runs drop_ctx once.
+    let empty_roster_c =
+        CString::new(serde_json::to_string(&tendril_core::roster::Roster::new()).unwrap()).unwrap();
+    let s_seed = make_state();
+    let c_seed = build_c_signer(&s_seed, &mut pub_buf);
+    let ep_seed = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            ok_dir_c.as_ptr(),
+            saved_id_c.as_ptr(),
+            empty_roster_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c_seed,
+        )
+    };
+    assert!(!ep_seed.is_null(), "{}", read_last_err());
+    unsafe { tendril_endpoint_free(ep_seed) };
+    assert_eq!(s_seed.drop_calls.load(Ordering::SeqCst), 1);
+
+    let s_reopen_no_id = make_state();
+    let c_reopen_no_id = build_c_signer(&s_reopen_no_id, &mut pub_buf);
+    let ep_no_id = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            ok_dir_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c_reopen_no_id,
+        )
+    };
+    assert!(ep_no_id.is_null());
+    assert_eq!(s_reopen_no_id.drop_calls.load(Ordering::SeqCst), 1);
+
+    let s_zero_key = make_state();
+    let mut c_zero_key = build_c_signer(&s_zero_key, &mut pub_buf);
+    c_zero_key.public_key = forged_pub.as_ptr();
+    c_zero_key.public_key_len = forged_pub.len();
+    let ep_zero_key = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            ok_dir_c.as_ptr(),
+            saved_id_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c_zero_key,
+        )
+    };
+    assert!(ep_zero_key.is_null());
+    assert_eq!(s_zero_key.drop_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn sealed_external_mldsa_drop_ctx_waits_for_live_session_and_group() {
+    let tmp = TempDir::new().unwrap();
+    let host_dir = CString::new(tmp.path().join("host_state").to_str().unwrap()).unwrap();
+    let cli_dir = CString::new(tmp.path().join("cli_state").to_str().unwrap()).unwrap();
+
+    let kp = SigningKeypair::from_seeds([0x81; 32], [0x91; 32]);
+    let host_state = Arc::new(MockMlDsaCtx {
+        inner: kp,
+        sign_calls: AtomicUsize::new(0),
+        drop_calls: AtomicUsize::new(0),
+        fail_sign: false,
+    });
+    let mut pub_buf = [0u8; TENDRIL_MLDSA65_PUB_LEN];
+    let c_signer = build_c_signer(&host_state, &mut pub_buf);
+    let host_ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            host_dir.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c_signer,
+        )
+    };
+    assert!(!host_ep.is_null(), "{}", read_last_err());
+    let mut info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(host_ep, &raw mut info_p) },
+        TENDRIL_OK
+    );
+    let host_info: Value = serde_json::from_str(&unsafe { take_cstr(info_p) }).unwrap();
+    let host_name = CString::new(host_info["host_id"].as_str().unwrap()).unwrap();
+
+    let cli_ep = unsafe {
+        tendril_endpoint_new_sealed(cli_dir.as_ptr(), ptr::null(), ptr::null(), ptr::null())
+    };
+    assert!(!cli_ep.is_null(), "{}", read_last_err());
+
+    let bind_c = CString::new("127.0.0.1:0").unwrap();
+    let mut ep_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, bind_c.as_ptr(), &raw mut ep_p) },
+        TENDRIL_OK
+    );
+    let listen_ep = unsafe { take_cstr(ep_p) };
+
+    let kind_c = CString::new("lan").unwrap();
+    let mut code_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, kind_c.as_ptr(), &raw mut code_p) },
+        TENDRIL_OK
+    );
+    let code_c = CString::new(unsafe { take_cstr(code_p) }).unwrap();
+
+    let hep_usize = host_ep as usize;
+    let acc_thr = thread::spawn(move || {
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_v2_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK, "{}", read_last_err());
+        serde_json::from_str::<Value>(&unsafe { take_cstr(out) }).unwrap()
+    });
+    let dep_c = CString::new(listen_ep).unwrap();
+    let cli_name_c = CString::new("group-cli").unwrap();
+    let dev_kind_c = CString::new("desktop").unwrap();
+    let mut pair_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                cli_ep,
+                dep_c.as_ptr(),
+                ptr::null(),
+                code_c.as_ptr(),
+                cli_name_c.as_ptr(),
+                dev_kind_c.as_ptr(),
+                ptr::null(),
+                &raw mut pair_p,
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        read_last_err()
+    );
+    drop(unsafe { take_cstr(pair_p) });
+    let acc_val = acc_thr.join().unwrap();
+    let cli_dev_c = CString::new(acc_val["device_id"].as_str().unwrap()).unwrap();
+    let sas_c = CString::new(acc_val["sas"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, cli_dev_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(cli_ep, host_name.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+
+    let caps_c = CString::new("[\"fs.read\"]").unwrap();
+    let mut grant_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                cli_dev_c.as_ptr(),
+                caps_c.as_ptr(),
+                300,
+                &raw mut grant_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_c = CString::new(unsafe { take_cstr(grant_p) }).unwrap();
+
+    // Create and open a group on host_ep so GroupPool also retains Arc<EndpointIdentity>.
+    let grp_name_c = CString::new("custody-grp").unwrap();
+    let mut manifest_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_group_create(
+                host_ep,
+                grp_name_c.as_ptr(),
+                2,
+                ptr::null(),
+                &raw mut manifest_p,
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        read_last_err()
+    );
+    let manifest: Value = serde_json::from_str(&unsafe { take_cstr(manifest_p) }).unwrap();
+    let group_id_c = CString::new(manifest["group_id"].as_str().unwrap()).unwrap();
+    let mut host_grp: *mut TendrilGroup = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_group_open(host_ep, group_id_c.as_ptr(), ptr::null(), &raw mut host_grp) },
+        TENDRIL_OK,
+        "{}",
+        read_last_err()
+    );
+    assert!(!host_grp.is_null());
+
+    // Open a live session before freeing host_ep.
+    let sess_acc = thread::spawn(move || unsafe {
+        tendril_session_accept_v2(hep_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) as usize
+    });
+    let cli_sess = unsafe {
+        tendril_session_connect_v2(
+            cli_ep,
+            dep_c.as_ptr(),
+            ptr::null(),
+            host_name.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(!cli_sess.is_null(), "{}", read_last_err());
+    let host_sess = sess_acc.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess.is_null());
+    assert_eq!(host_state.drop_calls.load(Ordering::SeqCst), 0);
+
+    // Freeing host_ep while host_sess and host_grp remain live must NOT drop_ctx yet.
+    unsafe { tendril_endpoint_free(host_ep) };
+    assert_eq!(host_state.drop_calls.load(Ordering::SeqCst), 0);
+
+    // Live session continues exchanging data independently of freed endpoint.
+    let msg = b"still-alive-after-ep-free";
+    assert_eq!(
+        unsafe { tendril_session_send_data(cli_sess, msg.as_ptr(), msg.len()) },
+        TENDRIL_OK
+    );
+    let mut ev_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_poll_event(host_sess, 2_000, &raw mut ev_p) },
+        TENDRIL_OK
+    );
+    let ev: Value = serde_json::from_str(&unsafe { take_cstr(ev_p) }).unwrap();
+    assert_eq!(ev["event"], "data");
+    assert_eq!(
+        b64url_decode(ev["data_b64"].as_str().unwrap()).unwrap(),
+        msg
+    );
+
+    // Closing/freeing sessions while host_grp is open still leaves GroupPool holding identity Arc.
+    unsafe {
+        tendril_session_free(cli_sess);
+        tendril_session_free(host_sess);
+        tendril_endpoint_free(cli_ep);
+    }
+    assert_eq!(host_state.drop_calls.load(Ordering::SeqCst), 0);
+
+    // Closing and freeing the last group handle drops the final Arc and invokes drop_ctx once.
+    assert_eq!(unsafe { tendril_group_close(host_grp) }, TENDRIL_OK);
+    unsafe { tendril_group_free(host_grp) };
+    assert_eq!(host_state.drop_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn sealed_external_mldsa_round_trip_and_signing() {
+    let tmp = TempDir::new().unwrap();
+    let host_dir = CString::new(tmp.path().join("host_state").to_str().unwrap()).unwrap();
+    let cli_dir = CString::new(tmp.path().join("cli_state").to_str().unwrap()).unwrap();
+    let host_name = CString::new("enclave-host").unwrap();
+
+    let kp = SigningKeypair::from_seeds([0x51; 32], [0x61; 32]);
+    let state1 = Arc::new(MockMlDsaCtx {
+        inner: kp.clone(),
+        sign_calls: AtomicUsize::new(0),
+        drop_calls: AtomicUsize::new(0),
+        fail_sign: false,
+    });
+    let mut pub_buf = [0u8; TENDRIL_MLDSA65_PUB_LEN];
+    let c_signer1 = build_c_signer(&state1, &mut pub_buf);
+    let opts_default =
+        CString::new(r#"{"runtime_profile":"default","client_only":false}"#).unwrap();
+
+    let ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            host_dir.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            host_name.as_ptr(),
+            opts_default.as_ptr(),
+            &raw const c_signer1,
+        )
+    };
+    assert!(!ep.is_null(), "{}", read_last_err());
+
+    let mut id_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_export_identity_json(ep, &raw mut id_p) },
+        TENDRIL_OK
+    );
+    let id_json = unsafe { take_cstr(id_p) };
+    let id_val: Value = serde_json::from_str(&id_json).unwrap();
+    assert_eq!(id_val["version"], 2);
+    assert_eq!(id_val["pq_signing_custody"], "external_mldsa65");
+    assert!(id_val.get("pq_signing_seed_b64").is_none());
+
+    let mut info_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(ep, &raw mut info_p) },
+        TENDRIL_OK
+    );
+    let host_info: Value = serde_json::from_str(&unsafe { take_cstr(info_p) }).unwrap();
+    let host_dev_id = host_info["device_id"].as_str().unwrap().to_owned();
+
+    // Serve direct and issue pairing URI (signs route set via external ML-DSA-65 signer).
+    let bind_c = CString::new("127.0.0.1:0").unwrap();
+    let mut ep_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(ep, bind_c.as_ptr(), &raw mut ep_p) },
+        TENDRIL_OK
+    );
+    drop(unsafe { take_cstr(ep_p) });
+
+    let mut uri_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_pairing_uri(ep, ptr::null(), &raw mut uri_p) },
+        TENDRIL_OK
+    );
+    drop(unsafe { take_cstr(uri_p) });
+    assert!(state1.sign_calls.load(Ordering::SeqCst) >= 1);
+
+    unsafe { tendril_endpoint_free(ep) };
+    assert_eq!(state1.drop_calls.load(Ordering::SeqCst), 1);
+
+    // Reopen without signer must fail closed.
+    let id_c = CString::new(id_json.clone()).unwrap();
+    let missing_signer_ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            host_dir.as_ptr(),
+            id_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(missing_signer_ep.is_null());
+
+    // Reopen with mismatched external public key must fail closed and drop ctx once.
+    let wrong_kp = SigningKeypair::from_seeds([0x51; 32], [0x77; 32]);
+    let wrong_state = Arc::new(MockMlDsaCtx {
+        inner: wrong_kp,
+        sign_calls: AtomicUsize::new(0),
+        drop_calls: AtomicUsize::new(0),
+        fail_sign: false,
+    });
+    let c_wrong = build_c_signer(&wrong_state, &mut pub_buf);
+    let wrong_ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            host_dir.as_ptr(),
+            id_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c_wrong,
+        )
+    };
+    assert!(wrong_ep.is_null());
+    assert_eq!(wrong_state.drop_calls.load(Ordering::SeqCst), 1);
+
+    // Reopen with matching external signer: grant mint, v2 pair + session connect all succeed.
+    let state2 = Arc::new(MockMlDsaCtx {
+        inner: kp,
+        sign_calls: AtomicUsize::new(0),
+        drop_calls: AtomicUsize::new(0),
+        fail_sign: false,
+    });
+    let c_signer2 = build_c_signer(&state2, &mut pub_buf);
+    let host_ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            host_dir.as_ptr(),
+            id_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &raw const c_signer2,
+        )
+    };
+    assert!(!host_ep.is_null(), "{}", read_last_err());
+
+    let mut info2_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_info_json(host_ep, &raw mut info2_p) },
+        TENDRIL_OK
+    );
+    let info2: Value = serde_json::from_str(&unsafe { take_cstr(info2_p) }).unwrap();
+    assert_eq!(info2["device_id"], host_dev_id);
+
+    let mut listen_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, bind_c.as_ptr(), &raw mut listen_p) },
+        TENDRIL_OK
+    );
+    let listen_ep = unsafe { take_cstr(listen_p) };
+    let kind_c = CString::new("lan").unwrap();
+    let mut code_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, kind_c.as_ptr(), &raw mut code_p) },
+        TENDRIL_OK
+    );
+    let code_c = CString::new(unsafe { take_cstr(code_p) }).unwrap();
+
+    // Client runs with extension profile + client_only: true.
+    let cli_opts = CString::new(r#"{"runtime_profile":"extension","client_only":true}"#).unwrap();
+    let cli_ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            cli_dir.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            cli_opts.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(!cli_ep.is_null(), "{}", read_last_err());
+
+    let cli_dev_id: String = {
+        let mut ci_p: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_info_json(cli_ep, &raw mut ci_p) },
+            TENDRIL_OK
+        );
+        let ci: Value = serde_json::from_str(&unsafe { take_cstr(ci_p) }).unwrap();
+        ci["device_id"].as_str().unwrap().to_owned()
+    };
+
+    let hep_usize = host_ep as usize;
+    let acc_thr = thread::spawn(move || {
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_v2_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK, "{}", read_last_err());
+        serde_json::from_str::<Value>(&unsafe { take_cstr(out) }).unwrap()
+    });
+    let dep_c = CString::new(listen_ep.clone()).unwrap();
+    let cli_name_c = CString::new("ext-client").unwrap();
+    let dev_kind_c = CString::new("phone").unwrap();
+    let mut pair_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                cli_ep,
+                dep_c.as_ptr(),
+                ptr::null(),
+                code_c.as_ptr(),
+                cli_name_c.as_ptr(),
+                dev_kind_c.as_ptr(),
+                ptr::null(),
+                &raw mut pair_p,
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        read_last_err()
+    );
+    drop(unsafe { take_cstr(pair_p) });
+    let acc_val = acc_thr.join().unwrap();
+
+    let cli_dev_c = CString::new(cli_dev_id.clone()).unwrap();
+    let sas_c = CString::new(acc_val["sas"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, cli_dev_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(cli_ep, host_name.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+
+    let sign_before_grant = state2.sign_calls.load(Ordering::SeqCst);
+    let caps_c = CString::new("[\"fs.read\"]").unwrap();
+    let mut grant_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                cli_dev_c.as_ptr(),
+                caps_c.as_ptr(),
+                300,
+                &raw mut grant_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_str = unsafe { take_cstr(grant_p) };
+    assert!(state2.sign_calls.load(Ordering::SeqCst) > sign_before_grant);
+
+    let issuer_keys_c = CString::new(
+        serde_json::json!({
+            "enclave-host": info2["signing_pub"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let grant_c = CString::new(grant_str).unwrap();
+    let cap_c = CString::new("fs.read").unwrap();
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut allowed = 0u8;
+    assert_eq!(
+        unsafe {
+            tendril_verify_grant_json(
+                grant_c.as_ptr(),
+                issuer_keys_c.as_ptr(),
+                cli_dev_c.as_ptr(),
+                host_name.as_ptr(),
+                cap_c.as_ptr(),
+                now_unix,
+                ptr::null(),
+                &raw mut allowed,
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        read_last_err()
+    );
+    assert_eq!(allowed, 1);
+
+    // Connect v2 session from extension client to external-custody host.
+    let sess_acc_thr = thread::spawn(move || unsafe {
+        tendril_session_accept_v2(hep_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) as usize
+    });
+    let cli_sess = unsafe {
+        tendril_session_connect_v2(
+            cli_ep,
+            dep_c.as_ptr(),
+            ptr::null(),
+            host_name.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(!cli_sess.is_null(), "{}", read_last_err());
+    let host_sess = sess_acc_thr.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess.is_null());
+
+    let payload = b"hello-enclave";
+    assert_eq!(
+        unsafe { tendril_session_send_data(cli_sess, payload.as_ptr(), payload.len()) },
+        TENDRIL_OK
+    );
+    let mut ev_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_poll_event(host_sess, 2_000, &raw mut ev_p) },
+        TENDRIL_OK
+    );
+    let ev: Value = serde_json::from_str(&unsafe { take_cstr(ev_p) }).unwrap();
+    assert_eq!(ev["event"], "data");
+    assert_eq!(
+        b64url_decode(ev["data_b64"].as_str().unwrap()).unwrap(),
+        payload
+    );
+
+    unsafe {
+        tendril_session_free(cli_sess);
+        tendril_session_free(host_sess);
+        tendril_endpoint_free(cli_ep);
+        tendril_endpoint_free(host_ep);
+    }
+    assert_eq!(state2.drop_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn extension_client_only_rejects_listeners_and_allows_outbound() {
+    let tmp = TempDir::new().unwrap();
+    let dir_c = CString::new(tmp.path().join("ext_state").to_str().unwrap()).unwrap();
+    let opts_c = CString::new(r#"{"runtime_profile":"extension","client_only":true}"#).unwrap();
+
+    let ep = unsafe {
+        tendril_endpoint_new_sealed_with_options(
+            dir_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            opts_c.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(!ep.is_null(), "{}", read_last_err());
+
+    let mut out: *mut c_char = ptr::null_mut();
+    let addr_c = CString::new("127.0.0.1:0").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(ep, addr_c.as_ptr(), &raw mut out) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("client_only"));
+
+    let relay_c = CString::new("wss://relay.example/v1/relay").unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_relay(ep, relay_c.as_ptr(), ptr::null(), &raw mut out) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("client_only"));
+
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_serve_relay_v2(
+                ep,
+                relay_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &raw mut out,
+            )
+        },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("client_only"));
+
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_p2p(ep, ptr::null(), &raw mut out) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("client_only"));
+
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_pairing_uri(ep, ptr::null(), &raw mut out) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("client_only"));
+
+    assert_eq!(
+        unsafe { tendril_endpoint_refresh_routes(ep, ptr::null(), &raw mut out) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(read_last_err().contains("client_only"));
+
+    let grp_c = CString::new("grp-ext").unwrap();
+    let mut grp: *mut TendrilGroup = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_group_open(ep, grp_c.as_ptr(), addr_c.as_ptr(), &raw mut grp) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert!(grp.is_null());
+    assert!(read_last_err().contains("client_only"));
+
+    // NULL listen_addr does not fail client_only (reaches missing group check).
+    assert_eq!(
+        unsafe { tendril_group_open(ep, grp_c.as_ptr(), ptr::null(), &raw mut grp) },
+        TENDRIL_ERR_NOT_FOUND
+    );
+
+    // Outbound v2 pairing and session connect succeed under extension + client_only.
+    let host_name = CString::new("ext-outbound-host").unwrap();
+    let host_ep =
+        unsafe { tendril_endpoint_new_from_state(ptr::null(), ptr::null(), host_name.as_ptr()) };
+    assert!(!host_ep.is_null(), "{}", read_last_err());
+    let mut listen_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_serve_direct(host_ep, addr_c.as_ptr(), &raw mut listen_p) },
+        TENDRIL_OK
+    );
+    let listen_ep = unsafe { take_cstr(listen_p) };
+    let kind_c = CString::new("lan").unwrap();
+    let mut code_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_endpoint_issue_code(host_ep, kind_c.as_ptr(), &raw mut code_p) },
+        TENDRIL_OK
+    );
+    let code_c = CString::new(unsafe { take_cstr(code_p) }).unwrap();
+
+    let hep_usize = host_ep as usize;
+    let pair_acc = thread::spawn(move || {
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            tendril_endpoint_pair_v2_accept(
+                hep_usize as *mut tendril_ffi::TendrilEndpoint,
+                5_000,
+                &raw mut out,
+            )
+        };
+        assert_eq!(rc, TENDRIL_OK, "{}", read_last_err());
+        serde_json::from_str::<Value>(&unsafe { take_cstr(out) }).unwrap()
+    });
+    let dep_c = CString::new(listen_ep).unwrap();
+    let cli_name_c = CString::new("ext-cli").unwrap();
+    let dev_kind_c = CString::new("ios").unwrap();
+    let mut pair_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_pair_v2_initiate(
+                ep,
+                dep_c.as_ptr(),
+                ptr::null(),
+                code_c.as_ptr(),
+                cli_name_c.as_ptr(),
+                dev_kind_c.as_ptr(),
+                ptr::null(),
+                &raw mut pair_p,
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        read_last_err()
+    );
+    drop(unsafe { take_cstr(pair_p) });
+    let acc_val = pair_acc.join().unwrap();
+    let cli_dev_c = CString::new(acc_val["device_id"].as_str().unwrap()).unwrap();
+    let sas_c = CString::new(acc_val["sas"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(host_ep, cli_dev_c.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    assert_eq!(
+        unsafe { tendril_endpoint_confirm_peer(ep, host_name.as_ptr(), sas_c.as_ptr()) },
+        TENDRIL_OK
+    );
+    let caps_c = CString::new("[\"fs.read\"]").unwrap();
+    let mut grant_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            tendril_endpoint_mint_grant(
+                host_ep,
+                cli_dev_c.as_ptr(),
+                caps_c.as_ptr(),
+                300,
+                &raw mut grant_p,
+            )
+        },
+        TENDRIL_OK
+    );
+    let grant_c = CString::new(unsafe { take_cstr(grant_p) }).unwrap();
+
+    let sess_acc = thread::spawn(move || unsafe {
+        tendril_session_accept_v2(hep_usize as *mut tendril_ffi::TendrilEndpoint, 5_000) as usize
+    });
+    let cli_sess = unsafe {
+        tendril_session_connect_v2(
+            ep,
+            dep_c.as_ptr(),
+            ptr::null(),
+            host_name.as_ptr(),
+            grant_c.as_ptr(),
+        )
+    };
+    assert!(!cli_sess.is_null(), "{}", read_last_err());
+    let host_sess = sess_acc.join().unwrap() as *mut tendril_ffi::TendrilSession;
+    assert!(!host_sess.is_null());
+    let msg = b"ext-outbound-ok";
+    assert_eq!(
+        unsafe { tendril_session_send_data(cli_sess, msg.as_ptr(), msg.len()) },
+        TENDRIL_OK
+    );
+    let mut ev_p: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { tendril_session_poll_event(host_sess, 2_000, &raw mut ev_p) },
+        TENDRIL_OK
+    );
+    let ev: Value = serde_json::from_str(&unsafe { take_cstr(ev_p) }).unwrap();
+    assert_eq!(ev["event"], "data");
+    assert_eq!(
+        b64url_decode(ev["data_b64"].as_str().unwrap()).unwrap(),
+        msg
+    );
+
+    unsafe {
+        tendril_session_free(cli_sess);
+        tendril_session_free(host_sess);
+        tendril_endpoint_free(host_ep);
+        tendril_endpoint_free(ep);
+    }
+}
+
+#[test]
+fn verify_wake_tag_c_abi_checks_window_and_args() {
+    let secret = [0x42u8; 32];
+    let other_secret = [0x99u8; 32];
+    let now = 1_764_115_200u64;
+    let tag_b64 = derive_epoch_wake_tag(&secret, now).to_b64url();
+    let tag_c = CString::new(tag_b64).unwrap();
+
+    for delta in [-3600i64, 0, 3600] {
+        let check_now = (now as i64 + delta) as u64;
+        let mut matched = 0u8;
+        assert_eq!(
+            unsafe {
+                tendril_verify_wake_tag(
+                    secret.as_ptr(),
+                    tag_c.as_ptr(),
+                    check_now,
+                    &raw mut matched,
+                )
+            },
+            TENDRIL_OK
+        );
+        assert_eq!(matched, 1, "delta={delta}");
+    }
+
+    for delta in [-7200i64, 7200] {
+        let check_now = (now as i64 + delta) as u64;
+        let mut matched = 1u8;
+        assert_eq!(
+            unsafe {
+                tendril_verify_wake_tag(
+                    secret.as_ptr(),
+                    tag_c.as_ptr(),
+                    check_now,
+                    &raw mut matched,
+                )
+            },
+            TENDRIL_OK
+        );
+        assert_eq!(matched, 0, "delta={delta}");
+    }
+
+    let mut wrong_matched = 1u8;
+    assert_eq!(
+        unsafe {
+            tendril_verify_wake_tag(
+                other_secret.as_ptr(),
+                tag_c.as_ptr(),
+                now,
+                &raw mut wrong_matched,
+            )
+        },
+        TENDRIL_OK
+    );
+    assert_eq!(wrong_matched, 0);
+
+    let bad_tag_c = CString::new("not-valid-b64").unwrap();
+    let mut matched = 0u8;
+    assert_eq!(
+        unsafe {
+            tendril_verify_wake_tag(secret.as_ptr(), bad_tag_c.as_ptr(), now, &raw mut matched)
+        },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert_eq!(
+        unsafe { tendril_verify_wake_tag(ptr::null(), tag_c.as_ptr(), now, &raw mut matched) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert_eq!(
+        unsafe { tendril_verify_wake_tag(secret.as_ptr(), ptr::null(), now, &raw mut matched) },
+        TENDRIL_ERR_INVALID_ARG
+    );
+    assert_eq!(
+        unsafe { tendril_verify_wake_tag(secret.as_ptr(), tag_c.as_ptr(), now, ptr::null_mut()) },
+        TENDRIL_ERR_INVALID_ARG
+    );
 }

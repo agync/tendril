@@ -1,10 +1,18 @@
 //! Pairing URIs, stored routes and signed route announcements through the C ABI.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rcgen::{
+    CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tendril_ffi::{
@@ -20,7 +28,7 @@ use tendril_ffi::{
     tendril_endpoint_set_peer_routes, tendril_last_error, tendril_session_accept,
     tendril_session_accept_v2, tendril_session_connect, tendril_session_connect_v2,
     tendril_session_connect_with_options, tendril_session_free, tendril_session_poll_event,
-    tendril_session_send_data, tendril_string_free,
+    tendril_session_send_data, tendril_string_free, tendril_verify_wake_tag,
 };
 
 fn cs(s: &str) -> CString {
@@ -1496,4 +1504,327 @@ fn serve_after_close_does_not_start_hosting() {
     let (rc, null, err) = issue_rc(&host);
     assert_eq!(rc, TENDRIL_ERR_CLOSED, "{err}");
     assert!(null);
+}
+
+#[derive(Debug)]
+struct CapturedApnsReq {
+    request_line: String,
+    headers: HashMap<String, String>,
+    body: Value,
+}
+
+fn apns_capture_server() -> (String, Arc<Mutex<Vec<CapturedApnsReq>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_bg = Arc::clone(&captured);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_len = 0usize;
+            loop {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if header_end.is_none()
+                    && let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let end = pos + 4;
+                    header_end = Some(end);
+                    let hdr_str = String::from_utf8_lossy(&raw[..pos]);
+                    for line in hdr_str.split("\r\n").skip(1) {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(end) = header_end
+                    && raw.len() >= end + content_len
+                {
+                    break;
+                }
+            }
+            let Some(end) = header_end else { continue };
+            let head = String::from_utf8_lossy(&raw[..end - 4]);
+            let mut lines = head.split("\r\n");
+            let request_line = lines.next().unwrap_or_default().to_owned();
+            let mut headers = HashMap::new();
+            for line in lines {
+                if let Some((k, v)) = line.split_once(':') {
+                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_owned());
+                }
+            }
+            if request_line.starts_with("POST /3/device/") {
+                let body_bytes = &raw[end..(end + content_len).min(raw.len())];
+                let body: Value = serde_json::from_slice(body_bytes).unwrap();
+                captured_bg.lock().unwrap().push(CapturedApnsReq {
+                    request_line,
+                    headers,
+                    body,
+                });
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+    (format!("http://{addr}/3/device/deadbeef"), captured)
+}
+
+#[test]
+fn apns_mutable_alert_and_coalesce_persist_across_dials() {
+    let p = paired(Kind::StateDir, 2);
+    let (host, client) = (&p.host, &p.client);
+    let (wake_url, captured) = apns_capture_server();
+    let secret = [0x29u8; 32];
+    let secret_b64 = tendril_core::crypto::b64url_encode(&secret);
+    assert_eq!(
+        client.configure(&json!({
+            "wake_url": wake_url,
+            "wake_adapter": "apns",
+            "wake_secret_b64": secret_b64,
+            "wake_auth_token": "dev-bearer-token",
+            "wake_pre_wake": true,
+            "wake_retry_delay_ms": 20,
+            "wake_max_attempts": 2,
+            "wake_coalesce_secs": 60,
+            "wake_apns_mode": "mutable_alert",
+            "wake_apns_topic": "app.tendril.test",
+            "wake_apns_loc_key": "TENDRIL_WAKE_TEST",
+        })),
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+
+    let target = cs(p.host_id.as_str());
+    let endpoint = cs(&p.listen);
+    let g = cs(&p.grant);
+    let (c1, h1) = connect_pair(host, 2, || unsafe {
+        tendril_session_connect_v2(
+            client.raw(),
+            endpoint.as_ptr(),
+            ptr::null(),
+            target.as_ptr(),
+            g.as_ptr(),
+        )
+    })
+    .expect("first dial");
+    drop((c1, h1));
+    // Rapid second dial must be coalesced by the cached WakeProvider cooldown.
+    let (c2, h2) = connect_pair(host, 2, || unsafe {
+        tendril_session_connect_v2(
+            client.raw(),
+            endpoint.as_ptr(),
+            ptr::null(),
+            target.as_ptr(),
+            g.as_ptr(),
+        )
+    })
+    .expect("second dial");
+    drop((c2, h2));
+
+    let reqs = captured.lock().unwrap();
+    assert_eq!(reqs.len(), 1, "expected second wake to coalesce");
+    let req = &reqs[0];
+    assert!(req.request_line.starts_with("POST /3/device/deadbeef "));
+    assert_eq!(
+        req.headers.get("authorization").map(String::as_str),
+        Some("Bearer dev-bearer-token")
+    );
+    assert_eq!(
+        req.headers.get("apns-push-type").map(String::as_str),
+        Some("alert")
+    );
+    assert_eq!(
+        req.headers.get("apns-priority").map(String::as_str),
+        Some("10")
+    );
+    assert_eq!(
+        req.headers.get("apns-topic").map(String::as_str),
+        Some("app.tendril.test")
+    );
+    assert_eq!(req.body["aps"]["mutable-content"], 1);
+    assert!(req.body["aps"].get("content-available").is_none());
+    assert_eq!(req.body["aps"]["alert"]["loc-key"], "TENDRIL_WAKE_TEST");
+    let tag_c = cs(req.body["wake_tag"].as_str().unwrap());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut matched = 0u8;
+    assert_eq!(
+        unsafe { tendril_verify_wake_tag(secret.as_ptr(), tag_c.as_ptr(), now, &raw mut matched) },
+        TENDRIL_OK
+    );
+    assert_eq!(matched, 1);
+}
+
+fn generate_ephemeral_ec_p8_and_mtls_pem() -> (String, String, String) {
+    let p8_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate p256 key");
+    let p8_pem = p8_key.serialize_pem();
+
+    let mut params =
+        CertificateParams::new(vec!["tendril-apns-test".to_owned()]).expect("cert params");
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let mtls_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate mtls key");
+    let cert = params.self_signed(&mtls_key).expect("self-signed cert");
+    (p8_pem, cert.pem(), mtls_key.serialize_pem())
+}
+
+#[test]
+fn apns_h2_config_validation_and_tls_attempt() {
+    let (p8_pem, cert_pem, key_pem) = generate_ephemeral_ec_p8_and_mtls_pem();
+    let p = paired(Kind::StateDir, 2);
+    let (host, client) = (&p.host, &p.client);
+    let device_token = "0".repeat(64);
+    let secret_b64 = tendril_core::crypto::b64url_encode(&[0x55u8; 32]);
+
+    // Valid APNs HTTP/2 provider token (.p8) + mutable_alert configuration succeeds.
+    assert_eq!(
+        client.configure(&json!({
+            "wake_url": format!("https://api.sandbox.push.apple.com/3/device/{device_token}"),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": secret_b64,
+            "wake_apns_mode": "mutable_alert",
+            "wake_apns_topic": "app.tendril.ios",
+            "wake_apns_loc_key": "TENDRIL_WAKE_CALL",
+            "wake_apns_team_id": "TEAM123456",
+            "wake_apns_key_id": "KEY1234567",
+            "wake_apns_p8_pem": p8_pem,
+            "wake_coalesce_secs": 15,
+        })),
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+
+    // Valid APNs HTTP/2 client mTLS certificate/key configuration succeeds.
+    assert_eq!(
+        client.configure(&json!({
+            "wake_url": format!("https://api.push.apple.com/3/device/{device_token}"),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": secret_b64,
+            "wake_apns_mode": "background",
+            "wake_apns_topic": "app.tendril.ios",
+            "wake_apns_client_cert_pem": cert_pem,
+            "wake_apns_client_key_pem": key_pem,
+        })),
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+
+    // Fail-closed rejections and error redaction checks.
+    let bad_configs = [
+        json!({
+            "wake_url": format!("http://127.0.0.1:8080/3/device/{device_token}"),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": secret_b64,
+            "wake_auth_token": "tok",
+            "wake_apns_topic": "app.tendril.ios",
+        }),
+        json!({
+            "wake_url": format!("https://evil.example/3/device/{device_token}"),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": secret_b64,
+            "wake_auth_token": "tok",
+            "wake_apns_topic": "app.tendril.ios",
+        }),
+        json!({
+            "wake_url": format!("https://api.push.apple.com/3/device/{device_token}"),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": secret_b64,
+            "wake_auth_token": "tok",
+        }),
+        json!({
+            "wake_url": format!("https://api.push.apple.com/3/device/{device_token}"),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": secret_b64,
+            "wake_auth_token": "tok",
+            "wake_apns_topic": "app.tendril.ios",
+            "wake_apns_team_id": "TEAM123456",
+            "wake_apns_key_id": "KEY1234567",
+            "wake_apns_p8_pem": p8_pem,
+        }),
+        json!({
+            "wake_url": format!("https://api.push.apple.com/3/device/{device_token}"),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": secret_b64,
+            "wake_auth_token": "tok",
+            "wake_apns_topic": "app.tendril.ios",
+            "wake_apns_mode": "mutable_alert",
+            "wake_apns_loc_key": "BAD KEY WITH SPACES",
+        }),
+        json!({
+            "wake_url": format!("https://api.push.apple.com/3/device/{device_token}"),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": secret_b64,
+            "wake_apns_topic": "app.tendril.ios",
+            "wake_apns_team_id": "TEAM123456",
+            "wake_apns_key_id": "KEY1234567",
+            "wake_apns_p8_pem": "TOPSECRET_INVALID_P8",
+        }),
+    ];
+    for cfg in bad_configs {
+        assert_eq!(client.configure(&cfg), TENDRIL_ERR_INVALID_ARG, "{cfg}");
+        let err = last_err();
+        assert!(!err.contains("TOPSECRET_INVALID_P8"), "{err}");
+        assert!(!err.contains(&secret_b64), "{err}");
+    }
+
+    // Loopback TLS listener proves ApnsH2WakeProvider connects cleanly and fails closed on untrusted TLS,
+    // without blocking best-effort tendril_session_connect_v2.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tls_addr = listener.local_addr().unwrap();
+    let tls_hits = Arc::new(AtomicUsize::new(0));
+    let tls_hits_bg = Arc::clone(&tls_hits);
+    thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            tls_hits_bg.fetch_add(1, Ordering::SeqCst);
+            drop(s);
+        }
+    });
+    assert_eq!(
+        client.configure(&json!({
+            "wake_url": format!("https://{tls_addr}/3/device/{device_token}"),
+            "wake_adapter": "apns_h2",
+            "wake_secret_b64": secret_b64,
+            "wake_auth_token": "TOPSECRET_BEARER",
+            "wake_pre_wake": true,
+            "wake_max_attempts": 1,
+            "wake_timeout_ms": 500,
+            "wake_apns_mode": "mutable_alert",
+            "wake_apns_topic": "app.tendril.ios",
+            "wake_apns_loc_key": "TENDRIL_WAKE_CALL",
+        })),
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    let target = cs(p.host_id.as_str());
+    let endpoint = cs(&p.listen);
+    let g = cs(&p.grant);
+    let (c, h) = connect_pair(host, 2, || unsafe {
+        tendril_session_connect_v2(
+            client.raw(),
+            endpoint.as_ptr(),
+            ptr::null(),
+            target.as_ptr(),
+            g.as_ptr(),
+        )
+    })
+    .expect("connect continues best-effort");
+    drop((c, h));
+    assert!(tls_hits.load(Ordering::SeqCst) >= 1);
 }

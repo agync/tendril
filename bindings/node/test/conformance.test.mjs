@@ -1015,3 +1015,148 @@ test("Node binding delivers wake_and_dial_v2 HTTP wake on connectV2", async () =
     await new Promise((resolve) => wakeServer.close(resolve));
   }
 });
+
+test("verifyWakeTag and camelCase APNs wake config with coalescing", async () => {
+  const secret = Buffer.alloc(32, 0x33);
+  const wrong = Buffer.alloc(32, 0x99);
+  const now = 1_764_115_200;
+  const epochBuf = Buffer.alloc(8);
+  epochBuf.writeBigUInt64BE(BigInt(Math.floor(now / 3600)));
+  const prk = crypto.createHmac("sha256", epochBuf).update(secret).digest();
+  const okm = crypto
+    .createHmac("sha256", prk)
+    .update(Buffer.from("tendril/wake/epoch-tag/v1\x01"))
+    .digest();
+  const tagB64 = okm.subarray(0, 16).toString("base64url");
+
+  for (const checkNow of [now - 3600, now, now + 3600]) {
+    assert.equal(tendril.verifyWakeTag(secret, tagB64, checkNow), true);
+  }
+  for (const checkNow of [now - 7200, now + 7200]) {
+    assert.equal(tendril.verifyWakeTag(secret, tagB64, checkNow), false);
+  }
+  assert.equal(tendril.verifyWakeTag(wrong, tagB64, now), false);
+  assert.throws(() => tendril.verifyWakeTag(Buffer.alloc(16), tagB64, now));
+  assert.throws(() => tendril.verifyWakeTag(secret, "not-valid-b64", now));
+  assert.throws(() => tendril.verifyWakeTag(secret, tagB64, -1));
+
+  const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const p8Pem = privateKey.export({ type: "pkcs8", format: "pem" });
+
+  const apnsRequests = [];
+  const apnsServer = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      apnsRequests.push({
+        url: req.url,
+        headers: req.headers,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      });
+      res.writeHead(200);
+      res.end();
+    });
+  });
+  await new Promise((resolve) => apnsServer.listen(0, "127.0.0.1", resolve));
+  const apnsPort = apnsServer.address().port;
+
+  const hostEp = new tendril.Endpoint(null, "node-apns-host");
+  const cliEp = new tendril.Endpoint(null, "node-apns-cli");
+  try {
+    const secretB64 = secret.toString("base64url");
+    const devTok = "0".repeat(64);
+    cliEp.configureTransportsJson(
+      JSON.stringify({
+        wakeUrl: `https://api.sandbox.push.apple.com/3/device/${devTok}`,
+        wakeAdapter: "apns_h2",
+        wakeSecretB64: secretB64,
+        wakeApnsMode: "mutable_alert",
+        wakeApnsTopic: "app.tendril.node",
+        wakeApnsLocKey: "TENDRIL_WAKE_NODE",
+        wakeApnsTeamId: "TEAM123456",
+        wakeApnsKeyId: "KEY1234567",
+        wakeApnsP8Pem: p8Pem,
+        wakeCoalesceSecs: 15,
+      }),
+    );
+    for (const bad of [
+      {
+        wakeUrl: `http://127.0.0.1:${apnsPort}/3/device/${devTok}`,
+        wakeAdapter: "apns_h2",
+        wakeSecretB64: secretB64,
+        wakeAuthToken: "tok",
+        wakeApnsTopic: "app.tendril.node",
+      },
+      {
+        wakeUrl: `https://api.push.apple.com/3/device/${devTok}`,
+        wakeAdapter: "apns_h2",
+        wakeSecretB64: secretB64,
+        wakeAuthToken: "tok",
+      },
+      {
+        wakeUrl: `https://api.push.apple.com/3/device/${devTok}`,
+        wakeAdapter: "apns_h2",
+        wakeSecretB64: secretB64,
+        wakeAuthToken: "tok",
+        wakeApnsTopic: "app.tendril.node",
+        wakeApnsMode: "mutable_alert",
+        wakeApnsLocKey: "BAD KEY",
+      },
+    ]) {
+      assert.throws(() => cliEp.configureTransportsJson(JSON.stringify(bad)));
+    }
+
+    const directAddr = await hostEp.serveDirect("127.0.0.1:0");
+    const code = hostEp.issueCode("lan");
+    const [pairRaw, accRaw] = await Promise.all([
+      cliEp.pairV2Initiate(directAddr, code, null, "node-apns-cli", "node", null),
+      hostEp.pairV2Accept(5000),
+    ]);
+    const pairRes = JSON.parse(pairRaw);
+    const accRes = JSON.parse(accRaw);
+    hostEp.confirmPeer(accRes.device_id, pairRes.sas);
+    cliEp.confirmPeer("node-apns-host", pairRes.sas);
+    const grantJson = hostEp.mintGrant(accRes.device_id, ["fs.read"], 3600);
+
+    cliEp.configureTransportsJson(
+      JSON.stringify({
+        wakeUrl: `http://127.0.0.1:${apnsPort}/3/device/deadbeef`,
+        wakeAdapter: "apns",
+        wakeSecretB64: secretB64,
+        wakeAuthToken: "node-apns-tok",
+        wakePreWake: true,
+        wakeCoalesceSecs: 60,
+        wakeApnsMode: "mutable_alert",
+        wakeApnsTopic: "app.tendril.node",
+        wakeApnsLocKey: "TENDRIL_WAKE_NODE",
+      }),
+    );
+
+    for (let i = 0; i < 2; i += 1) {
+      const [cliSess, hostSess] = await Promise.all([
+        cliEp.connectV2(directAddr, "node-apns-host", grantJson, null),
+        hostEp.acceptV2(5000),
+      ]);
+      await cliSess.close(1000, "done");
+      await hostSess.close(1000, "done");
+    }
+
+    assert.equal(apnsRequests.length, 1);
+    const req = apnsRequests[0];
+    assert.equal(req.url, "/3/device/deadbeef");
+    assert.equal(req.headers.authorization, "Bearer node-apns-tok");
+    assert.equal(req.headers["apns-push-type"], "alert");
+    assert.equal(req.headers["apns-priority"], "10");
+    assert.equal(req.headers["apns-topic"], "app.tendril.node");
+    assert.equal(req.body.aps["mutable-content"], 1);
+    assert.equal(req.body.aps.alert["loc-key"], "TENDRIL_WAKE_NODE");
+    assert.equal(
+      tendril.verifyWakeTag(secret, req.body.wake_tag, Math.floor(Date.now() / 1000)),
+      true,
+    );
+  } finally {
+    cliEp.close();
+    hostEp.close();
+    await new Promise((resolve) => apnsServer.close(resolve));
+  }
+});

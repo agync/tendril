@@ -3837,14 +3837,19 @@ name = "tendril-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "data-encoding",
  "ed25519-dalek",
  "futures-util",
+ "h2",
+ "http",
  "iroh",
  "iroh-services",
  "netdev 0.47.0",
+ "ring",
  "rustix",
  "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "socket2",
@@ -3853,9 +3858,11 @@ dependencies = [
  "tendril-relay",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "url",
+ "webpki-roots 1.0.12",
  "zeroize",
 ]
 

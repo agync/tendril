@@ -1105,6 +1105,173 @@ class TendrilPythonTests(unittest.TestCase):
             server.server_close()
             srv_thread.join(timeout=2)
 
+    def test_verify_wake_tag_and_apns_mutable_alert_coalesce(self) -> None:
+        import hashlib
+        import hmac
+
+        secret = bytes(range(32))
+        wrong = bytes([0xEE] * 32)
+        now = 1_764_115_200
+        epoch = now // 3600
+        prk = hmac.new(epoch.to_bytes(8, "big"), secret, hashlib.sha256).digest()
+        tag = hmac.new(prk, b"tendril/wake/epoch-tag/v1\x01", hashlib.sha256).digest()[:16]
+        tag_b64 = base64.urlsafe_b64encode(tag).rstrip(b"=").decode("ascii")
+
+        for check_now in (now - 3600, now, now + 3600):
+            self.assertTrue(tendril.verify_wake_tag(secret, tag_b64, check_now))
+        for check_now in (now - 7200, now + 7200):
+            self.assertFalse(tendril.verify_wake_tag(secret, tag_b64, check_now))
+        self.assertFalse(tendril.verify_wake_tag(wrong, tag_b64, now))
+        with self.assertRaises(ValueError):
+            tendril.verify_wake_tag(b"short", tag_b64, now)
+        with self.assertRaises(ValueError):
+            tendril.verify_wake_tag(secret, "bad-tag", now)
+
+        p8_pem = subprocess.run(
+            ["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"],
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout
+
+        apns_requests: list[dict] = []
+
+        class ApnsHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                apns_requests.append(
+                    {
+                        "path": self.path,
+                        "auth": self.headers.get("Authorization"),
+                        "push_type": self.headers.get("apns-push-type"),
+                        "priority": self.headers.get("apns-priority"),
+                        "topic": self.headers.get("apns-topic"),
+                        "body": json.loads(raw.decode("utf-8")),
+                    }
+                )
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ApnsHandler)
+        apns_port = server.server_address[1]
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
+
+        host_ep = tendril.Endpoint(None, "py-apns-host")
+        cli_ep = tendril.Endpoint(None, "py-apns-cli")
+        try:
+            secret_b64 = base64.urlsafe_b64encode(secret).rstrip(b"=").decode("ascii")
+            dev_tok = "0" * 64
+            cli_ep.configure_transports_json(
+                json.dumps(
+                    {
+                        "wake_url": f"https://api.sandbox.push.apple.com/3/device/{dev_tok}",
+                        "wake_adapter": "apns_h2",
+                        "wake_secret_b64": secret_b64,
+                        "wake_apns_mode": "mutable_alert",
+                        "wake_apns_topic": "app.tendril.py",
+                        "wake_apns_loc_key": "TENDRIL_WAKE_PY",
+                        "wake_apns_team_id": "TEAM123456",
+                        "wake_apns_key_id": "KEY1234567",
+                        "wake_apns_p8_pem": p8_pem,
+                        "wake_coalesce_secs": 15,
+                    }
+                )
+            )
+            for bad in (
+                {
+                    "wake_url": f"http://127.0.0.1:{apns_port}/3/device/{dev_tok}",
+                    "wake_adapter": "apns_h2",
+                    "wake_secret_b64": secret_b64,
+                    "wake_auth_token": "tok",
+                    "wake_apns_topic": "app.tendril.py",
+                },
+                {
+                    "wake_url": f"https://api.push.apple.com/3/device/{dev_tok}",
+                    "wake_adapter": "apns_h2",
+                    "wake_secret_b64": secret_b64,
+                    "wake_auth_token": "tok",
+                },
+                {
+                    "wake_url": f"https://api.push.apple.com/3/device/{dev_tok}",
+                    "wake_adapter": "apns_h2",
+                    "wake_secret_b64": secret_b64,
+                    "wake_auth_token": "tok",
+                    "wake_apns_topic": "app.tendril.py",
+                    "wake_apns_mode": "mutable_alert",
+                    "wake_apns_loc_key": "BAD KEY",
+                },
+            ):
+                with self.assertRaises(ValueError):
+                    cli_ep.configure_transports_json(json.dumps(bad))
+
+            direct_addr = host_ep.serve_direct("127.0.0.1:0")
+            code = host_ep.issue_code("lan")
+            acc_holder: dict = {}
+            t_acc = threading.Thread(
+                target=lambda: acc_holder.__setitem__("raw", host_ep.pair_v2_accept(5000))
+            )
+            t_acc.start()
+            pair_res = json.loads(
+                cli_ep.pair_v2_initiate(direct_addr, code, None, "py-apns-cli", "python", None)
+            )
+            t_acc.join(timeout=5)
+            acc_res = json.loads(acc_holder["raw"])
+            host_ep.confirm_peer(acc_res["device_id"], pair_res["sas"])
+            cli_ep.confirm_peer("py-apns-host", pair_res["sas"])
+            grant_json = host_ep.mint_grant(acc_res["device_id"], ["fs.read"], 3600)
+
+            cli_ep.configure_transports_json(
+                json.dumps(
+                    {
+                        "wake_url": f"http://127.0.0.1:{apns_port}/3/device/deadbeef",
+                        "wake_adapter": "apns",
+                        "wake_secret_b64": secret_b64,
+                        "wake_auth_token": "py-apns-tok",
+                        "wake_pre_wake": True,
+                        "wake_coalesce_secs": 60,
+                        "wake_apns_mode": "mutable_alert",
+                        "wake_apns_topic": "app.tendril.py",
+                        "wake_apns_loc_key": "TENDRIL_WAKE_PY",
+                    }
+                )
+            )
+
+            for _ in range(2):
+                sess_holder: dict = {}
+                t_sess = threading.Thread(
+                    target=lambda: sess_holder.__setitem__("s", host_ep.accept_v2(5000))
+                )
+                t_sess.start()
+                cli_sess = cli_ep.connect_v2(direct_addr, "py-apns-host", grant_json)
+                t_sess.join(timeout=5)
+                cli_sess.close()
+                sess_holder["s"].close()
+
+            self.assertEqual(len(apns_requests), 1)
+            req = apns_requests[0]
+            self.assertEqual(req["path"], "/3/device/deadbeef")
+            self.assertEqual(req["auth"], "Bearer py-apns-tok")
+            self.assertEqual(req["push_type"], "alert")
+            self.assertEqual(req["priority"], "10")
+            self.assertEqual(req["topic"], "app.tendril.py")
+            self.assertEqual(req["body"]["aps"]["mutable-content"], 1)
+            self.assertEqual(req["body"]["aps"]["alert"]["loc-key"], "TENDRIL_WAKE_PY")
+            self.assertTrue(
+                tendril.verify_wake_tag(secret, req["body"]["wake_tag"], int(time.time()))
+            )
+        finally:
+            cli_ep.close()
+            host_ep.close()
+            server.shutdown()
+            server.server_close()
+            srv_thread.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()

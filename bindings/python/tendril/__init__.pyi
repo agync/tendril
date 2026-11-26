@@ -11,4 +11,7 @@ def verify_route_set(payload: bytes, signing_pub: bytes) -> str:
     There is no unverified decode.
     """
 
+def verify_wake_tag(wake_secret: bytes, wake_tag_b64: str, now_unix_secs: int) -> bool:
+    """Verifies an epoch-blinded wake tag over the +-1 hour window against a 32-byte secret."""
+
 def __getattr__(name: str) -> Any: ...
