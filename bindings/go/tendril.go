@@ -77,6 +77,13 @@ type EnrollInitiateResult struct {
 	Status          string `json:"status"`
 	HostRotationSeq uint64 `json:"host_rotation_seq"`
 	TokenNonce      string `json:"token_nonce"`
+	// RoutesPersisted lists the Day-2 routes stored with the enrollment.
+	RoutesPersisted []Route `json:"routes_persisted"`
+	// RouteWarnings names route hints the host advertised that were not stored.
+	RouteWarnings []string `json:"route_warnings"`
+	// RoutesReason is "no_state_dir" for a memory-only endpoint, which stores no routes,
+	// and empty otherwise.
+	RoutesReason string `json:"routes_reason"`
 }
 
 // SessionEvent represents one polled decrypted session event from Session.PollEvent.
