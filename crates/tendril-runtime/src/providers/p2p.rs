@@ -476,6 +476,7 @@ pub fn parse_p2p_bind_addrs(key: &str, addrs: &[String]) -> Result<P2pBindAddrs,
                 "invalid {key} entry: expected a socket address such as 0.0.0.0:0 or [::]:0"
             ))
         })?;
+        super::egress::check_bind_addr(addr)?;
         let duplicate = match addr {
             SocketAddr::V4(a) => v4.replace(a).is_some(),
             SocketAddr::V6(a) => v6.replace(a).is_some(),
@@ -540,6 +541,15 @@ fn validate_p2p_options(options: &P2pOptions) -> Result<(), RuntimeError> {
         return Err(RuntimeError::Protocol(
             "p2p bind needs at least one address".into(),
         ));
+    }
+    if let P2pBindAddrs::Only { v4, v6 } = &options.bind_addrs {
+        for addr in v4
+            .iter()
+            .map(|a| SocketAddr::V4(*a))
+            .chain(v6.iter().map(|a| SocketAddr::V6(*a)))
+        {
+            super::egress::check_bind_addr(addr)?;
+        }
     }
     if let Some(auth) = &options.relay_auth {
         if matches!(options.relay_mode, P2pRelayMode::Disabled) {
@@ -639,8 +649,15 @@ async fn build_iroh_endpoint(
     } else {
         &relay_urls
     };
-    let pins = DnsPinTable::new(&options.dns_pins);
-    check_and_pin_relay_hosts(&pins, &relay_urls, options.allow_private_addrs, trusted).await?;
+    let pins = DnsPinTable::new(&options.dns_pins, options.allow_private_addrs);
+    check_and_pin_relay_hosts(
+        &pins,
+        &relay_urls,
+        options.allow_private_addrs,
+        trusted,
+        !options.uri_derived_relays,
+    )
+    .await?;
 
     let seed = match secret_seed {
         Some(s) => s,
@@ -1562,20 +1579,28 @@ const MAX_RELAY_PIN_ENTRIES: usize = 256;
 struct PinEntry {
     host: String,
     ips: Vec<IpAddr>,
-    /// `None` for an operator pin, which never expires and is never replaced.
+    /// `None` for an operator pin, whose addresses never expire.
     expires: Option<std::time::Instant>,
     private_ok: bool,
+    /// Never evicted and never replaced by a peer-chosen host: operator pins and the relays the
+    /// endpoint was configured with.
+    permanent: bool,
 }
 
 /// Relay host answers shared by an endpoint's DNS resolver and its dialer. The resolver answers a
 /// pinned host from the addresses the egress check accepted, so `iroh` connects to what was
-/// checked; any other lookup is filtered by [`relay_answer_allowed`].
+/// checked; any other lookup is filtered by [`relay_answer_allowed`], with `default_private` (the
+/// endpoint's `allow_private_addrs`) as the policy of a host that was never checked.
 #[derive(Debug, Clone, Default)]
-struct DnsPinTable(Arc<StdMutex<Vec<PinEntry>>>);
+struct DnsPinTable {
+    entries: Arc<StdMutex<Vec<PinEntry>>>,
+    default_private: Arc<AtomicBool>,
+}
 
 impl DnsPinTable {
-    /// A table holding `operator` pins, which never expire.
-    fn new(operator: &[(String, Vec<IpAddr>)]) -> Self {
+    /// A table holding `operator` pins, which never expire, for an endpoint whose
+    /// `allow_private_addrs` is `default_private`.
+    fn new(operator: &[(String, Vec<IpAddr>)], default_private: bool) -> Self {
         let entries = operator
             .iter()
             .map(|(host, ips)| PinEntry {
@@ -1583,15 +1608,28 @@ impl DnsPinTable {
                 ips: ips.clone(),
                 expires: None,
                 private_ok: true,
+                permanent: true,
             })
             .collect();
-        Self(Arc::new(StdMutex::new(entries)))
+        Self {
+            entries: Arc::new(StdMutex::new(entries)),
+            default_private: Arc::new(AtomicBool::new(default_private)),
+        }
     }
 
     fn entries(&self) -> std::sync::MutexGuard<'_, Vec<PinEntry>> {
-        self.0
+        self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The policy of a host that was never checked.
+    fn default_private(&self) -> bool {
+        self.default_private.load(Ordering::Relaxed)
+    }
+
+    fn set_default_private(&self, allow: bool) {
+        self.default_private.store(allow, Ordering::Relaxed);
     }
 
     /// The unexpired pinned addresses of `host`.
@@ -1605,7 +1643,7 @@ impl DnsPinTable {
     }
 
     /// Whether private addresses were allowed for `host` when it was last checked, even after
-    /// its pin expired; `None` for a host never checked.
+    /// its pin expired; `None` for a host never checked or whose entry was reclaimed.
     fn private_ok(&self, host: &str) -> Option<bool> {
         let host = host.trim_end_matches('.');
         self.entries()
@@ -1624,43 +1662,50 @@ impl DnsPinTable {
             .collect()
     }
 
-    /// Pins freshly checked hosts for [`RELAY_PIN_TTL`]; an operator pin is kept as it is.
-    fn record(&self, checked: Vec<CheckedRelayHost>) {
+    /// Pins freshly checked hosts for [`RELAY_PIN_TTL`]. `permanent` entries (the configured
+    /// relays) are never evicted and keep their policy; an operator pin is kept as it is. A new
+    /// host reclaims only entries whose pin already expired and is refused once the table holds
+    /// [`MAX_RELAY_PIN_ENTRIES`] live or permanent entries, so a peer cannot displace the pins
+    /// of the relays in use.
+    fn record(&self, checked: Vec<CheckedRelayHost>, permanent: bool) -> Result<(), RuntimeError> {
         let expires = Some(std::time::Instant::now() + RELAY_PIN_TTL);
         let mut entries = self.entries();
         for host in checked {
             let name = host.host.trim_end_matches('.');
-            let entry = PinEntry {
-                host: name.to_owned(),
-                ips: host.ips,
-                expires,
-                private_ok: host.private_ok,
-            };
             if let Some(existing) = entries
                 .iter_mut()
                 .find(|e| e.host.eq_ignore_ascii_case(name))
             {
-                if existing.expires.is_some() {
-                    *existing = entry;
+                if existing.expires.is_none() {
+                    continue;
                 }
-            } else {
-                if entries.len() >= MAX_RELAY_PIN_ENTRIES {
-                    let now = std::time::Instant::now();
-                    entries.retain(|e| e.expires.is_none_or(|t| t > now));
+                existing.ips = host.ips;
+                existing.expires = expires;
+                if existing.permanent {
+                    continue;
                 }
-                if entries.len() >= MAX_RELAY_PIN_ENTRIES
-                    && let Some(oldest) = entries
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, e)| e.expires.map(|t| (i, t)))
-                        .min_by_key(|(_, t)| *t)
-                        .map(|(i, _)| i)
-                {
-                    entries.remove(oldest);
-                }
-                entries.push(entry);
+                existing.private_ok = host.private_ok;
+                existing.permanent = permanent;
+                continue;
             }
+            if entries.len() >= MAX_RELAY_PIN_ENTRIES {
+                let now = std::time::Instant::now();
+                entries.retain(|e| e.permanent || e.expires.is_none_or(|t| t > now));
+            }
+            if entries.len() >= MAX_RELAY_PIN_ENTRIES {
+                return Err(RuntimeError::Protocol(
+                    "too many pinned relay hosts; try again later".into(),
+                ));
+            }
+            entries.push(PinEntry {
+                host: name.to_owned(),
+                ips: host.ips,
+                expires,
+                private_ok: host.private_ok,
+                permanent,
+            });
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1676,11 +1721,13 @@ impl DnsPinTable {
 
 /// Checks the hosts of `relay_urls` ([`check_relay_hosts_pinned`]) and pins the checked
 /// addresses in `pins`, so the `iroh` resolver answers the connect that follows from them.
+/// `permanent` marks the endpoint's configured relays, whose entries are never evicted.
 async fn check_and_pin_relay_hosts(
     pins: &DnsPinTable,
     relay_urls: &[String],
     allow_private_addrs: bool,
     trusted_relays: &[String],
+    permanent: bool,
 ) -> Result<(), RuntimeError> {
     let checked = check_relay_hosts_pinned(
         relay_urls,
@@ -1689,16 +1736,16 @@ async fn check_and_pin_relay_hosts(
         &pins.snapshot(),
     )
     .await?;
-    pins.record(checked);
-    Ok(())
+    pins.record(checked, permanent)
 }
 
 /// Whether the `iroh` resolver may return `ip` for a host it has no live pin for. Always-blocked
-/// addresses are never returned; a relay host checked without private allowance (`Some(false)`)
-/// gets public addresses only, the same rule [`check_relay_hosts_pinned`] applies.
-fn relay_answer_allowed(ip: IpAddr, private_ok: Option<bool>) -> bool {
+/// addresses are never returned; without private allowance (the host's recorded policy, else the
+/// endpoint's `default_private`) only public addresses are, the rule
+/// [`check_relay_hosts_pinned`] applies.
+fn relay_answer_allowed(ip: IpAddr, private_ok: Option<bool>, default_private: bool) -> bool {
     classify_destination(ip) != DestClass::Blocked
-        && (private_ok != Some(false) || !is_non_public_ip(ip))
+        && (private_ok.unwrap_or(default_private) || !is_non_public_ip(ip))
 }
 
 fn pinned_addrs<'a>(pins: &'a [(String, Vec<IpAddr>)], host: &str) -> Option<&'a [IpAddr]> {
@@ -1739,6 +1786,7 @@ impl PinnedDnsResolver {
             return Box::pin(async move { Ok(Box::new(out.into_iter()) as iroh::dns::BoxIter<T>) });
         }
         let private_ok = self.pins.private_ok(&host);
+        let default_private = self.pins.default_private();
         let inner = self.inner.clone();
         Box::pin(async move {
             let ips: Vec<IpAddr> = if v6 {
@@ -1754,7 +1802,7 @@ impl PinnedDnsResolver {
             };
             let out: Vec<T> = ips
                 .into_iter()
-                .filter(|ip| relay_answer_allowed(*ip, private_ok))
+                .filter(|ip| relay_answer_allowed(*ip, private_ok, default_private))
                 .filter_map(pick)
                 .collect();
             Ok(Box::new(out.into_iter()) as iroh::dns::BoxIter<T>)
@@ -1893,6 +1941,7 @@ impl P2pDialer {
     #[must_use]
     pub fn with_allow_private_addrs(mut self, allow: bool) -> Self {
         self.allow_private_addrs = allow;
+        self.pins.set_default_private(allow);
         self
     }
 
@@ -1929,6 +1978,7 @@ impl PathDialer for P2pDialer {
                 &relay_urls,
                 self.allow_private_addrs,
                 &self.trusted_relays,
+                false,
             )
             .await?;
             addr
@@ -2047,13 +2097,15 @@ pub(crate) mod tests {
         assert!(parse_p2p_endpoint_filtered(&meta, true).is_err());
     }
 
-    const BLOCKED_ADDRS: [&str; 6] = [
+    const BLOCKED_ADDRS: [&str; 8] = [
         "[2001::1]:4433",
         "[64:ff9b:1::1]:4433",
         "[fec0::1]:4433",
         "[64:ff9b::a9fe:a9fe]:4433",
         "[2002:a9fe:a9fe::1]:4433",
         "[::ffff:0:a9fe:a9fe]:4433",
+        "224.0.0.1:4433",
+        "240.0.0.1:4433",
     ];
 
     #[test]
@@ -2141,6 +2193,25 @@ pub(crate) mod tests {
             )
             .await;
             assert!(by_pin.is_err(), "{sock} pinned relay");
+            let listener_literal = P2pListener::bind_with_options(
+                P2pOptions::for_listener(P2pRelayMode::Custom(format!("https://{literal}/")))
+                    .with_allow_private_addrs(true)
+                    .with_port_mapping(false),
+                None,
+            )
+            .await;
+            assert!(listener_literal.is_err(), "{sock} listener literal relay");
+            let listener_pin = P2pListener::bind_with_options(
+                P2pOptions::for_listener(P2pRelayMode::Custom(
+                    "https://pinned-relay.invalid/".to_owned(),
+                ))
+                .with_allow_private_addrs(true)
+                .with_dns_pins(vec![("pinned-relay.invalid".to_owned(), vec![ip])])
+                .with_port_mapping(false),
+                None,
+            )
+            .await;
+            assert!(listener_pin.is_err(), "{sock} listener pinned relay");
         }
     }
 
@@ -2258,24 +2329,37 @@ pub(crate) mod tests {
 
     #[test]
     fn dns_pin_table_pins_checked_hosts_and_remembers_the_private_policy() {
-        let table = DnsPinTable::new(&[(
-            "operator.example".to_owned(),
-            vec![IpAddr::from([10, 0, 0, 1])],
-        )]);
+        let table = DnsPinTable::new(
+            &[(
+                "operator.example".to_owned(),
+                vec![IpAddr::from([10, 0, 0, 1])],
+            )],
+            false,
+        );
         let ip = IpAddr::from([203, 0, 113, 7]);
-        table.record(vec![CheckedRelayHost {
-            host: "Relay.Example".to_owned(),
-            ips: vec![ip],
-            private_ok: false,
-        }]);
+        table
+            .record(
+                vec![CheckedRelayHost {
+                    host: "Relay.Example".to_owned(),
+                    ips: vec![ip],
+                    private_ok: false,
+                }],
+                false,
+            )
+            .expect("record");
         assert_eq!(table.live("relay.example."), Some(vec![ip]));
         assert_eq!(table.private_ok("relay.example"), Some(false));
         assert_eq!(table.live("other.example"), None);
-        table.record(vec![CheckedRelayHost {
-            host: "operator.example".to_owned(),
-            ips: vec![IpAddr::from([203, 0, 113, 9])],
-            private_ok: false,
-        }]);
+        table
+            .record(
+                vec![CheckedRelayHost {
+                    host: "operator.example".to_owned(),
+                    ips: vec![IpAddr::from([203, 0, 113, 9])],
+                    private_ok: false,
+                }],
+                false,
+            )
+            .expect("record");
         assert_eq!(
             table.live("operator.example"),
             Some(vec![IpAddr::from([10, 0, 0, 1])]),
@@ -2300,33 +2384,182 @@ pub(crate) mod tests {
             ("100.64.0.1", Some(false), false),
             ("64:ff9b::7f00:1", Some(false), false),
             ("10.0.0.5", Some(true), true),
-            ("127.0.0.1", None, true),
             ("2001::1", Some(true), false),
-            ("fec0::1", None, false),
             ("64:ff9b::a9fe:a9fe", Some(true), false),
         ] {
             let ip: IpAddr = ip.parse().expect("ip");
-            assert_eq!(
-                relay_answer_allowed(ip, private_ok),
-                want,
-                "{ip} {private_ok:?}"
+            for default_private in [false, true] {
+                assert_eq!(
+                    relay_answer_allowed(ip, private_ok, default_private),
+                    want,
+                    "{ip} {private_ok:?} default={default_private}"
+                );
+            }
+        }
+        assert!(relay_answer_allowed(public, None, false));
+    }
+
+    #[test]
+    fn relay_hosts_never_checked_follow_the_endpoint_default() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "100.64.0.1",
+            "::1",
+            "fd34::9",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a00:1",
+        ] {
+            let ip: IpAddr = ip.parse().expect("ip");
+            assert!(
+                !relay_answer_allowed(ip, None, false),
+                "{ip} refused by default"
+            );
+            assert!(
+                relay_answer_allowed(ip, None, true),
+                "{ip} allowed when private is"
             );
         }
-        assert!(relay_answer_allowed(public, None));
+        for ip in ["2001::1", "fec0::1", "224.0.0.1", "64:ff9b::a9fe:a9fe"] {
+            let ip: IpAddr = ip.parse().expect("ip");
+            assert!(!relay_answer_allowed(ip, None, true), "{ip} never");
+        }
+        assert!(relay_answer_allowed(
+            "8.8.8.8".parse().expect("ip"),
+            None,
+            false
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_dialer_sets_the_default_policy_of_its_resolver() {
+        let dialer = P2pDialer::bind_with_options(
+            P2pOptions::for_dialer(P2pRelayMode::N0Public).with_port_mapping(false),
+        )
+        .await
+        .expect("bind");
+        assert!(!dialer.pins.default_private());
+        let dialer = dialer.with_allow_private_addrs(true);
+        assert!(dialer.pins.default_private());
+        dialer.close().await;
+        let lan = P2pDialer::bind_with_options(
+            P2pOptions::for_dialer(P2pRelayMode::Disabled).with_port_mapping(false),
+        )
+        .await
+        .expect("bind");
+        assert!(
+            lan.pins.default_private(),
+            "a relay-less dialer allows private addrs"
+        );
+        lan.close().await;
+    }
+
+    fn checked(host: &str) -> CheckedRelayHost {
+        CheckedRelayHost {
+            host: host.to_owned(),
+            ips: vec![IpAddr::from([8, 8, 8, 8])],
+            private_ok: false,
+        }
+    }
+
+    #[test]
+    fn a_full_pin_table_refuses_new_hosts_instead_of_evicting_live_pins() {
+        let table = DnsPinTable::new(&[], false);
+        table
+            .record(vec![checked("configured.example")], true)
+            .expect("configured");
+        for i in 0..MAX_RELAY_PIN_ENTRIES - 1 {
+            table
+                .record(vec![checked(&format!("peer{i}.example"))], false)
+                .expect("room");
+        }
+        let err = table
+            .record(vec![checked("one-too-many.example")], false)
+            .expect_err("full");
+        assert!(matches!(err, RuntimeError::Protocol(_)), "{err:?}");
+        assert_eq!(table.live("one-too-many.example"), None);
+        assert!(table.live("configured.example").is_some());
+        assert!(
+            table.live("peer0.example").is_some(),
+            "a live pin is not evicted"
+        );
+        assert_eq!(table.entries().len(), MAX_RELAY_PIN_ENTRIES);
+        table
+            .record(vec![checked("peer0.example")], false)
+            .expect("an existing host refreshes when full");
+
+        table.expire_now("peer1.example");
+        table
+            .record(vec![checked("fresh.example")], false)
+            .expect("an expired entry is reclaimed");
+        assert_eq!(table.private_ok("peer1.example"), None);
+        assert_eq!(table.entries().len(), MAX_RELAY_PIN_ENTRIES);
+    }
+
+    #[test]
+    fn a_table_of_only_permanent_entries_refuses_instead_of_growing() {
+        let operator: Vec<(String, Vec<IpAddr>)> = (0..MAX_RELAY_PIN_ENTRIES)
+            .map(|i| (format!("op{i}.example"), vec![IpAddr::from([8, 8, 8, 8])]))
+            .collect();
+        let table = DnsPinTable::new(&operator, false);
+        assert!(table.record(vec![checked("extra.example")], false).is_err());
+        assert_eq!(table.entries().len(), MAX_RELAY_PIN_ENTRIES);
+    }
+
+    #[test]
+    fn a_configured_relay_pin_survives_churn_and_keeps_its_policy() {
+        let table = DnsPinTable::new(&[], false);
+        let mut configured = checked("configured.example");
+        configured.private_ok = true;
+        table.record(vec![configured], true).expect("configured");
+        for round in 0..3 * MAX_RELAY_PIN_ENTRIES {
+            let host = format!("peer{round}.example");
+            if table.record(vec![checked(&host)], false).is_ok() {
+                table.expire_now(&host);
+            }
+        }
+        assert!(table.live("configured.example").is_some(), "pin survives");
+        assert_eq!(table.private_ok("configured.example"), Some(true));
+        table.expire_now("configured.example");
+        assert_eq!(
+            table.live("configured.example"),
+            None,
+            "addresses still expire"
+        );
+        assert_eq!(
+            table.private_ok("configured.example"),
+            Some(true),
+            "the configured policy is never evicted"
+        );
+        assert!(table.entries().len() <= MAX_RELAY_PIN_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn a_bound_endpoint_pins_its_configured_relay_permanently() {
+        let dialer = P2pDialer::bind_with_options(
+            P2pOptions::for_dialer(P2pRelayMode::Custom("https://localhost:9/".to_owned()))
+                .with_allow_private_addrs(true)
+                .with_port_mapping(false),
+        )
+        .await
+        .expect("bind");
+        assert!(dialer.pins.live("localhost").is_some());
+        assert_eq!(dialer.pins.private_ok("localhost"), Some(true));
+        dialer.close().await;
     }
 
     #[tokio::test]
     async fn checked_relay_hosts_are_pinned_before_the_connect() {
-        let table = DnsPinTable::new(&[]);
+        let table = DnsPinTable::new(&[], false);
         let relay = vec!["https://localhost/".to_owned()];
         assert!(
-            check_and_pin_relay_hosts(&table, &relay, false, &[])
+            check_and_pin_relay_hosts(&table, &relay, false, &[], false)
                 .await
                 .is_err(),
             "an untrusted loopback relay is refused and not pinned"
         );
         assert_eq!(table.live("localhost"), None);
-        check_and_pin_relay_hosts(&table, &relay, true, &[])
+        check_and_pin_relay_hosts(&table, &relay, true, &[], false)
             .await
             .expect("allowed");
         let pinned = table.live("localhost").expect("pinned");
@@ -2376,12 +2609,61 @@ pub(crate) mod tests {
         let render = |opts: &P2pOptions| {
             let key = SecretKey::from_bytes(&[43u8; 32]);
             let builder =
-                assemble_iroh_builder(opts, key, None, Vec::new(), &DnsPinTable::new(&[]))
+                assemble_iroh_builder(opts, key, None, Vec::new(), &DnsPinTable::new(&[], false))
                     .expect("assemble");
             format!("{builder:?}")
         };
         let plain = render(&P2pOptions::for_listener(P2pRelayMode::Disabled));
         assert!(plain.contains("PinnedDnsResolver"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn p2p_bind_addrs_in_the_blocked_set_are_refused_everywhere() {
+        for raw in [
+            "224.0.0.1:0",
+            "240.0.0.1:0",
+            "[2001::1]:0",
+            "[fec0::1]:0",
+            "[64:ff9b:1::1]:0",
+        ] {
+            let parsed = parse_p2p_bind_addrs("--p2p-bind", &[raw.to_owned()]);
+            assert_eq!(
+                parsed.err().and_then(|e| e.skip_reason()),
+                Some(SkipReason::BlockedAddress),
+                "parse {raw}"
+            );
+            let addr: SocketAddr = raw.parse().expect("addr");
+            let only = match addr {
+                SocketAddr::V4(a) => P2pBindAddrs::Only {
+                    v4: Some(a),
+                    v6: None,
+                },
+                SocketAddr::V6(a) => P2pBindAddrs::Only {
+                    v4: None,
+                    v6: Some(a),
+                },
+            };
+            let opts = P2pOptions::for_listener(P2pRelayMode::Disabled)
+                .with_port_mapping(false)
+                .with_bind_addrs(only);
+            assert_eq!(
+                validate_p2p_options(&opts)
+                    .err()
+                    .and_then(|e| e.skip_reason()),
+                Some(SkipReason::BlockedAddress),
+                "validate {raw}"
+            );
+            let bound = P2pListener::bind_with_options(opts, None).await;
+            assert_eq!(
+                bound.err().and_then(|e| e.skip_reason()),
+                Some(SkipReason::BlockedAddress),
+                "bind {raw}"
+            );
+        }
+        for raw in ["0.0.0.0:0", "127.0.0.1:0", "[::]:0"] {
+            let parsed = parse_p2p_bind_addrs("--p2p-bind", &[raw.to_owned()]);
+            assert!(parsed.is_ok(), "{raw}");
+        }
     }
 
     #[test]
@@ -2647,7 +2929,7 @@ pub(crate) mod tests {
     async fn pinned_dns_answers_pinned_relays_only_from_checked_addresses() {
         let pinned = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));
         let resolver = iroh::dns::DnsResolver::custom(PinnedDnsResolver {
-            pins: DnsPinTable::new(&[("relay.example".to_owned(), vec![pinned])]),
+            pins: DnsPinTable::new(&[("relay.example".to_owned(), vec![pinned])], false),
             inner: iroh::dns::DnsResolver::new(),
         });
         let v4: Vec<IpAddr> = resolver
@@ -2735,7 +3017,7 @@ pub(crate) mod tests {
         let render = |opts: &P2pOptions| {
             let key = SecretKey::from_bytes(&[42u8; 32]);
             let builder =
-                assemble_iroh_builder(opts, key, None, Vec::new(), &DnsPinTable::new(&[]))
+                assemble_iroh_builder(opts, key, None, Vec::new(), &DnsPinTable::new(&[], false))
                     .expect("assemble");
             format!("{builder:?}")
         };
@@ -2808,7 +3090,7 @@ pub(crate) mod tests {
             vec!["not-an-addr".to_owned()],
             vec!["127.0.0.1".to_owned()],
             vec!["127.0.0.1:0".to_owned(), "127.0.0.2:0".to_owned()],
-            vec!["[::1]:0".to_owned(), "[::2]:0".to_owned()],
+            vec!["[::1]:0".to_owned(), "[fd00::2]:0".to_owned()],
         ] {
             let err = parse_p2p_bind_addrs("--p2p-bind", &bad).expect_err("invalid");
             assert!(err.to_string().contains("--p2p-bind"), "{err}");
