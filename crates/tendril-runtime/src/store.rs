@@ -9,13 +9,13 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tendril_core::crypto::{
-    ExternalMlDsaSigner, MLDSA65_PUBLIC_LEN, SigningKeypair, StaticKeypair, b64url_decode_array,
-    b64url_encode,
+    ExternalMlDsaSigner, HybridSigningPublicKey, MLDSA65_PUBLIC_LEN, SigningKeypair, StaticKeypair,
+    b64url_decode_array, b64url_encode,
 };
 use tendril_core::error::CoreError;
 use tendril_core::group::GroupBook;
 use tendril_core::identity::{EndpointIdentity, RotationRecord, is_valid_host_id};
-use tendril_core::roster::{PeerState, Roster};
+use tendril_core::roster::Roster;
 use tendril_core::state_seal::{StateKey, StateKind};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -517,10 +517,27 @@ impl StateStore {
         Ok(out)
     }
 
-    /// Like [`Self::update_roster`], but when `f` fails, any peer that `f` transitioned to
-    /// [`PeerState::Revoked`] is still persisted (and nothing else) before the error is returned,
-    /// so a detected fork or revocation cannot be lost to the transactional rollback.
+    /// Like [`Self::update_roster`], but when `f` fails, the revocation state `f` added to the
+    /// working roster (a peer or anchor it revoked, a CRL it ingested) is still persisted, and
+    /// nothing else, before the error is returned. A detected fork or revocation cannot be lost
+    /// to the transactional rollback.
+    ///
+    /// The local host's own CRL is dropped on this path; use
+    /// [`Self::update_roster_persisting_revocations_with`] to keep it.
     pub fn update_roster_persisting_revocations<T, F>(&self, f: F) -> Result<T, RuntimeError>
+    where
+        F: FnOnce(&mut Roster) -> Result<T, RuntimeError>,
+    {
+        self.update_roster_persisting_revocations_with(None, f)
+    }
+
+    /// [`Self::update_roster_persisting_revocations`] with the local host id and signing key,
+    /// the only key that verifies the host's own CRL (`Roster::absorb_held_revocations`).
+    pub fn update_roster_persisting_revocations_with<T, F>(
+        &self,
+        local: Option<(&str, &HybridSigningPublicKey)>,
+        f: F,
+    ) -> Result<T, RuntimeError>
     where
         F: FnOnce(&mut Roster) -> Result<T, RuntimeError>,
     {
@@ -538,21 +555,8 @@ impl StateStore {
                 Ok(out)
             }
             Err(err) => {
-                let newly_revoked: Vec<String> = working
-                    .entries()
-                    .filter(|(id, entry)| {
-                        entry.state == PeerState::Revoked
-                            && original
-                                .get(id)
-                                .is_some_and(|prev| prev.state != PeerState::Revoked)
-                    })
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                if !newly_revoked.is_empty() {
-                    let mut persisted = original;
-                    for id in &newly_revoked {
-                        let _ = persisted.revoke_peer(id);
-                    }
+                let mut persisted = original;
+                if persisted.absorb_held_revocations(&working, local) {
                     self.save_roster_unlocked(&persisted)?;
                 }
                 Err(err)
