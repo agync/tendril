@@ -42,14 +42,16 @@ use crate::driver::{
     dial_with_policy_verified,
 };
 use crate::error::RuntimeError;
+use crate::power::PowerProfile;
 use crate::provider::{
     DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream, PrefixedPathStream, peek_exact,
 };
 use crate::providers::{
-    RelayClientAuth, RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig,
+    RelayClientAuth, RelayListener, RelayListenerConfig, RelayV2Dialer, RelayV2Listener,
+    RelayV2ListenerConfig,
 };
 use crate::rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter, RefusalState};
-use crate::store::{RosterStamp, StateStore};
+use crate::store::{RosterStamp, StateStore, store_change_notifier, store_change_seq};
 use crate::v2_driver::{ConcurrentV2Session, StagedCommit, V2ResponderState, V2SessionDriver};
 use crate::wake::{DEFAULT_WAKE_TIMEOUT, WakeProvider, WakeSecret, WakeTarget};
 
@@ -62,7 +64,6 @@ pub const DEFAULT_GROUP_DIAL_BUDGET: Duration = Duration::from_secs(5);
 const EVENT_QUEUE_CAP: usize = 1024;
 const CONTROL_EVENT_RESERVE: usize = 64;
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
-const BOOK_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 /// Earliest respawn of a relay mailbox listener task after it finished.
 const MAILBOX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -132,6 +133,8 @@ pub struct GroupPoolConfig {
     /// `/v1/relay` URLs on which the host process already registers the identity's relay
     /// mailbox and routes session streams to its [`GroupHub`]; the pool never registers there.
     pub served_v1_relays: Vec<String>,
+    /// Power profile for relay mailbox listeners and store watch fallback cadence.
+    pub power_profile: PowerProfile,
 }
 
 impl GroupPoolConfig {
@@ -150,7 +153,16 @@ impl GroupPoolConfig {
             relay_auth: RelayClientAuth::None,
             relay_listen: false,
             served_v1_relays: Vec::new(),
+            power_profile: PowerProfile::Standard,
         }
+    }
+
+    /// Sets the [`PowerProfile`] for this pool's mailbox listeners and store watcher.
+    #[must_use]
+    pub fn with_power_profile(mut self, power_profile: PowerProfile) -> Self {
+        self.power_profile = power_profile;
+        self.policy = power_profile.path_policy();
+        self
     }
 
     /// Sets the relay admission credentials used for sibling relay dials and listeners.
@@ -859,7 +871,7 @@ struct Inner {
     pending_commits: Arc<Semaphore>,
     pending_by_peer: Arc<Mutex<HashMap<String, usize>>>,
     closed: AtomicBool,
-    close_notify: tokio::sync::Notify,
+    close_notify: Arc<Notify>,
     watcher_started: AtomicBool,
     tasks: Mutex<Vec<AbortHandle>>,
     relay_mailboxes: Mutex<HashMap<String, MailboxListener>>,
@@ -1090,7 +1102,7 @@ impl GroupPool {
                 events_rx: AsyncMutex::new(events_rx),
                 v2_state,
                 closed: AtomicBool::new(false),
-                close_notify: tokio::sync::Notify::new(),
+                close_notify: Arc::new(Notify::new()),
                 watcher_started: AtomicBool::new(false),
                 tasks: Mutex::new(Vec::new()),
                 relay_mailboxes: Mutex::new(HashMap::new()),
@@ -1120,11 +1132,53 @@ impl GroupPool {
             return;
         }
         let weak = Arc::downgrade(&self.inner);
+        let fallback = self
+            .inner
+            .cfg
+            .power_profile
+            .group_watch_fallback_interval(self.inner.cfg.relay_listen);
         let task = runtime.spawn(async move {
-            let mut tick = tokio::time::interval(BOOK_WATCH_INTERVAL);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let store_notify = store_change_notifier();
+            let mut last_seq = store_change_seq();
+            let mut first_pass = true;
             loop {
-                tick.tick().await;
+                if !first_pass {
+                    let notified = store_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let Some(inner) = weak.upgrade() else {
+                        return;
+                    };
+                    if inner.closed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let close_notify = Arc::clone(&inner.close_notify);
+                    drop(inner);
+                    let closed = close_notify.notified();
+                    tokio::pin!(closed);
+                    closed.as_mut().enable();
+                    if weak
+                        .upgrade()
+                        .is_none_or(|inner| inner.closed.load(Ordering::Acquire))
+                    {
+                        return;
+                    }
+                    if store_change_seq() == last_seq {
+                        tokio::select! {
+                            biased;
+                            () = &mut closed => return,
+                            () = &mut notified => {}
+                            () = async {
+                                match fallback {
+                                    Some(d) => tokio::time::sleep(d).await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {}
+                        }
+                    }
+                }
+                first_pass = false;
+                last_seq = store_change_seq();
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
@@ -2594,6 +2648,7 @@ impl Inner {
         #[cfg(test)]
         fire_gate(&inner.hooks.before_mailbox_bind).await;
         let auth = inner.cfg.relay_auth.clone();
+        let power_profile = inner.cfg.power_profile;
         let identity = Arc::clone(&inner.identity);
         drop(inner);
         let bound: Result<(Box<dyn PathListener>, Option<V1MailboxClaim>), RuntimeError> =
@@ -2601,6 +2656,7 @@ impl Inner {
                 Some(secret) => {
                     let cfg = RelayV2ListenerConfig {
                         auth,
+                        power_profile,
                         ..RelayV2ListenerConfig::default()
                     };
                     RelayV2Listener::bind_with_config(url, *secret, cfg)
@@ -2615,12 +2671,12 @@ impl Inner {
                         None => Err(RuntimeError::Protocol(
                             "relay mailbox held by another pool".to_owned(),
                         )),
-                        Some(claim) => RelayListener::bind_with_auth(
+                        Some(claim) => RelayListener::bind_with_config(
                             url,
                             None,
                             signing.ed25519_signing_key(),
-                            DEFAULT_WRITE_TIMEOUT,
                             auth,
+                            RelayListenerConfig::new().with_power_profile(power_profile),
                         )
                         .await
                         .map(|l| (Box::new(l) as Box<dyn PathListener>, Some(claim))),

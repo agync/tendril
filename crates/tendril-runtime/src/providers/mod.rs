@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex as StdMutex, Once, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,6 +42,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async_tls_with_config};
 
 use crate::error::RuntimeError;
+use crate::power::PowerProfile;
 use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, PathWriter};
 use crate::redact::{redact_text, redact_url_str};
 
@@ -66,7 +67,7 @@ pub use p2p::{
     filter_p2p_hint, format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_bind_addrs,
     parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
 };
-pub use relay::{EmbeddedRelay, RelayClientAuth, RelayDialer, RelayListener};
+pub use relay::{EmbeddedRelay, RelayClientAuth, RelayDialer, RelayListener, RelayListenerConfig};
 pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};
 #[cfg(feature = "webrtc")]
 pub use webrtc::{
@@ -233,8 +234,74 @@ pub(crate) fn decode_incoming_init_frame(
 }
 
 pub(crate) const STANDBY_POOL_SIZE: usize = 2;
+pub(crate) const LOW_POWER_CONTROL_PING_MIN_MS: u64 = 55_000;
+pub(crate) const LOW_POWER_CONTROL_PING_MAX_MS: u64 = 75_000;
+const LOW_POWER_PING_JOIN_MIN_MS: u64 = 15_000;
 const STANDBY_BACKOFF_INITIAL: Duration = Duration::from_millis(100);
 const STANDBY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+fn jittered_ping_delay(min_ms: u64, max_ms: u64) -> Duration {
+    let raw = u32::from_le_bytes(random_bytes::<4>().unwrap_or([0; 4]));
+    let span = (max_ms - min_ms + 1).max(1);
+    Duration::from_millis(min_ms + u64::from(raw) % span)
+}
+
+/// Coalesces relay control/standby keepalive pings onto shared monotonic wakeup instants in
+/// [`PowerProfile::LowPower`] so concurrent sockets wake the mobile radio once per keepalive cycle
+/// instead of independently. [`PowerProfile::Standard`] always samples independent per-call
+/// jitter so concurrent `/v2/relay` epoch sockets remain timing-unlinkable.
+pub(crate) struct CoalescedPingScheduler {
+    profile: PowerProfile,
+    targets: StdMutex<Vec<tokio::time::Instant>>,
+}
+
+impl CoalescedPingScheduler {
+    pub(crate) const fn new(profile: PowerProfile) -> Self {
+        Self {
+            profile,
+            targets: StdMutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn next_delay_at(&self, now: tokio::time::Instant) -> Duration {
+        if self.profile == PowerProfile::Standard {
+            return jittered_ping_delay(relay::CONTROL_PING_MIN_MS, relay::CONTROL_PING_MAX_MS);
+        }
+        let join_min = Duration::from_millis(LOW_POWER_PING_JOIN_MIN_MS);
+        let max_delay = Duration::from_millis(LOW_POWER_CONTROL_PING_MAX_MS);
+        let mut guard = self
+            .targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.retain(|&t| t > now + Duration::from_secs(1));
+        if let Some(delay) = guard
+            .iter()
+            .map(|&t| t.saturating_duration_since(now))
+            .find(|&d| d >= join_min && d <= max_delay)
+        {
+            return delay;
+        }
+        let delay =
+            jittered_ping_delay(LOW_POWER_CONTROL_PING_MIN_MS, LOW_POWER_CONTROL_PING_MAX_MS);
+        if guard.len() >= 4 {
+            guard.remove(0);
+        }
+        guard.push(now + delay);
+        delay
+    }
+}
+
+pub(crate) fn coalesced_ping_delay(profile: PowerProfile) -> Duration {
+    static LOW_POWER: OnceLock<CoalescedPingScheduler> = OnceLock::new();
+    match profile {
+        PowerProfile::Standard => {
+            jittered_ping_delay(relay::CONTROL_PING_MIN_MS, relay::CONTROL_PING_MAX_MS)
+        }
+        PowerProfile::LowPower => LOW_POWER
+            .get_or_init(|| CoalescedPingScheduler::new(PowerProfile::LowPower))
+            .next_delay_at(tokio::time::Instant::now()),
+    }
+}
 
 pub(crate) fn jittered_standby_backoff(backoff: Duration) -> Duration {
     let base_ms = u64::try_from(backoff.as_millis()).unwrap_or(5_000).max(1);
@@ -305,8 +372,8 @@ where
         + 'static,
 {
     let (pool_shutdown_tx, mut pool_shutdown_rx) = watch::channel(false);
-    if *parent_shutdown.borrow() {
-        // The owner already stopped: start no slots.
+    if pool_size == 0 || *parent_shutdown.borrow() {
+        // Zero pool size or stopped owner: start no slots.
         pool_shutdown_tx.send_replace(true);
         return (
             StandbyPoolHandle {
@@ -1269,5 +1336,60 @@ mod tests {
             .await
             .expect_err("link-local relay must fail closed");
         assert_eq!(err.skip_reason(), Some(egress::SkipReason::BlockedAddress));
+    }
+
+    #[test]
+    fn coalesced_ping_scheduler_shares_wake_window_in_low_power() {
+        let sched = CoalescedPingScheduler::new(PowerProfile::LowPower);
+        let t0 = tokio::time::Instant::now();
+        let d1 = sched.next_delay_at(t0);
+        assert!(
+            d1 >= Duration::from_millis(LOW_POWER_CONTROL_PING_MIN_MS)
+                && d1 <= Duration::from_millis(LOW_POWER_CONTROL_PING_MAX_MS),
+            "first low-power ping delay must lie in 55-75 s: {d1:?}"
+        );
+        let d2 = sched.next_delay_at(t0 + Duration::from_secs(2));
+        assert_eq!(
+            d2 + Duration::from_secs(2),
+            d1,
+            "second socket must coalesce onto first socket wake instant"
+        );
+    }
+
+    #[test]
+    fn standard_ping_scheduler_samples_independently_without_cross_epoch_coalescing() {
+        let sched = CoalescedPingScheduler::new(PowerProfile::Standard);
+        let t0 = tokio::time::Instant::now();
+        let mut shifted_targets = Vec::new();
+        for offset in 0..8 {
+            let delay = sched.next_delay_at(t0 + Duration::from_secs(offset));
+            assert!(
+                delay >= Duration::from_millis(relay::CONTROL_PING_MIN_MS)
+                    && delay <= Duration::from_millis(relay::CONTROL_PING_MAX_MS),
+                "standard ping delay must stay in 22.5-37.5 s: {delay:?}"
+            );
+            shifted_targets.push(delay + Duration::from_secs(offset));
+        }
+        assert!(
+            sched.targets.lock().expect("targets mutex").is_empty(),
+            "standard profile must not record shared ping instants"
+        );
+        let first = shifted_targets[0];
+        assert!(
+            shifted_targets.iter().any(|&t| t != first),
+            "standard profile samples must remain independent across calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_pool_supervisor_with_zero_size_spawns_no_slots() {
+        let (tx, rx) = watch::channel(false);
+        let (handle, ready_rxs) =
+            spawn_standby_pool_supervisor(0, rx, |_ready, _consumed, _shut| {
+                Box::pin(async { StandbySlotOutcome::Shutdown })
+            });
+        assert!(ready_rxs.is_empty());
+        drop(handle);
+        drop(tx);
     }
 }

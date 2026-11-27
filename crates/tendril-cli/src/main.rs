@@ -2424,6 +2424,7 @@ async fn sync_v2_relay_listeners(
             replay_cache: None,
             unix_secs: None,
             auth: relay_auth.clone(),
+            ..RelayV2ListenerConfig::default()
         };
         let listener = RelayV2Listener::bind_with_config(v2_relay_url, secret, cfg).await?;
         newly_bound.push(listener.local_endpoint());

@@ -5,6 +5,7 @@ pub mod announce;
 pub mod driver;
 pub mod error;
 pub mod group;
+pub mod power;
 pub mod provider;
 pub mod providers;
 pub mod rate_limit;
@@ -52,6 +53,10 @@ pub use group::{
     group_ingest_manifest, group_remove_member, handle_session_group_frame, ingest_pushed_manifest,
     ingest_pushed_rendezvous, normalize_endpoint_hint,
 };
+pub use power::{
+    HOST_BOOK_WATCH_FALLBACK, LOW_POWER_EPOCH_OVERLAP_SECS, LOW_POWER_P2P_IDLE_TIMEOUT,
+    PowerProfile,
+};
 pub use provider::{
     DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathListener, PathReader, PathStream,
     PathWriter, PrefixedPathStream, peek_exact, recv_tendril_frame, send_tendril_frame,
@@ -60,8 +65,8 @@ pub use provider::{
 pub use providers::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DirectDialer, DirectListener, EmbeddedRelay,
     LocalDialer, LocalListener, OverlayConfig, OverlayDialer, OverlayListener, OverlayMode,
-    OverlayResolvedMode, RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer,
-    RelayV2Listener, RelayV2ListenerConfig, dial_endpoint, dial_endpoint_with_auth,
+    OverlayResolvedMode, RelayClientAuth, RelayDialer, RelayListener, RelayListenerConfig,
+    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, dial_endpoint, dial_endpoint_with_auth,
     is_loopback_host, is_metadata_or_link_local_ip, is_tailnet_ip, select_overlay_mode,
 };
 #[cfg(feature = "p2p-iroh")]
@@ -88,7 +93,7 @@ pub use rate_limit::{
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
 pub use store::{
     RosterStamp, StateStore, deserialize_identity_json, deserialize_identity_json_with_signer,
-    serialize_identity_json,
+    serialize_identity_json, store_change_notifier, store_change_seq,
 };
 pub use v2_driver::{
     ConcurrentV2Session, DEFAULT_ARGON2_ACQUIRE_TIMEOUT, DEFAULT_ARGON2_CONCURRENCY,

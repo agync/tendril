@@ -27,12 +27,13 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use super::{
-    ActiveStandbyGuard, STANDBY_POOL_SIZE, StandbyPoolHandle, StandbySlotOutcome,
-    WsBinaryPathStream, await_standby_ready_with_deadline, connect_ws_resolved,
+    ActiveStandbyGuard, StandbyPoolHandle, StandbySlotOutcome, WsBinaryPathStream,
+    await_standby_ready_with_deadline, coalesced_ping_delay, connect_ws_resolved,
     decode_incoming_init_frame, encode_fast_open_init_frame, ensure_rustls_ring_provider,
     spawn_standby_pool_supervisor, ws_binary_config, ws_control_config,
 };
 use crate::error::{RelayOffline, RuntimeError};
+use crate::power::PowerProfile;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
 use crate::redact::{redact_hint, redact_url_str};
 
@@ -42,22 +43,72 @@ pub(crate) const CONTROL_PING_MAX_MS: u64 = 37_500;
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_ACCEPTS: usize = 16;
 
+/// Configuration for [`RelayListener::bind_with_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayListenerConfig {
+    pub write_timeout: Duration,
+    pub power_profile: PowerProfile,
+}
+
+impl Default for RelayListenerConfig {
+    fn default() -> Self {
+        Self {
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            power_profile: PowerProfile::Standard,
+        }
+    }
+}
+
+impl RelayListenerConfig {
+    /// Creates a [`RelayListenerConfig`] with default write timeout and [`PowerProfile::Standard`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the WebSocket control/frame write timeout.
+    #[must_use]
+    pub const fn with_write_timeout(mut self, write_timeout: Duration) -> Self {
+        self.write_timeout = write_timeout;
+        self
+    }
+
+    /// Sets the listener's [`PowerProfile`].
+    #[must_use]
+    pub const fn with_power_profile(mut self, power_profile: PowerProfile) -> Self {
+        self.power_profile = power_profile;
+        self
+    }
+}
+
 /// Keepalive timing of a [`RelayListener`] control socket.
 #[derive(Clone, Copy)]
 struct ControlTimings {
     idle_timeout: Duration,
-    ping_delay: fn() -> Duration,
+    power_profile: PowerProfile,
+    ping_delay: Option<fn() -> Duration>,
 }
 
 impl Default for ControlTimings {
     fn default() -> Self {
         Self {
             idle_timeout: CONTROL_IDLE_TIMEOUT,
-            ping_delay: jittered_ping_delay,
+            power_profile: PowerProfile::Standard,
+            ping_delay: None,
         }
     }
 }
 
+impl ControlTimings {
+    fn next_ping_delay(self) -> Duration {
+        match self.ping_delay {
+            Some(f) => f(),
+            None => coalesced_ping_delay(self.power_profile),
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn jittered_ping_delay() -> Duration {
     let raw = u32::from_le_bytes(random_bytes::<4>().unwrap_or([0; 4]));
     Duration::from_millis(
@@ -378,13 +429,35 @@ impl RelayListener {
         write_timeout: Duration,
         auth: RelayClientAuth,
     ) -> Result<Self, RuntimeError> {
+        Self::bind_with_config(
+            relay_url,
+            expected_host,
+            signing_key,
+            auth,
+            RelayListenerConfig::new().with_write_timeout(write_timeout),
+        )
+        .await
+    }
+
+    /// Connects to `relay_url` with admission credentials `auth` and explicit [`RelayListenerConfig`].
+    pub async fn bind_with_config(
+        relay_url: impl Into<String>,
+        expected_host: Option<String>,
+        signing_key: SigningKey,
+        auth: RelayClientAuth,
+        config: RelayListenerConfig,
+    ) -> Result<Self, RuntimeError> {
         Self::bind_with_timings(
             relay_url,
             expected_host,
             signing_key,
-            write_timeout,
+            config.write_timeout,
             auth,
-            ControlTimings::default(),
+            ControlTimings {
+                idle_timeout: CONTROL_IDLE_TIMEOUT,
+                power_profile: config.power_profile,
+                ping_delay: None,
+            },
         )
         .await
     }
@@ -470,7 +543,7 @@ impl RelayListener {
             let mut accept_tasks: JoinSet<()> = JoinSet::new();
             let idle_sleep = tokio::time::sleep(timings.idle_timeout);
             tokio::pin!(idle_sleep);
-            let ping_sleep = tokio::time::sleep((timings.ping_delay)());
+            let ping_sleep = tokio::time::sleep(timings.next_ping_delay());
             tokio::pin!(ping_sleep);
             let mut shut_down = false;
             loop {
@@ -487,7 +560,7 @@ impl RelayListener {
                     () = &mut ping_sleep => {
                         ping_sleep
                             .as_mut()
-                            .reset(TokioInstant::now() + (timings.ping_delay)());
+                            .reset(TokioInstant::now() + timings.next_ping_delay());
                         if !timeout(write_timeout, control_ws.send(Message::Ping(Vec::new().into())))
                             .await
                             .is_ok_and(|res| res.is_ok())
@@ -572,7 +645,8 @@ impl RelayListener {
             control_task: Some(control_task),
         };
 
-        let standby_pool = if server_standby && !*shutdown_tx.borrow() {
+        let standby_pool_size = timings.power_profile.standby_pool_size();
+        let standby_pool = if server_standby && !*shutdown_tx.borrow() && standby_pool_size > 0 {
             let (pool_handle, sb_ready_rxs) = spawn_v1_standby_pool(
                 relay_url.clone(),
                 expected_host.clone(),
@@ -583,6 +657,8 @@ impl RelayListener {
                 Arc::clone(&active_standby_sockets),
                 Arc::clone(&auth),
                 write_timeout,
+                standby_pool_size,
+                timings.power_profile,
                 shutdown_tx.subscribe(),
             );
             await_standby_ready_with_deadline(sb_ready_rxs, CONTROL_TIMEOUT).await;
@@ -663,13 +739,15 @@ fn spawn_v1_standby_pool(
     active_standby: Arc<AtomicUsize>,
     auth: Arc<RelayClientAuth>,
     write_timeout: Duration,
+    pool_size: usize,
+    power_profile: PowerProfile,
     shutdown_rx: watch::Receiver<bool>,
 ) -> (
     StandbyPoolHandle,
     Vec<oneshot::Receiver<Result<(), RuntimeError>>>,
 ) {
     spawn_standby_pool_supervisor(
-        STANDBY_POOL_SIZE,
+        pool_size,
         shutdown_rx,
         move |ready_tx, consumed_tx, slot_shutdown| {
             let url_c = relay_url.clone();
@@ -690,6 +768,7 @@ fn spawn_v1_standby_pool(
                 active_c,
                 auth_c,
                 write_timeout,
+                power_profile,
                 ready_tx,
                 consumed_tx,
                 slot_shutdown,
@@ -709,6 +788,7 @@ async fn run_v1_standby_slot(
     active_standby: Arc<AtomicUsize>,
     auth: Arc<RelayClientAuth>,
     write_timeout: Duration,
+    power_profile: PowerProfile,
     mut ready_tx: Option<oneshot::Sender<Result<(), RuntimeError>>>,
     consumed_tx: oneshot::Sender<()>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -816,7 +896,7 @@ async fn run_v1_standby_slot(
 
     let idle_sleep = tokio::time::sleep(CONTROL_IDLE_TIMEOUT);
     tokio::pin!(idle_sleep);
-    let ping_sleep = tokio::time::sleep(jittered_ping_delay());
+    let ping_sleep = tokio::time::sleep(coalesced_ping_delay(power_profile));
     tokio::pin!(ping_sleep);
 
     loop {
@@ -836,7 +916,7 @@ async fn run_v1_standby_slot(
             () = &mut ping_sleep => {
                 ping_sleep
                     .as_mut()
-                    .reset(TokioInstant::now() + jittered_ping_delay());
+                    .reset(TokioInstant::now() + coalesced_ping_delay(power_profile));
                 if !timeout(write_timeout, ws.send(Message::Ping(Vec::new().into())))
                     .await
                     .is_ok_and(|res| res.is_ok())
@@ -876,7 +956,7 @@ async fn run_v1_standby_slot(
                             .reset(TokioInstant::now() + CONTROL_IDLE_TIMEOUT);
                         ping_sleep
                             .as_mut()
-                            .reset(TokioInstant::now() + jittered_ping_delay());
+                            .reset(TokioInstant::now() + coalesced_ping_delay(power_profile));
                     }
                     _ => return StandbySlotOutcome::Retry,
                 }
@@ -1487,7 +1567,8 @@ mod tests {
 
         let timings = ControlTimings {
             idle_timeout: Duration::from_millis(300),
-            ping_delay: || Duration::from_millis(100),
+            power_profile: PowerProfile::Standard,
+            ping_delay: Some(|| Duration::from_millis(100)),
         };
         let mut listener = RelayListener::bind_with_timings(
             url,
@@ -1583,5 +1664,31 @@ mod tests {
             .await
             .expect("cancelled bind left its control socket open")
             .expect("mock relay saw the control socket close");
+    }
+
+    #[tokio::test]
+    async fn low_power_v1_listener_opens_zero_standby_sockets() {
+        use tendril_relay::server::RelayConfig;
+
+        use crate::EmbeddedRelay;
+
+        let relay = EmbeddedRelay::start(RelayConfig {
+            host: "127.0.0.1".to_owned(),
+            ..RelayConfig::default()
+        })
+        .await
+        .expect("start relay");
+        let listener = RelayListener::bind_with_config(
+            relay.ws_url(),
+            None,
+            SigningKey::from_bytes(&[0x61; 32]),
+            RelayClientAuth::None,
+            RelayListenerConfig::new().with_power_profile(PowerProfile::LowPower),
+        )
+        .await
+        .expect("bind low power v1 listener");
+        assert_eq!(listener.active_standby_socket_count(), 0);
+        drop(listener);
+        relay.shutdown().await.expect("stop relay");
     }
 }

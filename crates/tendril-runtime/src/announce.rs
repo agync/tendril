@@ -57,7 +57,7 @@ use crate::advertise::{
     AdvertiseInputs, ListAddrSource, LocalAddrSource, NativeAddrSource, NetworkSnapshot,
 };
 use crate::error::RuntimeError;
-use crate::store::StateStore;
+use crate::store::{RosterStamp, StateStore};
 
 /// Host: a change waits this long before it is sent, coalescing later changes.
 pub const HOST_ROUTE_SET_DEBOUNCE_MS: u64 = 2_000;
@@ -92,6 +92,8 @@ pub struct LastRouteSet {
     pub seq: u64,
 }
 
+type CachedLocalRoutes = Option<(Option<RosterStamp>, Option<LocalRouteState>)>;
+
 /// Store-or-memory roster handle (state directory, sealed or store-less) shared by the
 /// announcer, client ingest and the route setter.
 ///
@@ -109,6 +111,7 @@ pub struct RosterAccess {
     route_status: Arc<StdMutex<BTreeMap<String, LastRouteSet>>>,
     /// The local host id and signing key, the only key that verifies the host's own CRL.
     local: Option<(String, HybridSigningPublicKey)>,
+    last_stamp: Arc<StdMutex<CachedLocalRoutes>>,
 }
 
 impl std::fmt::Debug for RosterAccess {
@@ -128,6 +131,7 @@ impl RosterAccess {
             roster,
             route_status: Arc::default(),
             local: None,
+            last_stamp: Arc::default(),
         }
     }
 
@@ -163,8 +167,29 @@ impl RosterAccess {
 
     /// A store-backed handle seeded with the store's current roster.
     pub fn from_store(store: Arc<StateStore>) -> Result<Self, RuntimeError> {
-        let roster = store.load_roster()?;
-        Ok(Self::new(Some(store), Arc::new(StdMutex::new(roster))))
+        let (roster, stamp) = store.load_roster_with_stamp()?;
+        let routes = roster.local_routes().cloned();
+        Ok(Self {
+            store: Some(store),
+            roster: Arc::new(StdMutex::new(roster)),
+            route_status: Arc::default(),
+            local: None,
+            last_stamp: Arc::new(StdMutex::new(Some((stamp, routes)))),
+        })
+    }
+
+    fn record_cached_routes(&self, stamp: Option<RosterStamp>, routes: Option<LocalRouteState>) {
+        *lock(&self.last_stamp) = Some((stamp, routes));
+    }
+
+    fn record_stamp_unlocked(
+        &self,
+        store: &StateStore,
+        roster: &Roster,
+    ) -> Result<(), RuntimeError> {
+        let stamp = store.roster_stamp()?;
+        self.record_cached_routes(stamp, roster.local_routes().cloned());
+        Ok(())
     }
 
     /// A store-less handle; updates stay in memory.
@@ -184,6 +209,24 @@ impl RosterAccess {
         &self.roster
     }
 
+    /// Returns cached local routes without decrypting `rt-roster.sealed` when the file's
+    /// on-disk [`RosterStamp`] still matches the last loaded or saved generation.
+    fn cached_local_routes_if_fresh(
+        &self,
+    ) -> Result<Option<Option<LocalRouteState>>, RuntimeError> {
+        let Some(store) = &self.store else {
+            return Ok(Some(lock(&self.roster).local_routes().cloned()));
+        };
+        let disk_stamp = store.roster_stamp()?;
+        let guard = lock(&self.last_stamp);
+        if let Some((cached_stamp, cached_routes)) = guard.as_ref()
+            && *cached_stamp == disk_stamp
+        {
+            return Ok(Some(cached_routes.clone()));
+        }
+        Ok(None)
+    }
+
     /// The latest roster: loaded from the store, else a copy of the in-memory one. The
     /// revocation state the in-memory copy holds (CRLs, revoked entries and anchors accepted by a
     /// session, not yet persisted) is folded into the loaded roster, so a reload never drops it.
@@ -191,7 +234,8 @@ impl RosterAccess {
     pub fn load(&self) -> Result<Roster, RuntimeError> {
         match &self.store {
             Some(store) => {
-                let mut roster = store.load_roster()?;
+                let (mut roster, stamp) = store.load_roster_with_stamp()?;
+                self.record_cached_routes(stamp, roster.local_routes().cloned());
                 self.fold_held_into(&mut roster);
                 Ok(roster)
             }
@@ -219,6 +263,7 @@ impl RosterAccess {
                 self.fold_held_into(&mut roster);
                 let out = f(&mut roster)?;
                 store.save_roster_unlocked(&roster)?;
+                self.record_stamp_unlocked(store, &roster)?;
                 self.publish(roster);
                 Ok(out)
             }),
@@ -246,6 +291,7 @@ impl RosterAccess {
                 let (out, changed) = f(&mut roster)?;
                 if changed || folded {
                     store.save_roster_unlocked(&roster)?;
+                    self.record_stamp_unlocked(store, &roster)?;
                     self.publish(roster);
                 }
                 Ok(out)
@@ -280,6 +326,7 @@ impl RosterAccess {
             if changed {
                 store.save_roster_unlocked(&roster)?;
             }
+            self.record_stamp_unlocked(store, &roster)?;
             self.publish(roster);
             Ok(changed)
         })
@@ -293,6 +340,7 @@ impl RosterAccess {
         };
         store.with_roster_lock(|store| {
             let roster = store.load_roster_unlocked()?;
+            self.record_stamp_unlocked(store, &roster)?;
             self.publish(roster);
             Ok(())
         })
@@ -517,6 +565,8 @@ pub struct RouteAnnouncer {
     wake: Arc<Notify>,
     /// `true` while a [`Self::spawn`] timer task is alive.
     timer_running: Arc<AtomicBool>,
+    /// `true` when an OS path monitor (such as `NWPathMonitor`) drives [`Self::refresh`].
+    external_monitor: AtomicBool,
 }
 
 /// Clears [`RouteAnnouncer::timer_running`] when the timer task ends or is aborted.
@@ -584,7 +634,24 @@ impl RouteAnnouncer {
             }),
             wake: Arc::new(Notify::new()),
             timer_running: Arc::new(AtomicBool::new(false)),
+            external_monitor: AtomicBool::new(false),
         }
+    }
+
+    /// Tells the announcer whether an external OS path monitor (such as Apple's
+    /// `NWPathMonitor` or Android's `ConnectivityManager.NetworkCallback`) drives
+    /// [`Self::refresh`]. When active, [`Self::spawn`] suppresses periodic native polling.
+    pub fn set_external_monitor(&self, active: bool) {
+        self.external_monitor.store(active, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+
+    /// Reports whether periodic interface polling should run under [`Self::spawn`].
+    /// `AddressSource::Snapshot` and external-monitor endpoints return `false`.
+    #[must_use]
+    pub fn uses_periodic_refresh(&self) -> bool {
+        !self.external_monitor.load(Ordering::Acquire)
+            && !matches!(lock(&self.state).source, AddressSource::Snapshot)
     }
 
     #[must_use]
@@ -654,12 +721,15 @@ impl RouteAnnouncer {
         let (identity, endpoints) = self.current_endpoints(now_ms);
         let announced = PairingManager::announced_route_set(&identity, &endpoints);
         let digest = LocalRouteState::digest_of(announced.routes());
-        let unchanged = self
-            .store
-            .load()?
-            .local_routes()
-            .filter(|s| *s.digest() == digest)
-            .cloned();
+        let unchanged = match self.store.cached_local_routes_if_fresh()? {
+            Some(routes) => routes.filter(|s| *s.digest() == digest),
+            None => self
+                .store
+                .load()?
+                .local_routes()
+                .filter(|s| *s.digest() == digest)
+                .cloned(),
+        };
         let bumped = match unchanged {
             Some(state) => Ok((state, false)),
             None => self.store.update(|roster| {
@@ -943,21 +1013,30 @@ impl RouteAnnouncer {
         let every_ms = refresh_every.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         tokio::spawn(async move {
             let _guard = guard;
-            let mut next_refresh = every_ms.map(|e| unix_ms().saturating_add(e));
+            let mut next_refresh: Option<u64> = None;
             loop {
                 // Registered before the state is read: `notify_waiters` from a publish or from
                 // the announcer's drop after this point wakes it.
                 let notified = wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 let Some(this) = weak.upgrade() else {
                     return;
                 };
                 let now = unix_ms();
+                let periodic_every = this.uses_periodic_refresh().then_some(every_ms).flatten();
+                match periodic_every {
+                    Some(e) => {
+                        next_refresh.get_or_insert_with(|| now.saturating_add(e));
+                    }
+                    None => next_refresh = None,
+                }
                 let empty_due = this.empty_deadline_ms().is_some_and(|t| now >= t);
                 if empty_due || next_refresh.is_some_and(|t| now >= t) {
                     if let Err(err) = this.refresh(now, None) {
                         tracing::warn!(%err, "route refresh failed");
                     }
-                    next_refresh = every_ms.map(|e| now.saturating_add(e));
+                    next_refresh = periodic_every.map(|e| now.saturating_add(e));
                 }
                 this.flush(now).await;
                 let deadline = this
@@ -971,10 +1050,10 @@ impl RouteAnnouncer {
                         let wait = Duration::from_millis(t.saturating_sub(unix_ms()));
                         tokio::select! {
                             () = tokio::time::sleep(wait) => {}
-                            () = notified => {}
+                            () = &mut notified => {}
                         }
                     }
-                    None => notified.await,
+                    None => (&mut notified).await,
                 }
             }
         })
@@ -1143,4 +1222,84 @@ pub fn ingest_route_sets(
         outcomes.push(outcome);
     }
     Ok(outcomes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_monitor_and_snapshot_disable_periodic_refresh() {
+        let id = EndpointIdentity::generate().expect("id");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(StateStore::open_sealed(dir.path(), &id).expect("open"));
+        let access = RosterAccess::from_store(store).expect("access");
+
+        let snap_ann = RouteAnnouncer::new(
+            id.clone(),
+            access.clone(),
+            AdvertiseInputs::default(),
+            AddressSource::Snapshot,
+        );
+        assert!(!snap_ann.uses_periodic_refresh());
+
+        let native_ann = RouteAnnouncer::new(
+            id,
+            access,
+            AdvertiseInputs::default(),
+            AddressSource::Native,
+        );
+        assert!(native_ann.uses_periodic_refresh());
+        native_ann.set_external_monitor(true);
+        assert!(!native_ann.uses_periodic_refresh());
+        native_ann.set_external_monitor(false);
+        assert!(native_ann.uses_periodic_refresh());
+    }
+
+    #[test]
+    fn publish_reuses_roster_stamp_cache_without_redecrypting() {
+        let id = EndpointIdentity::generate().expect("id");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(StateStore::open_sealed(dir.path(), &id).expect("open"));
+        let access = RosterAccess::from_store(store).expect("access");
+        let ann = RouteAnnouncer::new(
+            id,
+            access.clone(),
+            AdvertiseInputs::default(),
+            AddressSource::Snapshot,
+        );
+        let s1 = ann.publish(1_000_000).expect("first publish");
+        let s2 = ann.publish(1_001_000).expect("second publish");
+        assert_eq!(s1.seq(), s2.seq());
+        assert_eq!(s1.digest(), s2.digest());
+        assert!(
+            access
+                .cached_local_routes_if_fresh()
+                .expect("fresh check")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_wakes_immediately_when_external_monitor_disables() {
+        let id = EndpointIdentity::generate().expect("id");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(StateStore::open_sealed(dir.path(), &id).expect("open"));
+        let access = RosterAccess::from_store(store).expect("access");
+        let ann = Arc::new(RouteAnnouncer::new(
+            id,
+            access,
+            AdvertiseInputs::default(),
+            AddressSource::Native,
+        ));
+        ann.set_external_monitor(true);
+        let task = Arc::clone(&ann).spawn(Some(Duration::from_millis(25)));
+        tokio::task::yield_now().await;
+        assert!(!ann.uses_periodic_refresh());
+        ann.set_external_monitor(false);
+        assert!(ann.uses_periodic_refresh());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        task.abort();
+        let _ = task.await;
+    }
 }
