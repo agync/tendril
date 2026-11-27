@@ -198,6 +198,8 @@ A host can tell a known initiator that it is revoked or still pending, instead o
 
 Revocation is permanent per static key. A host MUST NOT re-admit a `revoked` static key, by re-pairing (Section 5) or by any host-side "forget" of a revoked entry: grants are bearer documents bound to `device_id`, so re-admitting the key would revive any unexpired grant the device still holds. A host MAY remove a `pending` entry, and MAY silence a revoked entry's refusal notice (Section 5.1), but the entry stays `revoked`. A device that the host revoked re-pairs only with a fresh identity.
 
+A host that keeps roster state both in memory and in storage MUST NOT lose a revocation, revoked trust anchor or CRL when it reloads or commits it, and MUST commit it before admitting or dialing from storage.
+
 ---
 
 ## 6. Pairing URI Scheme
