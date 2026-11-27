@@ -152,7 +152,7 @@ enroll_proof    = Ed25519(peer_ed25519_priv, key_proof_bytes)
 - **Re-pairing rules:**
   - Re-pairing an already `active` static key updates metadata if needed and stays `active`, except that a verified signing key claim for an `active` entry without a key returns it to `pending` (Section 4.1).
   - Re-pairing a `revoked` static key MUST fail (`Revoked`) and keep the peer `revoked`; the matched pairing code still burns so an attacker cannot probe live codes with a revoked device.
-  - A peer in `pending` state MUST NOT open `intent = session` connections until an operator runs `pair.confirm` after comparing `device_fingerprint` and `pairing_sas`. Whenever a live pairing SAS was recorded during pairing, `pair.confirm` MUST require explicit SAS matching and MUST fail closed if omitted; out-of-band fingerprint-only confirmation requires an explicit opt-in API or flag (`--allow-no-sas`).
+  - A peer in `pending` state MUST NOT open `intent = session` connections until an operator runs `pair.confirm` after comparing `device_fingerprint` and `pairing_sas`. A host MAY tell such a peer that it is still pending with a refusal (`4004 peer_pending`, Section 5.1). Whenever a live pairing SAS was recorded during pairing, `pair.confirm` MUST require explicit SAS matching and MUST fail closed if omitted; out-of-band fingerprint-only confirmation requires an explicit opt-in API or flag (`--allow-no-sas`).
 - **Grant separation:** `pair.confirm` marks the roster entry `active` with zero non-session grants by default. Minting capabilities (`pair.mint`) is an independent operation.
 - **Symmetric client-side SAS gate & pin protection:**
   - When initiating pairing via an out-of-band pinned URI (`PinnedHost`), the initiator cryptographically verifies the responder's static/signing keys and rotation chain in `msg2` and may record the host pin directly as `active`.
@@ -166,6 +166,37 @@ enroll_proof    = Ed25519(peer_ed25519_priv, key_proof_bytes)
   - **Wire floors:** a claim's `min_wire_version` floors its static key (the anti-downgrade check at `msg2` and pinned pairing floors) and carries into a pin written for that static key, but never floors a `host_id`; neither does a `pending` entry.
   - Existing `active` or `revoked` host pins MUST NOT be overwritten with differing cryptographic keys during pairing (`host_id` collisions fail closed without retaining or transferring prior grants).
   - **Stored rosters:** on load, every `pending` entry kept under a key other than `device_id(static_pub)` moves into the pending host store under that label; a `pending` entry under its own `device_id` stays. Stored claims that are not `pending`, carry an invalid `host_id` or static key, or hold a revoked label or key are dropped. Claims never overwrite `active` or `revoked` entries, which keep their keys: a roster does not record whether a revoked entry was ever confirmed, so it keeps blocking its label and keys.
+
+### 5.1 Refusal Notices
+
+A host can tell a known initiator that it is revoked or still pending, instead of dropping the connection silently. The notice is an authenticated refusal: a `0x07 CLOSE` with code `4001 peer_revoked` or `4004 peer_pending` on Wire v1 (`spec/wire-v1.md` Sections 3.3 and 5.4), or a sealed refusal at `msg2` on Wire v2 (`spec/wire-v2.md` Sections 3.1.3 and 3.1.5). A refusal speaks only for the host's own roster entry for the initiator's `device_id`. It never concerns the initiator's pending host store, whose `peer_pending` state is local and fails before any byte is sent.
+
+**Refusal policy.** The host's refusal policy is stored with its roster, sealed with it wherever the roster is sealed, and applies to every listener of the endpoint:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `pending` | `true` | Refuse `pending` peers with `4004` |
+| `revoked_notice_ttl_secs` | `2,592,000` (30 days) | Lifetime of a refusal notice recorded at revocation. `0` records none, so every revocation is silent |
+
+**Recording a notice.** A notice is recorded only when an `active` or `pending` entry transitions to `revoked`, with `until_unix = saturating_add(now_unix, revoked_notice_ttl_secs)`. Revoking an entry that is already `revoked` never creates or extends a notice: with `notify: false` it clears any existing notice and zeroizes its refusal secret, and with `notify: true` it leaves the notice unchanged. On Wire v2 the notice also holds the peer's `reconnect_secret` as its refusal secret, and `mailbox_secret` is zeroized (`spec/wire-v2.md` Section 3.1.1). A notice is live while `now_unix < until_unix`. An `active` entry that a stored CRL revokes is treated as carrying a live notice while `revoked_notice_ttl_secs` is not `0`. Which revocations record a notice:
+
+| Revocation | Notice |
+|---|---|
+| Operator revoke of a peer | yes, per policy, unless the revoke passes `notify: false` |
+| Ingesting a CRL | only when the CRL is the host's own and the caller asks for notices; otherwise silent |
+| Fork detection (`spec/wire-v1.md` Section 4.2), in any form | **never**: a fork is a security event |
+| Sibling revocation by shared keys, revoking a pending host claim's keys, revoking a trust anchor | never; the primary revoked entry carries the notice |
+
+- Expired notices are pruned whenever the roster is loaded or saved and before a responder classifies an inbound connection. Pruning a notice zeroizes its refusal secret.
+- `clear_refusal_notice(peer_id)` drops one entry's notice. The entry stays `revoked`.
+- Listeners that serve groups never refuse (`spec/wire-v1.md` Section 5.4.3).
+- Every refusal is subject to the refusal limiter (`spec/wire-v1.md` Section 5.4.2). A denied refusal falls back to the silent behaviour.
+
+**Initiator handling.** A refusal does not change the initiator's roster or pin: the application decides. `4001` means the host blocks this device's static key permanently (Section 5.2), so a new pairing needs a new device identity. `4004` means the host has not run `pair.confirm` yet; the initiator MAY retry with backoff. An initiator-side way to forget a host, and serving `/v2/relay` mailboxes to `pending` peers, are specified separately; `revoked` peers are never served a `/v2/relay` mailbox.
+
+### 5.2 Permanent Revocation
+
+Revocation is permanent per static key. A host MUST NOT re-admit a `revoked` static key, by re-pairing (Section 5) or by any host-side "forget" of a revoked entry: grants are bearer documents bound to `device_id`, so re-admitting the key would revive any unexpired grant the device still holds. A host MAY remove a `pending` entry, and MAY silence a revoked entry's refusal notice (Section 5.1), but the entry stays `revoked`. A device that the host revoked re-pairs only with a fresh identity.
 
 ---
 
@@ -185,6 +216,7 @@ tendril://pair?v=1&host=<url_encoded_name>&code=<code>&k=<b64url_host_static>&sh
 - `ep` carries comma-separated endpoint hints (`<provider>:<addr>`), which are dialing hints only and never grant authorization. Each hint is percent-encoded before joining.
 - `rq` and `rs` carry the host's route statement (Section 6.5). They are present together or not at all.
 - Strict URI validation: parsers MUST reject unknown query parameters (the allow-list is `v`, `host`, `code`, `k`, `sh`, `id`, `seq`, `rp`, `ep`, `rq`, `rs`), duplicate parameters, empty `host`/`code`/`id` values, ASCII control characters (`0x00..=0x1F`, `0x7F`), malformed pairing codes (expecting `TND-XXXX-XXXX` or `TND-XXXX-XXXX-XXXX`), and unsafe/unrecognized endpoint hints (`javascript:`, `file:`, `data:`, non-loopback cleartext `ws://`/`http://`, userinfo `@`, fragments, or link-local/metadata IP hints). `PairClaim` and `HostHello` display/identifier fields with control characters or empty required names MUST likewise fail closed.
+- No URI expiry parameter is defined. An opt-in `exp` parameter is proposed separately and is not part of the allow-list.
 - A pairing URI hint, stored route or route announcement MUST NOT contain `#`. A relay hint's mailbox key travels in `rp`, never as a fragment.
 - Builders emit parameters in the order shown above, with each value in the canonical percent-encoding: unreserved bytes literal, every other byte as `%XX` with uppercase hex. Parsers MUST be handed the exact scanned string; a surface MUST NOT normalize, reorder, or re-encode a URI before parsing it, because `rs` covers its bytes (Section 6.5).
 

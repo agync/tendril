@@ -1,7 +1,7 @@
 ---
 type: Design
 title: Wire protocol and pairing
-description: Preamble framing, Noise XXhfs hybrid PQ handshake, transcript-bound pairing proof, signed multi-route pairing URIs, hybrid key rotation chains, and inner encrypted transport frames including signed route announcements.
+description: Preamble framing, Noise XXhfs hybrid PQ handshake, transcript-bound pairing proof, signed multi-route pairing URIs, refusal close codes for revoked and pending peers, hybrid key rotation chains, and inner encrypted transport frames including signed route announcements.
 status: stable
 tags: [design, wire, pairing]
 ---
@@ -76,6 +76,25 @@ A host keeps its paired clients' `signed` routes current inside the session. Its
 | Client acceptance | Entry active and not revoked, keys match the pin, signature verifies, `issued_at` at most 24 hours ahead, and `seq` newer than the stored one (or equal over a route set that came from a URI). A rejection is recorded and never closes the session. |
 
 The host's sequence lives in its roster, so it survives restarts and only moves when the advertised set changes. Structural failures close the session; semantic ones never do. See `spec/wire-v1.md` Section 5.2 for the exact bytes and the receive pipeline.
+
+## Refusing revoked and pending peers
+
+A host can tell a known device that it is revoked or still waiting for `pair.confirm`, so the device stops guessing between a dead host and a blocked key. On Wire v1 the host learns who the device is only from `msg3`. It then checks the entry's wire floor first, so a v2-floored entry still gets `VersionDowngrade` and no bytes. Otherwise it finishes the handshake and sends one encrypted `0x07 CLOSE` with `4001 peer_revoked` or `4004 peer_pending` and empty text. It then releases the half-open slot, half-closes the stream so the frame is not lost to a reset, drains for at most `250 ms`, and closes (`spec/wire-v1.md` Sections 3.3 and 5.4). Wire v2 refuses earlier, at `msg2`, with a sealed refusal (see [Wire v2 privacy profile and PAKE](wire-v2-privacy.md)).
+
+| Close code | Meaning | Refusal |
+|---|---|---|
+| `1000`, `1002`, `1008`, `1011` | normal, protocol error, policy violation, internal error | no |
+| `4001` | `peer_revoked`: the host blocks this device key permanently | yes |
+| `4002`, `4003` | `grant_expired`, `key_unverified` (reserved) | no |
+| `4004` | `peer_pending`: the host has not confirmed this device yet | yes |
+| `4400..=4499` | reserved admission refusals | yes |
+
+- **Who is told:** revocations record a notice by default, kept for 30 days. An operator can revoke with `notify: false`, set the lifetime to `0`, or clear one notice while the key stays revoked. Fork revocations are always silent. Pending notices are on by default.
+- **Who is not told:** a stranger gets the same drop as before, with no `CLOSE`. Group listeners never refuse. A limiter allows one refusal per peer per `10 s` and falls back to silence.
+- **Revocation stays permanent:** a host never re-admits a revoked key. A refused device that wants back in re-pairs with a fresh identity (`spec/pairing-v1.md` Sections 5.1 and 5.2).
+- **Privacy residual on Wire v1:** a passive observer can see one extra 21-byte frame after `msg3` and so tell a refusal from a silent drop. Wire v1 is not the privacy profile; v2-floored entries never send it.
+
+Only an initiator reads a refusal code as a refusal. A responder that receives one keeps it as a plain close.
 
 ## Inner encrypted frames and rotation
 
