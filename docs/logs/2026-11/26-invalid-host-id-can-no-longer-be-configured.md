@@ -9,6 +9,6 @@ status: stable
 
 identity: an invalid host_id can no longer be configured:
 
-- `EndpointIdentity::try_with_host_id` returns an error for a `host_id` that fails `is_valid_host_id`; `with_host_id` stays unchecked, for literals and tests that forge a hostile host.
-- `StateStore::load_or_generate_identity`, the C ABI, Python, Node, the WASM identity and the conformance peer use `try_with_host_id`, so an invalid `host_id` is an error at configuration and nothing is written. `serialize_identity_json` refuses to persist one, and persisted identities were already validated on load, so `tendril serve` and every other responder refuse to start with an invalid local `host_id`.
+- `EndpointIdentity::try_with_host_id` returns an error for a `host_id` that fails `is_valid_host_id`; `with_host_id` is built only for tests (`cfg(test)` or the `test-utils` feature), which forge hostile hosts with it.
+- `StateStore::load_or_generate_identity`, the C ABI, Python, Node, the WASM identity and the conformance peer use `try_with_host_id`, so an invalid `host_id` is an error at configuration and nothing is written. `serialize_identity_json` refuses to persist one, persisted identities were already validated on load, and every runtime responder entry (v1 and v2 session accept, v1 pair and v2 PAKE pair responders) refuses an invalid local `host_id` before touching the stream.
 - Updated `spec/pairing-v1.md` Section 5.

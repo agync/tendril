@@ -830,6 +830,9 @@ fn err_json(msg: impl Into<String>) -> serde_json::Value {
 async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value, bool) {
     match cmd {
         PeerCmd::Init { state_dir, host_id } => {
+            if host_id.as_deref() == Some("") {
+                return (err_json("host_id must not be empty"), false);
+            }
             let identity_res = if let Some(dir) = state_dir {
                 match StateStore::open_or_create(&dir) {
                     Ok(store) => {
@@ -848,8 +851,8 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
             } else {
                 EndpointIdentity::generate()
                     .and_then(|id| match host_id {
-                        Some(h) if !h.is_empty() => id.try_with_host_id(h),
-                        _ => Ok(id),
+                        Some(h) => id.try_with_host_id(h),
+                        None => Ok(id),
                     })
                     .map_err(|e| e.to_string())
             };

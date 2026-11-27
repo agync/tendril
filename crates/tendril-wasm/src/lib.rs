@@ -935,6 +935,9 @@ impl WasmIdentity {
     }
 
     fn serialize_json_bytes(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        if !tendril_core::identity::is_valid_host_id(self.inner.host_id()) {
+            return Err("invalid host_id".to_owned());
+        }
         let doc = PersistedWasmIdentity {
             host_id: self.inner.host_id().to_owned(),
             static_secret_b64: b64url_encode(self.inner.static_key().secret_bytes()),
@@ -4692,6 +4695,7 @@ mod tests {
                 .with_host_id("has#hash"),
         };
         assert!(forged.serialize_json().is_err());
+        assert!(forged.serialize_json_bytes().is_err());
     }
 
     #[test]

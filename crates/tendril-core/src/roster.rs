@@ -3477,6 +3477,46 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_coexisting_with_a_rotated_active_entry_is_removed_alone() {
+        use crate::crypto::{SigningKeypair, StaticKeypair};
+        use crate::identity::sign_rotation;
+
+        let k0 = *StaticKeypair::from_scalar([0xF1; 32]).public_bytes();
+        let s0 = SigningKeypair::from_seed([0xF2; 32]);
+        let k1 = *StaticKeypair::from_scalar([0xF3; 32]).public_bytes();
+        let s1 = SigningKeypair::from_seed([0xF4; 32]);
+        let mut active = Roster::new();
+        active
+            .insert_pinned_host(
+                "act".into(),
+                "Active".into(),
+                k0,
+                Some(s0.public_key().clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        let rec = sign_rotation(1, &s0, s1.public_key(), &k1, 1_795_133_000).unwrap();
+        active
+            .apply_verified_rotation("act", &[rec], &k1, s1.public_key())
+            .unwrap();
+        let mut claimed = Roster::new();
+        record_claim(&mut claimed, "act", &host_keys(0xF5), "sas").unwrap();
+        let claims = serde_json::to_value(&claimed).unwrap()["pending_hosts"].clone();
+
+        // A stored roster holding both: the claim never replaces the active entry.
+        let mut roster = reload(&active, |j| j["pending_hosts"] = claims);
+        assert_eq!(roster.pending_hosts().count(), 1);
+        assert_eq!(roster.get("act").unwrap().state, PeerState::Active);
+
+        roster.remove_pending_host_claims("act").unwrap();
+        assert_eq!(roster.pending_hosts().count(), 0);
+        let kept = roster.get("act").unwrap();
+        assert_eq!((kept.state, kept.static_pub), (PeerState::Active, k1));
+        assert_eq!(kept.rotation_seq, 1);
+    }
+
+    #[test]
     fn host_claims_wait_outside_entries_and_confirm_by_sas() {
         let real = host_keys(0x79);
         let other = host_keys(0x7b);
