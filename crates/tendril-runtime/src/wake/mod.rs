@@ -1089,6 +1089,8 @@ pub struct WakeConfigSpec {
     #[zeroize(skip)]
     pub wake_retry_delay_ms: Option<u64>,
     #[zeroize(skip)]
+    pub wake_retry_max_delay_ms: Option<u64>,
+    #[zeroize(skip)]
     pub wake_max_attempts: Option<usize>,
     #[zeroize(skip)]
     pub wake_timeout_ms: Option<u64>,
@@ -1112,6 +1114,7 @@ impl WakeConfigSpec {
             || self.wake_auth_token.is_some()
             || self.wake_pre_wake.is_some()
             || self.wake_retry_delay_ms.is_some()
+            || self.wake_retry_max_delay_ms.is_some()
             || self.wake_max_attempts.is_some()
             || self.wake_timeout_ms.is_some()
             || self.wake_coalesce_secs.is_some()
@@ -1145,6 +1148,7 @@ impl fmt::Debug for WakeConfigSpec {
             )
             .field("wake_pre_wake", &self.wake_pre_wake)
             .field("wake_retry_delay_ms", &self.wake_retry_delay_ms)
+            .field("wake_retry_max_delay_ms", &self.wake_retry_max_delay_ms)
             .field("wake_max_attempts", &self.wake_max_attempts)
             .field("wake_timeout_ms", &self.wake_timeout_ms)
             .field("wake_coalesce_secs", &self.wake_coalesce_secs)
@@ -1177,6 +1181,7 @@ pub struct WakeTransportSettings {
     pub secret: WakeSecret,
     pub pre_wake: bool,
     pub retry_delay_ms: u64,
+    pub retry_max_delay_ms: Option<u64>,
     pub max_attempts: usize,
     pub timeout_ms: u64,
     pub coalesce_secs: u64,
@@ -1193,6 +1198,7 @@ impl fmt::Debug for WakeTransportSettings {
             .field("secret", &self.secret)
             .field("pre_wake", &self.pre_wake)
             .field("retry_delay_ms", &self.retry_delay_ms)
+            .field("retry_max_delay_ms", &self.retry_max_delay_ms)
             .field("max_attempts", &self.max_attempts)
             .field("timeout_ms", &self.timeout_ms)
             .field("coalesce_secs", &self.coalesce_secs)
@@ -1209,7 +1215,7 @@ impl WakeTransportSettings {
     /// Converts these endpoint settings into per-dial [`WakeDialOptions`] sharing the pooled provider.
     #[must_use]
     pub fn to_dial_options(&self) -> WakeDialOptions {
-        WakeDialOptions::new(
+        let mut opts = WakeDialOptions::new(
             Arc::clone(&self.provider),
             self.target.clone(),
             self.secret.clone(),
@@ -1217,7 +1223,11 @@ impl WakeTransportSettings {
         .with_pre_wake(self.pre_wake)
         .with_retry_delay(Duration::from_millis(self.retry_delay_ms))
         .with_max_attempts(self.max_attempts)
-        .with_wake_timeout(Duration::from_millis(self.timeout_ms))
+        .with_wake_timeout(Duration::from_millis(self.timeout_ms));
+        if let Some(max_ms) = self.retry_max_delay_ms {
+            opts = opts.with_retry_max_delay(Duration::from_millis(max_ms));
+        }
+        opts
     }
 }
 
@@ -1304,8 +1314,16 @@ pub fn build_wake_provider_with_root_certs(
     }
 
     let pre_wake = spec.wake_pre_wake.unwrap_or(false);
-    let retry_delay_ms = spec.wake_retry_delay_ms.unwrap_or(100);
-    let max_attempts = spec.wake_max_attempts.unwrap_or(10).max(1);
+    let (retry_delay_ms, retry_max_delay_ms, default_attempts) =
+        match (spec.wake_retry_delay_ms, spec.wake_retry_max_delay_ms) {
+            (None, None) => (250, Some(4_000), 6),
+            (Some(delay_ms), None) => (delay_ms, None, 10),
+            (delay_opt, Some(max_ms)) => {
+                let delay_ms = delay_opt.unwrap_or(250);
+                (delay_ms, Some(max_ms.max(delay_ms)), 6)
+            }
+        };
+    let max_attempts = spec.wake_max_attempts.unwrap_or(default_attempts).max(1);
     let timeout_ms = spec.wake_timeout_ms.unwrap_or(3_000);
     let coalesce_secs = spec
         .wake_coalesce_secs
@@ -1432,6 +1450,7 @@ pub fn build_wake_provider_with_root_certs(
         secret,
         pre_wake,
         retry_delay_ms,
+        retry_max_delay_ms,
         max_attempts,
         timeout_ms,
         coalesce_secs,

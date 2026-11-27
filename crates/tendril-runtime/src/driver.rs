@@ -37,12 +37,15 @@ use tendril_core::{MAX_FRAME_LEN, PREAMBLE_LEN};
 use tendril_core::{RefusalMode, RefusalReason};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::AbortHandle;
-use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
+use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
 
 use crate::announce::{RosterAccess, RouteSetLimiter, RouteSetSink, ingest_route_sets, unix_ms};
 use crate::error::{RelayOffline, RuntimeError};
+use crate::power::{IdleActivity, PowerProfile};
 use crate::provider::{MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, PathWriter};
-use crate::providers::egress::{EgressKind, HintSource, HostResolver, SkipReason, SkippedHint};
+use crate::providers::egress::{
+    EgressKind, HintSource, HostResolver, LocalReachability, SkipReason, SkippedHint,
+};
 use crate::providers::hints::{
     CandidateSet, DialWire, HintDialers, HintInput, HintTarget, MultiDialOptions, RelayV2Gate,
     build_pairing_candidates, normalize_operator_endpoint, normalize_peer_routes,
@@ -167,6 +170,17 @@ pub enum SessionEvent {
         code: u16,
         reason: String,
     },
+}
+
+pub(crate) const fn is_application_event(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::AppData(_)
+            | SessionEvent::GrantUpdated(_)
+            | SessionEvent::RevocationUpdated { .. }
+            | SessionEvent::GroupManifestReceived(_)
+            | SessionEvent::GroupRendezvousReceived(_)
+    )
 }
 
 /// Completed outcome from an async pairing exchange.
@@ -1243,6 +1257,7 @@ pub struct SessionDriver {
     started_at: Instant,
     _half_open: Option<HalfOpenGuard>,
     route_ingest: IngestSlot,
+    activity: IdleActivity,
     /// `true` for a session this side dialed: only an initiator maps a refusal close code.
     initiator: bool,
     /// The endpoint's refusal state on a refusal-enabled responder.
@@ -1515,6 +1530,7 @@ impl SessionDriver {
             started_at: Instant::now(),
             _half_open: None,
             route_ingest: IngestSlot::default(),
+            activity: IdleActivity::default(),
             initiator: true,
             refusal: None,
             refused: None,
@@ -1734,6 +1750,7 @@ impl SessionDriver {
             started_at: Instant::now(),
             _half_open: half_open,
             route_ingest: IngestSlot::default(),
+            activity: IdleActivity::default(),
             initiator: false,
             refusal,
             refused: None,
@@ -1783,7 +1800,9 @@ impl SessionDriver {
             .machine
             .send_data(payload, now_ms)
             .map_err(|err| self.core_error(err))?;
-        self.apply_actions(actions).await
+        self.apply_actions(actions).await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted `0x02 GRANT`.
@@ -1793,7 +1812,9 @@ impl SessionDriver {
             .machine
             .send_grant(grant, now_ms)
             .map_err(|err| self.core_error(err))?;
-        self.apply_actions(actions).await
+        self.apply_actions(actions).await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted `0x03 REVOCATION`.
@@ -1803,7 +1824,9 @@ impl SessionDriver {
             .machine
             .send_revocation(crl, now_ms)
             .map_err(|err| self.core_error(err))?;
-        self.apply_actions(actions).await
+        self.apply_actions(actions).await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted `0x0A GROUP_MANIFEST`.
@@ -1816,7 +1839,9 @@ impl SessionDriver {
             .machine
             .send_group_manifest(manifest, now_ms)
             .map_err(|err| self.core_error(err))?;
-        self.apply_actions(actions).await
+        self.apply_actions(actions).await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted `0x0B GROUP_RENDEZVOUS` carrying `secrets` for `group_id`.
@@ -1831,7 +1856,9 @@ impl SessionDriver {
             .machine
             .send_group_rendezvous(&frame[..], now_ms)
             .map_err(|err| self.core_error(err))?;
-        self.apply_actions(actions).await
+        self.apply_actions(actions).await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Returns the group gossip summary the initiator advertised in `SessionHello`, if any.
@@ -1989,6 +2016,14 @@ impl SessionDriver {
         self.stream.provider_id()
     }
 
+    /// Sets an opt-in application-data idle timeout for this session. Keepalives (`Ping`/`Pong`,
+    /// rekey) do not extend the deadline.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.activity = IdleActivity::new(timeout);
+        self
+    }
+
     /// Converts this established [`SessionDriver`] into a full-duplex [`ConcurrentSession`].
     #[must_use]
     pub fn into_concurrent(self) -> ConcurrentSession {
@@ -2012,6 +2047,7 @@ impl SessionDriver {
             provider_id,
             _half_open: self._half_open,
             route_ingest: self.route_ingest,
+            activity: self.activity,
             initiator: self.initiator,
             negotiated_upgrade_caps,
             peer_upgrade_caps,
@@ -2134,6 +2170,9 @@ impl SessionDriver {
     ) -> Result<Option<SessionEvent>, RuntimeError> {
         loop {
             if let Some(ev) = self.pending_events.pop_front() {
+                if is_application_event(&ev) {
+                    self.activity.touch();
+                }
                 #[cfg(feature = "webrtc")]
                 if let SessionEvent::PathUpgrade(PathUpgradeMsg::Offer {
                     upgrade_id,
@@ -2149,7 +2188,23 @@ impl SessionDriver {
             if self.machine.is_closed() {
                 return Ok(None);
             }
-            let n = self.stream.recv_chunk(&mut self.recv_buf).await?;
+            let idle_dl = self.activity.deadline();
+            let n = tokio::select! {
+                biased;
+                () = async {
+                    match idle_dl {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if self.activity.deadline().is_some_and(|dl| TokioInstant::now() >= dl) {
+                        let _ = self.send_close(1000, "idle_timeout").await;
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                res = self.stream.recv_chunk(&mut self.recv_buf) => res?,
+            };
             if n == 0 {
                 return Ok(None);
             }
@@ -2394,6 +2449,7 @@ pub struct ConcurrentSession {
     provider_id: ProviderId,
     _half_open: Option<HalfOpenGuard>,
     route_ingest: IngestSlot,
+    activity: IdleActivity,
     initiator: bool,
     negotiated_upgrade_caps: Vec<String>,
     peer_upgrade_caps: Vec<String>,
@@ -2451,25 +2507,33 @@ impl ConcurrentSession {
     /// Sends encrypted `0x01 DATA` concurrently with inbound polling.
     pub async fn send_data(&self, payload: &[u8]) -> Result<(), RuntimeError> {
         self.run_write_op(|machine, now_ms| machine.send_data(payload, now_ms))
-            .await
+            .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted `0x02 GRANT` concurrently with inbound polling.
     pub async fn send_grant(&self, grant: &Grant) -> Result<(), RuntimeError> {
         self.run_write_op(|machine, now_ms| machine.send_grant(grant, now_ms))
-            .await
+            .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted `0x03 REVOCATION` concurrently with inbound polling.
     pub async fn send_revocation(&self, crl: &RevocationList) -> Result<(), RuntimeError> {
         self.run_write_op(|machine, now_ms| machine.send_revocation(crl, now_ms))
-            .await
+            .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted `0x0A GROUP_MANIFEST` concurrently with inbound polling.
     pub async fn send_group_manifest(&self, manifest: &GroupManifest) -> Result<(), RuntimeError> {
         self.run_write_op(|machine, now_ms| machine.send_group_manifest(manifest, now_ms))
-            .await
+            .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted `0x0B GROUP_RENDEZVOUS` carrying `secrets` for `group_id`.
@@ -2480,7 +2544,9 @@ impl ConcurrentSession {
     ) -> Result<(), RuntimeError> {
         let frame = secrets.to_rendezvous_frame(group_id)?;
         self.run_write_op(|machine, now_ms| machine.send_group_rendezvous(&frame[..], now_ms))
-            .await
+            .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Returns the negotiated in-band path upgrade capabilities for this session.
@@ -2694,6 +2760,9 @@ impl ConcurrentSession {
                 return Ok(None);
             }
             if let Some(ev) = self.pop_pending_event() {
+                if is_application_event(&ev) {
+                    self.activity.touch();
+                }
                 #[cfg(feature = "webrtc")]
                 if let SessionEvent::PathUpgrade(PathUpgradeMsg::Offer {
                     upgrade_id,
@@ -2716,12 +2785,25 @@ impl ConcurrentSession {
             }
 
             let read_half_ref = &mut *read_half;
+            let idle_dl = self.activity.deadline();
             let n = tokio::select! {
                 biased;
                 _ = shutdown_rx.changed() => {
                     return Ok(None);
                 }
                 _ = &mut notified => continue,
+                () = async {
+                    match idle_dl {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if self.activity.deadline().is_some_and(|dl| TokioInstant::now() >= dl) {
+                        let _ = self.send_close(1000, "idle_timeout").await;
+                        return Ok(None);
+                    }
+                    continue;
+                }
                 res = read_half_ref.reader.recv_chunk(&mut read_half_ref.recv_buf) => res?,
             };
             if n == 0 {
@@ -3094,6 +3176,7 @@ where
             }
         }
 
+        let next_dl = planner.next_deadline_ms();
         tokio::select! {
             maybe_res = result_rx.recv() => {
                 let Some((id, res)) = maybe_res else {
@@ -3121,7 +3204,12 @@ where
                     }
                 }
             }
-            _ = sleep(Duration::from_millis(25)) => {
+            () = async {
+                match next_dl {
+                    Some(dl) => tokio::time::sleep_until(started + Duration::from_millis(dl)).await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 planner.tick(now_ms);
             }
@@ -4001,6 +4089,15 @@ pub struct ConnectOpts {
     /// Resolver for the egress check (default: the system resolver).
     pub resolver: Option<Arc<dyn HostResolver>>,
     pub policy_config: PathPolicyConfig,
+    /// Cached last-known-good candidate hint to prioritize ahead of other rungs (never outranks
+    /// an operator override).
+    pub preferred_hint: Option<String>,
+    /// Optional local IPv4/IPv6 reachability used to filter unreachable candidates before dialing.
+    pub reachability: Option<LocalReachability>,
+    /// Power profile controlling ladder concurrency (`max_in_flight`) and Wire v2 keepalives.
+    pub power_profile: PowerProfile,
+    /// Opt-in application-data idle timeout for the connected session.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for ConnectOpts {
@@ -4010,6 +4107,10 @@ impl std::fmt::Debug for ConnectOpts {
             .field("replace_routes", &self.replace_routes)
             .field("policy", &self.policy)
             .field("operator_endpoint", &self.operator_endpoint)
+            .field("preferred_hint", &self.preferred_hint)
+            .field("reachability", &self.reachability)
+            .field("power_profile", &self.power_profile)
+            .field("idle_timeout", &self.idle_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -4028,7 +4129,50 @@ impl ConnectOpts {
             relay_auth_origins: Vec::new(),
             resolver: None,
             policy_config: PathPolicyConfig::default(),
+            preferred_hint: None,
+            reachability: None,
+            power_profile: PowerProfile::Standard,
+            idle_timeout: None,
         }
+    }
+
+    /// Prioritizes `hint` as a last-known-good route within the path planner.
+    #[must_use]
+    pub fn with_preferred_hint(mut self, hint: impl Into<String>) -> Self {
+        self.preferred_hint = Some(hint.into());
+        self
+    }
+
+    /// Sets local interface IPv4/IPv6 reachability used to skip unreachable address families.
+    #[must_use]
+    pub const fn with_reachability(mut self, reachability: LocalReachability) -> Self {
+        self.reachability = Some(reachability);
+        self
+    }
+
+    /// Applies `power_profile` to the path planner and Wire v2 session keepalives.
+    #[must_use]
+    pub fn with_power_profile(mut self, power_profile: PowerProfile) -> Self {
+        self.power_profile = power_profile;
+        self.policy_config = power_profile.path_policy();
+        self
+    }
+
+    pub(crate) fn effective_policy_config(&self) -> PathPolicyConfig {
+        if self.power_profile != PowerProfile::Standard
+            && self.policy_config == PathPolicyConfig::default()
+        {
+            self.power_profile.path_policy()
+        } else {
+            self.policy_config
+        }
+    }
+
+    /// Sets an opt-in application-data idle timeout on the resulting session.
+    #[must_use]
+    pub const fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
     }
 }
 
@@ -4127,8 +4271,18 @@ pub(crate) async fn plan_connect(
     if let Some(resolver) = &opts.resolver {
         ctx = ctx.with_resolver(Arc::clone(resolver));
     }
+    if let Some(reachability) = opts.reachability {
+        ctx = ctx.with_reachability(reachability);
+    }
     let multi = MultiDialOptions::new(Arc::clone(&opts.dialers), wire);
-    let set = build_pairing_candidates(&hints, &hint_target, &ctx, &multi).await?;
+    let mut set = build_pairing_candidates(&hints, &hint_target, &ctx, &multi).await?;
+    if let Some(preferred) = opts.preferred_hint.as_deref() {
+        for cand in &mut set.candidates {
+            if cand.addr == preferred {
+                cand.preferred = true;
+            }
+        }
+    }
     if set.is_empty() {
         let mut msg = format!("no dialable stored routes for {target}");
         if !entry.relay_hints.is_empty() {
@@ -4348,7 +4502,7 @@ impl SessionDriver {
         let ev = Arc::clone(&evidence);
         let race = race_candidates(
             &set.dialers,
-            opts.policy_config,
+            opts.effective_policy_config(),
             set.candidates.clone(),
             move |cand, dialer| {
                 let identity = Arc::clone(&identity);
@@ -4440,6 +4594,7 @@ impl SessionDriver {
                 return Err(committed_error(err, skipped, failures));
             }
         };
+        driver.activity = IdleActivity::new(opts.idle_timeout);
         // Route sets arrive only when `route_seq` was sent; CRLs the session accepts reach
         // `store` either way.
         driver.set_route_ingest(store.clone(), opts.policy);
@@ -4485,6 +4640,7 @@ impl SessionDriver {
             started_at: Instant::now(),
             _half_open: None,
             route_ingest: IngestSlot::default(),
+            activity: IdleActivity::default(),
             initiator: true,
             refusal: None,
             refused: None,
@@ -4545,6 +4701,7 @@ impl SessionDriver {
 mod tests {
     use tendril_core::crypto::{SigningKeypair, StaticKeypair};
     use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+    use tokio::time::sleep;
 
     use super::*;
 
@@ -5213,6 +5370,179 @@ mod tests {
             ingest.pending_crls.len(),
             1,
             "evidence kept for the next run"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_ignores_pong_and_extends_on_app_data() {
+        let host_id = identity(0x61);
+        let cli_id = identity(0x62);
+        let mut host_roster = Roster::new();
+        host_roster
+            .insert_pinned_host(
+                cli_id.device_id(),
+                "cli".to_owned(),
+                *cli_id.static_key().public_bytes(),
+                Some(cli_id.signing_key().public_key().clone()),
+                0,
+                vec![],
+            )
+            .expect("host add client");
+        let mut cli_roster = Roster::new();
+        cli_roster
+            .insert_pinned_host(
+                host_id.host_id().to_owned(),
+                "host".to_owned(),
+                *host_id.static_key().public_bytes(),
+                Some(host_id.signing_key().public_key().clone()),
+                0,
+                vec![],
+            )
+            .expect("cli pin host");
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let sa = Box::new(crate::provider::IoPathStream::new(
+            ProviderId::Direct,
+            None,
+            Duration::from_secs(1),
+            a,
+        ));
+        let sb = Box::new(crate::provider::IoPathStream::new(
+            ProviderId::Direct,
+            None,
+            Duration::from_secs(1),
+            b,
+        ));
+        let (cli_res, host_res) = tokio::join!(
+            SessionDriver::connect(sa, &cli_id, host_id.host_id(), None, &mut cli_roster, NOW),
+            SessionDriver::accept(sb, &host_id, &mut host_roster, NOW, None),
+        );
+        let cli = cli_res
+            .expect("client handshake")
+            .with_idle_timeout(Some(Duration::from_secs(30)))
+            .into_concurrent();
+        let cli_roster = Mutex::new(cli_roster);
+        let host = host_res.expect("host handshake").into_concurrent();
+        let host_roster = Arc::new(Mutex::new(host_roster));
+        let host_drain_roster = Arc::clone(&host_roster);
+        let host_drain = tokio::spawn(async move {
+            while let Ok(Some(_)) = host.next_event_with_clock(&host_drain_roster, || NOW).await {}
+        });
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        cli.send_ping(42).await.expect("send ping");
+        let ev = cli
+            .next_event_with_clock(&cli_roster, || NOW + 20)
+            .await
+            .expect("pong event")
+            .expect("some event");
+        assert!(matches!(ev, SessionEvent::PongReceived(42)));
+
+        // Advance past the original 30 s idle timeout: send_ping and Pong did NOT extend it.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert_eq!(
+            cli.next_event_with_clock(&cli_roster, || NOW + 31)
+                .await
+                .expect("idle close cleanly"),
+            None
+        );
+        host_drain.abort();
+
+        // Application data extends the deadline past 30 s.
+        let (a2, b2) = tokio::io::duplex(64 * 1024);
+        let sa2 = Box::new(crate::provider::IoPathStream::new(
+            ProviderId::Direct,
+            None,
+            Duration::from_secs(1),
+            a2,
+        ));
+        let sb2 = Box::new(crate::provider::IoPathStream::new(
+            ProviderId::Direct,
+            None,
+            Duration::from_secs(1),
+            b2,
+        ));
+        let mut host_roster2 = Roster::new();
+        host_roster2
+            .insert_pinned_host(
+                cli_id.device_id(),
+                "cli".to_owned(),
+                *cli_id.static_key().public_bytes(),
+                Some(cli_id.signing_key().public_key().clone()),
+                0,
+                vec![],
+            )
+            .expect("host2 add client");
+        let mut cli_roster2 = Roster::new();
+        cli_roster2
+            .insert_pinned_host(
+                host_id.host_id().to_owned(),
+                "host".to_owned(),
+                *host_id.static_key().public_bytes(),
+                Some(host_id.signing_key().public_key().clone()),
+                0,
+                vec![],
+            )
+            .expect("cli2 pin host");
+        let (cli2_res, host2_res) = tokio::join!(
+            SessionDriver::connect(sa2, &cli_id, host_id.host_id(), None, &mut cli_roster2, NOW),
+            SessionDriver::accept(sb2, &host_id, &mut host_roster2, NOW, None),
+        );
+        let mut cli2 = cli2_res.expect("client2 handshake");
+        let host2 = host2_res
+            .expect("host2 handshake")
+            .with_idle_timeout(Some(Duration::from_secs(30)))
+            .into_concurrent();
+        let host_roster2 = Mutex::new(host_roster2);
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        cli2.send_data(b"hello").await.expect("send data");
+        let ev2 = host2
+            .next_event_with_clock(&host_roster2, || NOW + 20)
+            .await
+            .expect("data event")
+            .expect("some event");
+        assert!(matches!(ev2, SessionEvent::AppData(ref d) if d == b"hello"));
+
+        // At t = 35s (only 15s since AppData), session is STILL alive.
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert!(
+            timeout(
+                Duration::from_millis(10),
+                host2.next_event_with_clock(&host_roster2, || NOW + 35),
+            )
+            .await
+            .is_err()
+        );
+
+        // At t = 51s (>30s after AppData), idle timeout closes the session.
+        tokio::time::advance(Duration::from_secs(16)).await;
+        assert_eq!(
+            host2
+                .next_event_with_clock(&host_roster2, || NOW + 51)
+                .await
+                .expect("idle close cleanly"),
+            None
+        );
+    }
+
+    #[test]
+    fn connect_opts_low_power_profile_updates_effective_policy_config() {
+        let dialers = Arc::new(HintDialers::new(
+            crate::providers::hints::HintDialerConfig::default(),
+        ));
+        let builder_opts =
+            ConnectOpts::new(Arc::clone(&dialers)).with_power_profile(PowerProfile::LowPower);
+        assert_eq!(
+            builder_opts.effective_policy_config(),
+            PathPolicyConfig::low_power()
+        );
+
+        let mut direct_opts = ConnectOpts::new(dialers);
+        direct_opts.power_profile = PowerProfile::LowPower;
+        assert_eq!(
+            direct_opts.effective_policy_config(),
+            PathPolicyConfig::low_power()
         );
     }
 }

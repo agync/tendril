@@ -3,7 +3,7 @@
 use std::fmt;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -1096,16 +1096,33 @@ pub fn filter_p2p_hint(hint: &str, relay_mode: &P2pRelayMode) -> Result<P2pHintA
     })
 }
 
+struct P2pActiveRef(Arc<AtomicUsize>);
+
+impl P2pActiveRef {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for P2pActiveRef {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct P2pConnDropper {
     guard: StdMutex<Option<Arc<EndpointGuard>>>,
     conn: StdMutex<Option<Connection>>,
+    active_ref: StdMutex<Option<P2pActiveRef>>,
 }
 
 impl P2pConnDropper {
-    fn new(guard: Arc<EndpointGuard>, conn: Connection) -> Self {
+    fn new(guard: Arc<EndpointGuard>, conn: Connection, active_ref: Option<P2pActiveRef>) -> Self {
         Self {
             guard: StdMutex::new(Some(guard)),
             conn: StdMutex::new(Some(conn)),
+            active_ref: StdMutex::new(active_ref),
         }
     }
 
@@ -1118,6 +1135,12 @@ impl P2pConnDropper {
         {
             g.close_now().await;
         }
+        let active_ref = self
+            .active_ref
+            .lock()
+            .expect("p2p active ref mutex poisoned")
+            .take();
+        drop(active_ref);
     }
 }
 
@@ -1129,6 +1152,11 @@ impl Drop for P2pConnDropper {
             .get_mut()
             .expect("p2p guard mutex poisoned")
             .take();
+        let active_ref = self
+            .active_ref
+            .get_mut()
+            .expect("p2p active ref mutex poisoned")
+            .take();
         if let (Some(conn), Some(guard)) = (conn, guard)
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
@@ -1137,6 +1165,7 @@ impl Drop for P2pConnDropper {
                 let _ = timeout(Duration::from_millis(250), conn.closed()).await;
                 drop(conn);
                 drop(guard);
+                drop(active_ref);
             });
         }
     }
@@ -1167,10 +1196,11 @@ impl P2pStream {
         send: SendStream,
         recv: RecvStream,
         write_timeout: Duration,
+        active_ref: Option<P2pActiveRef>,
     ) -> Self {
         let peer_transport_id = conn.remote_id().to_string();
         Self {
-            conn_drop: Arc::new(P2pConnDropper::new(guard, conn)),
+            conn_drop: Arc::new(P2pConnDropper::new(guard, conn, active_ref)),
             peer_ip: None,
             peer_transport_id,
             send: P2pFinishSend(send),
@@ -1398,7 +1428,8 @@ impl P2pListener {
                         timeout(P2P_MAGIC_TIMEOUT, recv.read_exact(&mut magic)).await
                         && magic[0] == P2P_STREAM_MAGIC
                     {
-                        let stream = P2pStream::new(stream_guard, conn, send, recv, write_timeout);
+                        let stream =
+                            P2pStream::new(stream_guard, conn, send, recv, write_timeout, None);
                         let _ = timeout(P2P_ACCEPT_BI_TIMEOUT, tx_c.send(stream)).await;
                     }
                 });
@@ -1471,6 +1502,7 @@ pub struct P2pDialer {
     /// Relay host names answered from their checked addresses: the operator pins
     /// ([`P2pOptions::with_dns_pins`]) and the hosts checked at bind and on every dial.
     pins: DnsPinTable,
+    active_refs: Arc<AtomicUsize>,
 }
 
 fn configured_relay_urls(mode: &P2pRelayMode) -> Vec<String> {
@@ -1911,7 +1943,25 @@ impl P2pDialer {
             trusted_relays,
             hint_relay_map,
             pins,
+            active_refs: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Number of active dials and open streams backed by this dialer.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.active_refs.load(Ordering::Acquire)
+    }
+
+    /// Reports whether this dialer's underlying iroh endpoint has been closed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.guard.closed.load(Ordering::Acquire)
+    }
+
+    /// Closes this dialer's endpoint handle without consuming `self`.
+    pub(crate) async fn close_ref(&self) {
+        self.guard.close_now().await;
     }
 
     /// Local UDP socket addresses this dialer's endpoint is bound to.
@@ -1965,6 +2015,7 @@ impl PathDialer for P2pDialer {
     }
 
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+        let active_ref = P2pActiveRef::enter(&self.active_refs);
         let addr = if let Some(map) = &self.hint_relay_map {
             filter_hint_addr(endpoint, map)
                 .map_err(|reason| {
@@ -2013,6 +2064,7 @@ impl PathDialer for P2pDialer {
             send,
             recv,
             self.write_timeout,
+            Some(active_ref),
         )))
     }
 }
