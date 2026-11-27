@@ -1739,13 +1739,14 @@ impl Endpoint {
     ) -> Result<String> {
         let store = self.group_store()?;
         let wire = f64_to_u8(min_wire_version, "min_wire_version")?;
-        let manifest = rt_group_create(
-            &store,
-            &self.identity,
-            &name,
-            wire,
-            endpoints.unwrap_or_default(),
-        )
+        self.sync_roster_from_store().await?;
+        let identity = Arc::clone(&self.identity);
+        let endpoints = endpoints.unwrap_or_default();
+        let manifest = tokio::task::spawn_blocking(move || {
+            rt_group_create(&store, &identity, &name, wire, endpoints)
+        })
+        .await
+        .map_err(to_generic_err)?
         .map_err(to_generic_err)?;
         manifest_json(&manifest)
     }
@@ -1759,14 +1760,14 @@ impl Endpoint {
         endpoints: Option<Vec<String>>,
     ) -> Result<String> {
         let store = self.group_store()?;
-        let manifest = rt_group_add_member(
-            &store,
-            &self.identity,
-            &group_id,
-            &peer_id,
-            caps.unwrap_or_default(),
-            endpoints.unwrap_or_default(),
-        )
+        self.sync_roster_from_store().await?;
+        let identity = Arc::clone(&self.identity);
+        let (caps, endpoints) = (caps.unwrap_or_default(), endpoints.unwrap_or_default());
+        let manifest = tokio::task::spawn_blocking(move || {
+            rt_group_add_member(&store, &identity, &group_id, &peer_id, caps, endpoints)
+        })
+        .await
+        .map_err(to_generic_err)?
         .map_err(to_generic_err)?;
         manifest_json(&manifest)
     }
@@ -1774,8 +1775,14 @@ impl Endpoint {
     #[napi]
     pub async fn group_remove_member(&self, group_id: String, peer_id: String) -> Result<String> {
         let store = self.group_store()?;
-        let manifest = rt_group_remove_member(&store, &self.identity, &group_id, &peer_id)
-            .map_err(to_generic_err)?;
+        self.sync_roster_from_store().await?;
+        let identity = Arc::clone(&self.identity);
+        let manifest = tokio::task::spawn_blocking(move || {
+            rt_group_remove_member(&store, &identity, &group_id, &peer_id)
+        })
+        .await
+        .map_err(to_generic_err)?
+        .map_err(to_generic_err)?;
         manifest_json(&manifest)
     }
 
@@ -1786,12 +1793,13 @@ impl Endpoint {
         sender_peer_id: String,
     ) -> Result<String> {
         let store = self.group_store()?;
-        rt_group_ingest_manifest(
-            &store,
-            &self.identity.device_id(),
-            &sender_peer_id,
-            &manifest_json,
-        )
+        self.sync_roster_from_store().await?;
+        let local_id = self.identity.device_id();
+        tokio::task::spawn_blocking(move || {
+            rt_group_ingest_manifest(&store, &local_id, &sender_peer_id, &manifest_json)
+        })
+        .await
+        .map_err(to_generic_err)?
         .map(|outcome| outcome.group_id)
         .map_err(to_generic_err)
     }
@@ -1811,6 +1819,7 @@ impl Endpoint {
                     .map_err(|e| to_invalid_arg(format!("invalid address: {e}")))
             })
             .transpose()?;
+        self.sync_roster_from_store().await?;
         let transport_cfg = self.snapshot_transport_cfg();
         let mut dialers: Vec<Arc<dyn PathDialer>> = vec![
             Arc::new(DirectDialer::new()),
@@ -3268,6 +3277,14 @@ impl Session {
     /// event instead.
     async fn group_frame_json(&self, ev: SessionEvent) -> Result<serde_json::Value> {
         if let Some(store) = self.store.as_ref() {
+            // The runtime reads the stored roster: commit held revocations first.
+            sync_roster_async(
+                self.store.as_ref(),
+                &self.store_lock,
+                &self.roster,
+                &self.identity,
+            )
+            .await?;
             let peer = self.session.peer_device_id().ok_or_else(|| {
                 Error::new(Status::GenericFailure, "session peer is not authenticated")
             })?;
