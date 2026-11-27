@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 use crate::crypto::{
     HybridSigningPublicKey, device_id, has_control_chars, is_valid_x25519_public_key,
 };
-use crate::error::CoreError;
+use crate::error::{CoreError, RefusalReason};
 use crate::grants::{
     AuditEvent, Grant, RevocationList, authorize_grant, authorize_path_capability,
     verify_grant_with_chain,
@@ -19,7 +19,8 @@ use crate::group::{
 use crate::identity::{EndpointIdentity, RotationRecord};
 use crate::noise::{NoiseHfsHandshake, NoiseHfsHandshakeBuilder, NoiseTransport};
 use crate::pairing::{PairingUri, RouteCheck, VerifiedRouteStatement};
-use crate::roster::{PeerState, Roster};
+use crate::refusal::{RefusalLimiter, RefusalMode};
+use crate::roster::{PeerState, Roster, StaticResolution};
 use crate::routes::{MAX_ROUTE_SEQ, RouteSet};
 use crate::wire::{
     HostHello, InnerFrameType, Intent, PathUpgradeMsg, PathUpgradeState, Preamble,
@@ -98,6 +99,15 @@ pub enum SessionAction {
     CloseTransport {
         code: u16,
         reason: String,
+    },
+    /// The responder refused a known revoked or pending peer (`spec/wire-v1.md` Section 3.3).
+    ///
+    /// Follows the `WriteBytes` carrying the one encrypted `0x07 CLOSE` frame. The session is
+    /// closed and never emitted `Established`; the caller writes the frame and runs the refusal
+    /// close sequence (`spec/wire-v1.md` Section 5.4.4).
+    Refused {
+        peer_device_id: String,
+        code: u16,
     },
 }
 
@@ -415,6 +425,8 @@ pub struct SessionMachine {
     local_upgrade_caps: Vec<String>,
     peer_upgrade_caps: Vec<String>,
     upgrade_state: PathUpgradeState,
+    refusal_mode: RefusalMode,
+    remote_refusal: Option<u16>,
 }
 
 impl fmt::Debug for SessionMachine {
@@ -469,6 +481,8 @@ impl SessionMachine {
             local_upgrade_caps: Vec::new(),
             peer_upgrade_caps: Vec::new(),
             upgrade_state: PathUpgradeState::new(true),
+            refusal_mode: RefusalMode::Off,
+            remote_refusal: None,
         })
     }
 
@@ -494,9 +508,25 @@ impl SessionMachine {
     }
 
     /// Creates a responder session listening for an inbound initiator preamble.
+    ///
+    /// Never refuses: a known revoked or pending peer is dropped silently, as with
+    /// [`RefusalMode::Off`].
     pub fn new_responder(
         local_identity: &EndpointIdentity,
         fixed_ephemeral: Option<[u8; 32]>,
+    ) -> Result<Self, CoreError> {
+        Self::new_responder_with_refusal(local_identity, fixed_ephemeral, RefusalMode::Off)
+    }
+
+    /// Creates a responder session whose listener may refuse known revoked or pending peers
+    /// (`spec/wire-v1.md` Section 5.4.3).
+    ///
+    /// With [`RefusalMode::Enabled`], refusals are sent only when the session is fed through
+    /// [`Self::feed_bytes_with_limiter`]; [`Self::feed_bytes`] keeps the silent drop.
+    pub fn new_responder_with_refusal(
+        local_identity: &EndpointIdentity,
+        fixed_ephemeral: Option<[u8; 32]>,
+        refusal_mode: RefusalMode,
     ) -> Result<Self, CoreError> {
         let hs = build_handshake(false, local_identity, fixed_ephemeral)?;
         Ok(Self {
@@ -530,6 +560,8 @@ impl SessionMachine {
             local_upgrade_caps: Vec::new(),
             peer_upgrade_caps: Vec::new(),
             upgrade_state: PathUpgradeState::new(false),
+            refusal_mode,
+            remote_refusal: None,
         })
     }
 
@@ -566,6 +598,7 @@ impl SessionMachine {
         msg: &PathUpgradeMsg,
         now_ms: u64,
     ) -> Result<Vec<SessionAction>, CoreError> {
+        self.check_not_refused()?;
         if !self.is_established() {
             return Err(CoreError::NotReady("session not in transport mode"));
         }
@@ -722,6 +755,8 @@ impl SessionMachine {
     }
 
     /// Feeds raw transport bytes into the session state machine under explicit virtual time.
+    ///
+    /// A responder fed this way never refuses; see [`Self::feed_bytes_with_limiter`].
     pub fn feed_bytes(
         &mut self,
         chunk: &[u8],
@@ -729,11 +764,47 @@ impl SessionMachine {
         now_ms: u64,
         roster: &mut Roster,
     ) -> Result<Vec<SessionAction>, CoreError> {
+        self.feed_inner(chunk, now_unix, now_ms, roster, None)
+    }
+
+    /// Feeds raw transport bytes as [`Self::feed_bytes`] does, consulting the endpoint's shared
+    /// refusal limiter (`spec/wire-v1.md` Section 5.4.2) before a refusal is sent.
+    pub fn feed_bytes_with_limiter(
+        &mut self,
+        chunk: &[u8],
+        now_unix: u64,
+        now_ms: u64,
+        roster: &mut Roster,
+        limiter: &mut RefusalLimiter,
+    ) -> Result<Vec<SessionAction>, CoreError> {
+        self.feed_inner(chunk, now_unix, now_ms, roster, Some(limiter))
+    }
+
+    /// `SessionClosed` with the refusal code once a received refusal closed the session.
+    fn check_not_refused(&self) -> Result<(), CoreError> {
+        if self.remote_refusal.is_some() && self.is_closed() {
+            return Err(self.closed_error("session closed"));
+        }
+        Ok(())
+    }
+
+    fn closed_error(&self, reason: &str) -> CoreError {
+        CoreError::SessionClosed {
+            code: self.remote_refusal.unwrap_or(SessionCloseCode::NORMAL),
+            reason: reason.to_string(),
+        }
+    }
+
+    fn feed_inner(
+        &mut self,
+        chunk: &[u8],
+        now_unix: u64,
+        now_ms: u64,
+        roster: &mut Roster,
+        mut limiter: Option<&mut RefusalLimiter>,
+    ) -> Result<Vec<SessionAction>, CoreError> {
         if self.is_closed() {
-            return Err(CoreError::SessionClosed {
-                code: SessionCloseCode::NORMAL,
-                reason: "session is closed".to_string(),
-            });
+            return Err(self.closed_error("session is closed"));
         }
         if let Err(err) = self.reader.push(chunk) {
             self.phase = SessionPhase::Closed;
@@ -777,7 +848,14 @@ impl SessionMachine {
                 }
             };
 
-            if let Err(err) = self.handle_frame(&body, now_unix, now_ms, roster, &mut actions) {
+            if let Err(err) = self.handle_frame(
+                &body,
+                now_unix,
+                now_ms,
+                roster,
+                limiter.as_deref_mut(),
+                &mut actions,
+            ) {
                 self.phase = SessionPhase::Closed;
                 return Err(err);
             }
@@ -841,6 +919,7 @@ impl SessionMachine {
 
     /// Explicitly initiates a Noise `0x04 REKEY` transition on the outgoing cipher state.
     pub fn send_rekey(&mut self, now_ms: u64) -> Result<Vec<SessionAction>, CoreError> {
+        self.check_not_refused()?;
         let SessionPhase::Transport(ref mut tx) = self.phase else {
             return Err(CoreError::NotReady("session not in transport mode"));
         };
@@ -863,6 +942,7 @@ impl SessionMachine {
 
     /// Sends an encrypted `0x07 CLOSE` frame and transitions to terminal closed state.
     pub fn send_close(&mut self, code: u16, reason: &str) -> Result<Vec<SessionAction>, CoreError> {
+        self.check_not_refused()?;
         if !matches!(self.phase, SessionPhase::Transport(_)) {
             return Err(CoreError::NotReady("session not in transport mode"));
         }
@@ -1005,10 +1085,7 @@ impl SessionMachine {
     ) -> Result<Vec<SessionAction>, CoreError> {
         let mut actions = Vec::new();
         if self.is_closed() {
-            return Err(CoreError::SessionClosed {
-                code: SessionCloseCode::NORMAL,
-                reason: "session closed".to_string(),
-            });
+            return Err(self.closed_error("session closed"));
         }
         if !matches!(self.phase, SessionPhase::Transport(_)) {
             return Err(CoreError::NotReady("session not in transport mode"));
@@ -1046,6 +1123,7 @@ impl SessionMachine {
         now_unix: u64,
         now_ms: u64,
         roster: &mut Roster,
+        limiter: Option<&mut RefusalLimiter>,
         actions: &mut Vec<SessionAction>,
     ) -> Result<(), CoreError> {
         let phase = std::mem::replace(&mut self.phase, SessionPhase::Closed);
@@ -1181,13 +1259,54 @@ impl SessionMachine {
                     ));
                 }
 
-                let peer_entry = roster.lookup_active_by_static(&peer_static)?;
-                if peer_entry.min_wire_version > WIRE_VERSION {
+                // Floor first: a peer whose floor forbids `0x01` never gets a transport frame.
+                let floor = roster.pairing_floor(&peer_static);
+                if floor > WIRE_VERSION {
                     return Err(CoreError::VersionDowngrade {
-                        peer_min: peer_entry.min_wire_version,
+                        peer_min: floor,
                         negotiated: WIRE_VERSION,
                     });
                 }
+                roster.prune_expired_refusal_notices(now_unix);
+                let silent = match roster.resolve_static(&peer_static) {
+                    StaticResolution::Active(entry) => {
+                        entry.require_static_pin()?;
+                        None
+                    }
+                    StaticResolution::Revoked(entry) => {
+                        Some(CoreError::PeerRevoked(entry.device_id.clone()))
+                    }
+                    StaticResolution::Pending(entry) => {
+                        Some(CoreError::PeerPending(entry.device_id.clone()))
+                    }
+                    StaticResolution::NotFound => {
+                        return Err(CoreError::PeerNotFound(device_id(&peer_static)));
+                    }
+                };
+                if let Some(silent) = silent {
+                    // Keyed on the canonical id so every alias of one key shares a window.
+                    let canonical = device_id(&peer_static);
+                    let Some(reason) = refusal_decision(
+                        self.refusal_mode,
+                        roster,
+                        &peer_static,
+                        &canonical,
+                        now_unix,
+                        limiter,
+                    ) else {
+                        return Err(silent);
+                    };
+                    let mut tx = hs.into_transport_mode()?;
+                    let code = reason.close_code();
+                    let frame = encrypt_inner(&mut tx, InnerFrameType::Close, &code.to_be_bytes())?;
+                    actions.push(SessionAction::WriteBytes(frame));
+                    actions.push(SessionAction::Refused {
+                        peer_device_id: canonical,
+                        code,
+                    });
+                    return Ok(());
+                }
+                let peer_entry = roster.lookup_active_by_static(&peer_static)?;
                 let canonical_peer_id = peer_entry.device_id.clone();
                 let crl = roster.crl(&self.local_host_id);
                 if roster.crl_revokes_entry(peer_entry) || roster.crl_revokes_id(&canonical_peer_id)
@@ -1301,6 +1420,11 @@ impl SessionMachine {
                             CoreError::InvalidInnerFramePayload("CLOSE reason must be UTF-8")
                         })?;
                         self.phase = SessionPhase::Closed;
+                        if self.role == SessionRole::Initiator
+                            && RefusalReason::from_close_code(code).is_some()
+                        {
+                            self.remote_refusal = Some(code);
+                        }
                         actions.push(SessionAction::CloseTransport { code, reason });
                     }
                     InnerFrameType::RouteSet => receive_route_set(
@@ -1321,10 +1445,7 @@ impl SessionMachine {
             }
             SessionPhase::Init(_) => Err(CoreError::NotReady("initiator must call start() first")),
             SessionPhase::AwaitPreamble(_) => Err(CoreError::NotReady("session preamble missing")),
-            SessionPhase::Closed => Err(CoreError::SessionClosed {
-                code: SessionCloseCode::NORMAL,
-                reason: "session closed".to_string(),
-            }),
+            SessionPhase::Closed => Err(self.closed_error("session closed")),
         }
     }
 
@@ -1425,6 +1546,26 @@ impl SessionMachine {
             roster.lookup_active_signing_key(issuer_id)
         }
     }
+}
+
+/// Decides whether a responder refuses the known peer `peer_static` (`peer_id`) at `now_unix`.
+///
+/// Runs the checks in the spec order: the listener mode, the roster's notice and policy rules
+/// ([`Roster::refusal_for_static`]), then the shared limiter, which is charged only when every
+/// other check passed. A missing limiter means no refusal. The caller checks the floor first.
+pub(crate) fn refusal_decision(
+    mode: RefusalMode,
+    roster: &Roster,
+    peer_static: &[u8; 32],
+    peer_id: &str,
+    now_unix: u64,
+    limiter: Option<&mut RefusalLimiter>,
+) -> Option<RefusalReason> {
+    if !mode.is_enabled() {
+        return None;
+    }
+    let reason = roster.refusal_for_static(peer_static, now_unix)?;
+    limiter?.allow(peer_id, now_unix).then_some(reason)
 }
 
 /// Fails closed with [`CoreError::VersionDowngrade`] when `roster` pins `target_host_id` to a
