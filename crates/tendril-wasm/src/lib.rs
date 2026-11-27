@@ -69,7 +69,8 @@ const GENERIC_ERROR_CODE: &str = "error";
 /// An error crossing the JS boundary: a stable machine `code` plus the human message.
 ///
 /// JS receives an `Error` whose `message` is the message and whose `code` property is the
-/// code: the snake-case name of the [`CoreError`](tendril_core::error::CoreError) variant, or
+/// code: the code from `CoreError::code` (the snake-case variant name, except `PeerRefused`,
+/// which maps to `refused_revoked`, `refused_pending` or `refused`), or
 /// [`GENERIC_ERROR_CODE`] for argument and state errors of this crate. Callers rank errors by
 /// `code`, never by message text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +90,7 @@ impl WasmError {
     /// A core error behind a context prefix; the code stays the core variant's.
     fn core_in(context: impl fmt::Display, err: &tendril_core::error::CoreError) -> Self {
         Self {
-            code: core_error_code(err),
+            code: err.code(),
             message: format!("{context}: {err}"),
         }
     }
@@ -104,7 +105,7 @@ impl fmt::Display for WasmError {
 impl From<tendril_core::error::CoreError> for WasmError {
     fn from(err: tendril_core::error::CoreError) -> Self {
         Self {
-            code: core_error_code(&err),
+            code: err.code(),
             message: err.to_string(),
         }
     }
@@ -131,76 +132,6 @@ impl From<serde_json::Error> for WasmError {
 impl From<std::str::Utf8Error> for WasmError {
     fn from(err: std::str::Utf8Error) -> Self {
         Self::generic(err.to_string())
-    }
-}
-
-/// The stable code of a core error: the snake-case variant name. The match is exhaustive, so a
-/// new variant cannot ship without a code.
-fn core_error_code(err: &tendril_core::error::CoreError) -> &'static str {
-    use tendril_core::error::CoreError;
-    match err {
-        CoreError::InvalidPreambleLength { .. } => "invalid_preamble_length",
-        CoreError::BadPreambleMagic => "bad_preamble_magic",
-        CoreError::UnsupportedVersion(_) => "unsupported_version",
-        CoreError::UnknownIntent(_) => "unknown_intent",
-        CoreError::NonZeroReserved(_) => "non_zero_reserved",
-        CoreError::InvalidPreambleFlags { .. } => "invalid_preamble_flags",
-        CoreError::VersionDowngrade { .. } => "version_downgrade",
-        CoreError::PairingAuthFailed => "pairing_auth_failed",
-        CoreError::FrameTooLarge { .. } => "frame_too_large",
-        CoreError::TruncatedFrame { .. } => "truncated_frame",
-        CoreError::EmptyInnerFrame => "empty_inner_frame",
-        CoreError::UnknownInnerFrameType(_) => "unknown_inner_frame_type",
-        CoreError::InvalidInnerFramePayload(_) => "invalid_inner_frame_payload",
-        CoreError::InvalidLength { .. } => "invalid_length",
-        CoreError::Base64Decode(_) => "base64_decode",
-        CoreError::InvalidSignature => "invalid_signature",
-        CoreError::Argon2(_) => "argon2",
-        CoreError::Noise(_) => "noise",
-        CoreError::InvalidTimestamp(_) => "invalid_timestamp",
-        CoreError::RotationEmptyChain => "rotation_empty_chain",
-        CoreError::RotationRootMismatch => "rotation_root_mismatch",
-        CoreError::RotationNonMonotonicSeq { .. } => "rotation_non_monotonic_seq",
-        CoreError::RotationNonContiguous => "rotation_non_contiguous",
-        CoreError::RotationForkDetected { .. } => "rotation_fork_detected",
-        CoreError::RotationEndpointMismatch => "rotation_endpoint_mismatch",
-        CoreError::HostKeyUnverified => "host_key_unverified",
-        CoreError::InvalidCapability(_) => "invalid_capability",
-        CoreError::CanonicalJson(_) => "canonical_json",
-        CoreError::GrantDenied(_) => "grant_denied",
-        CoreError::DelegationDenied(_) => "delegation_denied",
-        CoreError::Rng(_) => "rng",
-        CoreError::Json(_) => "json",
-        CoreError::ProtocolViolation(_) => "protocol_violation",
-        CoreError::PeerNotFound(_) => "peer_not_found",
-        CoreError::PeerPending(_) => "peer_pending",
-        CoreError::PeerRevoked(_) => "peer_revoked",
-        CoreError::IncompletePin(_) => "incomplete_pin",
-        CoreError::PairingCodeInvalid => "pairing_code_invalid",
-        CoreError::PairingCodeExpired => "pairing_code_expired",
-        CoreError::PairingCodeBurned => "pairing_code_burned",
-        CoreError::PairingPathDisallowed(_) => "pairing_path_disallowed",
-        CoreError::InvalidPairingUri(_) => "invalid_pairing_uri",
-        CoreError::CrlUnsupportedVersion(_) => "crl_unsupported_version",
-        CoreError::CrlIssuerMismatch { .. } => "crl_issuer_mismatch",
-        CoreError::CrlStaleSeq { .. } => "crl_stale_seq",
-        CoreError::SessionClosed { .. } => "session_closed",
-        CoreError::EnrollmentTokenInvalid(_) => "enrollment_token_invalid",
-        CoreError::EnrollmentTokenExpired => "enrollment_token_expired",
-        CoreError::EnrollmentTokenReplayed => "enrollment_token_replayed",
-        CoreError::EnrollmentAnchorUntrusted(_) => "enrollment_anchor_untrusted",
-        CoreError::EnrollmentBurnLogFull => "enrollment_burn_log_full",
-        CoreError::NotReady(_) => "not_ready",
-        CoreError::BufferOverflow { .. } => "buffer_overflow",
-        CoreError::InvalidGroupManifest(_) => "invalid_group_manifest",
-        CoreError::InvalidGroupCapabilityScope(_) => "invalid_group_capability_scope",
-        CoreError::GroupSeqRollback { .. } => "group_seq_rollback",
-        CoreError::GroupManifestFork { .. } => "group_manifest_fork",
-        CoreError::GroupMemberRevoked(_) => "group_member_revoked",
-        CoreError::GroupNotFound(_) => "group_not_found",
-        CoreError::GroupUnauthorized(_) => "group_unauthorized",
-        CoreError::GroupManifestTooLarge { .. } => "group_manifest_too_large",
-        CoreError::GroupWireDowngrade { .. } => "group_wire_downgrade",
     }
 }
 

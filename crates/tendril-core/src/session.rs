@@ -43,9 +43,16 @@ impl SessionCloseCode {
     pub const NORMAL: u16 = 1000;
     pub const PROTOCOL_ERROR: u16 = 1002;
     pub const POLICY_VIOLATION: u16 = 1008;
-    pub const REVOKED: u16 = 4001;
+    /// Refusal: the responder knows the peer and it is revoked (`spec/wire-v1.md` Section 5.4.1).
+    pub const PEER_REVOKED: u16 = 4001;
+    /// Alias of [`Self::PEER_REVOKED`], kept for existing callers.
+    pub const REVOKED: u16 = Self::PEER_REVOKED;
+    /// Reserved, never a refusal.
     pub const GRANT_EXPIRED: u16 = 4002;
+    /// Reserved, never a refusal.
     pub const KEY_UNVERIFIED: u16 = 4003;
+    /// Refusal: the responder knows the peer and it is still pending confirmation.
+    pub const PEER_PENDING: u16 = 4004;
 }
 
 /// Direction of a completed Noise `CipherState::rekey()` transition.
@@ -1474,6 +1481,15 @@ fn encrypt_inner(
 mod tests {
     use super::*;
     use crate::crypto::{SigningKeypair, StaticKeypair};
+
+    #[test]
+    fn close_code_registry_matches_spec() {
+        assert_eq!(SessionCloseCode::PEER_REVOKED, 4001);
+        assert_eq!(SessionCloseCode::PEER_PENDING, 4004);
+        assert_eq!(SessionCloseCode::REVOKED, SessionCloseCode::PEER_REVOKED);
+        assert_eq!(SessionCloseCode::GRANT_EXPIRED, 4002);
+        assert_eq!(SessionCloseCode::KEY_UNVERIFIED, 4003);
+    }
 
     fn established_pair() -> (SessionMachine, SessionMachine) {
         established_pair_with(None)
