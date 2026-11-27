@@ -13,6 +13,84 @@ public enum TendrilError: Error, Equatable, Sendable {
   case invalidArgument(String)
   case closed
   case ffi(code: Int32, message: String)
+  /// The host proved it knows this device and refuses to serve it. A Wire v2 connect throws it
+  /// at once. After a Wire v1 connect, and after a v2 refusal that lands once the session is
+  /// up, `sendData`, `rekey` and `close` throw it and `pollEvent` delivers a `closed` event
+  /// that `TendrilRefusal(closedEventJson:)` turns into the same value.
+  case refused(TendrilRefusal)
+}
+
+/// Why a host refused this device. Read the app guidance on each case.
+public enum TendrilRefusal: Equatable, Sendable {
+  /// The host blocks this device key permanently (close code 4001, `refused_revoked`).
+  /// Retrying cannot help and re-pairing needs a new device identity: offer to forget the host.
+  case revoked
+  /// The host has not confirmed this device yet (close code 4004, `refused_pending`). Retry with
+  /// backoff.
+  case pending
+  /// Another refusal (`refused`), with its close code in 4400...4499. The code is 0 when the
+  /// refusal came from a failed call, which reports only the reason.
+  case other(UInt16)
+
+  /// The close code of the refusal on the wire.
+  public var closeCode: UInt16 {
+    switch self {
+    case .revoked: return UInt16(TENDRIL_CLOSE_PEER_REVOKED)
+    case .pending: return UInt16(TENDRIL_CLOSE_PEER_PENDING)
+    case .other(let code): return code
+    }
+  }
+
+  /// The stable machine code `tendril_last_error_code` reports: `refused_revoked`,
+  /// `refused_pending` or `refused`.
+  public var code: String {
+    switch self {
+    case .revoked: return "refused_revoked"
+    case .pending: return "refused_pending"
+    case .other: return "refused"
+    }
+  }
+
+  /// Maps a stable last-error code to a refusal, nil for any other code.
+  internal init?(code: String) {
+    switch code {
+    case "refused_revoked": self = .revoked
+    case "refused_pending": self = .pending
+    case "refused": self = .other(0)
+    default: return nil
+    }
+  }
+
+  /// The refusal a `closed` session event carries, nil for any other event and for a close
+  /// that is no refusal. Only sessions this endpoint dialed report one.
+  public init?(closedEventJson json: String) {
+    guard
+      let any = try? JSONSerialization.jsonObject(with: Data(json.utf8)),
+      let event = any as? [String: Any],
+      event["event"] as? String == "closed",
+      let refusal = event["refusal"] as? String
+    else {
+      return nil
+    }
+    switch refusal {
+    case "revoked": self = .revoked
+    case "pending": self = .pending
+    case "other":
+      let code = (event["code"] as? NSNumber).flatMap { UInt16(exactly: $0.intValue) } ?? 0
+      self = .other(code)
+    default: return nil
+    }
+  }
+}
+
+extension TendrilRefusal: CustomStringConvertible {
+  public var description: String {
+    switch self {
+    case .revoked: return "refused by peer (revoked)"
+    case .pending: return "refused by peer (pending)"
+    case .other(let code): return "refused by peer (other, close code \(code))"
+    }
+  }
 }
 
 public enum TendrilRuntimeProfile: String, Sendable, Equatable {
@@ -176,23 +254,28 @@ internal func withExpiringActivityGuard<T>(
   return try withExpiringStateActivity(onExpire: onExpire, body)
 }
 
-private func lastFfiError() -> String {
-  var buf = [CChar](repeating: 0, count: 512)
-  let needed = buf.withUnsafeMutableBufferPointer { ptr in
-    tendril_last_error(ptr.baseAddress, ptr.count)
+/// Copies the last FFI error text, or its stable code when `code` is true. The error state is
+/// thread-local: read it on the thread of the failing FFI call, before any other call.
+private func readLastFfi(code: Bool) -> String {
+  func read(_ ptr: UnsafeMutableBufferPointer<CChar>) -> Int {
+    Int(code ? tendril_last_error_code(ptr.baseAddress, ptr.count) : tendril_last_error(ptr.baseAddress, ptr.count))
   }
+  var buf = [CChar](repeating: 0, count: 512)
+  let needed = buf.withUnsafeMutableBufferPointer { read($0) }
   if needed <= 1 {
     return ""
   }
-  if Int(needed) <= buf.count {
+  if needed <= buf.count {
     return String(cString: buf)
   }
-  var larger = [CChar](repeating: 0, count: Int(needed))
-  larger.withUnsafeMutableBufferPointer { ptr in
-    _ = tendril_last_error(ptr.baseAddress, ptr.count)
-  }
+  var larger = [CChar](repeating: 0, count: needed)
+  _ = larger.withUnsafeMutableBufferPointer { read($0) }
   return String(cString: larger)
 }
+
+private func lastFfiError() -> String { readLastFfi(code: false) }
+
+private func lastFfiErrorCode() -> String { readLastFfi(code: true) }
 
 private func ffiError(_ code: Int32, fallback: String) -> TendrilError {
   if code == TENDRIL_WOULD_BLOCK.rawValue {
@@ -201,7 +284,12 @@ private func ffiError(_ code: Int32, fallback: String) -> TendrilError {
   if code == TENDRIL_EOF.rawValue {
     return .eof
   }
+  // Both reads happen back to back on the failing thread; every other FFI call clears them.
   let msg = lastFfiError()
+  let stableCode = lastFfiErrorCode()
+  if let refusal = TendrilRefusal(code: stableCode) {
+    return .refused(refusal)
+  }
   return .ffi(code: code, message: msg.isEmpty ? fallback : msg)
 }
 
@@ -1308,14 +1396,51 @@ public final class TendrilEndpoint: @unchecked Sendable {
     }
   }
 
-  public func revokePeer(peerId: String) throws {
+  /// Revokes `peerId` and clears its grants. A `nil` `notify` follows the endpoint refusal
+  /// policy, which records a refusal notice, so the peer gets an authenticated refusal on its
+  /// next session attempt. `notify: false` revokes silently and `true` records a notice when the policy TTL allows.
+  public func revokePeer(peerId: String, notify: Bool? = nil) throws {
+    let options = notify.map { "{\"notify\":\($0)}" }
     try withExpiringStateActivityIfNeeded {
       try self.withHandle { h in
         let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
-          tendril_endpoint_revoke_peer(h, cPeer)
+          try withOptionalValidatedCString(options, name: "options") { cOptions in
+            tendril_endpoint_revoke_peer_with_options(h, cPeer, cOptions)
+          }
         }
         guard rc == TENDRIL_OK.rawValue else {
-          throw ffiError(rc, fallback: "tendril_endpoint_revoke_peer failed")
+          throw ffiError(rc, fallback: "tendril_endpoint_revoke_peer_with_options failed")
+        }
+      }
+    }
+  }
+
+  /// Sets and persists the host refusal policy. `pending` refuses unconfirmed peers with close
+  /// code 4004. `revokedNoticeTtlSecs` is the lifetime of a notice recorded at revocation, and 0
+  /// records none.
+  public func setRefusalPolicy(pending: Bool, revokedNoticeTtlSecs: UInt64) throws {
+    let policy = "{\"pending\":\(pending),\"revoked_notice_ttl_secs\":\(revokedNoticeTtlSecs)}"
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(policy, name: "policy") { cPolicy in
+          tendril_endpoint_set_refusal_policy_json(h, cPolicy)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_set_refusal_policy_json failed")
+        }
+      }
+    }
+  }
+
+  /// Drops the refusal notice of `peerId`, which stays revoked. Throws for an unknown peer.
+  public func clearRefusalNotice(_ peerId: String) throws {
+    try withExpiringStateActivityIfNeeded {
+      try self.withHandle { h in
+        let rc = try withValidatedCString(peerId, name: "peerId") { cPeer in
+          tendril_endpoint_clear_refusal_notice(h, cPeer)
+        }
+        guard rc == TENDRIL_OK.rawValue else {
+          throw ffiError(rc, fallback: "tendril_endpoint_clear_refusal_notice failed")
         }
       }
     }
