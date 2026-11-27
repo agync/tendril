@@ -26,7 +26,7 @@ use crate::crypto::{
     device_id, fingerprint_device, has_control_chars, hkdf_sha256_32, is_valid_ed25519_public_key,
     is_valid_x25519_public_key, normalize_code, pairing_sas, random_bytes,
 };
-use crate::error::CoreError;
+use crate::error::{CoreError, RefusalReason};
 use crate::grants::{
     AuditEvent, Grant, RevocationList, authorize_grant, authorize_path_capability,
     verify_grant_with_chain,
@@ -46,11 +46,15 @@ use crate::pairing::{
     PinnedHost, VerifiedHost, VerifiedRouteStatement, claim_route_seq, human_key_claim,
     verify_human_key_claim,
 };
-use crate::roster::{HostSlot, PairMergeOutcome, PeerState, Roster, V2PeerSecrets};
+use crate::refusal::{RefusalLimiter, RefusalMode, RefusalReplayCache};
+use crate::roster::{
+    HostSlot, PairMergeOutcome, PeerState, Roster, RosterEntry, StaticResolution, V2PeerSecrets,
+};
 use crate::routes::RouteSet;
 use crate::session::{
     REKEY_MAX_AGE_MS, REKEY_MAX_FRAMES, RekeyDirection, RouteExpectation, SessionCloseCode,
-    SessionRole, check_route_seq, check_route_set_send, receive_route_set, verify_session_host,
+    SessionRole, check_route_seq, check_route_set_send, receive_route_set, refusal_decision,
+    verify_session_host,
 };
 use crate::wire::{
     AEAD_TAG_LEN, FLAG_PAKE_PAIR, HostHello, InnerFrameType, Intent, MAX_FRAME_LEN,
@@ -140,6 +144,9 @@ const RELAY_V2_ACCEPT_DOMAIN: &[u8] = b"tendril-relay-accept-v2\0";
 
 const RENDEZVOUS_DOMAIN: &[u8] = b"tendril-v2-rendezvous\0";
 const HELLO_SEAL_INFO: &[u8] = b"tendril-v2-hello-seal";
+const REFUSAL_SEAL_INFO: &[u8] = b"tendril-v2-refusal-seal";
+const REFUSAL_BODY_VERSION: u8 = 0x01;
+const REFUSAL_BODY_LEN: usize = 3;
 const PAKE_PROLOGUE_INFO: &[u8] = b"tendril-v2-pake-prologue";
 const PAKE_INIT_KEY_INFO: &[u8] = b"tendril-v2-pake-init-key";
 const PAKE_HELLO_INFO: &[u8] = b"tendril-v2-pake-hello";
@@ -1830,6 +1837,85 @@ pub fn unseal_v2_hello_envelope(
     Ok(Zeroizing::new(pt[2..2 + json_len].to_vec()))
 }
 
+/// Derives `refusal_seal_key` from the pair's `reconnect_secret` and the initiator's
+/// `rendezvous_nonce` (`spec/wire-v2.md` Section 3.1.5).
+#[must_use]
+pub fn derive_refusal_seal_key(
+    reconnect_secret: &[u8; 32],
+    rendezvous_nonce: &[u8; 16],
+) -> Zeroizing<[u8; 32]> {
+    hkdf_sha256_32(reconnect_secret, rendezvous_nonce, REFUSAL_SEAL_INFO)
+}
+
+/// Seals a refusal for v2 `msg2` in place of the sealed `HostHello` (`spec/wire-v2.md`
+/// Section 3.1.5): `uint16_be(3) || 0x01 || code_be16`, zero-padded so the envelope is exactly
+/// `bucket` bytes. `bucket` must be one of the v2 handshake buckets.
+pub fn seal_v2_refusal_envelope(
+    reconnect_secret: &[u8; 32],
+    rendezvous_nonce: &[u8; 16],
+    h_pre: &[u8; 32],
+    bucket: usize,
+    reason: RefusalReason,
+) -> Result<Vec<u8>, CoreError> {
+    if !V2_HANDSHAKE_BUCKETS.contains(&bucket) {
+        return Err(CoreError::ProtocolViolation(
+            "refusal envelope must fill a v2 handshake bucket",
+        ));
+    }
+    let mut buf = vec![0u8; bucket - AEAD_TAG_LEN];
+    buf[..2].copy_from_slice(&(REFUSAL_BODY_LEN as u16).to_be_bytes());
+    buf[2] = REFUSAL_BODY_VERSION;
+    buf[3..5].copy_from_slice(&reason.close_code().to_be_bytes());
+    let key = derive_refusal_seal_key(reconnect_secret, rendezvous_nonce);
+    let cipher = ChaCha20Poly1305::new_from_slice(&*key)
+        .map_err(|err| CoreError::Noise(format!("refusal seal init: {err}")))?;
+    cipher
+        .encrypt_in_place(&Nonce::from([0u8; 12]), h_pre, &mut buf)
+        .map_err(|_| CoreError::Noise("refusal envelope seal failed".into()))?;
+    Ok(buf)
+}
+
+/// Opens a v2 `msg2` envelope under `refusal_seal_key` (`spec/wire-v2.md` Section 3.1.4 step 2).
+///
+/// Returns [`CoreError::HostKeyUnverified`] when the AEAD open fails. An envelope that opens
+/// but is not a well-formed refusal (length outside the v2 handshake buckets, a low-order
+/// `remote_static`, non-zero padding, `len != 3`, `version != 0x01`, or a code that is not a
+/// refusal code) is [`CoreError::ProtocolViolation`].
+pub fn open_v2_refusal_envelope(
+    reconnect_secret: &[u8; 32],
+    rendezvous_nonce: &[u8; 16],
+    h_pre: &[u8; 32],
+    envelope: &[u8],
+    remote_static: &[u8; 32],
+) -> Result<RefusalReason, CoreError> {
+    if envelope.len() < AEAD_TAG_LEN {
+        return Err(CoreError::HostKeyUnverified);
+    }
+    let key = derive_refusal_seal_key(reconnect_secret, rendezvous_nonce);
+    let cipher = ChaCha20Poly1305::new_from_slice(&*key)
+        .map_err(|err| CoreError::Noise(format!("refusal open init: {err}")))?;
+    let mut pt = Zeroizing::new(envelope.to_vec());
+    cipher
+        .decrypt_in_place(&Nonce::from([0u8; 12]), h_pre, &mut *pt)
+        .map_err(|_| CoreError::HostKeyUnverified)?;
+    let malformed = CoreError::ProtocolViolation("malformed v2 refusal envelope");
+    if !V2_HANDSHAKE_BUCKETS.contains(&envelope.len())
+        || !is_valid_x25519_public_key(remote_static)
+        || pt.len() < 2 + REFUSAL_BODY_LEN
+        || usize::from(u16::from_be_bytes([pt[0], pt[1]])) != REFUSAL_BODY_LEN
+    {
+        return Err(malformed);
+    }
+    let mut nonzero = 0u8;
+    for &b in &pt[2 + REFUSAL_BODY_LEN..] {
+        nonzero |= b;
+    }
+    if !bool::from(nonzero.ct_eq(&0u8)) || pt[2] != REFUSAL_BODY_VERSION {
+        return Err(malformed);
+    }
+    RefusalReason::from_close_code(u16::from_be_bytes([pt[3], pt[4]])).ok_or(malformed)
+}
+
 fn pad_len_prefixed(buckets: &[usize], json: &[u8]) -> Result<Vec<u8>, CoreError> {
     let needed = 2 + json.len();
     let max = *buckets.last().unwrap_or(&63_488);
@@ -1968,6 +2054,28 @@ pub enum V2SessionAction {
         code: u16,
         reason: String,
     },
+    /// The responder refused a known revoked or pending peer.
+    ///
+    /// With `at_msg2`, the refusal replaced the sealed `HostHello` (`spec/wire-v2.md` Section
+    /// 3.1.3.3): the session stays on the decoy path, so the caller keeps the connection and its
+    /// half-open slot until `msg3` (rejected as `HostKeyUnverified`) or the handshake timeout,
+    /// exactly as for a decoy. Without it, the entry changed state before `msg3` (Section
+    /// 3.1.4): the preceding `WriteBytes` carries one sealed `0x07 CLOSE`, the session is closed,
+    /// and the caller runs the refusal close sequence (`spec/wire-v1.md` Section 5.4.4).
+    Refused {
+        peer_device_id: String,
+        code: u16,
+        at_msg2: bool,
+    },
+}
+
+/// Endpoint-wide refusal state a v2 listener shares across its connections
+/// (`spec/wire-v2.md` Section 3.1.3.2). The caller owns both, beside its
+/// [`RendezvousReplayCache`].
+#[derive(Debug)]
+pub struct V2RefusalCaches<'a> {
+    pub replay: &'a mut RefusalReplayCache,
+    pub limiter: &'a mut RefusalLimiter,
 }
 
 enum V2InitPhase {
@@ -2006,6 +2114,7 @@ pub struct V2SessionInitiator {
     local_upgrade_caps: Vec<String>,
     peer_upgrade_caps: Vec<String>,
     upgrade_state: PathUpgradeState,
+    remote_refusal: Option<u16>,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_rendezvous_nonce: Option<[u8; 16]>,
 }
@@ -2059,9 +2168,29 @@ impl V2SessionInitiator {
             local_upgrade_caps: Vec::new(),
             peer_upgrade_caps: Vec::new(),
             upgrade_state: PathUpgradeState::new(true),
+            remote_refusal: None,
             #[cfg(any(test, feature = "test-utils"))]
             fixed_rendezvous_nonce: None,
         })
+    }
+
+    fn closed_error(&self) -> CoreError {
+        CoreError::SessionClosed {
+            code: self.remote_refusal.unwrap_or(SessionCloseCode::NORMAL),
+            reason: "v2 session closed".to_string(),
+        }
+    }
+
+    /// The transport, or `SessionClosed` with the refusal code once a refusal closed the
+    /// session (`spec/wire-v1.md` Section 5.4.1).
+    fn transport_mut(&mut self) -> Result<&mut SealedSession, CoreError> {
+        if self.remote_refusal.is_some() && matches!(self.phase, V2InitPhase::Closed) {
+            return Err(self.closed_error());
+        }
+        match self.phase {
+            V2InitPhase::Transport(ref mut sealed) => Ok(sealed),
+            _ => Err(CoreError::NotReady("v2 session not established")),
+        }
     }
 
     /// Sets the gossip summary advertised in the initiator `SessionHello` (before `msg3`).
@@ -2174,6 +2303,9 @@ impl V2SessionInitiator {
         msg: &PathUpgradeMsg,
         now_ms: u64,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
+        if self.remote_refusal.is_some() && matches!(self.phase, V2InitPhase::Closed) {
+            return Err(self.closed_error());
+        }
         let V2InitPhase::Transport(ref mut sealed) = self.phase else {
             return Err(CoreError::NotReady("v2 session not established"));
         };
@@ -2264,10 +2396,7 @@ impl V2SessionInitiator {
         roster: &mut Roster,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
         if matches!(self.phase, V2InitPhase::Closed) {
-            return Err(CoreError::SessionClosed {
-                code: SessionCloseCode::NORMAL,
-                reason: "v2 session closed".to_string(),
-            });
+            return Err(self.closed_error());
         }
         if let Err(err) = self.reader.push(chunk) {
             self.phase = V2InitPhase::Closed;
@@ -2308,12 +2437,26 @@ impl V2SessionInitiator {
                 rendezvous_nonce,
             } => {
                 let (outer_env, h_pre) = hs.read_msg2_with_pre_payload_hash(body)?;
-                let hello_json = unseal_v2_hello_envelope(
+                let hello_json = match unseal_v2_hello_envelope(
                     &self.reconnect_secret,
                     &rendezvous_nonce,
                     &h_pre,
                     &outer_env,
-                )?;
+                ) {
+                    Ok(json) => json,
+                    Err(CoreError::HostKeyUnverified) => {
+                        let remote_static = hs.get_remote_static().copied().unwrap_or([0u8; 32]);
+                        let reason = open_v2_refusal_envelope(
+                            &self.reconnect_secret,
+                            &rendezvous_nonce,
+                            &h_pre,
+                            &outer_env,
+                            &remote_static,
+                        )?;
+                        return Err(CoreError::PeerRefused { reason });
+                    }
+                    Err(err) => return Err(err),
+                };
                 let host_hello: HostHello = serde_json::from_slice(&hello_json)
                     .map_err(|err| CoreError::Json(err.to_string()))?;
                 if host_hello.proto_version != WIRE_VERSION_V2 {
@@ -2405,10 +2548,7 @@ impl V2SessionInitiator {
                 self.handle_transport_frame(decoded, now_unix, now_ms, roster, actions)
             }
             V2InitPhase::Init(_) => Err(CoreError::NotReady("v2 initiator must call start()")),
-            V2InitPhase::Closed => Err(CoreError::SessionClosed {
-                code: SessionCloseCode::NORMAL,
-                reason: "v2 session closed".to_string(),
-            }),
+            V2InitPhase::Closed => Err(self.closed_error()),
         }
     }
 
@@ -2495,6 +2635,9 @@ impl V2SessionInitiator {
                             CoreError::InvalidInnerFramePayload("CLOSE reason must be UTF-8")
                         })?;
                         self.phase = V2InitPhase::Closed;
+                        if RefusalReason::from_close_code(code).is_some() {
+                            self.remote_refusal = Some(code);
+                        }
                         actions.push(V2SessionAction::CloseTransport { code, reason });
                     }
                     InnerFrameType::RouteSet => receive_route_set(
@@ -2634,9 +2777,7 @@ impl V2SessionInitiator {
         payload: &[u8],
         now_ms: u64,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
-        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-            return Err(CoreError::NotReady("v2 session not established"));
-        };
+        let sealed = self.transport_mut()?;
         seal_transport_action(sealed, InnerFrameType::Data, payload, now_ms)
     }
 
@@ -2646,9 +2787,7 @@ impl V2SessionInitiator {
         grant: &Grant,
         now_ms: u64,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
-        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-            return Err(CoreError::NotReady("v2 session not established"));
-        };
+        let sealed = self.transport_mut()?;
         let json = Zeroizing::new(
             serde_json::to_vec(grant).map_err(|err| CoreError::Json(err.to_string()))?,
         );
@@ -2661,9 +2800,7 @@ impl V2SessionInitiator {
         crl: &RevocationList,
         now_ms: u64,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
-        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-            return Err(CoreError::NotReady("v2 session not established"));
-        };
+        let sealed = self.transport_mut()?;
         let json = Zeroizing::new(
             serde_json::to_vec(crl).map_err(|err| CoreError::Json(err.to_string()))?,
         );
@@ -2676,9 +2813,7 @@ impl V2SessionInitiator {
         manifest: &GroupManifest,
         now_ms: u64,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
-        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-            return Err(CoreError::NotReady("v2 session not established"));
-        };
+        let sealed = self.transport_mut()?;
         let json = manifest.to_wire_bytes()?;
         seal_transport_action(sealed, InnerFrameType::GroupManifest, &json, now_ms)
     }
@@ -2689,9 +2824,7 @@ impl V2SessionInitiator {
         payload: &[u8],
         now_ms: u64,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
-        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-            return Err(CoreError::NotReady("v2 session not established"));
-        };
+        let sealed = self.transport_mut()?;
         seal_transport_action(sealed, InnerFrameType::GroupRendezvous, payload, now_ms)
     }
 
@@ -2701,17 +2834,13 @@ impl V2SessionInitiator {
         bucket: usize,
         now_ms: u64,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
-        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-            return Err(CoreError::NotReady("v2 session not established"));
-        };
+        let sealed = self.transport_mut()?;
         seal_cover_action(sealed, bucket, now_ms)
     }
 
     /// Explicitly initiates a Noise `0x04 REKEY` transition on the outgoing cipher state.
     pub fn seal_rekey(&mut self, now_ms: u64) -> Result<Vec<V2SessionAction>, CoreError> {
-        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-            return Err(CoreError::NotReady("v2 session not established"));
-        };
+        let sealed = self.transport_mut()?;
         seal_rekey_actions(sealed, now_ms)
     }
 
@@ -2721,9 +2850,7 @@ impl V2SessionInitiator {
         cookie: u64,
         now_ms: u64,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
-        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-            return Err(CoreError::NotReady("v2 session not established"));
-        };
+        let sealed = self.transport_mut()?;
         seal_transport_action(sealed, InnerFrameType::Ping, &cookie.to_be_bytes(), now_ms)
     }
 
@@ -2734,9 +2861,7 @@ impl V2SessionInitiator {
         reason: &str,
         now_ms: u64,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
-        let V2InitPhase::Transport(ref mut sealed) = self.phase else {
-            return Err(CoreError::NotReady("v2 session not established"));
-        };
+        let sealed = self.transport_mut()?;
         let actions = seal_close_payload(sealed, code, reason, now_ms)?;
         self.phase = V2InitPhase::Closed;
         Ok(actions)
@@ -2780,6 +2905,48 @@ impl V2SessionInitiator {
     }
 }
 
+/// The roster entry whose candidate secret authenticated a genuine `msg1`.
+struct MatchedPeer {
+    device_id: String,
+    static_pub: [u8; 32],
+    roster_key: String,
+    via_alternate: bool,
+}
+
+/// Class of a verified `msg1` candidate (`spec/wire-v2.md` Section 3.1.3.1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Msg1Class {
+    Genuine,
+    Refusal(RefusalReason),
+    Silent,
+}
+
+impl Msg1Class {
+    /// Strict merge order `Silent > Refusal(4001) > Genuine > Refusal(4004)`.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Silent => 3,
+            Self::Refusal(RefusalReason::Revoked | RefusalReason::Other(_)) => 2,
+            Self::Genuine => 1,
+            Self::Refusal(RefusalReason::Pending) => 0,
+        }
+    }
+}
+
+struct Msg1Candidate {
+    class: Msg1Class,
+    revoked_entry: bool,
+    peer: MatchedPeer,
+    secret: Zeroizing<[u8; 32]>,
+}
+
+/// Where a classified `msg1` goes once the replay caches and limiter have been consulted.
+enum Msg1Route {
+    Genuine(MatchedPeer, Zeroizing<[u8; 32]>),
+    Refusal(RefusalReason, String, Zeroizing<[u8; 32]>),
+    Decoy,
+}
+
 enum V2RespPhase {
     AwaitPreamble,
     AwaitMsg1 {
@@ -2787,7 +2954,7 @@ enum V2RespPhase {
     },
     AwaitMsg3 {
         hs: Box<NoiseHfsHandshake>,
-        authenticated_peer: Option<(String, [u8; 32])>,
+        authenticated_peer: Option<MatchedPeer>,
     },
     Transport(Box<SealedSession>),
     Closed,
@@ -2817,6 +2984,7 @@ pub struct V2SessionResponder {
     local_upgrade_caps: Vec<String>,
     peer_upgrade_caps: Vec<String>,
     upgrade_state: PathUpgradeState,
+    refusal_mode: RefusalMode,
     #[cfg(any(test, feature = "test-utils"))]
     fixed_ephemeral: Option<[u8; 32]>,
 }
@@ -2833,7 +3001,22 @@ impl fmt::Debug for V2SessionResponder {
 
 impl V2SessionResponder {
     /// Creates a new v2 session responder bound to `local_identity`.
+    ///
+    /// Never refuses: a known revoked or pending peer gets the decoy, as with
+    /// [`RefusalMode::Off`].
     pub fn new(local_identity: &EndpointIdentity) -> Result<Self, CoreError> {
+        Self::new_with_refusal(local_identity, RefusalMode::Off)
+    }
+
+    /// Creates a v2 session responder whose listener may refuse known revoked or pending peers
+    /// (`spec/wire-v1.md` Section 5.4.3).
+    ///
+    /// With [`RefusalMode::Enabled`], refusals are sent only when the session is fed through
+    /// [`Self::feed_bytes_with_caches`]; the other feed methods keep the decoy.
+    pub fn new_with_refusal(
+        local_identity: &EndpointIdentity,
+        refusal_mode: RefusalMode,
+    ) -> Result<Self, CoreError> {
         Ok(Self {
             phase: V2RespPhase::AwaitPreamble,
             reader: ResumableFrameReader::with_preamble(),
@@ -2856,6 +3039,7 @@ impl V2SessionResponder {
             local_upgrade_caps: Vec::new(),
             peer_upgrade_caps: Vec::new(),
             upgrade_state: PathUpgradeState::new(false),
+            refusal_mode,
             #[cfg(any(test, feature = "test-utils"))]
             fixed_ephemeral: None,
         })
@@ -3026,6 +3210,8 @@ impl V2SessionResponder {
     }
 
     /// Feeds raw transport bytes using a caller-owned shared [`RendezvousReplayCache`].
+    ///
+    /// Never refuses; see [`Self::feed_bytes_with_caches`].
     pub fn feed_bytes_with_replay_cache(
         &mut self,
         chunk: &[u8],
@@ -3033,6 +3219,33 @@ impl V2SessionResponder {
         now_ms: u64,
         roster: &mut Roster,
         replay_cache: &mut RendezvousReplayCache,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        self.feed_inner(chunk, now_unix, now_ms, roster, replay_cache, None)
+    }
+
+    /// Feeds raw transport bytes using the caller-owned shared replay cache and the listener's
+    /// refusal caches (`spec/wire-v2.md` Section 3.1.3.2). The refusal decision is made against
+    /// them before `msg2` is built.
+    pub fn feed_bytes_with_caches(
+        &mut self,
+        chunk: &[u8],
+        now_unix: u64,
+        now_ms: u64,
+        roster: &mut Roster,
+        replay_cache: &mut RendezvousReplayCache,
+        refusal: V2RefusalCaches<'_>,
+    ) -> Result<Vec<V2SessionAction>, CoreError> {
+        self.feed_inner(chunk, now_unix, now_ms, roster, replay_cache, Some(refusal))
+    }
+
+    fn feed_inner(
+        &mut self,
+        chunk: &[u8],
+        now_unix: u64,
+        now_ms: u64,
+        roster: &mut Roster,
+        replay_cache: &mut RendezvousReplayCache,
+        mut refusal: Option<V2RefusalCaches<'_>>,
     ) -> Result<Vec<V2SessionAction>, CoreError> {
         if matches!(self.phase, V2RespPhase::Closed) {
             return Err(CoreError::SessionClosed {
@@ -3077,9 +3290,15 @@ impl V2SessionResponder {
                     return Err(err);
                 }
             };
-            if let Err(err) =
-                self.handle_frame(&body, now_unix, now_ms, roster, replay_cache, &mut actions)
-            {
+            if let Err(err) = self.handle_frame(
+                &body,
+                now_unix,
+                now_ms,
+                roster,
+                replay_cache,
+                refusal.as_mut(),
+                &mut actions,
+            ) {
                 self.phase = V2RespPhase::Closed;
                 return Err(err);
             }
@@ -3089,6 +3308,7 @@ impl V2SessionResponder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_frame(
         &mut self,
         body: &[u8],
@@ -3096,6 +3316,7 @@ impl V2SessionResponder {
         now_ms: u64,
         roster: &mut Roster,
         replay_cache: &mut RendezvousReplayCache,
+        mut refusal: Option<&mut V2RefusalCaches<'_>>,
         actions: &mut Vec<V2SessionAction>,
     ) -> Result<(), CoreError> {
         let phase = std::mem::replace(&mut self.phase, V2RespPhase::Closed);
@@ -3109,12 +3330,10 @@ impl V2SessionResponder {
                 let ek_hash: [u8; 32] = Sha256::digest(&body[32..MSG1_LEN]).into();
                 let payload = &body[MSG1_LEN..];
 
-                let mut matched: Option<(String, [u8; 32], Zeroizing<[u8; 32]>)> = None;
                 let mut r_nonce = [0u8; 16];
                 let mut ts_unix = 0u64;
                 let mut candidate_mac = [0u8; 32];
                 let payload_valid_len = payload.len() == V2_RENDEZVOUS_PROOF_LEN;
-                let dummy_key = [0u8; 32];
 
                 if payload_valid_len {
                     r_nonce.copy_from_slice(&payload[..16]);
@@ -3123,51 +3342,58 @@ impl V2SessionResponder {
                 }
                 let ts_fresh =
                     payload_valid_len && ts_unix.abs_diff(now_unix) <= V2_RENDEZVOUS_MAX_SKEW_SECS;
-                let cache_accepts =
-                    payload_valid_len && replay_cache.can_accept(&r_nonce, now_unix);
 
-                for (key, entry) in roster.entries() {
-                    let active = entry.state == PeerState::Active;
-                    let candidates = entry
-                        .v2_secrets
-                        .iter()
-                        .chain(roster.rendezvous_alternates(key))
-                        .map(|s| s.reconnect_secret());
-                    for candidate in candidates {
-                        let key_ref = if active { candidate } else { &dummy_key };
-                        let mac_ok = verify_rendezvous_mac(
-                            key_ref,
-                            &preamble,
-                            &re_i,
-                            &ek_hash,
-                            &r_nonce,
-                            ts_unix,
-                            &candidate_mac,
-                        );
-                        if payload_valid_len && active && ts_fresh && cache_accepts && mac_ok {
-                            matched = Some((
-                                entry.device_id.clone(),
-                                entry.static_pub,
-                                Zeroizing::new(*key_ref),
-                            ));
-                        }
+                roster.prune_expired_refusal_notices(now_unix);
+                let verified = classify_msg1(
+                    roster,
+                    self.refusal_mode.is_enabled() && refusal.is_some(),
+                    now_unix,
+                    |secret| {
+                        gated_rendezvous_check(payload_valid_len, || {
+                            verify_rendezvous_mac(
+                                secret,
+                                &preamble,
+                                &re_i,
+                                &ek_hash,
+                                &r_nonce,
+                                ts_unix,
+                                &candidate_mac,
+                            )
+                        })
+                    },
+                );
+                let route = match merge_msg1_candidates(verified) {
+                    Some((Msg1Class::Genuine, c))
+                        if ts_fresh
+                            && replay_cache.can_accept(&r_nonce, now_unix)
+                            && refusal
+                                .as_ref()
+                                .is_none_or(|r| !r.replay.contains(&r_nonce, now_unix))
+                            && replay_cache.record(r_nonce, ts_unix, now_unix) =>
+                    {
+                        Msg1Route::Genuine(c.peer, c.secret)
                     }
-                }
+                    Some((Msg1Class::Refusal(reason), c))
+                        if ts_fresh
+                            && admit_refusal(
+                                refusal.as_deref_mut(),
+                                replay_cache,
+                                &r_nonce,
+                                ts_unix,
+                                now_unix,
+                                &device_id(&c.peer.static_pub),
+                            ) =>
+                    {
+                        Msg1Route::Refusal(reason, device_id(&c.peer.static_pub), c.secret)
+                    }
+                    _ => Msg1Route::Decoy,
+                };
 
                 let hello_json = self.build_host_hello_json()?;
                 let decoy_bucket = select_handshake_bucket(2 + hello_json.len() + AEAD_TAG_LEN)?;
 
                 let decoy_static = StaticKeypair::generate()?;
-                let recorded_match = match matched {
-                    Some((peer_id, peer_static, secret))
-                        if replay_cache.record(r_nonce, ts_unix, now_unix) =>
-                    {
-                        Some((peer_id, peer_static, secret))
-                    }
-                    _ => None,
-                };
-
-                let hs_priv: &[u8; 32] = if recorded_match.is_some() {
+                let hs_priv: &[u8; 32] = if matches!(route, Msg1Route::Genuine(..)) {
                     &self.local_static_priv
                 } else {
                     decoy_static.secret_bytes()
@@ -3184,22 +3410,37 @@ impl V2SessionResponder {
                 let mut hs = builder.build_responder()?;
                 hs.read_message_vec(body)?;
 
-                let (msg2, authenticated_peer) = if let Some((peer_id, peer_static, secret)) =
-                    recorded_match
-                {
-                    let msg2 = hs.write_msg2_with_hash(|h_pre| {
-                        seal_v2_hello_envelope(&secret, &r_nonce, h_pre, &hello_json)
-                    })?;
-                    self.matched_rendezvous_secret = Some(secret);
-                    (msg2, Some((peer_id, peer_static)))
-                } else {
-                    let mut decoy = vec![0u8; decoy_bucket];
-                    getrandom::fill(&mut decoy).map_err(|err| CoreError::Rng(err.to_string()))?;
-                    let msg2 = hs.write_message_vec(&decoy)?;
-                    (msg2, None)
+                let mut refused = None;
+                let (msg2, authenticated_peer) = match route {
+                    Msg1Route::Genuine(peer, secret) => {
+                        let msg2 = hs.write_msg2_with_hash(|h_pre| {
+                            seal_v2_hello_envelope(&secret, &r_nonce, h_pre, &hello_json)
+                        })?;
+                        self.matched_rendezvous_secret = Some(secret);
+                        (msg2, Some(peer))
+                    }
+                    Msg1Route::Refusal(reason, peer_device_id, secret) => {
+                        let msg2 = hs.write_msg2_with_hash(|h_pre| {
+                            seal_v2_refusal_envelope(&secret, &r_nonce, h_pre, decoy_bucket, reason)
+                        })?;
+                        refused = Some(V2SessionAction::Refused {
+                            peer_device_id,
+                            code: reason.close_code(),
+                            at_msg2: true,
+                        });
+                        (msg2, None)
+                    }
+                    Msg1Route::Decoy => {
+                        let mut decoy = vec![0u8; decoy_bucket];
+                        getrandom::fill(&mut decoy)
+                            .map_err(|err| CoreError::Rng(err.to_string()))?;
+                        let msg2 = hs.write_message_vec(&decoy)?;
+                        (msg2, None)
+                    }
                 };
 
                 actions.push(V2SessionAction::WriteBytes(encode_frame(&msg2)?));
+                actions.extend(refused);
                 self.phase = V2RespPhase::AwaitMsg3 {
                     hs: Box::new(hs),
                     authenticated_peer,
@@ -3211,9 +3452,10 @@ impl V2SessionResponder {
                 authenticated_peer,
             } => {
                 let pt = hs.read_message_vec(body)?;
-                let Some((expected_peer_id, expected_static)) = authenticated_peer else {
+                let Some(matched) = authenticated_peer else {
                     return Err(CoreError::HostKeyUnverified);
                 };
+                let expected_static = matched.static_pub;
                 let peer_static: [u8; 32] = *hs.get_remote_static().ok_or(
                     CoreError::ProtocolViolation("missing initiator static key in msg3"),
                 )?;
@@ -3237,10 +3479,63 @@ impl V2SessionResponder {
                     ));
                 }
 
+                roster.prune_expired_refusal_notices(now_unix);
+                let silent = match roster.resolve_static(&peer_static) {
+                    StaticResolution::Revoked(entry) => {
+                        Some(CoreError::PeerRevoked(entry.device_id.clone()))
+                    }
+                    StaticResolution::Pending(entry) => {
+                        Some(CoreError::PeerPending(entry.device_id.clone()))
+                    }
+                    StaticResolution::Active(_) | StaticResolution::NotFound => None,
+                };
+                if let Some(silent) = silent {
+                    // The entry changed state after `msg1` (`spec/wire-v2.md` Section 3.1.4).
+                    let eligible = !matched.via_alternate
+                        && !roster.is_manifest_pinned(&matched.roster_key)
+                        && roster
+                            .get(&matched.roster_key)
+                            .is_some_and(|e| e.static_pub == peer_static);
+                    let reason = if eligible {
+                        refusal_decision(
+                            self.refusal_mode,
+                            roster,
+                            &peer_static,
+                            &device_id(&peer_static),
+                            now_unix,
+                            refusal.as_mut().map(|r| &mut *r.limiter),
+                        )
+                    } else {
+                        None
+                    };
+                    let Some(reason) = reason else {
+                        return Err(silent);
+                    };
+                    let transport = hs.into_transport_mode()?;
+                    let mut sealed = SealedSession::with_v2_policies(
+                        transport,
+                        self.padding.clone(),
+                        RekeyThresholds::default(),
+                        None,
+                        now_ms,
+                    );
+                    let code = reason.close_code();
+                    let outcome =
+                        sealed.seal(InnerFrameType::Close, &code.to_be_bytes(), now_ms)?;
+                    actions.push(V2SessionAction::WriteBytes(encode_frame(
+                        &outcome.ciphertext,
+                    )?));
+                    actions.push(V2SessionAction::Refused {
+                        peer_device_id: device_id(&peer_static),
+                        code,
+                        at_msg2: false,
+                    });
+                    return Ok(());
+                }
                 let peer_entry = roster.lookup_active_by_static(&peer_static)?;
                 check_wire_version(peer_entry.min_wire_version, WIRE_VERSION_V2)?;
                 let canonical_peer_id = peer_entry.device_id.clone();
-                if canonical_peer_id != expected_peer_id {
+                if canonical_peer_id != matched.device_id {
                     return Err(CoreError::HostKeyUnverified);
                 }
 
@@ -3677,6 +3972,141 @@ impl V2SessionResponder {
             _ => Err(CoreError::NotReady("v2 session not established")),
         }
     }
+}
+
+/// Classifies every roster entry and runs the rendezvous check over every candidate secret
+/// without early exit (`spec/wire-v2.md` Section 3.1.3.1). `verify` returns whether a secret
+/// verifies `msg1`; a slot that is not a candidate is checked under a dummy key, so the number
+/// of checks depends only on the roster. Returns the verified candidates in roster order.
+fn classify_msg1(
+    roster: &Roster,
+    refusals_on: bool,
+    now_unix: u64,
+    mut verify: impl FnMut(&[u8; 32]) -> bool,
+) -> Vec<Msg1Candidate> {
+    let dummy_key = [0u8; 32];
+    let policy = roster.refusal_policy();
+    let mut verified = Vec::new();
+    for (key, entry) in roster.entries() {
+        let crl_revoked = roster.crl_revokes_entry(entry);
+        let may_refuse = refusals_on && !roster.is_manifest_pinned(key);
+        let refusal_or_silent = |reason, enabled: bool| {
+            if may_refuse && enabled {
+                Msg1Class::Refusal(reason)
+            } else {
+                Msg1Class::Silent
+            }
+        };
+        let (own_class, alt_class) = match entry.state {
+            PeerState::Active if !crl_revoked => {
+                (Some(Msg1Class::Genuine), Some(Msg1Class::Genuine))
+            }
+            PeerState::Active => (
+                Some(refusal_or_silent(
+                    RefusalReason::Revoked,
+                    policy.revoked_notices_enabled(),
+                )),
+                Some(Msg1Class::Silent),
+            ),
+            PeerState::Pending => (
+                Some(refusal_or_silent(RefusalReason::Pending, policy.pending)),
+                None,
+            ),
+            PeerState::Revoked => (None, None),
+        };
+        let tombstone = entry
+            .refusal_notice()
+            .filter(|n| entry.state == PeerState::Revoked && n.is_live(now_unix))
+            .map(|_| refusal_or_silent(RefusalReason::Revoked, true));
+        let revoked_entry = entry.state == PeerState::Revoked || crl_revoked;
+
+        let has_slot = entry.v2_secrets.is_some()
+            || !roster.rendezvous_alternates(key).is_empty()
+            || entry.refusal_notice().is_some_and(|n| n.has_secret());
+        let mut check = |secret: &[u8; 32], class: Option<Msg1Class>, via_alternate: bool| {
+            let key_ref = if class.is_some() { secret } else { &dummy_key };
+            let ok = verify(key_ref);
+            if let (true, Some(class)) = (ok, class) {
+                verified.push(Msg1Candidate {
+                    class,
+                    revoked_entry,
+                    peer: matched_peer(key, entry, via_alternate),
+                    secret: Zeroizing::new(*secret),
+                });
+            }
+        };
+        if let Some(own) = entry.v2_secrets.as_ref() {
+            check(own.reconnect_secret(), own_class, false);
+        }
+        for alt in roster.rendezvous_alternates(key) {
+            check(alt.reconnect_secret(), alt_class, true);
+        }
+        if let Some(secret) = entry.refusal_notice().and_then(|n| n.secret()) {
+            check(secret.expose(), tombstone, false);
+        }
+        if !has_slot {
+            check(&dummy_key, None, false);
+        }
+    }
+    verified
+}
+
+/// Runs the rendezvous HMAC first and only then applies the payload length gate, so a
+/// malformed `msg1` costs the same number of HMACs as a well-formed one and the candidate count
+/// never leaks through timing (`spec/wire-v2.md` Section 3.1.3 step 2).
+fn gated_rendezvous_check(payload_valid_len: bool, verify: impl FnOnce() -> bool) -> bool {
+    let mac_ok = verify();
+    payload_valid_len && mac_ok
+}
+
+fn matched_peer(key: &str, entry: &RosterEntry, via_alternate: bool) -> MatchedPeer {
+    MatchedPeer {
+        device_id: entry.device_id.clone(),
+        static_pub: entry.static_pub,
+        roster_key: key.to_string(),
+        via_alternate,
+    }
+}
+
+/// Runs the refusal steps of `spec/wire-v2.md` Section 3.1.3.2 in order: the read-only
+/// checks (the nonce is in neither replay cache and the refusal cache has room), then the
+/// limiter, then the insert. A replay never charges the limiter. No caches means no refusal.
+fn admit_refusal(
+    refusal: Option<&mut V2RefusalCaches<'_>>,
+    replay_cache: &mut RendezvousReplayCache,
+    nonce: &[u8; 16],
+    ts_unix: u64,
+    now_unix: u64,
+    peer_device_id: &str,
+) -> bool {
+    let Some(r) = refusal else {
+        return false;
+    };
+    !replay_cache.contains(nonce, now_unix)
+        && r.replay.can_accept(nonce, now_unix)
+        && r.limiter.allow(peer_device_id, now_unix)
+        && r.replay.insert(*nonce, ts_unix, now_unix)
+}
+
+/// Merges verified candidates: a secret that verifies for a revoked entry and for an entry that
+/// is not revoked is an identity collision and `Silent`; otherwise the highest class wins, the
+/// last such candidate in roster order on a tie.
+fn merge_msg1_candidates(verified: Vec<Msg1Candidate>) -> Option<(Msg1Class, Msg1Candidate)> {
+    let collision =
+        verified.iter().any(|c| c.revoked_entry) && verified.iter().any(|c| !c.revoked_entry);
+    let best = verified.into_iter().reduce(|a, b| {
+        if b.class.rank() >= a.class.rank() {
+            b
+        } else {
+            a
+        }
+    })?;
+    let class = if collision {
+        Msg1Class::Silent
+    } else {
+        best.class
+    };
+    Some((class, best))
 }
 
 fn seal_transport_action(
@@ -6080,5 +6510,64 @@ mod tests {
         let entry = roster.get(&dev.device_id()).unwrap();
         assert_eq!(entry.state, PeerState::Pending);
         assert_eq!(entry.signing_pub, None);
+    }
+}
+
+#[cfg(test)]
+mod refusal_classification_tests {
+    use super::*;
+    use crate::crypto::StaticKeypair;
+    use std::cell::Cell;
+
+    #[test]
+    fn the_rendezvous_hmac_runs_even_for_a_malformed_payload() {
+        let calls = Cell::new(0);
+        let check = |valid, ok| {
+            gated_rendezvous_check(valid, || {
+                calls.set(calls.get() + 1);
+                ok
+            })
+        };
+        assert!(!check(false, true));
+        assert!(!check(false, false));
+        assert!(check(true, true));
+        assert_eq!(calls.get(), 3, "the length gate never skips the HMAC");
+    }
+
+    fn client(roster: &mut Roster, seed: u8, secrets: bool) -> String {
+        let static_pub = *StaticKeypair::from_scalar([seed; 32]).public_bytes();
+        let id = device_id(&static_pub);
+        roster
+            .record_pending_pair(static_pub, None, "c".into(), "cli".into(), "s".into())
+            .unwrap();
+        if secrets {
+            roster
+                .set_peer_v2_secrets(&id, V2PeerSecrets::new([seed; 32], [seed; 32]))
+                .unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn classification_checks_every_slot_and_one_dummy_per_slotless_entry() {
+        let mut roster = Roster::new();
+        let active = client(&mut roster, 0x11, true);
+        roster.confirm_peer(&active, Some("s")).unwrap();
+        roster
+            .add_rendezvous_alternate(&active, V2PeerSecrets::new([0x12; 32], [0x12; 32]))
+            .unwrap();
+        client(&mut roster, 0x13, false);
+        let revoked = client(&mut roster, 0x14, true);
+        roster.confirm_peer(&revoked, Some("s")).unwrap();
+        roster.revoke_peer_at(&revoked, true, 1_000).unwrap();
+        for refusals_on in [true, false] {
+            let mut calls = 0;
+            let verified = classify_msg1(&roster, refusals_on, 1_000, |_| {
+                calls += 1;
+                false
+            });
+            assert!(verified.is_empty());
+            assert_eq!(calls, 4, "own + alternate, one dummy, one tombstone");
+        }
     }
 }

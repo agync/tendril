@@ -11,7 +11,7 @@ use crate::crypto::{
     HybridSigningPublicKey, b64url_decode_array, b64url_encode, device_id, has_control_chars,
     is_valid_x25519_public_key,
 };
-use crate::error::CoreError;
+use crate::error::{CoreError, RefusalReason};
 use crate::grants::{
     Capability, Grant, GrantUnsigned, RevocationList, RevocationListUnsigned, sign_crl, sign_grant,
     verify_crl_signature,
@@ -137,6 +137,151 @@ pub enum PeerState {
     Revoked,
 }
 
+/// Default lifetime of a refusal notice recorded at revocation: 30 days.
+pub const DEFAULT_REVOKED_NOTICE_TTL_SECS: u64 = 2_592_000;
+
+/// Whether and how long a host tells known peers that it refuses them
+/// (`spec/pairing-v1.md` Section 5.1). Stored and sealed with the [`Roster`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RefusalPolicy {
+    /// Refuse `Pending` peers with `4004 peer_pending`.
+    pub pending: bool,
+    /// Lifetime of a notice recorded at revocation. `0` records none.
+    pub revoked_notice_ttl_secs: u64,
+}
+
+impl Default for RefusalPolicy {
+    fn default() -> Self {
+        Self {
+            pending: true,
+            revoked_notice_ttl_secs: DEFAULT_REVOKED_NOTICE_TTL_SECS,
+        }
+    }
+}
+
+impl RefusalPolicy {
+    /// Returns `true` when revocations may record refusal notices.
+    #[must_use]
+    pub const fn revoked_notices_enabled(&self) -> bool {
+        self.revoked_notice_ttl_secs != 0
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A revoked peer's former `reconnect_secret`, kept only to verify its Wire v2 `msg1` and seal
+/// a refusal (`spec/wire-v2.md` Section 3.1.1).
+///
+/// Zeroized on drop and redacted in `Debug`. It has no public constructor and no public
+/// accessor, so it can never authenticate a session or leave the core:
+///
+/// ```compile_fail
+/// fn leak(n: &tendril_core::roster::RefusalNotice) -> [u8; 32] {
+///     *n.secret().unwrap().expose()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn leak(s: &tendril_core::roster::RefusalSecret) -> [u8; 32] {
+///     s.0
+/// }
+/// ```
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct RefusalSecret([u8; 32]);
+
+impl RefusalSecret {
+    pub(crate) fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl PartialEq for RefusalSecret {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(self.0.ct_eq(&other.0))
+    }
+}
+
+impl Eq for RefusalSecret {}
+
+impl fmt::Debug for RefusalSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RefusalSecret(<redacted>)")
+    }
+}
+
+impl Serialize for RefusalSecret {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Zeroizing::new(b64url_encode(&self.0)).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RefusalSecret {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = Zeroizing::new(String::deserialize(deserializer)?);
+        let bytes =
+            Zeroizing::new(b64url_decode_array::<32>(&repr).map_err(serde::de::Error::custom)?);
+        Ok(Self(*bytes))
+    }
+}
+
+/// A refusal notice on a `Revoked` entry (`spec/pairing-v1.md` Section 5.1).
+///
+/// The notice is live while `now_unix < until_unix`. A notice compiles fine to inspect:
+///
+/// ```
+/// fn live(n: &tendril_core::roster::RefusalNotice, now: u64) -> bool {
+///     n.is_live(now) && n.until_unix() > now
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusalNotice {
+    until_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<RefusalSecret>,
+}
+
+impl RefusalNotice {
+    /// Unix second at which the notice stops being live.
+    #[must_use]
+    pub const fn until_unix(&self) -> u64 {
+        self.until_unix
+    }
+
+    /// Returns `true` while `now_unix < until_unix`.
+    #[must_use]
+    pub const fn is_live(&self, now_unix: u64) -> bool {
+        now_unix < self.until_unix
+    }
+
+    /// Returns `true` when the notice holds a Wire v2 refusal secret.
+    #[must_use]
+    pub const fn has_secret(&self) -> bool {
+        self.secret.is_some()
+    }
+
+    pub(crate) const fn secret(&self) -> Option<&RefusalSecret> {
+        self.secret.as_ref()
+    }
+}
+
+/// How a peer static key resolves on a responder (`spec/wire-v1.md` Section 3.3 step 3).
+///
+/// "Revoked wins" across every entry holding the key, so roster key order never decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticResolution<'a> {
+    /// An `Active` entry, not revoked by a stored CRL or a revoked signing sibling.
+    Active(&'a RosterEntry),
+    /// No entry is active or revoked, and an entry is `Pending`.
+    Pending(&'a RosterEntry),
+    /// An entry is `Revoked`, or an `Active` entry is revoked by a CRL or a revoked sibling.
+    Revoked(&'a RosterEntry),
+    /// No entry holds the key.
+    NotFound,
+}
+
 /// Persistent trust state for one paired peer or pinned host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterEntry {
@@ -171,9 +316,39 @@ pub struct RosterEntry {
     /// equal-sequence displacement while `route_meta.origin` is `Approved`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     approved_signed: Vec<String>,
+    /// Refusal notice of a `Revoked` entry (`spec/pairing-v1.md` Section 5.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<RefusalNotice>,
 }
 
 impl RosterEntry {
+    /// Applies the `spec/pairing-v1.md` Section 5.1 notice rules for a revocation of this entry
+    /// at `notify_at` (`None` for a silent revocation). Call before changing `state`.
+    fn apply_revocation_notice(&mut self, policy: RefusalPolicy, notify_at: Option<u64>) {
+        if self.state == PeerState::Revoked {
+            if notify_at.is_none() {
+                self.refusal = None;
+            }
+            return;
+        }
+        self.refusal = match notify_at {
+            Some(now_unix) if policy.revoked_notices_enabled() => Some(RefusalNotice {
+                until_unix: now_unix.saturating_add(policy.revoked_notice_ttl_secs),
+                secret: self
+                    .v2_secrets
+                    .as_ref()
+                    .map(|s| RefusalSecret(*s.reconnect_secret())),
+            }),
+            _ => None,
+        };
+    }
+
+    /// The refusal notice recorded when this entry was revoked, if any.
+    #[must_use]
+    pub const fn refusal_notice(&self) -> Option<&RefusalNotice> {
+        self.refusal.as_ref()
+    }
+
     /// Confirms this entry pins a valid full-order X25519 static public key.
     pub fn require_static_pin(&self) -> Result<[u8; 32], CoreError> {
         if !is_valid_x25519_public_key(&self.static_pub) {
@@ -556,6 +731,8 @@ struct StoredRoster {
     local_routes: Option<Box<LocalRouteState>>,
     #[serde(default)]
     pending_hosts: Vec<RosterEntry>,
+    #[serde(default)]
+    refusal_policy: RefusalPolicy,
 }
 
 impl From<StoredRoster> for Roster {
@@ -571,8 +748,15 @@ impl From<StoredRoster> for Roster {
             trust_anchors: stored.trust_anchors,
             burned_enrollment_nonces: stored.burned_enrollment_nonces,
             local_routes: stored.local_routes,
+            refusal_policy: stored.refusal_policy,
             ..Self::default()
         };
+        // A notice belongs only to a `Revoked` entry; a stored one anywhere else is dropped.
+        for entry in roster.entries.values_mut() {
+            if entry.state != PeerState::Revoked {
+                entry.refusal = None;
+            }
+        }
         let legacy: Vec<String> = roster
             .entries
             .iter()
@@ -587,7 +771,8 @@ impl From<StoredRoster> for Roster {
             }
         }
         claims.extend(stored.pending_hosts);
-        for entry in claims {
+        for mut entry in claims {
+            entry.refusal = None;
             if entry.state == PeerState::Pending
                 && is_valid_host_id(&entry.device_id)
                 && is_valid_x25519_public_key(&entry.static_pub)
@@ -622,6 +807,9 @@ pub struct Roster {
     /// host_id)`. They hold no label until `pair.confirm` moves one into `entries`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_hosts: Vec<RosterEntry>,
+    /// Host refusal policy (`spec/pairing-v1.md` Section 5.1); omitted while default.
+    #[serde(default, skip_serializing_if = "RefusalPolicy::is_default")]
+    refusal_policy: RefusalPolicy,
     #[serde(skip)]
     signing_hash_pins: BTreeMap<String, [u8; 32]>,
     #[serde(skip)]
@@ -938,6 +1126,7 @@ impl Roster {
             routes: Vec::new(),
             route_meta: None,
             approved_signed: Vec::new(),
+            refusal: None,
         };
         self.drop_pending_host_claims(&host_id);
         self.entries.insert(host_id.clone(), entry);
@@ -1043,6 +1232,7 @@ impl Roster {
             routes: Vec::new(),
             route_meta: None,
             approved_signed: Vec::new(),
+            refusal: None,
         });
         Ok(HostSlot::Pending(self.pending_hosts.len() - 1))
     }
@@ -1283,6 +1473,7 @@ impl Roster {
             routes: Vec::new(),
             route_meta: None,
             approved_signed: Vec::new(),
+            refusal: None,
         };
         self.entries.insert(id.clone(), entry);
         Ok(&self.entries[&id])
@@ -1451,10 +1642,14 @@ impl Roster {
         Ok(&self.entries[peer_id])
     }
 
+    /// Revokes every entry sharing the revoked keys. With `clear_notices` (a silent revocation,
+    /// a fork, or a revoked claim) it also drops their refusal notices, so no alias keeps
+    /// refusing for keys the host revoked without a notice.
     fn revoke_siblings_by_keys(
         &mut self,
         revoked_static: [u8; 32],
         revoked_signing: Option<&HybridSigningPublicKey>,
+        clear_notices: bool,
     ) {
         for other in self.entries.values_mut() {
             let shares_static = revoked_static != [0u8; 32] && other.static_pub == revoked_static;
@@ -1468,6 +1663,9 @@ impl Roster {
                 other.state = PeerState::Revoked;
                 other.grants.clear();
                 other.v2_secrets = None;
+                if clear_notices {
+                    other.refusal = None;
+                }
             }
         }
         self.pending_hosts.retain(|claim| {
@@ -1499,13 +1697,42 @@ impl Roster {
     /// naming it as their `host_id`. Revoking a claim drops it and revokes its keys, never the
     /// `host_id` it named or an entry holding other keys. Unconfirmed claims sharing the revoked
     /// keys are dropped.
+    ///
+    /// Silent: it records no refusal notice and clears any notice an earlier revocation
+    /// recorded. [`Self::revoke_peer_at`] with `notify: true` records one per the policy.
     pub fn revoke_peer(&mut self, peer_id: &str) -> Result<(), CoreError> {
+        self.revoke_peer_noticed(peer_id, None)
+    }
+
+    /// Revokes `peer_id` as [`Self::revoke_peer`] does, and records a refusal notice at
+    /// `now_unix` when `notify` is set (`spec/pairing-v1.md` Section 5.1).
+    ///
+    /// A notice is recorded only when an `Active` or `Pending` entry under `peer_id` becomes
+    /// `Revoked` and [`RefusalPolicy::revoked_notice_ttl_secs`] is not `0`. It expires at
+    /// `now_unix + ttl` (saturating) and keeps the entry's v2 `reconnect_secret` as its refusal
+    /// secret; `mailbox_secret` is zeroized. Re-revoking a `Revoked` entry never creates or
+    /// extends a notice: `notify: false` clears it, `notify: true` leaves it unchanged. Siblings
+    /// sharing the revoked keys and unconfirmed host claims never get a notice.
+    pub fn revoke_peer_at(
+        &mut self,
+        peer_id: &str,
+        notify: bool,
+        now_unix: u64,
+    ) -> Result<(), CoreError> {
+        self.revoke_peer_noticed(peer_id, notify.then_some(now_unix))
+    }
+
+    fn revoke_peer_noticed(
+        &mut self,
+        peer_id: &str,
+        notify_at: Option<u64>,
+    ) -> Result<(), CoreError> {
         if self
             .entries
             .get(peer_id)
             .is_some_and(|e| e.state != PeerState::Pending)
         {
-            return self.revoke_entry(peer_id);
+            return self.revoke_entry(peer_id, notify_at);
         }
         if self
             .pending_hosts
@@ -1515,7 +1742,7 @@ impl Roster {
             return self.revoke_pending_host(peer_id);
         }
         match self.resolve_peer(peer_id, None)? {
-            HostSlot::Entry(key) => self.revoke_entry(&key),
+            HostSlot::Entry(key) => self.revoke_entry(&key, notify_at),
             HostSlot::Pending(i) => {
                 let claim = self.pending_hosts.remove(i);
                 self.revoke_claim_keys(claim);
@@ -1545,18 +1772,24 @@ impl Roster {
         Ok(())
     }
 
-    fn revoke_entry(&mut self, key: &str) -> Result<(), CoreError> {
+    fn revoke_entry(&mut self, key: &str, notify_at: Option<u64>) -> Result<(), CoreError> {
+        let policy = self.refusal_policy;
         let (revoked_static, revoked_signing) = {
             let entry = self
                 .entries
                 .get_mut(key)
                 .ok_or_else(|| CoreError::PeerNotFound(key.to_string()))?;
+            entry.apply_revocation_notice(policy, notify_at);
             entry.state = PeerState::Revoked;
             entry.grants.clear();
             entry.v2_secrets = None;
             (entry.static_pub, entry.signing_pub.clone())
         };
-        self.revoke_siblings_by_keys(revoked_static, revoked_signing.as_ref());
+        self.revoke_siblings_by_keys(
+            revoked_static,
+            revoked_signing.as_ref(),
+            notify_at.is_none(),
+        );
         Ok(())
     }
 
@@ -1577,6 +1810,7 @@ impl Roster {
                 entry.state = PeerState::Revoked;
                 entry.grants.clear();
                 entry.v2_secrets = None;
+                entry.refusal = None;
             }
             _ => {
                 let signing = claim.signing_pub.as_ref().map_or_else(
@@ -1588,11 +1822,12 @@ impl Roster {
                 claim.state = PeerState::Revoked;
                 claim.grants.clear();
                 claim.v2_secrets = None;
+                claim.refusal = None;
                 claim.last_pairing_sas = None;
                 self.entries.insert(key, claim.clone());
             }
         }
-        self.revoke_siblings_by_keys(claim.static_pub, claim.signing_pub.as_ref());
+        self.revoke_siblings_by_keys(claim.static_pub, claim.signing_pub.as_ref(), true);
     }
 
     /// Raises the minimum wire protocol version required for `peer_id` (anti-downgrade floor).
@@ -1747,13 +1982,14 @@ impl Roster {
             }
             Err(err @ CoreError::RotationForkDetected { .. }) => {
                 let keys = self.entries.get_mut(peer_id).map(|entry| {
+                    entry.refusal = None;
                     entry.state = PeerState::Revoked;
                     entry.grants.clear();
                     entry.v2_secrets = None;
                     (entry.static_pub, entry.signing_pub.clone())
                 });
                 if let Some((revoked_static, revoked_signing)) = keys {
-                    self.revoke_siblings_by_keys(revoked_static, revoked_signing.as_ref());
+                    self.revoke_siblings_by_keys(revoked_static, revoked_signing.as_ref(), true);
                 }
                 Err(err)
             }
@@ -1763,11 +1999,44 @@ impl Roster {
 
     /// Validates a signed [`RevocationList`], enforces monotonic `seq`, updates revoked peers, and
     /// persists the latest CRL for `expected_issuer`.
+    ///
+    /// Silent: entries it revokes get no refusal notice, and entries it lists that are already
+    /// `Revoked` lose theirs. See [`Self::ingest_crl_at`].
     pub fn ingest_crl(
         &mut self,
         crl: RevocationList,
         expected_issuer: &str,
         issuer_signing_pub: &HybridSigningPublicKey,
+    ) -> Result<(), CoreError> {
+        self.ingest_crl_noticed(crl, expected_issuer, issuer_signing_pub, None)
+    }
+
+    /// Ingests `crl` as [`Self::ingest_crl`] does. When `notify` is set, each `Active` or
+    /// `Pending` entry it revokes records a refusal notice at `now_unix`, as
+    /// [`Self::revoke_peer_at`] does. Pass `notify: true` only for the host's own CRL
+    /// (`spec/pairing-v1.md` Section 5.1).
+    pub fn ingest_crl_at(
+        &mut self,
+        crl: RevocationList,
+        expected_issuer: &str,
+        issuer_signing_pub: &HybridSigningPublicKey,
+        notify: bool,
+        now_unix: u64,
+    ) -> Result<(), CoreError> {
+        self.ingest_crl_noticed(
+            crl,
+            expected_issuer,
+            issuer_signing_pub,
+            notify.then_some(now_unix),
+        )
+    }
+
+    fn ingest_crl_noticed(
+        &mut self,
+        crl: RevocationList,
+        expected_issuer: &str,
+        issuer_signing_pub: &HybridSigningPublicKey,
+        notify_at: Option<u64>,
     ) -> Result<(), CoreError> {
         if crl.v != 1 {
             return Err(CoreError::CrlUnsupportedVersion(crl.v));
@@ -1792,6 +2061,7 @@ impl Roster {
             }
         }
 
+        let policy = self.refusal_policy;
         let mut revoked_keys = Vec::new();
         for revoked_id in &crl.revoked_devices {
             for (key, entry) in &mut self.entries {
@@ -1799,6 +2069,7 @@ impl Roster {
                     || &entry.device_id == revoked_id
                     || &device_id(&entry.static_pub) == revoked_id
                 {
+                    entry.apply_revocation_notice(policy, notify_at);
                     entry.state = PeerState::Revoked;
                     entry.grants.clear();
                     entry.v2_secrets = None;
@@ -1811,7 +2082,11 @@ impl Roster {
             }
         }
         for (revoked_static, revoked_signing) in revoked_keys {
-            self.revoke_siblings_by_keys(revoked_static, revoked_signing.as_ref());
+            self.revoke_siblings_by_keys(
+                revoked_static,
+                revoked_signing.as_ref(),
+                notify_at.is_none(),
+            );
         }
 
         self.crls.insert(expected_issuer.to_string(), crl);
@@ -1819,6 +2094,8 @@ impl Roster {
     }
 
     /// Finds an active peer matching `static_pub`, rejecting unknown, pending, or revoked peers.
+    ///
+    /// A wrapper over [`Self::resolve_static`] that maps each non-active resolution to its error.
     pub fn lookup_active_by_static(
         &self,
         static_pub: &[u8; 32],
@@ -1828,6 +2105,48 @@ impl Roster {
                 "invalid or low-order static_pub".to_string(),
             ));
         }
+        match self.resolve_static(static_pub) {
+            StaticResolution::Active(entry) => {
+                entry.require_static_pin()?;
+                Ok(entry)
+            }
+            StaticResolution::Revoked(entry) => {
+                Err(CoreError::PeerRevoked(entry.device_id.clone()))
+            }
+            StaticResolution::Pending(entry) => {
+                Err(CoreError::PeerPending(entry.device_id.clone()))
+            }
+            StaticResolution::NotFound => Err(CoreError::PeerNotFound(device_id(static_pub))),
+        }
+    }
+
+    fn revoked_signing_sibling(&self, entry: &RosterEntry) -> bool {
+        entry.signing_pub.as_ref().is_some_and(|sig| {
+            self.entries.values().any(|other| {
+                other.state == PeerState::Revoked
+                    && other
+                        .signing_pub
+                        .as_ref()
+                        .is_some_and(|o| signing_keys_share_identity(sig, o))
+            })
+        })
+    }
+
+    fn active_entry_revoked(&self, entry: &RosterEntry) -> bool {
+        self.crl_revokes_entry(entry) || self.revoked_signing_sibling(entry)
+    }
+
+    /// Resolves `static_pub` across every entry holding it (`spec/wire-v1.md` Section 3.3).
+    ///
+    /// Revoked wins: any matching `Revoked` entry, or a matching `Active` entry that a stored
+    /// CRL revokes or that shares its signing identity with a `Revoked` entry, makes the key
+    /// revoked. Otherwise an `Active` entry wins over a `Pending` one. The result never depends
+    /// on roster key order. Unconfirmed host claims are not entries and never match; they count
+    /// only toward the wire floor ([`Self::pairing_floor`]).
+    #[must_use]
+    pub fn resolve_static(&self, static_pub: &[u8; 32]) -> StaticResolution<'_> {
+        let mut revoked: Option<&RosterEntry> = None;
+        let mut revoked_active: Option<&RosterEntry> = None;
         let mut active: Option<&RosterEntry> = None;
         let mut pending: Option<&RosterEntry> = None;
         for entry in self
@@ -1836,33 +2155,95 @@ impl Roster {
             .filter(|e| e.static_pub == *static_pub)
         {
             match entry.state {
-                PeerState::Revoked => return Err(CoreError::PeerRevoked(entry.device_id.clone())),
+                PeerState::Revoked => {
+                    revoked.get_or_insert(entry);
+                }
                 PeerState::Pending => pending = Some(entry),
-                PeerState::Active => active = Some(entry),
+                PeerState::Active => {
+                    if self.active_entry_revoked(entry) {
+                        revoked_active.get_or_insert(entry);
+                    }
+                    active = Some(entry);
+                }
             }
+        }
+        if let Some(entry) = revoked.or(revoked_active) {
+            return StaticResolution::Revoked(entry);
         }
         if let Some(entry) = active {
-            entry.require_static_pin()?;
-            if self.crl_revokes_entry(entry) {
-                return Err(CoreError::PeerRevoked(entry.device_id.clone()));
-            }
-            if let Some(ref sig) = entry.signing_pub
-                && self.entries.values().any(|other| {
-                    other.state == PeerState::Revoked
-                        && other
-                            .signing_pub
-                            .as_ref()
-                            .is_some_and(|o| signing_keys_share_identity(sig, o))
+            return StaticResolution::Active(entry);
+        }
+        pending.map_or(StaticResolution::NotFound, StaticResolution::Pending)
+    }
+
+    /// Returns the refusal a responder may send to `static_pub` at `now_unix`, before the
+    /// listener mode and the refusal limiter are applied (`spec/wire-v1.md` Section 3.3).
+    ///
+    /// `Revoked` when the key resolves as revoked and any matching entry that is not
+    /// manifest-pinned carries a live notice; an `Active` entry a stored CRL revokes counts as
+    /// carrying one while revoked notices are enabled. `Pending` when the key resolves as pending,
+    /// pending notices are on, and no matching `Pending` entry is manifest-pinned. Otherwise
+    /// `None`. The caller checks the wire floor first.
+    #[must_use]
+    pub fn refusal_for_static(
+        &self,
+        static_pub: &[u8; 32],
+        now_unix: u64,
+    ) -> Option<RefusalReason> {
+        let matching = || {
+            self.entries
+                .iter()
+                .filter(move |(_, e)| e.static_pub == *static_pub)
+        };
+        match self.resolve_static(static_pub) {
+            StaticResolution::Revoked(_) => matching()
+                .filter(|(key, _)| !self.is_manifest_pinned(key))
+                .any(|(_, e)| match e.state {
+                    PeerState::Revoked => e.refusal.as_ref().is_some_and(|n| n.is_live(now_unix)),
+                    PeerState::Active => {
+                        self.refusal_policy.revoked_notices_enabled() && self.crl_revokes_entry(e)
+                    }
+                    PeerState::Pending => false,
                 })
-            {
-                return Err(CoreError::PeerRevoked(entry.device_id.clone()));
+                .then_some(RefusalReason::Revoked),
+            StaticResolution::Pending(_) => (self.refusal_policy.pending
+                && !matching()
+                    .any(|(key, e)| e.state == PeerState::Pending && self.is_manifest_pinned(key)))
+            .then_some(RefusalReason::Pending),
+            StaticResolution::Active(_) | StaticResolution::NotFound => None,
+        }
+    }
+
+    /// The host refusal policy (`spec/pairing-v1.md` Section 5.1).
+    #[must_use]
+    pub const fn refusal_policy(&self) -> RefusalPolicy {
+        self.refusal_policy
+    }
+
+    /// Replaces the host refusal policy. Notices already recorded keep their expiry.
+    pub fn set_refusal_policy(&mut self, policy: RefusalPolicy) {
+        self.refusal_policy = policy;
+    }
+
+    /// Drops every refusal notice that is no longer live at `now_unix`, zeroizing its secret.
+    /// Returns the number dropped. Call on roster load and save and before classifying an
+    /// inbound connection.
+    pub fn prune_expired_refusal_notices(&mut self, now_unix: u64) -> usize {
+        let mut pruned = 0;
+        for entry in self.entries.values_mut() {
+            if entry.refusal.as_ref().is_some_and(|n| !n.is_live(now_unix)) {
+                entry.refusal = None;
+                pruned += 1;
             }
-            return Ok(entry);
         }
-        if let Some(entry) = pending {
-            return Err(CoreError::PeerPending(entry.device_id.clone()));
-        }
-        Err(CoreError::PeerNotFound(device_id(static_pub)))
+        pruned
+    }
+
+    /// Drops the refusal notice of the entry under `peer_id`, which stays `Revoked`
+    /// (`spec/pairing-v1.md` Section 5.2: a host never re-admits a revoked key).
+    pub fn clear_refusal_notice(&mut self, peer_id: &str) -> Result<(), CoreError> {
+        self.entry_mut(peer_id)?.refusal = None;
+        Ok(())
     }
 
     /// Returns the pinned hybrid signing public key of an `Active` peer for grant verification,
@@ -1974,7 +2355,7 @@ impl Roster {
             anchor.state = AnchorState::Revoked;
             anchor.signing_pub.clone()
         };
-        self.revoke_siblings_by_keys([0u8; 32], Some(&revoked_pub));
+        self.revoke_siblings_by_keys([0u8; 32], Some(&revoked_pub), true);
         Ok(())
     }
 
@@ -2159,6 +2540,7 @@ impl Roster {
             routes: Vec::new(),
             route_meta: None,
             approved_signed: Vec::new(),
+            refusal: None,
         };
         self.drop_pending_host_claims(&id);
         self.entries.insert(id.clone(), entry);
@@ -2710,12 +3092,17 @@ impl Roster {
         match detect_rotation_fork(&reachable) {
             Err(err @ CoreError::RotationForkDetected { .. }) => {
                 let entry = self.entry_mut(peer_id)?;
+                entry.refusal = None;
                 entry.state = PeerState::Revoked;
                 entry.grants.clear();
                 entry.v2_secrets = None;
                 let current = (entry.static_pub, entry.signing_pub.clone());
-                self.revoke_siblings_by_keys(current.0, current.1.as_ref());
-                self.revoke_siblings_by_keys(original.static_pub, Some(&original.signing_pub));
+                self.revoke_siblings_by_keys(current.0, current.1.as_ref(), true);
+                self.revoke_siblings_by_keys(
+                    original.static_pub,
+                    Some(&original.signing_pub),
+                    true,
+                );
                 Err(err)
             }
             _ => Ok(()),
@@ -4020,5 +4407,617 @@ mod tests {
             roster.revoke_pending_host(&label),
             Err(CoreError::PeerNotFound(label.clone()))
         );
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use crate::crypto::{SigningKeypair, StaticKeypair};
+    use crate::error::RefusalReason;
+    use crate::grants::{RevocationListUnsigned, sign_crl};
+    use crate::identity::sign_rotation;
+
+    const NOW: u64 = 1_795_000_000;
+    const TTL: u64 = DEFAULT_REVOKED_NOTICE_TTL_SECS;
+
+    fn keys(seed: u8) -> ([u8; 32], HybridSigningPublicKey) {
+        (
+            *StaticKeypair::from_scalar([seed; 32]).public_bytes(),
+            SigningKeypair::from_seed([seed.wrapping_add(1); 32])
+                .public_key()
+                .clone(),
+        )
+    }
+
+    /// An `Active` client entry under its own `device_id`, holding v2 secrets.
+    fn active_client(roster: &mut Roster, seed: u8, secret: u8) -> String {
+        let (static_pub, _) = keys(seed);
+        let id = device_id(&static_pub);
+        roster
+            .record_pending_pair(static_pub, None, "c".into(), "cli".into(), "sas".into())
+            .unwrap();
+        roster.confirm_peer(&id, Some("sas")).unwrap();
+        roster
+            .set_peer_v2_secrets(&id, V2PeerSecrets::new([secret; 32], [secret ^ 0xFF; 32]))
+            .unwrap();
+        id
+    }
+
+    fn notice(roster: &Roster, id: &str) -> Option<RefusalNotice> {
+        roster.get(id).unwrap().refusal_notice().cloned()
+    }
+
+    fn notice_secret(roster: &Roster, id: &str) -> Option<[u8; 32]> {
+        notice(roster, id).and_then(|n| n.secret().map(|s| *s.expose()))
+    }
+
+    #[test]
+    fn default_policy_is_pending_on_and_thirty_days() {
+        let policy = RefusalPolicy::default();
+        assert!(policy.pending);
+        assert_eq!(policy.revoked_notice_ttl_secs, 2_592_000);
+        assert_eq!(Roster::new().refusal_policy(), policy);
+    }
+
+    #[test]
+    fn revoke_with_notice_keeps_only_the_reconnect_secret() {
+        let mut roster = Roster::new();
+        let id = active_client(&mut roster, 0x21, 0x31);
+        roster.revoke_peer_at(&id, true, NOW).unwrap();
+        let entry = roster.get(&id).unwrap();
+        assert_eq!(entry.state, PeerState::Revoked);
+        assert!(entry.v2_secrets.is_none());
+        assert!(entry.grants.is_empty());
+        let n = entry.refusal_notice().unwrap();
+        assert_eq!(n.until_unix(), NOW + TTL);
+        assert!(n.has_secret());
+        assert!(n.is_live(NOW + TTL - 1));
+        assert!(!n.is_live(NOW + TTL));
+        assert_eq!(notice_secret(&roster, &id), Some([0x31; 32]));
+        let json = serde_json::to_string(entry).unwrap();
+        let mailbox = b64url_encode(&[0x31 ^ 0xFF; 32]);
+        assert!(
+            !json.contains(&mailbox),
+            "mailbox_secret must not survive revocation"
+        );
+        assert!(!format!("{entry:?}").contains(&b64url_encode(&[0x31; 32])));
+    }
+
+    #[test]
+    fn silent_revoke_and_zero_ttl_store_nothing() {
+        let mut roster = Roster::new();
+        let a = active_client(&mut roster, 0x22, 0x32);
+        roster.revoke_peer(&a).unwrap();
+        assert_eq!(notice(&roster, &a), None);
+
+        let b = active_client(&mut roster, 0x23, 0x33);
+        roster.revoke_peer_at(&b, false, NOW).unwrap();
+        assert_eq!(notice(&roster, &b), None);
+
+        let c = active_client(&mut roster, 0x24, 0x34);
+        roster.set_refusal_policy(RefusalPolicy {
+            pending: true,
+            revoked_notice_ttl_secs: 0,
+        });
+        roster.revoke_peer_at(&c, true, NOW).unwrap();
+        assert_eq!(notice(&roster, &c), None);
+        assert_eq!(roster.get(&c).unwrap().state, PeerState::Revoked);
+    }
+
+    #[test]
+    fn re_revoking_never_creates_or_extends_a_notice() {
+        let mut roster = Roster::new();
+        let a = active_client(&mut roster, 0x25, 0x35);
+        roster.revoke_peer(&a).unwrap();
+        roster.revoke_peer_at(&a, true, NOW).unwrap();
+        assert_eq!(
+            notice(&roster, &a),
+            None,
+            "re-revoke must not create a notice"
+        );
+
+        let b = active_client(&mut roster, 0x26, 0x36);
+        roster.revoke_peer_at(&b, true, NOW).unwrap();
+        roster.revoke_peer_at(&b, true, NOW + 1_000).unwrap();
+        assert_eq!(notice(&roster, &b).unwrap().until_unix(), NOW + TTL);
+        roster.revoke_peer_at(&b, false, NOW + 2_000).unwrap();
+        assert_eq!(notice(&roster, &b), None, "notify false clears the notice");
+        assert_eq!(roster.get(&b).unwrap().state, PeerState::Revoked);
+    }
+
+    #[test]
+    fn notice_expiry_saturates() {
+        let mut roster = Roster::new();
+        roster.set_refusal_policy(RefusalPolicy {
+            pending: true,
+            revoked_notice_ttl_secs: u64::MAX,
+        });
+        let a = active_client(&mut roster, 0x27, 0x37);
+        roster.revoke_peer_at(&a, true, NOW).unwrap();
+        assert_eq!(notice(&roster, &a).unwrap().until_unix(), u64::MAX);
+    }
+
+    #[test]
+    fn pending_to_revoked_records_a_notice_without_v2_secret() {
+        let mut roster = Roster::new();
+        let (static_pub, _) = keys(0x28);
+        let id = device_id(&static_pub);
+        roster
+            .record_pending_pair(static_pub, None, "c".into(), "cli".into(), "sas".into())
+            .unwrap();
+        roster.revoke_peer_at(&id, true, NOW).unwrap();
+        let n = notice(&roster, &id).unwrap();
+        assert_eq!(n.until_unix(), NOW + TTL);
+        assert!(!n.has_secret());
+    }
+
+    #[test]
+    fn notice_and_policy_round_trip_and_old_rosters_load() {
+        let mut roster = Roster::new();
+        let a = active_client(&mut roster, 0x29, 0x39);
+        roster.revoke_peer_at(&a, true, NOW).unwrap();
+        let policy = RefusalPolicy {
+            pending: false,
+            revoked_notice_ttl_secs: 77,
+        };
+        roster.set_refusal_policy(policy);
+        let json = serde_json::to_string(&roster).unwrap();
+        let back: Roster = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.refusal_policy(), policy);
+        assert_eq!(notice(&back, &a), notice(&roster, &a));
+        assert_eq!(notice_secret(&back, &a), Some([0x39; 32]));
+
+        let mut plain = Roster::new();
+        active_client(&mut plain, 0x2A, 0x3A);
+        let plain_json = serde_json::to_value(&plain).unwrap();
+        assert!(plain_json.get("refusal_policy").is_none());
+        let entry_json = serde_json::to_value(plain.entries().next().unwrap().1).unwrap();
+        assert!(entry_json.get("refusal").is_none());
+        let old: Roster = serde_json::from_value(plain_json).unwrap();
+        assert_eq!(old.refusal_policy(), RefusalPolicy::default());
+    }
+
+    #[test]
+    fn fork_revocations_store_no_notice() {
+        let (fork_static, _) = keys(0x41);
+        let fork_sk = SigningKeypair::from_seed([0x42; 32]);
+        let mut roster = Roster::new();
+        for label in ["fork-a", "fork-b"] {
+            roster
+                .insert_pinned_host(
+                    label.into(),
+                    "F".into(),
+                    fork_static,
+                    Some(fork_sk.public_key().clone()),
+                    0,
+                    vec![],
+                )
+                .unwrap();
+            roster
+                .set_peer_v2_secrets(label, V2PeerSecrets::new([0x43; 32], [0x44; 32]))
+                .unwrap();
+        }
+        let snapshot = roster.pin_snapshot("fork-b").unwrap();
+        let (n1, s1) = keys(0x45);
+        let (n2, s2) = keys(0x47);
+        let rec1 = sign_rotation(1, &fork_sk, &s1, &n1, NOW).unwrap();
+        let rec2 = sign_rotation(1, &fork_sk, &s2, &n2, NOW + 1).unwrap();
+        let res = roster.apply_verified_rotation("fork-a", &[rec1.clone(), rec2.clone()], &n1, &s1);
+        assert!(matches!(res, Err(CoreError::RotationForkDetected { .. })));
+        for label in ["fork-a", "fork-b"] {
+            assert_eq!(roster.get(label).unwrap().state, PeerState::Revoked);
+            assert_eq!(notice(&roster, label), None, "{label}");
+        }
+
+        // A fork found later clears a notice an operator revoke recorded.
+        roster.entries.get_mut("fork-b").unwrap().refusal = Some(RefusalNotice {
+            until_unix: NOW + TTL,
+            secret: None,
+        });
+        let res = roster.reconcile_rotation_evidence("fork-b", &snapshot, &[rec1, rec2]);
+        assert!(matches!(res, Err(CoreError::RotationForkDetected { .. })));
+        assert_eq!(notice(&roster, "fork-b"), None);
+    }
+
+    #[test]
+    fn siblings_claims_and_anchors_store_no_notice() {
+        let (alias_static, alias_sig) = keys(0x51);
+        let mut roster = Roster::new();
+        for label in ["alias-a", "alias-b"] {
+            roster
+                .insert_pinned_host(
+                    label.into(),
+                    "A".into(),
+                    alias_static,
+                    Some(alias_sig.clone()),
+                    0,
+                    vec![],
+                )
+                .unwrap();
+            roster
+                .set_peer_v2_secrets(label, V2PeerSecrets::new([0x53; 32], [0x54; 32]))
+                .unwrap();
+        }
+        roster.revoke_peer_at("alias-a", true, NOW).unwrap();
+        assert!(notice(&roster, "alias-a").is_some());
+        assert_eq!(roster.get("alias-b").unwrap().state, PeerState::Revoked);
+        assert_eq!(notice(&roster, "alias-b"), None);
+
+        let claim = keys(0x55);
+        roster
+            .record_pending_host(
+                "studio".into(),
+                "S".into(),
+                claim.0,
+                claim.1.clone(),
+                0,
+                "sas".into(),
+                vec![],
+            )
+            .unwrap();
+        roster
+            .revoke_peer_at(&device_id(&claim.0), true, NOW)
+            .unwrap();
+        assert!(
+            roster
+                .entries()
+                .filter(|(_, e)| e.static_pub == claim.0)
+                .all(|(_, e)| e.state == PeerState::Revoked && e.refusal_notice().is_none())
+        );
+
+        let anchor_sk = SigningKeypair::from_seed([0x57; 32]);
+        let (m_static, _) = keys(0x58);
+        roster
+            .insert_pinned_host(
+                "machine".into(),
+                "M".into(),
+                m_static,
+                Some(anchor_sk.public_key().clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+        roster
+            .add_trust_anchor("anchor".into(), anchor_sk.public_key().clone())
+            .unwrap();
+        roster.revoke_trust_anchor("anchor").unwrap();
+        assert_eq!(roster.get("machine").unwrap().state, PeerState::Revoked);
+        assert_eq!(notice(&roster, "machine"), None);
+    }
+
+    fn crl_revoking(root: &SigningKeypair, issuer: &str, seq: u64, ids: &[&str]) -> RevocationList {
+        sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: issuer.into(),
+                seq,
+                revoked_devices: ids.iter().map(|s| (*s).to_string()).collect(),
+                revoked_nonces: vec![],
+                ts: "2026-11-20T00:00:00Z".into(),
+            },
+            root,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ingest_crl_at_records_notices_only_when_asked() {
+        let root = SigningKeypair::from_seed([0x61; 32]);
+        let mut roster = Roster::new();
+        let a = active_client(&mut roster, 0x62, 0x63);
+        let b = active_client(&mut roster, 0x64, 0x65);
+        roster
+            .ingest_crl(
+                crl_revoking(&root, "host", 1, &[&a]),
+                "host",
+                root.public_key(),
+            )
+            .unwrap();
+        assert_eq!(notice(&roster, &a), None);
+        roster
+            .ingest_crl_at(
+                crl_revoking(&root, "host", 2, &[&a, &b]),
+                "host",
+                root.public_key(),
+                true,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(notice(&roster, &a), None, "already revoked: no new notice");
+        assert_eq!(notice(&roster, &b).unwrap().until_unix(), NOW + TTL);
+        assert_eq!(notice_secret(&roster, &b), Some([0x65; 32]));
+    }
+
+    #[test]
+    fn prune_drops_only_expired_notices() {
+        let mut roster = Roster::new();
+        let a = active_client(&mut roster, 0x71, 0x72);
+        let b = active_client(&mut roster, 0x73, 0x74);
+        roster.revoke_peer_at(&a, true, NOW).unwrap();
+        roster.revoke_peer_at(&b, true, NOW + 100).unwrap();
+        assert_eq!(roster.prune_expired_refusal_notices(NOW + TTL - 1), 0);
+        assert_eq!(roster.prune_expired_refusal_notices(NOW + TTL), 1);
+        assert_eq!(notice(&roster, &a), None);
+        assert!(notice(&roster, &b).is_some());
+        assert_eq!(roster.get(&a).unwrap().state, PeerState::Revoked);
+    }
+
+    #[test]
+    fn clear_refusal_notice_keeps_the_entry_revoked() {
+        let mut roster = Roster::new();
+        let a = active_client(&mut roster, 0x75, 0x76);
+        roster.revoke_peer_at(&a, true, NOW).unwrap();
+        roster.clear_refusal_notice(&a).unwrap();
+        assert_eq!(notice(&roster, &a), None);
+        assert_eq!(roster.get(&a).unwrap().state, PeerState::Revoked);
+        assert_eq!(
+            roster.clear_refusal_notice("nope"),
+            Err(CoreError::PeerNotFound("nope".into()))
+        );
+    }
+
+    fn entry(id: &str, static_pub: [u8; 32], state: PeerState, floor: u8) -> RosterEntry {
+        RosterEntry {
+            device_id: id.into(),
+            name: id.into(),
+            kind: "cli".into(),
+            static_pub,
+            signing_pub: None,
+            rotation_seq: 0,
+            state,
+            last_pairing_sas: None,
+            grants: Vec::new(),
+            relay_hints: Vec::new(),
+            min_wire_version: floor,
+            v2_secrets: None,
+            routes: Vec::new(),
+            route_meta: None,
+            approved_signed: Vec::new(),
+            refusal: None,
+        }
+    }
+
+    fn live_notice() -> Option<RefusalNotice> {
+        Some(RefusalNotice {
+            until_unix: NOW + 10,
+            secret: None,
+        })
+    }
+
+    #[test]
+    fn resolve_static_is_independent_of_key_order() {
+        let (s, _) = keys(0x81);
+        for (active_key, revoked_key) in [("a-active", "z-revoked"), ("z-active", "a-revoked")] {
+            let mut roster = Roster::new();
+            roster.entries.insert(
+                active_key.into(),
+                entry(active_key, s, PeerState::Active, 1),
+            );
+            let mut revoked = entry(revoked_key, s, PeerState::Revoked, 1);
+            revoked.refusal = live_notice();
+            roster.entries.insert(revoked_key.into(), revoked);
+            assert!(matches!(
+                roster.resolve_static(&s),
+                StaticResolution::Revoked(_)
+            ));
+            assert_eq!(
+                roster.refusal_for_static(&s, NOW),
+                Some(RefusalReason::Revoked)
+            );
+            assert_eq!(roster.refusal_for_static(&s, NOW + 10), None, "expired");
+            assert!(matches!(
+                roster.lookup_active_by_static(&s),
+                Err(CoreError::PeerRevoked(_))
+            ));
+        }
+
+        // Two revoked entries, only one carries a live notice: liveness ignores key order.
+        for (with_notice, without) in [("a-r", "z-r"), ("z-r", "a-r")] {
+            let mut roster = Roster::new();
+            let mut n = entry(with_notice, s, PeerState::Revoked, 1);
+            n.refusal = live_notice();
+            roster.entries.insert(with_notice.into(), n);
+            roster
+                .entries
+                .insert(without.into(), entry(without, s, PeerState::Revoked, 1));
+            assert_eq!(
+                roster.refusal_for_static(&s, NOW),
+                Some(RefusalReason::Revoked)
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_static_floor_spans_entries_and_claims() {
+        let (s, sig) = keys(0x83);
+        let mut roster = Roster::new();
+        roster
+            .entries
+            .insert("p".into(), entry("p", s, PeerState::Pending, 1));
+        assert!(matches!(
+            roster.resolve_static(&s),
+            StaticResolution::Pending(_)
+        ));
+        assert_eq!(roster.pairing_floor(&s), 1);
+        roster
+            .record_pending_host("studio".into(), "S".into(), s, sig, 0, "x".into(), vec![])
+            .unwrap();
+        roster.pending_hosts[0].min_wire_version = 2;
+        assert_eq!(roster.pairing_floor(&s), 2);
+    }
+
+    #[test]
+    fn crl_revoked_active_and_manifest_pins_follow_the_notice_rules() {
+        let root = SigningKeypair::from_seed([0x85; 32]);
+        let (s, _) = keys(0x86);
+        let id = device_id(&s);
+        let mut roster = Roster::new();
+        roster
+            .entries
+            .insert(id.clone(), entry(&id, s, PeerState::Active, 1));
+        roster
+            .crls
+            .insert("host".into(), crl_revoking(&root, "host", 1, &[&id]));
+        assert!(matches!(
+            roster.resolve_static(&s),
+            StaticResolution::Revoked(_)
+        ));
+        assert_eq!(
+            roster.refusal_for_static(&s, NOW),
+            Some(RefusalReason::Revoked)
+        );
+        roster.set_refusal_policy(RefusalPolicy {
+            pending: true,
+            revoked_notice_ttl_secs: 0,
+        });
+        assert_eq!(roster.refusal_for_static(&s, NOW), None);
+
+        let (p, _) = keys(0x87);
+        let pid = device_id(&p);
+        let mut roster = Roster::new();
+        roster
+            .entries
+            .insert(pid.clone(), entry(&pid, p, PeerState::Pending, 1));
+        assert_eq!(
+            roster.refusal_for_static(&p, NOW),
+            Some(RefusalReason::Pending)
+        );
+        roster.set_refusal_policy(RefusalPolicy {
+            pending: false,
+            revoked_notice_ttl_secs: TTL,
+        });
+        assert_eq!(roster.refusal_for_static(&p, NOW), None);
+        roster.set_refusal_policy(RefusalPolicy::default());
+        roster.signing_hash_pins.insert(pid.clone(), [0u8; 32]);
+        assert_eq!(roster.refusal_for_static(&p, NOW), None, "manifest-pinned");
+
+        let mut roster = Roster::new();
+        let mut r = entry(&pid, p, PeerState::Revoked, 1);
+        r.refusal = live_notice();
+        roster.entries.insert(pid.clone(), r);
+        roster.signing_hash_pins.insert(pid.clone(), [0u8; 32]);
+        assert_eq!(roster.refusal_for_static(&p, NOW), None, "manifest-pinned");
+    }
+
+    fn all_notices(roster: &Roster) -> Vec<(String, RefusalNotice)> {
+        roster
+            .entries()
+            .filter_map(|(k, e)| e.refusal_notice().map(|n| (k.clone(), n.clone())))
+            .collect()
+    }
+
+    fn alias_pair(roster: &mut Roster, seed: u8) -> ([u8; 32], SigningKeypair) {
+        let (static_pub, _) = keys(seed);
+        let sk = SigningKeypair::from_seed([seed.wrapping_add(1); 32]);
+        for label in ["alias-a", "alias-b"] {
+            roster
+                .insert_pinned_host(
+                    label.into(),
+                    "A".into(),
+                    static_pub,
+                    Some(sk.public_key().clone()),
+                    0,
+                    vec![],
+                )
+                .unwrap();
+            roster
+                .set_peer_v2_secrets(label, V2PeerSecrets::new([seed; 32], [seed ^ 0xFF; 32]))
+                .unwrap();
+        }
+        (static_pub, sk)
+    }
+
+    #[test]
+    fn a_fork_leaves_no_live_notice_on_any_sibling() {
+        let mut roster = Roster::new();
+        let (static_pub, sk) = alias_pair(&mut roster, 0x91);
+        roster.revoke_peer_at("alias-b", true, NOW).unwrap();
+        assert!(notice(&roster, "alias-b").is_some());
+        // Re-activate alias-a so a fork can be detected on it; alias-b keeps its notice.
+        roster.entries.get_mut("alias-a").unwrap().state = PeerState::Active;
+        let (n1, s1) = keys(0x93);
+        let (n2, s2) = keys(0x95);
+        let rec1 = sign_rotation(1, &sk, &s1, &n1, NOW).unwrap();
+        let rec2 = sign_rotation(1, &sk, &s2, &n2, NOW + 1).unwrap();
+        let res = roster.apply_verified_rotation("alias-a", &[rec1, rec2], &n1, &s1);
+        assert!(matches!(res, Err(CoreError::RotationForkDetected { .. })));
+        assert!(
+            all_notices(&roster).is_empty(),
+            "{:?}",
+            all_notices(&roster)
+        );
+        assert_eq!(roster.refusal_for_static(&static_pub, NOW), None);
+    }
+
+    #[test]
+    fn a_silent_revoke_of_an_alias_clears_the_sibling_notice() {
+        let mut roster = Roster::new();
+        let (static_pub, _) = alias_pair(&mut roster, 0x97);
+        roster.revoke_peer_at("alias-b", true, NOW).unwrap();
+        assert_eq!(
+            roster.refusal_for_static(&static_pub, NOW),
+            Some(RefusalReason::Revoked)
+        );
+        roster.revoke_peer("alias-a").unwrap();
+        assert!(all_notices(&roster).is_empty());
+        assert_eq!(roster.refusal_for_static(&static_pub, NOW), None);
+
+        // A noticed revoke leaves an already noticed sibling alone.
+        let mut roster = Roster::new();
+        alias_pair(&mut roster, 0x99);
+        roster.revoke_peer_at("alias-b", true, NOW).unwrap();
+        roster.revoke_peer_at("alias-a", true, NOW + 5).unwrap();
+        assert_eq!(notice(&roster, "alias-b").unwrap().until_unix(), NOW + TTL);
+    }
+
+    #[test]
+    fn revoking_a_claim_clears_notices_on_entries_holding_its_keys() {
+        let mut roster = Roster::new();
+        let (static_pub, sig) = keys(0x9B);
+        let own = device_id(&static_pub);
+        let mut e = entry(&own, static_pub, PeerState::Revoked, 1);
+        e.refusal = live_notice();
+        roster.entries.insert(own.clone(), e);
+        let mut claim = entry("studio", static_pub, PeerState::Pending, 1);
+        claim.signing_pub = Some(sig);
+        claim.refusal = live_notice();
+        roster.revoke_claim_keys(claim);
+        assert!(
+            all_notices(&roster).is_empty(),
+            "{:?}",
+            all_notices(&roster)
+        );
+    }
+
+    #[test]
+    fn stored_notices_outside_revoked_entries_are_dropped_on_load() {
+        let mut roster = Roster::new();
+        let a = active_client(&mut roster, 0x9D, 0x9E);
+        let b = active_client(&mut roster, 0xA1, 0xA2);
+        roster.revoke_peer_at(&a, true, NOW).unwrap();
+        roster.revoke_peer_at(&b, true, NOW).unwrap();
+        let (host_static, host_sig) = keys(0xA3);
+        roster
+            .record_pending_host(
+                "studio".into(),
+                "S".into(),
+                host_static,
+                host_sig,
+                0,
+                "sas".into(),
+                vec![],
+            )
+            .unwrap();
+        let mut json = serde_json::to_value(&roster).unwrap();
+        let notice_json = json["entries"][&a]["refusal"].clone();
+        assert!(notice_json.is_object());
+        json["entries"][&a]["state"] = serde_json::json!("active");
+        json["pending_hosts"][0]["refusal"] = notice_json;
+        let loaded: Roster = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.get(&a).unwrap().state, PeerState::Active);
+        assert!(loaded.get(&a).unwrap().refusal_notice().is_none());
+        assert!(loaded.pending_hosts().all(|c| c.refusal_notice().is_none()));
+        assert!(loaded.get(&b).unwrap().refusal_notice().is_some());
     }
 }

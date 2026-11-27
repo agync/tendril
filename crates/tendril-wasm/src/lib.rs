@@ -3127,6 +3127,12 @@ impl WasmSessionClient {
                     "code": code,
                     "reason": reason,
                 })),
+                // Only a refusal-enabled responder emits this; the WASM surface builds none.
+                SessionAction::Refused { code, .. } => events.push(json!({
+                    "event": "closed",
+                    "code": code,
+                    "reason": "",
+                })),
             }
         }
 
@@ -3929,6 +3935,14 @@ impl WasmV2SessionInitiator {
                     "event": "closed",
                     "code": code,
                     "reason": reason,
+                }));
+            }
+            // Only a refusal-enabled responder emits this; the WASM surface builds none.
+            V2SessionAction::Refused { code, .. } => {
+                self.pending_events.push(json!({
+                    "event": "closed",
+                    "code": code,
+                    "reason": "",
                 }));
             }
         }

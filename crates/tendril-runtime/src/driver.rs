@@ -103,6 +103,14 @@ fn push_non_write_action(
             pending_events.push_back(SessionEvent::Closed { code, reason });
             (true, true)
         }
+        // Only a refusal-enabled responder emits this; the runtime builds none yet.
+        SessionAction::Refused { code, .. } => {
+            pending_events.push_back(SessionEvent::Closed {
+                code,
+                reason: String::new(),
+            });
+            (true, true)
+        }
         SessionAction::GroupManifestReceived(manifest) => {
             pending_events.push_back(SessionEvent::GroupManifestReceived(manifest));
             (true, false)
