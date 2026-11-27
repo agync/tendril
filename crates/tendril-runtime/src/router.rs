@@ -176,6 +176,24 @@ impl InboundRouter {
         Self::with_config(PreAuthConfig::default())
     }
 
+    /// Returns this router with `refusal` as its endpoint-wide refusal state, installed on every
+    /// limiter it owns. Use it to carry a [`RefusalState::with_audit_sink`] or a custom drain
+    /// bound; call it before the router accepts connections.
+    #[must_use]
+    pub fn with_refusal_state(mut self, refusal: RefusalState) -> Self {
+        for limiter in [
+            &mut self.rate_limiter,
+            &mut self.pair_limiter,
+            &mut self.session_limiter,
+            &mut self.v2_pair_limiter,
+            &mut self.v2_session_limiter,
+        ] {
+            *limiter = limiter.clone().with_refusal_state(refusal.clone());
+        }
+        self.refusal = refusal;
+        self
+    }
+
     /// Returns the endpoint-wide refusal state every limiter of this router carries. Hand it to
     /// [`crate::V2ResponderState::with_refusal_state`] so Wire v1 and Wire v2 share one limiter.
     #[must_use]
@@ -534,5 +552,42 @@ pub async fn recv_routed(
             }
             return if st.closed { Ok(None) } else { Err(()) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::rate_limit::RefusalAudit;
+
+    #[test]
+    fn with_refusal_state_shares_one_state_with_every_limiter() {
+        let seen: Arc<Mutex<Vec<RefusalAudit>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let router =
+            InboundRouter::new().with_refusal_state(RefusalState::with_audit_sink(move |audit| {
+                sink.lock().expect("sink").push(audit.clone())
+            }));
+
+        let states = [
+            router.refusal_state(),
+            router.rate_limiter().refusal_state(),
+            router.pair_rate_limiter().refusal_state(),
+            router.session_rate_limiter().refusal_state(),
+            router.v2_pair_rate_limiter().refusal_state(),
+            router.v2_session_rate_limiter().refusal_state(),
+        ];
+        for (i, state) in states.iter().enumerate() {
+            state.record(&format!("peer-{i}"), 4001);
+        }
+        let seen = seen.lock().expect("seen");
+        assert_eq!(
+            seen.len(),
+            states.len(),
+            "every limiter reports to the sink"
+        );
+        assert!(seen.iter().all(|a| a.code == 4001));
     }
 }

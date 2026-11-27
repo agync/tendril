@@ -114,3 +114,102 @@ fn revoke_follows_the_roster_policy_ttl() {
     assert_eq!(json["notice"], false, "a zero TTL records no notice");
     assert_eq!(notice(&store.load_roster().expect("roster"), &key), None);
 }
+
+fn json_stdout(out: &std::process::Output) -> serde_json::Value {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("json")
+}
+
+#[test]
+fn refusal_policy_prints_the_default_without_flags() {
+    let dir = TempDir::new().expect("dir");
+    assert!(run_tendril(dir.path(), &["init"]).status.success());
+    let json = json_stdout(&run_tendril(dir.path(), &["refusal-policy"]));
+    assert_eq!(json["pending"], true);
+    assert_eq!(json["revoked_notice_ttl_secs"], 2_592_000);
+}
+
+#[test]
+fn refusal_policy_flags_set_and_persist_the_policy() {
+    let dir = TempDir::new().expect("dir");
+    assert!(run_tendril(dir.path(), &["init"]).status.success());
+    let store = StateStore::open_or_create(dir.path()).expect("store");
+
+    let json = json_stdout(&run_tendril(
+        dir.path(),
+        &["refusal-policy", "--pending", "false"],
+    ));
+    assert_eq!(json["pending"], false);
+    assert_eq!(json["revoked_notice_ttl_secs"], 2_592_000, "ttl untouched");
+
+    let json = json_stdout(&run_tendril(
+        dir.path(),
+        &["refusal-policy", "--revoked-ttl-secs", "60"],
+    ));
+    assert_eq!(json["pending"], false, "pending untouched");
+    assert_eq!(json["revoked_notice_ttl_secs"], 60);
+
+    let policy = store.load_roster().expect("roster").refusal_policy();
+    assert_eq!(
+        policy,
+        RefusalPolicy {
+            pending: false,
+            revoked_notice_ttl_secs: 60,
+        }
+    );
+    let json = json_stdout(&run_tendril(dir.path(), &["refusal-policy"]));
+    assert_eq!(json["pending"], false);
+    assert_eq!(json["revoked_notice_ttl_secs"], 60);
+}
+
+#[test]
+fn refusal_policy_rejects_a_non_boolean_pending() {
+    let dir = TempDir::new().expect("dir");
+    assert!(run_tendril(dir.path(), &["init"]).status.success());
+    let out = run_tendril(dir.path(), &["refusal-policy", "--pending", "maybe"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid value") && stderr.contains("--pending"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn clear_refusal_notice_drops_the_notice_and_keeps_the_peer_revoked() {
+    let dir = TempDir::new().expect("dir");
+    assert!(run_tendril(dir.path(), &["init"]).status.success());
+    let store = StateStore::open_or_create(dir.path()).expect("store");
+    let (id, key) = store
+        .update_roster(|roster| Ok(peer(roster, 0x71)))
+        .expect("seed");
+    assert!(run_tendril(dir.path(), &["revoke", &id]).status.success());
+    assert_eq!(
+        notice(&store.load_roster().expect("roster"), &key),
+        Some(RefusalReason::Revoked)
+    );
+
+    let json = json_stdout(&run_tendril(dir.path(), &["clear-refusal-notice", &id]));
+    assert_eq!(json["cleared"], id);
+
+    let roster = store.load_roster().expect("roster");
+    assert_eq!(roster.get(&id).expect("peer").state, PeerState::Revoked);
+    assert_eq!(notice(&roster, &key), None);
+}
+
+#[test]
+fn clear_refusal_notice_fails_for_an_unknown_peer() {
+    let dir = TempDir::new().expect("dir");
+    assert!(run_tendril(dir.path(), &["init"]).status.success());
+    let out = run_tendril(dir.path(), &["clear-refusal-notice", "no-such-peer"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("PeerNotFound") && stderr.contains("no-such-peer"),
+        "{stderr}"
+    );
+}

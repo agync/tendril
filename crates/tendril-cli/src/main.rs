@@ -40,9 +40,9 @@ use tendril_runtime::{
     InboundQueue, InboundRouter, InboundSession, LastRouteSet, ListAddrSource, M2mEnrollOptions,
     OverlayListener, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode,
     PairPolicyOptions, PathDialer, PathListener, PathStream, PreAuthRateLimiter, RecoveryRoutes,
-    RelayClientAuth, RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig,
-    RosterAccess, RouteAnnouncer, RouteSetSink, RuntimeError, SessionDriver, SessionEvent,
-    StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec,
+    RefusalState, RelayClientAuth, RelayListener, RelayV2Dialer, RelayV2Listener,
+    RelayV2ListenerConfig, RosterAccess, RouteAnnouncer, RouteSetSink, RuntimeError, SessionDriver,
+    SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec,
     WakeDialOptions, WakeOutcome, WakeSecret, WebRtcUpgradeEndpoint, WebRtcUpgradeHandle,
     WtListener, build_wake_provider, connect_with_wake_policy,
     dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
@@ -510,6 +510,20 @@ enum Command {
         #[arg(long)]
         no_notify: bool,
     },
+    /// Show or set the host refusal policy (`spec/pairing-v1.md` Section 5.1).
+    ///
+    /// With no flag it prints the stored policy. Each flag given replaces that field and the
+    /// resulting policy is persisted and printed. Notices already recorded keep their expiry.
+    RefusalPolicy {
+        /// Refuse unconfirmed (`Pending`) peers with `4004 peer_pending`.
+        #[arg(long)]
+        pending: Option<bool>,
+        /// Lifetime in seconds of a notice recorded at revocation; `0` records none.
+        #[arg(long)]
+        revoked_ttl_secs: Option<u64>,
+    },
+    /// Drop the recorded refusal notice of a peer, which stays revoked.
+    ClearRefusalNotice { peer_id: String },
     /// List, remove or revoke unconfirmed host claims from unpinned pairing.
     Pending {
         #[command(subcommand)]
@@ -2546,7 +2560,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let identity = Arc::new(store.load_or_generate_identity(None)?);
             let store_lock = Arc::new(AsyncMutex::new(()));
             let pair_mgr = Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default())));
-            let router = Arc::new(InboundRouter::new());
+            let router = Arc::new(InboundRouter::new().with_refusal_state(
+                RefusalState::with_audit_sink(|audit| {
+                    print_json_line(&serde_json::json!({
+                        "event": "session_refused",
+                        "peer_device_id": audit.peer_id,
+                        "code": audit.code,
+                    }));
+                }),
+            ));
             let (webrtc_handle, webrtc_listener, webrtc_addr) = if let Some(addr) = webrtc_upgrade {
                 let (wh, wl) = WebRtcUpgradeEndpoint::bind(addr).await?;
                 let bound = wl.local_addr();
@@ -3659,6 +3681,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .is_some_and(|e| roster.refusal_for_static(&e.static_pub, now).is_some()))
             })?;
             print_json_line(&serde_json::json!({ "revoked": peer_id, "notice": notice }));
+        }
+        Command::RefusalPolicy {
+            pending,
+            revoked_ttl_secs,
+        } => {
+            let policy = if pending.is_none() && revoked_ttl_secs.is_none() {
+                store.load_roster()?.refusal_policy()
+            } else {
+                store.update_roster(|roster| {
+                    let mut policy = roster.refusal_policy();
+                    if let Some(pending) = pending {
+                        policy.pending = pending;
+                    }
+                    if let Some(ttl) = revoked_ttl_secs {
+                        policy.revoked_notice_ttl_secs = ttl;
+                    }
+                    roster.set_refusal_policy(policy);
+                    Ok(policy)
+                })?
+            };
+            print_json_line(&policy);
+        }
+        Command::ClearRefusalNotice { peer_id } => {
+            store.update_roster(|roster| {
+                roster.clear_refusal_notice(&peer_id)?;
+                Ok(())
+            })?;
+            print_json_line(&serde_json::json!({ "cleared": peer_id }));
         }
         Command::Pending { cmd } => match cmd {
             PendingCommand::List => {
