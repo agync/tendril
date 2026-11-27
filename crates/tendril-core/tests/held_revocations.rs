@@ -661,6 +661,187 @@ fn held_crls_are_ingested_whatever_order_they_are_met_in() {
     assert_eq!(disk.crl(&pending_id).map(|c| c.seq), Some(1));
 }
 
+/// A memory-born keyless `id1 = device_id(PK1)` and a labelled entry `(PK1, SK1)` that sorts
+/// before it and that disk rotated: the tombstone of the second must not be needed before the
+/// first is inserted, so the CRL of `id1` verifies in the first fold.
+#[test]
+fn a_label_sorting_before_the_keyless_id_still_gives_the_crl_a_key_in_one_fold() {
+    let old = Peer::new(0xb8);
+    let fresh = Peer::new(0xba);
+    let fork_a = Peer::new(0xbc);
+    let fork_b = Peer::new(0xbe);
+    let id1 = device_id(&old.static_pub);
+    assert!("aaa-host" < id1.as_str());
+
+    let mut memory = Roster::new();
+    memory
+        .record_pending_pair(
+            old.static_pub,
+            None,
+            "Keyless".into(),
+            "cli".into(),
+            "sas".into(),
+        )
+        .unwrap();
+    memory.confirm_peer(&id1, Some("sas")).unwrap();
+    pin(&mut memory, "aaa-host", &old);
+    let rec_a = sign_rotation(1, &old.sk, &fork_a.pubkey(), &fork_a.static_pub, NOW).unwrap();
+    let rec_b = sign_rotation(1, &old.sk, &fork_b.pubkey(), &fork_b.static_pub, NOW + 1).unwrap();
+    let res = memory.apply_verified_rotation(
+        "aaa-host",
+        &[rec_a, rec_b],
+        &fork_a.static_pub,
+        &fork_a.pubkey(),
+    );
+    assert!(matches!(res, Err(CoreError::RotationForkDetected { .. })));
+    assert_eq!(state(&memory, &id1), Some(PeerState::Revoked));
+    memory
+        .ingest_crl(crl(&id1, 1, &old.sk, &["x"]), &id1, &old.pubkey())
+        .unwrap();
+
+    let mut disk = Roster::new();
+    pin(&mut disk, "aaa-host", &old);
+    let rec = sign_rotation(1, &old.sk, &fresh.pubkey(), &fresh.static_pub, NOW).unwrap();
+    disk.apply_verified_rotation("aaa-host", &[rec], &fresh.static_pub, &fresh.pubkey())
+        .unwrap();
+    assert!(disk.get(&id1).is_none());
+
+    assert!(disk.absorb_held_revocations(&memory, None));
+    assert_eq!(
+        disk.crl(&id1).map(|c| c.seq),
+        Some(1),
+        "the CRL is ingested by the first fold"
+    );
+    fold(&mut disk, &memory, None);
+}
+
+/// Two revoked records of one static key, one with a signing key and one without, both of
+/// which disk replaced: the result never holds a `#revoked-none` tombstone, whichever sorts
+/// first.
+#[test]
+fn a_keyless_claim_never_gets_its_own_tombstone_next_to_a_keyed_one() {
+    for (keyed, keyless) in [("aaa-host", "bbb-host"), ("bbb-host", "aaa-host")] {
+        let old = Peer::new(0xb0);
+        let fresh = Peer::new(0xb2);
+        let other = Peer::new(0xb4);
+        let keyless_peer = Peer {
+            static_pub: old.static_pub,
+            sk: SigningKeypair::from_seed([0xb6; 32]),
+        };
+        let mut memory = Roster::new();
+        pin(&mut memory, keyed, &old);
+        memory
+            .insert_pinned_host(
+                keyless.into(),
+                "Keyless".into(),
+                keyless_peer.static_pub,
+                None,
+                0,
+                vec![],
+            )
+            .unwrap();
+        memory.revoke_peer(keyed).unwrap();
+        assert_eq!(state(&memory, keyless), Some(PeerState::Revoked));
+
+        let mut disk = Roster::new();
+        pin(&mut disk, keyed, &old);
+        let rec = sign_rotation(1, &old.sk, &fresh.pubkey(), &fresh.static_pub, NOW).unwrap();
+        disk.apply_verified_rotation(keyed, &[rec], &fresh.static_pub, &fresh.pubkey())
+            .unwrap();
+        pin(&mut disk, keyless, &other);
+
+        fold(&mut disk, &memory, None);
+        assert!(is_revoked(&disk, &old.static_pub), "{keyed} first");
+        assert!(
+            !disk.entries().any(|(k, _)| k.ends_with("#revoked-none")),
+            "{keyed} first: {:?}",
+            disk.entries().map(|(k, _)| k.clone()).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A keyless revoked record revokes its keyed sibling through the shared static key before the
+/// sibling's own turn: the sibling's signing key must still be revoked, whichever label sorts
+/// first, so a `Pending` issuer and an anchor holding that key are revoked in one fold.
+#[test]
+fn a_sibling_revoked_by_an_earlier_entry_still_revokes_its_signing_key() {
+    let mut results = Vec::new();
+    for keyless in ["aaa-keyless", "zzz-keyless"] {
+        let shared = Peer::new(0xa8);
+        let keyed = Peer {
+            static_pub: shared.static_pub,
+            sk: SigningKeypair::from_seed([0xaa; 32]),
+        };
+        let issuer = Peer {
+            static_pub: *StaticKeypair::from_scalar([0xac; 32]).public_bytes(),
+            sk: SigningKeypair::from_seed([0xaa; 32]),
+        };
+        let id2 = device_id(&issuer.static_pub);
+
+        let mut disk = Roster::new();
+        disk.insert_pinned_host(
+            keyless.into(),
+            "Keyless".into(),
+            shared.static_pub,
+            None,
+            0,
+            vec![],
+        )
+        .unwrap();
+        pin(&mut disk, "bbb-peer", &keyed);
+        disk.record_pending_pair(
+            issuer.static_pub,
+            Some(issuer.pubkey()),
+            "Issuer".into(),
+            "cli".into(),
+            "sas".into(),
+        )
+        .unwrap();
+        disk.add_trust_anchor("anchor-b".into(), keyed.pubkey())
+            .unwrap();
+        assert_eq!(state(&disk, &id2), Some(PeerState::Pending));
+
+        let mut memory = Roster::new();
+        memory
+            .insert_pinned_host(
+                keyless.into(),
+                "Keyless".into(),
+                shared.static_pub,
+                None,
+                0,
+                vec![],
+            )
+            .unwrap();
+        pin(&mut memory, "bbb-peer", &keyed);
+        memory.revoke_peer("bbb-peer").unwrap();
+        assert_eq!(state(&memory, keyless), Some(PeerState::Revoked));
+        memory
+            .ingest_crl(crl(&id2, 1, &keyed.sk, &["x"]), &id2, &keyed.pubkey())
+            .unwrap();
+
+        assert!(disk.absorb_held_revocations(&memory, None));
+        assert_eq!(
+            disk.crl(&id2).map(|c| c.seq),
+            Some(1),
+            "{keyless}: the Pending issuer's CRL is ingested by the first fold"
+        );
+        fold(&mut disk, &memory, None);
+        assert_eq!(state(&disk, &id2), Some(PeerState::Revoked), "{keyless}");
+        assert_eq!(
+            disk.trust_anchor("anchor-b").map(|a| a.state),
+            Some(AnchorState::Revoked),
+            "{keyless}"
+        );
+        results.push((
+            state(&disk, "bbb-peer"),
+            state(&disk, &id2),
+            disk.trust_anchor("anchor-b").map(|a| a.state),
+            disk.crl(&id2).map(|c| c.seq),
+        ));
+    }
+    assert_eq!(results[0], results[1], "the label order never decides");
+}
+
 // ---------------------------------------------------------------------------------------------
 // A CRL never un-revokes
 // ---------------------------------------------------------------------------------------------

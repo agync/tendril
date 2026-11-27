@@ -509,8 +509,18 @@ const ANCHORS: usize = 2;
 const CLAIMS: usize = 2;
 const CRL_SEQS: u64 = 3;
 
+/// Even peers sort before a `dev_...` id, odd peers after it.
 fn peer_label(i: usize) -> String {
-    format!("peer-{i}")
+    if i.is_multiple_of(2) {
+        format!("aaa-peer-{i}")
+    } else {
+        format!("zzz-peer-{i}")
+    }
+}
+
+/// The keyless record `device_id(static)` memory can hold for a peer's static key.
+fn keyless_id(i: usize) -> String {
+    device_id(&static_of(peer_seed(i)))
 }
 
 fn anchor_label(i: usize) -> String {
@@ -592,6 +602,8 @@ fn fixtures() -> &'static Fixtures {
             .collect();
         crls.extend((0..ANCHORS).map(|i| issuer(&anchor_label(i), &anchor_sk(i))));
         crls.push(issuer("local-host", local.signing_key()));
+        // The keyless `device_id(static)` of each peer signs with the peer's key.
+        crls.extend((0..PEERS).map(|i| issuer(&keyless_id(i), &peer_sk(i))));
         Fixtures { rotations, crls }
     })
 }
@@ -624,13 +636,17 @@ fn seed_disk(store: &StateStore) {
         .unwrap();
 }
 
+const ISSUERS: usize = PEERS + ANCHORS + 1 + PEERS;
+
 fn issuer_key(ix: usize) -> HybridSigningPublicKey {
     if ix < PEERS {
         peer_sk(ix).public_key().clone()
     } else if ix < PEERS + ANCHORS {
         anchor_sk(ix - PEERS).public_key().clone()
-    } else {
+    } else if ix == PEERS + ANCHORS {
         local_identity().signing_key().public_key().clone()
+    } else {
+        peer_sk(ix - PEERS - ANCHORS - 1).public_key().clone()
     }
 }
 
@@ -639,8 +655,10 @@ fn issuer_id(ix: usize) -> String {
         peer_label(ix)
     } else if ix < PEERS + ANCHORS {
         anchor_label(ix - PEERS)
-    } else {
+    } else if ix == PEERS + ANCHORS {
         "local-host".to_owned()
+    } else {
+        keyless_id(ix - PEERS - ANCHORS - 1)
     }
 }
 
@@ -855,7 +873,7 @@ fn run_seed(seed: u64) {
     let local = local_identity();
     let local_pub = local.signing_key().public_key().clone();
     let mut rng = SplitMix64(seed);
-    let mut crl_seq = [0usize; PEERS + ANCHORS + 1];
+    let mut crl_seq = [0usize; ISSUERS];
     let mut log = Vec::new();
 
     let sync = |op: usize, ctx: &str| {
@@ -907,10 +925,10 @@ fn run_seed(seed: u64) {
     let ops = 1 + rng.below(16);
     for step in 0..ops {
         let ctx = format!("seed {seed} step {step} after {log:?}");
-        let choice = rng.below(19);
+        let choice = rng.below(20);
         let (p, a, c) = (rng.below(PEERS), rng.below(ANCHORS), rng.below(CLAIMS));
         let notify = rng.below(2) == 0;
-        let issuer_ix = rng.below(PEERS + ANCHORS + 1);
+        let issuer_ix = rng.below(ISSUERS);
         log.push(choice);
         match choice {
             0 => {
@@ -1006,7 +1024,22 @@ fn run_seed(seed: u64) {
                     Ok(())
                 });
             }
-            n => sync(n - 14, &ctx),
+            14 => {
+                // A memory-born keyless record of a peer's static key, revoked: the case where
+                // a labelled entry (sorting before or after it) and `dev_...` interleave.
+                let mut mem = lock(access.roster());
+                let id = keyless_id(p);
+                let _ = mem.insert_pinned_host(
+                    id.clone(),
+                    "Keyless".into(),
+                    static_of(peer_seed(p)),
+                    None,
+                    0,
+                    vec![],
+                );
+                let _ = mem.revoke_peer(&id);
+            }
+            n => sync(n - 15, &ctx),
         }
     }
 
