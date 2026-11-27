@@ -44,6 +44,8 @@ impl SessionCloseCode {
     pub const NORMAL: u16 = 1000;
     pub const PROTOCOL_ERROR: u16 = 1002;
     pub const POLICY_VIOLATION: u16 = 1008;
+    /// The responder hit an internal failure (`spec/wire-v1.md` Section 5.4.1).
+    pub const INTERNAL_ERROR: u16 = 1011;
     /// Refusal: the responder knows the peer and it is revoked (`spec/wire-v1.md` Section 5.4.1).
     pub const PEER_REVOKED: u16 = 4001;
     /// Alias of [`Self::PEER_REVOKED`], kept for existing callers.
@@ -1627,6 +1629,7 @@ mod tests {
     fn close_code_registry_matches_spec() {
         assert_eq!(SessionCloseCode::PEER_REVOKED, 4001);
         assert_eq!(SessionCloseCode::PEER_PENDING, 4004);
+        assert_eq!(SessionCloseCode::INTERNAL_ERROR, 1011);
         assert_eq!(SessionCloseCode::REVOKED, SessionCloseCode::PEER_REVOKED);
         assert_eq!(SessionCloseCode::GRANT_EXPIRED, 4002);
         assert_eq!(SessionCloseCode::KEY_UNVERIFIED, 4003);

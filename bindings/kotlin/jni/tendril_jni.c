@@ -126,15 +126,15 @@ static int throw_refused(JNIEnv *env, const char *reason, int close_code, const 
 static int refusal_from_code(const char *code, const char **reason, int *close_code) {
   if (strcmp(code, "refused_revoked") == 0) {
     *reason = "revoked";
-    *close_code = 4001;
+    *close_code = TENDRIL_CLOSE_PEER_REVOKED;
     return 1;
   }
   if (strcmp(code, "refused_pending") == 0) {
     *reason = "pending";
-    *close_code = 4004;
+    *close_code = TENDRIL_CLOSE_PEER_PENDING;
     return 1;
   }
-  if (strncmp(code, "refused", 7) == 0) {
+  if (strcmp(code, "refused") == 0) {
     *reason = "other";
     *close_code = 0;
     return 1;

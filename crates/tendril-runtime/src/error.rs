@@ -90,10 +90,8 @@ impl RuntimeError {
     /// every other error becomes [`RuntimeError::Core`].
     ///
     /// Call it only where the session is known to be an initiator. A responder must keep the
-    /// plain [`CoreError::SessionClosed`]. Nothing calls it outside tests until the initiator
-    /// drivers adopt it.
+    /// plain [`CoreError::SessionClosed`].
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_initiator_core(err: CoreError) -> Self {
         match err {
             CoreError::SessionClosed { code, reason } => Self::InitiatorClosed { code, reason },

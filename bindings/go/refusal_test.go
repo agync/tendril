@@ -1,6 +1,7 @@
 package tendril_test
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -36,6 +37,29 @@ func TestRefusedV2ConnectIsATypedError(t *testing.T) {
 	}
 	if refused.Code != "refused_revoked" || !strings.Contains(refused.Error(), "revoked") {
 		t.Fatalf("unexpected code or text: %+v / %q", refused, refused.Error())
+	}
+}
+
+func TestRefusedConnectWithOptionsV2IsATypedError(t *testing.T) {
+	p := newRoutesHost(t, t.TempDir(), true)
+	if err := p.ep.RevokePeer(p.deviceID); err != nil {
+		t.Fatalf("RevokePeer: %v", err)
+	}
+	_, _, err := connectPair(t, p.ep, true, func() (*tendril.Session, error) {
+		return p.clientEp.ConnectWithOptions(p.hostID, &tendril.ConnectOptions{
+			Wire:  2,
+			Grant: json.RawMessage(p.grant),
+		})
+	})
+	if err == nil {
+		t.Fatal("a revoked peer connected")
+	}
+	refused := asRefused(t, err)
+	if refused.Reason != tendril.RefusalRevoked || refused.CloseCode != tendril.CloseCodePeerRevoked {
+		t.Fatalf("unexpected refusal: %+v", refused)
+	}
+	if refused.Code != "refused_revoked" {
+		t.Fatalf("unexpected code: %+v", refused)
 	}
 }
 
