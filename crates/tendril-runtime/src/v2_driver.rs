@@ -520,6 +520,7 @@ async fn drive_v2_pake_pair_responder_inner(
     existing_guard: Option<HalfOpenGuard>,
     handshake_timeout: Duration,
 ) -> Result<V2PairDriveResult, RuntimeError> {
+    crate::store::ensure_valid_local_host_id(identity)?;
     let _half_open = match existing_guard {
         Some(g) => Some(g),
         None => rate_limiter
@@ -2097,6 +2098,7 @@ impl V2SessionDriver {
         existing_guard: Option<HalfOpenGuard>,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        crate::store::ensure_valid_local_host_id(local_identity)?;
         let mut half_open = match existing_guard {
             Some(g) => Some(g),
             None => rate_limiter

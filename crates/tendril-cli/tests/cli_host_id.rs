@@ -16,7 +16,7 @@ fn tendril(state_dir: &std::path::Path, args: &[&str]) -> std::process::Output {
 
 #[test]
 fn init_refuses_an_invalid_host_id_and_writes_nothing() {
-    for bad in ["has#hash", "ctl\u{7}char", &"x".repeat(257)] {
+    for bad in ["", "has#hash", "ctl\u{7}char", &"x".repeat(257)] {
         let dir = TempDir::new().expect("dir");
         let out = tendril(dir.path(), &["init", "--host-id", bad]);
         assert!(!out.status.success(), "{bad:?} was accepted");
@@ -55,11 +55,36 @@ fn conformance_peer_refuses_an_invalid_host_id() {
         stdout.read_line(&mut line).expect("read");
         serde_json::from_str(&line).expect("json")
     };
-    let bad = call(serde_json::json!({"op": "init", "host_id": "has#hash"}));
-    assert_eq!(bad["ok"], false, "{bad}");
+    for bad_id in ["has#hash", ""] {
+        let bad = call(serde_json::json!({"op": "init", "host_id": bad_id}));
+        assert_eq!(bad["ok"], false, "{bad_id:?}: {bad}");
+    }
     let good = call(serde_json::json!({"op": "init", "host_id": "peer-ok"}));
     assert_eq!(good["ok"], true, "{good}");
     assert_eq!(good["host_id"], "peer-ok");
     drop(stdin);
     let _ = child.wait();
+}
+
+#[test]
+fn init_refuses_a_host_id_that_differs_from_the_stored_identity() {
+    let dir = TempDir::new().expect("dir");
+    assert!(
+        tendril(dir.path(), &["init", "--host-id", "studio"])
+            .status
+            .success()
+    );
+    assert!(
+        tendril(dir.path(), &["init", "--host-id", "studio"])
+            .status
+            .success()
+    );
+    for bad in ["has#hash", "other-name"] {
+        let out = tendril(dir.path(), &["init", "--host-id", bad]);
+        assert!(!out.status.success(), "{bad:?} was accepted");
+    }
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("identity.json")).expect("read"))
+            .expect("json");
+    assert_eq!(stored["host_id"], "studio");
 }

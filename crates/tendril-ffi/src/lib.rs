@@ -1245,45 +1245,39 @@ impl TendrilEndpoint {
     /// written (no `roster.json` created, no mtime bump) when the store already holds them.
     ///
     /// Each CRL is verified against the issuer's key as [`Self::persist_v1_crl_if_newer`] does:
-    /// the local signing key for this host's own CRL, else an active key or anchor on disk,
-    /// else the key the in-memory roster holds, so a CRL whose issuer was revoked on disk since
-    /// is kept.
+    /// the local signing key for this host's own CRL, else a key or trust anchor on disk (an
+    /// active one first, then a revoked peer's or anchor's), else the one the in-memory roster
+    /// holds, so a CRL whose issuer was revoked meanwhile is kept.
     fn persist_session_crls(&self) -> Result<(), (i32, String)> {
         let Some(store) = self.store.as_ref() else {
             return Ok(());
         };
         let _store_guard = self.rt.block_on(self.store_lock.lock());
         let local_id = self.identity.host_id();
-        let held: Vec<(String, RevocationList, Option<HybridSigningPublicKey>)> = {
-            let mem = lock_roster(&self.roster);
-            let mut issuers: Vec<&String> = mem.entries().map(|(id, _)| id).collect();
-            issuers.extend(mem.trust_anchors().map(|(id, _)| id));
-            let local = local_id.to_owned();
-            if !issuers.contains(&&local) {
-                issuers.push(&local);
-            }
-            issuers
-                .into_iter()
-                .filter_map(|id| {
-                    mem.crl(id).map(|crl| {
-                        let key = mem
-                            .get(id)
-                            .and_then(|e| e.signing_pub.clone())
-                            .or_else(|| mem.lookup_active_anchor_key(id));
-                        (id.clone(), crl.clone(), key)
-                    })
-                })
-                .collect()
-        };
         store
             .update_roster_if_changed(|disk| {
-                for (issuer, crl, memory_key) in &held {
+                // Lock order: store lock, roster file lock (held here), in-memory roster. The
+                // CRLs are read under the file lock, so none arrives between read and merge.
+                let mem = lock_roster(&self.roster);
+                let mut issuers: Vec<&String> = mem.entries().map(|(id, _)| id).collect();
+                issuers.extend(mem.trust_anchors().map(|(id, _)| id));
+                let local = local_id.to_owned();
+                if !issuers.contains(&&local) {
+                    issuers.push(&local);
+                }
+                for issuer in issuers {
+                    let Some(crl) = mem.crl(issuer) else {
+                        continue;
+                    };
                     let key = if issuer == local_id {
                         Some(self.identity.signing_key().public_key().clone())
                     } else {
                         disk.lookup_active_signing_key(issuer)
                             .or_else(|| disk.lookup_active_anchor_key(issuer))
-                            .or_else(|| memory_key.clone())
+                            .or_else(|| disk.get(issuer).and_then(|e| e.signing_pub.clone()))
+                            .or_else(|| disk.trust_anchor(issuer).map(|a| a.signing_pub.clone()))
+                            .or_else(|| mem.get(issuer).and_then(|e| e.signing_pub.clone()))
+                            .or_else(|| mem.trust_anchor(issuer).map(|a| a.signing_pub.clone()))
                     };
                     if let Some(key) = key {
                         let _ = disk.ingest_crl(crl.clone(), issuer, &key);
@@ -7710,6 +7704,43 @@ mod route_state_tests {
         ep.get().persist_session_crls().unwrap();
         assert_eq!(ep.disk_crl_seq(&local_id), Some(1), "the host's own CRL");
         assert_eq!(ep.disk_crl_seq(&peer_id), Some(1), "a revoked issuer's CRL");
+    }
+
+    #[test]
+    fn persisting_session_crls_keeps_a_revoked_anchors_crl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ep = Ep::new(tmp.path(), None);
+        let anchor = EndpointIdentity::generate().unwrap();
+        let anchor_id = "ca-1".to_owned();
+        let anchor_pub = anchor.signing_key().public_key().clone();
+        ep.get()
+            .mutate_roster(|r| {
+                r.add_trust_anchor(anchor_id.clone(), anchor_pub.clone())
+                    .map(|_| ())
+                    .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+            })
+            .unwrap();
+        lock_roster(&ep.get().roster)
+            .ingest_crl(crl(&anchor, &anchor_id, 1), &anchor_id, &anchor_pub)
+            .unwrap();
+        // The anchor is revoked on disk and in memory before the CRL is persisted.
+        ep.get()
+            .store
+            .as_ref()
+            .unwrap()
+            .update_roster(|r| r.revoke_trust_anchor(&anchor_id).map_err(Into::into))
+            .unwrap();
+        lock_roster(&ep.get().roster)
+            .revoke_trust_anchor(&anchor_id)
+            .unwrap();
+        assert_eq!(ep.disk_crl_seq(&anchor_id), None);
+
+        ep.get().persist_session_crls().unwrap();
+        assert_eq!(
+            ep.disk_crl_seq(&anchor_id),
+            Some(1),
+            "a revoked anchor's CRL is kept"
+        );
     }
 
     #[test]

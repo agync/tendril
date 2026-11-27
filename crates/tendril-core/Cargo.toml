@@ -37,5 +37,9 @@ url.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+# Enables `test-utils` (the forging `EndpointIdentity::with_host_id`) for tests, examples and benches.
+tendril-core = { path = ".", features = ["test-utils"] }
+
 [lints]
 workspace = true

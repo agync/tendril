@@ -382,6 +382,10 @@ impl StateStore {
     /// Loads the existing identity (attaching `signer` when `version == 2`), or generates and
     /// persists a new identity under an exclusive `.identity.lock` advisory lock.
     ///
+    /// A non-empty `host_id` must pass `is_valid_host_id`, and when an identity already exists
+    /// it must equal that identity's `host_id`; either failure is an error and nothing changes.
+    /// An empty `host_id` is the same as `None`.
+    ///
     /// When `identity.json` is absent:
     /// - `signer == None` generates a software `version == 1` identity.
     /// - `signer == Some(ext)` generates a `version == 2` identity with a fresh Ed25519 seed
@@ -392,11 +396,26 @@ impl StateStore {
         signer: Option<Arc<dyn ExternalMlDsaSigner>>,
     ) -> Result<EndpointIdentity, RuntimeError> {
         self.refuse_identity_on_sealed()?;
+        let host_id = host_id.filter(|id| !id.is_empty());
+        if let Some(id) = host_id
+            && !is_valid_host_id(id)
+        {
+            return Err(CoreError::ProtocolViolation("invalid host_id").into());
+        }
         let lock = open_lock_0600(&self.dir.join(IDENTITY_LOCK_FILE))?;
         flock(&lock, true)?;
         let path = self.identity_path();
         match fs::symlink_metadata(&path) {
-            Ok(_) => return self.load_identity_with_signer(signer),
+            Ok(_) => {
+                let identity = self.load_identity_with_signer(signer)?;
+                if host_id.is_some_and(|id| id != identity.host_id()) {
+                    return Err(CoreError::ProtocolViolation(
+                        "host_id differs from the stored identity",
+                    )
+                    .into());
+                }
+                return Ok(identity);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(RuntimeError::Io(err)),
         }
@@ -409,9 +428,7 @@ impl StateStore {
             None => SigningKeypair::generate()?,
         };
         let mut identity = EndpointIdentity::from_keys(static_key, signing_key);
-        if let Some(id) = host_id
-            && !id.is_empty()
-        {
+        if let Some(id) = host_id {
             identity = identity.try_with_host_id(id)?;
         }
         self.save_identity(&identity)?;
@@ -704,6 +721,18 @@ impl StateStore {
     }
 }
 
+/// Refuses a local `identity` whose `host_id` peers would refuse in `HostHello`.
+///
+/// Every responder entry point calls it before touching the stream, so a responder never
+/// starts with an invalid local `host_id` (`spec/pairing-v1.md` Section 5).
+pub(crate) fn ensure_valid_local_host_id(identity: &EndpointIdentity) -> Result<(), RuntimeError> {
+    if is_valid_host_id(identity.host_id()) {
+        Ok(())
+    } else {
+        Err(CoreError::ProtocolViolation("invalid local host_id").into())
+    }
+}
+
 /// The serialized form of `roster`, compared to tell whether a transaction changed it.
 fn roster_fingerprint(roster: &Roster) -> Result<Zeroizing<Vec<u8>>, RuntimeError> {
     serde_json::to_vec(roster)
@@ -878,6 +907,34 @@ mod tests {
         ED25519_SIG_LEN, HYBRID_MLDSA_CTX, MLDSA65_PUBLIC_LEN, MLDSA65_SIG_LEN,
     };
     use tendril_core::error::CoreError;
+
+    #[test]
+    fn a_supplied_host_id_is_checked_against_an_existing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open_or_create(dir.path()).unwrap();
+        let first = store.load_or_generate_identity(Some("studio")).unwrap();
+        let stored = std::fs::read(store.identity_path()).unwrap();
+        // The same name, and no name, keep the identity.
+        assert_eq!(
+            store
+                .load_or_generate_identity(Some("studio"))
+                .unwrap()
+                .host_id(),
+            "studio"
+        );
+        assert_eq!(
+            store.load_or_generate_identity(None).unwrap().device_id(),
+            first.device_id()
+        );
+        // An invalid or different name is refused, not silently ignored.
+        for bad in ["has#hash", "other-name"] {
+            assert!(
+                store.load_or_generate_identity(Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(std::fs::read(store.identity_path()).unwrap(), stored);
+    }
 
     #[test]
     fn an_invalid_host_id_is_never_generated_or_persisted() {
@@ -1100,9 +1157,18 @@ mod tests {
         assert!(created_v2.signing_key().is_external_mldsa());
 
         // Reloading with matching signer returns the exact same persisted identity.
+        assert!(
+            ext_store
+                .load_or_generate_identity_with_signer(
+                    Some("other-host"),
+                    Some(Arc::new(StoreMockExternalSigner::new([0x66; 32]))),
+                )
+                .is_err(),
+            "a different host_id is refused, not ignored"
+        );
         let reloaded_v2 = ext_store
             .load_or_generate_identity_with_signer(
-                Some("ignored-host"),
+                Some("sep-store-host"),
                 Some(Arc::new(StoreMockExternalSigner::new([0x66; 32]))),
             )
             .unwrap();

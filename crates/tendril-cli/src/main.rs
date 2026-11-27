@@ -2465,6 +2465,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.cmd {
         Command::Init { host_id } => {
+            if host_id.as_deref() == Some("") {
+                return Err("--host-id must not be empty".into());
+            }
             let id = store.load_or_generate_identity(host_id.as_deref())?;
             let roster = store.load_roster()?;
             store.save_roster(&roster)?;
