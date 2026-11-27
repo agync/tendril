@@ -1,14 +1,14 @@
 ---
 type: Decision
 title: "0006 Meeting mailboxes from a shared secret"
-description: Proposed design for short-lived relay mailboxes derived from a typed pairing code and a 15-minute epoch, admitted on allowlist relays by narrow host-delegated tickets whose lifetime and stream budget the relay enforces.
-status: draft
+description: Accepted design for short-lived relay mailboxes derived from a typed pairing code and a 15-minute epoch, admitted on allowlist relays by narrow host-delegated tickets whose lifetime and stream budget the relay enforces.
+status: stable
 tags: [adr, relay, pairing, privacy, security]
 ---
 
 # 0006 Meeting mailboxes from a shared secret
 
-> **Status: Proposed.** No spec or code changes yet. The follow-up work at the end lists what acceptance would start and the existing relay and roster behaviour the design relies on.
+> **Status: Accepted (2026-11-27).** No spec or code changes yet. The follow-up work at the end lists the issues acceptance starts and the existing relay and roster behaviour the design relies on.
 
 ## Context
 
@@ -234,7 +234,7 @@ Limits: an attacker who knows the code can always burn it by dialing first, and 
 - Unconfirmed host claims live in a pending host store keyed by `(device_id(host_static_pub), host_id)` and never revoke a label (`spec/pairing-v1.md` Section 5).
 - `auth_scope` defaults to `register-only` on allowlist-only relays and to `all` once Tier 2 or 3 is configured, and the relay validates allowlist keys (`spec/relay-v1.md` Section 2.5).
 
-Issues to file if this ADR is accepted:
+Follow-up issues, filed on acceptance:
 
 1. **spec: meeting mailbox derivation.** Fix the labels and epoch rules of Section 1 (registration span, symmetric second dial, no underflow at epoch `0`), add vectors under `spec/vectors/` and the Go cross-check, and state the `Remote3Group` requirement.
 2. **relay: delegated meeting tickets.** Opt-in setting, issuer and target rules, issuer binding checked on `register` and `accept`, no standby, one stream per registration with its budget, per-issuer live quota and rolling admission window, `max_meeting_ttl`, closing bridged meeting streams at the `not_after + 30 s` deadline, and the start-up conflict check, in `spec/relay-v1.md` Section 2.5, `crates/tendril-relay` and the Workers relay under `deploy/`.
