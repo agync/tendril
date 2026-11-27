@@ -574,8 +574,44 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
   fun mintGrant(peerId: String, capsJson: String, ttlSecs: Long = 3600): String =
     withHandle { TendrilNative.endpointMintGrant(it, peerId, capsJson, ttlSecs) }
 
+  /**
+   * Revokes the peer. Unless the [setRefusalPolicy] policy records no notice, the peer gets an
+   * authenticated refusal ([TendrilRefusedException]) on its next session attempt.
+   */
   fun revokePeer(peerId: String) =
     withHandle { TendrilNative.endpointRevokePeer(it, peerId) }
+
+  /**
+   * Revokes the peer. [notify] null follows the refusal policy, true records a refusal notice and
+   * false revokes silently, so the peer sees an unknown host.
+   */
+  fun revokePeerWithOptions(peerId: String, notify: Boolean? = null) =
+    withHandle {
+      TendrilNative.endpointRevokePeerWithOptions(
+        it,
+        peerId,
+        notify?.let { n -> """{"notify":$n}""" },
+      )
+    }
+
+  /**
+   * Sets and persists how this host refuses known peers: [pending] refuses unconfirmed peers with
+   * close code 4004, and [revokedNoticeTtlSecs] is how long a revoked peer keeps getting a notice
+   * (0 records none). Notices already recorded keep their expiry.
+   */
+  fun setRefusalPolicy(pending: Boolean = true, revokedNoticeTtlSecs: Long = 2_592_000L) {
+    require(revokedNoticeTtlSecs >= 0) { "revokedNoticeTtlSecs must not be negative" }
+    withHandle {
+      TendrilNative.endpointSetRefusalPolicyJson(
+        it,
+        """{"pending":$pending,"revoked_notice_ttl_secs":$revokedNoticeTtlSecs}""",
+      )
+    }
+  }
+
+  /** Drops the refusal notice of [peerId], which stays revoked. Throws for an unknown peer. */
+  fun clearRefusalNotice(peerId: String) =
+    withHandle { TendrilNative.endpointClearRefusalNotice(it, peerId) }
 
   fun addTrustAnchor(anchorId: String, signingPub: ByteArray) =
     withHandle { TendrilNative.endpointAddTrustAnchor(it, anchorId, signingPub) }
@@ -869,6 +905,31 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
       }
     }
   }
+}
+
+/**
+ * The refusal a `closed` session event carries, or null for any other event. A refused Wire v1
+ * connect returns first; [TendrilSession.pollEvent] then delivers this event, and the session's
+ * next [TendrilSession.sendData], [TendrilSession.rekey] or [TendrilSession.closeSession] throws the
+ * same [TendrilRefusedException]. ([TendrilSession.close] only frees the session.)
+ */
+fun closedEventRefusal(eventJson: String): TendrilRefusedException? {
+  val ev = JSONObject(eventJson)
+  if (ev.optString("event") != "closed") return null
+  val reason = ev.optString("refusal").takeIf { it.isNotEmpty() && !ev.isNull("refusal") } ?: return null
+  if (TendrilRefusedException.Reason.fromWire(reason) == null) return null
+  val closeCode =
+    when (reason) {
+      "revoked" -> TendrilRefusedException.CLOSE_PEER_REVOKED
+      "pending" -> TendrilRefusedException.CLOSE_PEER_PENDING
+      else -> ev.optInt("code", 0)
+    }
+  val detail = ev.optString("reason")
+  return TendrilRefusedException(
+    reason,
+    closeCode,
+    "refused by peer ($reason)" + if (detail.isNotEmpty()) ": $detail" else "",
+  )
 }
 
 class TendrilSession internal constructor(handle: Long) : Closeable {

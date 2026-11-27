@@ -127,6 +127,7 @@ bindings/jni: ## Build tendril_jni shared library and run host JVM conformance t
 	  -o bindings/kotlin/build-jni/libtendril_jni.$(SHLIB_EXT); \
 	javac -d bindings/kotlin/build-jni/classes \
 	  bindings/kotlin/src/main/java/dev/tendril/TendrilNative.java \
+	  bindings/kotlin/src/main/java/dev/tendril/TendrilRefusedException.java \
 	  bindings/kotlin/test/TendrilJniConformanceTest.java; \
 	java --enable-native-access=ALL-UNNAMED \
 	  -Djava.library.path="$$(pwd)/bindings/kotlin/build-jni" \

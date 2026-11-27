@@ -66,39 +66,122 @@ static void throw_ex(JNIEnv *env, const char *class_name, const char *msg) {
   (*env)->DeleteLocalRef(env, cls);
 }
 
+static char *read_ffi_string(int32_t (*reader)(char *, size_t), char *stack, size_t stack_cap) {
+  stack[0] = '\0';
+  int32_t needed = reader(stack, stack_cap);
+  if (needed > (int32_t)stack_cap) {
+    char *dyn = (char *)malloc((size_t)needed);
+    if (dyn != NULL) {
+      dyn[0] = '\0';
+      reader(dyn, (size_t)needed);
+      return dyn;
+    }
+  }
+  return NULL;
+}
+
+/* Throws dev.tendril.TendrilRefusedException(reason, closeCode, message). Returns 1 when it threw.
+ * A missing class or constructor (a stripped or renamed class) is cleared and returns 0 so the
+ * caller can throw IllegalStateException instead; out-of-memory and initialisation errors stay
+ * pending. */
+static int throw_refused(JNIEnv *env, const char *reason, int close_code, const char *msg) {
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
+  jclass cls = (*env)->FindClass(env, "dev/tendril/TendrilRefusedException");
+  if (cls == NULL) {
+    (*env)->ExceptionClear(env);
+    return 0;
+  }
+  jmethodID ctor =
+      (*env)->GetMethodID(env, cls, "<init>", "(Ljava/lang/String;ILjava/lang/String;)V");
+  if (ctor == NULL) {
+    (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, cls);
+    return 0;
+  }
+  int threw = 0;
+  jstring jreason = utf8_to_jstring(env, reason);
+  jstring jmsg = jreason != NULL && !(*env)->ExceptionCheck(env) ? utf8_to_jstring(env, msg) : NULL;
+  if (jmsg != NULL && !(*env)->ExceptionCheck(env)) {
+    jthrowable ex = (jthrowable)(*env)->NewObject(env, cls, ctor, jreason, (jint)close_code, jmsg);
+    if (ex != NULL && !(*env)->ExceptionCheck(env)) {
+      threw = (*env)->Throw(env, ex) == 0;
+    }
+    if (ex != NULL) {
+      (*env)->DeleteLocalRef(env, ex);
+    }
+  }
+  if (jreason != NULL) {
+    (*env)->DeleteLocalRef(env, jreason);
+  }
+  if (jmsg != NULL) {
+    (*env)->DeleteLocalRef(env, jmsg);
+  }
+  (*env)->DeleteLocalRef(env, cls);
+  return threw;
+}
+
+/* Maps a stable last-error code to a refusal reason and close code. Returns 0 for no refusal. */
+static int refusal_from_code(const char *code, const char **reason, int *close_code) {
+  if (strcmp(code, "refused_revoked") == 0) {
+    *reason = "revoked";
+    *close_code = 4001;
+    return 1;
+  }
+  if (strcmp(code, "refused_pending") == 0) {
+    *reason = "pending";
+    *close_code = 4004;
+    return 1;
+  }
+  if (strncmp(code, "refused", 7) == 0) {
+    *reason = "other";
+    *close_code = 0;
+    return 1;
+  }
+  return 0;
+}
+
+/* Reads tendril_last_error and tendril_last_error_code back to back, first thing after the
+ * failing call and on its thread: any other FFI entry point clears both. */
 static void throw_ffi_error(JNIEnv *env, int32_t rc, const char *fallback) {
   if ((*env)->ExceptionCheck(env)) {
     return;
   }
   char errbuf[512];
-  errbuf[0] = '\0';
-  int32_t needed = tendril_last_error(errbuf, sizeof(errbuf));
-  const char *err_msg = errbuf;
-  char *dyn_err = NULL;
-  if (needed > (int32_t)sizeof(errbuf)) {
-    dyn_err = (char *)malloc((size_t)needed);
-    if (dyn_err != NULL) {
-      dyn_err[0] = '\0';
-      tendril_last_error(dyn_err, (size_t)needed);
-      err_msg = dyn_err;
-    }
+  char codebuf[64];
+  char *dyn_err = read_ffi_string(tendril_last_error, errbuf, sizeof(errbuf));
+  char *dyn_code = read_ffi_string(tendril_last_error_code, codebuf, sizeof(codebuf));
+  const char *err_msg = dyn_err != NULL ? dyn_err : errbuf;
+  const char *err_code = dyn_code != NULL ? dyn_code : codebuf;
+  const char *reason = NULL;
+  int close_code = 0;
+  int refused = refusal_from_code(err_code, &reason, &close_code);
+  const char *class_name = "java/lang/IllegalStateException";
+  if (refused) {
+    rc = TENDRIL_ERR_REFUSED;
   }
-  if (needed > 1) {
+  char *full = NULL;
+  if (err_msg[0] != '\0') {
     size_t full_cap = strlen(err_msg) + 48;
-    char *full = (char *)malloc(full_cap);
+    full = (char *)malloc(full_cap);
     if (full != NULL) {
       snprintf(full, full_cap, "tendril ffi error (%d): %s", (int)rc, err_msg);
-      throw_ex(env, "java/lang/IllegalStateException", full);
-      free(full);
-    } else {
-      throw_ex(env, "java/lang/IllegalStateException", err_msg);
     }
   } else {
-    char full[128];
-    snprintf(full, sizeof(full), "%s (code %d)", fallback, (int)rc);
-    throw_ex(env, "java/lang/IllegalStateException", full);
+    size_t full_cap = strlen(fallback) + 32;
+    full = (char *)malloc(full_cap);
+    if (full != NULL) {
+      snprintf(full, full_cap, "%s (code %d)", fallback, (int)rc);
+    }
   }
+  const char *text = full != NULL ? full : (err_msg[0] != '\0' ? err_msg : fallback);
+  if (!refused || !throw_refused(env, reason, close_code, text)) {
+    throw_ex(env, class_name, text);
+  }
+  free(full);
   free(dyn_err);
+  free(dyn_code);
 }
 
 static int dup_opt_utf8(JNIEnv *env, jstring s, char **out_buf) {
@@ -1000,6 +1083,72 @@ JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointRevokePeer(
   free(c_peer);
   if (rc != TENDRIL_OK) {
     throw_ffi_error(env, rc, "tendril_endpoint_revoke_peer failed");
+  }
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointRevokePeerWithOptions(
+    JNIEnv *env, jclass cls, jlong ptr, jstring peer_id, jstring options_json) {
+  (void)cls;
+  if (ptr == 0 || peer_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid revoke arguments");
+    return;
+  }
+  char *c_peer = NULL;
+  char *c_opts = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, peer_id, &c_peer) && dup_opt_utf8(env, options_json, &c_opts)) {
+    rc = tendril_endpoint_revoke_peer_with_options(
+        (TendrilEndpoint *)(uintptr_t)ptr, c_peer, c_opts);
+  }
+  free(c_peer);
+  free(c_opts);
+  if ((*env)->ExceptionCheck(env)) {
+    return;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_revoke_peer_with_options failed");
+  }
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointSetRefusalPolicyJson(
+    JNIEnv *env, jclass cls, jlong ptr, jstring policy_json) {
+  (void)cls;
+  if (ptr == 0 || policy_json == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid refusal policy arguments");
+    return;
+  }
+  char *c_policy = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, policy_json, &c_policy)) {
+    rc = tendril_endpoint_set_refusal_policy_json((TendrilEndpoint *)(uintptr_t)ptr, c_policy);
+  }
+  free(c_policy);
+  if ((*env)->ExceptionCheck(env)) {
+    return;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_set_refusal_policy_json failed");
+  }
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointClearRefusalNotice(
+    JNIEnv *env, jclass cls, jlong ptr, jstring peer_id) {
+  (void)cls;
+  if (ptr == 0 || peer_id == NULL) {
+    throw_ex(env, "java/lang/IllegalArgumentException", "invalid clear refusal notice arguments");
+    return;
+  }
+  char *c_peer = NULL;
+  int32_t rc = TENDRIL_ERR_INTERNAL;
+  if (dup_opt_utf8(env, peer_id, &c_peer)) {
+    rc = tendril_endpoint_clear_refusal_notice((TendrilEndpoint *)(uintptr_t)ptr, c_peer);
+  }
+  free(c_peer);
+  if ((*env)->ExceptionCheck(env)) {
+    return;
+  }
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_clear_refusal_notice failed");
   }
 }
 

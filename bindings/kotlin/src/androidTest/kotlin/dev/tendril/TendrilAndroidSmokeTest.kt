@@ -1130,6 +1130,126 @@ class TendrilAndroidSmokeTest {
     }
   }
 
+  /** Pairs a client with a serving host over [v2] and returns the host id and the client's grant. */
+  private fun pairedForRefusal(host: TendrilEndpoint, client: TendrilEndpoint, v2: Boolean): Triple<String, String, String> {
+    host.serveDirect("127.0.0.1:0")
+    val res = pairViaUri(host, client, JSONObject(host.issuePairingUri()).getString("uri"), v2)
+    val hostId = JSONObject(host.infoJson()).getString("host_id")
+    val clientId = res.getString("device_id")
+    return Triple(hostId, clientId, grantFor(host, clientId))
+  }
+
+  /** Runs a Wire v2 connect against [host]'s accept loop and returns the connect failure, or null. */
+  private fun connectV2Failure(
+    host: TendrilEndpoint,
+    client: TendrilEndpoint,
+    hostId: String,
+    grant: String,
+  ): Throwable? {
+    var accepted: TendrilSession? = null
+    val accept = Thread { runCatching { accepted = host.acceptV2(3_000) } }
+    accept.start()
+    return try {
+      client.connectV2(targetHostId = hostId, grantJson = grant).close()
+      null
+    } catch (t: Throwable) {
+      t
+    } finally {
+      accept.join(8_000)
+      accepted?.close()
+    }
+  }
+
+  @Test
+  fun refusedWireV2ConnectThrowsTypedException() {
+    withNodes("host", "client") { (hostNode, clientNode) ->
+      val host = hostNode.open()
+      val client = clientNode.open()
+      val (hostId, clientId, grant) = pairedForRefusal(host, client, v2 = true)
+      host.revokePeer(clientId)
+      val err = connectV2Failure(host, client, hostId, grant)
+      assertTrue("expected a refusal, got $err", err is TendrilRefusedException)
+      val refused = err as TendrilRefusedException
+      assertEquals(TendrilRefusedException.Reason.REVOKED, refused.reason)
+      assertEquals(4001, refused.closeCode)
+      assertEquals("refused_revoked", refused.code)
+    }
+  }
+
+  @Test
+  fun refusedWireV1ConnectSurfacesAsClosedEventAndThrowingCalls() {
+    withNodes("host", "client") { (hostNode, clientNode) ->
+      val host = hostNode.open()
+      val client = clientNode.open()
+      val (hostId, clientId, grant) = pairedForRefusal(host, client, v2 = false)
+      host.revokePeer(clientId)
+      var accepted: TendrilSession? = null
+      val accept = Thread { runCatching { accepted = host.acceptSession(3_000) } }
+      accept.start()
+      val session = client.connect(targetHostId = hostId, grantJson = grant)
+      try {
+        var closed: String? = null
+        val deadline = System.nanoTime() + 10_000_000_000L
+        while (closed == null && System.nanoTime() < deadline) {
+          val ev = session.pollEvent(500)
+          if (JSONObject(ev).optString("event") == "closed") closed = ev
+        }
+        assertTrue("no closed event", closed != null)
+        val refusal = closedEventRefusal(closed!!)
+        assertEquals(TendrilRefusedException.Reason.REVOKED, refusal?.reason)
+        assertEquals(4001, refusal?.closeCode)
+        assertNull(closedEventRefusal("""{"event":"closed","code":1000,"reason":"","refusal":null}"""))
+        assertNull(closedEventRefusal("""{"event":"data"}"""))
+        assertEquals("eof", JSONObject(session.pollEvent(500)).optString("status"))
+        val send = runCatching { session.sendData(byteArrayOf(1)) }.exceptionOrNull()
+        assertTrue("sendData: $send", send is TendrilRefusedException)
+        assertEquals(4001, (send as TendrilRefusedException).closeCode)
+        val rekey = runCatching { session.rekey() }.exceptionOrNull()
+        assertEquals("refused_revoked", (rekey as? TendrilRefusedException)?.code)
+      } finally {
+        session.close()
+        accept.join(8_000)
+        accepted?.close()
+      }
+    }
+  }
+
+  @Test
+  fun refusalEndpointCallsControlTheNotice() {
+    // A host sends one notice per peer in a short window, so each case uses fresh nodes.
+    fun case(body: (host: TendrilEndpoint, clientId: String, attempt: () -> Throwable?) -> Unit) {
+      withNodes("host", "client") { (hostNode, clientNode) ->
+        val host = hostNode.open()
+        val client = clientNode.open()
+        val (hostId, clientId, grant) = pairedForRefusal(host, client, v2 = true)
+        body(host, clientId) { connectV2Failure(host, client, hostId, grant) }
+      }
+    }
+    case { host, clientId, attempt ->
+      host.revokePeerWithOptions(clientId, notify = false)
+      val err = attempt()
+      assertTrue("a silent revoke must not refuse: $err", err != null && err !is TendrilRefusedException)
+    }
+    case { host, clientId, attempt ->
+      host.setRefusalPolicy(pending = true, revokedNoticeTtlSecs = 0)
+      host.revokePeerWithOptions(clientId)
+      val err = attempt()
+      assertTrue("ttl 0 records no notice: $err", err != null && err !is TendrilRefusedException)
+    }
+    case { host, clientId, attempt ->
+      host.revokePeerWithOptions(clientId)
+      host.clearRefusalNotice(clientId)
+      val err = attempt()
+      assertTrue("a cleared notice must not refuse: $err", err != null && err !is TendrilRefusedException)
+      assertTrue(runCatching { host.clearRefusalNotice("no-such-peer") }.isFailure)
+    }
+    case { host, clientId, attempt ->
+      host.setRefusalPolicy()
+      host.revokePeerWithOptions(clientId, notify = true)
+      assertTrue(attempt() is TendrilRefusedException)
+    }
+  }
+
   @Test
   fun p2pNetOptionsReachTheListenerAndAreValidated() {
     TendrilEndpoint.create(stateDir = null, hostId = "smoke-p2p-net").use { ep ->
