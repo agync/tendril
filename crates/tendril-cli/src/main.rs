@@ -501,7 +501,15 @@ enum Command {
         message: Option<String>,
     },
     /// Revoke an existing peer (`pair.revoke`), failing closed on all future sessions.
-    Revoke { peer_id: String },
+    ///
+    /// Unless `--no-notify` is given, the roster's refusal policy decides whether the peer is
+    /// told it is revoked when it next connects (a zero notice TTL tells it nothing).
+    Revoke {
+        peer_id: String,
+        /// Revoke silently: record no refusal notice for this peer.
+        #[arg(long)]
+        no_notify: bool,
+    },
     /// List, remove or revoke unconfirmed host claims from unpinned pairing.
     Pending {
         #[command(subcommand)]
@@ -2536,12 +2544,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 (None, None, None)
             };
-            let v2_state = Arc::new(V2ResponderState::with_config(
-                tendril_runtime::V2ResponderConfig {
+            let v2_state = Arc::new(
+                V2ResponderState::with_config(tendril_runtime::V2ResponderConfig {
                     webrtc_upgrade_handle: webrtc_handle.clone(),
                     ..Default::default()
-                },
-            ));
+                })
+                .with_refusal_state(router.refusal_state().clone()),
+            );
             let pair_enabled = issue_code.is_some() || allow_enroll;
             router.set_pair_enabled(pair_enabled);
             router.set_v2_pair_enabled(wire_v2 && pair_enabled);
@@ -3631,9 +3640,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_json_line(&out);
         }
         Command::Group { cmd } => group::run(Arc::clone(&store), cmd).await?,
-        Command::Revoke { peer_id } => {
-            store.update_roster(|roster| roster.revoke_peer(&peer_id).map_err(Into::into))?;
-            print_json_line(&serde_json::json!({ "revoked": peer_id }));
+        Command::Revoke { peer_id, no_notify } => {
+            let now = now_unix();
+            let notice = store.update_roster(|roster| {
+                roster.revoke_peer_at(&peer_id, !no_notify, now)?;
+                Ok(roster
+                    .get(&peer_id)
+                    .is_some_and(|e| roster.refusal_for_static(&e.static_pub, now).is_some()))
+            })?;
+            print_json_line(&serde_json::json!({ "revoked": peer_id, "notice": notice }));
         }
         Command::Pending { cmd } => match cmd {
             PendingCommand::List => {
