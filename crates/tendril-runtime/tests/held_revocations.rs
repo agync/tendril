@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tempfile::tempdir;
-use tendril_core::crypto::{HybridSigningPublicKey, SigningKeypair, StaticKeypair, device_id};
+use tendril_core::crypto::{
+    HybridSigningPublicKey, SigningKeypair, StaticKeypair, b64url_encode, device_id,
+};
 use tendril_core::grants::{RevocationList, RevocationListUnsigned, sign_crl};
 use tendril_core::identity::RotationRecord;
 use tendril_core::identity::{EndpointIdentity, sign_rotation};
@@ -420,6 +422,68 @@ fn a_route_publish_racing_a_reload_and_a_commit_never_clobbers() {
     );
 }
 
+/// A `Pending` issuer on disk has no usable key until another held CRL revokes it: both CRLs
+/// are committed together, whatever order they are met in, and a second commit is quiet.
+#[test]
+fn a_commit_is_idempotent_when_one_held_crl_revokes_the_issuer_of_another() {
+    let dir = tempdir().unwrap();
+    let store = store_in(dir.path());
+    let claimed_static = static_of(0x70);
+    let pending_id = device_id(&claimed_static);
+    let issuer_sk = sk_of(0x44);
+    store
+        .update_roster(|r| {
+            r.record_pending_pair(
+                claimed_static,
+                Some(sk_of(0x71).public_key().clone()),
+                "C".into(),
+                "cli".into(),
+                "sas".into(),
+            )?;
+            pin(r, "zz-issuer", 0x20, 0x44);
+            Ok(())
+        })
+        .unwrap();
+    let access = access_with_signer(&store);
+    {
+        let mut mem = lock(access.roster());
+        // Memory never saw the claim: only its CRL and the issuer's CRL revoking it.
+        *mem = Roster::new();
+        mem.ingest_crl(
+            crl(&pending_id, 1, &sk_of(0x71), &["x"]),
+            &pending_id,
+            sk_of(0x71).public_key(),
+        )
+        .unwrap();
+        mem.ingest_crl(
+            crl("zz-issuer", 1, &issuer_sk, &[&pending_id]),
+            "zz-issuer",
+            issuer_sk.public_key(),
+        )
+        .unwrap();
+    }
+
+    assert!(access.commit_held_revocations().unwrap());
+    let disk = store.load_roster().unwrap();
+    assert_eq!(disk.crl(&pending_id).map(|c| c.seq), Some(1));
+    assert_eq!(disk.crl("zz-issuer").map(|c| c.seq), Some(1));
+    assert_eq!(
+        disk.get(&pending_id).map(|e| e.state),
+        Some(PeerState::Revoked)
+    );
+    let before = stamp(&store);
+    assert!(
+        !access.commit_held_revocations().unwrap(),
+        "the second commit returns false"
+    );
+    assert_eq!(stamp(&store), before);
+    assert_eq!(
+        lock(access.roster()).crl(&pending_id).map(|c| c.seq),
+        Some(1),
+        "and memory agrees with disk"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Property round trip
 // ---------------------------------------------------------------------------------------------
@@ -486,8 +550,9 @@ fn fresh_sk(n: usize) -> SigningKeypair {
 struct Fixtures {
     /// `rotations[peer][variant]`: the record from the peer's initial key to the fresh keys.
     rotations: Vec<[RotationRecord; 2]>,
-    /// Issuer index (peers, anchors, local), then seq `1..=CRL_SEQS`, then target peer.
-    crls: Vec<Vec<Vec<RevocationList>>>,
+    /// Issuer index (peers, anchors, local), then seq `1..=CRL_SEQS`. Each list revokes the
+    /// first `seq` peers, so a newer list never drops what an older one revoked.
+    crls: Vec<Vec<RevocationList>>,
 }
 
 fn fixtures() -> &'static Fixtures {
@@ -510,17 +575,19 @@ fn fixtures() -> &'static Fixtures {
             })
             .collect();
         let targets: Vec<String> = (0..PEERS).map(peer_label).collect();
-        let issuer = |id: &str, signer: &SigningKeypair| -> Vec<Vec<RevocationList>> {
+        let issuer = |id: &str, signer: &SigningKeypair| -> Vec<RevocationList> {
             (1..=CRL_SEQS)
                 .map(|seq| {
-                    targets
+                    let revoked: Vec<&str> = targets
                         .iter()
-                        .map(|t| crl(id, seq, signer, &[t.as_str()]))
-                        .collect()
+                        .take(usize::try_from(seq).unwrap())
+                        .map(String::as_str)
+                        .collect();
+                    crl(id, seq, signer, &revoked)
                 })
                 .collect()
         };
-        let mut crls: Vec<Vec<Vec<RevocationList>>> = (0..PEERS)
+        let mut crls: Vec<Vec<RevocationList>> = (0..PEERS)
             .map(|i| issuer(&peer_label(i), &peer_sk(i)))
             .collect();
         crls.extend((0..ANCHORS).map(|i| issuer(&anchor_label(i), &anchor_sk(i))));
@@ -578,21 +645,35 @@ fn issuer_id(ix: usize) -> String {
 }
 
 /// The reference model of the notice a `Revoked` entry ends with (`spec/pairing-v1.md`
-/// Section 5.1), from the entry on disk and in memory before the fold alone.
-fn expected_notice(disk: Option<&RosterEntry>, memory: Option<&RosterEntry>) -> Option<u64> {
+/// Section 5.1), from the entry on disk and in memory before the fold alone: its expiry and
+/// its refusal secret. A notice carried from memory takes the secret of the disk entry's
+/// `reconnect_secret`, else the one memory recorded.
+fn expected_notice(
+    disk: Option<&RosterEntry>,
+    memory: Option<&RosterEntry>,
+) -> Option<(u64, Option<String>)> {
+    let notice_parts = |e: &RosterEntry| {
+        e.refusal_notice().map(|n| {
+            let json = serde_json::to_value(n).unwrap();
+            (n.until_unix(), json["secret"].as_str().map(str::to_owned))
+        })
+    };
     let memory_revoked = memory.filter(|m| m.state == PeerState::Revoked);
     match disk {
         Some(d) if d.state == PeerState::Revoked => {
-            let kept = d.refusal_notice().map(|n| n.until_unix());
             if memory_revoked.is_some_and(|m| m.refusal_notice().is_none()) {
                 None
             } else {
-                kept
+                notice_parts(d)
             }
         }
-        Some(_) => memory_revoked
-            .and_then(|m| m.refusal_notice())
-            .map(|n| n.until_unix()),
+        Some(d) => memory_revoked.and_then(notice_parts).map(|(until, held)| {
+            let from_disk = d
+                .v2_secrets
+                .as_ref()
+                .map(|s| b64url_encode(s.reconnect_secret()));
+            (until, from_disk.or(held))
+        }),
         None => None,
     }
 }
@@ -680,6 +761,37 @@ fn check(ctx: &str, disk: &Roster, memory: &Roster, result: &Roster) {
         );
     }
 
+    // A revoked device or nonce is never dropped from a stored or verifiable held CRL.
+    for (side, roster) in sides {
+        for (issuer, list) in roster
+            .entries()
+            .map(|(id, _)| id)
+            .chain(roster.trust_anchors().map(|(id, _)| id))
+            .chain(std::iter::once(&"local-host".to_owned()))
+            .filter_map(|id| roster.crl(id).map(|c| (id, c)))
+        {
+            let Some(kept) = result.crl(issuer) else {
+                continue;
+            };
+            // A held list the result outran, or one no allowed key verified, is skipped.
+            if side == "memory" && kept.seq < list.seq {
+                continue;
+            }
+            assert!(
+                kept.seq >= list.seq
+                    && list
+                        .revoked_devices
+                        .iter()
+                        .all(|d| kept.revoked_devices.contains(d))
+                    && list
+                        .revoked_nonces
+                        .iter()
+                        .all(|n| kept.revoked_nonces.contains(n)),
+                "{ctx}: the CRL of {issuer} from {side} keeps every revoked device and nonce"
+            );
+        }
+    }
+
     // INV-3: no non-revocation state crosses.
     for (key, entry) in result.entries() {
         match disk.get(key) {
@@ -723,7 +835,10 @@ fn check(ctx: &str, disk: &Roster, memory: &Roster, result: &Roster) {
             continue;
         }
         assert_eq!(
-            entry.refusal_notice().map(|n| n.until_unix()),
+            entry.refusal_notice().map(|n| {
+                let json = serde_json::to_value(n).unwrap();
+                (n.until_unix(), json["secret"].as_str().map(str::to_owned))
+            }),
             expected_notice(disk.get(key), memory.get(key)),
             "{ctx}: notice of {key}"
         );
@@ -779,6 +894,12 @@ fn run_seed(seed: u64) {
                 access.commit_held_revocations().unwrap();
                 check(ctx, &disk, &memory, &other.load_roster().unwrap());
                 check(ctx, &disk, &memory, &lock(access.roster()));
+                let before = stamp(&other);
+                assert!(
+                    !access.commit_held_revocations().unwrap(),
+                    "{ctx}: a second commit has nothing new"
+                );
+                assert_eq!(stamp(&other), before, "{ctx}: and writes nothing");
             }
         }
     };
@@ -816,7 +937,7 @@ fn run_seed(seed: u64) {
             5 | 6 | 10 => {
                 crl_seq[issuer_ix] =
                     (crl_seq[issuer_ix] + 1).min(usize::try_from(CRL_SEQS).unwrap());
-                let list = fx.crls[issuer_ix][crl_seq[issuer_ix] - 1][p].clone();
+                let list = fx.crls[issuer_ix][crl_seq[issuer_ix] - 1].clone();
                 let id = issuer_id(issuer_ix);
                 let key = issuer_key(issuer_ix);
                 if choice == 10 {
