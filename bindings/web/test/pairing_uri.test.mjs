@@ -1155,6 +1155,69 @@ test("session_candidates ranks /v2/relay ahead of /v1/relay and admits broker wi
   }
 });
 
+test("session_candidates ranks operator routes ahead of every rung, then rung then source", async () => {
+  await ensureWasm();
+  const { WasmRoster } = await import("../pkg/tendril_wasm.js");
+  const host = await hostFixture("source-rank-host");
+  const roster = new WasmRoster();
+  try {
+    roster.insert_pinned_host(
+      host.info.host_id,
+      host.info.host_id,
+      host.info.static_pub,
+      host.info.signing_pub,
+      0,
+      null
+    );
+    const json = JSON.parse(roster.to_json());
+    json.entries[host.info.host_id].routes = [
+      { hint: "wss://198.51.100.10/v1/relay", source: "committed" },
+      { hint: "wss://signed.example.test/v1/relay", source: "signed" },
+      { hint: "wss://operator.example.test/v1/relay", source: "operator" },
+      {
+        hint: "wt://192.168.1.10:4433/?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        source: "signed",
+      },
+    ];
+    roster.replace_from_json(JSON.stringify(json));
+    const out = JSON.parse(
+      roster.session_candidates(host.info.host_id, JSON.stringify({ webtransport: true }))
+    );
+    assert.deepEqual(
+      out.candidates.map((c) => [c.provider, c.source]),
+      [
+        ["relay", "operator"],
+        ["direct", "signed"],
+        ["relay", "signed"],
+        ["relay", "committed"],
+      ]
+    );
+  } finally {
+    roster.free();
+  }
+});
+
+test("WasmPathPlanner honours candidate sources and rejects an unknown one", async () => {
+  await ensureWasm();
+  const { WasmPathPlanner } = await import("../pkg/tendril_wasm.js");
+  const cands = [
+    { id: 0, addr: "192.168.1.20:7000", provider: "direct", source: "signed" },
+    { id: 1, addr: "wss://relay.example.test/v1/relay", provider: "relay", source: "operator" },
+  ];
+  const planner = new WasmPathPlanner(JSON.stringify(cands), "{}");
+  try {
+    planner.start(0);
+    const actions = JSON.parse(planner.drain_actions());
+    assert.equal(actions[0].candidate.id, 1);
+  } finally {
+    planner.free();
+  }
+  assert.throws(
+    () => new WasmPathPlanner(JSON.stringify([{ ...cands[0], source: "bogus" }]), "{}"),
+    /unknown route source/
+  );
+});
+
 test("live: broker+ws:// pairs, connects endpoint-free, falls back across dead route, and connectV2 prefers /v2/relay over /v1/relay", async () => {
   await ensureWasm();
   const host = await liveHost("broker-v2-host", { serveBroker: true });

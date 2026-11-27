@@ -21,7 +21,7 @@ Tendril treats every transport path as an untrusted byte pipe below hybrid post-
 | `relay` | 4 | `RelayListener` / `RelayDialer`, `EmbeddedRelay` | Stateless WebSocket relay (`spec/relay-v1.md`) |
 | `broker` | 5 | `BrokerListener` / `BrokerDialer` (`broker+ws://` / `broker+wss://`) | Reverse-proxied or authenticated HTTPS/WSS tunnel adapter |
 
-`PathPlanner` (`dial_with_policy`) ranks candidates by `sort_key` (`(provider.rank(), u8::from(provider == Relay && !is_v2_relay_hint), !is_numeric_host, id)`), prioritizing `/v2/relay` ahead of `/v1/relay`, exposes `next_deadline_ms()`, and enforces `p2p_cold_delay_ms` (`500 ms` default) before dialing `p2p` candidates alongside higher-priority local/direct/overlay candidates so fast local connections are never stalled by peer discovery.
+`PathPlanner` (`dial_with_policy`) ranks candidates by `sort_key` (`(u8::from(!operator), provider.rank(), source_tier, u8::from(provider == Relay && !is_v2_relay_hint), !is_numeric_host, id)`, where `source_tier` is `0` for `operator` and `signed`, `1` for `committed` and `2` for no stored source), prioritizing `/v2/relay` ahead of `/v1/relay`, exposes `next_deadline_ms()`, and enforces `p2p_cold_delay_ms` (`500 ms` default) before dialing `p2p` candidates alongside higher-priority local/direct/overlay candidates so fast local connections are never stalled by peer discovery.
 
 ## Route-driven dialing
 
