@@ -137,95 +137,22 @@ fn lock_roster(roster: &StdMutex<Roster>) -> std::sync::MutexGuard<'_, Roster> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Applies `f` to the latest on-disk roster and publishes the committed result to memory.
+/// The roster handle live sessions share: the state directory and the in-memory roster they
+/// write to, with the local signer, so the host's own CRL is kept.
 ///
-/// Callers must hold `store_lock`. Lock order (`tendril_runtime::announce`): store lock, roster
-/// file lock, pairing manager, in-memory roster mutex. The mutex is therefore taken only inside
-/// the file-lock transaction, for the pure callback, and again to publish after it; it is never
-/// held while waiting for the file lock or across an `.await`.
-fn commit_roster<T>(
-    store: &StateStore,
-    roster: &StdMutex<Roster>,
+/// Every read of the store folds the revocation state `roster` holds into the stored roster,
+/// and every write persists it, under the roster file lock. Callers must hold `store_lock`.
+/// Lock order (`tendril_runtime::announce`): store lock, roster file lock, pairing manager,
+/// in-memory roster mutex.
+fn session_access(
+    store: Option<&Arc<StateStore>>,
+    roster: &Arc<StdMutex<Roster>>,
     identity: &EndpointIdentity,
-    f: impl FnOnce(&mut Roster, &Roster) -> std::result::Result<T, RuntimeError>,
-) -> std::result::Result<T, RuntimeError> {
-    let (out, disk, _) = store.update_roster_with_state(|disk| f(disk, &lock_roster(roster)))?;
-    publish_roster(&mut lock_roster(roster), disk, identity);
-    Ok(out)
-}
-
-fn reload_roster(
-    store: &StateStore,
-    roster: &StdMutex<Roster>,
-    identity: &EndpointIdentity,
-) -> std::result::Result<(), RuntimeError> {
-    let disk = store.load_roster()?;
-    publish_roster(&mut lock_roster(roster), disk, identity);
-    Ok(())
-}
-
-/// Replaces the in-memory roster with the committed disk roster while keeping any revocation
-/// or CRL a live session learned in memory but has not committed yet.
-fn publish_roster(mem: &mut Roster, disk: Roster, identity: &EndpointIdentity) {
-    let mut next = disk;
-    merge_session_state(&mut next, mem, identity);
-    *mem = next;
-}
-
-/// Persists the revocations and CRLs live sessions learned in memory, under the roster file
-/// lock. Nothing is written when the store already holds them: no `roster.json` is created and
-/// an existing one keeps its mtime.
-fn commit_session_state(
-    store: &StateStore,
-    roster: &StdMutex<Roster>,
-    identity: &EndpointIdentity,
-) -> std::result::Result<(), RuntimeError> {
-    let (_, disk, _) = store.update_roster_if_changed(|disk| {
-        merge_session_state(disk, &lock_roster(roster), identity);
-        Ok(())
-    })?;
-    publish_roster(&mut lock_roster(roster), disk, identity);
-    Ok(())
-}
-
-/// Folds revocations and CRLs learned in memory by a live session into the on-disk roster
-/// without overwriting any other committed state.
-fn merge_session_state(disk: &mut Roster, mem: &Roster, identity: &EndpointIdentity) {
-    let newly_revoked: Vec<String> = mem
-        .entries()
-        .filter(|(id, entry)| {
-            entry.state == PeerState::Revoked
-                && disk
-                    .get(id)
-                    .is_some_and(|prev| prev.state != PeerState::Revoked)
-        })
-        .map(|(id, _)| id.clone())
-        .collect();
-    for id in &newly_revoked {
-        let _ = disk.revoke_peer(id);
-    }
-    let mut issuers = vec![identity.host_id().to_owned()];
-    issuers.extend(mem.entries().map(|(id, _)| id.clone()));
-    issuers.extend(mem.trust_anchors().map(|(id, _)| id.clone()));
-    for issuer in issuers {
-        let Some(crl) = mem.crl(&issuer).cloned() else {
-            continue;
-        };
-        let issuer_pub = if issuer == identity.host_id() {
-            Some(identity.signing_key().public_key().clone())
-        } else {
-            disk.lookup_active_signing_key(&issuer)
-                .or_else(|| disk.lookup_active_anchor_key(&issuer))
-                .or_else(|| {
-                    disk.get(&issuer)
-                        .filter(|e| e.state != PeerState::Pending)
-                        .and_then(|e| e.signing_pub.clone())
-                })
-        };
-        if let Some(pk) = issuer_pub {
-            let _ = disk.ingest_crl(crl, &issuer, &pk);
-        }
-    }
+) -> RosterAccess {
+    RosterAccess::new(store.cloned(), Arc::clone(roster)).with_local_signer(
+        identity.host_id(),
+        identity.signing_key().public_key().clone(),
+    )
 }
 
 /// Mutates the roster under the `store_lock` -> roster lock order from a Tokio worker without
@@ -243,21 +170,21 @@ where
 {
     if let Some(store) = store {
         let _guard = store_lock.lock().await;
-        let store = Arc::clone(store);
-        let roster = Arc::clone(roster);
-        let identity = Arc::clone(identity);
-        tokio::task::spawn_blocking(move || {
-            commit_roster(&store, &roster, &identity, |disk, _| f(disk))
-        })
-        .await
-        .map_err(to_generic_err)?
-        .map_err(to_generic_err)
+        let access = session_access(Some(store), roster, identity);
+        tokio::task::spawn_blocking(move || access.update(f))
+            .await
+            .map_err(to_generic_err)?
+            .map_err(to_generic_err)
     } else {
         let mut guard = lock_roster(roster);
         f(&mut guard).map_err(to_generic_err)
     }
 }
 
+/// Commits the revocations and CRLs live sessions learned in memory to the store and reloads
+/// the shared roster from the result. Nothing is written when the store already holds them: no
+/// `roster.json` is created and an existing one keeps its mtime. Call it before any driver
+/// reads the store and after any session event or driver result that can revoke.
 async fn sync_roster_async(
     store: Option<&Arc<StateStore>>,
     store_lock: &AsyncMutex<()>,
@@ -266,29 +193,8 @@ async fn sync_roster_async(
 ) -> Result<()> {
     if let Some(store) = store {
         let _guard = store_lock.lock().await;
-        let store = Arc::clone(store);
-        let roster = Arc::clone(roster);
-        let identity = Arc::clone(identity);
-        tokio::task::spawn_blocking(move || reload_roster(&store, &roster, &identity))
-            .await
-            .map_err(to_generic_err)?
-            .map_err(to_generic_err)?;
-    }
-    Ok(())
-}
-
-async fn commit_session_async(
-    store: Option<&Arc<StateStore>>,
-    store_lock: &AsyncMutex<()>,
-    roster: &Arc<StdMutex<Roster>>,
-    identity: &Arc<EndpointIdentity>,
-) -> Result<()> {
-    if let Some(store) = store {
-        let _guard = store_lock.lock().await;
-        let store = Arc::clone(store);
-        let roster = Arc::clone(roster);
-        let identity = Arc::clone(identity);
-        tokio::task::spawn_blocking(move || commit_session_state(&store, &roster, &identity))
+        let access = session_access(Some(store), roster, identity);
+        tokio::task::spawn_blocking(move || access.commit_held_revocations())
             .await
             .map_err(to_generic_err)?
             .map_err(to_generic_err)?;
@@ -1548,7 +1454,8 @@ impl Endpoint {
     ) -> Result<T> {
         if let Some(store) = &self.store {
             let _guard = self.store_lock.blocking_lock();
-            commit_roster(store, &self.roster, &self.identity, |disk, _| f(disk))
+            session_access(Some(store), &self.roster, &self.identity)
+                .update(f)
                 .map_err(to_generic_err)
         } else {
             let mut guard = lock_roster(&self.roster);
@@ -1558,16 +1465,6 @@ impl Endpoint {
 
     async fn sync_roster_from_store(&self) -> Result<()> {
         sync_roster_async(
-            self.store.as_ref(),
-            &self.store_lock,
-            &self.roster,
-            &self.identity,
-        )
-        .await
-    }
-
-    async fn commit_session_roster(&self) -> Result<()> {
-        commit_session_async(
             self.store.as_ref(),
             &self.store_lock,
             &self.roster,
@@ -1801,7 +1698,10 @@ impl Endpoint {
         } else {
             Arc::clone(&roster)
         };
-        let access = RosterAccess::new(store.clone(), access_roster);
+        let access = RosterAccess::new(store.clone(), access_roster).with_local_signer(
+            identity.host_id(),
+            identity.signing_key().public_key().clone(),
+        );
         let transport_cfg = Arc::new(StdMutex::new(EndpointTransportConfig::default()));
         let announce = Arc::new(AnnouncerSlot {
             identity: Arc::clone(&identity),
@@ -2187,6 +2087,8 @@ impl Endpoint {
         };
 
         let path_kind = pairing_path_kind_for_provider(stream.provider_id());
+        // The store-backed driver reads the stored roster: commit held revocations first.
+        self.sync_roster_from_store().await?;
         let driven = if let Some(ref store) = self.store {
             drive_pair_responder_with_store(
                 stream.as_mut(),
@@ -2468,9 +2370,8 @@ impl Endpoint {
         };
 
         let cfg = self.snapshot_transport_cfg();
-        // The store-backed driver reads the on-disk roster for its pin checks: persist the CRLs
-        // only this endpoint's sessions hold first, so the driver sees them.
-        self.commit_session_roster().await?;
+        // The store-backed driver reads the on-disk roster for its pin checks: persist the
+        // revocation state only this endpoint's sessions hold first, so the driver sees it.
         self.sync_roster_from_store().await?;
         let (fallback_floor, v2_secret) = {
             let roster = self
@@ -2648,7 +2549,7 @@ impl Endpoint {
             DEFAULT_PRE_AUTH_TIMEOUT,
         )
         .await;
-        let persisted = self.commit_session_roster().await;
+        let persisted = self.sync_roster_from_store().await;
         let driver = accepted.map_err(to_generic_err)?;
         persisted?;
 
@@ -2895,6 +2796,8 @@ impl Endpoint {
             Err(()) => return Err(to_generic_err("timed out accepting v2 pair")),
         };
         let path_kind = pairing_path_kind_for_provider(stream.provider_id());
+        // The store-backed driver reads the stored roster: commit held revocations first.
+        self.sync_roster_from_store().await?;
         let pair_res = if let Some(ref store) = self.store {
             drive_v2_pake_pair_responder_with_store(
                 stream.as_mut(),
@@ -3213,6 +3116,8 @@ impl Endpoint {
             Ok(None) => return Err(to_generic_err("listener closed")),
             Err(()) => return Err(to_generic_err("timed out accepting v2 session")),
         };
+        // The store-backed driver reads the stored roster: commit held revocations first.
+        self.sync_roster_from_store().await?;
         let driver_res = if let Some(ref store) = self.store {
             V2SessionDriver::accept_with_store(
                 stream,
@@ -3461,23 +3366,13 @@ impl Session {
                         "grant": g,
                     }),
                     SessionEvent::RevocationUpdated { issuer, seq } => {
-                        if matches!(self.session.as_ref(), SessionBackend::V2(_)) {
-                            sync_roster_async(
-                                self.store.as_ref(),
-                                &self.store_lock,
-                                &self.roster,
-                                &self.identity,
-                            )
-                            .await?;
-                        } else {
-                            commit_session_async(
-                                self.store.as_ref(),
-                                &self.store_lock,
-                                &self.roster,
-                                &self.identity,
-                            )
-                            .await?;
-                        }
+                        sync_roster_async(
+                            self.store.as_ref(),
+                            &self.store_lock,
+                            &self.roster,
+                            &self.identity,
+                        )
+                        .await?;
                         serde_json::json!({
                             "status": "event",
                             "event": "revocation_updated",
@@ -3520,16 +3415,8 @@ impl Session {
             }
             Ok(Ok(None)) => Ok(serde_json::json!({ "status": "eof" }).to_string()),
             Ok(Err(e)) => {
-                if matches!(self.session.as_ref(), SessionBackend::V2(_)) {
-                    let _ = sync_roster_async(
-                        self.store.as_ref(),
-                        &self.store_lock,
-                        &self.roster,
-                        &self.identity,
-                    )
-                    .await;
-                    Err(session_err(&e, e.to_string()))
-                } else if let Err(pe) = commit_session_async(
+                // A failed event can leave a revocation in memory only (a fork, say).
+                match sync_roster_async(
                     self.store.as_ref(),
                     &self.store_lock,
                     &self.roster,
@@ -3537,9 +3424,8 @@ impl Session {
                 )
                 .await
                 {
-                    Err(session_err(&e, format!("{e} ({pe})")))
-                } else {
-                    Err(session_err(&e, e.to_string()))
+                    Ok(()) => Err(session_err(&e, e.to_string())),
+                    Err(pe) => Err(session_err(&e, format!("{e} ({pe})"))),
                 }
             }
             Err(_) => Ok(serde_json::json!({ "status": "would_block" }).to_string()),
@@ -4169,35 +4055,5 @@ mod tests {
         assert_eq!(persisted_crl.revoked_nonces, vec![grant.nonce]);
 
         let _ = std::fs::remove_dir_all(&base_dir);
-    }
-
-    #[test]
-    fn publish_roster_keeps_anchor_signed_crl() {
-        use tendril_core::crypto::SigningKeypair;
-        use tendril_core::grants::{RevocationListUnsigned, sign_crl};
-
-        let identity = EndpointIdentity::generate().unwrap();
-        let anchor = SigningKeypair::generate().unwrap();
-        let anchor_id = "anchor-a".to_owned();
-        let mut disk = Roster::default();
-        disk.add_trust_anchor(anchor_id.clone(), anchor.public_key().clone())
-            .unwrap();
-        let mut mem = disk.clone();
-        let crl = sign_crl(
-            RevocationListUnsigned {
-                v: 1,
-                issuer: anchor_id.clone(),
-                seq: 1,
-                revoked_devices: vec!["dev-gone".to_owned()],
-                revoked_nonces: Vec::new(),
-                ts: "2026-01-01T00:00:00Z".to_owned(),
-            },
-            &anchor,
-        )
-        .unwrap();
-        mem.ingest_crl(crl, &anchor_id, anchor.public_key())
-            .unwrap();
-        publish_roster(&mut mem, disk, &identity);
-        assert!(mem.crl(&anchor_id).is_some(), "anchor CRL dropped on merge");
     }
 }
