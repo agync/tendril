@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tendril_core::PREAMBLE_LEN;
 use tendril_core::crypto::HybridSigningPublicKey;
 use tendril_core::error::CoreError;
 use tendril_core::grants::{
@@ -22,17 +21,20 @@ use tendril_core::pairing::{
 use tendril_core::policy::{CandidateEndpoint, PathPlanner, PathPolicyConfig, ProviderId};
 use tendril_core::roster::{PeerState, Roster, V2PeerSecrets};
 use tendril_core::routes::RouteSet;
-use tendril_core::session::{MAX_QUEUED_ROUTE_SETS, RekeyDirection, RouteExpectation};
+use tendril_core::session::{
+    MAX_QUEUED_ROUTE_SETS, RekeyDirection, RouteExpectation, SessionCloseCode,
+};
 use tendril_core::v2::{
     PaddingPolicy, PakeArgon2Params, RekeyStatus, RekeyThresholds, RendezvousReplayCache,
     ScheduleJitterPolicy, SealedSession, V2InnerFrame, V2PairAction, V2PairOutcome,
-    V2PakePairInitiator, V2PakePairResponder, V2PinnedHost, V2SessionAction, V2SessionInitiator,
-    V2SessionResponder,
+    V2PakePairInitiator, V2PakePairResponder, V2PinnedHost, V2RefusalCaches, V2SessionAction,
+    V2SessionInitiator, V2SessionResponder,
 };
 use tendril_core::wire::{
     FLAG_PAKE_PAIR, InnerFrameType, Intent, PREAMBLE_FLAG_NONE, PathUpgradeMsg, PathUpgradeState,
     Preamble, ResumableFrameReader, WIRE_VERSION_V2, encode_frame,
 };
+use tendril_core::{PREAMBLE_LEN, RefusalMode, RefusalReason};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
 use zeroize::Zeroizing;
@@ -56,7 +58,7 @@ use crate::providers::egress::SkippedHint;
 use crate::providers::hints::DialWire;
 #[cfg(feature = "webrtc")]
 use crate::providers::webrtc::WebRtcUpgradeHandle;
-use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
+use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter, RefusalState};
 use crate::store::StateStore;
 use crate::wake::{DEFAULT_WAKE_TIMEOUT, WakeOutcome, WakeProvider, WakeSecret, WakeTarget};
 
@@ -103,6 +105,10 @@ impl Default for V2ResponderConfig {
 pub struct V2ResponderState {
     replay_cache: Arc<Mutex<RendezvousReplayCache>>,
     argon2_semaphore: Arc<Semaphore>,
+    refusal: RefusalState,
+    /// `true` once [`Self::with_refusal_state`] chose the state; otherwise the state of the
+    /// accept's rate limiter wins, so one endpoint keeps one refusal limiter.
+    refusal_explicit: bool,
     config: V2ResponderConfig,
 }
 
@@ -126,8 +132,40 @@ impl V2ResponderState {
         Self {
             replay_cache: Arc::new(Mutex::new(RendezvousReplayCache::new())),
             argon2_semaphore: Arc::new(Semaphore::new(permits)),
+            refusal: RefusalState::new(),
+            refusal_explicit: false,
             config,
         }
+    }
+
+    /// Returns this state with `refusal` as its endpoint-wide refusal state, shared with every
+    /// listener holding the same value (for example the router's, see
+    /// [`crate::InboundRouter::refusal_state`]).
+    #[must_use]
+    pub fn with_refusal_state(mut self, refusal: RefusalState) -> Self {
+        self.refusal = refusal;
+        self.refusal_explicit = true;
+        self
+    }
+
+    /// The refusal state an accept uses: this state's when it was set explicitly, else the
+    /// state of the accept's `rate_limiter` (the router's, so Wire v1 and Wire v2 listeners of
+    /// one endpoint share one limiter and one drain bound), else this state's own.
+    pub(crate) fn effective_refusal<'a>(
+        &'a self,
+        rate_limiter: Option<&'a PreAuthRateLimiter>,
+    ) -> &'a RefusalState {
+        match rate_limiter {
+            Some(rl) if !self.refusal_explicit => rl.refusal_state(),
+            _ => &self.refusal,
+        }
+    }
+
+    /// Returns the endpoint-wide refusal state: the refusal limiter, the refused-`msg1` replay
+    /// cache, the drain bound and the audit sink.
+    #[must_use]
+    pub fn refusal_state(&self) -> &RefusalState {
+        &self.refusal
     }
 
     /// Returns the shared [`RendezvousReplayCache`] guarding all inbound v2 session handshakes.
@@ -162,6 +200,8 @@ impl V2ResponderState {
         Self {
             replay_cache: Arc::clone(&self.replay_cache),
             argon2_semaphore: Arc::clone(&self.argon2_semaphore),
+            refusal: self.refusal.clone(),
+            refusal_explicit: self.refusal_explicit,
             config,
         }
     }
@@ -794,6 +834,9 @@ struct V2TransportCore {
     negotiated_upgrade_caps: Vec<String>,
     peer_upgrade_caps: Vec<String>,
     upgrade_state: PathUpgradeState,
+    /// Initiator: the refusal close code the responder sent. Later operations then fail with
+    /// [`CoreError::SessionClosed`] carrying it, so [`RuntimeError::refusal`] classifies them.
+    remote_refusal: Option<u16>,
 }
 
 /// Outcome of [`V2SessionDriver::stage_commit_frame`].
@@ -806,6 +849,28 @@ pub(crate) enum StagedCommit {
 }
 
 impl V2TransportCore {
+    /// The error of an operation on a closed session: the recorded refusal close code on an
+    /// initiator whose responder refused it, else the plain not-ready error.
+    fn closed_error(&self) -> CoreError {
+        match self.remote_refusal {
+            Some(code) => CoreError::SessionClosed {
+                code,
+                reason: "v2 session closed".to_owned(),
+            },
+            None => CoreError::NotReady("v2 session closed"),
+        }
+    }
+
+    /// Wraps a core error of this session: an initiator keeps a peer close as
+    /// [`RuntimeError::InitiatorClosed`] so a refusal is classifiable; a responder keeps the
+    /// plain error.
+    fn rt_err(&self, err: CoreError) -> RuntimeError {
+        match self.role {
+            SessionRole::Initiator { .. } => RuntimeError::from_initiator_core(err),
+            SessionRole::Responder { .. } => RuntimeError::Core(err),
+        }
+    }
+
     fn peer_device_id(&self) -> &str {
         match &self.role {
             SessionRole::Initiator { target_host_id, .. } => target_host_id,
@@ -943,7 +1008,7 @@ impl V2TransportCore {
             )
         };
         if self.closed {
-            return deny(CoreError::NotReady("v2 session closed"));
+            return deny(self.closed_error());
         }
         if let Err(err) = self.verify_peer_and_active_grant(now_unix, roster) {
             return deny(err);
@@ -979,7 +1044,7 @@ impl V2TransportCore {
         now_ms: u64,
     ) -> Result<(Vec<Vec<u8>>, bool), CoreError> {
         if self.closed {
-            return Err(CoreError::NotReady("v2 session closed"));
+            return Err(self.closed_error());
         }
         let (rekey_ct, outcome) = self.sealed.seal_auto_rekey(kind, payload, now_ms)?;
         let mut writes = Vec::with_capacity(2);
@@ -1002,7 +1067,7 @@ impl V2TransportCore {
         now_ms: u64,
     ) -> Result<(Vec<Vec<u8>>, bool), CoreError> {
         if self.closed {
-            return Err(CoreError::NotReady("v2 session closed"));
+            return Err(self.closed_error());
         }
         if !matches!(self.role, SessionRole::Responder { .. }) {
             return Err(CoreError::NotReady("only a responder sends route sets"));
@@ -1020,7 +1085,7 @@ impl V2TransportCore {
         now_ms: u64,
     ) -> Result<(Vec<Vec<u8>>, bool), CoreError> {
         if self.closed {
-            return Err(CoreError::NotReady("v2 session closed"));
+            return Err(self.closed_error());
         }
         let payload = self.upgrade_state.prepare_send(msg)?;
         let out = self.seal_frame(InnerFrameType::PathUpgrade, &payload, now_ms)?;
@@ -1034,7 +1099,7 @@ impl V2TransportCore {
         now_ms: u64,
     ) -> Result<(Vec<Vec<u8>>, bool), CoreError> {
         if self.closed {
-            return Err(CoreError::NotReady("v2 session closed"));
+            return Err(self.closed_error());
         }
         let (rekey_ct, outcome) = self.sealed.seal_dummy_cover_auto_rekey(bucket, now_ms)?;
         let mut writes = Vec::with_capacity(2);
@@ -1050,7 +1115,7 @@ impl V2TransportCore {
 
     fn seal_rekey(&mut self, now_ms: u64) -> Result<Vec<u8>, CoreError> {
         if self.closed {
-            return Err(CoreError::NotReady("v2 session closed"));
+            return Err(self.closed_error());
         }
         let ct = self.sealed.seal_rekey(now_ms)?;
         encode_frame(&ct)
@@ -1058,7 +1123,7 @@ impl V2TransportCore {
 
     fn seal_close(&mut self, code: u16, reason: &str, now_ms: u64) -> Result<Vec<u8>, CoreError> {
         if self.closed {
-            return Err(CoreError::NotReady("v2 session closed"));
+            return Err(self.closed_error());
         }
         let mut payload = Vec::with_capacity(2 + reason.len());
         payload.extend_from_slice(&code.to_be_bytes());
@@ -1214,6 +1279,11 @@ impl V2TransportCore {
                     })?;
                     self.closed = true;
                     should_close = true;
+                    if matches!(self.role, SessionRole::Initiator { .. })
+                        && RefusalReason::from_close_code(code).is_some()
+                    {
+                        self.remote_refusal = Some(code);
+                    }
                     events.push(SessionEvent::Closed { code, reason });
                 }
                 InnerFrameType::GroupManifest => {
@@ -1265,6 +1335,35 @@ struct WireHandleOutcome {
     should_close: bool,
     ingested_crl: Option<(RevocationList, String, HybridSigningPublicKey)>,
     post_verify_err: Option<CoreError>,
+}
+
+/// Feeds `wire` to a responder with the endpoint's refusal caches when its listener may refuse
+/// (`spec/wire-v2.md` Section 3.1.3.2), else with the shared replay cache alone.
+fn feed_responder(
+    machine: &mut V2SessionResponder,
+    wire: &[u8],
+    (now_unix, now_ms): (u64, u64),
+    roster: &mut Roster,
+    replay_cache: &mut RendezvousReplayCache,
+    refusal: Option<&RefusalState>,
+) -> Result<Vec<V2SessionAction>, CoreError> {
+    match refusal {
+        Some(refusal) => {
+            let (mut replay, mut limiter) = refusal.caches();
+            machine.feed_bytes_with_caches(
+                wire,
+                now_unix,
+                now_ms,
+                roster,
+                replay_cache,
+                V2RefusalCaches {
+                    replay: &mut replay,
+                    limiter: &mut limiter,
+                },
+            )
+        }
+        None => machine.feed_bytes_with_replay_cache(wire, now_unix, now_ms, roster, replay_cache),
+    }
 }
 
 async fn write_protocol_bytes_timed(
@@ -1965,6 +2064,7 @@ impl V2SessionDriver {
                 negotiated_upgrade_caps,
                 peer_upgrade_caps,
                 upgrade_state,
+                remote_refusal: None,
             },
             frame_reader,
             pending_events: VecDeque::new(),
@@ -2030,6 +2130,7 @@ impl V2SessionDriver {
             rate_limiter,
             existing_guard,
             handshake_timeout,
+            Some(state.effective_refusal(rate_limiter).clone()),
         )
         .await
     }
@@ -2056,6 +2157,45 @@ impl V2SessionDriver {
             rate_limiter,
             existing_guard,
             handshake_timeout,
+            Some(state.effective_refusal(rate_limiter).clone()),
+        )
+        .await
+    }
+
+    /// Accepts an inbound Wire v2 session handshake with a mutex-guarded roster and an explicit
+    /// refusal listener mode.
+    ///
+    /// `refusal` is the endpoint's [`RefusalState`] for a listener that may refuse a known
+    /// revoked or pending peer (`spec/wire-v1.md` Section 5.4.3), or `None` for a listener that
+    /// never does: a group pool, a standalone group listener or a group mailbox. The other
+    /// `accept*` constructors always use `state`'s refusal state.
+    ///
+    /// A refusal at `msg2` keeps the decoy path: the call waits for `msg3` or the handshake
+    /// timeout like a decoy and then fails. A refusal at `msg3` writes one sealed `0x07 CLOSE`,
+    /// releases the half-open slot, drains in the background and fails with
+    /// [`CoreError::PeerRevoked`] or [`CoreError::PeerPending`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn accept_locked_with_refusal(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        roster: &Mutex<Roster>,
+        now_unix: u64,
+        state: &V2ResponderState,
+        rate_limiter: Option<&PreAuthRateLimiter>,
+        existing_guard: Option<HalfOpenGuard>,
+        handshake_timeout: Duration,
+        refusal: Option<&RefusalState>,
+    ) -> Result<Self, RuntimeError> {
+        Self::accept_inner(
+            stream,
+            local_identity,
+            V2AcceptBackend::InMemory(V2RosterRef::Locked(roster)),
+            now_unix,
+            state,
+            rate_limiter,
+            existing_guard,
+            handshake_timeout,
+            refusal.cloned(),
         )
         .await
     }
@@ -2083,6 +2223,7 @@ impl V2SessionDriver {
             rate_limiter,
             existing_guard,
             handshake_timeout,
+            Some(state.effective_refusal(rate_limiter).clone()),
         )
         .await
     }
@@ -2097,6 +2238,7 @@ impl V2SessionDriver {
         rate_limiter: Option<&PreAuthRateLimiter>,
         existing_guard: Option<HalfOpenGuard>,
         handshake_timeout: Duration,
+        refusal: Option<RefusalState>,
     ) -> Result<Self, RuntimeError> {
         crate::store::ensure_valid_local_host_id(local_identity)?;
         let mut half_open = match existing_guard {
@@ -2133,7 +2275,12 @@ impl V2SessionDriver {
             }
             state.config.webrtc_upgrade_handle.clone()
         };
-        let mut machine = V2SessionResponder::new(local_identity)?
+        let mode = if refusal.is_some() {
+            RefusalMode::Enabled
+        } else {
+            RefusalMode::Off
+        };
+        let mut machine = V2SessionResponder::new_with_refusal(local_identity, mode)?
             .with_padding_policy(state.config.padding.clone())
             .with_upgrade_caps(upgrade_caps)?;
         let mut frame_reader = ResumableFrameReader::with_preamble();
@@ -2186,7 +2333,14 @@ impl V2SessionDriver {
                     .replay_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                machine.feed_bytes_with_replay_cache(&msg1_wire, now_unix, now_ms, r, &mut cache)?
+                feed_responder(
+                    &mut machine,
+                    &msg1_wire,
+                    (now_unix, now_ms),
+                    r,
+                    &mut cache,
+                    refusal.as_ref(),
+                )?
             }
             V2AcceptBackend::InMemory(V2RosterRef::Locked(m)) => {
                 let mut rst = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2194,8 +2348,13 @@ impl V2SessionDriver {
                     .replay_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                machine.feed_bytes_with_replay_cache(
-                    &msg1_wire, now_unix, now_ms, &mut rst, &mut cache,
+                feed_responder(
+                    &mut machine,
+                    &msg1_wire,
+                    (now_unix, now_ms),
+                    &mut rst,
+                    &mut cache,
+                    refusal.as_ref(),
                 )?
             }
             V2AcceptBackend::DiskStore { store, store_lock } => {
@@ -2212,19 +2371,39 @@ impl V2SessionDriver {
                     .replay_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                machine.feed_bytes_with_replay_cache(
-                    &msg1_wire, now_unix, now_ms, &mut rst, &mut cache,
+                feed_responder(
+                    &mut machine,
+                    &msg1_wire,
+                    (now_unix, now_ms),
+                    &mut rst,
+                    &mut cache,
+                    refusal.as_ref(),
                 )?
             }
         };
         for action in msg1_actions {
-            if let V2SessionAction::WriteBytes(bytes) = action {
-                await_deadline!(
-                    deadline,
-                    stream,
-                    "pre-auth v2 session handshake timed out",
-                    write_protocol_bytes_timed(stream.as_mut(), &bytes)
-                );
+            match action {
+                V2SessionAction::WriteBytes(bytes) => {
+                    await_deadline!(
+                        deadline,
+                        stream,
+                        "pre-auth v2 session handshake timed out",
+                        write_protocol_bytes_timed(stream.as_mut(), &bytes)
+                    );
+                }
+                // The sealed refusal is written. The connection stays on the decoy path: it
+                // keeps its half-open slot and waits for `msg3` or the timeout below, so a
+                // passive observer cannot tell it from a decoy (`spec/wire-v2.md` 3.1.3.3).
+                V2SessionAction::Refused {
+                    peer_device_id,
+                    code,
+                    at_msg2: true,
+                } => {
+                    if let Some(refusal) = &refusal {
+                        refusal.record(&peer_device_id, code);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -2244,12 +2423,13 @@ impl V2SessionDriver {
                     .replay_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                machine.feed_bytes_with_replay_cache(
+                feed_responder(
+                    &mut machine,
                     &msg3_frame,
-                    now_unix,
-                    now_ms,
+                    (now_unix, now_ms),
                     r,
                     &mut cache,
+                    refusal.as_ref(),
                 )?
             }
             V2AcceptBackend::InMemory(V2RosterRef::Locked(m)) => {
@@ -2258,18 +2438,20 @@ impl V2SessionDriver {
                     .replay_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                machine.feed_bytes_with_replay_cache(
+                feed_responder(
+                    &mut machine,
                     &msg3_frame,
-                    now_unix,
-                    now_ms,
+                    (now_unix, now_ms),
                     &mut rst,
                     &mut cache,
+                    refusal.as_ref(),
                 )?
             }
             V2AcceptBackend::DiskStore { store, store_lock } => {
                 let _guard = store_lock.lock().await;
                 let store_c = (*store).clone();
                 let cache_arc = Arc::clone(&state.replay_cache);
+                let refusal_c = refusal.clone();
                 let mut m_owned = machine;
                 let (m_back, actions) = tokio::task::spawn_blocking(move || {
                     store_c
@@ -2277,12 +2459,13 @@ impl V2SessionDriver {
                             let mut cache = cache_arc
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let actions = m_owned.feed_bytes_with_replay_cache(
+                            let actions = feed_responder(
+                                &mut m_owned,
                                 &msg3_frame,
-                                now_unix,
-                                now_ms,
+                                (now_unix, now_ms),
                                 rst,
                                 &mut cache,
+                                refusal_c.as_ref(),
                             )?;
                             if m_owned.is_established()
                                 && let Some(peer_id) = m_owned.peer_device_id()
@@ -2303,6 +2486,7 @@ impl V2SessionDriver {
         };
 
         let mut peer_static_pub = None;
+        let mut refused = None;
         for action in msg3_actions {
             match action {
                 V2SessionAction::WriteBytes(bytes) => {
@@ -2313,6 +2497,11 @@ impl V2SessionDriver {
                         write_protocol_bytes_timed(stream.as_mut(), &bytes)
                     );
                 }
+                V2SessionAction::Refused {
+                    peer_device_id,
+                    code,
+                    at_msg2: false,
+                } => refused = Some((peer_device_id, code)),
                 V2SessionAction::Established {
                     peer_static_pub: p_pub,
                     ..
@@ -2321,6 +2510,23 @@ impl V2SessionDriver {
                 }
                 _ => {}
             }
+        }
+
+        if let Some((peer, code)) = refused {
+            // The sealed `CLOSE` is written: free the slot, then half-close and drain without
+            // holding this accept (`spec/wire-v1.md` Section 5.4.4).
+            half_open.take();
+            if let Some(refusal) = refusal {
+                refusal.record(&peer, code);
+                refusal.linger(stream);
+            }
+            return Err(RuntimeError::Core(
+                if code == SessionCloseCode::PEER_PENDING {
+                    CoreError::PeerPending(peer)
+                } else {
+                    CoreError::PeerRevoked(peer)
+                },
+            ));
         }
 
         if !machine.is_established() {
@@ -2374,6 +2580,7 @@ impl V2SessionDriver {
                 negotiated_upgrade_caps,
                 peer_upgrade_caps,
                 upgrade_state,
+                remote_refusal: None,
             },
             frame_reader,
             pending_events: VecDeque::new(),
@@ -2410,7 +2617,8 @@ impl V2SessionDriver {
         let now_ms = self.elapsed_ms();
         let (writes, rekeyed) = self
             .core
-            .seal_frame(InnerFrameType::Data, payload, now_ms)?;
+            .seal_frame(InnerFrameType::Data, payload, now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
@@ -2427,9 +2635,10 @@ impl V2SessionDriver {
     ) -> Result<(), RuntimeError> {
         let json = manifest.to_wire_bytes()?;
         let now_ms = self.elapsed_ms();
-        let (writes, rekeyed) =
-            self.core
-                .seal_frame(InnerFrameType::GroupManifest, &json, now_ms)?;
+        let (writes, rekeyed) = self
+            .core
+            .seal_frame(InnerFrameType::GroupManifest, &json, now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
@@ -2447,9 +2656,10 @@ impl V2SessionDriver {
     ) -> Result<(), RuntimeError> {
         let frame = secrets.to_rendezvous_frame(group_id)?;
         let now_ms = self.elapsed_ms();
-        let (writes, rekeyed) =
-            self.core
-                .seal_frame(InnerFrameType::GroupRendezvous, &frame[..], now_ms)?;
+        let (writes, rekeyed) = self
+            .core
+            .seal_frame(InnerFrameType::GroupRendezvous, &frame[..], now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
@@ -2471,7 +2681,10 @@ impl V2SessionDriver {
             serde_json::to_vec(grant).map_err(|err| CoreError::Json(err.to_string()))?,
         );
         let now_ms = self.elapsed_ms();
-        let (writes, rekeyed) = self.core.seal_frame(InnerFrameType::Grant, &json, now_ms)?;
+        let (writes, rekeyed) = self
+            .core
+            .seal_frame(InnerFrameType::Grant, &json, now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
@@ -2489,7 +2702,8 @@ impl V2SessionDriver {
         let now_ms = self.elapsed_ms();
         let (writes, rekeyed) = self
             .core
-            .seal_frame(InnerFrameType::Revocation, &json, now_ms)?;
+            .seal_frame(InnerFrameType::Revocation, &json, now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
@@ -2502,7 +2716,10 @@ impl V2SessionDriver {
     /// Sends encrypted `0x04 REKEY` and rotates the outgoing cipher key + jittered thresholds.
     pub async fn send_rekey(&mut self) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let wire = self.core.seal_rekey(now_ms)?;
+        let wire = self
+            .core
+            .seal_rekey(now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(std::slice::from_ref(&wire)).await?;
         self.pending_events.push_back(SessionEvent::Rekeyed {
             direction: RekeyDirection::Outgoing,
@@ -2513,9 +2730,10 @@ impl V2SessionDriver {
     /// Sends encrypted, bucket-padded `0x05 PING`.
     pub async fn send_ping(&mut self, cookie: u64) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let (writes, rekeyed) =
-            self.core
-                .seal_frame(InnerFrameType::Ping, &cookie.to_be_bytes(), now_ms)?;
+        let (writes, rekeyed) = self
+            .core
+            .seal_frame(InnerFrameType::Ping, &cookie.to_be_bytes(), now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
@@ -2528,7 +2746,10 @@ impl V2SessionDriver {
     /// Sends a pure `0x08 PADDING` cover frame sized to `bucket`.
     pub async fn send_dummy_cover(&mut self, bucket: usize) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let (writes, rekeyed) = self.core.seal_dummy_cover(bucket, now_ms)?;
+        let (writes, rekeyed) = self
+            .core
+            .seal_dummy_cover(bucket, now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
@@ -2541,7 +2762,10 @@ impl V2SessionDriver {
     /// Sends encrypted `0x07 CLOSE` and closes the underlying transport stream.
     pub async fn send_close(&mut self, code: u16, reason: &str) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let wire = self.core.seal_close(code, reason, now_ms)?;
+        let wire = self
+            .core
+            .seal_close(code, reason, now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         let res = self.write_wire_frames(std::slice::from_ref(&wire)).await;
         let _ = self.stream.close().await;
         res
@@ -2687,7 +2911,10 @@ impl V2SessionDriver {
     /// Sends one encrypted `0x0D PATH_UPGRADE` frame wrapped inside `0x09 PADDED`.
     pub async fn send_path_upgrade(&mut self, msg: &PathUpgradeMsg) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let (writes, rekeyed) = self.core.seal_path_upgrade(msg, now_ms)?;
+        let (writes, rekeyed) = self
+            .core
+            .seal_path_upgrade(msg, now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
@@ -2979,7 +3206,10 @@ impl V2SessionDriver {
     /// the frame cannot be sent (`FrameTooLarge`, `UnknownInnerFrameType`, not negotiated).
     pub async fn send_route_set(&mut self, payload: &[u8]) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let (writes, rekeyed) = self.core.seal_route_set(payload, now_ms)?;
+        let (writes, rekeyed) = self
+            .core
+            .seal_route_set(payload, now_ms)
+            .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
@@ -3275,7 +3505,8 @@ impl ConcurrentV2Session {
                 .core
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            core.seal_close(code, reason, now_ms)?
+            core.seal_close(code, reason, now_ms)
+                .map_err(|err| core.rt_err(err))?
         };
         let res = write_protocol_chunks_timed(writer.as_mut(), &wire).await;
         if res.is_err() {
@@ -3514,7 +3745,7 @@ impl ConcurrentV2Session {
                 .core
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            op(&mut core, now_ms)?
+            op(&mut core, now_ms).map_err(|err| core.rt_err(err))?
         };
         for w in writes {
             if let Err(err) = write_protocol_chunks_timed(writer.as_mut(), &w).await {

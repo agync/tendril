@@ -526,10 +526,15 @@ impl StateStore {
     {
         let _lock = self.lock_roster_file(true)?;
         let original = self.load_roster_unlocked()?;
+        let before = roster_fingerprint(&original)?;
         let mut working = original.clone();
         match f(&mut working) {
             Ok(out) => {
-                self.save_roster_unlocked(&working)?;
+                // An unchanged roster (a refused session, say) is neither rewritten nor
+                // re-stamped.
+                if roster_fingerprint(&working)? != before {
+                    self.save_roster_unlocked(&working)?;
+                }
                 Ok(out)
             }
             Err(err) => {
@@ -658,7 +663,7 @@ impl StateStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Roster::new()),
             Err(err) => return Err(RuntimeError::Io(err)),
         }
-        match &self.codec {
+        let mut roster: Roster = match &self.codec {
             Codec::Plain => {
                 let raw = Zeroizing::new(fs::read_to_string(&path)?);
                 serde_json::from_str(&raw).map_err(|err| {
@@ -666,13 +671,19 @@ impl StateStore {
                         "invalid roster json: {}",
                         redact_json_error(&err)
                     ))
-                })
+                })?
             }
-            Codec::Sealed(key) => sealed::load(key, StateKind::Roster, &path),
-        }
+            Codec::Sealed(key) => sealed::load(key, StateKind::Roster, &path)?,
+        };
+        roster.prune_expired_refusal_notices(crate::driver::current_unix_secs());
+        Ok(roster)
     }
 
     pub(crate) fn save_roster_unlocked(&self, roster: &Roster) -> Result<(), RuntimeError> {
+        // An expired refusal notice never reaches disk: its secret is dropped with it.
+        let mut pruned = roster.clone();
+        pruned.prune_expired_refusal_notices(crate::driver::current_unix_secs());
+        let roster = &pruned;
         let bytes = match &self.codec {
             Codec::Plain => {
                 let mut json = Zeroizing::new(Vec::new());

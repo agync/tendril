@@ -81,7 +81,10 @@ pub use providers::{
 };
 #[cfg(feature = "webtransport")]
 pub use providers::{WtDialer, WtListener};
-pub use rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
+pub use rate_limit::{
+    HalfOpenGuard, MAX_REFUSAL_DRAINS, PreAuthConfig, PreAuthRateLimiter, REFUSAL_LINGER,
+    RefusalAudit, RefusalState,
+};
 pub use router::{InboundQueue, InboundRouter, RoutedInbound, recv_routed};
 pub use store::{
     RosterStamp, StateStore, deserialize_identity_json, deserialize_identity_json_with_signer,
