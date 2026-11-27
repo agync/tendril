@@ -64,10 +64,11 @@ pub use provider::{
 };
 pub use providers::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DirectDialer, DirectListener, EmbeddedRelay,
-    LocalDialer, LocalListener, OverlayConfig, OverlayDialer, OverlayListener, OverlayMode,
-    OverlayResolvedMode, RelayClientAuth, RelayDialer, RelayListener, RelayListenerConfig,
-    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, dial_endpoint, dial_endpoint_with_auth,
-    is_loopback_host, is_metadata_or_link_local_ip, is_tailnet_ip, select_overlay_mode,
+    LocalDialer, LocalListener, LocalReachability, OverlayConfig, OverlayDialer, OverlayListener,
+    OverlayMode, OverlayResolvedMode, RelayClientAuth, RelayDialer, RelayListener,
+    RelayListenerConfig, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, dial_endpoint,
+    dial_endpoint_with_auth, is_loopback_host, is_metadata_or_link_local_ip, is_tailnet_ip,
+    select_overlay_mode,
 };
 #[cfg(feature = "p2p-iroh")]
 pub use providers::{

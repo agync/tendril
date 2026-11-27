@@ -1,5 +1,7 @@
 //! Power profile configuration for mobile and low-duty-cycle runtimes.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -122,6 +124,52 @@ impl PowerProfile {
     }
 }
 
+/// Tracks application-level I/O timestamps for opt-in idle session teardown.
+///
+/// Only application payloads (`send_data`, grants, revocations, group messages) refresh the
+/// clock; background keepalives (`Ping`/`Pong`, cover traffic, rekeys) do not.
+#[derive(Debug, Clone)]
+pub(crate) struct IdleActivity {
+    timeout: Option<Duration>,
+    base: tokio::time::Instant,
+    last_ms: Arc<AtomicU64>,
+}
+
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(100 * 365 * 86_400);
+
+impl Default for IdleActivity {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl IdleActivity {
+    pub(crate) fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            timeout: timeout
+                .filter(|d| !d.is_zero())
+                .map(|d| d.min(MAX_IDLE_TIMEOUT)),
+            base: tokio::time::Instant::now(),
+            last_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn touch(&self) {
+        if self.timeout.is_some() {
+            let ms = u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.last_ms.store(ms, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        let timeout = self.timeout?;
+        let last = self.last_ms.load(Ordering::Acquire);
+        self.base
+            .checked_add(Duration::from_millis(last))
+            .and_then(|t| t.checked_add(timeout))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +199,15 @@ mod tests {
             PowerProfile::LowPower.group_watch_fallback_interval(true),
             Some(Duration::from_secs(5))
         );
+    }
+
+    #[test]
+    fn idle_activity_overflow_timeout_does_not_panic() {
+        let activity = IdleActivity::new(Some(Duration::from_millis(u64::MAX)));
+        activity.touch();
+        let dl = activity.deadline().expect("clamped deadline");
+        assert!(dl <= activity.base + MAX_IDLE_TIMEOUT + Duration::from_secs(60));
+        activity.last_ms.store(u64::MAX, Ordering::Release);
+        let _ = activity.deadline();
     }
 }

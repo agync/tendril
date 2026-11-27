@@ -22,6 +22,7 @@ use tokio::time::timeout;
 
 #[cfg(feature = "p2p-iroh")]
 use super::p2p::{P2pRelayMode, filter_p2p_hint};
+use crate::advertise::{LocalAddr, NetworkSnapshot};
 use crate::error::RuntimeError;
 use crate::provider::{PathDialer, PathStream};
 use crate::redact::{redact_host, redact_text};
@@ -172,6 +173,8 @@ pub enum SkipReason {
     /// A `wt://` hint while the `webtransport` feature is disabled.
     #[serde(rename = "webtransport_feature_disabled")]
     WebtransportFeatureDisabled,
+    /// Hint targets an IP family with no currently reachable local interface.
+    UnreachableInterface,
 }
 
 impl SkipReason {
@@ -190,6 +193,94 @@ impl SkipReason {
             Self::RelayV2NotAuthorized => "relay_v2_not_authorized",
             Self::WireV1NoRelayV2 => "wire_v1_no_relay_v2",
             Self::WebtransportFeatureDisabled => "webtransport_feature_disabled",
+            Self::UnreachableInterface => "unreachable_interface",
+        }
+    }
+}
+
+/// Interface address-family availability used to filter unreachable hints before dialing.
+///
+/// Loopback destinations (`127.0.0.0/8`, `::1`) remain dialable regardless of interface state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalReachability {
+    pub has_ipv4: bool,
+    pub has_ipv6: bool,
+}
+
+impl Default for LocalReachability {
+    fn default() -> Self {
+        Self::both()
+    }
+}
+
+impl LocalReachability {
+    /// Assumes both IPv4 and IPv6 interfaces may be reachable.
+    #[must_use]
+    pub const fn both() -> Self {
+        Self {
+            has_ipv4: true,
+            has_ipv6: true,
+        }
+    }
+
+    /// Derives address-family availability from a mobile/host [`NetworkSnapshot`].
+    #[must_use]
+    pub fn from_snapshot(snap: &NetworkSnapshot) -> Self {
+        if snap.networks.is_empty() {
+            return Self {
+                has_ipv4: false,
+                has_ipv6: false,
+            };
+        }
+        let mut has_ipv4 = false;
+        let mut has_ipv6 = false;
+        for net in &snap.networks {
+            for raw in &net.addrs {
+                let ip_part = raw.split('/').next().unwrap_or(raw);
+                if let Ok(ip) = bare_host(ip_part).parse::<IpAddr>() {
+                    match ip {
+                        IpAddr::V4(_) => has_ipv4 = true,
+                        IpAddr::V6(_) => has_ipv6 = true,
+                    }
+                }
+            }
+        }
+        if !has_ipv4 && !has_ipv6 {
+            Self::both()
+        } else {
+            Self { has_ipv4, has_ipv6 }
+        }
+    }
+
+    /// Derives address-family availability from enumerated local addresses.
+    #[must_use]
+    pub fn from_local_addrs(addrs: &[LocalAddr]) -> Self {
+        if addrs.is_empty() {
+            return Self {
+                has_ipv4: false,
+                has_ipv6: false,
+            };
+        }
+        let mut has_ipv4 = false;
+        let mut has_ipv6 = false;
+        for addr in addrs {
+            match addr.addr {
+                IpAddr::V4(_) => has_ipv4 = true,
+                IpAddr::V6(_) => has_ipv6 = true,
+            }
+        }
+        Self { has_ipv4, has_ipv6 }
+    }
+
+    /// Returns `true` if `ip` matches an available local family or is loopback.
+    #[must_use]
+    pub fn allows_ip(self, ip: IpAddr) -> bool {
+        if classify_destination(ip) == DestClass::Loopback {
+            return true;
+        }
+        match ip {
+            IpAddr::V4(_) => self.has_ipv4,
+            IpAddr::V6(_) => self.has_ipv6,
         }
     }
 }
@@ -282,6 +373,11 @@ pub trait AddrPolicy: Send + Sync + fmt::Debug {
     fn resolver(&self) -> &dyn HostResolver {
         &SystemResolver
     }
+
+    /// Filters permitted addresses by local interface family availability (`true` keeps `ip`).
+    fn allows_reachability(&self, _ip: IpAddr) -> bool {
+        true
+    }
 }
 
 /// Policy of dials outside the egress layer: rejects the always-blocked set
@@ -300,16 +396,27 @@ impl AddrPolicy for DefaultAddrPolicy {
     }
 }
 
-/// Egress policy for hints: rejects the always-blocked set ([`DestClass::Blocked`]).
+/// Egress policy for hints: rejects the always-blocked set ([`DestClass::Blocked`]) and
+/// optionally filters resolved answers by [`LocalReachability`].
 #[derive(Clone)]
 pub struct EgressAddrPolicy {
     resolver: Arc<dyn HostResolver>,
+    reachability: Option<LocalReachability>,
 }
 
 impl EgressAddrPolicy {
     #[must_use]
     pub fn new(resolver: Arc<dyn HostResolver>) -> Self {
-        Self { resolver }
+        Self {
+            resolver,
+            reachability: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_reachability(mut self, reachability: Option<LocalReachability>) -> Self {
+        self.reachability = reachability;
+        self
     }
 }
 
@@ -321,7 +428,9 @@ impl Default for EgressAddrPolicy {
 
 impl fmt::Debug for EgressAddrPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("EgressAddrPolicy")
+        f.debug_struct("EgressAddrPolicy")
+            .field("reachability", &self.reachability)
+            .finish_non_exhaustive()
     }
 }
 
@@ -336,6 +445,10 @@ impl AddrPolicy for EgressAddrPolicy {
 
     fn resolver(&self) -> &dyn HostResolver {
         &*self.resolver
+    }
+
+    fn allows_reachability(&self, ip: IpAddr) -> bool {
+        self.reachability.is_none_or(|r| r.allows_ip(ip))
     }
 }
 
@@ -415,7 +528,17 @@ pub(crate) async fn resolve_checked(
             ));
         }
     }
-    Ok(addrs)
+    let filtered: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(|addr| policy.allows_reachability(addr.ip()))
+        .collect();
+    if filtered.is_empty() {
+        return Err(egress_err(
+            SkipReason::UnreachableInterface,
+            format!("host '{shown}' resolved to no reachable address family"),
+        ));
+    }
+    Ok(filtered)
 }
 
 tokio::task_local! {
@@ -513,13 +636,16 @@ pub struct EgressContext {
     pub iroh_relay_mode: P2pRelayMode,
     /// Resolver for `overlay://` and WebSocket host names.
     pub resolver: Arc<dyn HostResolver>,
+    /// Optional local IPv4/IPv6 reachability used to fail fast on unreachable hints.
+    pub reachability: Option<LocalReachability>,
 }
 
 impl fmt::Debug for EgressContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_struct("EgressContext");
         d.field("kind", &self.kind)
-            .field("relay_auth_origins", &self.relay_auth_origins);
+            .field("relay_auth_origins", &self.relay_auth_origins)
+            .field("reachability", &self.reachability);
         #[cfg(feature = "p2p-iroh")]
         d.field("iroh_relay_mode", &self.iroh_relay_mode);
         d.finish_non_exhaustive()
@@ -536,6 +662,7 @@ impl EgressContext {
             #[cfg(feature = "p2p-iroh")]
             iroh_relay_mode: P2pRelayMode::default(),
             resolver: Arc::new(SystemResolver),
+            reachability: None,
         }
     }
 
@@ -558,10 +685,19 @@ impl EgressContext {
         self
     }
 
+    /// Sets local interface IPv4/IPv6 reachability used to filter unreachable candidates.
+    #[must_use]
+    pub const fn with_reachability(mut self, reachability: LocalReachability) -> Self {
+        self.reachability = Some(reachability);
+        self
+    }
+
     /// The [`AddrPolicy`] for WebSocket-family dials of this context.
     #[must_use]
     pub fn addr_policy(&self) -> Arc<dyn AddrPolicy> {
-        Arc::new(EgressAddrPolicy::new(Arc::clone(&self.resolver)))
+        Arc::new(
+            EgressAddrPolicy::new(Arc::clone(&self.resolver)).with_reachability(self.reachability),
+        )
     }
 }
 
@@ -824,7 +960,8 @@ pub async fn check_hint(
             }
             #[cfg(feature = "webtransport")]
             {
-                let policy = EgressAddrPolicy::new(Arc::clone(&ctx.resolver));
+                let policy = EgressAddrPolicy::new(Arc::clone(&ctx.resolver))
+                    .with_reachability(ctx.reachability);
                 let addrs = resolve_checked(host, port, &policy)
                     .await
                     .map_err(|err| skip(err.skip_reason().unwrap_or(SkipReason::Unresolved)))?;
@@ -835,7 +972,9 @@ pub async fn check_hint(
                         host: host.to_owned(),
                         addrs,
                     });
-                    checked.addr_policy = Some(Arc::new(EgressAddrPolicy::new(pinned)));
+                    checked.addr_policy = Some(Arc::new(
+                        EgressAddrPolicy::new(pinned).with_reachability(ctx.reachability),
+                    ));
                 }
             }
         }
@@ -851,13 +990,17 @@ pub async fn check_hint(
             if classify_destination(sock.ip()) == DestClass::Blocked {
                 return Err(skip(SkipReason::BlockedAddress));
             }
+            if ctx.reachability.is_some_and(|r| !r.allows_ip(sock.ip())) {
+                return Err(skip(SkipReason::UnreachableInterface));
+            }
             checked.dial_endpoint = sock.to_string();
             checked.destinations = vec![sock.ip()];
         }
         ProviderId::Overlay => {
             let target = hint.strip_prefix("overlay://").unwrap_or(hint);
             let (host, port) = split_host_port(target).ok_or_else(|| skip(SkipReason::Invalid))?;
-            let policy = EgressAddrPolicy::new(Arc::clone(&ctx.resolver));
+            let policy = EgressAddrPolicy::new(Arc::clone(&ctx.resolver))
+                .with_reachability(ctx.reachability);
             let addrs = resolve_checked(host, port, &policy)
                 .await
                 .map_err(|err| skip(err.skip_reason().unwrap_or(SkipReason::Unresolved)))?;
@@ -874,12 +1017,16 @@ pub async fn check_hint(
                 .map(bare_host)
                 .filter(|h| !h.is_empty())
                 .ok_or_else(|| skip(SkipReason::Invalid))?;
-            if host.eq_ignore_ascii_case("metadata.google.internal")
-                || host
-                    .parse::<IpAddr>()
-                    .is_ok_and(|ip| classify_destination(ip) == DestClass::Blocked)
-            {
+            if host.eq_ignore_ascii_case("metadata.google.internal") {
                 return Err(skip(SkipReason::BlockedAddress));
+            }
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                if classify_destination(ip) == DestClass::Blocked {
+                    return Err(skip(SkipReason::BlockedAddress));
+                }
+                if ctx.reachability.is_some_and(|r| !r.allows_ip(ip)) {
+                    return Err(skip(SkipReason::UnreachableInterface));
+                }
             }
             checked.dial_endpoint = stripped.to_owned();
             checked.addr_policy = Some(ctx.addr_policy());
@@ -1240,5 +1387,47 @@ pub(crate) mod tests {
                 .relay_pins
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn local_reachability_skips_unreachable_ip_family_and_keeps_loopback() {
+        use crate::advertise::{NetworkSnapshot, SnapshotNetwork, Transport};
+
+        let snap = NetworkSnapshot {
+            networks: vec![SnapshotNetwork {
+                id: "wifi".to_owned(),
+                iface: "wlan0".to_owned(),
+                if_index: 1,
+                transports: vec![Transport::Wifi],
+                addrs: vec!["192.168.1.10/24".to_owned()],
+            }],
+        };
+        let reach = LocalReachability::from_snapshot(&snap);
+        assert_eq!(
+            reach,
+            LocalReachability {
+                has_ipv4: true,
+                has_ipv6: false
+            }
+        );
+
+        let ctx = EgressContext::new(EgressKind::Session).with_reachability(reach);
+        let skipped_v6 = check_hint("direct:[2001:db8::5]:7000", HintSource::Operator, &ctx)
+            .await
+            .expect_err("non-loopback v6 must skip when only v4 interface exists");
+        assert_eq!(skipped_v6.reason, SkipReason::UnreachableInterface);
+
+        let skipped_relay_v6 =
+            check_hint("wss://[2001:db8::9]/v2/relay", HintSource::Operator, &ctx)
+                .await
+                .expect_err("v6 relay literal must skip");
+        assert_eq!(skipped_relay_v6.reason, SkipReason::UnreachableInterface);
+
+        check_hint("direct:192.168.1.20:7000", HintSource::Operator, &ctx)
+            .await
+            .expect("v4 direct remains dialable");
+        check_hint("direct:[::1]:7000", HintSource::Operator, &ctx)
+            .await
+            .expect("loopback stays reachable");
     }
 }

@@ -72,7 +72,20 @@ where
         match connect().await {
             Ok(value) => return Ok((value, Some(outcome))),
             Err(err) if attempt >= attempts || !is_wakeable(&err) => return Err(err),
-            Err(_) => tokio::time::sleep(wake.retry_delay).await,
+            Err(_) => {
+                let delay = match wake.retry_max_delay {
+                    Some(max_delay) => {
+                        let shift = u32::try_from(attempt.saturating_sub(1))
+                            .unwrap_or(16)
+                            .min(16);
+                        wake.retry_delay
+                            .saturating_mul(1u32 << shift)
+                            .min(max_delay)
+                    }
+                    None => wake.retry_delay,
+                };
+                tokio::time::sleep(delay).await;
+            }
         }
     }
 }
@@ -467,5 +480,51 @@ mod tests {
                 (want_connects, want_notifies)
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exponential_backoff_doubles_retry_delay_until_max() {
+        let rig = Rig::new();
+        let wake = rig
+            .options(false, 6)
+            .with_retry_delay(Duration::from_millis(250))
+            .with_retry_max_delay(Duration::from_millis(4_000));
+        let start = tokio::time::Instant::now();
+        let res: Result<(usize, _), Miss> =
+            connect_with_wake(&wake, |&(_, wakeable)| wakeable, rig.failing(true)).await;
+        assert_eq!(res, Err((7, true)));
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(250 + 500 + 1_000 + 2_000 + 4_000)
+        );
+    }
+
+    #[test]
+    fn default_wake_spec_uses_exponential_backoff_and_preserves_explicit_flat_delay() {
+        use crate::wake::{WakeConfigSpec, build_wake_provider};
+
+        let secret = tendril_core::crypto::b64url_encode(&[0x19; 32]);
+        let mut default_spec = WakeConfigSpec::default();
+        default_spec.wake_url = Some("https://hook.example/wake".to_owned());
+        default_spec.wake_secret_b64 = Some(secret);
+        let default_dial = build_wake_provider(default_spec.clone())
+            .expect("valid default spec")
+            .expect("settings")
+            .to_dial_options();
+        assert_eq!(default_dial.retry_delay, Duration::from_millis(250));
+        assert_eq!(
+            default_dial.retry_max_delay,
+            Some(Duration::from_millis(4_000))
+        );
+        assert_eq!(default_dial.max_attempts, 6);
+
+        default_spec.wake_retry_delay_ms = Some(100);
+        let flat_dial = build_wake_provider(default_spec)
+            .expect("valid flat spec")
+            .expect("settings")
+            .to_dial_options();
+        assert_eq!(flat_dial.retry_delay, Duration::from_millis(100));
+        assert_eq!(flat_dial.retry_max_delay, None);
+        assert_eq!(flat_dial.max_attempts, 10);
     }
 }

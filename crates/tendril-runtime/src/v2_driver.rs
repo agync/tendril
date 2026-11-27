@@ -46,10 +46,12 @@ use crate::driver::{
     RaceEnd, RouteIngest, SessionEvent, SharedEvidence, StreamSource, WinnerFacts,
     collect_failures, committable_route_check, committed_error, connect_exhausted,
     current_unix_secs, day2_candidate_error, dial_source_with_init, dial_with_policy_candidates,
-    finalize_connect, has_complete_outer_frame, pairing_persist_plan, plan_connect, plan_pairing,
-    race_candidates, record_evidence, write_protocol_bytes, write_protocol_chunks,
+    finalize_connect, has_complete_outer_frame, is_application_event, pairing_persist_plan,
+    plan_connect, plan_pairing, race_candidates, record_evidence, write_protocol_bytes,
+    write_protocol_chunks,
 };
 use crate::error::RuntimeError;
+use crate::power::IdleActivity;
 use crate::provider::{
     DEFAULT_WRITE_TIMEOUT, MAX_OUTER_FRAME_LEN, PathDialer, PathReader, PathStream, PathWriter,
     recv_tendril_frame,
@@ -109,6 +111,7 @@ pub struct V2ResponderState {
     /// `true` once [`Self::with_refusal_state`] chose the state; otherwise the state of the
     /// accept's rate limiter wins, so one endpoint keeps one refusal limiter.
     refusal_explicit: bool,
+    jitter: Arc<Mutex<ScheduleJitterPolicy>>,
     config: V2ResponderConfig,
 }
 
@@ -129,13 +132,31 @@ impl V2ResponderState {
     #[must_use]
     pub fn with_config(config: V2ResponderConfig) -> Self {
         let permits = config.max_concurrent_argon2.max(1);
+        let jitter = Arc::new(Mutex::new(config.jitter));
         Self {
             replay_cache: Arc::new(Mutex::new(RendezvousReplayCache::new())),
             argon2_semaphore: Arc::new(Semaphore::new(permits)),
             refusal: RefusalState::new(),
             refusal_explicit: false,
+            jitter,
             config,
         }
+    }
+
+    /// Updates the keepalive jitter policy applied to newly accepted sessions.
+    pub fn set_jitter(&self, jitter: ScheduleJitterPolicy) {
+        *self
+            .jitter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = jitter;
+    }
+
+    #[must_use]
+    pub fn jitter(&self) -> ScheduleJitterPolicy {
+        *self
+            .jitter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Returns this state with `refusal` as its endpoint-wide refusal state, shared with every
@@ -202,6 +223,7 @@ impl V2ResponderState {
             argon2_semaphore: Arc::clone(&self.argon2_semaphore),
             refusal: self.refusal.clone(),
             refusal_explicit: self.refusal_explicit,
+            jitter: Arc::clone(&self.jitter),
             config,
         }
     }
@@ -1504,6 +1526,7 @@ pub struct V2SessionDriver {
     _half_open: Option<HalfOpenGuard>,
     verified_recovery: Option<Box<VerifiedRouteStatement>>,
     route_ingest: IngestSlot,
+    activity: IdleActivity,
     #[cfg(feature = "webrtc")]
     webrtc_upgrade_handle: Option<WebRtcUpgradeHandle>,
 }
@@ -2087,6 +2110,7 @@ impl V2SessionDriver {
             _half_open: None,
             verified_recovery,
             route_ingest: IngestSlot::default(),
+            activity: IdleActivity::default(),
             #[cfg(feature = "webrtc")]
             webrtc_upgrade_handle: None,
         })
@@ -2605,11 +2629,12 @@ impl V2SessionDriver {
             applied_rotation: Vec::new(),
             exported_secrets,
             matched_rendezvous,
-            jitter: state.config.jitter,
+            jitter: state.jitter(),
             store: disk_store,
             _half_open: half_open,
             verified_recovery: None,
             route_ingest: IngestSlot::default(),
+            activity: IdleActivity::default(),
             #[cfg(feature = "webrtc")]
             webrtc_upgrade_handle,
         })
@@ -2634,6 +2659,7 @@ impl V2SessionDriver {
             .seal_frame(InnerFrameType::Data, payload, now_ms)
             .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
+        self.activity.touch();
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
                 direction: RekeyDirection::Outgoing,
@@ -2654,6 +2680,7 @@ impl V2SessionDriver {
             .seal_frame(InnerFrameType::GroupManifest, &json, now_ms)
             .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
+        self.activity.touch();
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
                 direction: RekeyDirection::Outgoing,
@@ -2675,6 +2702,7 @@ impl V2SessionDriver {
             .seal_frame(InnerFrameType::GroupRendezvous, &frame[..], now_ms)
             .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
+        self.activity.touch();
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
                 direction: RekeyDirection::Outgoing,
@@ -2700,6 +2728,7 @@ impl V2SessionDriver {
             .seal_frame(InnerFrameType::Grant, &json, now_ms)
             .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
+        self.activity.touch();
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
                 direction: RekeyDirection::Outgoing,
@@ -2719,6 +2748,7 @@ impl V2SessionDriver {
             .seal_frame(InnerFrameType::Revocation, &json, now_ms)
             .map_err(|err| self.core.rt_err(err))?;
         self.write_wire_frames(&writes).await?;
+        self.activity.touch();
         if rekeyed {
             self.pending_events.push_back(SessionEvent::Rekeyed {
                 direction: RekeyDirection::Outgoing,
@@ -2808,6 +2838,14 @@ impl V2SessionDriver {
     pub fn next_keepalive_delay(&self) -> Result<Duration, RuntimeError> {
         let ms = self.jitter.next_ping_delay_ms()?;
         Ok(Duration::from_millis(ms))
+    }
+
+    /// Sets an opt-in application-data idle timeout for this session. Keepalives (`Ping`/`Pong`,
+    /// padding, rekey) do not extend the deadline.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.activity = IdleActivity::new(timeout);
+        self
     }
 
     /// Evaluates default-deny capability authorization and produces a structured audit event.
@@ -3066,6 +3104,9 @@ impl V2SessionDriver {
         let mut recv_buf = vec![0u8; MAX_OUTER_FRAME_LEN];
         loop {
             if let Some(ev) = self.pending_events.pop_front() {
+                if is_application_event(&ev) {
+                    self.activity.touch();
+                }
                 #[cfg(feature = "webrtc")]
                 if let SessionEvent::PathUpgrade(PathUpgradeMsg::Offer {
                     upgrade_id,
@@ -3087,7 +3128,23 @@ impl V2SessionDriver {
             } else if let Some(b) = self.frame_reader.next_frame()? {
                 b
             } else {
-                let n = self.stream.recv_chunk(&mut recv_buf).await?;
+                let idle_dl = self.activity.deadline();
+                let n = tokio::select! {
+                    biased;
+                    () = async {
+                        match idle_dl {
+                            Some(dl) => tokio::time::sleep_until(dl).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if self.activity.deadline().is_some_and(|dl| TokioInstant::now() >= dl) {
+                            let _ = self.send_close(1000, "idle_timeout").await;
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    res = self.stream.recv_chunk(&mut recv_buf) => res?,
+                };
                 if n == 0 {
                     return Ok(None);
                 }
@@ -3189,6 +3246,7 @@ impl V2SessionDriver {
             store: self.store,
             _half_open: self._half_open,
             route_ingest: self.route_ingest,
+            activity: self.activity,
             negotiated_upgrade_caps,
             peer_upgrade_caps,
             #[cfg(feature = "webrtc")]
@@ -3270,6 +3328,7 @@ pub struct ConcurrentV2Session {
     store: Option<StateStore>,
     _half_open: Option<HalfOpenGuard>,
     route_ingest: IngestSlot,
+    activity: IdleActivity,
     negotiated_upgrade_caps: Vec<String>,
     peer_upgrade_caps: Vec<String>,
     #[cfg(feature = "webrtc")]
@@ -3402,13 +3461,23 @@ impl ConcurrentV2Session {
         Ok(Duration::from_millis(ms))
     }
 
+    /// Sets an opt-in application-data idle timeout for this session. Keepalives (`Ping`/`Pong`,
+    /// padding, rekey) do not extend the deadline.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.activity = IdleActivity::new(timeout);
+        self
+    }
+
     /// Sends encrypted, bucket-padded `0x0A GROUP_MANIFEST` concurrently with inbound polling.
     pub async fn send_group_manifest(&self, manifest: &GroupManifest) -> Result<(), RuntimeError> {
         let json = manifest.to_wire_bytes()?;
         self.run_write_op(|core, now_ms| {
             core.seal_frame(InnerFrameType::GroupManifest, &json, now_ms)
         })
-        .await
+        .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted, bucket-padded `0x0B GROUP_RENDEZVOUS` carrying `secrets` for `group_id`.
@@ -3421,13 +3490,17 @@ impl ConcurrentV2Session {
         self.run_write_op(|core, now_ms| {
             core.seal_frame(InnerFrameType::GroupRendezvous, &frame[..], now_ms)
         })
-        .await
+        .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted, bucket-padded `0x01 DATA` concurrently with inbound polling.
     pub async fn send_data(&self, payload: &[u8]) -> Result<(), RuntimeError> {
         self.run_write_op(|core, now_ms| core.seal_frame(InnerFrameType::Data, payload, now_ms))
-            .await
+            .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Like [`Self::send_data`], but evaluates `authority` while holding the writer lock and
@@ -3440,7 +3513,9 @@ impl ConcurrentV2Session {
         self.run_authorized_write_op(authority, |core, now_ms| {
             core.seal_frame(InnerFrameType::Data, payload, now_ms)
         })
-        .await
+        .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Like [`Self::send_group_manifest`], with `authority` evaluated as in
@@ -3454,7 +3529,9 @@ impl ConcurrentV2Session {
         self.run_authorized_write_op(authority, |core, now_ms| {
             core.seal_frame(InnerFrameType::GroupManifest, &json, now_ms)
         })
-        .await
+        .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Like [`Self::send_group_rendezvous`], with `authority` evaluated as in
@@ -3469,7 +3546,9 @@ impl ConcurrentV2Session {
         self.run_authorized_write_op(authority, |core, now_ms| {
             core.seal_frame(InnerFrameType::GroupRendezvous, &frame[..], now_ms)
         })
-        .await
+        .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted, bucket-padded `0x02 GRANT`.
@@ -3478,7 +3557,9 @@ impl ConcurrentV2Session {
             serde_json::to_vec(grant).map_err(|err| CoreError::Json(err.to_string()))?,
         );
         self.run_write_op(|core, now_ms| core.seal_frame(InnerFrameType::Grant, &json, now_ms))
-            .await
+            .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted, bucket-padded `0x03 REVOCATION`.
@@ -3486,8 +3567,12 @@ impl ConcurrentV2Session {
         let json = Zeroizing::new(
             serde_json::to_vec(crl).map_err(|err| CoreError::Json(err.to_string()))?,
         );
-        self.run_write_op(|core, now_ms| core.seal_frame(InnerFrameType::Revocation, &json, now_ms))
-            .await
+        self.run_write_op(|core, now_ms| {
+            core.seal_frame(InnerFrameType::Revocation, &json, now_ms)
+        })
+        .await?;
+        self.activity.touch();
+        Ok(())
     }
 
     /// Sends encrypted `0x04 REKEY` and rotates outgoing cipher keys.
@@ -3603,6 +3688,9 @@ impl ConcurrentV2Session {
                 return Ok(None);
             }
             if let Some(ev) = self.pop_pending_event() {
+                if is_application_event(&ev) {
+                    self.activity.touch();
+                }
                 #[cfg(feature = "webrtc")]
                 if let SessionEvent::PathUpgrade(PathUpgradeMsg::Offer {
                     upgrade_id,
@@ -3632,10 +3720,23 @@ impl ConcurrentV2Session {
                 b
             } else {
                 let read_half_ref = &mut *read_half;
+                let idle_dl = self.activity.deadline();
                 let n = tokio::select! {
                     biased;
                     _ = shutdown_rx.changed() => return Ok(None),
                     _ = &mut notified => continue,
+                    () = async {
+                        match idle_dl {
+                            Some(dl) => tokio::time::sleep_until(dl).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if self.activity.deadline().is_some_and(|dl| TokioInstant::now() >= dl) {
+                            let _ = self.send_close(1000, "idle_timeout").await;
+                            return Ok(None);
+                        }
+                        continue;
+                    }
                     res = read_half_ref.reader.recv_chunk(&mut read_half_ref.recv_buf) => res?,
                 };
                 if n == 0 {
@@ -3832,6 +3933,7 @@ pub struct WakeDialOptions {
     pub target: WakeTarget,
     pub secret: WakeSecret,
     pub retry_delay: Duration,
+    pub retry_max_delay: Option<Duration>,
     pub max_attempts: usize,
     pub wake_timeout: Duration,
     pub pre_wake: bool,
@@ -3846,6 +3948,7 @@ impl WakeDialOptions {
             target,
             secret,
             retry_delay: Duration::from_millis(100),
+            retry_max_delay: None,
             max_attempts: 10,
             wake_timeout: DEFAULT_WAKE_TIMEOUT,
             pre_wake: false,
@@ -3859,10 +3962,19 @@ impl WakeDialOptions {
         self
     }
 
-    /// Sets the delay between dial retries after dispatching a wake hint.
+    /// Sets the delay between dial retries after dispatching a wake hint (or initial delay when
+    /// [`Self::with_retry_max_delay`] is set).
     #[must_use]
     pub fn with_retry_delay(mut self, retry_delay: Duration) -> Self {
         self.retry_delay = retry_delay;
+        self
+    }
+
+    /// Sets an upper cap for exponential retry backoff (`retry_delay * 2^(attempt-1)` clamped
+    /// to `retry_max_delay`).
+    #[must_use]
+    pub fn with_retry_max_delay(mut self, retry_max_delay: Duration) -> Self {
+        self.retry_max_delay = Some(retry_max_delay);
         self
     }
 
@@ -4355,7 +4467,7 @@ impl V2SessionDriver {
         let ev = Arc::clone(&evidence);
         let race = race_candidates(
             &set.dialers,
-            opts.policy_config,
+            opts.effective_policy_config(),
             set.candidates.clone(),
             move |cand, dialer| {
                 let identity = Arc::clone(&identity);
@@ -4460,6 +4572,8 @@ impl V2SessionDriver {
             }
         };
         driver.store = store.store().map(|s| (**s).clone());
+        driver.jitter = opts.power_profile.v2_jitter();
+        driver.activity = IdleActivity::new(opts.idle_timeout);
         // Route sets arrive only when `route_seq` was sent; CRLs the session accepts reach
         // `store` either way.
         driver.set_route_ingest(store.clone(), opts.policy);

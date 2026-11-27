@@ -620,6 +620,7 @@ impl EndpointTransportConfig {
             wake_auth_token: input.wake_auth_token.take(),
             wake_pre_wake: input.wake_pre_wake.take(),
             wake_retry_delay_ms: input.wake_retry_delay_ms.take(),
+            wake_retry_max_delay_ms: None,
             wake_max_attempts: input.wake_max_attempts.take(),
             wake_timeout_ms: input.wake_timeout_ms.take(),
             wake_coalesce_secs,
@@ -714,6 +715,7 @@ impl EndpointTransportConfig {
             p2p_port_mapping: self.p2p_port_mapping.unwrap_or(true),
             #[cfg(feature = "p2p-iroh")]
             p2p_bind_addrs: self.p2p_bind_addrs.clone(),
+            ..HintDialerConfig::default()
         };
         Ok(Arc::new(HintDialers::new(config)))
     }

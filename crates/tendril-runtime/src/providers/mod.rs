@@ -50,8 +50,8 @@ pub use broker::{BrokerDialer, BrokerListener, BrokerServerConfig};
 pub use direct::{DirectDialer, DirectListener};
 pub use egress::{
     AddrPolicy, CheckedHint, DefaultAddrPolicy, DestClass, EgressAddrPolicy, EgressContext,
-    EgressDialer, EgressKind, HintSource, HostResolver, SkipReason, SkippedHint, SystemResolver,
-    check_hint, classify_destination, path_class,
+    EgressDialer, EgressKind, HintSource, HostResolver, LocalReachability, SkipReason, SkippedHint,
+    SystemResolver, check_hint, classify_destination, path_class,
 };
 pub use local::{LocalDialer, LocalListener};
 pub use overlay::{

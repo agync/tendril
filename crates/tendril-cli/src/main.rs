@@ -958,6 +958,7 @@ fn build_hint_dialers(
         p2p_pkarr: pkarr_override(p2p_args),
         p2p_port_mapping: !p2p_args.p2p_no_port_mapping,
         p2p_bind_addrs: parse_p2p_bind_addrs("--p2p-bind", &p2p_args.p2p_bind)?,
+        ..HintDialerConfig::default()
     })))
 }
 
@@ -3499,6 +3500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         wake_auth_token: auth_token.as_mut().map(|t| std::mem::take(&mut **t)),
                         wake_pre_wake: Some(wake_pre_wake),
                         wake_retry_delay_ms: None,
+                        wake_retry_max_delay_ms: None,
                         wake_max_attempts: None,
                         wake_timeout_ms: None,
                         wake_coalesce_secs: None,

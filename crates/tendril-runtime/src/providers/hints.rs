@@ -9,7 +9,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+#[cfg(feature = "p2p-iroh")]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(not(feature = "p2p-iroh"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "p2p-iroh")]
+use std::sync::{Mutex as StdMutex, Weak};
+#[cfg(feature = "p2p-iroh")]
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
@@ -41,6 +48,7 @@ use super::{
 };
 use crate::announce::{LastRouteSet, RosterAccess};
 use crate::error::RuntimeError;
+use crate::power::PowerProfile;
 use crate::provider::{PathDialer, PathStream};
 use crate::redact::redact_hint;
 
@@ -308,6 +316,8 @@ pub struct HintDialerConfig {
     /// [`P2pBindAddrs::AllInterfaces`]).
     #[cfg(feature = "p2p-iroh")]
     pub p2p_bind_addrs: P2pBindAddrs,
+    /// Power profile controlling P2P port-mapping default and idle teardown (`60 s` in `LowPower`).
+    pub power_profile: PowerProfile,
 }
 
 impl Default for HintDialerConfig {
@@ -327,7 +337,21 @@ impl Default for HintDialerConfig {
             p2p_port_mapping: true,
             #[cfg(feature = "p2p-iroh")]
             p2p_bind_addrs: P2pBindAddrs::default(),
+            power_profile: PowerProfile::Standard,
         }
+    }
+}
+
+impl HintDialerConfig {
+    /// Applies `power_profile`, updating idle P2P teardown and default UPnP/NAT-PMP port mapping.
+    #[must_use]
+    pub fn with_power_profile(mut self, power_profile: PowerProfile) -> Self {
+        self.power_profile = power_profile;
+        #[cfg(feature = "p2p-iroh")]
+        {
+            self.p2p_port_mapping = power_profile.p2p_port_mapping_default();
+        }
+        self
     }
 }
 
@@ -335,7 +359,8 @@ impl fmt::Debug for HintDialerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_struct("HintDialerConfig");
         d.field("relay_auth", &self.relay_auth)
-            .field("relay_expected_host", &self.relay_expected_host);
+            .field("relay_expected_host", &self.relay_expected_host)
+            .field("power_profile", &self.power_profile);
         #[cfg(feature = "p2p-iroh")]
         d.field("p2p_relay_mode", &self.p2p_relay_mode)
             .field("p2p_relay_auth", &self.p2p_relay_auth)
@@ -380,13 +405,13 @@ impl HintDialers {
     #[must_use]
     pub fn new(config: HintDialerConfig) -> Self {
         #[cfg(feature = "p2p-iroh")]
-        let p2p_hint = Arc::new(LazyHintP2pDialer {
-            options: P2pOptions::for_hint_dialer(config.p2p_relay_mode.clone())
+        let p2p_hint = Arc::new(LazyHintP2pDialer::new(
+            P2pOptions::for_hint_dialer(config.p2p_relay_mode.clone())
                 .with_relay_auth(config.p2p_relay_auth.clone())
                 .with_port_mapping(config.p2p_port_mapping)
                 .with_bind_addrs(config.p2p_bind_addrs.clone()),
-            dialer: tokio::sync::OnceCell::new(),
-        });
+            config.power_profile.p2p_idle_timeout(),
+        ));
         #[cfg(feature = "p2p-iroh")]
         let p2p_operator = Arc::new(OperatorP2pDialer {
             relay_mode: Some(config.p2p_relay_mode.clone()),
@@ -468,25 +493,151 @@ impl HintDialers {
     pub async fn p2p_hint_dialer(&self) -> Result<Arc<P2pDialer>, RuntimeError> {
         self.p2p_hint.get().await
     }
+
+    /// Closes any lazily bound P2P hint endpoint and stops its idle teardown task.
+    pub async fn close(&self) {
+        #[cfg(feature = "p2p-iroh")]
+        self.p2p_hint.close().await;
+    }
+}
+
+#[cfg(feature = "p2p-iroh")]
+struct LazyP2pState {
+    options: P2pOptions,
+    idle_timeout: Option<Duration>,
+    dialer: tokio::sync::Mutex<Option<Arc<P2pDialer>>>,
+    epoch: tokio::time::Instant,
+    last_touch_ms: AtomicU64,
+    reaper: StdMutex<Option<tokio::task::AbortHandle>>,
+}
+
+#[cfg(feature = "p2p-iroh")]
+impl LazyP2pState {
+    fn touch(&self) {
+        let now_ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_touch_ms.store(now_ms, Ordering::Release);
+    }
+
+    fn stop_reaper(&self) {
+        if let Some(h) = self
+            .reaper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            h.abort();
+        }
+    }
+
+    fn ensure_reaper(self: &Arc<Self>, idle: Duration) {
+        let mut guard = self
+            .reaper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+        let handle = rt.spawn(async move {
+            loop {
+                tokio::time::sleep(idle).await;
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                let mut d_guard = this.dialer.lock().await;
+                let Some(d) = d_guard.as_ref() else {
+                    *this
+                        .reaper
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    return;
+                };
+                if d.active_count() > 0 {
+                    this.touch();
+                    continue;
+                }
+                let now_ms = u64::try_from(this.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let last_ms = this.last_touch_ms.load(Ordering::Acquire);
+                if now_ms.saturating_sub(last_ms) < idle_ms {
+                    continue;
+                }
+                let taken = d_guard.take();
+                drop(d_guard);
+                if let Some(d) = taken {
+                    d.close_ref().await;
+                }
+                // Re-check under the dialer mutex so a concurrent bind cannot share a finishing
+                // reaper task and get left without idle cleanup.
+                let d_guard = this.dialer.lock().await;
+                if d_guard.is_some() {
+                    this.touch();
+                    continue;
+                }
+                *this
+                    .reaper
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                return;
+            }
+        });
+        *guard = Some(handle.abort_handle());
+    }
+}
+
+#[cfg(feature = "p2p-iroh")]
+impl Drop for LazyP2pState {
+    fn drop(&mut self) {
+        self.stop_reaper();
+    }
 }
 
 #[cfg(feature = "p2p-iroh")]
 struct LazyHintP2pDialer {
-    options: P2pOptions,
-    dialer: tokio::sync::OnceCell<Arc<P2pDialer>>,
+    state: Arc<LazyP2pState>,
 }
 
 #[cfg(feature = "p2p-iroh")]
 impl LazyHintP2pDialer {
+    fn new(options: P2pOptions, idle_timeout: Option<Duration>) -> Self {
+        let state = Arc::new(LazyP2pState {
+            options,
+            idle_timeout,
+            dialer: tokio::sync::Mutex::new(None),
+            epoch: tokio::time::Instant::now(),
+            last_touch_ms: AtomicU64::new(0),
+            reaper: StdMutex::new(None),
+        });
+        Self { state }
+    }
+
     async fn get(&self) -> Result<Arc<P2pDialer>, RuntimeError> {
-        self.dialer
-            .get_or_try_init(|| async {
-                P2pDialer::bind_with_options(self.options.clone())
-                    .await
-                    .map(Arc::new)
-            })
-            .await
-            .cloned()
+        self.state.touch();
+        let mut guard = self.state.dialer.lock().await;
+        if let Some(existing) = guard.as_ref()
+            && !existing.is_closed()
+        {
+            return Ok(Arc::clone(existing));
+        }
+        let dialer = Arc::new(P2pDialer::bind_with_options(self.state.options.clone()).await?);
+        *guard = Some(Arc::clone(&dialer));
+        drop(guard);
+        self.state.touch();
+        if let Some(idle) = self.state.idle_timeout {
+            self.state.ensure_reaper(idle);
+        }
+        Ok(dialer)
+    }
+
+    async fn close(&self) {
+        self.state.stop_reaper();
+        let taken = self.state.dialer.lock().await.take();
+        if let Some(dialer) = taken {
+            dialer.close_ref().await;
+        }
     }
 }
 
@@ -498,7 +649,10 @@ impl PathDialer for LazyHintP2pDialer {
     }
 
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
-        self.get().await?.dial(endpoint).await
+        let dialer = self.get().await?;
+        let res = dialer.dial(endpoint).await;
+        self.state.touch();
+        res
     }
 }
 
@@ -701,6 +855,7 @@ pub async fn build_pairing_candidates(
     let mut info = Vec::new();
     let mut skipped = Vec::new();
 
+    let mut v2_filtered: Vec<(&HintInput, bool)> = Vec::new();
     for input in &inputs {
         let hint = input.hint.as_str();
         let v2_relay = is_v2_relay_hint(hint);
@@ -719,7 +874,19 @@ pub async fn build_pairing_candidates(
                 continue;
             }
         }
-        let checked = match check_hint(hint, input.source, ctx).await {
+        v2_filtered.push((input, v2_relay));
+    }
+
+    let check_results = futures_util::future::join_all(
+        v2_filtered
+            .iter()
+            .map(|(input, _)| check_hint(&input.hint, input.source, ctx)),
+    )
+    .await;
+
+    for ((input, v2_relay), checked_res) in v2_filtered.into_iter().zip(check_results) {
+        let hint = input.hint.as_str();
+        let checked = match checked_res {
             Ok(checked) => checked,
             Err(skip) => {
                 skipped.push(skip);
@@ -1304,8 +1471,8 @@ mod tests {
             p2p_pkarr: Some(true),
             ..HintDialerConfig::default()
         });
-        assert!(!dialers.p2p_hint.options.resolve_pkarr);
-        assert!(dialers.p2p_hint.options.hint_dialer);
+        assert!(!dialers.p2p_hint.state.options.resolve_pkarr);
+        assert!(dialers.p2p_hint.state.options.hint_dialer);
     }
     #[test]
     fn port_mapping_and_bind_addrs_reach_both_dialer_kinds() {
@@ -1320,9 +1487,9 @@ mod tests {
         };
 
         let defaults = HintDialers::new(HintDialerConfig::default());
-        assert!(defaults.p2p_hint.options.port_mapping);
+        assert!(defaults.p2p_hint.state.options.port_mapping);
         assert_eq!(
-            defaults.p2p_hint.options.bind_addrs,
+            defaults.p2p_hint.state.options.bind_addrs,
             P2pBindAddrs::AllInterfaces
         );
         let operator = defaults.operator_p2p_options(&endpoint).expect("options");
@@ -1334,8 +1501,8 @@ mod tests {
             p2p_bind_addrs: only.clone(),
             ..HintDialerConfig::default()
         });
-        assert!(!dialers.p2p_hint.options.port_mapping);
-        assert_eq!(dialers.p2p_hint.options.bind_addrs, only);
+        assert!(!dialers.p2p_hint.state.options.port_mapping);
+        assert_eq!(dialers.p2p_hint.state.options.bind_addrs, only);
         let operator = dialers.operator_p2p_options(&endpoint).expect("options");
         assert!(!operator.port_mapping);
         assert_eq!(operator.bind_addrs, only);
@@ -1376,5 +1543,124 @@ mod tests {
                 "{id:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn low_power_hint_dialer_config_and_concurrent_reachability_filtering() {
+        use crate::advertise::{NetworkSnapshot, SnapshotNetwork, Transport};
+        use crate::providers::egress::{HostResolver, LocalReachability};
+
+        struct BarrierResolver {
+            barrier: tokio::sync::Barrier,
+        }
+        #[async_trait]
+        impl HostResolver for BarrierResolver {
+            async fn resolve(
+                &self,
+                host: &str,
+                port: u16,
+            ) -> Result<Vec<std::net::SocketAddr>, RuntimeError> {
+                tokio::time::timeout(Duration::from_secs(2), self.barrier.wait())
+                    .await
+                    .expect("DNS checks must run concurrently");
+                let ip: IpAddr = match host {
+                    "one.example" => [198, 51, 100, 1].into(),
+                    "two.example" => [198, 51, 100, 2].into(),
+                    _ => [198, 51, 100, 3].into(),
+                };
+                Ok(vec![std::net::SocketAddr::new(ip, port)])
+            }
+        }
+
+        let cfg = HintDialerConfig::default().with_power_profile(PowerProfile::LowPower);
+        assert_eq!(cfg.power_profile, PowerProfile::LowPower);
+        #[cfg(feature = "p2p-iroh")]
+        assert!(!cfg.p2p_port_mapping);
+
+        let dialers = Arc::new(HintDialers::new(cfg));
+        let snap = NetworkSnapshot {
+            networks: vec![SnapshotNetwork {
+                id: "wifi".to_owned(),
+                iface: "wlan0".to_owned(),
+                if_index: 1,
+                transports: vec![Transport::Wifi],
+                addrs: vec!["192.168.1.50/24".to_owned()],
+            }],
+        };
+        let ctx = EgressContext::new(EgressKind::Session)
+            .with_resolver(Arc::new(BarrierResolver {
+                barrier: tokio::sync::Barrier::new(2),
+            }))
+            .with_reachability(LocalReachability::from_snapshot(&snap));
+        let target = HintTarget::session("host_1", Some([7; 32]), None);
+        let opts = MultiDialOptions::new(Arc::clone(&dialers), DialWire::V1);
+        let hints = vec![
+            HintInput::new("overlay://one.example:7000", HintSource::Operator),
+            HintInput::new("overlay://two.example:7000", HintSource::Operator),
+            HintInput::new("direct:[2001:db8::5]:7000", HintSource::Operator),
+            HintInput::new("direct:192.168.1.99:7000", HintSource::Operator),
+        ];
+
+        let set = build_pairing_candidates(&hints, &target, &ctx, &opts)
+            .await
+            .expect("build candidates");
+        assert_eq!(set.candidates.len(), 3);
+        assert_eq!(set.skipped.len(), 1);
+        assert_eq!(set.skipped[0].reason, SkipReason::UnreachableInterface);
+        assert_eq!(set.candidates[0].addr, "overlay://one.example:7000");
+        assert_eq!(set.candidates[1].addr, "overlay://two.example:7000");
+        assert_eq!(set.candidates[2].addr, "direct:192.168.1.99:7000");
+        dialers.close().await;
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    #[tokio::test]
+    async fn lazy_p2p_reaper_clears_handle_and_rebinds_without_stranding() {
+        let opts = P2pOptions::for_hint_dialer(P2pRelayMode::Disabled).with_port_mapping(false);
+        let lazy = LazyHintP2pDialer::new(opts, Some(Duration::from_millis(25)));
+        let first = lazy.get().await.expect("bind first dialer");
+        assert!(
+            lazy.state
+                .reaper
+                .lock()
+                .expect("reaper mutex")
+                .as_ref()
+                .is_some_and(|h| !h.is_finished())
+        );
+
+        let start = tokio::time::Instant::now();
+        while !first.is_closed() {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "first dialer did not reap"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while lazy.state.reaper.lock().expect("reaper mutex").is_some() {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "reaper handle stayed stale"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let second = lazy.get().await.expect("rebind dialer after teardown");
+        assert!(
+            lazy.state
+                .reaper
+                .lock()
+                .expect("reaper mutex")
+                .as_ref()
+                .is_some_and(|h| !h.is_finished())
+        );
+        let start2 = tokio::time::Instant::now();
+        while !second.is_closed() {
+            assert!(
+                start2.elapsed() < Duration::from_secs(3),
+                "rebound dialer was stranded"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        lazy.close().await;
     }
 }
