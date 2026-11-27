@@ -18,7 +18,7 @@ use tendril_core::crypto::{
     device_id as core_device_id, fingerprint_device as core_fingerprint_device,
     fingerprint_host as core_fingerprint_host, pairing_sas as core_pairing_sas, random_bytes,
 };
-use tendril_core::error::CoreError;
+use tendril_core::error::{CoreError, RefusalReason};
 use tendril_core::grants::{Grant, RevocationList, authorize_grant, canonical_json};
 use tendril_core::group::GroupManifest;
 use tendril_core::identity::{
@@ -31,7 +31,9 @@ use tendril_core::pairing::{
 };
 use tendril_core::policy::ProviderId;
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket, origin_allowed};
-use tendril_core::roster::{AnchorState, PeerState, Roster, RouteSource, StoredRoute};
+use tendril_core::roster::{
+    AnchorState, PeerState, RefusalPolicy, Roster, RouteSource, StoredRoute,
+};
 use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
@@ -342,6 +344,36 @@ fn to_generic_err(err: impl std::fmt::Display) -> Error {
 
 fn to_invalid_arg(err: impl std::fmt::Display) -> Error {
     Error::new(Status::InvalidArg, redact_text(&err.to_string()))
+}
+
+/// Name of a refusal reason in the closed event: `revoked`, `pending` or `other`.
+const fn refusal_name(reason: RefusalReason) -> &'static str {
+    match reason {
+        RefusalReason::Revoked => "revoked",
+        RefusalReason::Pending => "pending",
+        RefusalReason::Other(_) => "other",
+    }
+}
+
+/// The failure of a session call or connect.
+///
+/// An async N-API method can reject only with a napi status code, so a refusal carries its
+/// stable machine code and close code in a `[tendril:CODE:CLOSE]` prefix of the message. The
+/// package entry point (`index.js`) moves them to the `code` and `closeCode` properties of the
+/// error and strips the prefix.
+fn session_err(err: &RuntimeError, msg: String) -> Error {
+    match err.refusal() {
+        Some(reason) => Error::new(
+            Status::GenericFailure,
+            format!(
+                "[tendril:{}:{}] {}",
+                reason.code(),
+                reason.close_code(),
+                redact_text(&msg)
+            ),
+        ),
+        None => to_generic_err(msg),
+    }
 }
 
 fn rt_err(err: RuntimeError) -> Error {
@@ -1212,6 +1244,12 @@ async fn policy_connect(
 /// Folds an exhausted attempt into one error: the most severe cause, then the hints that were
 /// never dialed and each candidate's failure. `committed` means the pairing code may be spent.
 fn attempt_err(err: AttemptError) -> Error {
+    let msg = attempt_message(&err);
+    session_err(&err.error, msg)
+}
+
+/// The text of [`attempt_err`] without its typing, for callers that have no refusal to report.
+fn attempt_message(err: &AttemptError) -> String {
     use std::fmt::Write as _;
     let mut msg = redact_error(&err.error);
     if err.committed {
@@ -1240,7 +1278,7 @@ fn attempt_err(err: AttemptError) -> Error {
             .collect();
         let _ = write!(msg, "; candidates: {}", list.join("; "));
     }
-    to_generic_err(msg)
+    msg
 }
 
 /// The identity fields of a Wire v1 pairing outcome, or the rejection text.
@@ -1538,8 +1576,9 @@ impl Endpoint {
         .await
     }
 
-    fn new_session(&self, backend: SessionBackend) -> Session {
+    fn new_session(&self, backend: SessionBackend, initiator: bool) -> Session {
         Session {
+            initiator,
             store: self.store.clone(),
             store_lock: Arc::clone(&self.store_lock),
             identity: Arc::clone(&self.identity),
@@ -1576,7 +1615,7 @@ impl Endpoint {
                 return Err(err);
             }
         }
-        Ok(self.new_session(backend))
+        Ok(self.new_session(backend, false))
     }
 
     /// Day-2 connect through the runtime policy drivers.
@@ -1623,7 +1662,7 @@ impl Endpoint {
         let synced = self.sync_roster_from_store().await;
         let backend = res.map_err(attempt_err)?;
         synced?;
-        Ok(self.new_session(backend))
+        Ok(self.new_session(backend, true))
     }
 
     /// Pairing from a scanned URI through the runtime policy drivers.
@@ -1687,7 +1726,7 @@ impl Endpoint {
         .await
         .map_err(to_generic_err)?;
         let synced = self.sync_roster_from_store().await;
-        let (outcome, report) = res.map_err(attempt_err)?;
+        let (outcome, report) = res.map_err(|e| to_generic_err(attempt_message(&e)))?;
         synced?;
         let mut json = outcome.map_err(to_generic_err)?;
         if v2 {
@@ -2256,11 +2295,55 @@ impl Endpoint {
         serde_json::to_string(&grant).map_err(to_generic_err)
     }
 
+    /// Marks `peerId` revoked and clears its grants. `notify` unset follows the refusal policy
+    /// (a notice unless `revokedNoticeTtlSecs` is `0`); `false` revokes silently and clears an
+    /// earlier notice, so the peer's next connect is no longer told why.
     #[napi]
-    pub fn revoke_peer(&self, peer_id: String) -> Result<()> {
-        self.update_roster_sync(|roster| roster.revoke_peer(&peer_id).map_err(RuntimeError::from))?;
+    pub fn revoke_peer(&self, peer_id: String, notify: Option<bool>) -> Result<()> {
+        let notify = notify.unwrap_or(true);
+        self.update_roster_sync(|roster| {
+            roster
+                .revoke_peer_at(&peer_id, notify, now_unix())
+                .map_err(RuntimeError::from)
+        })?;
         self.refresh_m2m_enabled(&lock_roster(&self.roster));
         Ok(())
+    }
+
+    /// Sets the host refusal policy and persists it with the roster. `pending` refuses
+    /// unconfirmed peers with `4004` (default `true`); `revokedNoticeTtlSecs` is the lifetime of
+    /// a notice recorded at revocation (default 30 days) and `0` records none. Notices already
+    /// recorded keep their expiry.
+    #[napi]
+    pub fn set_refusal_policy(
+        &self,
+        pending: Option<bool>,
+        revoked_notice_ttl_secs: Option<f64>,
+    ) -> Result<()> {
+        let defaults = RefusalPolicy::default();
+        let ttl = match revoked_notice_ttl_secs {
+            None => defaults.revoked_notice_ttl_secs,
+            Some(v) => f64_to_u64(v, "revokedNoticeTtlSecs")?,
+        };
+        let policy = RefusalPolicy {
+            pending: pending.unwrap_or(defaults.pending),
+            revoked_notice_ttl_secs: ttl,
+        };
+        self.update_roster_sync(|roster| {
+            roster.set_refusal_policy(policy);
+            Ok(())
+        })
+    }
+
+    /// Drops the refusal notice of `peerId`, which stays revoked: its next connect is no longer
+    /// told why. Throws for an unknown peer.
+    #[napi]
+    pub fn clear_refusal_notice(&self, peer_id: String) -> Result<()> {
+        self.update_roster_sync(|roster| {
+            roster
+                .clear_refusal_notice(&peer_id)
+                .map_err(RuntimeError::from)
+        })
     }
 
     /// The unconfirmed host claims left by unpinned pairing, oldest first, as a JSON array of
@@ -3270,6 +3353,8 @@ pub struct Session {
     identity: Arc<EndpointIdentity>,
     roster: Arc<StdMutex<Roster>>,
     session: Arc<SessionBackend>,
+    /// `true` for a session this endpoint dialed: only an initiator maps a refusal close.
+    initiator: bool,
 }
 
 impl Session {
@@ -3351,7 +3436,7 @@ impl Session {
         self.session
             .send_data(payload.as_ref())
             .await
-            .map_err(to_generic_err)
+            .map_err(|e| session_err(&e, e.to_string()))
     }
 
     #[napi]
@@ -3424,6 +3509,11 @@ impl Session {
                         "event": "closed",
                         "code": code,
                         "reason": reason,
+                        "refusal": self
+                            .initiator
+                            .then(|| RefusalReason::from_close_code(code))
+                            .flatten()
+                            .map(refusal_name),
                     }),
                 };
                 Ok(json.to_string())
@@ -3438,7 +3528,7 @@ impl Session {
                         &self.identity,
                     )
                     .await;
-                    Err(to_generic_err(e))
+                    Err(session_err(&e, e.to_string()))
                 } else if let Err(pe) = commit_session_async(
                     self.store.as_ref(),
                     &self.store_lock,
@@ -3447,9 +3537,9 @@ impl Session {
                 )
                 .await
                 {
-                    Err(to_generic_err(format!("{e} ({pe})")))
+                    Err(session_err(&e, format!("{e} ({pe})")))
                 } else {
-                    Err(to_generic_err(e))
+                    Err(session_err(&e, e.to_string()))
                 }
             }
             Err(_) => Ok(serde_json::json!({ "status": "would_block" }).to_string()),
@@ -3466,7 +3556,10 @@ impl Session {
 
     #[napi]
     pub async fn rekey(&self) -> Result<()> {
-        self.session.send_rekey().await.map_err(to_generic_err)
+        self.session
+            .send_rekey()
+            .await
+            .map_err(|e| session_err(&e, e.to_string()))
     }
 
     #[napi]
@@ -3475,7 +3568,7 @@ impl Session {
         self.session
             .send_close(close_code, reason.as_deref().unwrap_or("normal"))
             .await
-            .map_err(to_generic_err)
+            .map_err(|e| session_err(&e, e.to_string()))
     }
 }
 

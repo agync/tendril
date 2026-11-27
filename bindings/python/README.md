@@ -30,6 +30,24 @@ session = host.accept_session(5000)
 assert session.authorize("notes.sync")
 ```
 
+## Refusals
+
+A host that knows this device and refuses it says so, instead of timing out. A refused `connect_v2` raises `tendril.RefusedError`, a `RuntimeError` with `reason` (`"revoked"`, `"pending"` or `"other"`), `close_code` and `code` (`refused_revoked`, `refused_pending`, `refused`):
+
+```python
+try:
+    session = client.connect_v2(addr, "laptop", grant)
+except tendril.RefusedError as err:
+    if err.reason == "revoked":
+        ...  # the host blocks this device key for good: re-pairing needs a new device identity
+    elif err.reason == "pending":
+        ...  # the host has not confirmed this device yet: retry with backoff
+```
+
+A Wire v1 connect returns before the refusal arrives. Its `poll_event` then reports a `closed` event with `"refusal": "revoked"`, and the next `send_data`, `rekey` or `close` raises the same error. A host sends at most one notice per peer in a short window, so a rapid retry can fail with a plain `RuntimeError`.
+
+On the host, `revoke_peer(peer_id)` records a notice per the refusal policy and `revoke_peer(peer_id, notify=False)` revokes silently. `set_refusal_policy(pending=True, revoked_notice_ttl_secs=2592000)` sets the policy (a TTL of `0` records no notice) and `clear_refusal_notice(peer_id)` drops a notice while the peer stays revoked.
+
 ## P2P sockets
 
 A P2P endpoint probes the local router for a port mapping and binds its QUIC UDP sockets on every interface. Turn the probe off or pin the bind addresses in the transport configuration:
