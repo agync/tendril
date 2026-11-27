@@ -4443,3 +4443,99 @@ fn cli_e2e_enroll_stores_routes_per_route_policy() {
         "{enrolled}"
     );
 }
+
+/// A revoked peer that dials a running `tendril serve` is refused, and the host's JSON event
+/// stream carries exactly one `session_refused` record for it (`spec/wire-v1.md` Section 5.4.2).
+#[test]
+fn serve_emits_one_session_refused_event_per_sent_refusal() {
+    let (host_dir, client_dir, cli_dev_id) = init_pair_dirs("host-refusal-audit");
+    let (_serve, mut stdout, listening) = spawn_serve(
+        host_dir.path(),
+        &["--listen", "127.0.0.1:0", "--issue-code", "lan"],
+    );
+    let endpoint = listening["direct_endpoint"].as_str().expect("endpoint");
+    let code = listening["pairing_code"].as_str().expect("code");
+
+    let paired = json_out(&run_tendril(
+        client_dir.path(),
+        &["pair", "--endpoint", endpoint, "--code", code],
+    ));
+    let sas = paired["sas"].as_str().expect("sas").to_owned();
+    assert_eq!(read_json_line(&mut stdout)["event"], "paired");
+    assert!(
+        run_tendril(
+            client_dir.path(),
+            &["confirm", "host-refusal-audit", "--sas", &sas]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run_tendril(host_dir.path(), &["confirm", &cli_dev_id, "--sas", &sas])
+            .status
+            .success()
+    );
+    assert!(
+        run_tendril(host_dir.path(), &["revoke", &cli_dev_id])
+            .status
+            .success()
+    );
+
+    let dial = run_tendril(
+        client_dir.path(),
+        &[
+            "dial",
+            "--target",
+            "host-refusal-audit",
+            "--endpoint",
+            endpoint,
+            "--message",
+            "must-be-refused",
+        ],
+    );
+    assert!(!dial.status.success(), "a revoked peer must be refused");
+
+    // Read on a thread so a missing event fails the test instead of hanging it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Some(event) = try_read_json_line(&mut stdout) {
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    let event = rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("serve emits a session_refused event");
+    assert_eq!(event["event"], "session_refused", "{event}");
+    assert_eq!(event["peer_device_id"], cli_dev_id, "{event}");
+    assert_eq!(event["code"], 4001, "{event}");
+
+    // A second attempt inside the limiter window is denied silently: still refused, no new line.
+    let again = run_tendril(
+        client_dir.path(),
+        &[
+            "dial",
+            "--target",
+            "host-refusal-audit",
+            "--endpoint",
+            endpoint,
+            "--message",
+            "refused-again",
+        ],
+    );
+    assert!(!again.status.success(), "a revoked peer stays refused");
+    if let Ok(extra) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        panic!("a second refusal inside the window must stay silent: {extra}");
+    }
+}
+
+fn try_read_json_line(
+    reader: &mut BufReader<std::process::ChildStdout>,
+) -> Option<serde_json::Value> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(n) if n > 0 => serde_json::from_str(&line).ok(),
+        _ => None,
+    }
+}

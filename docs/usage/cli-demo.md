@@ -216,6 +216,32 @@ tendril --state-dir ./host-state rotate
 
 Once revoked, subsequent `dial` attempts fail closed on the host listener during session establishment, and active `tendril serve` sessions reload `roster.json` updates (under `.roster.lock` advisory locking) to terminate revoked peers immediately across ticks or incoming frames (`0x04 REKEY`, `0x01 DATA`). `tendril rotate` re-signs any persisted self-issued CRL automatically under the new key so revoked tokens stay blocked across key rotation.
 
+## Refusal controls
+
+By default `revoke` records a refusal notice, so the revoked peer learns it is refused (`4001`) the next time it connects, instead of seeing a silent failure. A `Pending` peer is told `4004`. The host policy decides both (`spec/pairing-v1.md` Section 5.1).
+
+```bash
+# Revoke without telling the peer: no refusal notice is recorded
+tendril --state-dir ./host-state revoke --no-notify <client_device_id>
+
+# Print the stored policy: {"pending":true,"revoked_notice_ttl_secs":2592000}
+tendril --state-dir ./host-state refusal-policy
+
+# Stop refusing pending peers and shorten new revocation notices to one day; each flag is optional
+tendril --state-dir ./host-state refusal-policy --pending false --revoked-ttl-secs 86400
+
+# Drop a recorded notice early; the peer stays revoked
+tendril --state-dir ./host-state clear-refusal-notice <client_device_id>
+```
+
+| Command | Effect |
+|---|---|
+| `revoke <peer_id> [--no-notify]` | Revokes the peer. Prints `{"revoked": "<peer_id>", "notice": true|false}`, where `notice` is `true` when a notice was recorded. `--no-notify` and a policy TTL of `0` record none. |
+| `refusal-policy [--pending <bool>] [--revoked-ttl-secs <u64>]` | Without flags, prints the stored policy. With flags, replaces only the given fields, persists the policy and prints it. Notices already recorded keep their expiry. |
+| `clear-refusal-notice <peer_id>` | Drops the peer's notice and prints `{"cleared": <peer_id>}`. The peer stays `Revoked`. |
+
+`tendril serve` prints one `{"event":"session_refused","peer_device_id":...,"code":4001}` line on stdout for each refusal it sends (`code` is `4001` or `4004`). A peer is refused at most once per rate-limit window, so a flood of attempts from one peer yields one line.
+
 ## Peer groups
 
 `tendril group` manages a small signed mesh rooted at the local identity. The CLI only builds and persists manifests and drives `GroupPool`; verification and authorization stay in `tendril-core`. Members must already be in the roster as `Active` peers with a known signing key, learned by code pairing or M2M enrollment; peers code-paired before the signing key claim existed fail closed until they re-pair and the operator confirms the new SAS. Group commands require `host_id` to equal `device_id`, and a root identity roots exactly one group because the id derives from its signing key. Endpoint hints may be bare `host:port` (treated as `direct:`) or any other provider hint.

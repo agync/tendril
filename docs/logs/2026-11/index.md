@@ -39,3 +39,4 @@ Entries from November 2026.
 - [Propose ADR 0006 meeting mailboxes from a shared secret](26-propose-adr-0006-meeting-mailboxes-from.md)
 - [Gate Unix-socket providers so tendril-runtime builds on Windows](27-gate-unix-socket-providers-so-tendril.md)
 - [Return authenticated refusal from the Python, Node and Web bindings](27-return-authenticated-refusal-from-the-python.md)
+- [Add CLI refusal controls and a serve session_refused event](27-add-cli-refusal-controls-and-a.md)
