@@ -33,6 +33,8 @@ pub struct CandidateEndpoint {
     pub is_numeric_host: bool,
     /// Who authorized a stored route; `None` for a candidate with no stored source.
     pub source: Option<RouteSource>,
+    /// Last-Known-Good affinity hint on the current network; promotes ahead of non-operator rungs.
+    pub preferred: bool,
 }
 
 impl CandidateEndpoint {
@@ -47,6 +49,7 @@ impl CandidateEndpoint {
             addr,
             is_numeric_host,
             source: None,
+            preferred: false,
         }
     }
 
@@ -54,6 +57,13 @@ impl CandidateEndpoint {
     #[must_use]
     pub const fn with_source(mut self, source: Option<RouteSource>) -> Self {
         self.source = source;
+        self
+    }
+
+    /// Marks whether this candidate carries Last-Known-Good route affinity.
+    #[must_use]
+    pub const fn with_preferred(mut self, preferred: bool) -> Self {
+        self.preferred = preferred;
         self
     }
 }
@@ -97,13 +107,16 @@ pub fn is_numeric_host_addr(addr: &str) -> bool {
     false
 }
 
-/// Timing constants controlling Happy Eyeballs dial stagger, fall-up probes, and pin dwell.
+/// Timing and concurrency constants controlling Happy Eyeballs dial stagger, fall-up probes,
+/// pin dwell, and in-flight handshake bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathPolicyConfig {
     pub happy_eyeballs_stagger_ms: u64,
     pub fall_up_probe_interval_ms: u64,
     pub min_pin_dwell_ms: u64,
     pub p2p_cold_delay_ms: u64,
+    /// Maximum concurrent in-flight dials during the initial wave (`0` means unbounded).
+    pub max_in_flight: usize,
 }
 
 impl Default for PathPolicyConfig {
@@ -113,6 +126,22 @@ impl Default for PathPolicyConfig {
             fall_up_probe_interval_ms: 30_000,
             min_pin_dwell_ms: 10_000,
             p2p_cold_delay_ms: 500,
+            max_in_flight: 4,
+        }
+    }
+}
+
+impl PathPolicyConfig {
+    /// Battery-conscious policy for mobile and background runtimes: caps concurrent PQ handshakes
+    /// to 2, raises P2P cold-start hold to 750 ms, and spaces fall-up probes to 120 s.
+    #[must_use]
+    pub const fn low_power() -> Self {
+        Self {
+            happy_eyeballs_stagger_ms: 250,
+            fall_up_probe_interval_ms: 120_000,
+            min_pin_dwell_ms: 15_000,
+            p2p_cold_delay_ms: 750,
+            max_in_flight: 2,
         }
     }
 }
@@ -262,7 +291,8 @@ impl PathPlanner {
         self.pending.push_back(PlannerAction::ActivatePath(cand));
     }
 
-    /// Notifies the planner that dialing `id` failed, accelerating the next candidate when idle.
+    /// Notifies the planner that dialing `id` failed, accelerating the next candidate when idle or
+    /// filling a freed concurrency slot when a stagger deadline has passed.
     pub fn on_dial_failed(&mut self, id: usize, _reason: &str, now_ms: u64) {
         self.in_flight.remove(&id);
         if self.active.is_some() {
@@ -271,6 +301,8 @@ impl PathPlanner {
         self.failed.insert(id);
         if self.in_flight.is_empty() {
             self.next_dial_ready_ms = Some(now_ms);
+            self.advance_dial_wave(now_ms);
+        } else if self.next_dial_ready_ms.is_some_and(|t| now_ms >= t) {
             self.advance_dial_wave(now_ms);
         }
     }
@@ -324,6 +356,10 @@ impl PathPlanner {
             return Some(dwell_ready.max(probe_ready));
         }
 
+        if self.config.max_in_flight > 0 && self.in_flight.len() >= self.config.max_in_flight {
+            return None;
+        }
+
         let next_cand = self.candidates[self.next_dial_idx..]
             .iter()
             .find(|c| !self.failed.contains(&c.id) && !self.in_flight.contains(&c.id))?;
@@ -342,6 +378,9 @@ impl PathPlanner {
             if self.failed.contains(&cand.id) || self.in_flight.contains(&cand.id) {
                 self.next_dial_idx += 1;
                 continue;
+            }
+            if self.config.max_in_flight > 0 && self.in_flight.len() >= self.config.max_in_flight {
+                return;
             }
             if cand.provider == ProviderId::P2p
                 && let Some(first_ms) = self.first_non_p2p_start_ms
@@ -392,14 +431,16 @@ impl PathPlanner {
 
 /// Canonical deterministic sort key for [`CandidateEndpoint`] ranking.
 ///
-/// `operator` routes come first, ahead of every rung. All other candidates order by
-/// `ProviderId` rung, then by source tier (`signed` `0`, `committed` `1`, no source `2`), then prioritize `/v2/relay` ahead of `/v1/relay` within [`ProviderId::Relay`],
-/// then prefer literal IP hosts before DNS hostnames, breaking ties by `id`.
+/// `operator` routes come first, ahead of every rung. Next come `preferred` Last-Known-Good
+/// candidates, then `ProviderId` rung, then source tier (`signed` `0`, `committed` `1`, no source
+/// `2`), then `/v2/relay` ahead of `/v1/relay` within [`ProviderId::Relay`], then literal IP hosts
+/// before DNS hostnames, breaking ties by `id`.
 #[must_use]
-pub fn sort_key(c: &CandidateEndpoint) -> (u8, u8, u8, u8, bool, usize) {
+pub fn sort_key(c: &CandidateEndpoint) -> (u8, u8, u8, u8, u8, bool, usize) {
     let operator = c.source == Some(RouteSource::Operator);
     (
         u8::from(!operator),
+        u8::from(!c.preferred),
         c.provider.rank(),
         match c.source {
             Some(RouteSource::Operator | RouteSource::Signed) => 0,
@@ -780,5 +821,59 @@ mod tests {
             [PlannerAction::DialCandidate(c)] if c.id == 2
         ));
         assert_eq!(stagger.next_deadline_ms(), None);
+    }
+
+    #[test]
+    fn preferred_lkg_beats_higher_rung_without_outranking_operator() {
+        let cands = vec![
+            src(
+                1,
+                ProviderId::Direct,
+                "192.168.1.20:7000",
+                RouteSource::Signed,
+            ),
+            src(
+                2,
+                ProviderId::Relay,
+                "wss://relay.example/v2/relay",
+                RouteSource::Signed,
+            )
+            .with_preferred(true),
+            src(
+                3,
+                ProviderId::Broker,
+                "broker+wss://op.example/b",
+                RouteSource::Operator,
+            ),
+        ];
+        assert_eq!(ids_sorted(cands), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn max_in_flight_caps_concurrency_and_disarms_deadline_until_slot_frees() {
+        let cands = vec![
+            CandidateEndpoint::new(1, ProviderId::Direct, "10.0.0.1:7000"),
+            CandidateEndpoint::new(2, ProviderId::Direct, "10.0.0.2:7000"),
+            CandidateEndpoint::new(3, ProviderId::Relay, "wss://relay.example/v2/relay"),
+        ];
+        let mut planner = PathPlanner::new(PathPolicyConfig::low_power(), cands);
+        planner.start(0);
+        let a0 = planner.drain_actions();
+        assert!(matches!(&a0[..], [PlannerAction::DialCandidate(c)] if c.id == 1));
+        assert_eq!(planner.next_deadline_ms(), Some(250));
+
+        planner.tick(250);
+        let a1 = planner.drain_actions();
+        assert!(matches!(&a1[..], [PlannerAction::DialCandidate(c)] if c.id == 2));
+        // Two in flight at low_power max_in_flight = 2: no timer spin deadline until a slot frees.
+        assert_eq!(planner.next_deadline_ms(), None);
+        planner.tick(600);
+        assert!(planner.drain_actions().is_empty());
+
+        // Candidate 1 fails after the stagger window already elapsed -> candidate 3 launches now.
+        planner.on_dial_failed(1, "timeout", 600);
+        let a2 = planner.drain_actions();
+        assert!(matches!(&a2[..], [PlannerAction::DialCandidate(c)] if c.id == 3));
+        assert_eq!(planner.next_deadline_ms(), None);
     }
 }

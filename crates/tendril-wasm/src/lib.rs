@@ -4329,6 +4329,8 @@ enum PlannerCandidateInput {
         provider: Option<String>,
         #[serde(default)]
         source: Option<String>,
+        #[serde(default)]
+        preferred: bool,
     },
 }
 
@@ -4339,6 +4341,7 @@ struct WasmPathPolicyConfigInput {
     p2p_cold_delay_ms: Option<f64>,
     per_attempt_timeout_ms: Option<f64>,
     exhaustion_timeout_ms: Option<f64>,
+    max_in_flight: Option<f64>,
 }
 
 fn parse_provider_id(name: &str) -> Result<ProviderId, WasmError> {
@@ -4416,16 +4419,17 @@ impl WasmPathPlanner {
         let mut seen_ids = BTreeSet::new();
         let mut candidates = Vec::with_capacity(raw_candidates.len());
         for (idx, item) in raw_candidates.into_iter().enumerate() {
-            let (id, provider, addr, source) = match item {
+            let (id, provider, addr, source, preferred) = match item {
                 PlannerCandidateInput::Hint(hint) => {
                     let provider = classify_endpoint_hint(&hint).map_err(WasmError::from)?;
-                    (idx, provider, hint, None)
+                    (idx, provider, hint, None, false)
                 }
                 PlannerCandidateInput::Descriptor {
                     addr,
                     id,
                     provider,
                     source,
+                    preferred,
                 } => {
                     if addr.trim().is_empty() {
                         return Err(WasmError::from("candidate addr must not be empty"));
@@ -4439,13 +4443,17 @@ impl WasmPathPlanner {
                         None | Some("uri") => None,
                         Some(name) => Some(parse_route_source(name)?),
                     };
-                    (cid, prov, addr, source)
+                    (cid, prov, addr, source, preferred)
                 }
             };
             if !seen_ids.insert(id) {
                 return Err(WasmError::from(format!("duplicate candidate id {id}")));
             }
-            candidates.push(CandidateEndpoint::new(id, provider, addr).with_source(source));
+            candidates.push(
+                CandidateEndpoint::new(id, provider, addr)
+                    .with_source(source)
+                    .with_preferred(preferred),
+            );
         }
 
         let cfg_input: WasmPathPolicyConfigInput = match config_json {
@@ -4459,6 +4467,11 @@ impl WasmPathPlanner {
         }
         if let Some(v) = cfg_input.p2p_cold_delay_ms {
             policy.p2p_cold_delay_ms = f64_to_u64(v, "p2p_cold_delay_ms")?;
+        }
+        if let Some(v) = cfg_input.max_in_flight {
+            let n = f64_to_u64(v, "max_in_flight")?;
+            policy.max_in_flight = usize::try_from(n)
+                .map_err(|_| WasmError::from("max_in_flight exceeds platform usize"))?;
         }
         let per_attempt_timeout_ms = cfg_input
             .per_attempt_timeout_ms
