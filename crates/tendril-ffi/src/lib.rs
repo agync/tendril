@@ -255,24 +255,14 @@ fn lock_roster(roster: &StdMutex<Roster>) -> std::sync::MutexGuard<'_, Roster> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Every CRL `roster` holds, keyed by issuer (paired peers and trust anchors).
-fn held_crls(roster: &Roster) -> Vec<(String, RevocationList)> {
-    roster
-        .entries()
-        .map(|(id, _)| id)
-        .chain(roster.trust_anchors().map(|(id, _)| id))
-        .filter_map(|id| roster.crl(id).map(|crl| (id.clone(), crl.clone())))
-        .collect()
-}
-
 /// Applies `f` to the roster as one [`RosterAccess::update`] transaction; nothing is written
 /// when `f` fails. With a store the caller must already hold the endpoint's `store_lock`.
 ///
 /// Lock order (`tendril_runtime::announce` module docs): `store_lock`, then the roster file
 /// lock, then the in-memory roster mutex, which is never held while `f` runs or across store
-/// I/O. `f` runs on the latest on-disk roster with the CRLs only the in-memory copy holds (accepted
-/// by a session, not yet persisted) merged in, and the committed roster, again with any such
-/// CRLs, replaces the in-memory copy.
+/// I/O. `f` runs on the latest on-disk roster with the revocation state only the in-memory copy
+/// holds (accepted by a session, not yet persisted) folded in, and the committed roster, with
+/// that state folded in again, replaces the in-memory copy.
 fn commit_roster_update<T, F>(access: &RosterAccess, f: F) -> Result<T, (i32, String)>
 where
     F: FnOnce(&mut Roster) -> Result<T, (i32, String)>,
@@ -288,28 +278,58 @@ where
         .map_err(|e| failure.unwrap_or((TENDRIL_ERR_INTERNAL, e.to_string())))
 }
 
-/// Reloads the on-disk roster into `roster` under `store_lock` (lock order `store_lock` then
-/// `roster`) without taking an exclusive write lock or rewriting `roster.json`. CRLs only the
-/// in-memory copy holds are kept (merged into the reloaded copy).
-fn load_roster_from_store_locked(
-    store: Option<&Arc<StateStore>>,
+/// Reloads the on-disk roster into the shared roster under `store_lock` (lock order
+/// `store_lock`, roster file lock, in-memory roster) without rewriting `roster.json`. The
+/// revocation state only the in-memory copy holds is kept.
+fn reload_roster_locked(
+    access: &RosterAccess,
     store_lock: &AsyncMutex<()>,
     rt: &Runtime,
-    roster: &StdMutex<Roster>,
 ) -> Result<(), String> {
-    let Some(store) = store else {
+    if access.store().is_none() {
         return Ok(());
-    };
+    }
     let _store_guard = rt.block_on(store_lock.lock());
-    let disk = store.load_roster().map_err(|e| e.to_string())?;
-    replace_keeping_crls(&mut lock_roster(roster), disk);
-    Ok(())
+    access.reload().map_err(|e| e.to_string())
 }
 
-/// Replaces the in-memory roster with `disk`, keeping the CRLs only the in-memory copy holds.
-fn replace_keeping_crls(memory: &mut Roster, mut disk: Roster) {
-    disk.merge_crl_evidence(&held_crls(memory));
-    *memory = disk;
+/// Commits the revocation state only the in-memory roster holds under `store_lock` and
+/// reloads it from the result. Nothing is written when the store already holds it.
+fn commit_held_revocations_locked(
+    access: &RosterAccess,
+    store_lock: &AsyncMutex<()>,
+    rt: &Runtime,
+) -> Result<(), String> {
+    if access.store().is_none() {
+        return Ok(());
+    }
+    let _store_guard = rt.block_on(store_lock.lock());
+    access
+        .commit_held_revocations()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// [`commit_held_revocations_locked`] for async callers: the commit runs on a blocking thread.
+#[derive(Clone)]
+struct HeldRevocations {
+    access: RosterAccess,
+    store_lock: Arc<AsyncMutex<()>>,
+}
+
+impl HeldRevocations {
+    async fn commit(&self) -> Result<(), String> {
+        if self.access.store().is_none() {
+            return Ok(());
+        }
+        let _store_guard = self.store_lock.lock().await;
+        let access = self.access.clone();
+        tokio::task::spawn_blocking(move || access.commit_held_revocations())
+            .await
+            .map_err(|e| format!("commit held revocations task failed: {e}"))?
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -1244,7 +1264,7 @@ impl TendrilEndpoint {
         }
     }
 
-    /// Runs a route write on the shared roster handle (which merges unpersisted CRLs before it
+    /// Runs a route write on the shared roster handle (which folds held revocations in before it
     /// writes) under the endpoint's store lock, so it serializes with [`Self::mutate_roster`].
     fn route_write<T>(
         &self,
@@ -1257,52 +1277,23 @@ impl TendrilEndpoint {
         f(&self.route_access)
     }
 
-    /// Persists the CRLs only this endpoint's sessions hold, under the store lock. Nothing is
-    /// written (no `roster.json` created, no mtime bump) when the store already holds them.
+    /// Persists the revocation state only this endpoint's sessions hold (CRLs, revoked peers and
+    /// anchors), under the store lock, and reloads the roster from the result. Nothing is
+    /// written (no `roster.json` created, no mtime bump) when the store already holds it.
     ///
-    /// Each CRL is verified against the issuer's key as [`Self::persist_v1_crl_if_newer`] does:
-    /// the local signing key for this host's own CRL, else a key or trust anchor on disk (an
-    /// active one first, then a revoked peer's or anchor's), else the one the in-memory roster
-    /// holds, so a CRL whose issuer was revoked meanwhile is kept.
-    fn persist_session_crls(&self) -> Result<(), (i32, String)> {
-        let Some(store) = self.store.as_ref() else {
-            return Ok(());
-        };
-        let _store_guard = self.rt.block_on(self.store_lock.lock());
-        let local_id = self.identity.host_id();
-        store
-            .update_roster_if_changed(|disk| {
-                // Lock order: store lock, roster file lock (held here), in-memory roster. The
-                // CRLs are read under the file lock, so none arrives between read and merge.
-                let mem = lock_roster(&self.roster);
-                let mut issuers: Vec<&String> = mem.entries().map(|(id, _)| id).collect();
-                issuers.extend(mem.trust_anchors().map(|(id, _)| id));
-                let local = local_id.to_owned();
-                if !issuers.contains(&&local) {
-                    issuers.push(&local);
-                }
-                for issuer in issuers {
-                    let Some(crl) = mem.crl(issuer) else {
-                        continue;
-                    };
-                    let key = if issuer == local_id {
-                        Some(self.identity.signing_key().public_key().clone())
-                    } else {
-                        disk.lookup_active_signing_key(issuer)
-                            .or_else(|| disk.lookup_active_anchor_key(issuer))
-                            .or_else(|| disk.get(issuer).and_then(|e| e.signing_pub.clone()))
-                            .or_else(|| disk.trust_anchor(issuer).map(|a| a.signing_pub.clone()))
-                            .or_else(|| mem.get(issuer).and_then(|e| e.signing_pub.clone()))
-                            .or_else(|| mem.trust_anchor(issuer).map(|a| a.signing_pub.clone()))
-                    };
-                    if let Some(key) = key {
-                        let _ = disk.ingest_crl(crl.clone(), issuer, &key);
-                    }
-                }
-                Ok(())
-            })
-            .map(|_| ())
-            .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+    /// Call it before any driver reads the store, and after any driver result or session event
+    /// that can revoke, so no store-backed decision runs on a roster that lacks a held
+    /// revocation.
+    fn commit_held_revocations(&self) -> Result<(), String> {
+        commit_held_revocations_locked(&self.route_access, &self.store_lock, &self.rt)
+    }
+
+    /// The commit of [`Self::commit_held_revocations`] for the async accept paths.
+    fn held_revocations(&self) -> HeldRevocations {
+        HeldRevocations {
+            access: self.route_access.clone(),
+            store_lock: Arc::clone(&self.store_lock),
+        }
     }
 
     fn mutate_roster<T, F>(&self, f: F) -> Result<T, (i32, String)>
@@ -1316,13 +1307,10 @@ impl TendrilEndpoint {
         commit_roster_update(&self.route_access, f)
     }
 
+    /// Reloads the roster from the store, keeping the revocation state only memory holds. Never
+    /// writes.
     fn load_roster_from_store(&self) -> Result<(), String> {
-        load_roster_from_store_locked(
-            self.store.as_ref(),
-            &self.store_lock,
-            &self.rt,
-            &self.roster,
-        )
+        reload_roster_locked(&self.route_access, &self.store_lock, &self.rt)
     }
 
     fn snapshot_transport_cfg(&self) -> EndpointTransportConfig {
@@ -1423,6 +1411,7 @@ impl TendrilEndpoint {
                     Arc::clone(&self.v2_state),
                     v1_tx.clone(),
                     v2_tx.clone(),
+                    self.held_revocations(),
                 ))
                 .abort_handle(),
             handle
@@ -1433,6 +1422,7 @@ impl TendrilEndpoint {
                     Arc::clone(&self.v2_state),
                     v1_tx,
                     v2_tx,
+                    self.held_revocations(),
                 ))
                 .abort_handle(),
         ];
@@ -1500,6 +1490,7 @@ async fn group_inbound_pump(
     v2_state: Arc<V2ResponderState>,
     v1_tx: mpsc::Sender<SessionDriver>,
     v2_tx: mpsc::Sender<V2SessionDriver>,
+    held: HeldRevocations,
 ) {
     let mut handshakes = tokio::task::JoinSet::new();
     loop {
@@ -1511,7 +1502,13 @@ async fn group_inbound_pump(
                 let limiter = limiter.clone();
                 let v1_tx = v1_tx.clone();
                 let v2_tx = v2_tx.clone();
+                let held = held.clone();
                 handshakes.spawn(async move {
+                    // The hub admits from the stored roster: commit held revocations first,
+                    // and refuse the stream if that fails.
+                    if held.commit().await.is_err() {
+                        return;
+                    }
                     match hub
                         .accept(stream, &v2_state, Some(&limiter), Some(guard))
                         .await
@@ -1561,7 +1558,10 @@ fn build_endpoint_handle(
         .trust_anchors()
         .any(|(_, a)| a.state == AnchorState::Active);
     let roster = Arc::new(StdMutex::new(roster));
-    let route_access = RosterAccess::new(store.clone(), Arc::clone(&roster));
+    let route_access = RosterAccess::new(store.clone(), Arc::clone(&roster)).with_local_signer(
+        identity.host_id(),
+        identity.signing_key().public_key().clone(),
+    );
     let announcer = Arc::new(RouteAnnouncer::new(
         identity.clone(),
         route_access.clone(),
@@ -1724,8 +1724,6 @@ pub struct TendrilSession {
     roster: Arc<StdMutex<Roster>>,
     /// The endpoint's roster handle over `store` and `roster`.
     route_access: RosterAccess,
-    v1_root_id: Option<String>,
-    v1_local_signing: Option<(String, HybridSigningPublicKey)>,
     local_device_id: String,
     /// `true` for a session this endpoint dialed: only an initiator maps a refusal close.
     initiator: bool,
@@ -1767,63 +1765,26 @@ impl TendrilSession {
         }
     }
 
+    /// Reloads the roster from the store, keeping the revocation state only memory holds. Never
+    /// writes.
     fn load_roster_from_store(&self) -> Result<(), String> {
-        load_roster_from_store_locked(
-            self.store.as_ref(),
-            &self.store_lock,
-            &self.rt,
-            &self.roster,
-        )
+        reload_roster_locked(&self.route_access, &self.store_lock, &self.rt)
     }
 
-    /// Brings the store up to date with the revocation state this session holds for `issuer`
-    /// and reloads the roster. Stable entry point for the session event arms.
-    fn sync_held_revocations(&self, issuer: &str) -> Result<(), String> {
-        self.persist_v1_crl_if_newer(issuer)
+    /// Commits the revocation state this session's roster holds, under the store lock, and
+    /// reloads the roster from the result.
+    fn commit_held_revocations(&self) -> Result<(), String> {
+        commit_held_revocations_locked(&self.route_access, &self.store_lock, &self.rt)
     }
 
-    /// Persists the CRL a v1 session accepted for `issuer` when it is newer than the stored
-    /// one; otherwise reloads the roster. Either way the in-memory copy keeps every CRL only it
-    /// holds.
+    /// Commits the revocation state this session holds after it accepted a CRL from `issuer`.
     ///
-    /// Lock order: `store_lock`, then the roster file lock ([`RosterAccess::update`]), then the
-    /// in-memory roster mutex, which is never held across store I/O.
-    fn persist_v1_crl_if_newer(&self, issuer: &str) -> Result<(), String> {
-        let Some(ref store) = self.store else {
-            return Ok(());
-        };
-        let _store_guard = self.rt.block_on(self.store_lock.lock());
-        let held = {
-            let guard = lock_roster(&self.roster);
-            guard.crl(issuer).cloned().map(|crl| {
-                let key = guard.get(issuer).and_then(|e| e.signing_pub.clone());
-                (crl, key)
-            })
-        };
-        let disk = store.load_roster().map_err(|e| e.to_string())?;
-        let Some((crl, memory_key)) = held.filter(|(crl, _)| {
-            disk.crl(issuer)
-                .is_none_or(|existing| crl.seq > existing.seq)
-        }) else {
-            replace_keeping_crls(&mut lock_roster(&self.roster), disk);
-            return Ok(());
-        };
-        let issuer_pub = if let Some((ref local_id, ref local_pub)) = self.v1_local_signing
-            && local_id == issuer
-        {
-            local_pub.clone()
-        } else {
-            disk.lookup_active_signing_key(issuer)
-                .or_else(|| disk.lookup_active_anchor_key(issuer))
-                .or(memory_key)
-                .ok_or_else(|| format!("missing signing key for CRL issuer {issuer}"))?
-        };
-        self.route_access
-            .update(|d| match d.ingest_crl(crl, issuer, &issuer_pub) {
-                Ok(()) | Err(CoreError::CrlStaleSeq { .. }) => Ok(()),
-                Err(err) => Err(err.into()),
-            })
-            .map_err(|e| e.to_string())
+    /// The commit is not scoped to the issuer: it persists every CRL, revoked peer and revoked
+    /// anchor only memory holds, and verifies each CRL against the keys of
+    /// `Roster::absorb_held_revocations`, so a CRL whose issuer was revoked meanwhile is kept.
+    /// Lock order: `store_lock`, then the roster file lock, then the in-memory roster mutex.
+    fn sync_held_revocations(&self, _issuer: &str) -> Result<(), String> {
+        self.commit_held_revocations()
     }
 }
 
@@ -3005,7 +2966,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
 
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
-        if let Err(e) = ep.load_roster_from_store() {
+        if let Err(e) = ep.commit_held_revocations() {
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
         }
@@ -3145,6 +3106,10 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
 
             let path_kind = pairing_path_kind_for_provider(stream.provider_id());
             if let Some(ref store) = ep.store {
+                ep.held_revocations()
+                    .commit()
+                    .await
+                    .map_err(|e| (TENDRIL_ERR_INTERNAL, e))?;
                 drive_pair_responder_with_store(
                     stream.as_mut(),
                     &ep.identity,
@@ -3177,7 +3142,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
             .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
         });
         if !matches!(res, Err((TENDRIL_WOULD_BLOCK | TENDRIL_ERR_CLOSED, _)))
-            && let Err(e) = ep.load_roster_from_store()
+            && let Err(e) = ep.commit_held_revocations()
         {
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
@@ -3826,12 +3791,9 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
         // The store-backed driver reads the on-disk roster for its pin checks, so first
-        // persist the CRLs only this endpoint's sessions hold, if the store lacks any.
-        if let Err((rc, msg)) = ep.persist_session_crls() {
-            set_last_error(msg);
-            return rc;
-        }
-        if let Err(e) = ep.load_roster_from_store() {
+        // persist the revocation state only this endpoint's sessions hold, if the store lacks
+        // any, and reload the roster from the result.
+        if let Err(e) = ep.commit_held_revocations() {
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
         }
@@ -3900,7 +3862,7 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
                     token_nonce,
                 } => {
                     if ep.store.is_some() {
-                        if let Err(e) = ep.load_roster_from_store() {
+                        if let Err(e) = ep.commit_held_revocations() {
                             set_last_error(e);
                             return TENDRIL_ERR_INTERNAL;
                         }
@@ -4015,7 +3977,7 @@ fn connect_session(ep: &TendrilEndpoint, req: ConnectRequest<'_>) -> *mut Tendri
             None => connect_once().await,
         }
     });
-    let synced = ep.load_roster_from_store();
+    let synced = ep.commit_held_revocations();
     match res {
         Ok(session) => {
             if let Err(e) = synced {
@@ -4028,8 +3990,6 @@ fn connect_session(ep: &TendrilEndpoint, req: ConnectRequest<'_>) -> *mut Tendri
                 store_lock: Arc::clone(&ep.store_lock),
                 roster: Arc::clone(&ep.roster),
                 route_access: ep.route_access.clone(),
-                v1_root_id: (req.wire != 2).then(|| req.target.to_owned()),
-                v1_local_signing: None,
                 local_device_id: ep.identity.device_id(),
                 initiator: true,
                 session,
@@ -4179,6 +4139,7 @@ pub unsafe extern "C" fn tendril_session_accept(
                 let Some(rt_groups) = ep.group_runtime() else {
                     break (stream, guard);
                 };
+                ep.held_revocations().commit().await?;
                 match rt_groups
                     .hub
                     .accept(
@@ -4198,44 +4159,24 @@ pub unsafe extern "C" fn tendril_session_accept(
             };
             accepted.set(true);
 
-            if let Some(ref store) = ep.store {
-                let mut working_roster = {
-                    let _store_guard = ep.store_lock.lock().await;
-                    let store_c = store.as_ref().clone();
-                    let disk = tokio::task::spawn_blocking(move || store_c.load_roster())
-                        .await
-                        .map_err(|e| format!("load roster task failed: {e}"))?
-                        .map_err(|e| e.to_string())?;
-                    let mut guard = lock_roster(&ep.roster);
-                    replace_keeping_crls(&mut guard, disk);
-                    guard.clone()
-                };
-                SessionDriver::accept_with_options(
-                    stream,
-                    &ep.identity,
-                    &mut working_roster,
-                    now_unix(),
-                    Some(ep.router.rate_limiter()),
-                    Some(guard),
-                    DEFAULT_PRE_AUTH_TIMEOUT,
-                )
-                .await
-            } else {
-                SessionDriver::accept_locked(
-                    stream,
-                    &ep.identity,
-                    &ep.roster,
-                    now_unix(),
-                    Some(ep.router.rate_limiter()),
-                    Some(guard),
-                    DEFAULT_PRE_AUTH_TIMEOUT,
-                )
-                .await
-            }
+            // The accept reads the shared roster, so first commit every revocation only memory
+            // holds. A revocation the handshake adds stays in the shared roster too, and the
+            // commit after the accept persists it.
+            ep.held_revocations().commit().await?;
+            SessionDriver::accept_locked(
+                stream,
+                &ep.identity,
+                &ep.roster,
+                now_unix(),
+                Some(ep.router.rate_limiter()),
+                Some(guard),
+                DEFAULT_PRE_AUTH_TIMEOUT,
+            )
+            .await
             .map_err(|e| e.to_string())
         });
         let synced = if accepted.get() {
-            ep.load_roster_from_store()
+            ep.commit_held_revocations()
         } else {
             Ok(())
         };
@@ -4246,8 +4187,6 @@ pub unsafe extern "C" fn tendril_session_accept(
                     set_last_error(e);
                     return ptr::null_mut();
                 }
-                let local_id = ep.identity.host_id().to_owned();
-                let local_sig = ep.identity.signing_key().public_key().clone();
                 let session = SessionBackend::v1(driver);
                 if let Err(e) = ep.register_route_session(&session) {
                     set_last_error(e);
@@ -4259,8 +4198,6 @@ pub unsafe extern "C" fn tendril_session_accept(
                     store_lock: Arc::clone(&ep.store_lock),
                     roster: Arc::clone(&ep.roster),
                     route_access: ep.route_access.clone(),
-                    v1_root_id: Some(local_id.clone()),
-                    v1_local_signing: Some((local_id, local_sig)),
                     local_device_id: ep.identity.device_id(),
                     initiator: false,
                     session,
@@ -4440,12 +4377,7 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                         "grant": g,
                     }),
                     SessionEvent::RevocationUpdated { issuer, seq } => {
-                        let res = if matches!(sess.session, SessionBackend::V1(_)) {
-                            sess.sync_held_revocations(&issuer)
-                        } else {
-                            sess.load_roster_from_store()
-                        };
-                        if let Err(e) = res {
+                        if let Err(e) = sess.sync_held_revocations(&issuer) {
                             set_last_error(e);
                             return TENDRIL_ERR_INTERNAL;
                         }
@@ -4492,16 +4424,8 @@ pub unsafe extern "C" fn tendril_session_poll_event(
             }
             Ok(Ok(None)) => TENDRIL_EOF,
             Ok(Err(e)) => {
-                let sync_res = if matches!(sess.session, SessionBackend::V1(_)) {
-                    if let Some(ref root_id) = sess.v1_root_id {
-                        sess.sync_held_revocations(root_id)
-                    } else {
-                        sess.load_roster_from_store()
-                    }
-                } else {
-                    sess.load_roster_from_store()
-                };
-                match sync_res {
+                // A failed event can leave a revocation in memory only (a detected fork, say).
+                match sess.commit_held_revocations() {
                     Ok(()) => fail_session_err(&e),
                     Err(pe) => {
                         fail_session_err_msg(&e, format!("{e} (roster persist error: {pe})"))
@@ -4726,7 +4650,7 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay_v2(
             return TENDRIL_ERR_INVALID_ARG;
         }
         let cfg = ep.snapshot_transport_cfg();
-        if let Err(e) = ep.load_roster_from_store() {
+        if let Err(e) = ep.commit_held_revocations() {
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
         }
@@ -4829,7 +4753,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_initiate(
 
         let ep = unsafe { &*ep };
         let cfg = ep.snapshot_transport_cfg();
-        if let Err(e) = ep.load_roster_from_store() {
+        if let Err(e) = ep.commit_held_revocations() {
             set_last_error(e);
             return TENDRIL_ERR_INTERNAL;
         }
@@ -5002,6 +4926,10 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_accept(
             accepted.set(true);
             let path_kind = pairing_path_kind_for_provider(stream.provider_id());
             if let Some(ref store) = ep.store {
+                ep.held_revocations()
+                    .commit()
+                    .await
+                    .map_err(|e| (TENDRIL_ERR_INTERNAL, e))?;
                 drive_v2_pake_pair_responder_with_store(
                     stream.as_mut(),
                     &ep.identity,
@@ -5035,7 +4963,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_accept(
         });
 
         if accepted.get()
-            && let Err(e) = ep.load_roster_from_store()
+            && let Err(e) = ep.commit_held_revocations()
         {
             if let Err((_, msg)) = res {
                 set_last_error(format!("{msg} (roster sync error: {e})"));
@@ -5197,6 +5125,7 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
                 let Some(rt_groups) = ep.group_runtime() else {
                     break (stream, guard);
                 };
+                ep.held_revocations().commit().await?;
                 match rt_groups
                     .hub
                     .accept(
@@ -5216,6 +5145,7 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
             };
             accepted.set(true);
             if let Some(ref store) = ep.store {
+                ep.held_revocations().commit().await?;
                 V2SessionDriver::accept_with_store(
                     stream,
                     &ep.identity,
@@ -5245,7 +5175,7 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
         });
 
         let synced = if accepted.get() {
-            ep.load_roster_from_store()
+            ep.commit_held_revocations()
         } else {
             Ok(())
         };
@@ -5266,8 +5196,6 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
                     store_lock: Arc::clone(&ep.store_lock),
                     roster: Arc::clone(&ep.roster),
                     route_access: ep.route_access.clone(),
-                    v1_root_id: None,
-                    v1_local_signing: None,
                     local_device_id: ep.identity.device_id(),
                     initiator: false,
                     session,
@@ -5693,7 +5621,7 @@ unsafe fn pair_uri_impl(
                 )
             })
     };
-    if let Err(e) = ep.load_roster_from_store() {
+    if let Err(e) = ep.commit_held_revocations() {
         set_last_error(e);
         return TENDRIL_ERR_INTERNAL;
     }
@@ -6265,6 +6193,11 @@ unsafe fn group_admin_ep<'a>(
         set_last_error("groups require a state directory endpoint");
         return Err(TENDRIL_ERR_INVALID_ARG);
     };
+    // Group administration reads peers from the store: commit held revocations first.
+    if let Err(e) = ep.commit_held_revocations() {
+        set_last_error(e);
+        return Err(TENDRIL_ERR_INTERNAL);
+    }
     Ok((ep, store))
 }
 
@@ -7985,7 +7918,7 @@ mod route_state_tests {
         assert_eq!(ep.disk_crl_seq(&local_id), None);
         assert_eq!(ep.disk_crl_seq(&peer_id), None);
 
-        ep.get().persist_session_crls().unwrap();
+        ep.get().commit_held_revocations().unwrap();
         assert_eq!(ep.disk_crl_seq(&local_id), Some(1), "the host's own CRL");
         assert_eq!(ep.disk_crl_seq(&peer_id), Some(1), "a revoked issuer's CRL");
     }
@@ -8019,7 +7952,7 @@ mod route_state_tests {
             .unwrap();
         assert_eq!(ep.disk_crl_seq(&anchor_id), None);
 
-        ep.get().persist_session_crls().unwrap();
+        ep.get().commit_held_revocations().unwrap();
         assert_eq!(
             ep.disk_crl_seq(&anchor_id),
             Some(1),
@@ -8048,7 +7981,7 @@ mod route_state_tests {
 
         let sess = unsafe { &*c.0 };
         assert!(matches!(sess.session, SessionBackend::V1(_)));
-        sess.persist_v1_crl_if_newer(&host_id).unwrap();
+        sess.sync_held_revocations(&host_id).unwrap();
 
         assert_eq!(
             client.disk_crl_seq(&host_id),
