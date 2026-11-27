@@ -517,7 +517,7 @@ fn an_equal_or_lower_seq_changes_nothing() {
     let mut memory = base.clone();
     memory
         .ingest_crl(
-            crl("issuer-p", 6, &peer.sk, &["c"]),
+            crl("issuer-p", 6, &peer.sk, &["a", "c"]),
             "issuer-p",
             &peer.pubkey(),
         )
@@ -556,6 +556,97 @@ fn a_peer_named_like_the_local_host_cannot_write_the_local_crl() {
     )
     .unwrap();
     assert_eq!(disk.crl("local-host").map(|c| c.seq), Some(1));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Idempotence and order (INV-5)
+// ---------------------------------------------------------------------------------------------
+
+/// A keyless entry `id1 = device_id(PK1)` takes its signing key from a tombstone the fold adds;
+/// the CRL of `id1` held by memory must verify against it in the same fold, not the next one.
+#[test]
+fn a_crl_whose_issuer_key_arrives_in_the_same_fold_is_ingested_once() {
+    let old = Peer::new(0xc8);
+    let fresh = Peer::new(0xca);
+    let fork_a = Peer::new(0xcc);
+    let fork_b = Peer::new(0xce);
+    let id1 = device_id(&old.static_pub);
+    let mut base = Roster::new();
+    base.record_pending_pair(
+        old.static_pub,
+        None,
+        "Keyless".into(),
+        "cli".into(),
+        "sas".into(),
+    )
+    .unwrap();
+    base.confirm_peer(&id1, Some("sas")).unwrap();
+    pin(&mut base, "host-a", &old);
+
+    let mut memory = base.clone();
+    let rec_a = sign_rotation(1, &old.sk, &fork_a.pubkey(), &fork_a.static_pub, NOW).unwrap();
+    let rec_b = sign_rotation(1, &old.sk, &fork_b.pubkey(), &fork_b.static_pub, NOW + 1).unwrap();
+    let res = memory.apply_verified_rotation(
+        "host-a",
+        &[rec_a, rec_b],
+        &fork_a.static_pub,
+        &fork_a.pubkey(),
+    );
+    assert!(matches!(res, Err(CoreError::RotationForkDetected { .. })));
+    assert_eq!(state(&memory, &id1), Some(PeerState::Revoked));
+    memory
+        .ingest_crl(crl(&id1, 1, &old.sk, &["x"]), &id1, &old.pubkey())
+        .unwrap();
+
+    let mut disk = base.clone();
+    let rec = sign_rotation(1, &old.sk, &fresh.pubkey(), &fresh.static_pub, NOW).unwrap();
+    disk.apply_verified_rotation("host-a", &[rec], &fresh.static_pub, &fresh.pubkey())
+        .unwrap();
+
+    fold(&mut disk, &memory, None);
+    assert_eq!(disk.crl(&id1).map(|c| c.seq), Some(1));
+}
+
+/// A `Pending` issuer on disk has no usable key until another held CRL revokes it, so the
+/// result must not depend on which of the two CRLs the fold meets first.
+#[test]
+fn held_crls_are_ingested_whatever_order_they_are_met_in() {
+    let claimed = Peer::new(0xd4);
+    let issuer = Peer::new(0xd6);
+    let pending_id = device_id(&claimed.static_pub);
+    // "dev_..." sorts before "zz-issuer": the pending issuer's CRL is met first.
+    let mut disk = Roster::new();
+    disk.record_pending_pair(
+        claimed.static_pub,
+        Some(claimed.pubkey()),
+        "C".into(),
+        "cli".into(),
+        "sas".into(),
+    )
+    .unwrap();
+    pin(&mut disk, "zz-issuer", &issuer);
+    assert_eq!(state(&disk, &pending_id), Some(PeerState::Pending));
+
+    let mut memory = Roster::new();
+    memory
+        .ingest_crl(
+            crl(&pending_id, 1, &claimed.sk, &["x"]),
+            &pending_id,
+            &claimed.pubkey(),
+        )
+        .unwrap();
+    memory
+        .ingest_crl(
+            crl("zz-issuer", 1, &issuer.sk, &[&pending_id]),
+            "zz-issuer",
+            &issuer.pubkey(),
+        )
+        .unwrap();
+
+    fold(&mut disk, &memory, None);
+    assert_eq!(state(&disk, &pending_id), Some(PeerState::Revoked));
+    assert_eq!(disk.crl("zz-issuer").map(|c| c.seq), Some(1));
+    assert_eq!(disk.crl(&pending_id).map(|c| c.seq), Some(1));
 }
 
 // ---------------------------------------------------------------------------------------------

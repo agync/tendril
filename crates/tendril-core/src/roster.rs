@@ -2977,11 +2977,12 @@ impl Roster {
     /// route, grant, secret, nonce, pending claim or `Active` entry crosses over. `local` is the
     /// local host id and signing key, the only key that verifies the local host's own CRL.
     ///
-    /// In order: held CRLs (verified against the keys of [`Self::crl_issuer_keys`], skipping any
-    /// `self` already holds at an equal or higher `seq`), `Revoked` entries (a record disk
-    /// rotated or replaced keeps the held keys revoked through a tombstone), `Revoked` anchors,
-    /// and a last, deterministic pass that sets each refusal notice from the pair (`self`
-    /// before the fold, `held`) alone, so map and replay order never decide it
+    /// In order: `Revoked` entries (a record disk rotated or replaced keeps the held keys
+    /// revoked through a tombstone), `Revoked` anchors, held CRLs (verified against the keys of
+    /// [`Self::crl_issuer_keys`], skipping any `self` already holds at an equal or higher
+    /// `seq`, repeated until none more verifies), and a last, deterministic pass that sets each
+    /// refusal notice from the pair (`self` before the fold, `held`) alone, so map and replay
+    /// order never decide it
     /// (`spec/pairing-v1.md` Section 5.1). Folding the same `held` twice changes nothing.
     pub fn absorb_held_revocations(
         &mut self,
@@ -3001,9 +3002,11 @@ impl Roster {
         let before = fingerprint(self);
         let original = self.entries.clone();
 
-        self.absorb_held_crls(held, local);
+        // Entries and anchors first: a record the fold inserts or completes (a tombstone, a
+        // key filled into a keyless entry) can be the issuer key a held CRL verifies against.
         self.absorb_held_entries(held);
         self.absorb_held_anchors(held);
+        self.absorb_held_crls(held, local);
         self.set_absorbed_notices(held, &original);
 
         before.is_none() || before != fingerprint(self)
@@ -3060,16 +3063,30 @@ impl Roster {
         keys
     }
 
+    /// Ingests every held CRL a key allowed by [`Self::crl_issuer_keys`] verifies, repeating
+    /// until a pass ingests none: one CRL can revoke the issuer of another (a `Pending` entry
+    /// has no usable key until it is revoked), so the result never depends on map order.
+    /// Each ingest raises a stored `seq`, which the held `seq` bounds, so the loop ends.
     fn absorb_held_crls(&mut self, held: &Roster, local: Option<(&str, &HybridSigningPublicKey)>) {
-        for (issuer, crl) in &held.crls {
-            if self.crls.get(issuer).is_some_and(|d| d.seq >= crl.seq) {
-                continue;
-            }
-            for key in self.crl_issuer_keys(issuer, held, local) {
-                match self.ingest_crl_noticed(crl.clone(), issuer, &key, None) {
-                    Ok(()) | Err(CoreError::CrlStaleSeq { .. }) => break,
-                    Err(_) => {}
+        loop {
+            let mut ingested = false;
+            for (issuer, crl) in &held.crls {
+                if self.crls.get(issuer).is_some_and(|d| d.seq >= crl.seq) {
+                    continue;
                 }
+                for key in self.crl_issuer_keys(issuer, held, local) {
+                    match self.ingest_crl_noticed(crl.clone(), issuer, &key, None) {
+                        Ok(()) => {
+                            ingested = true;
+                            break;
+                        }
+                        Err(CoreError::CrlStaleSeq { .. }) => break,
+                        Err(_) => {}
+                    }
+                }
+            }
+            if !ingested {
+                return;
             }
         }
     }
@@ -3084,7 +3101,10 @@ impl Roster {
                 self.revoke_siblings_by_keys(h.static_pub, h.signing_pub.as_ref(), true);
                 continue;
             };
-            let same_keys = disk.static_pub == h.static_pub && disk.signing_pub == h.signing_pub;
+            // A held record without a signing key is covered by any disk record of its static
+            // key: revoking that record revokes the static key.
+            let same_keys = disk.static_pub == h.static_pub
+                && (h.signing_pub.is_none() || disk.signing_pub == h.signing_pub);
             let was_revoked = disk.state == PeerState::Revoked;
             if !was_revoked {
                 let _ = self.revoke_entry(key, None);
