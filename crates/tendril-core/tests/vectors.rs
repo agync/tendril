@@ -2458,3 +2458,189 @@ fn m2m_route_set_replies_match(
         }
     }
 }
+
+mod refusal {
+    use super::*;
+    use serde_json::Value;
+    use tendril_core::crypto::{StaticKeypair, hkdf_sha256_32};
+    use tendril_core::error::RefusalReason;
+    use tendril_core::identity::EndpointIdentity;
+    use tendril_core::refusal::{RefusalLimiter, RefusalMode};
+    use tendril_core::session::{SessionAction, SessionCloseCode, SessionMachine};
+    use tendril_core::v2::{
+        derive_refusal_seal_key, open_v2_refusal_envelope, seal_v2_refusal_envelope,
+    };
+
+    fn load(file: &str, key: &str) -> Value {
+        let raw = fs::read_to_string(vectors_dir().join(file)).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        v[key].clone()
+    }
+
+    fn s<'a>(v: &'a Value, key: &str) -> &'a str {
+        v[key].as_str().unwrap_or_else(|| panic!("missing {key}"))
+    }
+
+    fn writes(actions: &[SessionAction]) -> Vec<u8> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                SessionAction::WriteBytes(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn session_refusal_v1_replays_through_session_machines() {
+        let v = load("handshake.json", "session_refusal_v1");
+        let now = v["now_unix"].as_u64().unwrap();
+        let init_eph = decode_hex_array::<32>(s(&v, "initiator_ephem_scalar_hex"));
+        let resp_eph = decode_hex_array::<32>(s(&v, "responder_ephem_scalar_hex"));
+        let init_seeds = NoiseHfsSeeds::from_ephemeral_seed(init_eph);
+        let resp_seeds = NoiseHfsSeeds::from_ephemeral_seed(resp_eph);
+        let mut keygen = init_seeds.mlkem_d.to_vec();
+        keygen.extend_from_slice(&init_seeds.mlkem_z);
+        assert_eq!(
+            hex::encode(keygen),
+            s(&v, "initiator_mlkem768_keygen_seed_hex")
+        );
+        assert_eq!(
+            hex::encode(resp_seeds.mlkem_m),
+            s(&v, "responder_mlkem768_encaps_seed_hex")
+        );
+
+        let host = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar(decode_hex_array(s(&v, "responder_static_scalar_hex"))),
+            SigningKeypair::from_seeds(
+                decode_hex_array(s(&v, "responder_signing_seed_hex")),
+                decode_hex_array(s(&v, "responder_signing_mldsa_seed_hex")),
+            ),
+        );
+        let cli = EndpointIdentity::from_keys(
+            StaticKeypair::from_scalar(decode_hex_array(s(&v, "initiator_static_scalar_hex"))),
+            SigningKeypair::from_seed([0x01; 32]),
+        );
+        assert_eq!(cli.device_id(), s(&v, "revoked_device_id"));
+        let mut host_roster = Roster::new();
+        host_roster
+            .record_pending_pair(
+                *cli.static_key().public_bytes(),
+                None,
+                "Phone".into(),
+                "ios".into(),
+                "sas".into(),
+            )
+            .unwrap();
+        host_roster
+            .confirm_peer(&cli.device_id(), Some("sas"))
+            .unwrap();
+        host_roster
+            .revoke_peer_at(&cli.device_id(), true, now)
+            .unwrap();
+        let mut cli_roster = Roster::new();
+        cli_roster
+            .insert_pinned_host(
+                host.host_id().to_string(),
+                "Host".into(),
+                *host.static_key().public_bytes(),
+                Some(host.signing_key().public_key().clone()),
+                0,
+                vec![],
+            )
+            .unwrap();
+
+        let mut init =
+            SessionMachine::new_initiator(&cli, host.host_id(), None, None, Some(init_eph))
+                .unwrap();
+        let mut resp =
+            SessionMachine::new_responder_with_refusal(&host, Some(resp_eph), RefusalMode::Enabled)
+                .unwrap();
+        let mut limiter = RefusalLimiter::new();
+        let start = writes(&init.start().unwrap());
+        assert_eq!(hex::encode(&start[..6]), s(&v, "preamble_hex"));
+        assert_eq!(hex::encode(&start[6..]), s(&v, "msg1_frame_hex"));
+        let m2 = writes(
+            &resp
+                .feed_bytes_with_limiter(&start, now, 1, &mut host_roster, &mut limiter)
+                .unwrap(),
+        );
+        assert_eq!(hex::encode(&m2), s(&v, "msg2_frame_hex"));
+        let m3 = writes(&init.feed_bytes(&m2, now, 2, &mut cli_roster).unwrap());
+        assert_eq!(hex::encode(&m3), s(&v, "msg3_frame_hex"));
+        let refused = resp
+            .feed_bytes_with_limiter(&m3, now, 3, &mut host_roster, &mut limiter)
+            .unwrap();
+        let close = writes(&refused);
+        assert_eq!(close.len(), 21);
+        assert_eq!(hex::encode(&close), s(&v, "close_frame_hex"));
+        assert_eq!(
+            refused.last(),
+            Some(&SessionAction::Refused {
+                peer_device_id: cli.device_id(),
+                code: SessionCloseCode::PEER_REVOKED,
+            })
+        );
+        assert_eq!(
+            v["close_code"].as_u64(),
+            Some(u64::from(SessionCloseCode::PEER_REVOKED))
+        );
+        assert_eq!(s(&v, "close_inner_hex"), "070fa1");
+        assert_eq!(
+            init.feed_bytes(&close, now, 4, &mut cli_roster).unwrap(),
+            vec![SessionAction::CloseTransport {
+                code: SessionCloseCode::PEER_REVOKED,
+                reason: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn v2_refusal_envelopes_match_byte_for_byte() {
+        let v = load("wire_v2.json", "v2_refusal");
+        let secret = decode_hex_array::<32>(s(&v, "reconnect_secret_hex"));
+        let nonce = decode_hex_array::<16>(s(&v, "rendezvous_nonce_hex"));
+        let h_pre = decode_hex_array::<32>(s(&v, "h_pre_hex"));
+        let remote = decode_hex_array::<32>(s(&v, "remote_static_pub_hex"));
+        let bucket = usize::try_from(v["bucket"].as_u64().unwrap()).unwrap();
+        assert_eq!(s(&v, "refusal_seal_info"), "tendril-v2-refusal-seal");
+        assert_eq!(
+            hex::encode(*derive_refusal_seal_key(&secret, &nonce)),
+            s(&v, "refusal_seal_key_hex")
+        );
+        assert_eq!(
+            hex::encode(*hkdf_sha256_32(&secret, &nonce, b"tendril-v2-hello-seal")),
+            s(&v, "hello_seal_key_hex")
+        );
+        let cases = v["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 2);
+        for case in cases {
+            let code = u16::try_from(case["code"].as_u64().unwrap()).unwrap();
+            let reason = RefusalReason::from_close_code(code).unwrap();
+            let sealed = seal_v2_refusal_envelope(&secret, &nonce, &h_pre, bucket, reason).unwrap();
+            assert_eq!(sealed.len(), bucket);
+            assert_eq!(hex::encode(&sealed), s(case, "sealed_refusal_hex"));
+            assert_eq!(
+                open_v2_refusal_envelope(&secret, &nonce, &h_pre, &sealed, &remote),
+                Ok(reason)
+            );
+        }
+        let negatives = v["negatives"].as_array().unwrap();
+        assert_eq!(negatives.len(), 5);
+        for n in negatives {
+            let env = hex::decode(s(n, "envelope_hex")).unwrap();
+            let got = match s(n, "open_with") {
+                "hello" => unseal_v2_hello_envelope(&secret, &nonce, &h_pre, &env).map(|_| ()),
+                _ => open_v2_refusal_envelope(&secret, &nonce, &h_pre, &env, &remote).map(|_| ()),
+            };
+            let code = match got {
+                Err(CoreError::HostKeyUnverified) => "host_key_unverified",
+                Err(CoreError::ProtocolViolation(_)) => "protocol_violation",
+                other => panic!("{}: {other:?}", s(n, "name")),
+            };
+            assert_eq!(code, s(n, "expected_error"), "{}", s(n, "name"));
+        }
+    }
+}

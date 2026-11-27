@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chacha20poly1305::aead::{AeadInOut, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -13,6 +15,7 @@ use tendril_core::crypto::{
     device_id, fingerprint_device, fingerprint_host, normalize_code, pairing_sas,
     x25519_public_from_scalar,
 };
+use tendril_core::error::{CoreError, RefusalReason};
 use tendril_core::grants::{
     CRL_DOMAIN, GRANT_DOMAIN, Grant, GrantUnsigned, RevocationList, RevocationListUnsigned,
     canonical_json, crl_signed_bytes, grant_signed_bytes, sign_crl_deterministic,
@@ -27,24 +30,27 @@ use tendril_core::pairing::{
     mint_enrollment_token_deterministic, pair_key_proof_bytes, sign_enroll_proof_deterministic,
     sign_pair_key_proof_deterministic, verify_enrollment_token, verify_pair_key_proof,
 };
+use tendril_core::refusal::{RefusalLimiter, RefusalMode};
 use tendril_core::relay_auth::{
     RelayAuthProof, RelayAuthRole, RelayTicket, compute_relay_auth_hmac,
     compute_relay_auth_hmac_b64, mint_relay_ticket, relay_auth_hmac_input, relay_ticket_jcs,
     relay_ticket_signed_bytes, verify_relay_auth_hmac, verify_relay_ticket,
 };
 use tendril_core::roster::Roster;
+use tendril_core::session::{SessionAction, SessionCloseCode, SessionMachine};
 use tendril_core::v2::{
     PAKE_ARGON2_MEMORY_KIB, PAKE_ARGON2_PARALLELISM, PAKE_ARGON2_TIME, PaddingPolicy,
     PakeArgon2Params, V2_PAKE_SALT_LEN, canonical_relay_host, compute_pake_init_mac,
     compute_pake_msg1_mac, compute_pake_resp_mac, compute_rendezvous_mac, decode_v2_inner_frame,
-    derive_epoch_mailbox, derive_pake_keys, derive_pake_master, encode_dummy_cover_frame,
-    epoch_for_unix, pad_inner_frame, pad_msg3_payload, pad_pake_msg3_payload, pad_v2_pair_response,
-    pake_msg2_bucket_for_hello_len, pake_noise_prologue, seal_pake_host_hello,
-    seal_v2_hello_envelope, sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register,
-    unpad_inner_frame, unpad_msg3_payload, unpad_pake_msg3_payload, unpad_v2_pair_response,
-    unseal_pake_host_hello, unseal_v2_hello_envelope, v2_relay_accept_signed_bytes,
-    v2_relay_dial_signed_bytes, v2_relay_register_signed_bytes, verify_v2_relay_accept,
-    verify_v2_relay_dial, verify_v2_relay_register,
+    derive_epoch_mailbox, derive_pake_keys, derive_pake_master, derive_refusal_seal_key,
+    encode_dummy_cover_frame, epoch_for_unix, open_v2_refusal_envelope, pad_inner_frame,
+    pad_msg3_payload, pad_pake_msg3_payload, pad_v2_pair_response, pake_msg2_bucket_for_hello_len,
+    pake_noise_prologue, seal_pake_host_hello, seal_v2_hello_envelope, seal_v2_refusal_envelope,
+    sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register, unpad_inner_frame,
+    unpad_msg3_payload, unpad_pake_msg3_payload, unpad_v2_pair_response, unseal_pake_host_hello,
+    unseal_v2_hello_envelope, v2_relay_accept_signed_bytes, v2_relay_dial_signed_bytes,
+    v2_relay_register_signed_bytes, verify_v2_relay_accept, verify_v2_relay_dial,
+    verify_v2_relay_register,
 };
 use tendril_core::wire::{
     HostHello, InnerFrameType, Intent, NOISE_PATTERN, PREAMBLE_FLAG_NONE, PairClaim, PairResponse,
@@ -214,10 +220,37 @@ struct SessionTranscriptVector {
 }
 
 #[derive(Serialize)]
+struct SessionRefusalV1Vector {
+    preamble_hex: String,
+    initiator_static_scalar_hex: String,
+    initiator_static_pub_hex: String,
+    initiator_ephem_scalar_hex: String,
+    initiator_mlkem768_keygen_seed_hex: String,
+    responder_static_scalar_hex: String,
+    responder_static_pub_hex: String,
+    responder_ephem_scalar_hex: String,
+    responder_mlkem768_encaps_seed_hex: String,
+    responder_signing_seed_hex: String,
+    responder_signing_mldsa_seed_hex: String,
+    revoked_device_id: String,
+    now_unix: u64,
+    host_hello_json: String,
+    msg1_frame_hex: String,
+    msg2_frame_hex: String,
+    session_hello_json: String,
+    msg3_frame_hex: String,
+    final_handshake_hash_hex: String,
+    close_code: u16,
+    close_inner_hex: String,
+    close_frame_hex: String,
+}
+
+#[derive(Serialize)]
 struct HandshakeVector {
     noise_pattern: String,
     pair_transcript: PairTranscriptVector,
     session_transcript: SessionTranscriptVector,
+    session_refusal_v1: SessionRefusalV1Vector,
 }
 
 #[derive(Serialize)]
@@ -425,6 +458,36 @@ struct V2PakeVector {
 }
 
 #[derive(Serialize)]
+struct V2RefusalCase {
+    code: u16,
+    reason: String,
+    refusal_pt_hex: String,
+    sealed_refusal_hex: String,
+}
+
+#[derive(Serialize)]
+struct V2RefusalNegative {
+    name: String,
+    open_with: String,
+    envelope_hex: String,
+    expected_error: String,
+}
+
+#[derive(Serialize)]
+struct V2RefusalVector {
+    reconnect_secret_hex: String,
+    rendezvous_nonce_hex: String,
+    h_pre_hex: String,
+    bucket: usize,
+    refusal_seal_info: String,
+    refusal_seal_key_hex: String,
+    hello_seal_key_hex: String,
+    remote_static_pub_hex: String,
+    cases: Vec<V2RefusalCase>,
+    negatives: Vec<V2RefusalNegative>,
+}
+
+#[derive(Serialize)]
 struct WireV2Vector {
     noise_pattern: String,
     v2_session_preamble_hex: String,
@@ -433,6 +496,7 @@ struct WireV2Vector {
     relay_admission: RelayAdmissionVector,
     v2_reconnect: V2ReconnectVector,
     pake_pairing: V2PakeVector,
+    v2_refusal: V2RefusalVector,
 }
 
 fn concat64(a: &[u8; 32], b: &[u8; 32]) -> [u8; 64] {
@@ -734,10 +798,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pair_transcript = build_pair_transcript(&host_scalar, &host_pub, &dev_scalar, &dev_pub)?;
     let session_transcript =
         build_session_transcript(&host_scalar, &host_pub, &dev_scalar, &dev_pub)?;
+    let session_refusal_v1 = build_session_refusal_v1(&host_scalar, &dev_scalar)?;
     let handshake = HandshakeVector {
         noise_pattern: NOISE_PATTERN.to_string(),
         pair_transcript,
         session_transcript,
+        session_refusal_v1,
     };
     write_json(&vectors_dir, "handshake.json", &handshake)?;
 
@@ -1467,6 +1533,9 @@ fn generate_wire_v2_vector() -> Result<WireV2Vector, Box<dyn std::error::Error>>
     // 4. Hybrid Argon2id PAKE + ML-KEM-768 Pairing
     let pake_pairing = build_v2_pake_vector(&v2_pake_pair_preamble)?;
 
+    // 5. Sealed refusal envelope
+    let v2_refusal = build_v2_refusal_vector()?;
+
     Ok(WireV2Vector {
         noise_pattern: NOISE_PATTERN.to_string(),
         v2_session_preamble_hex: hex::encode(v2_session_preamble),
@@ -1475,6 +1544,7 @@ fn generate_wire_v2_vector() -> Result<WireV2Vector, Box<dyn std::error::Error>>
         relay_admission,
         v2_reconnect,
         pake_pairing,
+        v2_refusal,
     })
 }
 
@@ -1904,5 +1974,320 @@ fn build_v2_pake_vector(preamble: &[u8; 6]) -> Result<V2PakeVector, Box<dyn std:
         pair_response_frame_hex: hex::encode(pair_response_frame),
         exported_reconnect_secret_hex: hex::encode(*exported_reconnect),
         exported_mailbox_secret_hex: hex::encode(*exported_mailbox),
+    })
+}
+
+fn v1_writes(actions: &[SessionAction]) -> Vec<u8> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            SessionAction::WriteBytes(b) => Some(b.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// A Wire v1 session with a revoked initiator, driven through the real `SessionMachine`s, then
+/// replayed over raw Noise to pin each plaintext.
+fn build_session_refusal_v1(
+    resp_static: &[u8; 32],
+    init_static: &[u8; 32],
+) -> Result<SessionRefusalV1Vector, Box<dyn std::error::Error>> {
+    let now_unix = 1_795_564_800u64;
+    let init_eph = seq_bytes(0xA1);
+    let resp_eph = seq_bytes(0xB1);
+    let signing_seed = seq_bytes(0x71);
+    let signing_mldsa_seed = seq_bytes(0x75);
+    let host = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar(*resp_static),
+        SigningKeypair::from_seeds(signing_seed, signing_mldsa_seed),
+    );
+    let cli = EndpointIdentity::from_keys(
+        StaticKeypair::from_scalar(*init_static),
+        SigningKeypair::from_seeds(seq_bytes(0x72), seq_bytes(0x76)),
+    );
+    let cli_id = cli.device_id();
+
+    let mut host_roster = Roster::new();
+    host_roster.record_pending_pair(
+        *cli.static_key().public_bytes(),
+        None,
+        "Phone".into(),
+        "ios".into(),
+        "sas".into(),
+    )?;
+    host_roster.confirm_peer(&cli_id, Some("sas"))?;
+    host_roster.revoke_peer_at(&cli_id, true, now_unix)?;
+    let mut cli_roster = Roster::new();
+    cli_roster.insert_pinned_host(
+        host.host_id().to_string(),
+        "Host".into(),
+        *host.static_key().public_bytes(),
+        Some(host.signing_key().public_key().clone()),
+        0,
+        vec![],
+    )?;
+
+    let mut init = SessionMachine::new_initiator(&cli, host.host_id(), None, None, Some(init_eph))?;
+    let mut resp =
+        SessionMachine::new_responder_with_refusal(&host, Some(resp_eph), RefusalMode::Enabled)?;
+    let mut limiter = RefusalLimiter::new();
+    let start = v1_writes(&init.start()?);
+    let msg2_frame = v1_writes(&resp.feed_bytes_with_limiter(
+        &start,
+        now_unix,
+        1,
+        &mut host_roster,
+        &mut limiter,
+    )?);
+    let init_actions = init.feed_bytes(&msg2_frame, now_unix, 2, &mut cli_roster)?;
+    let final_hash = init_actions
+        .iter()
+        .find_map(|a| match a {
+            SessionAction::Established {
+                final_handshake_hash,
+                ..
+            } => Some(*final_handshake_hash),
+            _ => None,
+        })
+        .ok_or("initiator did not report Established")?;
+    let msg3_frame = v1_writes(&init_actions);
+    let refusal =
+        resp.feed_bytes_with_limiter(&msg3_frame, now_unix, 3, &mut host_roster, &mut limiter)?;
+    let close_frame = v1_writes(&refusal);
+    assert_eq!(close_frame.len(), 21);
+    assert_eq!(
+        refusal.last(),
+        Some(&SessionAction::Refused {
+            peer_device_id: cli_id.clone(),
+            code: SessionCloseCode::PEER_REVOKED,
+        })
+    );
+    let closed = init.feed_bytes(&close_frame, now_unix, 4, &mut cli_roster)?;
+    assert_eq!(
+        closed,
+        vec![SessionAction::CloseTransport {
+            code: SessionCloseCode::PEER_REVOKED,
+            reason: String::new(),
+        }]
+    );
+
+    let preamble = Preamble::v1(Intent::Session).encode();
+    assert_eq!(&start[..6], &preamble);
+    let msg1_frame = start[6..].to_vec();
+    let host_hello_json = serde_json::to_string(&HostHello {
+        host_id: host.host_id().to_string(),
+        proto_version: 1,
+        signing_pub: host.signing_key().public_key().to_b64url(),
+        rotation: vec![],
+        upgrade: vec![],
+    })?;
+    let session_hello_json = serde_json::to_string(&SessionHello {
+        device_id: cli_id.clone(),
+        grant: None,
+        crl_seq: None,
+        groups: None,
+        route_seq: None,
+        upgrade: vec![],
+    })?;
+    let close_inner = encode_inner_frame(
+        InnerFrameType::Close,
+        &SessionCloseCode::PEER_REVOKED.to_be_bytes(),
+    )?;
+
+    // Replay over raw Noise with the expanded seeds an independent verifier uses.
+    let init_seeds = NoiseHfsSeeds::from_ephemeral_seed(init_eph);
+    let resp_seeds = NoiseHfsSeeds::from_ephemeral_seed(resp_eph);
+    let mut raw_init = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(init_static)
+        .prologue(&preamble)
+        .fixed_hfs_seeds_for_testing_only(init_seeds.clone())
+        .build_initiator()?;
+    let mut raw_resp = NoiseHfsHandshakeBuilder::new()
+        .local_private_key(resp_static)
+        .prologue(&preamble)
+        .fixed_hfs_seeds_for_testing_only(resp_seeds.clone())
+        .build_responder()?;
+    let m1 = raw_init.write_message_vec(&[])?;
+    assert_eq!(encode_frame(&m1)?, msg1_frame);
+    raw_resp.read_message_vec(&m1)?;
+    let m2 = raw_resp.write_message_vec(host_hello_json.as_bytes())?;
+    assert_eq!(encode_frame(&m2)?, msg2_frame);
+    raw_init.read_message_vec(&m2)?;
+    let m3 = raw_init.write_message_vec(session_hello_json.as_bytes())?;
+    assert_eq!(encode_frame(&m3)?, msg3_frame);
+    raw_resp.read_message_vec(&m3)?;
+    assert_eq!(*raw_init.get_handshake_hash(), final_hash);
+    let mut resp_tx = raw_resp.into_transport_mode()?;
+    assert_eq!(
+        encode_frame(&resp_tx.write_message_vec(&close_inner)?)?,
+        close_frame
+    );
+
+    Ok(SessionRefusalV1Vector {
+        preamble_hex: hex::encode(preamble),
+        initiator_static_scalar_hex: hex::encode(init_static),
+        initiator_static_pub_hex: hex::encode(cli.static_key().public_bytes()),
+        initiator_ephem_scalar_hex: hex::encode(init_seeds.x25519),
+        initiator_mlkem768_keygen_seed_hex: hex::encode(concat64(
+            &init_seeds.mlkem_d,
+            &init_seeds.mlkem_z,
+        )),
+        responder_static_scalar_hex: hex::encode(resp_static),
+        responder_static_pub_hex: hex::encode(host.static_key().public_bytes()),
+        responder_ephem_scalar_hex: hex::encode(resp_seeds.x25519),
+        responder_mlkem768_encaps_seed_hex: hex::encode(resp_seeds.mlkem_m),
+        responder_signing_seed_hex: hex::encode(signing_seed),
+        responder_signing_mldsa_seed_hex: hex::encode(signing_mldsa_seed),
+        revoked_device_id: cli_id,
+        now_unix,
+        host_hello_json,
+        msg1_frame_hex: hex::encode(msg1_frame),
+        msg2_frame_hex: hex::encode(msg2_frame),
+        session_hello_json,
+        msg3_frame_hex: hex::encode(msg3_frame),
+        final_handshake_hash_hex: hex::encode(final_hash),
+        close_code: SessionCloseCode::PEER_REVOKED,
+        close_inner_hex: hex::encode(close_inner),
+        close_frame_hex: hex::encode(close_frame),
+    })
+}
+
+fn seal_raw_refusal(
+    key: &[u8; 32],
+    h_pre: &[u8; 32],
+    mut pt: Vec<u8>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| e.to_string())?
+        .encrypt_in_place(&Nonce::from([0u8; 12]), h_pre, &mut pt)
+        .map_err(|e| e.to_string())?;
+    Ok(pt)
+}
+
+fn refusal_plaintext(bucket: usize, version: u8, code: u16) -> Vec<u8> {
+    let mut pt = vec![0u8; bucket - 16];
+    pt[..2].copy_from_slice(&3u16.to_be_bytes());
+    pt[2] = version;
+    pt[3..5].copy_from_slice(&code.to_be_bytes());
+    pt
+}
+
+/// The `spec/wire-v2.md` Section 3.1.5 sealed refusal for codes `4001` and `4004`, plus
+/// envelopes an initiator MUST reject.
+fn build_v2_refusal_vector() -> Result<V2RefusalVector, Box<dyn std::error::Error>> {
+    use tendril_core::crypto::hkdf_sha256_32;
+
+    let reconnect_secret = seq_bytes(0xC1);
+    let nonce: [u8; 16] = seq_bytes(0xD1)[..16].try_into()?;
+    let h_pre = seq_bytes(0xE1);
+    let bucket = 4096usize;
+    let remote_static = *StaticKeypair::from_scalar(seq_bytes(0xF1)).public_bytes();
+    let refusal_key = derive_refusal_seal_key(&reconnect_secret, &nonce);
+    let hello_key = hkdf_sha256_32(&reconnect_secret, &nonce, b"tendril-v2-hello-seal");
+    assert_eq!(
+        *refusal_key,
+        *hkdf_sha256_32(&reconnect_secret, &nonce, b"tendril-v2-refusal-seal")
+    );
+
+    let mut cases = Vec::new();
+    for (reason, name) in [
+        (RefusalReason::Revoked, "revoked"),
+        (RefusalReason::Pending, "pending"),
+    ] {
+        let sealed = seal_v2_refusal_envelope(&reconnect_secret, &nonce, &h_pre, bucket, reason)?;
+        let pt = refusal_plaintext(bucket, 0x01, reason.close_code());
+        assert_eq!(seal_raw_refusal(&refusal_key, &h_pre, pt.clone())?, sealed);
+        assert_eq!(
+            open_v2_refusal_envelope(&reconnect_secret, &nonce, &h_pre, &sealed, &remote_static)?,
+            reason
+        );
+        cases.push(V2RefusalCase {
+            code: reason.close_code(),
+            reason: name.to_string(),
+            refusal_pt_hex: hex::encode(pt),
+            sealed_refusal_hex: hex::encode(sealed),
+        });
+    }
+
+    let hello_envelope = seal_v2_hello_envelope(
+        &reconnect_secret,
+        &nonce,
+        &h_pre,
+        br#"{"host_id":"host","proto_version":2}"#,
+    )?;
+    let mut nonzero_pad = refusal_plaintext(bucket, 0x01, SessionCloseCode::PEER_REVOKED);
+    *nonzero_pad.last_mut().ok_or("empty")? = 0x01;
+    let negatives = [
+        (
+            "refusal_under_hello_key",
+            "hello",
+            hex::decode(&cases[0].sealed_refusal_hex)?,
+            "host_key_unverified",
+        ),
+        (
+            "hello_under_refusal_key",
+            "refusal",
+            hello_envelope,
+            "host_key_unverified",
+        ),
+        (
+            "bad_version",
+            "refusal",
+            seal_raw_refusal(&refusal_key, &h_pre, refusal_plaintext(bucket, 0x02, 4001))?,
+            "protocol_violation",
+        ),
+        (
+            "nonzero_padding",
+            "refusal",
+            seal_raw_refusal(&refusal_key, &h_pre, nonzero_pad)?,
+            "protocol_violation",
+        ),
+        (
+            "code_4002",
+            "refusal",
+            seal_raw_refusal(
+                &refusal_key,
+                &h_pre,
+                refusal_plaintext(bucket, 0x01, SessionCloseCode::GRANT_EXPIRED),
+            )?,
+            "protocol_violation",
+        ),
+    ];
+    let mut out = Vec::new();
+    for (name, open_with, envelope, expected) in negatives {
+        let got = if open_with == "hello" {
+            unseal_v2_hello_envelope(&reconnect_secret, &nonce, &h_pre, &envelope).map(|_| ())
+        } else {
+            open_v2_refusal_envelope(&reconnect_secret, &nonce, &h_pre, &envelope, &remote_static)
+                .map(|_| ())
+        };
+        let code = match got {
+            Err(CoreError::HostKeyUnverified) => "host_key_unverified",
+            Err(CoreError::ProtocolViolation(_)) => "protocol_violation",
+            other => return Err(format!("{name}: unexpected {other:?}").into()),
+        };
+        assert_eq!(code, expected, "{name}");
+        out.push(V2RefusalNegative {
+            name: name.to_string(),
+            open_with: open_with.to_string(),
+            envelope_hex: hex::encode(envelope),
+            expected_error: expected.to_string(),
+        });
+    }
+
+    Ok(V2RefusalVector {
+        reconnect_secret_hex: hex::encode(reconnect_secret),
+        rendezvous_nonce_hex: hex::encode(nonce),
+        h_pre_hex: hex::encode(h_pre),
+        bucket,
+        refusal_seal_info: "tendril-v2-refusal-seal".to_string(),
+        refusal_seal_key_hex: hex::encode(*refusal_key),
+        hello_seal_key_hex: hex::encode(*hello_key),
+        remote_static_pub_hex: hex::encode(remote_static),
+        cases,
+        negatives: out,
     })
 }
