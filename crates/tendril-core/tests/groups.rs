@@ -3537,9 +3537,11 @@ fn root_crl_local_root_fails_closed_under_a_colliding_active_pin_list() {
         intruder.st.public_bytes(),
         &intruder.sk,
     );
+    // A newer list keeps earlier revocations (pairing-v1 Section 5.2); this test is about the
+    // colliding pin.
     store_list(
         &mut roster,
-        root_list(&root_dev, 2, vec![], vec![], &intruder.sk),
+        root_list(&root_dev, 2, vec![c.id()], vec![], &intruder.sk),
         &intruder.sk,
     );
     let err = root_crl(&roster, &root_dev, &root_pub, Some(root.host_id())).unwrap_err();

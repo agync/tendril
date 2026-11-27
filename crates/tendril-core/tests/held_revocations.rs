@@ -524,6 +524,18 @@ fn an_equal_or_lower_seq_changes_nothing() {
         .unwrap();
     fold(&mut disk, &memory, None);
     assert_eq!(disk.crl("issuer-p").unwrap().seq, 6);
+
+    // A newer list that drops a revoked device is not taken: revocation is permanent.
+    let mut memory = base.clone();
+    memory
+        .ingest_crl(
+            crl("issuer-p", 7, &peer.sk, &["z"]),
+            "issuer-p",
+            &peer.pubkey(),
+        )
+        .unwrap();
+    assert!(!disk.absorb_held_revocations(&memory, None));
+    assert_eq!(disk.crl("issuer-p").unwrap().seq, 6);
 }
 
 #[test]
@@ -647,6 +659,51 @@ fn held_crls_are_ingested_whatever_order_they_are_met_in() {
     assert_eq!(state(&disk, &pending_id), Some(PeerState::Revoked));
     assert_eq!(disk.crl("zz-issuer").map(|c| c.seq), Some(1));
     assert_eq!(disk.crl(&pending_id).map(|c| c.seq), Some(1));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A CRL never un-revokes
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_newer_crl_may_not_drop_a_revoked_device_or_nonce() {
+    let issuer = Peer::new(0xd8);
+    let list = |seq: u64, devices: &[&str], nonces: &[&str]| {
+        sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: "issuer".into(),
+                seq,
+                revoked_devices: devices.iter().map(|d| (*d).to_owned()).collect(),
+                revoked_nonces: nonces.iter().map(|n| (*n).to_owned()).collect(),
+                ts: "2026-11-20T00:00:00Z".into(),
+            },
+            &issuer.sk,
+        )
+        .unwrap()
+    };
+    let mut roster = Roster::new();
+    roster
+        .ingest_crl(list(1, &["a", "b"], &["n1"]), "issuer", &issuer.pubkey())
+        .unwrap();
+    for dropping in [list(2, &["a"], &["n1"]), list(2, &["a", "b"], &[])] {
+        assert_eq!(
+            roster.ingest_crl(dropping, "issuer", &issuer.pubkey()),
+            Err(CoreError::ProtocolViolation(
+                "CRL must not drop previously revoked devices or nonces"
+            ))
+        );
+        assert_eq!(roster.crl("issuer").map(|c| c.seq), Some(1));
+    }
+    // A superset (devices and nonces) is taken.
+    roster
+        .ingest_crl(
+            list(2, &["b", "a", "c"], &["n1", "n2"]),
+            "issuer",
+            &issuer.pubkey(),
+        )
+        .unwrap();
+    assert_eq!(roster.crl("issuer").map(|c| c.seq), Some(2));
 }
 
 // ---------------------------------------------------------------------------------------------

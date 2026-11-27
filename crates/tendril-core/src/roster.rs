@@ -2059,6 +2059,21 @@ impl Roster {
                     got: crl.seq,
                 });
             }
+            // Revocation is permanent (`spec/pairing-v1.md` Section 5.2): a newer list never
+            // drops a device or nonce an older one revoked.
+            if !existing
+                .revoked_devices
+                .iter()
+                .all(|d| crl.revoked_devices.contains(d))
+                || !existing
+                    .revoked_nonces
+                    .iter()
+                    .all(|n| crl.revoked_nonces.contains(n))
+            {
+                return Err(CoreError::ProtocolViolation(
+                    "CRL must not drop previously revoked devices or nonces",
+                ));
+            }
         }
 
         let policy = self.refusal_policy;
