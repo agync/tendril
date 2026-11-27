@@ -985,13 +985,23 @@ fn candidate_failures_json(failures: &[CandidateFailure]) -> Vec<serde_json::Val
         .collect()
 }
 
-/// Reports a failed pairing or connect attempt as one JSON line on stderr and returns its error.
-fn attempt_failed(err: AttemptError) -> Box<dyn std::error::Error> {
-    let error_code = match &err.error {
+/// The `error_code` of an `attempt_failed` line: the stable [`RuntimeError::code`] of an
+/// authenticated refusal (`refused_revoked`, `refused_pending`, `refused`), otherwise the
+/// bounded pairing code or egress reason.
+fn attempt_error_code(error: &RuntimeError) -> Option<&'static str> {
+    if error.refusal().is_some() {
+        return Some(error.code());
+    }
+    match error {
         RuntimeError::Core(core) => Some(core.pair_error_code()),
         RuntimeError::Egress { reason, .. } => Some(reason.as_str()),
         _ => None,
-    };
+    }
+}
+
+/// Reports a failed pairing or connect attempt as one JSON line on stderr and returns its error.
+fn attempt_failed(err: AttemptError) -> Box<dyn std::error::Error> {
+    let error_code = attempt_error_code(&err.error);
     let failures = candidate_failures_json(&err.failures);
     eprintln!(
         "{}",
@@ -3767,6 +3777,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attempt_error_code_reports_refusals_by_their_stable_code() {
+        use tendril_core::RefusalReason;
+        use tendril_core::error::CoreError;
+        let refused = |reason| RuntimeError::Core(CoreError::PeerRefused { reason });
+        assert_eq!(
+            attempt_error_code(&refused(RefusalReason::Revoked)),
+            Some("refused_revoked")
+        );
+        assert_eq!(
+            attempt_error_code(&refused(RefusalReason::Pending)),
+            Some("refused_pending")
+        );
+        let closed = |code| RuntimeError::InitiatorClosed {
+            code,
+            reason: String::new(),
+        };
+        assert_eq!(attempt_error_code(&closed(4001)), Some("refused_revoked"));
+        assert_eq!(attempt_error_code(&closed(4450)), Some("refused"));
+        // A close that is not a refusal and other errors keep their bounded pairing codes.
+        assert_eq!(attempt_error_code(&closed(1000)), None);
+        assert_eq!(
+            attempt_error_code(&RuntimeError::Core(CoreError::PairingCodeExpired)),
+            Some("code_expired")
+        );
+    }
 
     #[test]
     fn pkarr_default_enabled_only_for_default_relay_mode() {
