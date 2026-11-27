@@ -1272,6 +1272,11 @@ impl PathStream for P2pStream {
         Ok(())
     }
 
+    async fn shutdown_write(&mut self) -> Result<(), RuntimeError> {
+        let _ = self.send.0.finish();
+        Ok(())
+    }
+
     fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
         let this = *self;
         (

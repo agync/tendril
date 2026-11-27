@@ -60,6 +60,17 @@ pub trait PathStream: Send + Sync {
     /// Gracefully shuts down or closes the underlying transport stream.
     async fn close(&mut self) -> Result<(), RuntimeError>;
 
+    /// Half-closes the stream: the peer sees EOF after the bytes already sent, while
+    /// [`Self::recv_chunk`] keeps working. A host that writes a final frame and then drops a
+    /// stream with unread inbound data would otherwise reset the connection and discard that frame.
+    ///
+    /// Errors are returned, so a caller that only drains a refusal can ignore them. The default
+    /// does nothing and never closes the stream. Message-framed providers (WebSocket relay) keep
+    /// it, so a half-close there is a no-op, and rely on [`Self::close`].
+    async fn shutdown_write(&mut self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     /// Splits this stream into independent read and write halves for full-duplex operation.
     fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>);
 }
@@ -247,6 +258,13 @@ where
         Ok(())
     }
 
+    async fn shutdown_write(&mut self) -> Result<(), RuntimeError> {
+        match timeout(self.write_timeout, self.stream.shutdown()).await {
+            Ok(res) => Ok(res?),
+            Err(_) => Err(RuntimeError::Timeout("stream shutdown timed out")),
+        }
+    }
+
     fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
         let (read, write) = tokio::io::split(self.stream);
         (
@@ -335,6 +353,10 @@ impl PathStream for PrefixedPathStream {
         self.inner.close().await
     }
 
+    async fn shutdown_write(&mut self) -> Result<(), RuntimeError> {
+        self.inner.shutdown_write().await
+    }
+
     fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
         let (inner, w) = self.inner.into_split();
         (
@@ -389,5 +411,193 @@ pub async fn recv_tendril_frame(
             return Err(RuntimeError::Closed);
         }
         reader.push(&buf[..n])?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::*;
+
+    async fn tcp_pair() -> (Box<dyn PathStream>, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let (server, peer) = accepted.unwrap();
+        let stream = IoPathStream::new(
+            ProviderId::Direct,
+            Some(peer.ip()),
+            DEFAULT_WRITE_TIMEOUT,
+            server,
+        );
+        (Box::new(stream), client.unwrap())
+    }
+
+    #[tokio::test]
+    async fn shutdown_write_half_closes_tcp_and_keeps_reading() {
+        let (mut server, mut client) = tcp_pair().await;
+        server.send_chunk(b"bye").await.unwrap();
+        server.shutdown_write().await.unwrap();
+
+        let mut got = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut got))
+            .await
+            .expect("the client sees EOF after the half-close")
+            .unwrap();
+        assert_eq!(got, b"bye");
+
+        client.write_all(b"late").await.unwrap();
+        let mut buf = [0_u8; 16];
+        let n = timeout(Duration::from_secs(2), server.recv_chunk(&mut buf))
+            .await
+            .expect("the read half stays open")
+            .unwrap();
+        assert_eq!(&buf[..n], b"late");
+    }
+
+    #[tokio::test]
+    async fn shutdown_write_delivers_the_frame_over_unread_inbound_data() {
+        let (mut server, mut client) = tcp_pair().await;
+        client.write_all(&[0xAB; 4096]).await.unwrap();
+        server.send_chunk(b"refusal").await.unwrap();
+        server.shutdown_write().await.unwrap();
+
+        // Like the host's refusal drain: keep the stream open and discard inbound bytes until
+        // EOF or a short bound, so closing never resets over unread data.
+        let drain = tokio::spawn(async move {
+            let mut buf = [0_u8; 1024];
+            let _ = timeout(Duration::from_millis(500), async {
+                while matches!(server.recv_chunk(&mut buf).await, Ok(n) if n > 0) {}
+            })
+            .await;
+            drop(server);
+        });
+
+        let mut got = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut got))
+            .await
+            .expect("EOF")
+            .expect("no reset after the half-close");
+        assert_eq!(got, b"refusal");
+        client.shutdown().await.unwrap();
+        timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("the drain ends on the client's EOF")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_write_passes_through_a_prefixed_stream() {
+        let (server, mut client) = tcp_pair().await;
+        let mut wrapped: Box<dyn PathStream> = Box::new(PrefixedPathStream::new(server, vec![1]));
+        wrapped.shutdown_write().await.unwrap();
+        let mut got = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut got))
+            .await
+            .expect("EOF through the wrapper")
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    struct Bare;
+
+    #[async_trait]
+    impl PathStream for Bare {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Direct
+        }
+
+        fn peer_ip(&self) -> Option<IpAddr> {
+            None
+        }
+
+        async fn send_chunk(&mut self, _bytes: &[u8]) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn recv_chunk(&mut self, _buf: &mut [u8]) -> Result<usize, RuntimeError> {
+            Ok(0)
+        }
+
+        async fn close(&mut self) -> Result<(), RuntimeError> {
+            panic!("the default shutdown_write must not close the stream");
+        }
+
+        fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
+            split_path_stream_fallback(self)
+        }
+    }
+
+    #[tokio::test]
+    async fn default_shutdown_write_is_a_safe_no_op() {
+        let mut bare = Bare;
+        bare.shutdown_write().await.unwrap();
+    }
+
+    struct FailingShutdown {
+        stuck: bool,
+    }
+
+    impl AsyncRead for FailingShutdown {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FailingShutdown {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.stuck {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_write_returns_io_and_timeout_errors() {
+        let mut failing = IoPathStream::new(
+            ProviderId::Direct,
+            None,
+            DEFAULT_WRITE_TIMEOUT,
+            FailingShutdown { stuck: false },
+        );
+        assert!(matches!(
+            failing.shutdown_write().await,
+            Err(RuntimeError::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+        let mut stuck = IoPathStream::new(
+            ProviderId::Direct,
+            None,
+            Duration::from_millis(20),
+            FailingShutdown { stuck: true },
+        );
+        assert!(matches!(
+            stuck.shutdown_write().await,
+            Err(RuntimeError::Timeout(_))
+        ));
     }
 }
