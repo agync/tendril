@@ -127,7 +127,24 @@ For human pairing, confirming the peer (`pair.confirm`) and minting capabilities
 
 1. Validate the 6-byte preamble; drop and rate-limit on any invalid field.
 2. Execute Noise `msg1`..`msg3`. Any AEAD failure drops the connection before interpreting payload fields.
-3. For `intent = session`: verify the peer static key `s` from `msg3` belongs to an `active` roster entry and `SessionHello.device_id` equals the derived `device_id` of `s`. Reject `pending` or `revoked` peers. Reject `SessionHello.upgrade` if it contains any capability not advertised in `HostHello.upgrade`.
+3. For `intent = session`: verify `SessionHello.device_id` equals the derived `device_id` of the peer static key `s` from `msg3`, then resolve `s` as below and act on the first matching row of the table. Only an `active` resolution continues. Reject `SessionHello.upgrade` if it contains any capability not advertised in `HostHello.upgrade`.
+
+   Resolution of `s` considers every roster entry and every pending host claim (`spec/pairing-v1.md` Section 5) whose static key is `s`, and never depends on roster key order:
+
+   - **Floor:** the effective floor is the highest `min_wire_version` across all of those records. When it is above `1`, the responder fails closed before any admission or refusal, so it never writes a transport frame to a peer whose floor forbids `0x01`.
+   - **State, revoked wins:** `s` resolves as revoked when any matching entry is `revoked`, when a matching `active` entry is revoked by a stored CRL, or when a matching `active` entry shares its signing identity with a `revoked` entry. Otherwise it resolves as `active` when a matching entry is `active`, otherwise as `pending` when a matching entry is `pending`, otherwise as not found.
+   - **Notice:** when `s` resolves as revoked, a notice is live when any matching entry that is not manifest-pinned (a group sibling pin) carries a live refusal notice (`spec/pairing-v1.md` Section 5.1). An `active` entry revoked by a stored CRL counts as carrying a live notice while `revoked_notice_ttl_secs` is not `0`.
+
+   | Resolution of `s` | Action |
+   |---|---|
+   | effective floor above `1` (any state) | fail closed (`VersionDowngrade`) and drop; **0 bytes** written after `msg2` (`spec/wire-v2.md` Section 1.1) |
+   | `active` | continue the session |
+   | revoked; a live notice as defined above; the refusal limiter allows (Section 5.4.2); the listener is refusal-enabled (Section 5.4.3) | enter transport mode, send one `0x07 CLOSE` with code `4001 peer_revoked`, then run the refusal close sequence (Section 5.4.4) |
+   | `pending`; no matching `pending` entry is manifest-pinned; pending notices enabled (`spec/pairing-v1.md` Section 5.1); the refusal limiter allows; the listener is refusal-enabled | enter transport mode, send one `0x07 CLOSE` with code `4004 peer_pending`, then run the refusal close sequence |
+   | revoked or `pending` with no live notice or pending notices off, a manifest-pinned entry, rate-limited, or on a listener that is not refusal-enabled | drop; 0 bytes written after `msg2` |
+   | no matching entry, or any other failure | drop; 0 bytes written after `msg2` |
+
+   A responder MUST NOT emit `Established` for a refused peer. A stranger (no matching entry) never receives a `0x07 CLOSE`: its connection is dropped with the same bytes and the same code path as before this rule.
 4. For `intent = pair`: enforce mutual exclusion between `code_mac` and `enrollment_token`. For human claims, verify `PairClaim.code_mac` per `pairing-v1.md`, then verify the signing key claim (`signing_pub`, `enroll_proof`) per `pairing-v1.md` Section 4.1 when present, and record the peer per the Section 4.1 recording rules (a new entry, or an `active` entry the claim adds a key to, becomes `pending`; any other accepted claim keeps the entry's state). A Wire v1 responder built before that section rejects a keyed human claim as `protocol_error`; initiators MUST NOT retry without the proof (pre-1.0 break). For M2M claims (only when M2M enrollment is enabled by responder policy), verify the trust-anchored enrollment token, CRL, single-use nonce burn, and channel-bound `enroll_proof` per `pairing-v1.md` Section 7, burn the nonce atomically, and register the peer as `active` with zero application grants. When the claim carried `route_seq`, add the host-signed `route_set` per `pairing-v1.md` Section 7.5. Send `PairResponse` and close.
 
 ---
@@ -189,7 +206,7 @@ Receivers MUST close the session immediately on a 0-byte transport plaintext or 
 | `0x04` | `REKEY` | Empty (`0` bytes) | Triggers Noise `CipherState::rekey()` |
 | `0x05` | `PING` | `8 B` big-endian `u64` cookie | Liveness probe; peer responds with `0x06 PONG` |
 | `0x06` | `PONG` | `8 B` big-endian `u64` echoed cookie | Liveness response |
-| `0x07` | `CLOSE` | `2 B` big-endian `u16` reason code + optional UTF-8 text | Graceful session close (`payload.len() >= 2`) |
+| `0x07` | `CLOSE` | `2 B` big-endian `u16` reason code (Section 5.4) + optional UTF-8 text | Graceful session close (`payload.len() >= 2`); a refusal code closes a session the responder never admitted (Section 5.4) |
 | `0x0A` | `GROUP_MANIFEST` | Compact UTF-8 JSON `GroupManifest`, `<= 32768 B` | Pushes or gossips a signed group manifest (`spec/groups-v1.md`); surfaced to the caller, never auto-ingested |
 | `0x0B` | `GROUP_RENDEZVOUS` | `20 B` ASCII `group_id` `\|\|` `8 B` big-endian `u64` `seq` `\|\|` `32 B` key, exactly `60 B` | Delivers a group rendezvous key from an admin to a member (`spec/groups-v1.md` Section 7) |
 | `0x0C` | `ROUTE_SET` | `route_set_body \|\| sig`, `3455..=5003 B` (Section 5.2) | Host-signed route announcement, responder to initiator only (`spec/pairing-v1.md` Section 6.11) |
@@ -267,3 +284,53 @@ An initiator and responder connected over a non-direct path (such as a relay) ma
 3. **Direction, Correlation, and Rate Limits:** `Offer` is initiator -> responder only; `Answer` and `Reject` are responder -> initiator only. An initiator MAY send at most `MAX_PATH_UPGRADE_OFFERS_PER_SESSION = 4` offers per session; peers correlate pending `(upgrade_id, protocol)` pairs (`Answer.protocol` MUST match the pending offer's `protocol`) and fail closed (`InvalidInnerFramePayload` or `ProtocolViolation`) on wrong-direction frames, unnegotiated or mismatched protocols, stale/unsolicited `upgrade_id` replies, or excess offers.
 4. **Cutover Security:** For `"webrtc/v1"`, the initiator opens an ordered binary DataChannel named `"tendril/v1"` (`WEBRTC_DATACHANNEL_LABEL`), then runs a fresh `Noise_XXhfs` session handshake against the same pinned peer identity over that DataChannel before cutting over traffic. ICE and DTLS alone never replace Tendril's end-to-end Noise identity and AEAD confidentiality.
 5. **Compatibility:** Because `HostHello` enforces `deny_unknown_fields`, enabling responder `upgrade` advertisement is opt-in and requires clients that recognize `HostHello.upgrade`. Conversely, upgrade-capable initiators remain backward-compatible with older hosts that omit `HostHello.upgrade`, because `SessionHello.upgrade` carries only the intersection and omits the field when empty.
+
+### 5.4 Close Codes and Authenticated Refusal
+
+#### 5.4.1 Close Code Registry
+
+The `0x07 CLOSE` reason code is one of the values below. This registry applies to Wire v1 and Wire v2 sessions alike (`spec/wire-v2.md` Section 5.1).
+
+| Code | Name | Sent by | Refusal |
+|---|---|---|---|
+| `1000` | `normal` | either | no |
+| `1002` | `protocol_error` | either | no |
+| `1008` | `policy_violation` | either | no |
+| `1011` | `internal_error` | responder | no |
+| `4001` | `peer_revoked` | responder only | yes (`Revoked`) |
+| `4002` | `grant_expired` | either | no (reserved) |
+| `4003` | `key_unverified` | either | no (reserved) |
+| `4004` | `peer_pending` | responder only | yes (`Pending`) |
+| `4400..=4499` | admission refusals | responder only | yes (`Other(code)`), reserved for future use |
+
+- A **refusal** is a `0x07 CLOSE` whose code is marked "yes" above. It tells a known initiator that the host has authenticated it and will not admit it.
+- A responder MUST send refusal codes with empty reason text (`payload.len() == 2`).
+- Only an **initiator** maps a received refusal code to a refusal reason. A responder that receives a refusal code keeps the raw code and text as a plain close and never maps it to a refusal.
+- Every other code keeps its plain close meaning. `4002` and `4003` are never refusals. A code outside this registry is a plain close.
+- A refused Wire v1 session is exactly `uint16_be(19) || AEAD(0x07 || code_be16)`: one 21-byte outer frame, the first transport frame the responder writes.
+- An initiator reports `Established` when it writes `msg3` (Section 3.3) and MUST NOT wait for a post-`msg3` frame before doing so: a healthy responder sends nothing until it has traffic. A refusal that arrives after `Established` is surfaced as a session close carrying the code, and later operations on the session fail with that code.
+
+#### 5.4.2 Refusal Limiter
+
+A responder keeps one refusal limiter per endpoint, shared by its Wire v1 and Wire v2 responders. It allows at most one refusal per peer `device_id` per `10 s` and tracks at most `256` peers (least recently used first out). When the limiter denies a refusal, the responder falls back to the silent behaviour of the same row (Section 3.3 step 3, `spec/wire-v2.md` Section 3.1.3): Wire v1 drops with 0 bytes, Wire v2 sends the decoy. A refusal audit record, when the embedder keeps one, is emitted only when the limiter allowed the refusal, so a flood of attempts cannot evict other audit records.
+
+#### 5.4.3 Refusal-Enabled Listeners
+
+Whether a listener may refuse is a property of the accept path, never of roster contents:
+
+| Accept path | Refusals |
+|---|---|
+| An ordinary session listener (Wire v1 or Wire v2) | enabled |
+| A dispatcher that also admits ordinary sessions on an endpoint with groups open | enabled only for candidates from the persisted ordinary roster. Group sibling pins (manifest-pinned entries) and group rendezvous secrets are silent |
+| A group listener, group pool or group mailbox | never; a refusal would link the group endpoint to the host |
+
+#### 5.4.4 Refusal Close Sequence
+
+After writing the refusal frame, a Wire v1 responder:
+
+1. Releases the half-open handshake slot that the connection held, so refused peers cannot block admission of `active` peers.
+2. Half-closes its write side where the transport supports it (for example TCP or Unix stream shutdown), so unread inbound bytes do not turn the close into a reset that discards the frame. Message-framed transports (WebSocket, relay, QUIC) close normally.
+3. Reads and discards inbound bytes until end of stream or `250 ms` (`REFUSAL_LINGER`), then closes. An implementation MAY bound the number of connections lingering at once (the reference runtime uses `8`) and close immediately when the bound is reached.
+4. Reports the refusal to the embedder as a failed accept (`PeerRevoked` or `PeerPending`) and continues accepting.
+
+The same sequence applies to a Wire v2 responder that refuses at `msg3` time (`spec/wire-v2.md` Section 3.1.4). A Wire v2 refusal at `msg2` does not use it: that responder keeps the decoy path timing (`spec/wire-v2.md` Section 3.1.3.3).

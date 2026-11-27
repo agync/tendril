@@ -81,6 +81,7 @@ mailbox_secret   = HKDF-SHA256(ikm = exporter_secret, salt = "tendril-mailbox-v2
 - Pairing-derived `mailbox_secret` and `reconnect_secret` MUST be persisted in an encrypted-at-rest keystore (OS Keychain / Keystore / sealed roster store) and zeroized on drop. They MUST NOT appear in debug or audit logs.
 - Pairing-derived `reconnect_secret` and `mailbox_secret` are retained across reconnects (preventing `msg3`-drop or concurrent-session secret desynchronization); session-exported secrets are informational/explicit-only and MUST NOT overwrite persisted pairing-derived secrets on normal reconnects.
 - On reconnect, reaching `Established` (`msg3` verified against an `Active` peer) raises `min_wire_version = 2` for that peer on both initiator and responder rosters; responders MUST NOT mutate persisted peer state speculatively when emitting `msg2`.
+- **Refusal tombstone:** revoking a peer drops its `v2_secrets`, except that a revocation which records a refusal notice (`spec/pairing-v1.md` Section 5.1) keeps that peer's `reconnect_secret` as the notice's refusal secret until the notice expires, and zeroizes `mailbox_secret` at once. The refusal secret is used only to verify `msg1` and seal a refusal (Sections 3.1.3 and 3.1.5). It never authenticates a session, never serves a `/v2/relay` mailbox, is never exported, and follows the storage and logging rules above. A revocation without a notice, and every expired notice, keeps nothing.
 - Revocation checks on reconnect (handshake, `REKEY`, and authorization) MUST match every ingested CRL `revoked_devices` entry against both the stored roster `device_id` and the canonical `device_id` derived from the peer `static_pub`, so a host-keyed roster entry cannot outlive a CRL that names its derived identifier.
 
 #### 3.1.2 `msg1` Timestamped Rendezvous Proof (56 bytes)
@@ -107,30 +108,94 @@ Total `msg1` body size is `1216 + 56 = 1272` bytes.
 
 Upon receiving `msg1`, the responder:
 
-1. Checks `|ts_unix - now_unix| <= 300` seconds and checks `RendezvousReplayCache` for `rendezvous_nonce` and spare live capacity. Multi-connection listeners MUST share a single `RendezvousReplayCache` instance across concurrent inbound connections; at capacity (`MAX_RENDEZVOUS_REPLAY_ENTRIES`), the cache MUST evict only expired entries (`now_unix > ts_unix + 300`) and fail closed (route to decoy) rather than evicting live entries.
-2. Evaluates `rendezvous_mac` across all roster entries in constant time (executing a dummy HMAC for non-active or v1-only entries) without early exit, even if `payload.len() != 56`.
-3. Computes the target handshake bucket `bucket` from `V2_HANDSHAKE_BUCKETS = [4096, 16384, 32768, 63488]` matching `2 + len(host_hello_json) + 16` for the responder's actual `HostHello` (including any active `rotation` chain).
+1. Checks `|ts_unix - now_unix| <= 300` seconds and checks `RendezvousReplayCache` for `rendezvous_nonce` and spare live capacity. Multi-connection listeners MUST share a single `RendezvousReplayCache` instance across concurrent inbound connections; at capacity (`MAX_RENDEZVOUS_REPLAY_ENTRIES = 4096`), the cache MUST evict only expired entries (`now_unix > ts_unix + 300`) and fail closed (route to decoy) rather than evicting live entries. The `Refusal` class uses its own cache and order (Section 3.1.3.2).
+2. Classifies every roster entry and evaluates `rendezvous_mac` across all candidates in constant time without early exit, even if `payload.len() != 56` (Section 3.1.3.1). Entries without a candidate secret run a dummy HMAC.
+3. Computes the target handshake bucket `bucket` from `V2_HANDSHAKE_BUCKETS = [4096, 16384, 32768, 63488]` matching `2 + len(host_hello_json) + 16` for the responder's actual `HostHello` (including any active `rotation` chain). The same `bucket` is used for genuine, decoy and refusal `msg2`.
 
-- **When verified, fresh (`<= 300s` skew), and un-replayed (with cache capacity):**
+##### 3.1.3.1 Entry Classification
+
+Before or inside the constant-time loop, the responder assigns each entry a class **unconditionally**: whether a stored CRL revokes the entry is evaluated for every entry, never only after its MAC matched. The candidate secrets are the keys the loop puts into the real HMAC for that entry.
+
+| Entry | Candidate secrets | Class on a verified match |
+|---|---|---|
+| `Active`, no stored CRL revokes it | `v2_secrets.reconnect_secret` | `Genuine` |
+| `Active`, no stored CRL revokes it | each in-memory rendezvous alternate | `Genuine` |
+| `Active`, revoked by a stored CRL | `v2_secrets.reconnect_secret` | `Refusal(4001)` when revoked notices are enabled (`spec/pairing-v1.md` Section 5.1), else `Silent` |
+| `Active`, revoked by a stored CRL | each rendezvous alternate | `Silent` |
+| `Pending` holding `v2_secrets` | `v2_secrets.reconnect_secret` | `Refusal(4004)` when pending notices are enabled, else `Silent` |
+| `Revoked` holding a live refusal secret (Section 3.1.1) | the refusal secret | `Refusal(4001)` |
+| any other entry | none (dummy HMAC) | n/a |
+
+- A manifest-pinned entry (a group sibling pin) and a group rendezvous secret held as a rendezvous alternate never yield a `Refusal` class: where the table gives `Refusal(_)`, they give `Silent`.
+- On a listener that is not refusal-enabled (`spec/wire-v1.md` Section 5.4.3), every `Refusal(_)` class becomes `Silent`.
+- **Identity collision:** when the verified candidates include a revoked entry (a `Revoked` entry's refusal secret, or a CRL-revoked `Active` entry's `v2_secrets`) and any entry that is not revoked, the same secret authenticates two identities and the result is `Silent`.
+- Otherwise, when several candidates verify, the result is the highest class in the strict order `Silent > Refusal(4001) > Genuine > Refusal(4004)`.
+- The order of entries in the roster never decides the result. Rendezvous alternates of a CRL-revoked entry are never `Genuine`.
+- `Silent` and no match route to the decoy. `Genuine` routes to the genuine path. `Refusal(code)` routes to the refusal path below.
+
+##### 3.1.3.2 Replay Caches and Refusal Limiter
+
+The `Refusal` class never inserts into the shared `RendezvousReplayCache`, so `Active` peers keep its full capacity. Refusals use a separate `RefusalReplayCache` of `256` entries with the same `300 s` freshness and eviction rules, shared across the listener's concurrent connections like the main cache. The steps run in order: check, then limiter, then insert.
+
+| Step | `Genuine` | `Refusal(code)` |
+|---|---|---|
+| a. check | `ts` fresh, `RendezvousReplayCache` can accept the nonce (step 1), and the nonce is not in `RefusalReplayCache` (read-only), so a `msg1` refused while the peer was pending cannot be replayed once after promotion | `ts` fresh, the nonce is in neither `RendezvousReplayCache` nor `RefusalReplayCache`, and `RefusalReplayCache` has spare live capacity. Read-only, so a replay never charges the limiter |
+| b. limit | n/a | the refusal limiter allows the peer (`spec/wire-v1.md` Section 5.4.2) |
+| c. insert | record `(rendezvous_nonce, ts_unix)` in `RendezvousReplayCache` | record `(rendezvous_nonce, ts_unix)` in `RefusalReplayCache` |
+| failure at any step | decoy | decoy |
+
+The decision is made before `msg2` is built.
+
+##### 3.1.3.3 Response Paths
+
+- **When verified, fresh (`<= 300s` skew), and un-replayed (with cache capacity), class `Genuine`:**
   1. Record `(rendezvous_nonce, ts_unix)` in `RendezvousReplayCache`.
   2. Build `Noise_XXhfs` with the responder's real static X25519 private key and process `msg1`.
   3. Construct `HostHello` (`proto_version = 2`), pad `uint16_be(len) || host_hello_json || 0x00...` to `bucket - 16`, derive `hello_seal_key = HKDF-SHA256(ikm = reconnect_secret, salt = rendezvous_nonce, info = "tendril-v2-hello-seal")`, and encrypt with `ChaCha20Poly1305(key = hello_seal_key, nonce = 0x00^12, aad = h_pre)` right before encrypting `msg2` payload (where `h_pre` is the Noise handshake hash immediately prior to `msg2` payload encryption).
-- **When missing, malformed, stale (`> 300s` clock skew), replayed, or invalid (unauthenticated probe):**
+- **When verified, class `Refusal(code)`, and steps a to c of Section 3.1.3.2 pass:**
+  1. Generate a fresh ephemeral X25519 decoy keypair (`decoy_static`) exactly as on the decoy path. The responder's real static key is never used for a refusal, so a refused peer never learns a rotated host key.
+  2. Build `Noise_XXhfs` with `decoy_static`, process `msg1`, and emit `sealed_refusal` (Section 3.1.5) as the `msg2` payload, `bucket` bytes long.
+  3. Continue exactly as on the decoy path: keep the half-open slot, wait for `msg3` or the handshake timeout, and reject any `msg3` unconditionally (`HostKeyUnverified`). The responder MUST NOT close early, because an early close would let a passive observer tell a refusal from a decoy on high-latency paths.
+- **When missing, malformed, stale (`> 300s` clock skew), replayed, invalid (unauthenticated probe), class `Silent`, or a `Refusal` that failed a step of Section 3.1.3.2:**
   1. Unconditionally generate a fresh ephemeral X25519 decoy keypair (`decoy_static`) so the active probe learns neither `static_pub` nor `device_id`. (When an authentic peer has `> 300s` clock skew, the responder routes to decoy and the initiator surfaces `HostKeyUnverified` upon decrypting or failing to unseal `HostHello`.)
   2. Build `Noise_XXhfs` with `decoy_static`, process `msg1`, and emit `bucket` bytes of fresh CSPRNG data as the `msg2` payload (exact same wire byte length as a genuine `msg2`, even when the host has rotated).
   3. Upon receiving `msg3`, reject the connection unconditionally (`HostKeyUnverified`).
+
+Genuine, refusal and decoy `msg2` have identical length. To anyone without the pair's `reconnect_secret`, a refusal is indistinguishable from a decoy.
 
 #### 3.1.4 Initiator Verification at `msg2` and Padded `msg3`
 
 Before transmitting `msg3`, the initiator:
 
 1. Decrypts `msg2` with `Noise_XXhfs`, recording `h_pre` immediately prior to payload decryption.
-2. Derives `hello_seal_key` from `reconnect_secret` and `rendezvous_nonce`, decrypts `sealed_envelope` (`nonce = 0x00^12`, `aad = h_pre`), verifies trailing zero padding in constant time, and parses `HostHello`.
+2. Derives `hello_seal_key` from `reconnect_secret` and `rendezvous_nonce`, decrypts `sealed_envelope` (`nonce = 0x00^12`, `aad = h_pre`), verifies trailing zero padding in constant time, and parses `HostHello`. When that AEAD open fails, the initiator derives `refusal_seal_key` (Section 3.1.5) and tries to open the same envelope with it:
+   - On success, it requires all of: the envelope length is one of `V2_HANDSHAKE_BUCKETS`; the responder static `remote_static` is a valid, non-low-order X25519 public key; the padding is all zero (checked in constant time); and the body has `len == 3`, `version == 0x01`, and a refusal code from `spec/wire-v1.md` Section 5.4.1. It then aborts with `PeerRefused(reason)` **without writing `msg3`**. An opened refusal that fails any of these checks is `ProtocolViolation`, also without writing `msg3`.
+   - When both opens fail, the initiator aborts with `HostKeyUnverified` without writing `msg3`.
+   An initiator built before Section 3.1.5 fails the `hello_seal_key` open on a refusal and reports `HostKeyUnverified`, as on a decoy.
 3. Verifies `proto_version == 2`, `host_id == target_host_id`, `signing_pub`, `remote_static`, and any `rotation` chain against the stored `Roster` pin. If verification fails, the initiator aborts immediately without writing `msg3`.
    When the connect carries a recovery URI or an operator relay key, the initiator also runs the session route checks (`spec/pairing-v1.md` Section 6.5) here, after the rotation chain verifies and before applying the rotation. The relay key check compares the operator `URL#key` (and any URI `rp`) with the Ed25519 component of the authenticated `HostHello.signing_pub`, even when no URI is supplied. A failure aborts without writing `msg3`.
 4. Encodes `SessionHello` (which may carry `route_seq`, `spec/wire-v1.md` Section 5.2.2) into a padded `msg3` payload (`uint16_be(len) || session_hello_json || 0x00...`) rounded up to the smallest bucket in `[512, 1024, 2048, 4096, 8192, 16384, 32768, 63488]`.
 
 On `msg3`, the responder MUST verify that `peer_static` matches the exact `RosterEntry` whose `reconnect_secret` authenticated `msg1`, enforce `PeerState::Active`, CRLs, `SessionHello.device_id == device_id(peer_static)`, and any presented `Grant`.
+
+An entry can change state between `msg1` and `msg3`. The responder refuses at `msg3` only when all of these hold: the entry is revoked with a live refusal notice, or `pending` with pending notices enabled (`spec/pairing-v1.md` Section 5.1); the entry is not manifest-pinned; `msg1` was not authenticated by a rendezvous alternate; the listener is refusal-enabled; and the refusal limiter allows. A revocation between `msg1` and `msg3` without a live notice (with `notify: false`, by a CRL ingested without notices, after `clear_refusal_notice`, or by fork detection) is silent. When the conditions hold, the responder seals one `0x07 CLOSE` with the refusal code under the session's padding policy (Section 5.1) and runs the refusal close sequence (`spec/wire-v1.md` Section 5.4.4). Otherwise it drops the connection as before. The initiator has already reported `Established`, so this refusal arrives after establishment, as on Wire v1.
+
+#### 3.1.5 Sealed Refusal Envelope
+
+A responder refuses a known `Pending` or `Revoked` peer at `msg2` (Section 3.1.3.3) by sealing a refusal under the pair secret in place of the sealed `HostHello`:
+
+```text
+refusal_seal_key = HKDF-SHA256(ikm = reconnect_secret, salt = rendezvous_nonce, info = "tendril-v2-refusal-seal")
+refusal_body     = version (1 B) = 0x01 || code (2 B uint16_be)
+refusal_pt       = uint16_be(3) || refusal_body || 0x00^(bucket - 16 - 5)
+sealed_refusal   = ChaCha20Poly1305(key = refusal_seal_key, nonce = 0x00^12, aad = h_pre, pt = refusal_pt)
+```
+
+- `reconnect_secret` is the candidate secret that verified `msg1`: the `Pending` entry's `v2_secrets.reconnect_secret`, the CRL-revoked `Active` entry's `v2_secrets.reconnect_secret`, or the `Revoked` entry's refusal secret (Section 3.1.1).
+- `code` is a refusal code of `spec/wire-v1.md` Section 5.4.1: `4001` for `Refusal(4001)`, `4004` for `Refusal(4004)`.
+- `bucket` is the responder's genuine `HostHello` bucket (Section 3.1.3 step 3), so `sealed_refusal` is exactly `bucket` bytes and the three `msg2` kinds have identical length.
+- `h_pre` is the Noise handshake hash immediately before `msg2` payload encryption, as for `hello_seal_key`. The Noise handshake for a refusal uses `decoy_static`, never the real static key.
+- An on-path attacker cannot forge or replay a refusal: the key needs the pair secret and is salted with the initiator's fresh `rendezvous_nonce`, and the AEAD binds the transcript through `h_pre`.
 
 ---
 
@@ -216,6 +281,8 @@ Inside Noise transport mode, each outer AEAD frame decrypts to a plaintext paylo
 | `0x0B` | `GROUP_RENDEZVOUS` | v1 and v2 | Exactly `60 B` (`group_id || seq || key`) | Group rendezvous key delivery (`spec/groups-v1.md` Section 7); sealed inside `0x09 PADDED` on v2 sessions |
 | `0x0C` | `ROUTE_SET` | v1 and v2 | `route_set_body \|\| sig`, `3455..=5003 B` (`spec/wire-v1.md` Section 5.2) | Host-signed route announcement, responder to initiator only; sealed inside `0x09 PADDED` on v2 sessions. A v2 session with padding disabled neither sends nor receives it |
 | `0x0D` | `PATH_UPGRADE` | v1 and v2 | Compact UTF-8 JSON `PathUpgradeMsg`, `<= 16384 B` (`spec/wire-v1.md` Section 5.3) | In-band direct path upgrade signaling; sealed inside `0x09 PADDED` on v2 sessions. A v2 session with padding disabled omits both `HostHello.upgrade` and `SessionHello.upgrade` and neither sends nor accepts `0x0D` |
+
+`0x07 CLOSE` reason codes, including refusal codes, follow the registry of `spec/wire-v1.md` Section 5.4.1. A responder that refuses at `msg3` time (Section 3.1.4) seals the refusal `0x07 CLOSE` through the session's own padding policy: inside `0x09 PADDED` at the smallest configured bucket when padding is enabled, or as a bare `0x07` when padding is disabled, because a session with padding disabled rejects `0x09`.
 
 Receivers MUST reject `0x08` and `0x09` on v1 (`0x01`) sessions (`UnknownInnerFrameType`). Direct application `seal()` calls MUST reject `0x04 REKEY`, `0x08 PADDING`, and `0x09 PADDED` (callers use `seal_rekey()` and `seal_dummy_cover()`). A bare unpadded `0x0D PATH_UPGRADE` on v2 is rejected (`UnknownInnerFrameType`).
 

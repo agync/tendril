@@ -1,7 +1,7 @@
 ---
 type: Design
 title: Wire v2 privacy profile and PAKE
-description: Wire 0x02 anti-downgrade floor, pseudonymous paired reconnect, opt-in Argon2id PAKE pairing, blinded /v2/relay epoch mailboxes, bucketed inner padding, and jittered scheduling.
+description: Wire 0x02 anti-downgrade floor, pseudonymous paired reconnect, sealed refusal for revoked and pending peers, opt-in Argon2id PAKE pairing, blinded /v2/relay epoch mailboxes, bucketed inner padding, and jittered scheduling.
 status: stable
 tags: [design, privacy, wire-v2, pake, relay]
 ---
@@ -41,6 +41,26 @@ sequenceDiagram
 - **Shared replay cache and constant-time scan:** Multi-connection listeners share one `RendezvousReplayCache` across concurrent inbound connections, enforcing `|ts_unix - now_unix| <= 300` seconds, evicting only expired entries at capacity, and failing closed to the decoy path when full. The responder evaluates `rendezvous_mac` across all roster entries without early exit regardless of payload length.
 - **Rotation-matched decoy `msg2`:** Both genuine sealed `HostHello` envelopes and unauthenticated CSPRNG decoy payloads pad to the same `V2_HANDSHAKE_BUCKETS` (`[4096, 16384, 32768, 63488]`) size computed for the responder's real `HostHello` (including any `RotationRecord` chain), hiding `static_pub`, `host_id`, `signing_pub`, and rotation state from active scanners.
 - **Post-establish floor and secret retention:** Pairing-derived `reconnect_secret` and `mailbox_secret` are retained across reconnects to prevent `msg3`-drop or concurrent-session secret desynchronization (session-exported secrets are informational/explicit-only). Reaching `Established` (`msg3` verified against an `Active` peer) raises `min_wire_version = 2`, never speculatively at `msg2`.
+
+## Sealed refusal for revoked and pending peers
+
+A host can tell a known device that it is revoked or still pending without telling anyone else (`spec/wire-v2.md` Sections 3.1.3 to 3.1.5). In place of the sealed `HostHello`, `msg2` carries a refusal sealed under `refusal_seal_key = HKDF-SHA256(reconnect_secret, rendezvous_nonce, "tendril-v2-refusal-seal")` with `aad = h_pre`, padded to the same bucket, over a Noise handshake that uses the decoy static key. The device fails at `msg2` with `PeerRefused` and never writes `msg3`.
+
+- **Classification:** every roster entry gets a class on every `msg1` (`Genuine`, `Refusal(4001)`, `Refusal(4004)`, `Silent`), and CRL checks run for every entry, not only after a match. A secret that verifies for both a revoked and a non-revoked entry gives `Silent`; other matches merge in the strict order `Silent > Refusal(4001) > Genuine > Refusal(4004)`, so roster order never decides. Manifest-pinned siblings and group rendezvous secrets never refuse.
+- **Revoked peers keep one secret:** a revocation that records a notice keeps only the peer's `reconnect_secret`, for the notice lifetime (30 days by default), and zeroizes `mailbox_secret`. Fork revocations never record one.
+- **Separate replay cache:** refusals use their own `256`-entry replay cache and a limiter of one refusal per peer per `10 s`, in the order check, then limiter, then insert. A revoked peer flooding `msg1` cannot fill the shared cache that `Active` peers depend on, and a replay never charges the limiter.
+- **Decoy timing parity:** after a refusal the host waits for `msg3` or the handshake timeout and holds the half-open slot, exactly as on a decoy. Closing early would let a passive observer on a slow path tell a refusal from a decoy.
+- **Late state change:** an entry revoked between `msg1` and `msg3` gets a `0x07 CLOSE` refusal sealed under the session padding policy, which the device sees after `Established`.
+
+| Observer | Learns from a refusal |
+|---|---|
+| Stranger or active scanner | nothing: a refusal looks like a decoy without the pair secret |
+| Passive observer | nothing: same bucket, same timing as a decoy |
+| On-path attacker | can drop it; cannot forge or replay it |
+| The revoked device | that this host revoked it, and that the host at this address is the one that did. This is the main privacy cost, bounded by the notice lifetime, by `notify: false` on a revoke, and by group listeners never refusing |
+| A device probing a group endpoint | nothing: group listeners never refuse, so a refusal cannot link a group endpoint to its host |
+
+An initiator built before refusals fails the hello open and reports `HostKeyUnverified`, as on a decoy.
 
 ## Opt-in PAKE pairing (`FLAG_PAKE_PAIR = 0x01`)
 
