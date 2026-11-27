@@ -1795,14 +1795,17 @@ impl Roster {
 
     /// Records the keys of a dropped claim as `Revoked`. The entry under
     /// `device_id(static_pub)` carries them only when it holds the same static key and no other
-    /// signing key (a missing one is filled from the claim); otherwise a revoked record is kept
+    /// signing key (a missing one is filled from the claim, and a claim without one is covered
+    /// by any); otherwise a revoked record is kept
     /// under a key no `host_id` can take, so no label and no entry holding other keys is revoked.
     fn revoke_claim_keys(&mut self, mut claim: RosterEntry) {
         let own = device_id(&claim.static_pub);
         match self.entries.get_mut(&own) {
             Some(entry)
                 if entry.static_pub == claim.static_pub
-                    && (entry.signing_pub.is_none() || entry.signing_pub == claim.signing_pub) =>
+                    && (entry.signing_pub.is_none()
+                        || claim.signing_pub.is_none()
+                        || entry.signing_pub == claim.signing_pub) =>
             {
                 if entry.signing_pub.is_none() {
                     entry.signing_pub.clone_from(&claim.signing_pub);
@@ -3019,7 +3022,7 @@ impl Roster {
 
         // Entries and anchors first: a record the fold inserts or completes (a tombstone, a
         // key filled into a keyless entry) can be the issuer key a held CRL verifies against.
-        self.absorb_held_entries(held);
+        self.absorb_held_entries(held, &original);
         self.absorb_held_anchors(held);
         self.absorb_held_crls(held, local);
         self.set_absorbed_notices(held, &original);
@@ -3106,7 +3109,11 @@ impl Roster {
         }
     }
 
-    fn absorb_held_entries(&mut self, held: &Roster) {
+    /// Two passes, so the result never depends on map order: the first inserts or revokes the
+    /// record under every held key, the second keeps the held keys of every record disk
+    /// replaced revoked (`revoke_claim_keys`), keyed claims before keyless ones.
+    fn absorb_held_entries(&mut self, held: &Roster, original: &BTreeMap<String, RosterEntry>) {
+        let mut replaced: Vec<RosterEntry> = Vec::new();
         for (key, h) in &held.entries {
             if h.state != PeerState::Revoked {
                 continue;
@@ -3120,12 +3127,29 @@ impl Roster {
             // key: revoking that record revokes the static key.
             let same_keys = disk.static_pub == h.static_pub
                 && (h.signing_pub.is_none() || disk.signing_pub == h.signing_pub);
-            let was_revoked = disk.state == PeerState::Revoked;
-            if !was_revoked {
+            // Gated on the state before the fold, not the live one: an earlier entry may have
+            // revoked this one as a sibling by static key without revoking its signing key.
+            if original
+                .get(key)
+                .is_none_or(|d| d.state != PeerState::Revoked)
+            {
                 let _ = self.revoke_entry(key, None);
             }
             if !same_keys {
-                self.revoke_claim_keys(Self::sanitized_revoked(h));
+                replaced.push(Self::sanitized_revoked(h));
+            }
+        }
+        replaced.sort_by_key(|claim| claim.signing_pub.is_none());
+        for claim in replaced {
+            let covered = claim.signing_pub.is_none()
+                && self
+                    .entries
+                    .values()
+                    .any(|e| e.static_pub == claim.static_pub);
+            if covered {
+                self.revoke_siblings_by_keys(claim.static_pub, None, true);
+            } else {
+                self.revoke_claim_keys(claim);
             }
         }
     }
