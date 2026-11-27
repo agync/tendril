@@ -27,11 +27,24 @@ enum TendrilResult {
     TENDRIL_ERR_NOT_FOUND = -2,
     TENDRIL_ERR_CLOSED = -5,
     TENDRIL_ERR_PROTOCOL = -6,
-    TENDRIL_ERR_INTERNAL = -7
+    TENDRIL_ERR_INTERNAL = -7,
+    /* The peer authenticated a refusal: its host revoked or has not confirmed this device.
+     * tendril_last_error_code holds refused_revoked, refused_pending or refused. */
+    TENDRIL_ERR_REFUSED = -8
 };
+
+/* Close codes a host sends to refuse a known peer (closed event "code"). */
+#define TENDRIL_CLOSE_PEER_REVOKED 4001
+#define TENDRIL_CLOSE_PEER_PENDING 4004
 
 /* Copies the last thread-local error message into buf (NUL-terminated). Returns bytes needed. */
 int32_t tendril_last_error(char *buf, size_t cap);
+
+/* Copies the stable machine code of the last error on this thread into buf, "" when untyped
+ * (refused_revoked, refused_pending, refused, host_key_unverified, ...). Same contract as
+ * tendril_last_error: no allocation, NUL-terminated, returns bytes needed, never changes the
+ * stored error. Read both on the thread of the failing call, before its next FFI call. */
+int32_t tendril_last_error_code(char *buf, size_t cap);
 
 /* Frees a NUL-terminated UTF-8 string allocated by tendril-ffi. */
 void tendril_string_free(char *ptr);
@@ -174,7 +187,20 @@ int32_t tendril_endpoint_mint_grant(
     uint64_t ttl_secs,
     char **out_grant_json
 );
+/* Revokes peer_id; records a refusal notice under the endpoint refusal policy. */
 int32_t tendril_endpoint_revoke_peer(TendrilEndpoint *ep, const char *peer_id);
+/* options_json: NULL or {"notify": bool}. NULL and an absent notify follow the policy;
+ * {"notify": false} revokes silently. TENDRIL_ERR_NOT_FOUND for an unknown peer. */
+int32_t tendril_endpoint_revoke_peer_with_options(
+    TendrilEndpoint *ep,
+    const char *peer_id,
+    const char *options_json
+);
+/* policy_json: {"pending": bool, "revoked_notice_ttl_secs": u64}, absent fields default to
+ * (true, 30 days); 0 records no notice. Persisted with the roster. */
+int32_t tendril_endpoint_set_refusal_policy_json(TendrilEndpoint *ep, const char *policy_json);
+/* Drops the refusal notice of peer_id, which stays revoked. TENDRIL_ERR_NOT_FOUND if unknown. */
+int32_t tendril_endpoint_clear_refusal_notice(TendrilEndpoint *ep, const char *peer_id);
 /* Unconfirmed host claims left by unpinned pairing. out_json: array, oldest first, of
  * {"host_id", "device_id", "name", "static_pub", "signing_pub_hash", "rotation_seq",
  * "min_wire_version", "pairing_sas"}; host_id is the unauthenticated label a claim names and

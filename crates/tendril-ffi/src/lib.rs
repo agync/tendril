@@ -19,7 +19,7 @@ use tendril_core::crypto::{
     b64url_decode_array, b64url_encode, compute_code_mac, device_id, fingerprint_device,
     fingerprint_host, pairing_sas, random_bytes,
 };
-use tendril_core::error::CoreError;
+use tendril_core::error::{CoreError, RefusalReason};
 use tendril_core::grants::{Grant, RevocationList, authorize_grant, canonical_json};
 use tendril_core::identity::{
     EndpointIdentity, RotationRecord, SigningKeyPin, is_valid_host_id, verify_rotation_chain,
@@ -31,7 +31,9 @@ use tendril_core::pairing::{
 };
 use tendril_core::policy::{CandidateEndpoint, ProviderId};
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket, origin_allowed};
-use tendril_core::roster::{AnchorState, PeerState, Roster, RouteMeta, RouteSource, StoredRoute};
+use tendril_core::roster::{
+    AnchorState, PeerState, RefusalPolicy, Roster, RouteMeta, RouteSource, StoredRoute,
+};
 use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
@@ -83,20 +85,34 @@ pub const TENDRIL_ERR_NOT_FOUND: i32 = -2;
 pub const TENDRIL_ERR_CLOSED: i32 = -5;
 pub const TENDRIL_ERR_PROTOCOL: i32 = -6;
 pub const TENDRIL_ERR_INTERNAL: i32 = -7;
+/// The peer authenticated a refusal: its host revoked or has not confirmed this device.
+/// [`tendril_last_error_code`] holds `refused_revoked`, `refused_pending` or `refused`.
+pub const TENDRIL_ERR_REFUSED: i32 = -8;
+/// Close code of a host that refuses a revoked peer.
+pub const TENDRIL_CLOSE_PEER_REVOKED: u16 = 4001;
+/// Close code of a host that refuses a peer it has not confirmed.
+pub const TENDRIL_CLOSE_PEER_PENDING: u16 = 4004;
 pub const TENDRIL_MLDSA65_PUB_LEN: usize = MLDSA65_PUBLIC_LEN;
 pub const TENDRIL_MLDSA65_SIG_LEN: usize = MLDSA65_SIG_LEN;
 
 thread_local! {
-    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The redacted message and the stable machine code (`""` when untyped) of the last error.
+    static LAST_ERROR: RefCell<(String, &'static str)> = const { RefCell::new((String::new(), "")) };
 }
 
 /// Stores `msg` for [`tendril_last_error`] in redacted form: the shared runtime scrubber
 /// ([`redact_text`]) keeps only `scheme://host[:port]` of a URL, masks pairing codes and redacts
 /// a quoted value to the end of its line, so raw caller input never reaches a host app's logs.
 fn set_last_error(msg: impl Into<String>) {
+    set_last_typed_error(msg, "");
+}
+
+/// [`set_last_error`] with the stable machine code of the failure (`refused_revoked`, ...)
+/// that [`tendril_last_error_code`] reports. The code is a static name, never caller input.
+fn set_last_typed_error(msg: impl Into<String>, code: &'static str) {
     let s = redact_text(&msg.into());
     LAST_ERROR.with(|cell| {
-        *cell.borrow_mut() = s;
+        *cell.borrow_mut() = (s, code);
     });
 }
 
@@ -108,7 +124,7 @@ fn json_error(name: &str, err: &serde_json::Error) -> String {
 
 fn clear_last_error() {
     LAST_ERROR.with(|cell| {
-        cell.borrow_mut().clear();
+        *cell.borrow_mut() = (String::new(), "");
     });
 }
 
@@ -1711,6 +1727,8 @@ pub struct TendrilSession {
     v1_root_id: Option<String>,
     v1_local_signing: Option<(String, HybridSigningPublicKey)>,
     local_device_id: String,
+    /// `true` for a session this endpoint dialed: only an initiator maps a refusal close.
+    initiator: bool,
     session: SessionBackend,
 }
 
@@ -1810,25 +1828,50 @@ impl TendrilSession {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tendril_last_error(buf: *mut c_char, cap: usize) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        LAST_ERROR.with(|cell| {
-            let msg = cell.borrow();
-            let bytes = msg.as_bytes();
-            let needed = bytes.len() + 1;
-            if buf.is_null() || cap == 0 {
-                return i32::try_from(needed).unwrap_or(i32::MAX);
-            }
-            let mut copy_len = bytes.len().min(cap - 1);
-            while copy_len > 0 && !msg.is_char_boundary(copy_len) {
-                copy_len -= 1;
-            }
-            unsafe {
-                ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), copy_len);
-                *buf.add(copy_len) = 0;
-            }
-            i32::try_from(needed).unwrap_or(i32::MAX)
-        })
+        LAST_ERROR.with(|cell| unsafe { copy_c_string(&cell.borrow().0, buf, cap) })
     }))
     .unwrap_or(-1)
+}
+
+/// Copies the stable machine code of the last FFI error on this thread into `buf`, or `""` when
+/// the failure is untyped.
+///
+/// The code is one of the runtime error names (`refused_revoked`, `refused_pending`, `refused`,
+/// `host_key_unverified`, ...). It follows the contract of [`tendril_last_error`]: no allocation,
+/// NUL-terminated, returns the bytes needed including the NUL, and a read never changes the
+/// stored error. Read both on the thread that made the failing call, before the next FFI call
+/// on it, because every other entry point clears them.
+///
+/// # Safety
+/// `buf` must be null (to query needed length) or point to `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_last_error_code(buf: *mut c_char, cap: usize) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        LAST_ERROR.with(|cell| unsafe { copy_c_string(cell.borrow().1, buf, cap) })
+    }))
+    .unwrap_or(-1)
+}
+
+/// Copies `msg` into `buf` as a NUL-terminated string truncated on a char boundary and returns
+/// the bytes needed for the whole string including the NUL.
+///
+/// # Safety
+/// `buf` must be null or point to `cap` writable bytes.
+unsafe fn copy_c_string(msg: &str, buf: *mut c_char, cap: usize) -> i32 {
+    let bytes = msg.as_bytes();
+    let needed = bytes.len() + 1;
+    if buf.is_null() || cap == 0 {
+        return i32::try_from(needed).unwrap_or(i32::MAX);
+    }
+    let mut copy_len = bytes.len().min(cap - 1);
+    while copy_len > 0 && !msg.is_char_boundary(copy_len) {
+        copy_len -= 1;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), copy_len);
+        *buf.add(copy_len) = 0;
+    }
+    i32::try_from(needed).unwrap_or(i32::MAX)
 }
 
 /// Frees a NUL-terminated string returned by `tendril-ffi` after zeroizing its buffer.
@@ -3286,6 +3329,11 @@ pub unsafe extern "C" fn tendril_endpoint_mint_grant(
 
 /// Marks `peer_id` as `Revoked` and clears its stored grants (`pair.revoke`).
 ///
+/// A peer that was `Active` or `Pending` gets a refusal notice under the endpoint refusal policy
+/// ([`tendril_endpoint_set_refusal_policy_json`]), so its next connect fails with
+/// `TENDRIL_ERR_REFUSED` instead of an unexplained timeout. It is
+/// [`tendril_endpoint_revoke_peer_with_options`] with `NULL` options.
+///
 /// # Safety
 /// `ep` and `peer_id` must be valid non-null pointers.
 #[unsafe(no_mangle)]
@@ -3301,16 +3349,150 @@ pub unsafe extern "C" fn tendril_endpoint_revoke_peer(
         let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
             return TENDRIL_ERR_INVALID_ARG;
         };
+        revoke_peer_notified(unsafe { &*ep }, peer_s, true)
+    })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RevokeOptions {
+    notify: Option<bool>,
+}
+
+/// Marks `peer_id` as `Revoked` like [`tendril_endpoint_revoke_peer`], with an explicit choice
+/// of whether to record a refusal notice.
+///
+/// `options_json` is `NULL`, empty or `{"notify": bool}`. `NULL` and an absent `notify` use the
+/// endpoint policy, which records a notice unless its `revoked_notice_ttl_secs` is `0`;
+/// `{"notify": false}` revokes silently and clears any earlier notice. Returns
+/// `TENDRIL_ERR_NOT_FOUND` for an unknown peer.
+///
+/// # Safety
+/// `ep` and `peer_id` must be valid non-null pointers; `options_json` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_revoke_peer_with_options(
+    ep: *mut TendrilEndpoint,
+    peer_id: *const c_char,
+    options_json: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let Ok(opts_raw) = (unsafe { opt_cstr_to_str(options_json, "options_json") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let opts: RevokeOptions = match parse_options(opts_raw, "options_json") {
+            Ok(o) => o,
+            Err(e) => {
+                set_last_error(e);
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        revoke_peer_notified(unsafe { &*ep }, peer_s, opts.notify.unwrap_or(true))
+    })
+}
+
+fn revoke_peer_notified(ep: &TendrilEndpoint, peer_id: &str, notify: bool) -> i32 {
+    let now = now_unix();
+    if let Err((rc, msg)) = ep.mutate_roster(|roster| {
+        roster
+            .revoke_peer_at(peer_id, notify, now)
+            .map_err(|e| (revoke_error_code(&e), e.to_string()))
+    }) {
+        set_last_error(msg);
+        return rc;
+    }
+    ep.refresh_m2m_enabled(&lock_roster(&ep.roster));
+    TENDRIL_OK
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefusalPolicyInput {
+    pending: Option<bool>,
+    revoked_notice_ttl_secs: Option<u64>,
+}
+
+/// Sets the host refusal policy and persists it with the roster.
+///
+/// `policy_json` is `{"pending": bool, "revoked_notice_ttl_secs": u64}`; an absent field takes
+/// its default (`true`, 30 days). `pending` refuses unconfirmed peers with `4004`;
+/// `revoked_notice_ttl_secs` is the lifetime of a notice recorded at revocation, and `0`
+/// records none. Notices already recorded keep their expiry.
+///
+/// # Safety
+/// `ep` and `policy_json` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_set_refusal_policy_json(
+    ep: *mut TendrilEndpoint,
+    policy_json: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(raw) = (unsafe { cstr_to_str(policy_json, "policy_json") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
+        let input: RefusalPolicyInput = match serde_json::from_str(raw) {
+            Ok(i) => i,
+            Err(e) => {
+                set_last_error(json_error("policy_json", &e));
+                return TENDRIL_ERR_INVALID_ARG;
+            }
+        };
+        let defaults = RefusalPolicy::default();
+        let policy = RefusalPolicy {
+            pending: input.pending.unwrap_or(defaults.pending),
+            revoked_notice_ttl_secs: input
+                .revoked_notice_ttl_secs
+                .unwrap_or(defaults.revoked_notice_ttl_secs),
+        };
+        let ep = unsafe { &*ep };
+        if let Err((rc, msg)) = ep.mutate_roster(|roster| {
+            roster.set_refusal_policy(policy);
+            Ok(())
+        }) {
+            set_last_error(msg);
+            return rc;
+        }
+        TENDRIL_OK
+    })
+}
+
+/// Drops the refusal notice of `peer_id`. The peer stays `Revoked`: its next connect is no
+/// longer told why. Returns `TENDRIL_ERR_NOT_FOUND` for an unknown peer.
+///
+/// # Safety
+/// `ep` and `peer_id` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_clear_refusal_notice(
+    ep: *mut TendrilEndpoint,
+    peer_id: *const c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() {
+            set_last_error("null endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let Ok(peer_s) = (unsafe { cstr_to_str(peer_id, "peer_id") }) else {
+            return TENDRIL_ERR_INVALID_ARG;
+        };
         let ep = unsafe { &*ep };
         if let Err((rc, msg)) = ep.mutate_roster(|roster| {
             roster
-                .revoke_peer(peer_s)
+                .clear_refusal_notice(peer_s)
                 .map_err(|e| (revoke_error_code(&e), e.to_string()))
         }) {
             set_last_error(msg);
             return rc;
         }
-        ep.refresh_m2m_enabled(&lock_roster(&ep.roster));
         TENDRIL_OK
     })
 }
@@ -3843,15 +4025,17 @@ fn connect_session(ep: &TendrilEndpoint, req: ConnectRequest<'_>) -> *mut Tendri
                 v1_root_id: (req.wire != 2).then(|| req.target.to_owned()),
                 v1_local_signing: None,
                 local_device_id: ep.identity.device_id(),
+                initiator: true,
                 session,
             }))
         }
         Err(err) => {
             let msg = attempt_error_message(&err);
-            match synced {
-                Ok(()) => set_last_error(msg),
-                Err(pe) => set_last_error(format!("{msg} (roster sync error: {pe})")),
-            }
+            let msg = match synced {
+                Ok(()) => msg,
+                Err(pe) => format!("{msg} (roster sync error: {pe})"),
+            };
+            set_last_typed_error(msg, err.error.code());
             ptr::null_mut()
         }
     }
@@ -4072,6 +4256,7 @@ pub unsafe extern "C" fn tendril_session_accept(
                     v1_root_id: Some(local_id.clone()),
                     v1_local_signing: Some((local_id, local_sig)),
                     local_device_id: ep.identity.device_id(),
+                    initiator: false,
                     session,
                 }))
             }
@@ -4203,10 +4388,7 @@ pub unsafe extern "C" fn tendril_session_send_data(
         let sess = unsafe { &*sess };
         match sess.rt.block_on(sess.session.send_data(slice)) {
             Ok(()) => TENDRIL_OK,
-            Err(e) => {
-                set_last_error(e.to_string());
-                TENDRIL_ERR_PROTOCOL
-            }
+            Err(e) => fail_session_err(&e),
         }
     })
 }
@@ -4293,6 +4475,10 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                         "event": "closed",
                         "code": code,
                         "reason": reason,
+                        "refusal": sess.initiator
+                            .then(|| RefusalReason::from_close_code(code))
+                            .flatten()
+                            .map(refusal_name),
                     }),
                 };
                 let serialized = Zeroizing::new(val.to_string());
@@ -4310,10 +4496,11 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                     sess.load_roster_from_store()
                 };
                 match sync_res {
-                    Ok(()) => set_last_error(e.to_string()),
-                    Err(pe) => set_last_error(format!("{e} (roster persist error: {pe})")),
+                    Ok(()) => fail_session_err(&e),
+                    Err(pe) => {
+                        fail_session_err_msg(&e, format!("{e} (roster persist error: {pe})"))
+                    }
                 }
-                TENDRIL_ERR_PROTOCOL
             }
             Err(_) => TENDRIL_WOULD_BLOCK,
         }
@@ -4363,10 +4550,7 @@ pub unsafe extern "C" fn tendril_session_rekey(sess: *mut TendrilSession) -> i32
         let sess = unsafe { &*sess };
         match sess.rt.block_on(sess.session.send_rekey()) {
             Ok(()) => TENDRIL_OK,
-            Err(e) => {
-                set_last_error(e.to_string());
-                TENDRIL_ERR_PROTOCOL
-            }
+            Err(e) => fail_session_err(&e),
         }
     })
 }
@@ -4395,10 +4579,7 @@ pub unsafe extern "C" fn tendril_session_close(
                 .send_close(code, reason_opt.unwrap_or("normal")),
         ) {
             Ok(()) => TENDRIL_OK,
-            Err(e) => {
-                set_last_error(e.to_string());
-                TENDRIL_ERR_PROTOCOL
-            }
+            Err(e) => fail_session_err(&e),
         }
     })
 }
@@ -5082,6 +5263,7 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
                     v1_root_id: None,
                     v1_local_signing: None,
                     local_device_id: ep.identity.device_id(),
+                    initiator: false,
                     session,
                 }))
             }
@@ -5159,6 +5341,31 @@ const fn revoke_error_code(err: &CoreError) -> i32 {
     match err {
         CoreError::PeerNotFound(_) => TENDRIL_ERR_NOT_FOUND,
         _ => TENDRIL_ERR_PROTOCOL,
+    }
+}
+
+/// Name of a refusal reason in the closed event: `revoked`, `pending` or `other`.
+const fn refusal_name(reason: RefusalReason) -> &'static str {
+    match reason {
+        RefusalReason::Revoked => "revoked",
+        RefusalReason::Pending => "pending",
+        RefusalReason::Other(_) => "other",
+    }
+}
+
+/// Records a failed session call and returns its result code: [`TENDRIL_ERR_REFUSED`] for an
+/// authenticated refusal, [`TENDRIL_ERR_PROTOCOL`] otherwise. The stable code of the error is
+/// stored for [`tendril_last_error_code`] either way.
+fn fail_session_err(err: &RuntimeError) -> i32 {
+    fail_session_err_msg(err, err.to_string())
+}
+
+fn fail_session_err_msg(err: &RuntimeError, msg: String) -> i32 {
+    set_last_typed_error(msg, err.code());
+    if err.refusal().is_some() {
+        TENDRIL_ERR_REFUSED
+    } else {
+        TENDRIL_ERR_PROTOCOL
     }
 }
 
@@ -7320,7 +7527,7 @@ mod route_state_tests {
     }
 
     fn last_err() -> String {
-        LAST_ERROR.with(|c| c.borrow().clone())
+        LAST_ERROR.with(|c| c.borrow().0.clone())
     }
 
     struct Ep(*mut TendrilEndpoint);
