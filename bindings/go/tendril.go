@@ -889,8 +889,8 @@ func (ep *Endpoint) MintGrant(peerID string, caps []string, ttlSecs uint64) (str
 
 // RevokePeer marks peerID as Revoked and clears its grants. Unless the endpoint refusal policy
 // records no notice, the peer receives an authenticated refusal on its next session attempt. It
-// shows up as a *RefusedError from ConnectV2, SendData, Rekey or CloseSession, or as
-// SessionEvent.Refused on PollEvent.
+// shows up as a *RefusedError from ConnectV2, ConnectWithOptions with Wire 2, SendData, Rekey
+// or CloseSession, or as SessionEvent.Refused on PollEvent.
 func (ep *Endpoint) RevokePeer(peerID string) error {
 	return ep.RevokePeerWithOptions(peerID, nil)
 }
@@ -1918,7 +1918,9 @@ type ConnectOptions struct {
 }
 
 // ConnectWithOptions opens a session toward targetHostID, dialing its stored routes unless
-// opts.Endpoint is set. A nil opts connects over Wire v1 without a grant.
+// opts.Endpoint is set. A nil opts connects over Wire v1 without a grant. With Wire 2 a host
+// refusal returns a *RefusedError; over Wire v1 the refusal arrives after the call, as a closed
+// SessionEvent.
 func (ep *Endpoint) ConnectWithOptions(targetHostID string, opts *ConnectOptions) (*Session, error) {
 	var sess *Session
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
