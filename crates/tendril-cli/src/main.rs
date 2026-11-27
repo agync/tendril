@@ -1716,7 +1716,7 @@ fn swap_if_stamp_unchanged(
     if *current != *expected {
         return false;
     }
-    carry_unpersisted_crls(&memory, &mut written, identity);
+    carry_held_revocations(&memory, &mut written, identity);
     *memory = written;
     *current = stamp;
     true
@@ -1743,7 +1743,9 @@ async fn run_v1_session(
         let _guard = store_lock.lock().await;
         match store.roster_stamp() {
             Ok(curr_stamp) if curr_stamp != last_stamp => match store.load_roster_with_stamp() {
-                Ok((disk, fresh_stamp)) => {
+                Ok((mut disk, fresh_stamp)) => {
+                    // Disk wins for everything but the revocation state the accept added.
+                    carry_held_revocations(&roster, &mut disk, &identity);
                     roster = disk;
                     last_stamp = fresh_stamp;
                 }
@@ -1981,7 +1983,7 @@ async fn refresh_roster_if_changed(
                 // stamp moves under the same lock (roster, then stamp), so a concurrent CRL
                 // persist's compare-and-swap sees roster and stamp change together.
                 let mut memory = roster_arc.lock().expect("roster lock");
-                carry_unpersisted_crls(&memory, &mut disk, identity);
+                carry_held_revocations(&memory, &mut disk, identity);
                 *memory = disk;
                 *last_stamp_arc.lock().expect("stamp lock") = fresh_stamp;
                 drop(memory);
@@ -2196,7 +2198,7 @@ async fn run_v2_session(
                 match loaded {
                     Ok((mut disk, fresh_stamp)) => {
                         let mut memory = roster_arc.lock().expect("roster lock");
-                        carry_unpersisted_crls(&memory, &mut disk, &identity);
+                        carry_held_revocations(&memory, &mut disk, &identity);
                         *memory = disk;
                         *last_stamp_arc.lock().expect("stamp lock") = fresh_stamp;
                         drop(memory);
@@ -2264,52 +2266,19 @@ async fn run_v2_session(
     session.shutdown();
 }
 
-/// The signing key a CRL from `issuer` is verified with against `roster`: this host's, a
-/// paired peer's or an active trust anchor's (so anchor CRLs survive reloads too).
-fn crl_issuer_key(
-    roster: &Roster,
-    identity: &tendril_core::identity::EndpointIdentity,
-    issuer: &str,
-) -> Option<HybridSigningPublicKey> {
-    if issuer == identity.host_id() {
-        Some(identity.signing_key().public_key().clone())
-    } else {
-        roster
-            .lookup_active_signing_key(issuer)
-            .or_else(|| roster.lookup_active_anchor_key(issuer))
-            .or_else(|| {
-                roster
-                    .get(issuer)
-                    .filter(|e| e.state != PeerState::Pending)
-                    .and_then(|e| e.signing_pub.clone())
-            })
-    }
-}
-
-/// Re-ingests into `disk` every CRL `memory` holds at a higher sequence (accepted by a session
-/// but not yet persisted), so a roster reload never drops revocation state.
-fn carry_unpersisted_crls(
+/// Folds into `disk` the revocation state `memory` holds (CRLs, revoked entries and anchors a
+/// session accepted but the store lacks), so a roster reload never drops it. Verification keys
+/// and notice rules are those of `Roster::absorb_held_revocations`, with this host's own key
+/// for its own CRL.
+fn carry_held_revocations(
     memory: &Roster,
     disk: &mut Roster,
     identity: &tendril_core::identity::EndpointIdentity,
 ) {
-    let issuers: Vec<String> = memory
-        .entries()
-        .map(|(id, _)| id.clone())
-        .chain(memory.trust_anchors().map(|(id, _)| id.clone()))
-        .chain(std::iter::once(identity.host_id().to_owned()))
-        .collect();
-    for issuer in issuers {
-        let Some(crl) = memory.crl(&issuer) else {
-            continue;
-        };
-        if disk.crl(&issuer).is_some_and(|held| held.seq >= crl.seq) {
-            continue;
-        }
-        if let Some(pk) = crl_issuer_key(disk, identity, &issuer) {
-            let _ = disk.ingest_crl(crl.clone(), &issuer, &pk);
-        }
-    }
+    disk.absorb_held_revocations(
+        memory,
+        Some((identity.host_id(), identity.signing_key().public_key())),
+    );
 }
 
 fn persist_crl_for_issuer(
@@ -2324,21 +2293,13 @@ fn persist_crl_for_issuer(
     )>,
     tendril_runtime::RuntimeError,
 > {
-    let Some(crl) = roster.crl(issuer).cloned() else {
+    if roster.crl(issuer).is_none() {
         return Ok(None);
-    };
+    }
     let ((), disk, stamp) = store.update_roster_with_state(|disk| {
-        // Other held CRLs not yet on disk go in the same write, so swapping the session
-        // roster for the written one never drops them.
-        carry_unpersisted_crls(roster, disk, identity);
-        let Some(pk) = crl_issuer_key(disk, identity, issuer) else {
-            return Ok(());
-        };
-        if let Err(err) = disk.ingest_crl(crl, issuer, &pk)
-            && !matches!(err, tendril_core::error::CoreError::CrlStaleSeq { .. })
-        {
-            return Err(err.into());
-        }
+        // Every held revocation goes in the same write as the CRL of `issuer`, so swapping the
+        // session roster for the written one never drops any.
+        carry_held_revocations(roster, disk, identity);
         Ok(())
     })?;
     Ok(Some((disk, stamp)))
@@ -2757,7 +2718,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
             let announcer = Arc::new(RouteAnnouncer::new(
                 (*identity).clone(),
-                RosterAccess::from_store(Arc::clone(&store))?,
+                RosterAccess::from_store(Arc::clone(&store))?.with_local_signer(
+                    identity.host_id(),
+                    identity.signing_key().public_key().clone(),
+                ),
                 AdvertiseInputs {
                     mode: AdvertiseMode::Explicit,
                     served_endpoints,
@@ -3152,7 +3116,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             opts.operator_endpoint = endpoint;
             opts.persist = persist;
             opts.relay_auth_origins = origins.relay_auth_origins;
-            let access = RosterAccess::from_store(Arc::clone(&store))?;
+            let access = RosterAccess::from_store(Arc::clone(&store))?.with_local_signer(
+                identity.host_id(),
+                identity.signing_key().public_key().clone(),
+            );
 
             if wire_v2 {
                 let res = drive_v2_pair_initiator_with_policy(identity, &access, opts)
@@ -3576,7 +3543,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .clone_from(&origins.relay_auth_origins);
                 opts
             };
-            let access = RosterAccess::from_store(Arc::clone(&store))?;
+            let access = RosterAccess::from_store(Arc::clone(&store))?.with_local_signer(
+                identity.host_id(),
+                identity.signing_key().public_key().clone(),
+            );
             let identity = Arc::new(identity);
 
             let mut out = if wire_v2 {
@@ -3733,6 +3703,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Route { cmd } => {
             let access = RosterAccess::from_store(Arc::clone(&store))?;
+            // A store without a readable identity has no host CRL of its own to keep.
+            let access = match store.load_identity() {
+                Ok(identity) => access.with_local_signer(
+                    identity.host_id(),
+                    identity.signing_key().public_key().clone(),
+                ),
+                Err(_) => access,
+            };
             match cmd {
                 RouteCommand::Set {
                     target,
@@ -4380,8 +4358,60 @@ mod tests {
                 anchor.signing_key().public_key(),
             )
             .expect("anchor crl");
-        carry_unpersisted_crls(&memory, &mut disk, &identity);
+        carry_held_revocations(&memory, &mut disk, &identity);
         assert_eq!(disk.crl(anchor.host_id()).map(|c| c.seq), Some(3));
+    }
+
+    #[test]
+    fn a_reload_keeps_the_hosts_own_crl_and_revoked_state() {
+        let identity = tendril_core::identity::EndpointIdentity::generate().expect("identity");
+        let anchor = tendril_core::identity::EndpointIdentity::generate().expect("anchor");
+        let peer = tendril_core::identity::EndpointIdentity::generate().expect("peer");
+        let mut disk = Roster::new();
+        disk.add_trust_anchor(
+            anchor.host_id().to_owned(),
+            anchor.signing_key().public_key().clone(),
+        )
+        .expect("anchor");
+        disk.insert_pinned_host(
+            peer.host_id().to_owned(),
+            "peer".to_owned(),
+            *peer.static_key().public_bytes(),
+            Some(peer.signing_key().public_key().clone()),
+            0,
+            Vec::new(),
+        )
+        .expect("pin peer");
+        let mut memory = disk.clone();
+        memory
+            .ingest_crl(
+                test_crl(&anchor, 2),
+                anchor.host_id(),
+                anchor.signing_key().public_key(),
+            )
+            .expect("anchor crl");
+        memory
+            .ingest_crl(
+                test_crl(&identity, 1),
+                identity.host_id(),
+                identity.signing_key().public_key(),
+            )
+            .expect("own crl");
+        // The anchor and the peer are revoked in memory and the anchor also on disk.
+        memory
+            .revoke_trust_anchor(anchor.host_id())
+            .expect("revoke anchor");
+        memory.revoke_peer(peer.host_id()).expect("revoke peer");
+        disk.revoke_trust_anchor(anchor.host_id())
+            .expect("revoke anchor");
+
+        carry_held_revocations(&memory, &mut disk, &identity);
+        assert_eq!(disk.crl(anchor.host_id()).map(|c| c.seq), Some(2));
+        assert_eq!(disk.crl(identity.host_id()).map(|c| c.seq), Some(1));
+        assert_eq!(
+            disk.get(peer.host_id()).map(|e| e.state),
+            Some(PeerState::Revoked)
+        );
     }
 
     #[test]
