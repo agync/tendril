@@ -14,6 +14,7 @@ pub mod noise;
 pub mod pairing;
 pub mod policy;
 pub mod redact;
+pub mod refusal;
 pub mod relay_auth;
 pub mod roster;
 pub mod routes;
@@ -23,12 +24,17 @@ pub mod v2;
 pub mod wire;
 
 pub use crypto::ExternalMlDsaSigner;
+pub use error::{AdmissionRefusalCode, RefusalReason};
 pub use grants::{
     authorize_path_capability, canonicalize_capability_path, verify_enrollment_grant_chain,
 };
 pub use pairing::{
     DEFAULT_ENROLLMENT_TTL_SECS, ENROLL_PROOF_DOMAIN, EnrollmentPolicy, MAX_ENROLLMENT_TTL_SECS,
     MAX_LIVE_PAIRING_CODES, PAIR_KEY_PROOF_DOMAIN,
+};
+pub use refusal::{
+    MAX_REFUSAL_LIMITER_PEERS, MAX_REFUSAL_REPLAY_ENTRIES, REFUSAL_LIMIT_WINDOW_SECS,
+    RefusalLimiter, RefusalMode, RefusalReplayCache,
 };
 pub use relay_auth::{
     MAX_RELAY_AUTH_SECRET_BYTES, MAX_RELAY_FRAME_LEN, MAX_RELAY_TICKET_TTL_SECS,
