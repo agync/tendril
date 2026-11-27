@@ -1776,6 +1776,12 @@ impl TendrilSession {
         )
     }
 
+    /// Brings the store up to date with the revocation state this session holds for `issuer`
+    /// and reloads the roster. Stable entry point for the session event arms.
+    fn sync_held_revocations(&self, issuer: &str) -> Result<(), String> {
+        self.persist_v1_crl_if_newer(issuer)
+    }
+
     /// Persists the CRL a v1 session accepted for `issuer` when it is newer than the stored
     /// one; otherwise reloads the roster. Either way the in-memory copy keeps every CRL only it
     /// holds.
@@ -4435,7 +4441,7 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                     }),
                     SessionEvent::RevocationUpdated { issuer, seq } => {
                         let res = if matches!(sess.session, SessionBackend::V1(_)) {
-                            sess.persist_v1_crl_if_newer(&issuer)
+                            sess.sync_held_revocations(&issuer)
                         } else {
                             sess.load_roster_from_store()
                         };
@@ -4488,7 +4494,7 @@ pub unsafe extern "C" fn tendril_session_poll_event(
             Ok(Err(e)) => {
                 let sync_res = if matches!(sess.session, SessionBackend::V1(_)) {
                     if let Some(ref root_id) = sess.v1_root_id {
-                        sess.persist_v1_crl_if_newer(root_id)
+                        sess.sync_held_revocations(root_id)
                     } else {
                         sess.load_roster_from_store()
                     }
@@ -7371,6 +7377,77 @@ mod enroll_route_tests {
     }
 
     #[test]
+    fn enrol_keeps_memory_only_revocations() {
+        use tendril_core::crypto::{SigningKeypair, StaticKeypair, device_id};
+        let cd = tempfile::tempdir().unwrap();
+        let client = Ep::new(Some(cd.path()), None);
+        let ep = unsafe { &*client.0 };
+        let peer = EndpointIdentity::generate().unwrap();
+        let peer_id = peer.host_id().to_owned();
+        let anchor_key = SigningKeypair::from_seed([0x71; 32]);
+        let claim_static = *StaticKeypair::from_scalar([0x72; 32]).public_bytes();
+        let claim_signing = SigningKeypair::from_seed([0x73; 32]);
+        ep.mutate_roster(|r| {
+            r.insert_pinned_host(
+                peer_id.clone(),
+                "Peer".to_owned(),
+                *peer.static_key().public_bytes(),
+                Some(peer.signing_key().public_key().clone()),
+                0,
+                vec![],
+            )
+            .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))?;
+            r.add_trust_anchor("anchor-a".to_owned(), anchor_key.public_key().clone())
+                .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))?;
+            r.record_pending_host(
+                "claimed".to_owned(),
+                "Claim".to_owned(),
+                claim_static,
+                claim_signing.public_key().clone(),
+                0,
+                "123456".to_owned(),
+                vec![],
+            )
+            .map(|_| ())
+            .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+        })
+        .unwrap();
+        // Revocations only this endpoint's sessions hold: not on disk yet.
+        {
+            let mut mem = lock_roster(&ep.roster);
+            mem.revoke_peer(&peer_id).unwrap();
+            mem.revoke_pending_host(&device_id(&claim_static)).unwrap();
+            mem.revoke_trust_anchor("anchor-a").unwrap();
+        }
+
+        assert_ne!(enroll_to_closed_port(&client), TENDRIL_OK);
+
+        let store = ep.store.as_ref().unwrap();
+        for (place, roster) in [
+            ("memory", lock_roster(&ep.roster).clone()),
+            ("disk", store.load_roster().unwrap()),
+        ] {
+            assert_eq!(
+                roster.get(&peer_id).map(|e| e.state),
+                Some(PeerState::Revoked),
+                "{place}: the revoked peer"
+            );
+            assert!(
+                matches!(
+                    roster.resolve_static(&claim_static),
+                    tendril_core::roster::StaticResolution::Revoked(_)
+                ),
+                "{place}: the revoked claim key"
+            );
+            assert_eq!(
+                roster.trust_anchor("anchor-a").map(|a| a.state),
+                Some(AnchorState::Revoked),
+                "{place}: the revoked anchor"
+            );
+        }
+    }
+
+    #[test]
     fn memory_only_endpoint_pins_the_host_and_stores_no_route() {
         let hd = tempfile::tempdir().unwrap();
         let host = Ep::new(Some(hd.path()), Some("ffi-enr-host"));
@@ -7989,6 +8066,165 @@ mod route_state_tests {
                 client.disk_crl_seq(id),
                 Some(1),
                 "{id} CRL persisted with it"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_keeps_local_and_revoked_issuer_crls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ep = Ep::new(tmp.path(), None);
+        let local = ep.get().identity.clone();
+        let local_id = local.host_id().to_owned();
+        let local_pub = local.signing_key().public_key().clone();
+        let peer = EndpointIdentity::generate().unwrap();
+        let peer_id = peer.host_id().to_owned();
+        let peer_pub = peer.signing_key().public_key().clone();
+        ep.get()
+            .mutate_roster(|r| {
+                r.insert_pinned_host(
+                    peer_id.clone(),
+                    "Peer".to_owned(),
+                    *peer.static_key().public_bytes(),
+                    Some(peer_pub.clone()),
+                    0,
+                    vec![],
+                )
+                .map(|_| ())
+                .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+            })
+            .unwrap();
+        {
+            let mut mem = lock_roster(&ep.get().roster);
+            mem.ingest_crl(crl(&local, &local_id, 1), &local_id, &local_pub)
+                .unwrap();
+            mem.ingest_crl(crl(&peer, &peer_id, 1), &peer_id, &peer_pub)
+                .unwrap();
+        }
+        ep.get()
+            .store
+            .as_ref()
+            .unwrap()
+            .update_roster(|r| r.revoke_peer(&peer_id).map_err(Into::into))
+            .unwrap();
+
+        ep.get().load_roster_from_store().unwrap();
+        assert_eq!(ep.memory_crl_seq(&local_id), Some(1), "own CRL kept");
+        assert_eq!(ep.memory_crl_seq(&peer_id), Some(1), "revoked issuer kept");
+
+        ep.get().mutate_roster(|_| Ok(())).unwrap();
+        assert_eq!(ep.disk_crl_seq(&local_id), Some(1), "own CRL persisted");
+        assert_eq!(
+            ep.disk_crl_seq(&peer_id),
+            Some(1),
+            "revoked issuer persisted"
+        );
+    }
+
+    #[test]
+    fn v1_crl_persist_keeps_a_revoked_anchors_crl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Ep::new(&tmp.path().join("host"), Some("anchor-crl-host"));
+        let client = Ep::new(&tmp.path().join("client"), None);
+        serve_direct(&host);
+        let grant = pair(&host, &client);
+        let host_id = host.get().identity.host_id().to_owned();
+        let (c, _h) = connect(&host, &client, &host_id, &grant);
+
+        let anchor = EndpointIdentity::generate().unwrap();
+        let anchor_id = "ca-held".to_owned();
+        let anchor_pub = anchor.signing_key().public_key().clone();
+        client
+            .get()
+            .mutate_roster(|r| {
+                r.add_trust_anchor(anchor_id.clone(), anchor_pub.clone())
+                    .map(|_| ())
+                    .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+            })
+            .unwrap();
+        lock_roster(&client.get().roster)
+            .ingest_crl(crl(&anchor, &anchor_id, 1), &anchor_id, &anchor_pub)
+            .unwrap();
+        client
+            .get()
+            .store
+            .as_ref()
+            .unwrap()
+            .update_roster(|r| r.revoke_trust_anchor(&anchor_id).map_err(Into::into))
+            .unwrap();
+        lock_roster(&client.get().roster)
+            .revoke_trust_anchor(&anchor_id)
+            .unwrap();
+        assert_eq!(client.disk_crl_seq(&anchor_id), None);
+
+        let sess = unsafe { &*c.0 };
+        assert!(matches!(sess.session, SessionBackend::V1(_)));
+        sess.sync_held_revocations(&anchor_id).unwrap();
+        assert_eq!(
+            client.disk_crl_seq(&anchor_id),
+            Some(1),
+            "a revoked anchor's CRL is kept"
+        );
+    }
+
+    /// The v1 accept path reloads and rebuilds the roster from disk. Revocation state held
+    /// only in memory (a CRL a live session accepted, a revoked peer) must survive it, in
+    /// memory and on disk. A v1 responder handshake never ingests a CRL itself (a `Revocation`
+    /// frame arrives only after the session is established), so the state is set up before
+    /// the accept.
+    #[test]
+    fn v1_accept_keeps_a_crl_ingested_during_accept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Ep::new(&tmp.path().join("host"), Some("accept-keep-host"));
+        let client = Ep::new(&tmp.path().join("client"), None);
+        serve_direct(&host);
+        let grant = pair(&host, &client);
+        let host_id = host.get().identity.host_id().to_owned();
+
+        let other = EndpointIdentity::generate().unwrap();
+        let other_id = other.host_id().to_owned();
+        let other_pub = other.signing_key().public_key().clone();
+        host.get()
+            .mutate_roster(|r| {
+                r.insert_pinned_host(
+                    other_id.clone(),
+                    "Other".to_owned(),
+                    *other.static_key().public_bytes(),
+                    Some(other_pub.clone()),
+                    0,
+                    vec![],
+                )
+                .map(|_| ())
+                .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+            })
+            .unwrap();
+        {
+            let mut mem = lock_roster(&host.get().roster);
+            mem.ingest_crl(crl(&other, &other_id, 1), &other_id, &other_pub)
+                .unwrap();
+            mem.revoke_peer(&other_id).unwrap();
+        }
+        assert_eq!(host.disk_crl_seq(&other_id), None);
+
+        let (_c, _h) = connect(&host, &client, &host_id, &grant);
+
+        assert_eq!(
+            host.memory_crl_seq(&other_id),
+            Some(1),
+            "CRL kept in memory"
+        );
+        assert_eq!(host.disk_crl_seq(&other_id), Some(1), "CRL persisted");
+        for (place, roster) in [
+            ("memory", lock_roster(&host.get().roster).clone()),
+            (
+                "disk",
+                host.get().store.as_ref().unwrap().load_roster().unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                roster.get(&other_id).map(|e| e.state),
+                Some(PeerState::Revoked),
+                "{place}: the revoked peer"
             );
         }
     }
