@@ -16,33 +16,33 @@ use futures_util::{SinkExt, StreamExt};
 use tendril_core::crypto::{b64url_decode_array, b64url_encode, random_bytes};
 use tendril_core::policy::ProviderId;
 use tendril_core::v2::{
-    DerivedMailbox, RelayDialReplayCache, RelayEpochWindow, VerifiedRelayHost,
+    DerivedMailbox, RELAY_V2_EPOCH_SECS, RelayDialReplayCache, RelayEpochWindow, VerifiedRelayHost,
     derive_epoch_mailbox, derive_epoch_mailbox_window, epoch_for_unix, sign_v2_relay_accept,
     sign_v2_relay_dial, sign_v2_relay_register, verify_and_record_v2_relay_dial,
 };
 use tendril_relay::protocol::{MAX_RELAY_FRAME_LEN, RelayV2ClientMsg, RelayV2ServerMsg};
 use tendril_relay::server::ClientWsStream;
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Instant as TokioInstant, MissedTickBehavior, timeout};
+use tokio::time::{Instant as TokioInstant, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use super::relay::{RelayClientAuth, RelayStream, build_relay_auth_proof, jittered_ping_delay};
+use super::relay::{RelayClientAuth, RelayStream, build_relay_auth_proof};
 use super::{
-    ActiveStandbyGuard, STANDBY_POOL_SIZE, StandbyPoolHandle, StandbySlotOutcome,
-    await_standby_ready_with_deadline, connect_ws_resolved, decode_incoming_init_frame,
+    ActiveStandbyGuard, StandbyPoolHandle, StandbySlotOutcome, await_standby_ready_with_deadline,
+    coalesced_ping_delay, connect_ws_resolved, decode_incoming_init_frame,
     encode_fast_open_init_frame, ensure_rustls_ring_provider, spawn_standby_pool_supervisor,
     ws_binary_config, ws_control_config,
 };
 use crate::error::{RelayOffline, RuntimeError};
+use crate::power::PowerProfile;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_ACCEPTS: usize = 16;
-const EPOCH_ROTATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BACKOFF_INITIAL: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 const STABLE_UPTIME_RESET: Duration = Duration::from_secs(5);
@@ -191,6 +191,7 @@ pub struct RelayV2ListenerConfig {
     pub replay_cache: Option<Arc<Mutex<RelayDialReplayCache>>>,
     pub unix_secs: Option<u64>,
     pub auth: RelayClientAuth,
+    pub power_profile: PowerProfile,
 }
 
 impl Default for RelayV2ListenerConfig {
@@ -202,8 +203,59 @@ impl Default for RelayV2ListenerConfig {
             replay_cache: None,
             unix_secs: None,
             auth: RelayClientAuth::None,
+            power_profile: PowerProfile::Standard,
         }
     }
+}
+
+pub(crate) fn desired_epoch_mailboxes(
+    win: &RelayEpochWindow,
+    now_unix: u64,
+    overlap_margin_secs: Option<u64>,
+) -> Vec<DerivedMailbox> {
+    let Some(margin) = overlap_margin_secs else {
+        return win.mailboxes().into_iter().cloned().collect();
+    };
+    let margin = margin.min(RELAY_V2_EPOCH_SECS / 2);
+    let offset = now_unix % RELAY_V2_EPOCH_SECS;
+    let remaining = RELAY_V2_EPOCH_SECS - offset;
+    let mut out = Vec::with_capacity(3);
+    if offset < margin
+        && let Some(ref prev) = win.prev
+    {
+        out.push(prev.clone());
+    }
+    out.push(win.current.clone());
+    if remaining <= margin
+        && let Some(ref next) = win.next
+    {
+        out.push(next.clone());
+    }
+    out
+}
+
+pub(crate) fn next_epoch_transition_delay(
+    now_unix: u64,
+    overlap_margin_secs: Option<u64>,
+) -> Duration {
+    let offset = now_unix % RELAY_V2_EPOCH_SECS;
+    let remaining = RELAY_V2_EPOCH_SECS - offset;
+    let secs = match overlap_margin_secs {
+        None => remaining,
+        Some(m) => {
+            let m = m.min(RELAY_V2_EPOCH_SECS / 2);
+            if m == 0 {
+                remaining
+            } else if offset < m {
+                m - offset
+            } else if remaining > m {
+                remaining - m
+            } else {
+                remaining
+            }
+        }
+    };
+    Duration::from_secs(secs.max(1))
 }
 
 /// Listener-wide state an epoch control task updates when the relay reports `replaced`.
@@ -226,11 +278,17 @@ impl EpochTakeover {
 struct EpochSocketHandle {
     shutdown_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
+    fatal: Arc<AtomicBool>,
+    spawned_at: TokioInstant,
 }
 
 impl EpochSocketHandle {
     fn stop(self) {
         drop(self);
+    }
+
+    fn is_fatal(&self) -> bool {
+        self.fatal.load(Ordering::Acquire)
     }
 }
 
@@ -330,6 +388,9 @@ impl RelayV2Listener {
         let now_unix = config.unix_secs.unwrap_or_else(current_unix_secs);
         let initial_window = derive_epoch_mailbox_window(&secret, now_unix);
         let center_epoch = initial_window.center_epoch;
+        let power_profile = config.power_profile;
+        let overlap_margin = power_profile.v2_epoch_overlap_margin_secs();
+        let standby_pool_size = power_profile.standby_pool_size();
         let window = Arc::new(Mutex::new(initial_window.clone()));
         let replay_cache = config
             .replay_cache
@@ -342,6 +403,7 @@ impl RelayV2Listener {
         let epoch_tasks = Arc::new(Mutex::new(HashMap::<u64, EpochSocketHandle>::new()));
         let standby_pool = Arc::new(Mutex::new(None));
         let replaced = Arc::new(AtomicBool::new(false));
+        let task_exit_notify = Arc::new(Notify::new());
         let takeover = EpochTakeover {
             replaced: Arc::clone(&replaced),
             listener_stop: shutdown_tx.clone(),
@@ -353,14 +415,13 @@ impl RelayV2Listener {
         };
 
         let mut ready_waiters = Vec::new();
-        for mailbox in initial_window.mailboxes() {
-            let mailbox_owned = mailbox.clone();
-            let epoch = mailbox_owned.epoch;
+        for mailbox in desired_epoch_mailboxes(&initial_window, now_unix, overlap_margin) {
+            let epoch = mailbox.epoch;
             let (ready_tx, ready_rx) = oneshot::channel();
             let handle = spawn_epoch_control_task(
                 relay_url.clone(),
                 required_host.clone(),
-                mailbox_owned,
+                mailbox,
                 Arc::clone(&window),
                 Arc::clone(&replay_cache),
                 Arc::clone(&accept_sem),
@@ -368,8 +429,10 @@ impl RelayV2Listener {
                 Arc::clone(&active_control_sockets),
                 Arc::clone(&auth),
                 config.write_timeout,
+                power_profile,
                 Some(ready_tx),
                 takeover.clone(),
+                Arc::clone(&task_exit_notify),
             );
             epoch_tasks
                 .lock()
@@ -414,7 +477,7 @@ impl RelayV2Listener {
             return Err(first_err.unwrap_or(RuntimeError::Closed));
         }
 
-        if center_standby && !*shutdown_tx.borrow() {
+        if center_standby && !*shutdown_tx.borrow() && standby_pool_size > 0 {
             let (pool_handle, sb_ready_rxs) = spawn_v2_standby_pool(
                 relay_url.clone(),
                 required_host.clone(),
@@ -426,6 +489,8 @@ impl RelayV2Listener {
                 Arc::clone(&active_standby_sockets),
                 Arc::clone(&auth),
                 config.write_timeout,
+                standby_pool_size,
+                power_profile,
                 shutdown_tx.subscribe(),
             );
             *standby_pool
@@ -445,12 +510,195 @@ impl RelayV2Listener {
         let standby_shutdown_tx = shutdown_tx.clone();
         let url_c = relay_url.clone();
         let takeover_c = takeover.clone();
+        let exit_notify_c = Arc::clone(&task_exit_notify);
         let mut shut_rx = shutdown_rx;
         let manager_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(EPOCH_ROTATE_POLL_INTERVAL);
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut active_center = center_epoch;
+            let mut respawn_backoff: HashMap<u64, Duration> = HashMap::new();
+            let mut respawn_due: HashMap<u64, TokioInstant> = HashMap::new();
             loop {
+                let notified = exit_notify_c.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if *shut_rx.borrow() {
+                    tasks_c
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
+                    *standby_pool_c
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    break;
+                }
+
+                let now = pinned_unix.unwrap_or_else(current_unix_secs);
+                let new_center = epoch_for_unix(now);
+                let (desired, new_current_opt) = if new_center != active_center {
+                    let new_win = derive_epoch_mailbox_window(&secret, now);
+                    let new_current = new_win.current.clone();
+                    let desired = desired_epoch_mailboxes(&new_win, now, overlap_margin);
+                    {
+                        let mut guard = window_c
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *guard = new_win;
+                    }
+                    active_center = new_center;
+                    (desired, Some(new_current))
+                } else {
+                    let guard = window_c
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (desired_epoch_mailboxes(&guard, now, overlap_margin), None)
+                };
+
+                let keep_epochs: Vec<u64> = desired.iter().map(|m| m.epoch).collect();
+                respawn_backoff.retain(|ep, _| keep_epochs.contains(ep));
+                respawn_due.retain(|ep, _| keep_epochs.contains(ep));
+                let mut removed = Vec::new();
+                {
+                    let mut guard = tasks_c
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let to_remove: Vec<u64> = guard
+                        .keys()
+                        .copied()
+                        .filter(|ep| !keep_epochs.contains(ep))
+                        .collect();
+                    for ep in to_remove {
+                        if let Some(h) = guard.remove(&ep) {
+                            removed.push(h);
+                        }
+                    }
+                }
+                for h in removed {
+                    h.stop();
+                }
+
+                if let Some(new_current) = new_current_opt
+                    && center_standby
+                    && !*standby_shutdown_tx.borrow()
+                    && standby_pool_size > 0
+                {
+                    let old_sb = standby_pool_c
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    drop(old_sb);
+                    let (new_pool, _) = spawn_v2_standby_pool(
+                        url_c.clone(),
+                        required_host.clone(),
+                        new_current,
+                        Arc::clone(&window_c),
+                        Arc::clone(&cache_c),
+                        Arc::clone(&accept_sem),
+                        accepted_tx.clone(),
+                        Arc::clone(&standby_sockets_c),
+                        Arc::clone(&auth),
+                        write_timeout,
+                        standby_pool_size,
+                        power_profile,
+                        standby_shutdown_tx.subscribe(),
+                    );
+                    *standby_pool_c
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(new_pool);
+                }
+
+                let now_inst = TokioInstant::now();
+                let mut earliest_respawn: Option<TokioInstant> = None;
+                for mb in desired {
+                    let action = {
+                        let guard = tasks_c
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.get(&mb.epoch) {
+                            None => Some(None),
+                            Some(h) if !h.task.is_finished() => {
+                                if h.spawned_at.elapsed() >= STABLE_UPTIME_RESET {
+                                    respawn_backoff.remove(&mb.epoch);
+                                }
+                                respawn_due.remove(&mb.epoch);
+                                None
+                            }
+                            Some(h) if h.is_fatal() => {
+                                respawn_backoff.remove(&mb.epoch);
+                                respawn_due.remove(&mb.epoch);
+                                None
+                            }
+                            Some(h) => {
+                                if h.spawned_at.elapsed() >= STABLE_UPTIME_RESET {
+                                    respawn_backoff.remove(&mb.epoch);
+                                }
+                                let due = match respawn_due.get(&mb.epoch).copied() {
+                                    Some(d) => d,
+                                    None => {
+                                        let cur = respawn_backoff
+                                            .get(&mb.epoch)
+                                            .copied()
+                                            .unwrap_or(BACKOFF_INITIAL);
+                                        let d = now_inst + jittered_backoff(cur);
+                                        respawn_due.insert(mb.epoch, d);
+                                        d
+                                    }
+                                };
+                                if now_inst >= due {
+                                    respawn_due.remove(&mb.epoch);
+                                    let cur = respawn_backoff
+                                        .get(&mb.epoch)
+                                        .copied()
+                                        .unwrap_or(BACKOFF_INITIAL);
+                                    respawn_backoff.insert(mb.epoch, (cur * 2).min(BACKOFF_MAX));
+                                    Some(Some(()))
+                                } else {
+                                    earliest_respawn =
+                                        Some(earliest_respawn.map_or(due, |prev| prev.min(due)));
+                                    None
+                                }
+                            }
+                        }
+                    };
+                    if action.is_some() {
+                        let epoch = mb.epoch;
+                        let handle = spawn_epoch_control_task(
+                            url_c.clone(),
+                            required_host.clone(),
+                            mb,
+                            Arc::clone(&window_c),
+                            Arc::clone(&cache_c),
+                            Arc::clone(&accept_sem),
+                            accepted_tx.clone(),
+                            Arc::clone(&sockets_c),
+                            Arc::clone(&auth),
+                            write_timeout,
+                            power_profile,
+                            None,
+                            takeover_c.clone(),
+                            Arc::clone(&exit_notify_c),
+                        );
+                        let old = tasks_c
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(epoch, handle);
+                        drop(old);
+                    }
+                }
+
+                let epoch_delay = if pinned_unix.is_some() {
+                    None
+                } else {
+                    Some(next_epoch_transition_delay(
+                        current_unix_secs(),
+                        overlap_margin,
+                    ))
+                };
+                let respawn_delay =
+                    earliest_respawn.map(|d| d.saturating_duration_since(TokioInstant::now()));
+                let wake_delay = match (epoch_delay, respawn_delay) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
                 tokio::select! {
                     biased;
                     _ = shut_rx.changed() => {
@@ -463,103 +711,13 @@ impl RelayV2Listener {
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                         break;
                     }
-                    _ = interval.tick() => {
-                        let now = pinned_unix.unwrap_or_else(current_unix_secs);
-                        let new_center = epoch_for_unix(now);
-                        if new_center != active_center {
-                            let new_win = derive_epoch_mailbox_window(&secret, now);
-                            let new_current = new_win.current.clone();
-                            let keep_epochs: Vec<u64> =
-                                new_win.mailboxes().into_iter().map(|m| m.epoch).collect();
-                            {
-                                let mut guard = window_c
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                *guard = new_win;
-                            }
-                            let mut removed = Vec::new();
-                            {
-                                let mut guard = tasks_c
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let to_remove: Vec<u64> = guard
-                                    .keys()
-                                    .copied()
-                                    .filter(|ep| !keep_epochs.contains(ep))
-                                    .collect();
-                                for ep in to_remove {
-                                    if let Some(h) = guard.remove(&ep) {
-                                        removed.push(h);
-                                    }
-                                }
-                            }
-                            for h in removed {
-                                h.stop();
-                            }
-                            if center_standby && !*standby_shutdown_tx.borrow() {
-                                let old_sb = standby_pool_c
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .take();
-                                drop(old_sb);
-                                let (new_pool, _) = spawn_v2_standby_pool(
-                                    url_c.clone(),
-                                    required_host.clone(),
-                                    new_current,
-                                    Arc::clone(&window_c),
-                                    Arc::clone(&cache_c),
-                                    Arc::clone(&accept_sem),
-                                    accepted_tx.clone(),
-                                    Arc::clone(&standby_sockets_c),
-                                    Arc::clone(&auth),
-                                    write_timeout,
-                                    standby_shutdown_tx.subscribe(),
-                                );
-                                *standby_pool_c
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(new_pool);
-                            }
-                            active_center = new_center;
+                    () = &mut notified => {}
+                    () = async {
+                        match wake_delay {
+                            Some(d) => tokio::time::sleep(d).await,
+                            None => std::future::pending().await,
                         }
-
-                        let active_epochs: Vec<DerivedMailbox> = {
-                            let guard = window_c
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            guard.mailboxes().into_iter().cloned().collect()
-                        };
-                        for mb in active_epochs {
-                            let needs_spawn = {
-                                let guard = tasks_c
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                guard.get(&mb.epoch).is_none_or(|h| h.task.is_finished())
-                            };
-                            if needs_spawn {
-                                let epoch = mb.epoch;
-                                let handle = spawn_epoch_control_task(
-                                    url_c.clone(),
-                                    required_host.clone(),
-                                    mb,
-                                    Arc::clone(&window_c),
-                                    Arc::clone(&cache_c),
-                                    Arc::clone(&accept_sem),
-                                    accepted_tx.clone(),
-                                    Arc::clone(&sockets_c),
-                                    Arc::clone(&auth),
-                                    write_timeout,
-                                    None,
-                                    takeover_c.clone(),
-                                );
-                                let old = tasks_c
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .insert(epoch, handle);
-                                drop(old);
-                            }
-                        }
-                    }
+                    } => {}
                 }
             }
         });
@@ -677,13 +835,15 @@ fn spawn_v2_standby_pool(
     active_standby: Arc<AtomicUsize>,
     auth: Arc<RelayClientAuth>,
     write_timeout: Duration,
+    pool_size: usize,
+    power_profile: PowerProfile,
     shutdown_rx: watch::Receiver<bool>,
 ) -> (
     StandbyPoolHandle,
     Vec<oneshot::Receiver<Result<(), RuntimeError>>>,
 ) {
     spawn_standby_pool_supervisor(
-        STANDBY_POOL_SIZE,
+        pool_size,
         shutdown_rx,
         move |ready_tx, consumed_tx, slot_shutdown| {
             let url_c = relay_url.clone();
@@ -706,6 +866,7 @@ fn spawn_v2_standby_pool(
                 active_c,
                 auth_c,
                 write_timeout,
+                power_profile,
                 ready_tx,
                 consumed_tx,
                 slot_shutdown,
@@ -726,6 +887,7 @@ async fn run_v2_standby_slot(
     active_standby: Arc<AtomicUsize>,
     auth: Arc<RelayClientAuth>,
     write_timeout: Duration,
+    power_profile: PowerProfile,
     mut ready_tx: Option<oneshot::Sender<Result<(), RuntimeError>>>,
     consumed_tx: oneshot::Sender<()>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -835,7 +997,7 @@ async fn run_v2_standby_slot(
 
     let idle_sleep = tokio::time::sleep(CONTROL_IDLE_TIMEOUT);
     tokio::pin!(idle_sleep);
-    let ping_sleep = tokio::time::sleep(jittered_ping_delay());
+    let ping_sleep = tokio::time::sleep(coalesced_ping_delay(power_profile));
     tokio::pin!(ping_sleep);
 
     loop {
@@ -855,7 +1017,7 @@ async fn run_v2_standby_slot(
             () = &mut ping_sleep => {
                 ping_sleep
                     .as_mut()
-                    .reset(TokioInstant::now() + jittered_ping_delay());
+                    .reset(TokioInstant::now() + coalesced_ping_delay(power_profile));
                 if !timeout(write_timeout, ws.send(Message::Ping(Vec::new().into())))
                     .await
                     .is_ok_and(|res| res.is_ok())
@@ -944,12 +1106,20 @@ async fn run_v2_standby_slot(
                             .reset(TokioInstant::now() + CONTROL_IDLE_TIMEOUT);
                         ping_sleep
                             .as_mut()
-                            .reset(TokioInstant::now() + jittered_ping_delay());
+                            .reset(TokioInstant::now() + coalesced_ping_delay(power_profile));
                     }
                     _ => return StandbySlotOutcome::Retry,
                 }
             }
         }
+    }
+}
+
+struct TaskExitGuard(Arc<Notify>);
+
+impl Drop for TaskExitGuard {
+    fn drop(&mut self) {
+        self.0.notify_one();
     }
 }
 
@@ -965,11 +1135,17 @@ fn spawn_epoch_control_task(
     active_sockets: Arc<AtomicUsize>,
     auth: Arc<RelayClientAuth>,
     write_timeout: Duration,
+    power_profile: PowerProfile,
     ready_tx: Option<oneshot::Sender<Result<bool, RuntimeError>>>,
     takeover: EpochTakeover,
+    exit_notify: Arc<Notify>,
 ) -> EpochSocketHandle {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let fatal = Arc::new(AtomicBool::new(false));
+    let fatal_c = Arc::clone(&fatal);
+    let spawned_at = TokioInstant::now();
     let task = tokio::spawn(async move {
+        let _exit_guard = TaskExitGuard(exit_notify);
         let mut ready_tx = ready_tx;
         let mut backoff = BACKOFF_INITIAL;
         let mut accept_tasks: JoinSet<()> = JoinSet::new();
@@ -998,9 +1174,11 @@ fn spawn_epoch_control_task(
                     let is_core_err = matches!(err, RuntimeError::Core(_));
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Err(err));
+                        fatal_c.store(true, Ordering::Release);
                         break;
                     }
                     if is_core_err {
+                        fatal_c.store(true, Ordering::Release);
                         break;
                     }
                     tokio::select! {
@@ -1017,6 +1195,7 @@ fn spawn_epoch_control_task(
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Err(err.into()));
                     }
+                    fatal_c.store(true, Ordering::Release);
                     break;
                 }
             };
@@ -1033,6 +1212,7 @@ fn spawn_epoch_control_task(
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Err(err));
                     }
+                    fatal_c.store(true, Ordering::Release);
                     break;
                 }
             };
@@ -1052,6 +1232,7 @@ fn spawn_epoch_control_task(
             {
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(Err(err));
+                    fatal_c.store(true, Ordering::Release);
                     break;
                 }
                 tokio::select! {
@@ -1070,6 +1251,7 @@ fn spawn_epoch_control_task(
                         let _ = tx.send(Err(RuntimeError::Protocol(format!(
                             "v2 relay register rejected: {code}"
                         ))));
+                        fatal_c.store(true, Ordering::Release);
                         break;
                     }
                     tokio::select! {
@@ -1084,6 +1266,7 @@ fn spawn_epoch_control_task(
                         let _ = tx.send(Err(RuntimeError::Protocol(format!(
                             "unexpected v2 relay register response: {other:?}"
                         ))));
+                        fatal_c.store(true, Ordering::Release);
                         break;
                     }
                     tokio::select! {
@@ -1096,6 +1279,7 @@ fn spawn_epoch_control_task(
                 Err(err) => {
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Err(err));
+                        fatal_c.store(true, Ordering::Release);
                         break;
                     }
                     tokio::select! {
@@ -1116,7 +1300,7 @@ fn spawn_epoch_control_task(
 
             let idle_sleep = tokio::time::sleep(CONTROL_IDLE_TIMEOUT);
             tokio::pin!(idle_sleep);
-            let ping_sleep = tokio::time::sleep(jittered_ping_delay());
+            let ping_sleep = tokio::time::sleep(coalesced_ping_delay(power_profile));
             tokio::pin!(ping_sleep);
             let disconnected = loop {
                 if *shutdown_rx.borrow() {
@@ -1135,7 +1319,7 @@ fn spawn_epoch_control_task(
                     () = &mut ping_sleep => {
                         ping_sleep
                             .as_mut()
-                            .reset(TokioInstant::now() + jittered_ping_delay());
+                            .reset(TokioInstant::now() + coalesced_ping_delay(power_profile));
                         if !timeout(
                             write_timeout,
                             control_ws.send(Message::Ping(Vec::new().into())),
@@ -1156,7 +1340,7 @@ fn spawn_epoch_control_task(
                                     .reset(TokioInstant::now() + CONTROL_IDLE_TIMEOUT);
                                 ping_sleep
                                     .as_mut()
-                                    .reset(TokioInstant::now() + jittered_ping_delay());
+                                    .reset(TokioInstant::now() + coalesced_ping_delay(power_profile));
                                 if matches!(
                                     serde_json::from_str::<RelayV2ServerMsg>(&text),
                                     Ok(RelayV2ServerMsg::Error { code }) if code == "replaced"
@@ -1269,7 +1453,12 @@ fn spawn_epoch_control_task(
         }
         accept_tasks.abort_all();
     });
-    EpochSocketHandle { shutdown_tx, task }
+    EpochSocketHandle {
+        shutdown_tx,
+        task,
+        fatal,
+        spawned_at,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1613,7 +1802,7 @@ mod tests {
     fn control_ping_delay_is_jittered_within_bounds() {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..64 {
-            let d = jittered_ping_delay();
+            let d = crate::providers::relay::jittered_ping_delay();
             assert!(
                 d >= Duration::from_millis(crate::providers::relay::CONTROL_PING_MIN_MS),
                 "{d:?}"
@@ -1680,5 +1869,184 @@ mod tests {
             warn_multi_epoch_ticket(&RelayClientAuth::Ticket(spanning));
             assert_eq!(warns.load(Ordering::SeqCst), 1);
         });
+    }
+
+    #[test]
+    fn low_power_epoch_window_collapses_mid_hour_and_keeps_skew_overlap() {
+        let secret = [0x42; 32];
+        let base_epoch = 500_000u64;
+        let epoch_start = base_epoch * RELAY_V2_EPOCH_SECS;
+
+        let mid_unix = epoch_start + 1_800;
+        let win_mid = derive_epoch_mailbox_window(&secret, mid_unix);
+        let mid_mailboxes = desired_epoch_mailboxes(&win_mid, mid_unix, Some(120));
+        assert_eq!(mid_mailboxes.len(), 1);
+        assert_eq!(mid_mailboxes[0].epoch, base_epoch);
+        assert_eq!(
+            next_epoch_transition_delay(mid_unix, Some(120)),
+            Duration::from_secs(RELAY_V2_EPOCH_SECS - 120 - 1_800)
+        );
+
+        let after_unix = epoch_start + 60;
+        let after_mailboxes = desired_epoch_mailboxes(&win_mid, after_unix, Some(120));
+        assert_eq!(
+            after_mailboxes.iter().map(|m| m.epoch).collect::<Vec<_>>(),
+            vec![base_epoch - 1, base_epoch]
+        );
+        assert_eq!(
+            next_epoch_transition_delay(after_unix, Some(120)),
+            Duration::from_secs(60)
+        );
+
+        let before_unix = epoch_start + RELAY_V2_EPOCH_SECS - 60;
+        let before_mailboxes = desired_epoch_mailboxes(&win_mid, before_unix, Some(120));
+        assert_eq!(
+            before_mailboxes.iter().map(|m| m.epoch).collect::<Vec<_>>(),
+            vec![base_epoch, base_epoch + 1]
+        );
+        assert_eq!(
+            next_epoch_transition_delay(before_unix, Some(120)),
+            Duration::from_secs(60)
+        );
+
+        assert_eq!(desired_epoch_mailboxes(&win_mid, mid_unix, None).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn low_power_v2_listener_uses_one_mid_hour_socket_and_zero_standby() {
+        use std::sync::atomic::AtomicU64;
+        use tendril_relay::server::RelayConfig;
+
+        use crate::EmbeddedRelay;
+
+        let epoch_base = 500_000 * RELAY_V2_EPOCH_SECS;
+        let epoch_mid = epoch_base + 1_800;
+        let clock = Arc::new(AtomicU64::new(epoch_mid));
+        let read_clock = Arc::clone(&clock);
+        let relay = EmbeddedRelay::start(RelayConfig {
+            host: "127.0.0.1".to_owned(),
+            clock: Some(Arc::new(move || read_clock.load(Ordering::Acquire))),
+            ..RelayConfig::default()
+        })
+        .await
+        .expect("start relay");
+
+        let listener = RelayV2Listener::bind_with_config(
+            relay.ws_v2_url(),
+            [0x33; 32],
+            RelayV2ListenerConfig {
+                expected_host: Some("127.0.0.1".to_owned()),
+                unix_secs: Some(epoch_mid),
+                power_profile: PowerProfile::LowPower,
+                ..RelayV2ListenerConfig::default()
+            },
+        )
+        .await
+        .expect("bind low power v2 listener mid-hour");
+        assert_eq!(listener.active_control_socket_count(), 1);
+        assert_eq!(listener.active_standby_socket_count(), 0);
+        drop(listener);
+
+        let epoch_overlap = epoch_base + 60;
+        clock.store(epoch_overlap, Ordering::Release);
+        let boundary = RelayV2Listener::bind_with_config(
+            relay.ws_v2_url(),
+            [0x34; 32],
+            RelayV2ListenerConfig {
+                expected_host: Some("127.0.0.1".to_owned()),
+                unix_secs: Some(epoch_overlap),
+                power_profile: PowerProfile::LowPower,
+                ..RelayV2ListenerConfig::default()
+            },
+        )
+        .await
+        .expect("bind low power v2 listener at overlap boundary");
+        assert_eq!(boundary.active_control_socket_count(), 2);
+        assert_eq!(boundary.active_standby_socket_count(), 0);
+        drop(boundary);
+        relay.shutdown().await.expect("stop relay");
+    }
+
+    #[tokio::test]
+    async fn fatal_epoch_task_does_not_spin_respawn() {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = tcp.local_addr().expect("local addr");
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let count_srv = Arc::clone(&accept_count);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = tcp.accept().await else {
+                    break;
+                };
+                let n = count_srv.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let host = if n == 0 {
+                        "127.0.0.1".to_owned()
+                    } else {
+                        // Post-bind challenge host mismatch yields RuntimeError::Core(_),
+                        // which must mark the epoch task fatal instead of respawning at 10 Hz.
+                        "wrong.example".to_owned()
+                    };
+                    let challenge = RelayV2ServerMsg::Challenge {
+                        nonce: b64url_encode(&[7u8; 32]),
+                        host,
+                        epoch: 500_000,
+                        max_frame: MAX_RELAY_FRAME_LEN,
+                        auth_required: None,
+                        fast_open: Some(false),
+                        standby: Some(false),
+                    };
+                    let _ = ws
+                        .send(Message::Text(
+                            serde_json::to_string(&challenge).expect("json").into(),
+                        ))
+                        .await;
+                    if n == 0
+                        && let Some(Ok(Message::Text(reg_raw))) = ws.next().await
+                        && let Ok(RelayV2ClientMsg::Register {
+                            mailbox_id, epoch, ..
+                        }) = serde_json::from_str::<RelayV2ClientMsg>(&reg_raw)
+                    {
+                        let reg = RelayV2ServerMsg::Registered { mailbox_id, epoch };
+                        let _ = ws
+                            .send(Message::Text(
+                                serde_json::to_string(&reg).expect("json").into(),
+                            ))
+                            .await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        let _ = ws.close(None).await;
+                    }
+                });
+            }
+        });
+
+        let epoch_mid = 500_000 * RELAY_V2_EPOCH_SECS + 1_800;
+        let listener = RelayV2Listener::bind_with_config(
+            format!("ws://{addr}/v2/relay"),
+            [0x44; 32],
+            RelayV2ListenerConfig {
+                expected_host: Some("127.0.0.1".to_owned()),
+                unix_secs: Some(epoch_mid),
+                power_profile: PowerProfile::LowPower,
+                allow_insecure_ws: true,
+                ..RelayV2ListenerConfig::default()
+            },
+        )
+        .await
+        .expect("bind");
+
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(
+            accept_count.load(Ordering::Acquire),
+            2,
+            "fatal post-bind core error must not trigger repeated 100ms respawns"
+        );
+        drop(listener);
+        server.abort();
     }
 }

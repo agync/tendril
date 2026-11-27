@@ -1056,6 +1056,7 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                     replay_cache: None,
                     unix_secs: None,
                     auth: state.transport_cfg.relay_auth.clone(),
+                    ..RelayV2ListenerConfig::default()
                 };
                 match RelayV2Listener::bind_with_config(relay_url.clone(), secret, cfg).await {
                     Ok(listener) => {

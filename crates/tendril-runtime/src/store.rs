@@ -3,7 +3,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -17,12 +18,64 @@ use tendril_core::group::GroupBook;
 use tendril_core::identity::{EndpointIdentity, RotationRecord, is_valid_host_id};
 use tendril_core::roster::Roster;
 use tendril_core::state_seal::{StateKey, StateKind};
+use tokio::sync::Notify;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::RuntimeError;
 use crate::redact::redact_json_error;
 
 mod sealed;
+
+static STORE_CHANGE_SEQ: AtomicU64 = AtomicU64::new(0);
+static STORE_CHANGE_NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
+
+/// Process-wide notifier woken whenever any [`StateStore`] completes a durable file write.
+#[must_use]
+pub fn store_change_notifier() -> &'static Arc<Notify> {
+    STORE_CHANGE_NOTIFY.get_or_init(|| Arc::new(Notify::new()))
+}
+
+/// Monotonic counter incremented on every completed [`StateStore`] file write.
+#[must_use]
+pub fn store_change_seq() -> u64 {
+    STORE_CHANGE_SEQ.load(Ordering::Acquire)
+}
+
+fn record_store_change() {
+    STORE_CHANGE_SEQ.fetch_add(1, Ordering::AcqRel);
+    store_change_notifier().notify_waiters();
+}
+
+#[cfg(not(unix))]
+fn path_write_seqs() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, u64>> {
+    static PATH_WRITE_SEQS: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>> =
+        OnceLock::new();
+    PATH_WRITE_SEQS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(not(unix))]
+fn canonical_write_key(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(not(unix))]
+fn bump_path_write_seq(path: &Path) {
+    let key = canonical_write_key(path);
+    let mut map = path_write_seqs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let seq = map.entry(key).or_insert(0);
+    *seq = seq.saturating_add(1);
+}
+
+#[cfg(not(unix))]
+fn current_path_write_seq(path: &Path) -> u64 {
+    let key = canonical_write_key(path);
+    let map = path_write_seqs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.get(&key).copied().unwrap_or(0)
+}
 
 const IDENTITY_FILE: &str = "identity.json";
 const IDENTITY_LOCK_FILE: &str = ".identity.lock";
@@ -41,6 +94,8 @@ pub struct RosterStamp {
     pub modified: Option<SystemTime>,
     #[cfg(unix)]
     pub ino: u64,
+    #[cfg(not(unix))]
+    pub write_seq: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -247,6 +302,28 @@ impl StateStore {
         Ok(store)
     }
 
+    /// Opens an existing sealed store without walking and `fsync`ing every ancestor directory on
+    /// disk when sealed state files already exist (for short-lived extension wakes). Still
+    /// validates `0o700` non-symlink directory ownership and falls back to [`Self::open_sealed`]
+    /// when initializing a fresh directory.
+    pub fn open_sealed_existing_fast(
+        dir: impl AsRef<Path>,
+        identity: &EndpointIdentity,
+    ) -> Result<Self, RuntimeError> {
+        let dir = dir.as_ref().to_path_buf();
+        if Self::sealed_state_exists(&dir)? {
+            crate::providers::create_private_dir_0700(&dir)?;
+            let store = Self {
+                dir,
+                codec: Codec::Sealed(Arc::new(StateKey::derive(identity.static_key()))),
+            };
+            store.load_roster()?;
+            store.load_group_book()?;
+            return Ok(store);
+        }
+        Self::open_sealed(dir, identity)
+    }
+
     /// Reports whether `dir` already holds sealed runtime state.
     pub fn sealed_state_exists(dir: impl AsRef<Path>) -> Result<bool, RuntimeError> {
         let dir = dir.as_ref();
@@ -437,12 +514,15 @@ impl StateStore {
 
     /// Returns lightweight filesystem metadata identifying the current `roster.json` generation.
     pub fn roster_stamp(&self) -> Result<Option<RosterStamp>, RuntimeError> {
-        match fs::metadata(self.roster_path()) {
+        let path = self.roster_path();
+        match fs::metadata(&path) {
             Ok(meta) => Ok(Some(RosterStamp {
                 len: meta.len(),
                 modified: meta.modified().ok(),
                 #[cfg(unix)]
                 ino: std::os::unix::fs::MetadataExt::ino(&meta),
+                #[cfg(not(unix))]
+                write_seq: current_path_write_seq(&path),
             })),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(RuntimeError::Io(err)),
@@ -566,12 +646,15 @@ impl StateStore {
 
     /// Returns lightweight filesystem metadata identifying the current `groups.json` generation.
     pub fn groups_stamp(&self) -> Result<Option<RosterStamp>, RuntimeError> {
-        match fs::metadata(self.groups_path()) {
+        let path = self.groups_path();
+        match fs::metadata(&path) {
             Ok(meta) => Ok(Some(RosterStamp {
                 len: meta.len(),
                 modified: meta.modified().ok(),
                 #[cfg(unix)]
                 ino: std::os::unix::fs::MetadataExt::ino(&meta),
+                #[cfg(not(unix))]
+                write_seq: current_path_write_seq(&path),
             })),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(RuntimeError::Io(err)),
@@ -725,6 +808,8 @@ impl StateStore {
             drop(file);
             fault::inject(fault::Step::Rename)?;
             fs::rename(&tmp_path, target)?;
+            #[cfg(not(unix))]
+            bump_path_write_seq(target);
             Ok(())
         })();
         if staged.is_err() {
@@ -732,7 +817,9 @@ impl StateStore {
             return staged;
         }
         sync_dir(&self.dir)
-            .map_err(|err| RuntimeError::Storage(format!("state commit not durable: {err}")))
+            .map_err(|err| RuntimeError::Storage(format!("state commit not durable: {err}")))?;
+        record_store_change();
+        Ok(())
     }
 }
 
@@ -1229,5 +1316,78 @@ mod tests {
                 .unwrap_err(),
             "software identity v1",
         );
+    }
+
+    #[tokio::test]
+    async fn open_sealed_existing_fast_skips_ancestor_syncs_and_notifies_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = EndpointIdentity::generate().unwrap();
+        let store = StateStore::open_sealed(dir.path(), &id).unwrap();
+        let seq0 = store_change_seq();
+        let notified = store_change_notifier().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        store.save_roster(&Roster::new()).unwrap();
+        assert!(store_change_seq() > seq0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("store change notifier must wake on save");
+
+        fault::DIR_SYNCS.with(|n| n.set(0));
+        let fast = StateStore::open_sealed_existing_fast(dir.path(), &id).unwrap();
+        assert_eq!(fast.dir(), store.dir());
+        assert_eq!(fault::DIR_SYNCS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn equal_length_rapid_group_book_overwrites_advance_groups_stamp() {
+        use tendril_core::group::{
+            GroupBuildParams, GroupMember, V2GroupSecrets, create_group, group_id_from_root,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let id = EndpointIdentity::generate().unwrap();
+        let store = StateStore::open_or_create(dir.path()).unwrap();
+        let gid = group_id_from_root(id.signing_key().public_key());
+        let (manifest, _) = create_group(
+            id.signing_key(),
+            "stamp-test",
+            2,
+            GroupMember::new(
+                id.static_key().public_bytes(),
+                "a",
+                id.signing_key().public_key(),
+                vec!["direct:127.0.0.1:4100".to_owned()],
+                vec![format!("group.recv:{gid}"), format!("group.send:{gid}")],
+            ),
+            GroupBuildParams::new(1_795_564_800),
+        )
+        .unwrap();
+
+        store
+            .update_group_book(|book| {
+                book.ingest_group_manifest(&manifest, 1_795_564_800, None)?;
+                book.install_secrets(&gid, V2GroupSecrets::new([1; 32], 1))?;
+                Ok(())
+            })
+            .unwrap();
+        let stamp1 = store.groups_stamp().unwrap().expect("first stamp");
+
+        // Writing an unrelated store must not disturb `stamp1`.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = StateStore::open_or_create(other_dir.path()).unwrap();
+        other.save_roster(&Roster::new()).unwrap();
+        assert_eq!(store.groups_stamp().unwrap().expect("stable stamp"), stamp1);
+
+        // Immediately overwriting with an equal-length V2GroupSecrets must advance the stamp.
+        store
+            .update_group_book(|book| {
+                book.install_secrets(&gid, V2GroupSecrets::new([2; 32], 1))?;
+                Ok(())
+            })
+            .unwrap();
+        let stamp2 = store.groups_stamp().unwrap().expect("second stamp");
+        assert_eq!(stamp1.len, stamp2.len);
+        assert_ne!(stamp1, stamp2);
     }
 }

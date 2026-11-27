@@ -10,7 +10,7 @@ use tendril_core::wire::{Intent, Preamble, WIRE_VERSION, WIRE_VERSION_V2};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinHandle};
-use tokio::time::{Instant as TokioInstant, MissedTickBehavior, sleep, timeout, timeout_at};
+use tokio::time::{Instant as TokioInstant, sleep, sleep_until, timeout, timeout_at};
 
 use crate::driver::DEFAULT_PRE_AUTH_TIMEOUT;
 use crate::error::RuntimeError;
@@ -49,6 +49,7 @@ impl QueueState {
 struct QueueInner {
     state: StdMutex<QueueState>,
     notify: Notify,
+    sweeper_notify: Arc<Notify>,
 }
 
 /// Shared receiver handle for one routed inbound intent stream.
@@ -56,7 +57,7 @@ struct QueueInner {
 pub struct InboundQueue(Arc<QueueInner>);
 
 impl InboundQueue {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, sweeper_notify: Arc<Notify>) -> Self {
         Self(Arc::new(QueueInner {
             state: StdMutex::new(QueueState {
                 closed: false,
@@ -64,6 +65,7 @@ impl InboundQueue {
                 items: VecDeque::new(),
             }),
             notify: Notify::new(),
+            sweeper_notify,
         }))
     }
 
@@ -84,6 +86,7 @@ impl InboundQueue {
         };
         if pushed {
             self.0.notify.notify_waiters();
+            self.0.sweeper_notify.notify_one();
         }
         pushed
     }
@@ -93,9 +96,16 @@ impl InboundQueue {
         st.sweep_expired(now);
     }
 
+    fn next_expiry(&self) -> Option<TokioInstant> {
+        let st = self.0.state.lock().expect("inbound queue mutex poisoned");
+        st.items.iter().map(|entry| entry.expires_at).min()
+    }
+
     fn clear_items(&self) {
         let mut st = self.0.state.lock().expect("inbound queue mutex poisoned");
         st.items.clear();
+        drop(st);
+        self.0.sweeper_notify.notify_one();
     }
 
     fn close(&self) {
@@ -125,6 +135,7 @@ pub struct InboundRouter {
     session_queue: InboundQueue,
     v2_pair_queue: InboundQueue,
     v2_session_queue: InboundQueue,
+    sweeper_notify: Arc<Notify>,
     sweeper_started: AtomicBool,
     listener_tasks: StdMutex<Vec<AbortHandle>>,
 }
@@ -150,6 +161,7 @@ impl InboundRouter {
         let v2_session_limiter = limiter(config.clone());
         let rate_limiter = limiter(config);
         let (shutdown_tx, _) = watch::channel(false);
+        let sweeper_notify = Arc::new(Notify::new());
         Self {
             refusal,
             rate_limiter,
@@ -161,10 +173,11 @@ impl InboundRouter {
             v2_pair_enabled: Arc::new(AtomicBool::new(true)),
             queue_ttl: queue_ttl.max(Duration::from_millis(10)),
             shutdown_tx,
-            pair_queue: InboundQueue::new(queue_cap),
-            session_queue: InboundQueue::new(queue_cap),
-            v2_pair_queue: InboundQueue::new(queue_cap),
-            v2_session_queue: InboundQueue::new(queue_cap),
+            pair_queue: InboundQueue::new(queue_cap, Arc::clone(&sweeper_notify)),
+            session_queue: InboundQueue::new(queue_cap, Arc::clone(&sweeper_notify)),
+            v2_pair_queue: InboundQueue::new(queue_cap, Arc::clone(&sweeper_notify)),
+            v2_session_queue: InboundQueue::new(queue_cap, Arc::clone(&sweeper_notify)),
+            sweeper_notify,
             sweeper_started: AtomicBool::new(false),
             listener_tasks: StdMutex::new(Vec::new()),
         }
@@ -282,28 +295,48 @@ impl InboundRouter {
         let sess_q = self.session_queue.clone();
         let v2_pair_q = self.v2_pair_queue.clone();
         let v2_sess_q = self.v2_session_queue.clone();
+        let sweeper_notify = Arc::clone(&self.sweeper_notify);
         let mut shut = self.shutdown_tx.subscribe();
         if *shut.borrow() {
             return;
         }
-        let tick_every =
-            (self.queue_ttl / 2).clamp(Duration::from_millis(20), Duration::from_secs(1));
         let join = handle.spawn(async move {
-            let mut interval = tokio::time::interval(tick_every);
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
+                let notified = sweeper_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if *shut.borrow() {
                     break;
                 }
-                tokio::select! {
-                    biased;
-                    _ = shut.changed() => break,
-                    _ = interval.tick() => {
-                        let now = TokioInstant::now();
-                        pair_q.sweep(now);
-                        sess_q.sweep(now);
-                        v2_pair_q.sweep(now);
-                        v2_sess_q.sweep(now);
+                let now = TokioInstant::now();
+                pair_q.sweep(now);
+                sess_q.sweep(now);
+                v2_pair_q.sweep(now);
+                v2_sess_q.sweep(now);
+                let next_dl = [
+                    pair_q.next_expiry(),
+                    sess_q.next_expiry(),
+                    v2_pair_q.next_expiry(),
+                    v2_sess_q.next_expiry(),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
+                match next_dl {
+                    Some(deadline) => {
+                        tokio::select! {
+                            biased;
+                            _ = shut.changed() => break,
+                            () = &mut notified => {}
+                            () = sleep_until(deadline) => {}
+                        }
+                    }
+                    None => {
+                        tokio::select! {
+                            biased;
+                            _ = shut.changed() => break,
+                            () = &mut notified => {}
+                        }
                     }
                 }
             }
@@ -589,5 +622,40 @@ mod tests {
             "every limiter reports to the sink"
         );
         assert!(seen.iter().all(|a| a.code == 4001));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweeper_parks_idle_and_expires_at_ttl_without_polling() {
+        let router =
+            InboundRouter::with_config_and_ttl(PreAuthConfig::default(), Duration::from_secs(5));
+        let (pair_q, _) = router.split_queues();
+        let (a, _b) = tokio::io::duplex(64);
+        let guard = router
+            .rate_limiter()
+            .try_acquire_half_open_for_stream(tendril_core::policy::ProviderId::Direct, None, None)
+            .expect("guard");
+        let rt = tokio::runtime::Handle::current();
+        router.ensure_sweeper(&rt);
+
+        let now = TokioInstant::now();
+        assert!(pair_q.try_push(
+            (
+                Box::new(crate::provider::IoPathStream::new(
+                    tendril_core::policy::ProviderId::Direct,
+                    None,
+                    Duration::from_secs(1),
+                    a,
+                )),
+                guard,
+            ),
+            now + Duration::from_secs(5),
+        ));
+        assert_eq!(pair_q.next_expiry(), Some(now + Duration::from_secs(5)));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(pair_q.next_expiry(), None);
+        router.close();
     }
 }

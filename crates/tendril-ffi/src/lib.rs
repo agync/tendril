@@ -4689,6 +4689,7 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay_v2(
                 replay_cache: None,
                 unix_secs: None,
                 auth: cfg.relay_auth.clone(),
+                ..RelayV2ListenerConfig::default()
             };
             match ep
                 .rt

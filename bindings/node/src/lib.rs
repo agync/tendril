@@ -2654,6 +2654,7 @@ impl Endpoint {
                 replay_cache: None,
                 unix_secs: None,
                 auth: cfg.relay_auth.clone(),
+                ..RelayV2ListenerConfig::default()
             };
             let listener = RelayV2Listener::bind_with_config(&relay_url, secret, lcfg)
                 .await
