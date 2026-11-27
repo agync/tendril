@@ -1736,6 +1736,8 @@ impl TendrilSession {
     /// event instead.
     fn group_frame_json(&self, ev: &SessionEvent) -> Result<serde_json::Value, String> {
         if let Some(store) = self.store.as_ref() {
+            // The runtime reads the stored roster: commit held revocations first.
+            self.commit_held_revocations()?;
             let peer = self
                 .session
                 .peer_device_id()
@@ -8160,6 +8162,75 @@ mod route_state_tests {
                 "{place}: the revoked peer"
             );
         }
+    }
+
+    /// Pins a peer in `ep`'s roster (persisted), then revokes it in memory only, as a live
+    /// session would. Returns its id.
+    fn hold_unpersisted_revocation(ep: &Ep) -> String {
+        let peer = EndpointIdentity::generate().unwrap();
+        let peer_id = peer.host_id().to_owned();
+        ep.get()
+            .mutate_roster(|r| {
+                r.insert_pinned_host(
+                    peer_id.clone(),
+                    "Peer".to_owned(),
+                    *peer.static_key().public_bytes(),
+                    Some(peer.signing_key().public_key().clone()),
+                    0,
+                    vec![],
+                )
+                .map(|_| ())
+                .map_err(|e| (TENDRIL_ERR_INTERNAL, e.to_string()))
+            })
+            .unwrap();
+        lock_roster(&ep.get().roster).revoke_peer(&peer_id).unwrap();
+        assert_eq!(disk_state(ep, &peer_id), Some(PeerState::Active));
+        peer_id
+    }
+
+    fn disk_state(ep: &Ep, id: &str) -> Option<PeerState> {
+        let store = ep.get().store.as_ref().unwrap();
+        store.load_roster().unwrap().get(id).map(|e| e.state)
+    }
+
+    #[test]
+    fn group_calls_commit_held_revocations_before_they_read_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Ep::new(&tmp.path().join("host"), Some("group-commit-host"));
+        let client = Ep::new(&tmp.path().join("client"), None);
+        serve_direct(&host);
+        let grant = pair(&host, &client);
+        let host_id = host.get().identity.host_id().to_owned();
+        let (c, _h) = connect(&host, &client, &host_id, &grant);
+
+        // Group administration reads peers from the store.
+        let admin_peer = hold_unpersisted_revocation(&client);
+        let name = cs("g");
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_group_create(client.0, name.as_ptr(), 1, ptr::null(), &raw mut out) },
+            TENDRIL_OK,
+            "{}",
+            last_err()
+        );
+        let manifest_json = unsafe { take(out) };
+        assert_eq!(
+            disk_state(&client, &admin_peer),
+            Some(PeerState::Revoked),
+            "a group admin call commits first"
+        );
+
+        // A group frame a session receives is handed to the runtime, which reads the store.
+        let frame_peer = hold_unpersisted_revocation(&client);
+        let manifest =
+            tendril_core::group::GroupManifest::from_wire_bytes(manifest_json.as_bytes()).unwrap();
+        let sess = unsafe { &*c.0 };
+        let _ = sess.group_frame_json(&SessionEvent::GroupManifestReceived(Box::new(manifest)));
+        assert_eq!(
+            disk_state(&client, &frame_peer),
+            Some(PeerState::Revoked),
+            "a group frame commits first"
+        );
     }
 
     fn wake_config(url: &str, pre_wake: bool) -> WakeTransportSettings {

@@ -1518,6 +1518,16 @@ impl Endpoint {
             .ok_or_else(|| PyRuntimeError::new_err("group operations require a state_dir"))
     }
 
+    /// A commit of the revocation state live sessions hold, to run (outside the GIL) before a
+    /// group call reads the store.
+    fn held_commit(&self) -> impl FnOnce() -> PyResult<()> + Send + 'static {
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let roster = Arc::clone(&self.roster);
+        let identity = Arc::clone(&self.identity);
+        move || sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)
+    }
+
     fn snapshot_transport_cfg(&self) -> EndpointTransportConfig {
         self.transport_cfg
             .lock()
@@ -1616,7 +1626,9 @@ impl Endpoint {
         let identity = Arc::clone(&self.identity);
         let name = name.to_owned();
         let endpoints = endpoints.unwrap_or_default();
+        let commit = self.held_commit();
         py.detach(move || {
+            commit()?;
             let manifest = rt_group_create(&store, &identity, &name, min_wire_version, endpoints)
                 .map_err(py_err)?;
             manifest_json(&manifest)
@@ -1638,7 +1650,9 @@ impl Endpoint {
         let peer_id = peer_id.to_owned();
         let caps = caps.unwrap_or_default();
         let endpoints = endpoints.unwrap_or_default();
+        let commit = self.held_commit();
         py.detach(move || {
+            commit()?;
             let manifest =
                 rt_group_add_member(&store, &identity, &group_id, &peer_id, caps, endpoints)
                     .map_err(py_err)?;
@@ -1656,7 +1670,9 @@ impl Endpoint {
         let identity = Arc::clone(&self.identity);
         let group_id = group_id.to_owned();
         let peer_id = peer_id.to_owned();
+        let commit = self.held_commit();
         py.detach(move || {
+            commit()?;
             let manifest =
                 rt_group_remove_member(&store, &identity, &group_id, &peer_id).map_err(py_err)?;
             manifest_json(&manifest)
@@ -1673,7 +1689,9 @@ impl Endpoint {
         let local_id = self.identity.device_id();
         let manifest_json = manifest_json.to_owned();
         let sender = sender_peer_id.to_owned();
+        let commit = self.held_commit();
         py.detach(move || {
+            commit()?;
             rt_group_ingest_manifest(&store, &local_id, &sender, &manifest_json)
                 .map(|outcome| outcome.group_id)
                 .map_err(py_err)
@@ -1707,7 +1725,9 @@ impl Endpoint {
                     .map_err(|e| value_err(format!("invalid address: {e}")))
             })
             .transpose()?;
+        let commit = self.held_commit();
         py.detach(move || {
+            commit()?;
             let rt_for_pool = Arc::clone(&rt);
             rt_for_pool.block_on(async move {
                 let mut dialers: Vec<Arc<dyn PathDialer>> = vec![
@@ -3516,6 +3536,10 @@ impl Session {
                             }),
                             ev @ (SessionEvent::GroupManifestReceived(_)
                             | SessionEvent::GroupRendezvousReceived(_)) => {
+                                // The runtime reads the stored roster: commit held revocations.
+                                sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
+                                    .await
+                                    .map_err(py_err)?;
                                 group_frame_json(store.as_ref(), &identity, &sess, ev).await?
                             }
                             SessionEvent::PathUpgrade(msg) => serde_json::json!({
