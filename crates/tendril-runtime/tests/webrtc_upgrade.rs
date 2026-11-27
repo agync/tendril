@@ -263,6 +263,48 @@ async fn split_write_close_preserves_buffered_reads() {
 }
 
 #[tokio::test]
+async fn shutdown_write_delivers_bytes_sent_before_it() {
+    let (handle, mut listener) = WebRtcUpgradeEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind endpoint");
+
+    let client_task = tokio::spawn(async move {
+        WebRtcActiveDialer::dial(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            |offer_sdp| async move { handle.accept_offer(&offer_sdp).await },
+        )
+        .await
+        .expect("dial")
+    });
+
+    let mut server_stream = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("accept timeout")
+        .expect("accept stream");
+    let mut client_stream = timeout(Duration::from_secs(5), client_task)
+        .await
+        .expect("client timeout")
+        .expect("client join");
+
+    let frame = encode_frame(b"final-frame").expect("encode frame");
+    server_stream.send_chunk(&frame).await.expect("send chunk");
+    server_stream
+        .shutdown_write()
+        .await
+        .expect("half-close the write side");
+
+    let mut buf = vec![0u8; 256];
+    let n = timeout(Duration::from_secs(2), client_stream.recv_chunk(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read chunk");
+    assert!(
+        n >= frame.len(),
+        "the frame sent before the half-close arrives"
+    );
+}
+
+#[tokio::test]
 async fn v1_inband_webrtc_upgrade_and_cutover() {
     let now = 1_750_000_000;
     let (host_id, client_id) = make_identities();

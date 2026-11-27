@@ -583,6 +583,11 @@ impl PathStream for WtPathStream {
         Ok(())
     }
 
+    async fn shutdown_write(&mut self) -> Result<(), RuntimeError> {
+        let _ = timeout(CLOSE_FINISH_TIMEOUT, self.send.finish()).await;
+        Ok(())
+    }
+
     fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
         (
             Box::new(WtReadHalf {

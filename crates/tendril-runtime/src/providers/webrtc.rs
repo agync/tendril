@@ -971,6 +971,12 @@ impl PathStream for WebRtcStream {
         res
     }
 
+    /// Closes the data channel's write side. A data channel has no one-sided close, so the
+    /// local read side may see EOF once the channel closes. Bytes sent before it are delivered.
+    async fn shutdown_write(&mut self) -> Result<(), RuntimeError> {
+        self.close_write_half().await
+    }
+
     fn into_split(mut self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
         let cmd_tx = self
             .cmd_tx

@@ -326,6 +326,9 @@ impl PathStream for RelayStream {
         self.inner.close().await
     }
 
+    // `shutdown_write` keeps the trait default: a WebSocket has no half-close, so it is a no-op
+    // and `close()` ends the stream.
+
     fn into_split(
         self: Box<Self>,
     ) -> (

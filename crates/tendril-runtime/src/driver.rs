@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use tendril_core::RefusalReason;
 #[cfg(feature = "webrtc")]
 use tendril_core::UPGRADE_CAP_WEBRTC_V1;
 use tendril_core::crypto::HybridSigningPublicKey;
@@ -2750,6 +2751,16 @@ where
     .await
 }
 
+/// `true` for an error that ends a race whatever the candidate's own `fatal` flag says: a
+/// `Revoked` or `Pending` refusal. A reserved admission code (`Other`) may be transient, so it
+/// never cancels a healthy candidate.
+fn ends_race(error: &RuntimeError) -> bool {
+    matches!(
+        error.refusal(),
+        Some(RefusalReason::Revoked | RefusalReason::Pending)
+    )
+}
+
 /// Failure of one raced candidate. A `fatal` failure ends the whole race.
 pub(crate) struct CandidateError {
     pub(crate) error: RuntimeError,
@@ -2816,7 +2827,7 @@ where
 
     let driver = Arc::new(drive);
     let mut planner = PathPlanner::new(policy_config, candidates);
-    let started = Instant::now();
+    let started = TokioInstant::now();
     planner.start(0);
 
     struct AbortOnDrop(AbortHandle);
@@ -2883,11 +2894,13 @@ where
                         verified_values.insert(id, value);
                         planner.on_dial_succeeded(id, now_ms);
                     }
-                    Err(CandidateError { error, fatal: true }) => {
+                    Err(CandidateError { error, fatal })
+                        if fatal || ends_race(&error) =>
+                    {
                         in_flight_handles.clear();
                         return end(Err(RaceEnd::Fatal(error)), failures);
                     }
-                    Err(CandidateError { error, fatal: false }) => {
+                    Err(CandidateError { error, .. }) => {
                         planner.on_dial_failed(id, &error.to_string(), now_ms);
                         if let Some(cand) = by_id.get(&id) {
                             failures.push((cand.clone(), error));
@@ -2915,7 +2928,7 @@ pub struct CandidateFailure {
 /// Why a policy pairing attempt or a Day-2 connect failed.
 ///
 /// `error` is the most severe candidate error (`RotationForkDetected` > `PeerRevoked` >
-/// `VersionDowngrade` > `HostKeyUnverified` > `InvalidPairingUri` > transport errors) or the
+/// authenticated refusal > `VersionDowngrade` > `HostKeyUnverified` > `InvalidPairingUri` > transport errors) or the
 /// error that ended the attempt. `committed` is `true` once any `msg3` byte may have been written
 /// (the code may be spent and no other rung was tried). For a Day-2
 /// connect it is `true` when a candidate established a session and the attempt failed after
@@ -2946,7 +2959,7 @@ impl AttemptError {
 
     /// `true` for an uncommitted transport miss a wake retry may fix: the ending error and every
     /// candidate failure are `Io`, `Timeout` or `Closed`. Never for a committed attempt, a core
-    /// or policy refusal, relay admission or offline errors, egress refusals, storage errors or
+    /// or policy refusal (including an authenticated peer refusal), relay admission or offline errors, egress refusals, storage errors or
     /// an attempt without dialable routes.
     #[must_use]
     pub fn is_transient_precommit(&self) -> bool {
@@ -3016,8 +3029,9 @@ impl From<AttemptError> for RuntimeError {
 /// Severity rank of a candidate error (higher wins).
 const fn error_severity(err: &RuntimeError) -> u8 {
     match err {
-        RuntimeError::Core(CoreError::RotationForkDetected { .. }) => 6,
-        RuntimeError::Core(CoreError::PeerRevoked(_)) => 5,
+        RuntimeError::Core(CoreError::RotationForkDetected { .. }) => 7,
+        RuntimeError::Core(CoreError::PeerRevoked(_)) => 6,
+        _ if err.refusal().is_some() => 5,
         RuntimeError::Core(CoreError::VersionDowngrade { .. }) => 4,
         RuntimeError::Core(CoreError::HostKeyUnverified) => 3,
         RuntimeError::Core(CoreError::InvalidPairingUri(_)) => 2,
@@ -3084,6 +3098,10 @@ fn clone_runtime_error(err: &RuntimeError) -> RuntimeError {
             detail: detail.clone(),
         },
         RuntimeError::RelayOffline(kind) => RuntimeError::RelayOffline(*kind),
+        RuntimeError::InitiatorClosed { code, reason } => RuntimeError::InitiatorClosed {
+            code: *code,
+            reason: reason.clone(),
+        },
         RuntimeError::CapacityExceeded(m) => RuntimeError::CapacityExceeded(m),
     }
 }
@@ -4322,6 +4340,248 @@ mod tests {
     }
 
     const NOW: u64 = 1_795_564_800;
+
+    fn refused(reason: tendril_core::RefusalReason) -> RuntimeError {
+        RuntimeError::Core(CoreError::PeerRefused { reason })
+    }
+
+    #[test]
+    fn severity_ranks_a_refusal_between_revoked_and_downgrade() {
+        use tendril_core::RefusalReason;
+        let ranked = [
+            RuntimeError::Core(CoreError::RotationForkDetected { seq: 1 }),
+            RuntimeError::Core(CoreError::PeerRevoked("h".into())),
+            refused(RefusalReason::Revoked),
+            RuntimeError::Core(CoreError::VersionDowngrade {
+                peer_min: 2,
+                negotiated: 1,
+            }),
+            RuntimeError::Core(CoreError::HostKeyUnverified),
+            RuntimeError::Core(CoreError::InvalidPairingUri("u".into())),
+            RuntimeError::Closed,
+        ];
+        let levels: Vec<u8> = ranked.iter().map(error_severity).collect();
+        assert_eq!(levels, [7, 6, 5, 4, 3, 2, 1]);
+        for reason in [RefusalReason::Pending, RefusalReason::Revoked] {
+            assert_eq!(error_severity(&refused(reason)), 5);
+        }
+        let initiator = RuntimeError::from_initiator_core(CoreError::SessionClosed {
+            code: 4001,
+            reason: String::new(),
+        });
+        assert_eq!(error_severity(&initiator), 5);
+    }
+
+    #[test]
+    fn exhausted_error_prefers_the_most_severe_failure() {
+        use tendril_core::RefusalReason;
+        let failure = |error| CandidateFailure {
+            hint: "h".into(),
+            provider: ProviderId::Direct,
+            error,
+        };
+        let err = exhausted_error(
+            vec![
+                failure(RuntimeError::Core(CoreError::VersionDowngrade {
+                    peer_min: 2,
+                    negotiated: 1,
+                })),
+                failure(RuntimeError::Core(CoreError::HostKeyUnverified)),
+                failure(RuntimeError::Closed),
+            ],
+            Vec::new(),
+            RuntimeError::Closed,
+        );
+        assert!(matches!(
+            err.error,
+            RuntimeError::Core(CoreError::VersionDowngrade { .. })
+        ));
+        assert_eq!(error_severity(&refused(RefusalReason::Pending)), 5);
+    }
+
+    #[test]
+    fn a_refusal_is_never_transient_or_wakeable() {
+        use tendril_core::RefusalReason;
+        let attempt = |error, failures| AttemptError {
+            error,
+            committed: false,
+            skipped: Vec::new(),
+            failures,
+        };
+        let failure = |error| CandidateFailure {
+            hint: "h".into(),
+            provider: ProviderId::Direct,
+            error,
+        };
+        let initiator = || {
+            RuntimeError::from_initiator_core(CoreError::SessionClosed {
+                code: 4004,
+                reason: String::new(),
+            })
+        };
+        for error in [refused(RefusalReason::Revoked), initiator()] {
+            let miss = attempt(error, Vec::new());
+            assert!(!miss.is_transient_precommit());
+            assert!(!miss.is_wakeable_miss());
+        }
+        let io = || RuntimeError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        for refusal in [refused(RefusalReason::Pending), initiator()] {
+            let mixed = attempt(io(), vec![failure(io()), failure(refusal)]);
+            assert!(!mixed.is_transient_precommit(), "a refusal candidate");
+            assert!(!mixed.is_wakeable_miss(), "a refusal candidate");
+        }
+        assert!(attempt(io(), vec![failure(io())]).is_wakeable_miss());
+    }
+
+    struct NoDial;
+
+    #[async_trait]
+    impl PathDialer for NoDial {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Direct
+        }
+
+        async fn dial(&self, _endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+            Err(RuntimeError::Closed)
+        }
+    }
+
+    struct SetFlagOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetFlagOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Races three fake candidates: the first fails plainly, the second fails with `second`
+    /// after 400 ms, the third wins after 1.5 s. Returns the race, how many candidates were
+    /// dialed and whether the third was dropped before it finished.
+    async fn race_with_second_failure(second: RuntimeError) -> (Race<()>, usize, bool) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dialers: Vec<Arc<dyn PathDialer>> = vec![Arc::new(NoDial)];
+        let candidates: Vec<CandidateEndpoint> = (0..3)
+            .map(|id| {
+                CandidateEndpoint::new(id, ProviderId::Direct, format!("127.0.0.1:{}", 9000 + id))
+            })
+            .collect();
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(Mutex::new(Some(second)));
+        let drive = {
+            let started = Arc::clone(&started);
+            let dropped = Arc::clone(&dropped);
+            let finished = Arc::clone(&finished);
+            move |cand: CandidateEndpoint, _dialer: Arc<dyn PathDialer>| {
+                let started = Arc::clone(&started);
+                let dropped = Arc::clone(&dropped);
+                let finished = Arc::clone(&finished);
+                let second = Arc::clone(&second);
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    match cand.id {
+                        0 => Err(CandidateError::retry(RuntimeError::Closed)),
+                        1 => {
+                            sleep(Duration::from_millis(400)).await;
+                            let error = second.lock().unwrap().take().unwrap();
+                            Err(CandidateError::retry(error))
+                        }
+                        _ => {
+                            let _guard = SetFlagOnDrop(dropped);
+                            sleep(Duration::from_millis(1500)).await;
+                            finished.store(true, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    }
+                }
+            }
+        };
+        let config = PathPolicyConfig {
+            happy_eyeballs_stagger_ms: 20,
+            ..PathPolicyConfig::default()
+        };
+        let race = race_candidates(&dialers, config, candidates, drive).await;
+        tokio::task::yield_now().await;
+        let cancelled = dropped.load(Ordering::SeqCst) && !finished.load(Ordering::SeqCst);
+        (race, started.load(Ordering::SeqCst), cancelled)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_ends_on_the_first_refusal_and_cancels_the_rest() {
+        use tendril_core::RefusalReason;
+
+        let initiator = || {
+            RuntimeError::from_initiator_core(CoreError::SessionClosed {
+                code: 4004,
+                reason: String::new(),
+            })
+        };
+        for (second, expected) in [
+            (refused(RefusalReason::Revoked), RefusalReason::Revoked),
+            (refused(RefusalReason::Pending), RefusalReason::Pending),
+            (initiator(), RefusalReason::Pending),
+        ] {
+            let (race, started, cancelled) = race_with_second_failure(second).await;
+            match race.outcome {
+                Err(RaceEnd::Fatal(err)) => assert_eq!(err.refusal(), Some(expected)),
+                Err(RaceEnd::Exhausted) => panic!("the race ran on past a refusal"),
+                Err(RaceEnd::ChannelClosed) => panic!("channel closed"),
+                Ok(_) => panic!("a candidate won"),
+            }
+            assert_eq!(started, 3, "all candidates were dialed");
+            assert!(cancelled, "the pending candidate was cancelled");
+            assert_eq!(race.failures.len(), 1, "only the plain failure is reported");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_ignores_a_responder_close_and_an_admission_refusal() {
+        use tendril_core::{AdmissionRefusalCode, RefusalReason};
+
+        let other = AdmissionRefusalCode::new(4450).unwrap();
+        for second in [
+            RuntimeError::Core(CoreError::SessionClosed {
+                code: 4001,
+                reason: String::new(),
+            }),
+            refused(RefusalReason::Other(other)),
+            RuntimeError::from_initiator_core(CoreError::SessionClosed {
+                code: 4450,
+                reason: String::new(),
+            }),
+        ] {
+            let text = second.to_string();
+            let (race, started, cancelled) = race_with_second_failure(second).await;
+            assert!(race.outcome.is_ok(), "{text}: the healthy candidate won");
+            assert_eq!(started, 3);
+            assert!(
+                !cancelled,
+                "{text}: the healthy candidate was not cancelled"
+            );
+            assert_eq!(race.failures.len(), 2, "{text}: both failures are reported");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_keeps_going_past_a_plain_failure() {
+        let dialers: Vec<Arc<dyn PathDialer>> = vec![Arc::new(NoDial)];
+        let candidates: Vec<CandidateEndpoint> = (0..2)
+            .map(|id| {
+                CandidateEndpoint::new(id, ProviderId::Direct, format!("127.0.0.1:{}", 9000 + id))
+            })
+            .collect();
+        let drive = |cand: CandidateEndpoint, _dialer: Arc<dyn PathDialer>| async move {
+            if cand.id == 0 {
+                Err(CandidateError::retry(RuntimeError::Closed))
+            } else {
+                Ok(7_u8)
+            }
+        };
+        let race = race_candidates(&dialers, PathPolicyConfig::default(), candidates, drive).await;
+        assert!(matches!(race.outcome, Ok((_, 7))));
+    }
 
     /// A client roster with `host` pinned as `Active`.
     fn pinned_roster(host: &EndpointIdentity) -> Roster {
