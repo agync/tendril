@@ -52,11 +52,15 @@ pub use egress::{
     EgressDialer, EgressKind, HintSource, HostResolver, SkipReason, SkippedHint, SystemResolver,
     check_hint, classify_destination, path_class,
 };
-pub use local::{LocalDialer, LocalListener};
+pub use local::LocalDialer;
+#[cfg(unix)]
+pub use local::LocalListener;
 pub use overlay::{
-    OverlayConfig, OverlayDialer, OverlayHelperDialer, OverlayHelperListener, OverlayListener,
-    OverlayMode, OverlayResolvedMode, is_tailnet_ip, select_overlay_mode,
+    OverlayConfig, OverlayDialer, OverlayListener, OverlayMode, OverlayResolvedMode, is_tailnet_ip,
+    select_overlay_mode,
 };
+#[cfg(unix)]
+pub use overlay::{OverlayHelperDialer, OverlayHelperListener};
 #[cfg(feature = "p2p-iroh")]
 pub use p2p::{
     MAX_P2P_CUSTOM_RELAYS, P2pBindAddrs, P2pDialer, P2pHintAddr, P2pListener, P2pOptions,
@@ -418,11 +422,6 @@ pub(crate) fn set_mode_0600(path: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-pub(crate) fn set_mode_0600(_path: &Path) -> Result<(), RuntimeError> {
-    Ok(())
-}
-
 #[cfg(unix)]
 pub(crate) fn create_private_dir_0700(dir: &Path) -> Result<(), RuntimeError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -532,23 +531,6 @@ pub(crate) fn bind_private_unix_listener(
     }
     set_mode_0600(path)?;
     Ok(listener)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn bind_private_unix_listener(
-    path: &Path,
-    enforce_parent_0700: bool,
-) -> Result<tokio::net::UnixListener, RuntimeError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && (enforce_parent_0700 || !parent.exists())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    Ok(tokio::net::UnixListener::bind(path)?)
 }
 
 /// Shared WebSocket binary-frame `PathStream` used by `relay` and `broker` providers.

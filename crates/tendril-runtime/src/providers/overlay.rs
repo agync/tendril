@@ -2,29 +2,47 @@
 //!
 //! Supports direct binding/dialing over host tailnet interfaces as well as a scoped helper mode
 //! communicating purely over `0o600` Unix domain sockets without exposing localhost TCP ports.
+//! The helper mode is Unix-only; other targets build the host mode alone.
 
 use std::collections::HashSet;
-use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tendril_core::policy::ProviderId;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{Instant, timeout};
+
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::sync::Arc;
+
+#[cfg(unix)]
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+#[cfg(unix)]
+use tokio::net::UnixStream;
+#[cfg(unix)]
 use tokio::sync::{Semaphore, mpsc};
+#[cfg(unix)]
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout, timeout_at};
+#[cfg(unix)]
+use tokio::time::timeout_at;
 
 use crate::error::RuntimeError;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, IoPathStream, PathDialer, PathListener, PathStream};
 
+#[cfg(unix)]
 const HELPER_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
 const MAX_HELPER_LINE_LEN: usize = 1024;
+#[cfg(unix)]
 const MAX_CONCURRENT_HELPER_ACCEPTS: usize = 64;
 
 /// Requested overlay resolution strategy.
@@ -74,12 +92,16 @@ impl OverlayConfig {
 }
 
 /// Resolves whether overlay runs via a scoped helper, host tailnet socket, or stays unavailable.
+///
+/// The helper speaks over Unix domain sockets, so on targets without them `OverlayMode::Helper`
+/// and the helper arm of `OverlayMode::Auto` resolve to [`OverlayResolvedMode::Unavailable`].
 #[must_use]
 pub fn select_overlay_mode(config: &OverlayConfig, host_reachable: bool) -> OverlayResolvedMode {
+    let helper_available = cfg!(unix) && config.helper_configured();
     match config.mode {
         OverlayMode::Disabled => OverlayResolvedMode::Unavailable,
         OverlayMode::Helper => {
-            if config.helper_configured() {
+            if helper_available {
                 OverlayResolvedMode::Helper
             } else {
                 OverlayResolvedMode::Unavailable
@@ -93,7 +115,7 @@ pub fn select_overlay_mode(config: &OverlayConfig, host_reachable: bool) -> Over
             }
         }
         OverlayMode::Auto => {
-            if config.helper_configured() {
+            if helper_available {
                 OverlayResolvedMode::Helper
             } else if host_reachable {
                 OverlayResolvedMode::Host
@@ -308,6 +330,7 @@ impl PathDialer for OverlayDialer {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct HelperControlMsg {
     op: Option<String>,
@@ -317,6 +340,7 @@ struct HelperControlMsg {
     error: Option<String>,
 }
 
+#[cfg(unix)]
 async fn read_line_bounded(
     stream: &mut UnixStream,
     limit: Duration,
@@ -343,6 +367,7 @@ async fn read_line_bounded(
     }
 }
 
+#[cfg(unix)]
 async fn accept_one_helper(
     mut stream: UnixStream,
     write_timeout: Duration,
@@ -372,12 +397,14 @@ async fn accept_one_helper(
 }
 
 /// Scoped overlay listener receiving helper-bridged connections over a `0o600` Unix socket.
+#[cfg(unix)]
 pub struct OverlayHelperListener {
     socket_path: PathBuf,
     accepted_rx: mpsc::Receiver<Box<dyn PathStream>>,
     accept_task: JoinHandle<()>,
 }
 
+#[cfg(unix)]
 impl OverlayHelperListener {
     /// Binds an IPC socket for inbound overlay helper streams inside a `0o700` parent directory.
     pub fn bind(socket_path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
@@ -425,6 +452,7 @@ impl OverlayHelperListener {
     }
 }
 
+#[cfg(unix)]
 impl Drop for OverlayHelperListener {
     fn drop(&mut self) {
         self.accept_task.abort();
@@ -432,6 +460,7 @@ impl Drop for OverlayHelperListener {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl PathListener for OverlayHelperListener {
     async fn accept(&mut self) -> Result<Box<dyn PathStream>, RuntimeError> {
@@ -444,12 +473,14 @@ impl PathListener for OverlayHelperListener {
 }
 
 /// Dialer connecting through a scoped overlay helper `0o600` Unix socket (zero localhost TCP ports).
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct OverlayHelperDialer {
     socket_path: PathBuf,
     write_timeout: Duration,
 }
 
+#[cfg(unix)]
 impl OverlayHelperDialer {
     /// Creates a dialer targeting the helper's Unix control/stream socket.
     #[must_use]
@@ -461,6 +492,7 @@ impl OverlayHelperDialer {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl PathDialer for OverlayHelperDialer {
     fn provider_id(&self) -> ProviderId {

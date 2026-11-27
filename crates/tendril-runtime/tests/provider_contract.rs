@@ -1182,11 +1182,8 @@ async fn inbound_router_separates_pair_and_session_and_wakes_on_close() {
     assert!(matches!(woke, Ok(None)));
 }
 
-#[tokio::test]
-async fn overlay_mode_selection_and_scoped_unix_helper_roundtrip() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::{UnixListener, UnixStream};
-
+#[test]
+fn overlay_mode_selection_respects_platform() {
     assert!(is_tailnet_ip("100.100.100.100".parse().expect("v4")));
     assert!(!is_tailnet_ip("192.168.1.10".parse().expect("lan")));
     assert!(is_tailnet_ip("fd7a:115c:a1e0::1".parse().expect("ts v6")));
@@ -1219,10 +1216,12 @@ async fn overlay_mode_selection_and_scoped_unix_helper_roundtrip() {
         auth_key_file: Some(key_file),
         ..OverlayConfig::default()
     };
-    assert_eq!(
-        select_overlay_mode(&helper_cfg, true),
+    let expected_helper = if cfg!(unix) {
         OverlayResolvedMode::Helper
-    );
+    } else {
+        OverlayResolvedMode::Unavailable
+    };
+    assert_eq!(select_overlay_mode(&helper_cfg, true), expected_helper);
     let disabled_cfg = OverlayConfig {
         mode: OverlayMode::Disabled,
         ..helper_cfg
@@ -1231,7 +1230,15 @@ async fn overlay_mode_selection_and_scoped_unix_helper_roundtrip() {
         select_overlay_mode(&disabled_cfg, true),
         OverlayResolvedMode::Unavailable
     );
+}
 
+#[cfg(unix)]
+#[tokio::test]
+async fn overlay_scoped_unix_helper_roundtrip() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
+
+    let tmp = TempDir::new().expect("tempdir");
     let ipc_dir = tmp.path().join("tsnet-ipc");
     let listen_sock = ipc_dir.join("accept.sock");
     let dial_sock = ipc_dir.join("dial.sock");
