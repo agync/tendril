@@ -36,8 +36,75 @@ const (
 	MlDsa65SigLen = int(C.TENDRIL_MLDSA65_SIG_LEN)
 )
 
+const (
+	// CloseCodePeerRevoked is the close code of a host that refuses a revoked peer.
+	CloseCodePeerRevoked uint16 = C.TENDRIL_CLOSE_PEER_REVOKED
+	// CloseCodePeerPending is the close code of a host that refuses a peer it has not confirmed.
+	CloseCodePeerPending uint16 = C.TENDRIL_CLOSE_PEER_PENDING
+)
+
 // ErrWouldBlock indicates a polled FFI call timed out with no new event ready.
 var ErrWouldBlock = errors.New("tendril: would block")
+
+// RefusalReason says why a host refused this device.
+type RefusalReason string
+
+const (
+	// RefusalRevoked means the host blocks this device's key permanently. Re-pairing needs a new
+	// device identity.
+	RefusalRevoked RefusalReason = "revoked"
+	// RefusalPending means the host has not confirmed this device yet. Retry with backoff.
+	RefusalPending RefusalReason = "pending"
+	// RefusalOther is a refusal with a close code in the 4400..4499 range.
+	RefusalOther RefusalReason = "other"
+)
+
+// RefusedError reports an authenticated refusal: the host proved it knows this device and will
+// not serve it. Match it with errors.As.
+type RefusedError struct {
+	Reason RefusalReason
+	// CloseCode is the wire close code: CloseCodePeerRevoked or CloseCodePeerPending, and 0 for
+	// RefusalOther when only the reason is known.
+	CloseCode uint16
+	// Code is the stable machine code: "refused_revoked", "refused_pending" or "refused".
+	Code string
+	// Message is the redacted last-error text of the failing call.
+	Message string
+}
+
+func (e *RefusedError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("tendril: refused by peer (%s)", e.Reason)
+	}
+	return fmt.Sprintf("tendril: refused by peer (%s): %s", e.Reason, e.Message)
+}
+
+// refusalFromCode maps a stable last-error code to a *RefusedError, nil when it is no refusal.
+func refusalFromCode(code, msg string) *RefusedError {
+	switch code {
+	case "refused_revoked":
+		return &RefusedError{Reason: RefusalRevoked, CloseCode: CloseCodePeerRevoked, Code: code, Message: msg}
+	case "refused_pending":
+		return &RefusedError{Reason: RefusalPending, CloseCode: CloseCodePeerPending, Code: code, Message: msg}
+	case "refused":
+		return &RefusedError{Reason: RefusalOther, Code: code, Message: msg}
+	}
+	return nil
+}
+
+// RevokeOptions tunes Endpoint.RevokePeerWithOptions.
+type RevokeOptions struct {
+	// Notify chooses whether to record a refusal notice. Nil follows the endpoint policy.
+	Notify *bool `json:"notify,omitempty"`
+}
+
+// RefusalPolicy is the host policy for refusing known peers. It persists with the roster.
+type RefusalPolicy struct {
+	// Pending refuses unconfirmed peers with close code 4004.
+	Pending bool `json:"pending"`
+	// RevokedNoticeTTLSecs is the lifetime of a notice recorded at revocation; 0 records none.
+	RevokedNoticeTTLSecs uint64 `json:"revoked_notice_ttl_secs"`
+}
 
 // EndpointInfo holds an endpoint's public identifiers returned by Endpoint.Info.
 type EndpointInfo struct {
@@ -97,7 +164,10 @@ type SessionEvent struct {
 	Cookie    uint64          `json:"cookie,omitempty"`
 	Code      uint16          `json:"code,omitempty"`
 	Reason    string          `json:"reason,omitempty"`
-	Audit     json.RawMessage `json:"audit,omitempty"`
+	// Refusal is "revoked", "pending" or "other" on a closed event of a session this endpoint
+	// dialed that the host ended with a refusal code, and empty otherwise.
+	Refusal string          `json:"refusal,omitempty"`
+	Audit   json.RawMessage `json:"audit,omitempty"`
 	// Endpoints with a state directory ingest ordinary-session group frames in the runtime and
 	// report "group_manifest_ingested", "group_manifest_rejected", "group_rendezvous_ingested" or
 	// "group_rendezvous_rejected" with GroupID, Seq and, on a rejection, Error. Rendezvous keys
@@ -108,9 +178,35 @@ type SessionEvent struct {
 	Error        string `json:"error,omitempty"`
 }
 
-func lastError() string {
+// Refused returns the refusal a closed event carries, or nil.
+func (e *SessionEvent) Refused() *RefusedError {
+	if e == nil || e.Event != "closed" {
+		return nil
+	}
+	switch RefusalReason(e.Refusal) {
+	case RefusalRevoked:
+		return refusalFromCode("refused_revoked", e.Reason)
+	case RefusalPending:
+		return refusalFromCode("refused_pending", e.Reason)
+	case RefusalOther:
+		r := refusalFromCode("refused", e.Reason)
+		r.CloseCode = e.Code
+		return r
+	}
+	return nil
+}
+
+// readLast copies the last FFI error text, or its stable code when code is true. The error
+// state is thread-local: call it on the thread of the failing FFI call, before any other call.
+func readLast(code bool) string {
+	read := func(buf *C.char, n C.size_t) C.int32_t {
+		if code {
+			return C.tendril_last_error_code(buf, n)
+		}
+		return C.tendril_last_error(buf, n)
+	}
 	var probe [256]C.char
-	needed := C.tendril_last_error(&probe[0], C.size_t(len(probe)))
+	needed := read(&probe[0], C.size_t(len(probe)))
 	if needed <= 1 {
 		return ""
 	}
@@ -118,16 +214,39 @@ func lastError() string {
 		return C.GoString(&probe[0])
 	}
 	buf := make([]C.char, int(needed))
-	C.tendril_last_error(&buf[0], C.size_t(len(buf)))
+	read(&buf[0], C.size_t(len(buf)))
 	return C.GoString(&buf[0])
 }
 
-func ffiErr(code C.int32_t) error {
-	msg := lastError()
-	if msg == "" {
-		msg = fmt.Sprintf("code %d", int(code))
+func lastError() string { return readLast(false) }
+
+func lastErrorCode() string { return readLast(true) }
+
+// failure reads the message and the stable code of the failing call together, as the last
+// error of the calling thread. Every caller is inside a runtime.LockOSThread scope that
+// started before the failing call, so no other call can replace or clear either value.
+func failure() (msg, code string) {
+	return lastError(), lastErrorCode()
+}
+
+func ffiErr(rc C.int32_t) error {
+	msg, code := failure()
+	if refused := refusalFromCode(code, msg); refused != nil {
+		return refused
 	}
-	return fmt.Errorf("tendril ffi error (%d): %s", int(code), msg)
+	if msg == "" {
+		msg = fmt.Sprintf("code %d", int(rc))
+	}
+	return fmt.Errorf("tendril ffi error (%d): %s", int(rc), msg)
+}
+
+// callFailed is the error of a pointer-returning call that returned NULL.
+func callFailed(call string) error {
+	msg, code := failure()
+	if refused := refusalFromCode(code, msg); refused != nil {
+		return refused
+	}
+	return fmt.Errorf("%s failed: %s", call, msg)
 }
 
 func toCStr(s, name string) (*C.char, error) {
@@ -768,15 +887,64 @@ func (ep *Endpoint) MintGrant(peerID string, caps []string, ttlSecs uint64) (str
 	return grant, err
 }
 
-// RevokePeer marks peerID as Revoked and clears its grants.
+// RevokePeer marks peerID as Revoked and clears its grants. Unless the endpoint refusal policy
+// records no notice, the peer receives an authenticated refusal on its next session attempt. It
+// shows up as a *RefusedError from ConnectV2, SendData, Rekey or CloseSession, or as
+// SessionEvent.Refused on PollEvent.
 func (ep *Endpoint) RevokePeer(peerID string) error {
+	return ep.RevokePeerWithOptions(peerID, nil)
+}
+
+// RevokePeerWithOptions revokes peerID like RevokePeer. A nil opts, or a nil opts.Notify,
+// follows the endpoint refusal policy; Notify set to false revokes silently.
+func (ep *Endpoint) RevokePeerWithOptions(peerID string, opts *RevokeOptions) error {
 	return ep.withHandle(func(h *C.TendrilEndpoint) error {
 		cp, err := toCStr(peerID, "peerID")
 		if err != nil {
 			return err
 		}
 		defer C.free(unsafe.Pointer(cp))
-		if rc := C.tendril_endpoint_revoke_peer(h, cp); rc != C.TENDRIL_OK {
+		var o any
+		if opts != nil {
+			o = opts
+		}
+		return withOptJSON(o, "opts", func(co *C.char) error {
+			if rc := C.tendril_endpoint_revoke_peer_with_options(h, cp, co); rc != C.TENDRIL_OK {
+				return ffiErr(rc)
+			}
+			return nil
+		})
+	})
+}
+
+// SetRefusalPolicy sets and persists the host refusal policy.
+func (ep *Endpoint) SetRefusalPolicy(policy RefusalPolicy) error {
+	raw, err := json.Marshal(policy)
+	if err != nil {
+		return err
+	}
+	return ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cp, err := toCStr(string(raw), "policy")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cp))
+		if rc := C.tendril_endpoint_set_refusal_policy_json(h, cp); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return nil
+	})
+}
+
+// ClearRefusalNotice drops the refusal notice of peerID, which stays Revoked.
+func (ep *Endpoint) ClearRefusalNotice(peerID string) error {
+	return ep.withHandle(func(h *C.TendrilEndpoint) error {
+		cp, err := toCStr(peerID, "peerID")
+		if err != nil {
+			return err
+		}
+		defer C.free(unsafe.Pointer(cp))
+		if rc := C.tendril_endpoint_clear_refusal_notice(h, cp); rc != C.TENDRIL_OK {
 			return ffiErr(rc)
 		}
 		return nil
@@ -943,7 +1111,7 @@ func (ep *Endpoint) Connect(endpoint, relayHost, targetHostID, grantJSON string)
 			return err
 		}
 		if raw == nil {
-			return fmt.Errorf("tendril_session_connect failed: %s", lastError())
+			return callFailed("tendril_session_connect")
 		}
 		sess = newSession(raw)
 		return nil
@@ -991,7 +1159,7 @@ func (ep *Endpoint) ConnectV2(endpoint, relayHost, targetHostID, grantJSON strin
 			return err
 		}
 		if raw == nil {
-			return fmt.Errorf("tendril_session_connect_v2 failed: %s", lastError())
+			return callFailed("tendril_session_connect_v2")
 		}
 		sess = newSession(raw)
 		return nil
@@ -1771,7 +1939,7 @@ func (ep *Endpoint) ConnectWithOptions(targetHostID string, opts *ConnectOptions
 			return err
 		}
 		if raw == nil {
-			return fmt.Errorf("tendril_session_connect_with_options failed: %s", lastError())
+			return callFailed("tendril_session_connect_with_options")
 		}
 		sess = newSession(raw)
 		return nil
