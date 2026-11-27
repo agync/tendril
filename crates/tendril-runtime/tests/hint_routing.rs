@@ -301,6 +301,38 @@ async fn session_inputs_group_sources_and_add_signed_recovery_hints() {
 }
 
 #[tokio::test]
+async fn builder_carries_the_route_source_into_candidate_order() {
+    let hints = vec![
+        HintInput::new(
+            "direct:192.168.1.20:9100",
+            HintSource::Stored(RouteSource::Signed),
+        ),
+        HintInput::new(
+            "relay:ws://127.0.0.1:9/v1/relay",
+            HintSource::Stored(RouteSource::Operator),
+        ),
+        HintInput::new("overlay://100.101.1.2:9100", HintSource::Uri),
+    ];
+    let target = HintTarget::pairing(Some([7; 32]));
+    let set = build_pairing_candidates(
+        &hints,
+        &target,
+        &ctx(EgressKind::Pairing(PairingCodeKind::Remote3Group), &[]),
+        &opts(DialWire::V2, RelayClientAuth::None),
+    )
+    .await
+    .expect("build");
+    let sources: Vec<_> = set.candidates.iter().map(|c| c.source).collect();
+    assert_eq!(
+        sources,
+        vec![Some(RouteSource::Signed), Some(RouteSource::Operator), None]
+    );
+    let mut sorted = set.candidates;
+    tendril_core::policy::sort_candidates(&mut sorted);
+    assert_eq!(sorted[0].addr, "relay:ws://127.0.0.1:9/v1/relay");
+}
+
+#[tokio::test]
 async fn builder_dedupes_strips_prefixes_and_applies_wire_filters() {
     let hints = vec![
         HintInput::new("direct:192.168.1.20:9100", HintSource::Uri),

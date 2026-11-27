@@ -1337,6 +1337,15 @@ struct SessionCandidateOpts {
     allow_insecure_ws: bool,
 }
 
+fn route_source_of(source: &str) -> Option<RouteSource> {
+    match source {
+        "operator" => Some(RouteSource::Operator),
+        "signed" => Some(RouteSource::Signed),
+        "committed" => Some(RouteSource::Committed),
+        _ => None,
+    }
+}
+
 fn source_strength(source: &str) -> u8 {
     match source {
         "operator" => 3,
@@ -1573,7 +1582,8 @@ fn session_candidates_value(
             });
         match check_browser_hint(hint, source, wire, opts, authorized) {
             Ok((provider, endpoint)) => candidates.push((
-                CandidateEndpoint::new(idx, provider, hint.as_str()),
+                CandidateEndpoint::new(idx, provider, hint.as_str())
+                    .with_source(route_source_of(source)),
                 json!({
                     "hint": hint,
                     "endpoint": endpoint,
@@ -4352,6 +4362,8 @@ enum PlannerCandidateInput {
         id: Option<usize>,
         #[serde(default)]
         provider: Option<String>,
+        #[serde(default)]
+        source: Option<String>,
     },
 }
 
@@ -4374,6 +4386,10 @@ fn parse_provider_id(name: &str) -> Result<ProviderId, WasmError> {
         "broker" => Ok(ProviderId::Broker),
         _ => Err(WasmError::from(format!("unknown provider '{name}'"))),
     }
+}
+
+fn parse_route_source(name: &str) -> Result<RouteSource, WasmError> {
+    route_source_of(name).ok_or_else(|| WasmError::from(format!("unknown route source '{name}'")))
 }
 
 fn candidate_endpoint_json(c: &CandidateEndpoint) -> serde_json::Value {
@@ -4435,12 +4451,17 @@ impl WasmPathPlanner {
         let mut seen_ids = BTreeSet::new();
         let mut candidates = Vec::with_capacity(raw_candidates.len());
         for (idx, item) in raw_candidates.into_iter().enumerate() {
-            let (id, provider, addr) = match item {
+            let (id, provider, addr, source) = match item {
                 PlannerCandidateInput::Hint(hint) => {
                     let provider = classify_endpoint_hint(&hint).map_err(WasmError::from)?;
-                    (idx, provider, hint)
+                    (idx, provider, hint, None)
                 }
-                PlannerCandidateInput::Descriptor { addr, id, provider } => {
+                PlannerCandidateInput::Descriptor {
+                    addr,
+                    id,
+                    provider,
+                    source,
+                } => {
                     if addr.trim().is_empty() {
                         return Err(WasmError::from("candidate addr must not be empty"));
                     }
@@ -4449,13 +4470,17 @@ impl WasmPathPlanner {
                         Some(p) => parse_provider_id(p)?,
                         None => classify_endpoint_hint(&addr).map_err(WasmError::from)?,
                     };
-                    (cid, prov, addr)
+                    let source = match source.as_deref() {
+                        None | Some("uri") => None,
+                        Some(name) => Some(parse_route_source(name)?),
+                    };
+                    (cid, prov, addr, source)
                 }
             };
             if !seen_ids.insert(id) {
                 return Err(WasmError::from(format!("duplicate candidate id {id}")));
             }
-            candidates.push(CandidateEndpoint::new(id, provider, addr));
+            candidates.push(CandidateEndpoint::new(id, provider, addr).with_source(source));
         }
 
         let cfg_input: WasmPathPolicyConfigInput = match config_json {
@@ -6845,7 +6870,6 @@ mod route_tests {
         assert_eq!(
             candidates_of(&v1),
             [
-                (RELAY_V1.to_owned(), "signed".to_owned()),
                 (
                     "wss://op.example.test/v1/relay".to_owned(),
                     "operator".to_owned()
@@ -6854,6 +6878,7 @@ mod route_tests {
                     "wss://alt.example.test/v1/relay".to_owned(),
                     "operator".to_owned()
                 ),
+                (RELAY_V1.to_owned(), "signed".to_owned()),
             ]
         );
         let skipped = skipped_of(&v1);
@@ -6864,16 +6889,19 @@ mod route_tests {
         assert_eq!(v1["legacy_relay_hints"], json!(true));
         assert_eq!(v1["route_seq"], json!(0.0));
 
-        // Wire v2 admits the stored signed /v2/relay hint; p2p ranks before relay.
+        // Wire v2 admits the stored signed /v2/relay hint. Operator routes lead; among the
+        // rest p2p ranks before relay.
         let v2 = to_json(
             &roster
                 .session_candidates_inner("host-l6a", Some(r#"{"wire":2,"p2p":true}"#))
                 .unwrap(),
         );
         let hints: Vec<String> = candidates_of(&v2).into_iter().map(|(h, _)| h).collect();
-        assert_eq!(hints[0], iroh);
+        assert_eq!(v2["candidates"][0]["source"], json!("operator"));
+        assert_eq!(v2["candidates"][1]["source"], json!("operator"));
+        assert_eq!(hints[2], iroh);
         assert!(hints.contains(&RELAY_V2.to_owned()));
-        assert_eq!(v2["candidates"][0]["provider"], json!("p2p"));
+        assert_eq!(v2["candidates"][2]["provider"], json!("p2p"));
 
         // The policy decides the route_seq to send.
         let none = to_json(
@@ -6989,8 +7017,8 @@ mod route_tests {
         assert_eq!(
             candidates_of(&out),
             [
-                ("ws://127.0.0.1:9/v1/relay".to_owned(), "uri".to_owned()),
                 (RELAY_V1.to_owned(), "operator".to_owned()),
+                ("ws://127.0.0.1:9/v1/relay".to_owned(), "uri".to_owned()),
                 (
                     "wss://new.example.test/v1/relay".to_owned(),
                     "uri".to_owned()
@@ -7755,6 +7783,43 @@ mod route_tests {
         assert!(hints.contains(&"broker+ws://insecure-broker.example.test/b".to_owned()));
         assert!(hints.contains(&"ws://insecure-relay.example.test/v1/relay".to_owned()));
         assert_eq!(hints[0], "wss://dns.example.test/v2/relay");
+    }
+
+    #[test]
+    fn wasm_path_planner_ranks_operator_source_ahead_of_every_rung() {
+        let cands = json!([
+            { "addr": "192.168.1.20:7000", "id": 1, "provider": "direct", "source": "signed" },
+            { "addr": "wss://relay.example.test/v1/relay", "id": 2, "provider": "relay", "source": "operator" },
+            { "addr": "wss://198.51.100.10/v2/relay", "id": 3, "provider": "relay", "source": "committed" },
+            { "addr": "wss://relay.example.test/v2/relay", "id": 4, "provider": "relay", "source": "signed" },
+        ])
+        .to_string();
+        let mut planner = WasmPathPlanner::new_inner(&cands, None).unwrap();
+        planner.start_inner(0.0).unwrap();
+        let mut order = Vec::new();
+        for t in [0.0, 250.0, 500.0, 750.0] {
+            if t > 0.0 {
+                planner.tick_inner(t).unwrap();
+            }
+            let actions: Vec<serde_json::Value> =
+                serde_json::from_str(&planner.drain_actions_json()).unwrap();
+            order.extend(
+                actions
+                    .iter()
+                    .map(|a| a["candidate"]["id"].as_u64().unwrap()),
+            );
+        }
+        assert_eq!(order, vec![2, 1, 4, 3]);
+        let bad = json!([
+            { "addr": "wss://relay.example.test/v1/relay", "id": 1, "provider": "relay", "source": "bogus" },
+        ])
+        .to_string();
+        assert!(WasmPathPlanner::new_inner(&bad, None).is_err());
+        let with_uri = json!([
+            { "addr": "wss://relay.example.test/v1/relay", "id": 1, "provider": "relay", "source": "uri" },
+        ])
+        .to_string();
+        assert!(WasmPathPlanner::new_inner(&with_uri, None).is_ok());
     }
 
     #[test]

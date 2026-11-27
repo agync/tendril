@@ -582,8 +582,9 @@ async fn a1_ladder_pairs_on_lan_then_overlay_then_relay_without_prompts() {
     }
 }
 
-/// A2: the host's direct address changes; the next connect learns it from `0x0C` and the one
-/// after goes straight to the new address. Operator routes survive the announcement.
+/// A2: the host's direct address changes; the next connect learns it from `0x0C` and, once the
+/// operator relay route is cleared, the one after goes straight to the new address. Operator
+/// routes dial first and survive the announcement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a2_host_address_change_propagates_to_next_dial() {
     let relay = RelayServer::bind(RelayConfig {
@@ -657,13 +658,10 @@ async fn a2_host_address_change_propagates_to_next_dial() {
         let first = dial(&peers, "host-moves", &grant, "after-move-1");
         expect_session(&mut host2.stdout, "Relay", "after-move-1");
         assert_eq!(first["provider"], "Relay", "{first}");
-        assert!(
-            first["failures"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|f| f["hint"] == p1.as_str()),
-            "the stale address is tried and fails: {first}"
+        assert_eq!(
+            first["failures"],
+            serde_json::json!([]),
+            "the operator relay is dialed first, so the stale address is never tried: {first}"
         );
         assert_eq!(
             first["route_set"],
@@ -678,6 +676,17 @@ async fn a2_host_address_change_propagates_to_next_dial() {
         assert_eq!(listed["route_meta"]["origin"], "session");
         assert_eq!(listed["last_route_set"]["outcome"], "applied");
 
+        json_out(&run_tendril(
+            peers.client.path(),
+            &[
+                "route",
+                "clear",
+                "--target",
+                "host-moves",
+                "--source",
+                "operator",
+            ],
+        ));
         let second = dial(&peers, "host-moves", &grant, "after-move-2");
         expect_session(&mut host2.stdout, "Direct", "after-move-2");
         assert_eq!(second["provider"], "Direct", "{second}");

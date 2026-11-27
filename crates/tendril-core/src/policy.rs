@@ -3,6 +3,8 @@
 use core::net::{IpAddr, SocketAddr};
 use std::collections::{BTreeSet, VecDeque};
 
+use crate::roster::RouteSource;
+
 /// Transport rung identifier ordered from lowest latency/trust-dependency to fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProviderId {
@@ -29,6 +31,8 @@ pub struct CandidateEndpoint {
     pub provider: ProviderId,
     pub addr: String,
     pub is_numeric_host: bool,
+    /// Who authorized a stored route; `None` for a candidate with no stored source.
+    pub source: Option<RouteSource>,
 }
 
 impl CandidateEndpoint {
@@ -42,7 +46,15 @@ impl CandidateEndpoint {
             provider,
             addr,
             is_numeric_host,
+            source: None,
         }
+    }
+
+    /// Returns the candidate with its stored route `source` set.
+    #[must_use]
+    pub const fn with_source(mut self, source: Option<RouteSource>) -> Self {
+        self.source = source;
+        self
     }
 }
 
@@ -380,12 +392,20 @@ impl PathPlanner {
 
 /// Canonical deterministic sort key for [`CandidateEndpoint`] ranking.
 ///
-/// Orders by `ProviderId` rung first, prioritizes `/v2/relay` ahead of `/v1/relay` within
-/// [`ProviderId::Relay`], then prefers literal IP hosts before DNS hostnames, breaking ties by `id`.
+/// `operator` routes come first, ahead of every rung. All other candidates order by
+/// `ProviderId` rung, then by source tier (`signed` `0`, `committed` `1`, no source `2`), then prioritize `/v2/relay` ahead of `/v1/relay` within [`ProviderId::Relay`],
+/// then prefer literal IP hosts before DNS hostnames, breaking ties by `id`.
 #[must_use]
-pub fn sort_key(c: &CandidateEndpoint) -> (u8, u8, bool, usize) {
+pub fn sort_key(c: &CandidateEndpoint) -> (u8, u8, u8, u8, bool, usize) {
+    let operator = c.source == Some(RouteSource::Operator);
     (
+        u8::from(!operator),
         c.provider.rank(),
+        match c.source {
+            Some(RouteSource::Operator | RouteSource::Signed) => 0,
+            Some(RouteSource::Committed) => 1,
+            None => 2,
+        },
         u8::from(c.provider == ProviderId::Relay && !crate::pairing::is_v2_relay_hint(&c.addr)),
         !c.is_numeric_host,
         c.id,
@@ -424,6 +444,158 @@ mod tests {
         assert!(!is_numeric_host_addr(
             "wt://peer.example:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         ));
+    }
+
+    fn ids_sorted(mut cands: Vec<CandidateEndpoint>) -> Vec<usize> {
+        sort_candidates(&mut cands);
+        cands.iter().map(|c| c.id).collect()
+    }
+
+    fn src(id: usize, provider: ProviderId, addr: &str, source: RouteSource) -> CandidateEndpoint {
+        CandidateEndpoint::new(id, provider, addr).with_source(Some(source))
+    }
+
+    #[test]
+    fn operator_relay_beats_signed_direct() {
+        let cands = vec![
+            src(
+                1,
+                ProviderId::Direct,
+                "192.168.1.20:7000",
+                RouteSource::Signed,
+            ),
+            src(
+                2,
+                ProviderId::Relay,
+                "wss://relay.example/v1/relay",
+                RouteSource::Operator,
+            ),
+            src(
+                3,
+                ProviderId::Local,
+                "/run/tendril.sock",
+                RouteSource::Committed,
+            ),
+        ];
+        assert_eq!(ids_sorted(cands), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn operator_routes_keep_rung_v2_and_numeric_order() {
+        let cands = vec![
+            src(
+                1,
+                ProviderId::Relay,
+                "wss://relay.example/v1/relay",
+                RouteSource::Operator,
+            ),
+            src(
+                2,
+                ProviderId::Relay,
+                "wss://relay.example/v2/relay",
+                RouteSource::Operator,
+            ),
+            src(
+                3,
+                ProviderId::Direct,
+                "host.local:7000",
+                RouteSource::Operator,
+            ),
+            src(
+                4,
+                ProviderId::Direct,
+                "10.0.0.1:7000",
+                RouteSource::Operator,
+            ),
+        ];
+        assert_eq!(ids_sorted(cands), vec![4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn signed_hostname_relay_beats_committed_ip_relay_in_a_rung() {
+        let cands = vec![
+            src(
+                1,
+                ProviderId::Relay,
+                "wss://198.51.100.10/v2/relay",
+                RouteSource::Committed,
+            ),
+            src(
+                2,
+                ProviderId::Relay,
+                "wss://relay.example/v2/relay",
+                RouteSource::Signed,
+            ),
+        ];
+        assert_eq!(ids_sorted(cands), vec![2, 1]);
+    }
+
+    #[test]
+    fn signed_source_beats_committed_before_v2_preference() {
+        let cands = vec![
+            src(
+                1,
+                ProviderId::Relay,
+                "wss://relay.example/v2/relay",
+                RouteSource::Committed,
+            ),
+            src(
+                2,
+                ProviderId::Relay,
+                "wss://other.example/v1/relay",
+                RouteSource::Signed,
+            ),
+        ];
+        assert_eq!(ids_sorted(cands), vec![2, 1]);
+    }
+
+    #[test]
+    fn signed_lan_direct_beats_committed_relay() {
+        let cands = vec![
+            src(
+                1,
+                ProviderId::Relay,
+                "wss://relay.example/v2/relay",
+                RouteSource::Committed,
+            ),
+            src(
+                2,
+                ProviderId::Direct,
+                "192.168.1.20:7000",
+                RouteSource::Signed,
+            ),
+        ];
+        assert_eq!(ids_sorted(cands), vec![2, 1]);
+    }
+
+    #[test]
+    fn signed_then_committed_then_uri_hints_in_one_rung() {
+        let cands = vec![
+            CandidateEndpoint::new(1, ProviderId::Direct, "10.0.0.1:7000"),
+            src(
+                2,
+                ProviderId::Direct,
+                "host.local:7000",
+                RouteSource::Committed,
+            ),
+            src(
+                3,
+                ProviderId::Direct,
+                "host2.local:7000",
+                RouteSource::Signed,
+            ),
+        ];
+        assert_eq!(ids_sorted(cands), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn candidates_without_source_sort_as_before() {
+        let cands = vec![
+            CandidateEndpoint::new(1, ProviderId::Relay, "wss://198.51.100.10/v2/relay"),
+            CandidateEndpoint::new(2, ProviderId::Relay, "wss://relay.example/v2/relay"),
+            CandidateEndpoint::new(3, ProviderId::Direct, "host.local:7000"),
+        ];
+        assert_eq!(ids_sorted(cands), vec![3, 1, 2]);
     }
 
     #[test]

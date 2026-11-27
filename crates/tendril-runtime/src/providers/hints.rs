@@ -82,8 +82,9 @@ const fn source_rank(source: HintSource) -> u8 {
 
 /// The stored routes of `entry`, one input per hint with its strongest source
 /// (`operator` > `signed` > `committed`), ordered by that source and then by first-stored
-/// order. The order becomes the candidate id, the last tie-break of the candidate sort after
-/// the provider rung, the `/v2/relay` preference and the IP literal preference.
+/// order. The order becomes the candidate id, the last tie-break of the candidate sort. The
+/// source itself is carried on each candidate and ranks `operator` first, then rung, then
+/// `signed` before `committed`.
 ///
 /// Legacy `relay_hints` are never read.
 #[must_use]
@@ -821,6 +822,7 @@ pub async fn build_pairing_candidates(
             addr: hint.to_owned(),
             is_numeric_host: is_numeric_host_addr(&checked.dial_endpoint)
                 || !checked.destinations.is_empty(),
+            source: candidate_route_source(input.source),
         });
         routes
             .entry(checked.provider)
@@ -872,6 +874,15 @@ pub async fn build_pairing_candidates(
         skipped,
         info,
     })
+}
+
+/// The stored route source a hint carries into candidate ordering; URI hints carry none.
+const fn candidate_route_source(source: HintSource) -> Option<RouteSource> {
+    match source {
+        HintSource::Operator => Some(RouteSource::Operator),
+        HintSource::Stored(stored) => Some(stored),
+        HintSource::Uri => None,
+    }
 }
 
 fn has_known_prefix(raw: &str) -> bool {

@@ -2751,6 +2751,7 @@ export class TendrilWebClient {
           id,
           addr: cand.hint ?? cand.endpoint,
           provider: cand.provider,
+          ...(cand.source ? { source: cand.source } : {}),
         }))
       ),
       JSON.stringify({
