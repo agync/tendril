@@ -911,7 +911,8 @@ fn is_ws_url(raw: &str) -> bool {
 /// Normalizes an endpoint typed by the local operator or developer.
 ///
 /// Never called on URI hints, stored routes or announcements. `/abs/path` becomes
-/// `local:/abs/path`; a relay `URL#<43-char key>` loses its fragment and yields `relay_key`
+/// `local:/abs/path` and `\\.\pipe\name` becomes `local:\\.\pipe\name`; a relay
+/// `URL#<43-char key>` loses its fragment and yields `relay_key`
 /// (a valid Ed25519 point); a `/v2/relay#<mailbox_id>` loses its fragment; a bare `host:port`
 /// becomes `direct:host:port`; any other `#` fails with `fragment not allowed`. The result
 /// must pass the pairing hint grammar.
@@ -930,6 +931,7 @@ pub fn normalize_operator_endpoint(raw: &str) -> Result<OperatorEndpoint, Runtim
         }
         Some(_) => return Err(invalid("fragment not allowed")),
         None if raw.starts_with('/') => (format!("local:{raw}"), None),
+        None if raw.starts_with(r"\\.\pipe\") => (format!("local:{raw}"), None),
         None if has_known_prefix(raw) => (raw.to_owned(), None),
         None => (format!("direct:{raw}"), None),
     };

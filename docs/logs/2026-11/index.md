@@ -41,3 +41,4 @@ Entries from November 2026.
 - [Return authenticated refusal from the Python, Node and Web bindings](27-return-authenticated-refusal-from-the-python.md)
 - [Add CLI refusal controls and a serve session_refused event](27-add-cli-refusal-controls-and-a.md)
 - [Keep revocation state across roster reloads and commits in the FFI, Python, Node and CLI](27-keep-revocation-state-across-roster-reloads.md)
+- [Add a Windows named-pipe local provider](27-add-a-windows-named-pipe-local.md)

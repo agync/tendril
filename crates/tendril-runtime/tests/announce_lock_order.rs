@@ -1,6 +1,8 @@
 //! Lock order of a store-backed host: issuing pairing URIs while Wire v1 and v2 pairings claim
 //! codes under the roster file lock must never deadlock.
 
+mod common;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -56,7 +58,7 @@ async fn pair_once(
     v2: bool,
 ) {
     let sock_dir = tempdir().unwrap();
-    let mut listener = LocalListener::bind(sock_dir.path().join("pair.sock")).unwrap();
+    let mut listener = LocalListener::bind(common::ipc_path(&sock_dir, "pair.sock")).unwrap();
     let ep = listener.local_endpoint();
     let responder = {
         let (host, mgr, store, lock, state) = (

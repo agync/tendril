@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +21,7 @@ use tendril_core::v2::{
     sign_v2_relay_dial,
 };
 use tendril_core::wire::{Intent, Preamble, WIRE_VERSION_V2};
+use tendril_core::wire::{ResumableFrameReader, encode_frame};
 use tendril_relay::{
     MAX_RELAY_FRAME_LEN, RelayClientMsg, RelayConfig, RelayServerMsg, RelayV2ClientMsg,
     RelayV2ServerMsg,
@@ -32,8 +35,9 @@ use tendril_runtime::{
     WakeSecret, WakeTag, WakeTarget, drive_m2m_enroll_initiator_with_store,
     drive_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_store,
     drive_v2_pake_pair_responder, drive_v2_pake_pair_responder_with_store,
-    drive_v2_session_initiator, drive_v2_session_responder, split_path_stream_fallback,
-    verify_epoch_wake_tag_window, wake_and_connect_v2_session, wake_and_dial_v2,
+    drive_v2_session_initiator, drive_v2_session_responder, recv_tendril_frame,
+    split_path_stream_fallback, verify_epoch_wake_tag_window, wake_and_connect_v2_session,
+    wake_and_dial_v2,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -47,6 +51,14 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Reads exactly one wire frame and returns its raw bytes, so a transport that splits a write
+/// across reads does not truncate the frame.
+async fn recv_raw_frame(stream: &mut dyn PathStream) -> Vec<u8> {
+    let mut reader = ResumableFrameReader::new();
+    let body = recv_tendril_frame(stream, &mut reader).await.unwrap();
+    encode_frame(&body).unwrap()
 }
 
 fn make_identities() -> (EndpointIdentity, EndpointIdentity) {
@@ -115,7 +127,7 @@ async fn live_v2_relay_pake_pair_session_rekey_padding_and_security_rejections()
     let cli_store_lock = Arc::new(AsyncMutex::new(()));
 
     let sock_dir = tempdir().unwrap();
-    let sock_path = sock_dir.path().join("pair.sock");
+    let sock_path = common::ipc_path(&sock_dir, "pair.sock");
     let mut pair_listener = LocalListener::bind(&sock_path).unwrap();
     let pair_ep = pair_listener.local_endpoint();
 
@@ -531,7 +543,7 @@ async fn shared_rendezvous_replay_cache_and_argon2_semaphore_protect_responder()
 
     let v2_state = Arc::new(V2ResponderState::new());
     let sock_dir = tempdir().unwrap();
-    let sock_path = sock_dir.path().join("sess.sock");
+    let sock_path = common::ipc_path(&sock_dir, "sess.sock");
     let mut listener = LocalListener::bind(&sock_path).unwrap();
     let ep = listener.local_endpoint();
 
@@ -573,17 +585,24 @@ async fn shared_rendezvous_replay_cache_and_argon2_semaphore_protect_responder()
     let mut s1 = LocalDialer::new().dial(&ep).await.unwrap();
     s1.send_chunk(&msg1_wire).await.unwrap();
     let mut buf = vec![0u8; 65536];
-    let n1 = s1.recv_chunk(&mut buf).await.unwrap();
     let mut cli_r = setup_paired_v2_rosters(&host_id, &cli_id, &secrets).1;
-    let msg2_actions = machine1
-        .feed_bytes(&buf[..n1], now_unix, 10, &mut cli_r)
-        .unwrap();
-    for a in msg2_actions {
-        if let tendril_core::v2::V2SessionAction::WriteBytes(b) = a {
-            s1.send_chunk(&b).await.unwrap();
+    let established = tokio::time::timeout(Duration::from_secs(5), async {
+        while !machine1.is_established() {
+            // A pipe read may return part of the frame; feed each chunk as it arrives.
+            let n1 = s1.recv_chunk(&mut buf).await.unwrap();
+            assert_ne!(n1, 0, "stream closed during the handshake");
+            let actions = machine1
+                .feed_bytes(&buf[..n1], now_unix, 10, &mut cli_r)
+                .unwrap();
+            for a in actions {
+                if let tendril_core::v2::V2SessionAction::WriteBytes(b) = a {
+                    s1.send_chunk(&b).await.unwrap();
+                }
+            }
         }
-    }
-    assert!(machine1.is_established());
+    })
+    .await;
+    assert!(established.is_ok(), "handshake did not complete");
     drop(s1);
     assert_eq!(v2_state.replay_cache().lock().unwrap().len(), 1);
 
@@ -608,8 +627,7 @@ async fn shared_rendezvous_replay_cache_and_argon2_semaphore_protect_responder()
         .collect();
     let mut s2 = LocalDialer::new().dial(&ep).await.unwrap();
     s2.send_chunk(&msg1_b).await.unwrap();
-    let n2 = s2.recv_chunk(&mut buf).await.unwrap();
-    let genuine_msg2_b = buf[..n2].to_vec();
+    let genuine_msg2_b = recv_raw_frame(s2.as_mut()).await;
     s2.close().await.unwrap();
     assert_eq!(v2_state.replay_cache().lock().unwrap().len(), 2);
 
@@ -617,9 +635,7 @@ async fn shared_rendezvous_replay_cache_and_argon2_semaphore_protect_responder()
     // without inserting a new cache entry; the REAL machine_b must reject decoy_msg2_b.
     let mut s3 = LocalDialer::new().dial(&ep).await.unwrap();
     s3.send_chunk(&msg1_b).await.unwrap();
-    let n3 = s3.recv_chunk(&mut buf).await.unwrap();
-    assert!(n3 > 0);
-    let decoy_msg2_b = buf[..n3].to_vec();
+    let decoy_msg2_b = recv_raw_frame(s3.as_mut()).await;
     assert_ne!(decoy_msg2_b, genuine_msg2_b);
     s3.close().await.unwrap();
     assert_eq!(v2_state.replay_cache().lock().unwrap().len(), 2);
@@ -633,8 +649,8 @@ async fn shared_rendezvous_replay_cache_and_argon2_semaphore_protect_responder()
     // Connection 4: replay Connection 1's msg1_wire across another connection -> still cached!
     let mut s4 = LocalDialer::new().dial(&ep).await.unwrap();
     s4.send_chunk(&msg1_wire).await.unwrap();
-    let n4 = s4.recv_chunk(&mut buf).await.unwrap();
-    assert!(n4 > 0);
+    let decoy_msg2_a = recv_raw_frame(s4.as_mut()).await;
+    assert!(!decoy_msg2_a.is_empty());
     s4.close().await.unwrap();
     assert_eq!(v2_state.replay_cache().lock().unwrap().len(), 2);
 
@@ -651,7 +667,7 @@ async fn shared_rendezvous_replay_cache_and_argon2_semaphore_protect_responder()
     let held_permit = sat_state.argon2_semaphore().acquire_owned().await.unwrap();
     assert_eq!(sat_state.available_argon2_permits(), 0);
 
-    let pair_sock = sock_dir.path().join("sat.sock");
+    let pair_sock = common::ipc_path(&sock_dir, "sat.sock");
     let mut sat_listener = LocalListener::bind(&pair_sock).unwrap();
     let sat_ep = sat_listener.local_endpoint();
     let mut sat_mgr = PairingManager::new(PairingConfig::default());
@@ -774,7 +790,7 @@ async fn mid_session_v2_revocation_terminates_authorization_immediately() {
         .unwrap();
 
     let sock_dir = tempdir().unwrap();
-    let sock_path = sock_dir.path().join("rev.sock");
+    let sock_path = common::ipc_path(&sock_dir, "rev.sock");
     let mut listener = LocalListener::bind(&sock_path).unwrap();
     let ep = listener.local_endpoint();
     let v2_state = Arc::new(V2ResponderState::new());
@@ -856,7 +872,7 @@ async fn v1_pairing_downgrade_is_rejected_for_v2_paired_host_before_sending_byte
     let host_lock = Arc::new(AsyncMutex::new(()));
 
     let sock_dir = tempdir().unwrap();
-    let sock_path = sock_dir.path().join("downgrade.sock");
+    let sock_path = common::ipc_path(&sock_dir, "downgrade.sock");
     let mut listener = LocalListener::bind(&sock_path).unwrap();
     let ep = listener.local_endpoint();
 
@@ -1452,7 +1468,7 @@ async fn blocker2_corrupted_msg3_preserves_v2_secrets_for_subsequent_reconnect()
     let cli_lock = Arc::new(AsyncMutex::new(()));
 
     let sock_dir = tempdir().unwrap();
-    let mut listener = LocalListener::bind(sock_dir.path().join("reconnect.sock")).unwrap();
+    let mut listener = LocalListener::bind(common::ipc_path(&sock_dir, "reconnect.sock")).unwrap();
     let ep = listener.local_endpoint();
     let v2_state = Arc::new(V2ResponderState::new());
 
@@ -1707,7 +1723,8 @@ async fn unpinned_v1_pairing_with_store_rejects_v2_floored_host_on_learned_stati
     assert_eq!(tendril_runtime::pinned_pairing_floor(&cli_roster, &pin), 2);
 
     let sock_dir = tempdir().unwrap();
-    let mut listener = LocalListener::bind(sock_dir.path().join("unpinned_v1.sock")).unwrap();
+    let mut listener =
+        LocalListener::bind(common::ipc_path(&sock_dir, "unpinned_v1.sock")).unwrap();
     let ep = listener.local_endpoint();
     let mut mgr = PairingManager::new(PairingConfig::default());
     let code = mgr
@@ -1777,7 +1794,7 @@ async fn concurrent_v2_session_persists_ingested_crl_to_state_store_and_errors_c
     let cli_lock = Arc::new(AsyncMutex::new(()));
 
     let sock_dir = tempdir().unwrap();
-    let mut listener = LocalListener::bind(sock_dir.path().join("crl.sock")).unwrap();
+    let mut listener = LocalListener::bind(common::ipc_path(&sock_dir, "crl.sock")).unwrap();
     let ep = listener.local_endpoint();
     let v2_state = Arc::new(V2ResponderState::new());
 
@@ -1914,7 +1931,7 @@ async fn send_rekey_write_error_closes_v2_session_without_rekeyed_event() {
     let (mut host_roster, mut cli_roster) = setup_paired_v2_rosters(&host_id, &cli_id, &secrets);
 
     let sock_dir = tempdir().unwrap();
-    let mut listener = LocalListener::bind(sock_dir.path().join("rekey_err.sock")).unwrap();
+    let mut listener = LocalListener::bind(common::ipc_path(&sock_dir, "rekey_err.sock")).unwrap();
     let ep = listener.local_endpoint();
     let v2_state = Arc::new(V2ResponderState::new());
 
@@ -1991,7 +2008,7 @@ async fn v2_responders_reject_v1_preamble_with_unsupported_version() {
     let (host_id, _cli_id) = make_identities();
     let now_unix = now_unix_secs();
     let sock_dir = tempdir().unwrap();
-    let mut listener = LocalListener::bind(sock_dir.path().join("v1_reject.sock")).unwrap();
+    let mut listener = LocalListener::bind(common::ipc_path(&sock_dir, "v1_reject.sock")).unwrap();
     let ep = listener.local_endpoint();
     let v2_state = Arc::new(V2ResponderState::new());
 
@@ -2044,7 +2061,7 @@ async fn inbound_router_isolates_v1_and_v2_pair_and_session_queues_concurrently(
     use tendril_runtime::InboundRouter;
 
     let sock_dir = tempdir().unwrap();
-    let listener = LocalListener::bind(sock_dir.path().join("router_v1_v2.sock")).unwrap();
+    let listener = LocalListener::bind(common::ipc_path(&sock_dir, "router_v1_v2.sock")).unwrap();
     let ep = listener.local_endpoint();
     let router = InboundRouter::new();
     let handle = tokio::runtime::Handle::current();
@@ -2186,7 +2203,8 @@ async fn unpinned_v1_tofu_aborts_at_msg2_with_zero_msg3_bytes_on_wire() {
 
     for responder_id in [host_id.clone(), rotated_host] {
         let sock_dir = tempdir().unwrap();
-        let mut listener = LocalListener::bind(sock_dir.path().join("zero_msg3.sock")).unwrap();
+        let mut listener =
+            LocalListener::bind(common::ipc_path(&sock_dir, "zero_msg3.sock")).unwrap();
         let ep = listener.local_endpoint();
         let mut mgr = PairingManager::new(PairingConfig::default());
         let code = mgr

@@ -235,7 +235,7 @@ tendril://pair?v=1&host=<url_encoded_name>&code=<code>&k=<b64url_host_static>&sh
 | `rq` form | A decimal `uint64` in `1..=2^53-1`: no sign, no leading zero. `rq` MUST be present if and only if `rs` is present, and MUST be the parameter immediately before `rs`. |
 | `rs` form | `86` base64url characters (an Ed25519 signature) and the last parameter. Nothing may follow it. |
 | Blocked hint addresses | A `direct:`, bare, `overlay://` or iroh `addr=` hint, or a URL hint's IP host, naming a link-local, unspecified or multicast address, the IPv6 cloud metadata address, a local-use NAT64 address (`64:ff9b:1::/48`) or a Teredo address (`2001::/32`) is `InvalidPairingUri`. The check first unwraps every fixed IPv4 embedding as Section 6.8 does (IPv4-mapped, IPv4-translated, IPv4-compatible except `::` and `::1`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`). |
-| IPC hints | `local:` and `unix://` hints still parse (legacy), are never emitted by a builder or in an announcement, and are never dialed or persisted when they come from a URI. A route set containing one is rejected. |
+| IPC hints | `local:` and `unix://` hints still parse (legacy), are never emitted by a builder or in an announcement, and are never dialed or persisted when they come from a URI. A route set containing one is rejected. The `<path>` of an operator hint is a Unix socket path on Unix and a named-pipe path (`\\.\pipe\<name>`) on Windows. |
 
 ### 6.3 Code Kind and Path Class
 

@@ -55,6 +55,17 @@ zeroize.workspace = true
 [target.'cfg(not(any(target_os = "android", target_arch = "wasm32")))'.dependencies]
 netdev = { version = "0.47", default-features = false, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
 # std `File::lock` is unsupported on Android; the state store takes its `flock` through rustix there.
 [target.'cfg(target_os = "android")'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
@@ -67,5 +78,11 @@ rcgen.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
-[lints]
-workspace = true
+[lints.rust]
+# Mirrors the workspace lints: Cargo cannot combine `workspace = true` with an override, so this
+# crate repeats them with `unsafe_code` at `deny` instead of `forbid`. Only
+# `providers/local/windows.rs` allows it, for the Win32 pipe DACL and token checks.
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

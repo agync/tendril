@@ -1,39 +1,24 @@
-//! Same-host IPC path provider backed by Unix domain sockets (`local`).
-//!
-//! Unix domain sockets are the only transport this provider offers, so on targets without them
-//! [`LocalDialer`] still exists but every dial reports an unsupported-path error.
+//! Unix domain socket backend for the `local` provider.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tendril_core::policy::ProviderId;
-
-use crate::error::RuntimeError;
-use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathStream};
-
-#[cfg(unix)]
-use std::fs;
-#[cfg(unix)]
-use std::path::PathBuf;
-
-#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
-#[cfg(unix)]
-use super::bind_private_unix_listener;
-#[cfg(unix)]
-use crate::provider::{IoPathStream, PathListener};
+use super::super::bind_private_unix_listener;
+use crate::error::RuntimeError;
+use crate::provider::{DEFAULT_WRITE_TIMEOUT, IoPathStream, PathDialer, PathListener, PathStream};
 
 /// Listener accepting local IPC streams on a `0o600` Unix domain socket.
-#[cfg(unix)]
 pub struct LocalListener {
     listener: UnixListener,
     path: PathBuf,
     write_timeout: Duration,
 }
 
-#[cfg(unix)]
 impl LocalListener {
     /// Binds a Unix domain socket listener at `path`, replacing only a verified stale socket.
     pub fn bind(path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
@@ -60,14 +45,12 @@ impl LocalListener {
     }
 }
 
-#[cfg(unix)]
 impl Drop for LocalListener {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
-#[cfg(unix)]
 #[async_trait]
 impl PathListener for LocalListener {
     async fn accept(&mut self) -> Result<Box<dyn PathStream>, RuntimeError> {
@@ -114,7 +97,6 @@ impl LocalDialer {
     }
 
     /// Connects directly to `socket_path`.
-    #[cfg(unix)]
     pub async fn connect(
         &self,
         socket_path: impl AsRef<Path>,
@@ -127,15 +109,6 @@ impl LocalDialer {
             stream,
         )))
     }
-
-    /// Reports that this target has no Unix domain sockets to connect to.
-    #[cfg(not(unix))]
-    pub async fn connect(
-        &self,
-        _socket_path: impl AsRef<Path>,
-    ) -> Result<Box<dyn PathStream>, RuntimeError> {
-        Err(unix_sockets_unsupported())
-    }
 }
 
 #[async_trait]
@@ -145,13 +118,10 @@ impl PathDialer for LocalDialer {
     }
 
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
-        #[cfg(unix)]
-        let endpoint = endpoint.strip_prefix("unix://").unwrap_or(endpoint);
-        self.connect(endpoint).await
+        let path = endpoint
+            .strip_prefix("local:")
+            .or_else(|| endpoint.strip_prefix("unix://"))
+            .unwrap_or(endpoint);
+        self.connect(path).await
     }
-}
-
-#[cfg(not(unix))]
-fn unix_sockets_unsupported() -> RuntimeError {
-    RuntimeError::Protocol("the local provider requires Unix domain sockets".to_owned())
 }

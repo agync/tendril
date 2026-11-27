@@ -1136,6 +1136,7 @@ fn operator_endpoints_normalize_to_persistable_hints() {
     let key_b64 = b64url_encode(&key);
     let cases: &[(&str, &str)] = &[
         ("/run/tendril.sock", "local:/run/tendril.sock"),
+        (r"\\.\pipe\tendril", r"local:\\.\pipe\tendril"),
         ("unix:///run/tendril.sock", "unix:///run/tendril.sock"),
         ("local:/run/tendril.sock", "local:/run/tendril.sock"),
         ("192.168.1.4:9000", "direct:192.168.1.4:9000"),

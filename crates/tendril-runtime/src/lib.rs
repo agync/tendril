@@ -59,13 +59,11 @@ pub use provider::{
 };
 pub use providers::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DirectDialer, DirectListener, EmbeddedRelay,
-    LocalDialer, OverlayConfig, OverlayDialer, OverlayListener, OverlayMode, OverlayResolvedMode,
-    RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer, RelayV2Listener,
-    RelayV2ListenerConfig, dial_endpoint, dial_endpoint_with_auth, is_loopback_host,
-    is_metadata_or_link_local_ip, is_tailnet_ip, select_overlay_mode,
+    LocalDialer, LocalListener, OverlayConfig, OverlayDialer, OverlayListener, OverlayMode,
+    OverlayResolvedMode, RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer,
+    RelayV2Listener, RelayV2ListenerConfig, dial_endpoint, dial_endpoint_with_auth,
+    is_loopback_host, is_metadata_or_link_local_ip, is_tailnet_ip, select_overlay_mode,
 };
-#[cfg(unix)]
-pub use providers::{LocalListener, OverlayHelperDialer, OverlayHelperListener};
 #[cfg(feature = "p2p-iroh")]
 pub use providers::{
     MAX_P2P_CUSTOM_RELAYS, P2pBindAddrs, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth,
@@ -79,6 +77,8 @@ pub use providers::{
     WebRtcReadHalf, WebRtcStream, WebRtcUpgradeEndpoint, WebRtcUpgradeHandle,
     WebRtcUpgradeListener, WebRtcWriteHalf,
 };
+#[cfg(unix)]
+pub use providers::{OverlayHelperDialer, OverlayHelperListener};
 #[cfg(feature = "webtransport")]
 pub use providers::{WtDialer, WtListener};
 pub use rate_limit::{

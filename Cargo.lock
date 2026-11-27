@@ -4508,6 +4508,7 @@ dependencies = [
  "tracing",
  "url",
  "webpki-roots 1.0.12",
+ "windows-sys 0.61.2",
  "wtransport",
  "zeroize",
 ]
