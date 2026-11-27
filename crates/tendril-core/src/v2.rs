@@ -108,6 +108,14 @@ pub const DEFAULT_PING_INTERVAL_MS: u64 = 25_000;
 /// Default keepalive jitter (`+-25%`, `2500` basis points) for [`ScheduleJitterPolicy`].
 pub const DEFAULT_PING_JITTER_BPS: u16 = 2_500;
 
+/// Low-power mobile keepalive base interval (`75` seconds; `60..=90 s` bounds, `< 1/3` of the
+/// `300 s` relay idle timeout) for [`ScheduleJitterPolicy::low_power`].
+pub const LOW_POWER_PING_INTERVAL_MS: u64 = 75_000;
+
+/// Low-power mobile keepalive jitter (`+-20%`, `2000` basis points) for
+/// [`ScheduleJitterPolicy::low_power`].
+pub const LOW_POWER_PING_JITTER_BPS: u16 = 2_000;
+
 /// Default minimum rekey threshold fraction (`75%`, `7500` basis points).
 pub const DEFAULT_REKEY_MIN_PCT_BPS: u16 = 7_500;
 
@@ -1197,6 +1205,18 @@ impl Default for ScheduleJitterPolicy {
 }
 
 impl ScheduleJitterPolicy {
+    /// Returns the mobile battery-conscious keepalive and rekey policy (`60..=90 s` pings).
+    #[must_use]
+    pub const fn low_power() -> Self {
+        Self {
+            ping_interval_ms: LOW_POWER_PING_INTERVAL_MS,
+            ping_jitter_bps: LOW_POWER_PING_JITTER_BPS,
+            rekey_max_frames: REKEY_MAX_FRAMES,
+            rekey_max_age_secs: REKEY_MAX_AGE_MS / 1_000,
+            rekey_min_pct_bps: DEFAULT_REKEY_MIN_PCT_BPS,
+        }
+    }
+
     /// Validates and constructs a [`ScheduleJitterPolicy`].
     pub fn new(
         ping_interval_ms: u64,
@@ -5867,6 +5887,10 @@ mod tests {
         let resp_delay = resp.next_ping_delay_ms().unwrap();
         assert!((min_ping..=max_ping).contains(&init_delay));
         assert!((min_ping..=max_ping).contains(&resp_delay));
+        assert_eq!(
+            ScheduleJitterPolicy::low_power().ping_bounds_ms(),
+            (60_000, 90_000)
+        );
 
         let ping_wire = collect_wire(init.seal_ping(0x1122_3344_5566_7788, 100).unwrap());
         let pong_wire = collect_wire(

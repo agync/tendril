@@ -823,6 +823,7 @@ pub async fn build_pairing_candidates(
             is_numeric_host: is_numeric_host_addr(&checked.dial_endpoint)
                 || !checked.destinations.is_empty(),
             source: candidate_route_source(input.source),
+            preferred: false,
         });
         routes
             .entry(checked.provider)
