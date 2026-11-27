@@ -174,6 +174,8 @@ A host that knows a peer and refuses it says so over an authenticated channel in
 
 App guidance: `refused_revoked` means the host blocks this device's key permanently; re-pairing needs a new device identity, so offer to forget the host. `refused_pending` means the host has not confirmed this device yet; retry with backoff. A host sends at most one notice per peer in a short window and answers the rest as an unknown peer, so a revoked device can see `refused_revoked` once and a generic failure on a rapid retry. The `tendril` CLI reports the same stable code as `error_code` in its `attempt_failed` line.
 
+Swift: `TendrilError.refused(TendrilRefusal)` (`.revoked`, `.pending`, `.other(UInt16)`) comes from `connectV2`, `connectWithOptions` (wire 2), `sendData`, `rekey` and `close`; `TendrilRefusal(closedEventJson:)` reads a `closed` event. `revokePeer(peerId:notify:)`, `setRefusalPolicy(pending:revokedNoticeTtlSecs:)` and `clearRefusalNotice(_:)` wrap the endpoint calls. The new `TendrilError` case is a source break for an exhaustive `switch` before 1.0. See [Web and mobile bindings](web-and-mobile.md#apple-swift-packageswift-and-bindingsswift).
+
 ### `TendrilResult` status codes
 
 - `TENDRIL_OK` (`0`): operation succeeded.
