@@ -2294,9 +2294,199 @@ public final class TendrilJniConformanceTest {
     verifyP2pNetOptions();
   }
 
+  /** A paired host and client; the host knows the client by [clientId] and mints [grant]. */
+  private static final class RefusalFixture {
+    long host;
+    long client;
+    String hostId;
+    String clientId;
+    String grant;
+  }
+
+  private static RefusalFixture refusalFixture(boolean v2) throws Exception {
+    RefusalFixture f = new RefusalFixture();
+    f.host = newEp("tendril-jni-rf-h-", "jni-refusal-host-" + (v2 ? "v2" : "v1"));
+    f.client = newEp("tendril-jni-rf-c-", null);
+    TendrilNative.endpointServeDirect(f.host, "127.0.0.1:0");
+    String uri = asStr(issue(f.host, null).get("uri"));
+    pairViaUri(f.host, f.client, uri, v2);
+    f.hostId = hostIdOf(f.host);
+    f.clientId = deviceIdOf(f.client);
+    f.grant =
+        TendrilNative.endpointMintGrant(f.host, f.clientId, Json.stringify(List.of("fs.read")), 3600);
+    return f;
+  }
+
+  private static void closeFixture(RefusalFixture f) {
+    TendrilNative.endpointClose(f.host);
+    TendrilNative.endpointClose(f.client);
+    TendrilNative.endpointFree(f.host);
+    TendrilNative.endpointFree(f.client);
+  }
+
+  /** The failure of a v2 connect that the host refuses, or null when the connect fails another way. */
+  private static TendrilRefusedException refusedV2Connect(RefusalFixture f) throws Exception {
+    try {
+      long[] s = connectStored(f.client, f.host, f.hostId, f.grant, true, 3000);
+      TendrilNative.sessionFree(s[0]);
+      TendrilNative.sessionFree(s[1]);
+    } catch (TendrilRefusedException e) {
+      return e;
+    } catch (IllegalStateException e) {
+      return null;
+    }
+    throw new AssertionError("a revoked peer connected");
+  }
+
+  private static void verifyRefusal() throws Exception {
+    // v2: the refusal arrives at connect as a typed exception.
+    RefusalFixture f = refusalFixture(true);
+    try {
+      TendrilNative.endpointRevokePeer(f.host, f.clientId);
+      TendrilRefusedException e = refusedV2Connect(f);
+      check(e != null, "v2 revoked connect must throw TendrilRefusedException");
+      check(e instanceof IllegalStateException, "refusal stays an IllegalStateException");
+      check(e.getReason() == TendrilRefusedException.Reason.REVOKED, "reason: " + e.getReason());
+      check(e.getCloseCode() == 4001, "close code: " + e.getCloseCode());
+      check("refused_revoked".equals(e.getCode()), "code: " + e.getCode());
+      check(String.valueOf(e.getMessage()).contains("revoked"), "message: " + e.getMessage());
+      check(
+          String.valueOf(e.getMessage()).startsWith("tendril ffi error (-8):"),
+          "a refused connect formats -8: " + e.getMessage());
+      // The refusal code must not leak into the next failing call on this thread: a different,
+      // non-refusal FFI failure is a plain IllegalStateException.
+      try {
+        TendrilNative.endpointClearRefusalNotice(f.host, "no-such-peer");
+        throw new AssertionError("clearing an unknown peer succeeded");
+      } catch (TendrilRefusedException leaked) {
+        throw new AssertionError("a refusal code leaked into the next failure: " + leaked.getMessage());
+      } catch (IllegalStateException plain) {
+        check(
+            plain.getClass() == IllegalStateException.class,
+            "plain failure class: " + plain.getClass());
+        check(!String.valueOf(plain.getMessage()).startsWith("tendril ffi error (-8)"), "plain rc");
+      }
+    } finally {
+      closeFixture(f);
+    }
+
+    // v1: connect returns first; the closed event carries the refusal and later calls throw it.
+    f = refusalFixture(false);
+    long clientSess = 0;
+    long[] hostSess = new long[1];
+    Thread accept = null;
+    try {
+      TendrilNative.endpointRevokePeer(f.host, f.clientId);
+      final long host = f.host;
+      accept =
+          new Thread(
+              () -> {
+                try {
+                  hostSess[0] = TendrilNative.sessionAccept(host, 3000);
+                } catch (RuntimeException ignored) {
+                  // the host side of a refused session is not under test
+                }
+              });
+      accept.start();
+      clientSess = TendrilNative.sessionConnect(f.client, "", null, f.hostId, f.grant);
+      Map<String, Object> closed = null;
+      long deadline = System.nanoTime() + 10_000_000_000L;
+      while (closed == null && System.nanoTime() < deadline) {
+        Map<String, Object> ev = asObj(Json.parse(TendrilNative.sessionPollEvent(clientSess, 500)));
+        if ("closed".equals(ev.get("event"))) {
+          closed = ev;
+        }
+      }
+      check(closed != null, "v1 refusal produced no closed event");
+      check("revoked".equals(closed.get("refusal")), "closed refusal: " + closed);
+      check(((Number) closed.get("code")).intValue() == 4001, "closed code: " + closed);
+      check(
+          "eof".equals(asObj(Json.parse(TendrilNative.sessionPollEvent(clientSess, 500))).get("status")),
+          "closed is followed by eof");
+      try {
+        TendrilNative.sessionSendData(clientSess, new byte[] {'x'});
+        throw new AssertionError("sendData after a refusal succeeded");
+      } catch (TendrilRefusedException e) {
+        check(e.getReason() == TendrilRefusedException.Reason.REVOKED, "sendData reason");
+        check(e.getCloseCode() == 4001, "sendData close code");
+      }
+      try {
+        TendrilNative.sessionRekey(clientSess);
+        throw new AssertionError("rekey after a refusal succeeded");
+      } catch (TendrilRefusedException e) {
+        check("refused_revoked".equals(e.getCode()), "rekey code: " + e.getCode());
+      }
+      try {
+        TendrilNative.sessionClose(clientSess, 1000, "");
+        throw new AssertionError("close after a refusal succeeded");
+      } catch (TendrilRefusedException e) {
+        check(e.getCloseCode() == 4001, "close close code");
+      }
+    } finally {
+      if (clientSess != 0) {
+        TendrilNative.sessionShutdown(clientSess);
+      }
+      if (accept != null) {
+        accept.join(8000);
+      }
+      if (clientSess != 0) {
+        TendrilNative.sessionFree(clientSess);
+      }
+      if (hostSess[0] != 0) {
+        TendrilNative.sessionFree(hostSess[0]);
+      }
+      closeFixture(f);
+    }
+
+    // Endpoint calls. Each case uses a fresh host: a host sends one notice per peer in a window.
+    f = refusalFixture(true);
+    try {
+      TendrilNative.endpointRevokePeerWithOptions(f.host, f.clientId, "{\"notify\":false}");
+      check(refusedV2Connect(f) == null, "a silent revoke must not refuse");
+    } finally {
+      closeFixture(f);
+    }
+    f = refusalFixture(true);
+    try {
+      TendrilNative.endpointSetRefusalPolicyJson(f.host, "{\"pending\":true,\"revoked_notice_ttl_secs\":0}");
+      TendrilNative.endpointRevokePeerWithOptions(f.host, f.clientId, null);
+      check(refusedV2Connect(f) == null, "ttl 0 records no notice");
+    } finally {
+      closeFixture(f);
+    }
+    f = refusalFixture(true);
+    try {
+      TendrilNative.endpointRevokePeerWithOptions(f.host, f.clientId, null);
+      TendrilNative.endpointClearRefusalNotice(f.host, f.clientId);
+      check(refusedV2Connect(f) == null, "a cleared notice must not refuse");
+      boolean unknown = false;
+      try {
+        TendrilNative.endpointClearRefusalNotice(f.host, "no-such-peer");
+      } catch (IllegalStateException e) {
+        unknown = true;
+      }
+      check(unknown, "clearing an unknown peer must fail");
+    } finally {
+      closeFixture(f);
+    }
+    f = refusalFixture(true);
+    try {
+      TendrilNative.endpointSetRefusalPolicyJson(f.host, "{\"pending\":true,\"revoked_notice_ttl_secs\":60}");
+      TendrilNative.endpointRevokePeerWithOptions(f.host, f.clientId, "{\"notify\":true}");
+      check(refusedV2Connect(f) != null, "notify true refuses");
+    } finally {
+      closeFixture(f);
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     Path root = Paths.get("").toAbsolutePath().normalize();
     Path peerBin = root.resolve("target").resolve("debug").resolve("tendril-conformance-peer");
+    if (args.length == 1 && args[0].equals("refusal")) {
+      verifyRefusal();
+      System.out.println("JNI_REFUSAL_OK=true");
+      return;
+    }
     verifyVectors(root);
     System.out.println("JNI_VECTORS_OK=true");
     verifyLiveInterop(peerBin);
@@ -2314,5 +2504,7 @@ public final class TendrilJniConformanceTest {
     System.out.println("JNI_SEALED_GROUP_OK=true");
     verifyPairingUriRoutes(root);
     System.out.println("JNI_PAIRING_URI_ROUTES_OK=true");
+    verifyRefusal();
+    System.out.println("JNI_REFUSAL_OK=true");
   }
 }

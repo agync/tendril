@@ -93,6 +93,13 @@ final class TendrilNative {
 
   public static native void endpointRevokePeer(long ptr, String peerId);
 
+  public static native void endpointRevokePeerWithOptions(
+      long ptr, String peerId, String optionsJson);
+
+  public static native void endpointSetRefusalPolicyJson(long ptr, String policyJson);
+
+  public static native void endpointClearRefusalNotice(long ptr, String peerId);
+
   public static native void endpointAddTrustAnchor(
       long ptr, String anchorId, byte[] signingPub);
 
