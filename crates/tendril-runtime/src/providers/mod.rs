@@ -1171,49 +1171,106 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn connect_ws_resolved_refuses_host_names_resolving_to_blocked_addresses() {
-        use std::net::SocketAddr;
+    /// Stub resolver answering every host name with fixed addresses.
+    struct Answers(Vec<std::net::SocketAddr>);
 
-        struct Answers(Vec<SocketAddr>);
-
-        #[async_trait::async_trait]
-        impl egress::HostResolver for Answers {
-            async fn resolve(
-                &self,
-                _host: &str,
-                port: u16,
-            ) -> Result<Vec<SocketAddr>, RuntimeError> {
-                Ok(self
-                    .0
-                    .iter()
-                    .map(|a| SocketAddr::new(a.ip(), port))
-                    .collect())
-            }
+    #[async_trait::async_trait]
+    impl egress::HostResolver for Answers {
+        async fn resolve(
+            &self,
+            _host: &str,
+            port: u16,
+        ) -> Result<Vec<std::net::SocketAddr>, RuntimeError> {
+            Ok(self
+                .0
+                .iter()
+                .map(|a| std::net::SocketAddr::new(a.ip(), port))
+                .collect())
         }
+    }
 
-        for blocked in [
-            "2001::1",
-            "64:ff9b:1::1",
-            "fec0::1",
-            "64:ff9b::a9fe:a9fe",
-            "224.0.0.1",
-        ] {
-            let ip: std::net::IpAddr = blocked.parse().expect("ip");
-            let policy = std::sync::Arc::new(egress::tests::DefaultPolicyWithResolver(
-                std::sync::Arc::new(Answers(vec![SocketAddr::new(ip, 0)])),
-            ));
-            let err = egress::with_addr_policy(
-                policy,
-                connect_ws_resolved("wss://relay.example:9/", None, "test connect"),
-            )
-            .await
-            .expect_err("blocked answer");
-            assert_eq!(
+    /// [`DefaultAddrPolicy`] checks behind a stub resolver answering `ip`.
+    fn default_policy_answering(
+        ip: &str,
+    ) -> std::sync::Arc<egress::tests::DefaultPolicyWithResolver> {
+        let ip: std::net::IpAddr = ip.parse().expect("ip");
+        std::sync::Arc::new(egress::tests::DefaultPolicyWithResolver(
+            std::sync::Arc::new(Answers(vec![std::net::SocketAddr::new(ip, 0)])),
+        ))
+    }
+
+    const BLOCKED_ANSWERS: [&str; 6] = [
+        "2001::1",
+        "64:ff9b:1::1",
+        "fec0::1",
+        "64:ff9b::a9fe:a9fe",
+        "2002:a9fe:a9fe::1",
+        "224.0.0.1",
+    ];
+
+    fn assert_blocked_answer<T>(what: &str, blocked: &str, got: Result<T, RuntimeError>) {
+        match got {
+            Ok(_) => panic!("{what} {blocked}: must be refused"),
+            Err(err) => assert_eq!(
                 err.skip_reason(),
                 Some(egress::SkipReason::BlockedAddress),
-                "{blocked}: {err:?}"
-            );
+                "{what} {blocked}: {err:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_ws_resolved_refuses_host_names_resolving_to_blocked_addresses() {
+        for blocked in BLOCKED_ANSWERS {
+            let got = egress::with_addr_policy(
+                default_policy_answering(blocked),
+                connect_ws_resolved("wss://relay.example:9/", None, "test connect"),
+            )
+            .await;
+            assert_blocked_answer("connect_ws_resolved", blocked, got);
+        }
+    }
+
+    /// Host names reach `DefaultAddrPolicy::check` (not the literal check of
+    /// `validate_url_host_safety`) in every relay and broker dial and in the v1 relay bind.
+    /// The v2 relay listener is not covered: it connects from spawned epoch tasks, which do
+    /// not inherit the task-scoped policy, so no resolver can be injected for it.
+    #[tokio::test]
+    async fn relay_and_broker_paths_refuse_host_names_resolving_to_blocked_addresses() {
+        use crate::provider::PathDialer;
+        use std::time::Duration;
+
+        for blocked in BLOCKED_ANSWERS {
+            let policy = default_policy_answering(blocked);
+            let relay = egress::with_addr_policy(
+                policy.clone(),
+                RelayDialer::new().connect("wss://relay.example:9/", &[7u8; 32]),
+            )
+            .await;
+            assert_blocked_answer("relay dial", blocked, relay);
+            let relay_v2 = egress::with_addr_policy(
+                policy.clone(),
+                RelayV2Dialer::new([7u8; 32]).connect("wss://relay.example:9/"),
+            )
+            .await;
+            assert_blocked_answer("relay v2 dial", blocked, relay_v2);
+            let broker = egress::with_addr_policy(
+                policy.clone(),
+                BrokerDialer::new().dial("broker+wss://relay.example:9/"),
+            )
+            .await;
+            assert_blocked_answer("broker dial", blocked, broker);
+            let bind = egress::with_addr_policy(
+                policy,
+                RelayListener::bind(
+                    "wss://relay.example:9/",
+                    None,
+                    ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+                    Duration::from_secs(1),
+                ),
+            )
+            .await;
+            assert_blocked_answer("relay bind", blocked, bind);
         }
     }
 

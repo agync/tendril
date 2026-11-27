@@ -1260,6 +1260,7 @@ pub struct EmbeddedRelay {
 impl EmbeddedRelay {
     /// Starts an embedded relay configured with `config`.
     pub async fn start(config: RelayConfig) -> Result<Self, RuntimeError> {
+        super::egress::check_bind_addr(config.listen_addr)?;
         let host = config.host.clone();
         let server = RelayServer::bind(config)
             .await
@@ -1313,6 +1314,26 @@ impl EmbeddedRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn embedded_relay_refuses_blocked_listen_addresses() {
+        for raw in ["224.0.0.1:0", "240.0.0.1:0", "[2001::1]:0", "[fec0::1]:0"] {
+            let err = EmbeddedRelay::start(RelayConfig {
+                listen_addr: raw.parse().expect("addr"),
+                ..RelayConfig::default()
+            })
+            .await
+            .expect_err("blocked listen address");
+            assert_eq!(
+                err.skip_reason(),
+                Some(super::super::egress::SkipReason::BlockedAddress),
+                "{raw}: {err:?}"
+            );
+        }
+        EmbeddedRelay::bind_local("relay.test")
+            .await
+            .expect("loopback stays allowed");
+    }
 
     #[tokio::test]
     async fn replaced_listener_returns_closed_and_stops_its_standby_pool() {
