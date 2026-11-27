@@ -2969,6 +2969,216 @@ impl Roster {
         ingested
     }
 
+    /// Folds the revocation state `held` (an in-memory copy of this roster) records into `self`
+    /// (the on-disk copy) and returns whether `self` changed.
+    ///
+    /// `held` is trusted local state, not network evidence. The fold carries only revocations,
+    /// never anything else: no revoked state, notice or CRL `self` holds is lost or lowered, and no
+    /// route, grant, secret, nonce, pending claim or `Active` entry crosses over. `local` is the
+    /// local host id and signing key, the only key that verifies the local host's own CRL.
+    ///
+    /// In order: held CRLs (verified against the keys of [`Self::crl_issuer_keys`], skipping any
+    /// `self` already holds at an equal or higher `seq`), `Revoked` entries (a record disk
+    /// rotated or replaced keeps the held keys revoked through a tombstone), `Revoked` anchors,
+    /// and a last, deterministic pass that sets each refusal notice from the pair (`self`
+    /// before the fold, `held`) alone, so map and replay order never decide it
+    /// (`spec/pairing-v1.md` Section 5.1). Folding the same `held` twice changes nothing.
+    pub fn absorb_held_revocations(
+        &mut self,
+        held: &Roster,
+        local: Option<(&str, &HybridSigningPublicKey)>,
+    ) -> bool {
+        let holds_state = !held.crls.is_empty()
+            || held.entries.values().any(|e| e.state == PeerState::Revoked)
+            || held
+                .trust_anchors
+                .values()
+                .any(|a| a.state == AnchorState::Revoked);
+        if !holds_state {
+            return false;
+        }
+        let fingerprint = |roster: &Self| serde_json::to_vec(roster).ok();
+        let before = fingerprint(self);
+        let original = self.entries.clone();
+
+        self.absorb_held_crls(held, local);
+        self.absorb_held_entries(held);
+        self.absorb_held_anchors(held);
+        self.set_absorbed_notices(held, &original);
+
+        before.is_none() || before != fingerprint(self)
+    }
+
+    /// The keys that may verify a held CRL of `issuer`, in order and without duplicates.
+    ///
+    /// The local host's own CRL is verified only by the local key: no peer whose label or
+    /// `device_id` equals the local host id can write it. Otherwise: an active peer's key, an
+    /// active anchor's key, a non-`Pending` entry's key in any state (by map key or `device_id`),
+    /// an anchor's key in any state, then the same entry and anchor keys in `held`. Keys of
+    /// `Pending` entries never verify a CRL.
+    fn crl_issuer_keys(
+        &self,
+        issuer: &str,
+        held: &Roster,
+        local: Option<(&str, &HybridSigningPublicKey)>,
+    ) -> Vec<HybridSigningPublicKey> {
+        if let Some((local_id, local_pub)) = local
+            && local_id == issuer
+        {
+            return vec![local_pub.clone()];
+        }
+        let entry_keys = |roster: &'_ Self| -> Vec<HybridSigningPublicKey> {
+            roster
+                .entries
+                .iter()
+                .filter(|(key, e)| {
+                    e.state != PeerState::Pending && (*key == issuer || e.device_id == issuer)
+                })
+                .filter_map(|(_, e)| e.signing_pub.clone())
+                .collect()
+        };
+        let candidates = [
+            self.lookup_active_signing_key(issuer).into_iter().collect(),
+            self.lookup_active_anchor_key(issuer).into_iter().collect(),
+            entry_keys(self),
+            self.trust_anchor(issuer)
+                .map(|a| a.signing_pub.clone())
+                .into_iter()
+                .collect(),
+            entry_keys(held),
+            held.trust_anchor(issuer)
+                .map(|a| a.signing_pub.clone())
+                .into_iter()
+                .collect(),
+        ];
+        let mut keys: Vec<HybridSigningPublicKey> = Vec::new();
+        for key in candidates.into_iter().flatten() {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    fn absorb_held_crls(&mut self, held: &Roster, local: Option<(&str, &HybridSigningPublicKey)>) {
+        for (issuer, crl) in &held.crls {
+            if self.crls.get(issuer).is_some_and(|d| d.seq >= crl.seq) {
+                continue;
+            }
+            for key in self.crl_issuer_keys(issuer, held, local) {
+                match self.ingest_crl_noticed(crl.clone(), issuer, &key, None) {
+                    Ok(()) | Err(CoreError::CrlStaleSeq { .. }) => break,
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    fn absorb_held_entries(&mut self, held: &Roster) {
+        for (key, h) in &held.entries {
+            if h.state != PeerState::Revoked {
+                continue;
+            }
+            let Some(disk) = self.entries.get(key) else {
+                self.entries.insert(key.clone(), Self::sanitized_revoked(h));
+                self.revoke_siblings_by_keys(h.static_pub, h.signing_pub.as_ref(), true);
+                continue;
+            };
+            let same_keys = disk.static_pub == h.static_pub && disk.signing_pub == h.signing_pub;
+            let was_revoked = disk.state == PeerState::Revoked;
+            if !was_revoked {
+                let _ = self.revoke_entry(key, None);
+            }
+            if !same_keys {
+                self.revoke_claim_keys(Self::sanitized_revoked(h));
+            }
+        }
+    }
+
+    /// `h` as a `Revoked` record that carries only its identity and keys.
+    fn sanitized_revoked(h: &RosterEntry) -> RosterEntry {
+        let mut entry = h.clone();
+        entry.state = PeerState::Revoked;
+        entry.grants.clear();
+        entry.v2_secrets = None;
+        entry.refusal = None;
+        entry.last_pairing_sas = None;
+        entry.routes.clear();
+        entry.route_meta = None;
+        entry.approved_signed.clear();
+        entry.relay_hints.clear();
+        entry
+    }
+
+    fn absorb_held_anchors(&mut self, held: &Roster) {
+        for (id, h) in &held.trust_anchors {
+            if h.state != AnchorState::Revoked {
+                continue;
+            }
+            let key = &h.signing_pub;
+            let Some(disk) = self.trust_anchors.get(id) else {
+                self.trust_anchors.insert(id.clone(), h.clone());
+                self.revoke_siblings_by_keys([0u8; 32], Some(key), true);
+                continue;
+            };
+            let same_key = disk.signing_pub == *key;
+            if disk.state == AnchorState::Active {
+                let _ = self.revoke_trust_anchor(id);
+            }
+            if !same_key {
+                self.revoke_siblings_by_keys([0u8; 32], Some(key), true);
+                let tomb_id = format!("{id}#revoked-{}", hex::encode(&key.sha256_hash()[..8]));
+                self.trust_anchors
+                    .entry(tomb_id.clone())
+                    .or_insert_with(|| TrustAnchor {
+                        anchor_id: tomb_id,
+                        signing_pub: key.clone(),
+                        state: AnchorState::Revoked,
+                    });
+            }
+        }
+    }
+
+    /// Sets the refusal notice of every `Revoked` entry from `original` (the entries before the
+    /// fold) and `held` alone, per the `spec/pairing-v1.md` Section 5.1 clearing rules:
+    ///
+    /// * `Revoked` in `original` with a notice: kept, unless `held` revoked the entry silently
+    ///   (a clearing event), which clears it. It is never created or extended.
+    /// * `Active` or `Pending` in `original`, `Revoked` with a notice in `held`: that notice's
+    ///   expiry, with the refusal secret from the `original` entry's `reconnect_secret`.
+    /// * Anything else: none.
+    fn set_absorbed_notices(&mut self, held: &Roster, original: &BTreeMap<String, RosterEntry>) {
+        for (key, entry) in &mut self.entries {
+            if entry.state != PeerState::Revoked {
+                continue;
+            }
+            let memory = held
+                .entries
+                .get(key)
+                .filter(|m| m.state == PeerState::Revoked);
+            entry.refusal = match original.get(key) {
+                Some(disk) if disk.state == PeerState::Revoked => {
+                    if memory.is_some_and(|m| m.refusal.is_none()) {
+                        None
+                    } else {
+                        disk.refusal.clone()
+                    }
+                }
+                Some(disk) => memory
+                    .and_then(|m| m.refusal.as_ref())
+                    .map(|notice| RefusalNotice {
+                        until_unix: notice.until_unix,
+                        secret: disk
+                            .v2_secrets
+                            .as_ref()
+                            .map(|s| RefusalSecret(*s.reconnect_secret()))
+                            .or_else(|| notice.secret.clone()),
+                    }),
+                None => None,
+            };
+        }
+    }
+
     /// Client acceptance of a host route set, in order: active
     /// peer, key binding, signature, issue time, sequence, then an atomic replacement of the
     /// `signed` routes. `operator` and `committed` routes are never touched.
