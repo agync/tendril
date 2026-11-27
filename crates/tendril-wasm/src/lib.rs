@@ -3127,7 +3127,9 @@ impl WasmSessionClient {
                     "code": code,
                     "reason": reason,
                 })),
-                // Only a refusal-enabled responder emits this; the WASM surface builds none.
+                // The WASM surface only builds initiators, and only a refusal-enabled responder
+                // emits this. If a responder ever reaches here, the session is over and the
+                // refusal code is reported like any other close.
                 SessionAction::Refused { code, .. } => events.push(json!({
                     "event": "closed",
                     "code": code,
@@ -3937,7 +3939,7 @@ impl WasmV2SessionInitiator {
                     "reason": reason,
                 }));
             }
-            // Only a refusal-enabled responder emits this; the WASM surface builds none.
+            // See the Wire v1 arm: initiators never emit a refusal, a responder's is a close.
             V2SessionAction::Refused { code, .. } => {
                 self.pending_events.push(json!({
                     "event": "closed",

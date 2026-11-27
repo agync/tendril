@@ -4,13 +4,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use tendril_core::policy::ProviderId;
+use tendril_core::{RefusalLimiter, RefusalReplayCache};
 use tendril_relay::normalize_rate_limit_ip;
+use tokio::runtime::Handle;
+use tokio::sync::{Semaphore, watch};
+use tokio::time::timeout;
 
 use crate::error::RuntimeError;
+use crate::provider::PathStream;
 
 /// Configuration bounds for [`PreAuthRateLimiter`].
 #[derive(Debug, Clone)]
@@ -157,10 +162,202 @@ impl HalfOpenKey {
     }
 }
 
+/// How long a refused Wire v1 connection is read and discarded after its half-close
+/// (`spec/wire-v1.md` Section 5.4.4, `REFUSAL_LINGER`).
+pub const REFUSAL_LINGER: Duration = Duration::from_millis(250);
+
+/// Maximum refused connections draining at once; a refusal that finds the bound reached closes
+/// its connection immediately.
+pub const MAX_REFUSAL_DRAINS: usize = 8;
+
+/// One refusal that was actually sent to a peer (`spec/wire-v1.md` Section 5.4.2).
+///
+/// It is built only after the refusal limiter allowed the refusal and its frame was written, so
+/// a flood of refusal-eligible attempts yields at most one record per peer per window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusalAudit {
+    /// Canonical `device_id` of the refused peer.
+    pub peer_id: String,
+    /// The refusal close code that was sent (`4001` or `4004`).
+    pub code: u16,
+}
+
+type AuditSink = Arc<dyn Fn(&RefusalAudit) + Send + Sync>;
+
+struct RefusalInner {
+    limiter: Mutex<RefusalLimiter>,
+    replay: Mutex<RefusalReplayCache>,
+    drains: Arc<Semaphore>,
+    max_drains: usize,
+    audit: Option<AuditSink>,
+    shutdown: watch::Sender<bool>,
+}
+
+/// Endpoint-wide state of authenticated refusal: the per-peer [`RefusalLimiter`], the
+/// [`RefusalReplayCache`] of refused Wire v2 `msg1` nonces, the bound on connections draining
+/// after a refusal, and the audit sink.
+///
+/// One value serves every ordinary listener of an endpoint, Wire v1 and Wire v2 alike, so the
+/// limiter keys a peer once whichever wire it uses. Clones share the state.
+#[derive(Clone)]
+pub struct RefusalState {
+    inner: Arc<RefusalInner>,
+}
+
+impl std::fmt::Debug for RefusalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefusalState")
+            .field("drains_in_flight", &self.drains_in_flight())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for RefusalState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RefusalState {
+    /// Creates state that audits through `tracing` only.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::build(MAX_REFUSAL_DRAINS, None)
+    }
+
+    /// Creates state that also hands every sent refusal to `sink`.
+    ///
+    /// The sink runs on the accepting task: keep it cheap and never block in it.
+    #[must_use]
+    pub fn with_audit_sink(sink: impl Fn(&RefusalAudit) + Send + Sync + 'static) -> Self {
+        Self::build(MAX_REFUSAL_DRAINS, Some(Arc::new(sink)))
+    }
+
+    /// Creates state that lets at most `max_drains` refused connections drain at once.
+    #[must_use]
+    pub fn with_max_drains(max_drains: usize) -> Self {
+        Self::build(max_drains, None)
+    }
+
+    fn build(max_drains: usize, audit: Option<AuditSink>) -> Self {
+        Self {
+            inner: Arc::new(RefusalInner {
+                limiter: Mutex::new(RefusalLimiter::new()),
+                replay: Mutex::new(RefusalReplayCache::new()),
+                drains: Arc::new(Semaphore::new(max_drains)),
+                max_drains,
+                audit,
+                shutdown: watch::channel(false).0,
+            }),
+        }
+    }
+
+    /// Locks the per-peer refusal limiter.
+    pub(crate) fn limiter(&self) -> MutexGuard<'_, RefusalLimiter> {
+        self.inner
+            .limiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the refused-`msg1` replay cache and the limiter together, in that order.
+    pub(crate) fn caches(
+        &self,
+    ) -> (
+        MutexGuard<'_, RefusalReplayCache>,
+        MutexGuard<'_, RefusalLimiter>,
+    ) {
+        let replay = self
+            .inner
+            .replay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (replay, self.limiter())
+    }
+
+    /// Returns the number of refused connections draining now.
+    #[must_use]
+    pub fn drains_in_flight(&self) -> usize {
+        self.inner
+            .max_drains
+            .saturating_sub(self.inner.drains.available_permits())
+    }
+
+    /// Records that a refusal with `code` was sent to `peer_id`.
+    pub(crate) fn record(&self, peer_id: &str, code: u16) {
+        tracing::info!(event = "session_refused", peer_id, code, "refusal sent");
+        if let Some(sink) = &self.inner.audit {
+            sink(&RefusalAudit {
+                peer_id: peer_id.to_owned(),
+                code,
+            });
+        }
+    }
+
+    /// Ends every refused connection that is draining and closes later ones at once. Called when
+    /// the endpoint closes, so no detached drain outlives it.
+    pub fn shutdown(&self) {
+        self.inner.shutdown.send_replace(true);
+    }
+
+    /// Returns `true` once [`Self::shutdown`] ran.
+    #[must_use]
+    pub fn is_shut_down(&self) -> bool {
+        *self.inner.shutdown.borrow()
+    }
+
+    /// Runs the refusal close sequence on `stream` after its refusal frame was written
+    /// (`spec/wire-v1.md` Section 5.4.4, steps 2 and 3), without blocking the caller.
+    ///
+    /// A task half-closes the write side, then reads and discards inbound bytes until end of
+    /// stream or [`REFUSAL_LINGER`], so unread inbound data cannot reset the connection and
+    /// discard the frame. At most [`MAX_REFUSAL_DRAINS`] tasks run; past that, outside a Tokio
+    /// runtime, or after [`Self::shutdown`], the stream is dropped at once.
+    pub(crate) fn linger(&self, mut stream: Box<dyn PathStream>) {
+        let Ok(runtime) = Handle::try_current() else {
+            return;
+        };
+        let mut shutdown = self.inner.shutdown.subscribe();
+        if *shutdown.borrow() {
+            return;
+        }
+        let Ok(permit) = Arc::clone(&self.inner.drains).try_acquire_owned() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let _permit = permit;
+            let drain = async {
+                let _ = stream.shutdown_write().await;
+                let mut buf = vec![0u8; 1024];
+                let _ = timeout(REFUSAL_LINGER, async {
+                    loop {
+                        match stream.recv_chunk(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                })
+                .await;
+            };
+            tokio::select! {
+                () = drain => {}
+                _ = shutdown.wait_for(|down| *down) => {}
+            }
+            let _ = stream.close().await;
+        });
+    }
+}
+
 /// Thread-safe pre-authentication rate limiter guarding listener `accept` paths.
+///
+/// It also carries the endpoint's [`RefusalState`], so a Wire v1 `accept` that is given this
+/// limiter is an ordinary listener that may refuse a known revoked or pending peer. Build one
+/// [`RefusalState`] per endpoint and install it on every limiter with
+/// [`Self::with_refusal_state`].
 #[derive(Debug, Clone)]
 pub struct PreAuthRateLimiter {
     inner: Arc<PreAuthInner>,
+    refusal: RefusalState,
 }
 
 #[derive(Debug)]
@@ -219,6 +416,7 @@ impl PreAuthRateLimiter {
     #[must_use]
     pub fn new(config: PreAuthConfig) -> Self {
         Self {
+            refusal: RefusalState::new(),
             inner: Arc::new(PreAuthInner {
                 max_half_open: config.max_half_open.max(1),
                 untrusted_max_half_open: config.untrusted_max_half_open.max(1),
@@ -243,6 +441,19 @@ impl PreAuthRateLimiter {
                 active_per_key: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Returns this limiter with `refusal` as its endpoint-wide refusal state.
+    #[must_use]
+    pub fn with_refusal_state(mut self, refusal: RefusalState) -> Self {
+        self.refusal = refusal;
+        self
+    }
+
+    /// Returns the refusal state shared with the listeners that use this limiter.
+    #[must_use]
+    pub fn refusal_state(&self) -> &RefusalState {
+        &self.refusal
     }
 
     /// Consumes a token for `ip` (if present) and acquires one bounded half-open slot.
@@ -413,5 +624,144 @@ impl PreAuthRateLimiter {
         self.inner
             .untrusted_active_half_open
             .load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use std::sync::atomic::AtomicBool;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::provider::{PathReader, PathWriter};
+
+    /// A stream that never reads anything and records what the refusal sequence did to it.
+    struct Idle {
+        half_closed: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for Idle {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl PathStream for Idle {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Direct
+        }
+
+        fn peer_ip(&self) -> Option<std::net::IpAddr> {
+            None
+        }
+
+        async fn send_chunk(&mut self, _bytes: &[u8]) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn recv_chunk(&mut self, _buf: &mut [u8]) -> Result<usize, RuntimeError> {
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn shutdown_write(&mut self) -> Result<(), RuntimeError> {
+            self.half_closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn into_split(self: Box<Self>) -> (Box<dyn PathReader>, Box<dyn PathWriter>) {
+            unreachable!("a refused stream is never split")
+        }
+    }
+
+    fn idle() -> (Box<dyn PathStream>, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let half_closed = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let stream = Box::new(Idle {
+            half_closed: Arc::clone(&half_closed),
+            dropped: Arc::clone(&dropped),
+        });
+        (stream, half_closed, dropped)
+    }
+
+    #[tokio::test]
+    async fn linger_half_closes_then_drains_until_the_linger_bound() {
+        let state = RefusalState::new();
+        let (stream, half_closed, dropped) = idle();
+        state.linger(stream);
+        assert_eq!(state.drains_in_flight(), 1);
+        tokio::time::sleep(REFUSAL_LINGER / 5).await;
+        assert!(half_closed.load(Ordering::SeqCst), "write side half-closed");
+        assert!(!dropped.load(Ordering::SeqCst), "still draining");
+        tokio::time::sleep(REFUSAL_LINGER * 2).await;
+        assert!(dropped.load(Ordering::SeqCst), "closed at the linger bound");
+        assert_eq!(state.drains_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn linger_past_the_drain_bound_closes_immediately() {
+        let state = RefusalState::with_max_drains(1);
+        let (first, _, first_dropped) = idle();
+        let (second, second_half_closed, second_dropped) = idle();
+        state.linger(first);
+        state.linger(second);
+        assert!(
+            second_dropped.load(Ordering::SeqCst),
+            "a refusal past the bound drops its stream at once"
+        );
+        assert!(!second_half_closed.load(Ordering::SeqCst));
+        assert!(!first_dropped.load(Ordering::SeqCst));
+        assert_eq!(state.drains_in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_a_draining_stream_promptly() {
+        let state = RefusalState::new();
+        let (stream, _, dropped) = idle();
+        state.linger(stream);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!dropped.load(Ordering::SeqCst));
+        state.shutdown();
+        tokio::time::sleep(REFUSAL_LINGER / 5).await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "closed by shutdown, not the bound"
+        );
+        assert_eq!(state.drains_in_flight(), 0);
+        let (late, _, late_dropped) = idle();
+        state.linger(late);
+        assert!(
+            late_dropped.load(Ordering::SeqCst),
+            "no drain after shutdown"
+        );
+    }
+
+    #[test]
+    fn linger_outside_a_runtime_drops_the_stream() {
+        let state = RefusalState::new();
+        let (stream, _, dropped) = idle();
+        state.linger(stream);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn record_reaches_the_audit_sink() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let state = RefusalState::with_audit_sink(move |ev| sink.lock().unwrap().push(ev.clone()));
+        state.record("dev-a", 4004);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [RefusalAudit {
+                peer_id: "dev-a".into(),
+                code: 4004
+            }]
+        );
     }
 }

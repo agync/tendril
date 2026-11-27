@@ -2256,3 +2256,129 @@ async fn responder_commits_only_the_path_the_initiator_kept() {
     pool_b.close();
     pool_c.close();
 }
+
+/// What a revoked ordinary peer `a` observes dialing `to_addr` over `wire`: the close code it
+/// received after `Established` (Wire v1, or a Wire v2 `msg3` race), its `msg2` refusal (Wire
+/// v2), or neither.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    Closed(u16),
+    PeerRefused,
+    Silent,
+}
+
+async fn probe_as_revoked(a: &Node, b: &Node, wire: u8, to_addr: String) -> Probe {
+    let stream = DirectDialer::new().dial(&to_addr).await.unwrap();
+    let mut roster = a.store.load_roster().unwrap();
+    if wire == 2 {
+        match V2SessionDriver::connect(stream, &a.identity, &b.id(), None, &mut roster, now()).await
+        {
+            Err(err) if err.refusal().is_some() => Probe::PeerRefused,
+            Err(_) => Probe::Silent,
+            Ok(mut session) => tokio::time::timeout(Duration::from_secs(5), async {
+                match session.next_event_now(&mut roster).await {
+                    Ok(Some(SessionEvent::Closed { code, .. })) => Probe::Closed(code),
+                    _ => Probe::Silent,
+                }
+            })
+            .await
+            .unwrap(),
+        }
+    } else {
+        let mut session =
+            SessionDriver::connect(stream, &a.identity, &b.id(), None, &mut roster, now())
+                .await
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match session.next_event_now(&mut roster).await {
+                    Ok(Some(SessionEvent::Closed { code, .. })) => return Probe::Closed(code),
+                    Ok(Some(_)) => {}
+                    _ => return Probe::Silent,
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+}
+
+/// REF-21: a revoked ordinary peer probes a group pool and then the endpoint's ordinary
+/// dispatcher. The pool never refuses (a refusal would link the group endpoint to the host);
+/// the dispatcher, which is the endpoint's ordinary listener, does.
+async fn group_isolation(wire: u8) {
+    let a = Node::new(0).await;
+    let b = Node::new(1).await;
+    let c = Node::new(2).await;
+    let secrets = V2PeerSecrets::new([0x5A; 32], [0x5B; 32]);
+    pair(&a, &b, (wire == 2).then_some(&secrets));
+    let (gid, _, _) = seed_rooted(&c, &[&b], wire);
+    b.store
+        .update_roster(|r| {
+            r.revoke_peer_at(&a.id(), true, now())?;
+            Ok(())
+        })
+        .unwrap();
+
+    let pool = pool_for(&b, &gid, direct_dialers());
+    let mut listener = DirectListener::bind("127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .unwrap();
+    let addr = listener.local_addr().to_string();
+    let accept = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            // A host daemon may probe a fresh loopback port with a stray request: skip it.
+            let stream = loop {
+                let mut stream = listener.accept().await.unwrap();
+                let peeked = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tendril_runtime::peek_exact(stream.as_mut(), 3),
+                )
+                .await;
+                if let Ok(Ok(prefix)) = peeked
+                    && prefix.starts_with(b"TND")
+                {
+                    break Box::new(tendril_runtime::PrefixedPathStream::new(stream, prefix))
+                        as Box<dyn PathStream>;
+                }
+            };
+            pool.accept(stream).await
+        }
+    });
+    let seen = probe_as_revoked(&a, &b, wire, addr).await;
+    let verdict = accept.await.unwrap();
+    assert!(verdict.is_err(), "{verdict:?}");
+    assert_eq!(seen, Probe::Silent, "a group pool must never refuse");
+    pool.close();
+
+    let mut b = b;
+    let hub = Arc::new(GroupHub::new(
+        b.store.clone(),
+        Arc::clone(&b.identity),
+        GroupPoolConfig::new(direct_dialers()),
+        None,
+    ));
+    assert_eq!(hub.sync().unwrap().len(), 1);
+    let mut routed = spawn_hub_server(Arc::clone(&hub), b.listener.take().unwrap());
+    let seen = probe_as_revoked(&a, &b, wire, b.addr.to_string()).await;
+    let expected = if wire == 2 {
+        Probe::PeerRefused
+    } else {
+        Probe::Closed(4001)
+    };
+    assert_eq!(seen, expected, "the ordinary dispatcher refuses");
+    let verdict = next_routed(&mut routed).await;
+    assert!(verdict.starts_with("refused:"), "{verdict}");
+    hub.close();
+}
+
+#[tokio::test]
+async fn ref_21_group_pool_never_refuses_wire_v1_but_the_hub_does() {
+    group_isolation(1).await;
+}
+
+#[tokio::test]
+async fn ref_21_group_pool_never_refuses_wire_v2_but_the_hub_does() {
+    group_isolation(2).await;
+}

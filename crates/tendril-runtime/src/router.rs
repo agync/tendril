@@ -15,7 +15,7 @@ use tokio::time::{Instant as TokioInstant, MissedTickBehavior, sleep, timeout, t
 use crate::driver::DEFAULT_PRE_AUTH_TIMEOUT;
 use crate::error::RuntimeError;
 use crate::provider::{PathListener, PathStream, PrefixedPathStream, peek_exact};
-use crate::rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
+use crate::rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter, RefusalState};
 
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(20);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
@@ -111,6 +111,7 @@ impl InboundQueue {
 /// and `Intent::Session` handshakes onto independent bounded queues with isolated
 /// half-open budgets and automatic expiration.
 pub struct InboundRouter {
+    refusal: RefusalState,
     rate_limiter: PreAuthRateLimiter,
     pair_limiter: PreAuthRateLimiter,
     session_limiter: PreAuthRateLimiter,
@@ -139,13 +140,18 @@ impl InboundRouter {
     #[must_use]
     pub fn with_config_and_ttl(config: PreAuthConfig, queue_ttl: Duration) -> Self {
         let queue_cap = config.max_half_open.clamp(16, 128);
-        let pair_limiter = PreAuthRateLimiter::new(config.clone());
-        let session_limiter = PreAuthRateLimiter::new(config.clone());
-        let v2_pair_limiter = PreAuthRateLimiter::new(config.clone());
-        let v2_session_limiter = PreAuthRateLimiter::new(config.clone());
-        let rate_limiter = PreAuthRateLimiter::new(config);
+        let refusal = RefusalState::new();
+        let limiter = |config: PreAuthConfig| {
+            PreAuthRateLimiter::new(config).with_refusal_state(refusal.clone())
+        };
+        let pair_limiter = limiter(config.clone());
+        let session_limiter = limiter(config.clone());
+        let v2_pair_limiter = limiter(config.clone());
+        let v2_session_limiter = limiter(config.clone());
+        let rate_limiter = limiter(config);
         let (shutdown_tx, _) = watch::channel(false);
         Self {
+            refusal,
             rate_limiter,
             pair_limiter,
             session_limiter,
@@ -168,6 +174,13 @@ impl InboundRouter {
     #[must_use]
     pub fn new() -> Self {
         Self::with_config(PreAuthConfig::default())
+    }
+
+    /// Returns the endpoint-wide refusal state every limiter of this router carries. Hand it to
+    /// [`crate::V2ResponderState::with_refusal_state`] so Wire v1 and Wire v2 share one limiter.
+    #[must_use]
+    pub fn refusal_state(&self) -> &RefusalState {
+        &self.refusal
     }
 
     /// Returns the shared pre-authentication rate limiter guarding preamble peeks and peer checks.
@@ -459,6 +472,7 @@ impl InboundRouter {
     /// Aborts all spawned listeners and closes inbound queues so blocked waiters wake immediately.
     pub fn close(&self) {
         let _ = self.shutdown_tx.send(true);
+        self.refusal.shutdown();
         self.pair_queue.close();
         self.session_queue.close();
         self.v2_pair_queue.close();

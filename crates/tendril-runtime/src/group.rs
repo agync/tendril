@@ -48,7 +48,7 @@ use crate::provider::{
 use crate::providers::{
     RelayClientAuth, RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig,
 };
-use crate::rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter};
+use crate::rate_limit::{HalfOpenGuard, PreAuthConfig, PreAuthRateLimiter, RefusalState};
 use crate::store::{RosterStamp, StateStore};
 use crate::v2_driver::{ConcurrentV2Session, StagedCommit, V2ResponderState, V2SessionDriver};
 use crate::wake::{DEFAULT_WAKE_TIMEOUT, WakeProvider, WakeSecret, WakeTarget};
@@ -1760,6 +1760,8 @@ impl GroupHub {
             .or_else(|| v2_state.webrtc_upgrade_handle())
             .cloned();
         #[cfg_attr(not(feature = "webrtc"), allow(unused_mut))]
+        // The hub is the endpoint's ordinary listener: it may refuse a known ordinary peer.
+        // Group pins and rendezvous alternates are silent in core (`spec/wire-v1.md` 5.4.3).
         let mut accepted = accept_handshake(
             stream,
             &self.identity,
@@ -1768,6 +1770,7 @@ impl GroupHub {
             v2_state,
             rate_limiter,
             guard,
+            Some(v2_state.effective_refusal(rate_limiter)),
             #[cfg(feature = "webrtc")]
             v1_webrtc_handle.as_ref(),
         )
@@ -1886,6 +1889,7 @@ async fn accept_handshake(
     v2_state: &V2ResponderState,
     rate_limiter: Option<&PreAuthRateLimiter>,
     guard: Option<HalfOpenGuard>,
+    refusal: Option<&RefusalState>,
     #[cfg(feature = "webrtc")] webrtc_upgrade: Option<
         &crate::providers::webrtc::WebRtcUpgradeHandle,
     >,
@@ -1893,7 +1897,7 @@ async fn accept_handshake(
     let now = current_unix_secs();
     let roster = Mutex::new(roster);
     if version >= 2 {
-        let driver = V2SessionDriver::accept_locked(
+        let driver = V2SessionDriver::accept_locked_with_refusal(
             stream,
             identity,
             &roster,
@@ -1902,6 +1906,7 @@ async fn accept_handshake(
             rate_limiter,
             guard,
             DEFAULT_PRE_AUTH_TIMEOUT,
+            refusal,
         )
         .await?;
         let matched = driver
@@ -1925,7 +1930,7 @@ async fn accept_handshake(
         };
         #[cfg(not(feature = "webrtc"))]
         let upgrade_caps = Vec::new();
-        let driver = SessionDriver::accept_locked_with_upgrade_caps(
+        let driver = SessionDriver::accept_locked_with_refusal(
             stream,
             identity,
             &roster,
@@ -1934,6 +1939,7 @@ async fn accept_handshake(
             guard,
             DEFAULT_PRE_AUTH_TIMEOUT,
             upgrade_caps,
+            refusal,
         )
         .await?;
         let peer_id = driver
@@ -3646,6 +3652,7 @@ impl Inner {
                 }
             }
         }
+        // A pool never refuses: a refusal would link the group endpoint to the host.
         let accepted = accept_handshake(
             stream,
             &self.identity,
@@ -3654,6 +3661,7 @@ impl Inner {
             &self.v2_state,
             Some(&self.admission),
             Some(guard),
+            None,
             #[cfg(feature = "webrtc")]
             None,
         )

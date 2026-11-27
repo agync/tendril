@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use tendril_core::RefusalReason;
 #[cfg(feature = "webrtc")]
 use tendril_core::UPGRADE_CAP_WEBRTC_V1;
 use tendril_core::crypto::HybridSigningPublicKey;
@@ -30,10 +29,12 @@ use tendril_core::roster::{
 };
 use tendril_core::routes::RouteSet;
 use tendril_core::session::{
-    RekeyDirection, RouteExpectation, SessionAction, SessionMachine, check_peer_allows_wire_v1,
+    RekeyDirection, RouteExpectation, SessionAction, SessionCloseCode, SessionMachine,
+    check_peer_allows_wire_v1,
 };
 use tendril_core::wire::{Intent, PathUpgradeMsg, Preamble};
 use tendril_core::{MAX_FRAME_LEN, PREAMBLE_LEN};
+use tendril_core::{RefusalMode, RefusalReason};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
@@ -49,7 +50,7 @@ use crate::providers::hints::{
 };
 #[cfg(feature = "webrtc")]
 use crate::providers::webrtc::WebRtcUpgradeHandle;
-use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter};
+use crate::rate_limit::{HalfOpenGuard, PreAuthRateLimiter, RefusalState};
 use crate::store::StateStore;
 
 pub(crate) fn current_unix_secs() -> u64 {
@@ -103,7 +104,9 @@ fn push_non_write_action(
             pending_events.push_back(SessionEvent::Closed { code, reason });
             (true, true)
         }
-        // Only a refusal-enabled responder emits this; the runtime builds none yet.
+        // The accept path writes the frame and ends the connection before it applies a batch
+        // that carries this, and an established session never emits it. Kept as a close so no
+        // refusal can leave a session open.
         SessionAction::Refused { code, .. } => {
             pending_events.push_back(SessionEvent::Closed {
                 code,
@@ -1240,6 +1243,12 @@ pub struct SessionDriver {
     started_at: Instant,
     _half_open: Option<HalfOpenGuard>,
     route_ingest: IngestSlot,
+    /// `true` for a session this side dialed: only an initiator maps a refusal close code.
+    initiator: bool,
+    /// The endpoint's refusal state on a refusal-enabled responder.
+    refusal: Option<RefusalState>,
+    /// A refusal the responder machine sent, held until the accept path ends the connection.
+    refused: Option<(String, u16)>,
     #[cfg(feature = "webrtc")]
     webrtc_upgrade_handle: Option<WebRtcUpgradeHandle>,
 }
@@ -1506,6 +1515,9 @@ impl SessionDriver {
             started_at: Instant::now(),
             _half_open: None,
             route_ingest: IngestSlot::default(),
+            initiator: true,
+            refusal: None,
+            refused: None,
             #[cfg(feature = "webrtc")]
             webrtc_upgrade_handle: None,
         };
@@ -1583,6 +1595,7 @@ impl SessionDriver {
             existing_guard,
             handshake_timeout,
             upgrade_caps,
+            rate_limiter.map(|rl| rl.refusal_state().clone()),
         )
         .await
     }
@@ -1633,6 +1646,45 @@ impl SessionDriver {
             existing_guard,
             handshake_timeout,
             upgrade_caps,
+            rate_limiter.map(|rl| rl.refusal_state().clone()),
+        )
+        .await
+    }
+
+    /// Accepts an inbound Noise XX session handshake with a mutex-guarded roster and an explicit
+    /// refusal listener mode.
+    ///
+    /// `refusal` is the endpoint's [`RefusalState`] for a listener that may refuse a known
+    /// revoked or pending peer (`spec/wire-v1.md` Section 5.4.3), or `None` for a listener that
+    /// never does: a group pool, a standalone group listener or a group mailbox. The other
+    /// `accept*` constructors take the state from `rate_limiter`, and refuse only when one is
+    /// given.
+    ///
+    /// A refused peer gets one `0x07 CLOSE` frame, its half-open slot is released at once, and
+    /// the connection drains in the background; this call then fails with
+    /// [`CoreError::PeerRevoked`] or [`CoreError::PeerPending`], so the accept loop continues.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn accept_locked_with_refusal(
+        stream: Box<dyn PathStream>,
+        local_identity: &EndpointIdentity,
+        roster: &Mutex<Roster>,
+        now_unix: u64,
+        rate_limiter: Option<&PreAuthRateLimiter>,
+        existing_guard: Option<HalfOpenGuard>,
+        handshake_timeout: Duration,
+        upgrade_caps: Vec<String>,
+        refusal: Option<&RefusalState>,
+    ) -> Result<Self, RuntimeError> {
+        Self::accept_with_roster(
+            stream,
+            local_identity,
+            RosterRef::Locked(roster),
+            now_unix,
+            rate_limiter,
+            existing_guard,
+            handshake_timeout,
+            upgrade_caps,
+            refusal.cloned(),
         )
         .await
     }
@@ -1647,6 +1699,7 @@ impl SessionDriver {
         existing_guard: Option<HalfOpenGuard>,
         handshake_timeout: Duration,
         upgrade_caps: Vec<String>,
+        refusal: Option<RefusalState>,
     ) -> Result<Self, RuntimeError> {
         crate::store::ensure_valid_local_host_id(local_identity)?;
         let half_open = match existing_guard {
@@ -1666,8 +1719,13 @@ impl SessionDriver {
         } else {
             upgrade_caps
         };
-        let machine =
-            SessionMachine::new_responder(local_identity, None)?.with_upgrade_caps(upgrade_caps)?;
+        let mode = if refusal.is_some() {
+            RefusalMode::Enabled
+        } else {
+            RefusalMode::Off
+        };
+        let machine = SessionMachine::new_responder_with_refusal(local_identity, None, mode)?
+            .with_upgrade_caps(upgrade_caps)?;
         let mut driver = Self {
             stream,
             machine,
@@ -1676,33 +1734,75 @@ impl SessionDriver {
             started_at: Instant::now(),
             _half_open: half_open,
             route_ingest: IngestSlot::default(),
+            initiator: false,
+            refusal,
+            refused: None,
             #[cfg(feature = "webrtc")]
             webrtc_upgrade_handle: None,
         };
-        driver
+        let established = driver
             .drive_until_established(now_unix, &mut roster, rate_limiter, Some(handshake_timeout))
-            .await?;
-        Ok(driver)
+            .await;
+        match established {
+            Ok(()) => Ok(driver),
+            Err(err) => match driver.refused.take() {
+                Some((peer, code)) => Err(driver.finish_refusal(peer, code)),
+                None => Err(err),
+            },
+        }
+    }
+
+    /// Ends a connection the responder machine refused: the `CLOSE` frame is already written, the
+    /// half-open slot is released, and the stream half-closes and drains in the background so
+    /// the accept loop never waits on it (`spec/wire-v1.md` Section 5.4.4). Returns the accept
+    /// error.
+    fn finish_refusal(self, peer: String, code: u16) -> RuntimeError {
+        let Self {
+            stream,
+            refusal,
+            _half_open,
+            ..
+        } = self;
+        drop(_half_open);
+        if let Some(refusal) = refusal {
+            refusal.record(&peer, code);
+            refusal.linger(stream);
+        }
+        let err = if code == SessionCloseCode::PEER_PENDING {
+            CoreError::PeerPending(peer)
+        } else {
+            CoreError::PeerRevoked(peer)
+        };
+        RuntimeError::Core(err)
     }
 
     /// Sends encrypted `0x01 DATA`.
     pub async fn send_data(&mut self, payload: &[u8]) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.send_data(payload, now_ms)?;
+        let actions = self
+            .machine
+            .send_data(payload, now_ms)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await
     }
 
     /// Sends encrypted `0x02 GRANT`.
     pub async fn send_grant(&mut self, grant: &Grant) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.send_grant(grant, now_ms)?;
+        let actions = self
+            .machine
+            .send_grant(grant, now_ms)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await
     }
 
     /// Sends encrypted `0x03 REVOCATION`.
     pub async fn send_revocation(&mut self, crl: &RevocationList) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.send_revocation(crl, now_ms)?;
+        let actions = self
+            .machine
+            .send_revocation(crl, now_ms)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await
     }
 
@@ -1712,7 +1812,10 @@ impl SessionDriver {
         manifest: &GroupManifest,
     ) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.send_group_manifest(manifest, now_ms)?;
+        let actions = self
+            .machine
+            .send_group_manifest(manifest, now_ms)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await
     }
 
@@ -1724,7 +1827,10 @@ impl SessionDriver {
     ) -> Result<(), RuntimeError> {
         let frame = secrets.to_rendezvous_frame(group_id)?;
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.send_group_rendezvous(&frame[..], now_ms)?;
+        let actions = self
+            .machine
+            .send_group_rendezvous(&frame[..], now_ms)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await
     }
 
@@ -1737,20 +1843,29 @@ impl SessionDriver {
     /// Sends encrypted `0x04 REKEY`.
     pub async fn send_rekey(&mut self) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.send_rekey(now_ms)?;
+        let actions = self
+            .machine
+            .send_rekey(now_ms)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await
     }
 
     /// Sends encrypted `0x05 PING`.
     pub async fn send_ping(&mut self, cookie: u64) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.send_ping(cookie, now_ms)?;
+        let actions = self
+            .machine
+            .send_ping(cookie, now_ms)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await
     }
 
     /// Sends encrypted `0x07 CLOSE` and closes the underlying transport stream.
     pub async fn send_close(&mut self, code: u16, reason: &str) -> Result<(), RuntimeError> {
-        let actions = self.machine.send_close(code, reason)?;
+        let actions = self
+            .machine
+            .send_close(code, reason)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await?;
         let _ = self.stream.close().await;
         Ok(())
@@ -1823,7 +1938,10 @@ impl SessionDriver {
     /// Sends encrypted `0x0D PATH_UPGRADE` signaling after enforcing role, cap, and `upgrade_id` rules.
     pub async fn send_path_upgrade(&mut self, msg: &PathUpgradeMsg) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.send_path_upgrade(msg, now_ms)?;
+        let actions = self
+            .machine
+            .send_path_upgrade(msg, now_ms)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await
     }
 
@@ -1894,6 +2012,7 @@ impl SessionDriver {
             provider_id,
             _half_open: self._half_open,
             route_ingest: self.route_ingest,
+            initiator: self.initiator,
             negotiated_upgrade_caps,
             peer_upgrade_caps,
             #[cfg(feature = "webrtc")]
@@ -2080,6 +2199,12 @@ impl SessionDriver {
             let actions = self
                 .feed_with_roster(&chunk, now_unix, now_ms, roster)
                 .await?;
+            if let Some(refused) = self.write_refusal(&actions, deadline).await? {
+                // The accept path ends the connection; it reads `refused`.
+                self.refused = Some(refused);
+                self._half_open.take();
+                return Err(RuntimeError::Closed);
+            }
             self.apply_actions(actions).await?;
         }
 
@@ -2102,15 +2227,30 @@ impl SessionDriver {
         roster: &mut RosterRef<'_>,
     ) -> Result<Vec<SessionAction>, RuntimeError> {
         let peer = self.machine.peer_device_id().map(ToOwned::to_owned);
+        let refusal = self
+            .refusal
+            .clone()
+            .filter(|_| !self.machine.is_established());
+        let machine = &mut self.machine;
+        let feed = |machine: &mut SessionMachine, roster: &mut Roster| match &refusal {
+            Some(refusal) => machine.feed_bytes_with_limiter(
+                chunk,
+                now_unix,
+                now_ms,
+                roster,
+                &mut refusal.limiter(),
+            ),
+            None => machine.feed_bytes(chunk, now_unix, now_ms, roster),
+        };
         let (res, crls) = match roster {
             RosterRef::Direct(r) => {
-                let res = self.machine.feed_bytes(chunk, now_unix, now_ms, r);
+                let res = feed(machine, r);
                 let crls = fed_crls(res.as_deref().ok(), peer.as_deref(), r);
                 (res, crls)
             }
             RosterRef::Locked(m) => {
                 let mut guard = m.lock().expect("roster mutex poisoned");
-                let res = self.machine.feed_bytes(chunk, now_unix, now_ms, &mut guard);
+                let res = feed(machine, &mut guard);
                 let crls = fed_crls(res.as_deref().ok(), peer.as_deref(), &guard);
                 (res, crls)
             }
@@ -2119,7 +2259,59 @@ impl SessionDriver {
         if res.is_err() {
             self.route_ingest.run(Vec::new()).await;
         }
-        Ok(res?)
+        res.map_err(|err| self.core_error(err))
+    }
+
+    /// Wraps a core error of this session: an initiator keeps a peer close as
+    /// [`RuntimeError::InitiatorClosed`] so a refusal close is classifiable
+    /// ([`RuntimeError::refusal`]); a responder keeps the plain error.
+    fn core_error(&self, err: CoreError) -> RuntimeError {
+        if self.initiator {
+            RuntimeError::from_initiator_core(err)
+        } else {
+            RuntimeError::Core(err)
+        }
+    }
+
+    /// When `actions` carry a refusal, writes its frame and returns the refused peer and code.
+    /// The frame is the only write such a batch holds; nothing else of it is applied.
+    async fn write_refusal(
+        &mut self,
+        actions: &[SessionAction],
+        deadline: Option<TokioInstant>,
+    ) -> Result<Option<(String, u16)>, RuntimeError> {
+        let Some((peer, code)) = actions.iter().find_map(|action| match action {
+            SessionAction::Refused {
+                peer_device_id,
+                code,
+            } => Some((peer_device_id.clone(), *code)),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let write = async {
+            for action in actions {
+                if let SessionAction::WriteBytes(bytes) = action {
+                    write_protocol_bytes(self.stream.as_mut(), bytes).await?;
+                }
+            }
+            Ok::<(), RuntimeError>(())
+        };
+        // The half-open slot is still held: a stalled peer must not outlive the handshake bound.
+        let written = match deadline {
+            Some(dl) => timeout_at(dl, write).await.ok(),
+            None => Some(write.await),
+        };
+        match written {
+            Some(res) => res?,
+            None => {
+                let _ = self.stream.close().await;
+                return Err(RuntimeError::Timeout(
+                    "pre-auth session handshake timed out",
+                ));
+            }
+        }
+        Ok(Some((peer, code)))
     }
 
     async fn apply_actions(&mut self, actions: Vec<SessionAction>) -> Result<(), RuntimeError> {
@@ -2172,7 +2364,10 @@ impl SessionDriver {
     /// Sends one `0x0C ROUTE_SET` payload (responder, to a client that sent `route_seq`).
     pub async fn send_route_set(&mut self, payload: &[u8]) -> Result<(), RuntimeError> {
         let now_ms = self.elapsed_ms();
-        let actions = self.machine.send_route_set(payload, now_ms)?;
+        let actions = self
+            .machine
+            .send_route_set(payload, now_ms)
+            .map_err(|err| self.core_error(err))?;
         self.apply_actions(actions).await
     }
 }
@@ -2199,6 +2394,7 @@ pub struct ConcurrentSession {
     provider_id: ProviderId,
     _half_open: Option<HalfOpenGuard>,
     route_ingest: IngestSlot,
+    initiator: bool,
     negotiated_upgrade_caps: Vec<String>,
     peer_upgrade_caps: Vec<String>,
     #[cfg(feature = "webrtc")]
@@ -2421,7 +2617,7 @@ impl ConcurrentSession {
                     let _ = writer.close().await;
                     self.event_notify.notify_waiters();
                 }
-                return Err(err.into());
+                return Err(self.core_error(err));
             }
         };
         let res = self.dispatch_actions_locked(&mut writer, actions).await;
@@ -2561,9 +2757,18 @@ impl ConcurrentSession {
                     drop(writer);
                     self.event_notify.notify_waiters();
                     self.route_ingest.run(Vec::new()).await;
-                    return Err(err.into());
+                    return Err(self.core_error(err));
                 }
             }
+        }
+    }
+
+    /// See [`SessionDriver::core_error`].
+    fn core_error(&self, err: CoreError) -> RuntimeError {
+        if self.initiator {
+            RuntimeError::from_initiator_core(err)
+        } else {
+            RuntimeError::Core(err)
         }
     }
 
@@ -2584,7 +2789,7 @@ impl ConcurrentSession {
         let actions = {
             let now_ms = self.elapsed_ms();
             let mut machine = self.machine.lock().expect("session machine mutex poisoned");
-            op(&mut machine, now_ms)?
+            op(&mut machine, now_ms).map_err(|err| self.core_error(err))?
         };
         self.dispatch_actions_locked(&mut writer, actions).await
     }
@@ -4280,6 +4485,9 @@ impl SessionDriver {
             started_at: Instant::now(),
             _half_open: None,
             route_ingest: IngestSlot::default(),
+            initiator: true,
+            refusal: None,
+            refused: None,
             #[cfg(feature = "webrtc")]
             webrtc_upgrade_handle: None,
         };
