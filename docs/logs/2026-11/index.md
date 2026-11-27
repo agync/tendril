@@ -37,3 +37,4 @@ Entries from November 2026.
 - [relay: ticket expiry, replaced registrations, and allowlist key checks](26-relay-ticket-expiry-replaced-registrations-and.md)
 - [roster: unconfirmed host pins stay off the host_id they name](26-roster-unconfirmed-host-pins-stay-off.md)
 - [Propose ADR 0006 meeting mailboxes from a shared secret](26-propose-adr-0006-meeting-mailboxes-from.md)
+- [Gate Unix-socket providers so tendril-runtime builds on Windows](27-gate-unix-socket-providers-so-tendril.md)

@@ -14,9 +14,9 @@ Tendril treats every transport path as an untrusted byte pipe below hybrid post-
 
 | Rung (`ProviderId`) | Rank | Implementation (`tendril-runtime`) | Primary Use Case |
 |---|---|---|---|
-| `local` | 0 | `LocalListener` / `LocalDialer` (`0o600` Unix socket) | Same-host IPC between desktop/daemon processes |
+| `local` | 0 | `LocalListener` / `LocalDialer` (`0o600` Unix socket, Unix only) | Same-host IPC between desktop/daemon processes |
 | `direct` | 1 | `DirectListener` / `DirectDialer` (TCP), `WtListener` / `WtDialer` (opt-in `webtransport` QUIC/HTTP3 `wt://`) | LAN or direct IP reachable sockets (and browser-capable QUIC with `?certhash=`) |
-| `overlay` | 2 | `OverlayListener` / `OverlayDialer`, `OverlayHelperListener` / `OverlayHelperDialer` | Tailnet CGNAT/ULA sockets or scoped `0o600` helper IPC |
+| `overlay` | 2 | `OverlayListener` / `OverlayDialer`, `OverlayHelperListener` / `OverlayHelperDialer` (helper IPC is Unix only) | Tailnet CGNAT/ULA sockets or scoped `0o600` helper IPC |
 | `p2p` | 3 | `P2pListener` / `P2pDialer` (`iroh` 1.5, gated behind `p2p-iroh`) | Zero-setup NAT traversal with public relay/discovery fallback |
 | `relay` | 4 | `RelayListener` / `RelayDialer`, `EmbeddedRelay` | Stateless WebSocket relay (`spec/relay-v1.md`) |
 | `broker` | 5 | `BrokerListener` / `BrokerDialer` (`broker+ws://` / `broker+wss://`) | Reverse-proxied or authenticated HTTPS/WSS tunnel adapter |
