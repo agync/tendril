@@ -19,7 +19,7 @@ use tendril_core::crypto::{
     device_id as core_device_id, fingerprint_device as core_fingerprint_device,
     fingerprint_host as core_fingerprint_host, pairing_sas as core_pairing_sas, random_bytes,
 };
-use tendril_core::error::CoreError;
+use tendril_core::error::{CoreError, RefusalReason};
 use tendril_core::grants::{AuditEvent, Grant, RevocationList, authorize_grant, canonical_json};
 use tendril_core::group::GroupManifest;
 use tendril_core::identity::{
@@ -32,7 +32,9 @@ use tendril_core::pairing::{
 };
 use tendril_core::policy::ProviderId;
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket, origin_allowed};
-use tendril_core::roster::{AnchorState, PeerState, Roster, RouteSource, StoredRoute};
+use tendril_core::roster::{
+    AnchorState, PeerState, RefusalPolicy, Roster, RouteSource, StoredRoute,
+};
 use tendril_core::v2::{
     V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
 };
@@ -84,6 +86,52 @@ fn py_err(err: impl fmt::Display) -> PyErr {
 
 fn value_err(err: impl fmt::Display) -> PyErr {
     PyValueError::new_err(redact_text(&err.to_string()))
+}
+
+pyo3::create_exception!(
+    tendril,
+    RefusedError,
+    PyRuntimeError,
+    "A host that knows this device refused the session over an authenticated channel.\n\n\
+     `reason` is `\"revoked\"` (the host blocks this device key for good: re-pairing needs a new \
+     device identity), `\"pending\"` (the host has not confirmed this device yet: retry with \
+     backoff) or `\"other\"`. `close_code` is the wire close code and `code` the stable machine \
+     code (`refused_revoked`, `refused_pending` or `refused`)."
+);
+
+/// Name of a refusal reason in a `RefusedError` and in the closed event.
+const fn refusal_name(reason: RefusalReason) -> &'static str {
+    match reason {
+        RefusalReason::Revoked => "revoked",
+        RefusalReason::Pending => "pending",
+        RefusalReason::Other(_) => "other",
+    }
+}
+
+/// A [`RefusedError`] carrying the typed `reason`, `close_code` and `code` of `reason`.
+fn refused_err(reason: RefusalReason, msg: &str) -> PyErr {
+    let err = RefusedError::new_err(redact_text(msg));
+    Python::attach(|py| {
+        let value = err.value(py);
+        // A fresh exception instance has a dict, so these attributes cannot fail to set.
+        let _ = value.setattr("reason", refusal_name(reason));
+        let _ = value.setattr("close_code", reason.close_code());
+        let _ = value.setattr("code", reason.code());
+    });
+    err
+}
+
+/// The error of a failed session call: a [`RefusedError`] for an authenticated refusal.
+fn session_err(err: &RuntimeError) -> PyErr {
+    session_err_msg(err, &err.to_string())
+}
+
+/// [`session_err`] with `msg` as the text, typed by the refusal of `err`.
+fn session_err_msg(err: &RuntimeError, msg: &str) -> PyErr {
+    match err.refusal() {
+        Some(reason) => refused_err(reason, msg),
+        None => PyRuntimeError::new_err(redact_text(msg)),
+    }
 }
 
 fn rt_err(err: RuntimeError) -> PyErr {
@@ -1112,6 +1160,15 @@ async fn policy_connect(
 /// Folds an exhausted attempt into one error: the most severe cause, then the hints that were
 /// never dialed and each candidate's failure. `committed` means the pairing code may be spent.
 fn attempt_err(err: AttemptError) -> PyErr {
+    let msg = attempt_message(&err);
+    match err.error.refusal() {
+        Some(reason) => refused_err(reason, &msg),
+        None => py_err(msg),
+    }
+}
+
+/// The text of [`attempt_err`] without its typing, for callers that have no refusal to report.
+fn attempt_message(err: &AttemptError) -> String {
     use std::fmt::Write as _;
     let mut msg = redact_error(&err.error);
     if err.committed {
@@ -1140,7 +1197,7 @@ fn attempt_err(err: AttemptError) -> PyErr {
             .collect();
         let _ = write!(msg, "; candidates: {}", list.join("; "));
     }
-    py_err(msg)
+    msg
 }
 
 fn skip_reason_name(skipped: &SkippedHint) -> String {
@@ -1375,8 +1432,9 @@ struct Endpoint {
 }
 
 impl Endpoint {
-    fn new_session(&self, backend: SessionBackend) -> Session {
+    fn new_session(&self, backend: SessionBackend, initiator: bool) -> Session {
         Session {
+            initiator,
             rt: Arc::clone(&self.rt),
             store: self.store.clone(),
             store_lock: Arc::clone(&self.store_lock),
@@ -1413,7 +1471,7 @@ impl Endpoint {
                 return Err(err);
             }
         }
-        Ok(self.new_session(backend))
+        Ok(self.new_session(backend, false))
     }
 
     /// Day-2 connect through the runtime policy drivers.
@@ -1464,7 +1522,7 @@ impl Endpoint {
             synced?;
             Ok::<_, PyErr>(backend)
         })?;
-        Ok(self.new_session(backend))
+        Ok(self.new_session(backend, true))
     }
 
     /// Pairing from a scanned URI through the runtime policy drivers.
@@ -1528,7 +1586,7 @@ impl Endpoint {
                 }
             });
             let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity);
-            let (outcome, report) = res.map_err(attempt_err)?;
+            let (outcome, report) = res.map_err(|e| py_err(attempt_message(&e)))?;
             synced?;
             let mut json = outcome.map_err(py_err)?;
             if v2 {
@@ -2303,7 +2361,11 @@ impl Endpoint {
         })
     }
 
-    fn revoke_peer(&self, py: Python<'_>, peer_id: &str) -> PyResult<()> {
+    /// Marks `peer_id` revoked and clears its grants. `notify=None` follows the refusal policy
+    /// (a notice unless `revoked_notice_ttl_secs` is `0`), `notify=False` revokes silently and
+    /// clears an earlier notice, so the peer's next connect is no longer told why.
+    #[pyo3(signature = (peer_id, notify=None))]
+    fn revoke_peer(&self, py: Python<'_>, peer_id: &str, notify: Option<bool>) -> PyResult<()> {
         let identity = Arc::clone(&self.identity);
         let roster_arc = Arc::clone(&self.roster);
         let store = self.store.clone();
@@ -2317,10 +2379,72 @@ impl Endpoint {
                 &store_lock,
                 &roster_arc,
                 &identity,
-                |roster| roster.revoke_peer(&pid).map_err(RuntimeError::from),
+                |roster| {
+                    roster
+                        .revoke_peer_at(&pid, notify.unwrap_or(true), now_unix())
+                        .map_err(RuntimeError::from)
+                },
             )?;
             refresh_m2m_flags(&self_m2m, &m2m, &lock_roster(&roster_arc));
             Ok(())
+        })
+    }
+
+    /// Sets the host refusal policy and persists it with the roster. `pending` refuses
+    /// unconfirmed peers with `4004` (default `True`); `revoked_notice_ttl_secs` is the lifetime
+    /// of a notice recorded at revocation (default 30 days) and `0` records none. Notices
+    /// already recorded keep their expiry.
+    #[pyo3(signature = (pending=None, revoked_notice_ttl_secs=None))]
+    fn set_refusal_policy(
+        &self,
+        py: Python<'_>,
+        pending: Option<bool>,
+        revoked_notice_ttl_secs: Option<u64>,
+    ) -> PyResult<()> {
+        let defaults = RefusalPolicy::default();
+        let policy = RefusalPolicy {
+            pending: pending.unwrap_or(defaults.pending),
+            revoked_notice_ttl_secs: revoked_notice_ttl_secs
+                .unwrap_or(defaults.revoked_notice_ttl_secs),
+        };
+        let identity = Arc::clone(&self.identity);
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        py.detach(move || {
+            update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster_arc,
+                &identity,
+                |roster| {
+                    roster.set_refusal_policy(policy);
+                    Ok(())
+                },
+            )
+        })
+    }
+
+    /// Drops the refusal notice of `peer_id`, which stays revoked: its next connect is no
+    /// longer told why. Raises `RuntimeError` for an unknown peer.
+    fn clear_refusal_notice(&self, py: Python<'_>, peer_id: &str) -> PyResult<()> {
+        let identity = Arc::clone(&self.identity);
+        let roster_arc = Arc::clone(&self.roster);
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let pid = peer_id.to_owned();
+        py.detach(move || {
+            update_roster_blocking(
+                store.as_ref(),
+                &store_lock,
+                &roster_arc,
+                &identity,
+                |roster| {
+                    roster
+                        .clear_refusal_notice(&pid)
+                        .map_err(RuntimeError::from)
+                },
+            )
         })
     }
 
@@ -3392,6 +3516,8 @@ struct Session {
     identity: Arc<EndpointIdentity>,
     roster: Arc<StdMutex<Roster>>,
     session: Arc<SessionBackend>,
+    /// `true` for a session this endpoint dialed: only an initiator maps a refusal close.
+    initiator: bool,
 }
 
 #[pymethods]
@@ -3409,7 +3535,9 @@ impl Session {
         let data = payload.to_vec();
         let rt = Arc::clone(&self.rt);
         let sess = Arc::clone(&self.session);
-        py.detach(move || rt.block_on(async move { sess.send_data(&data).await.map_err(py_err) }))
+        py.detach(move || {
+            rt.block_on(async move { sess.send_data(&data).await.map_err(|e| session_err(&e)) })
+        })
     }
 
     #[pyo3(signature = (timeout_ms=5000))]
@@ -3421,6 +3549,7 @@ impl Session {
         let store_lock = Arc::clone(&self.store_lock);
         let identity = Arc::clone(&self.identity);
         let wait = Duration::from_millis(timeout_ms);
+        let initiator = self.initiator;
 
         py.detach(move || {
             rt.block_on(async move {
@@ -3493,6 +3622,10 @@ impl Session {
                                 "event": "closed",
                                 "code": code,
                                 "reason": reason,
+                                "refusal": initiator
+                                    .then(|| RefusalReason::from_close_code(code))
+                                    .flatten()
+                                    .map(refusal_name),
                             }),
                         };
                         Ok(json.to_string())
@@ -3503,14 +3636,14 @@ impl Session {
                             let _ =
                                 sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
                                     .await;
-                            Err(py_err(e))
+                            Err(session_err(&e))
                         } else if let Err(pe) =
                             commit_session_async(store.as_ref(), &store_lock, &roster, &identity)
                                 .await
                         {
-                            Err(PyRuntimeError::new_err(redact_text(&format!("{e} ({pe})"))))
+                            Err(session_err_msg(&e, &format!("{e} ({pe})")))
                         } else {
-                            Err(py_err(e))
+                            Err(session_err(&e))
                         }
                     }
                     Err(_) => Ok(serde_json::json!({ "status": "would_block" }).to_string()),
@@ -3529,7 +3662,9 @@ impl Session {
     fn rekey(&self, py: Python<'_>) -> PyResult<()> {
         let rt = Arc::clone(&self.rt);
         let sess = Arc::clone(&self.session);
-        py.detach(move || rt.block_on(async move { sess.send_rekey().await.map_err(py_err) }))
+        py.detach(move || {
+            rt.block_on(async move { sess.send_rekey().await.map_err(|e| session_err(&e)) })
+        })
     }
 
     #[pyo3(signature = (code=1000, reason="normal"))]
@@ -3538,7 +3673,11 @@ impl Session {
         let sess = Arc::clone(&self.session);
         let reason_s = reason.to_owned();
         py.detach(move || {
-            rt.block_on(async move { sess.send_close(code, &reason_s).await.map_err(py_err) })
+            rt.block_on(async move {
+                sess.send_close(code, &reason_s)
+                    .await
+                    .map_err(|e| session_err(&e))
+            })
         })
     }
 }
@@ -3772,6 +3911,7 @@ fn _tendril(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Endpoint>()?;
     m.add_class::<Session>()?;
     m.add_class::<Group>()?;
+    m.add("RefusedError", m.py().get_type::<RefusedError>())?;
     Ok(())
 }
 

@@ -63,10 +63,30 @@ export interface WebCandidate {
 }
 
 /**
+ * Stable code of a host's authenticated refusal, the `code` of a `TendrilAttemptError` and of the
+ * error of a refused session.
+ *
+ * - `refused_revoked`: the host blocks this device key permanently. Re-pairing needs a new device
+ *   identity, so offer to forget the host.
+ * - `refused_pending`: the host has not confirmed this device yet. Retry with backoff.
+ * - `refused`: a reserved admission refusal (close codes 4400 to 4499).
+ *
+ * A host sends at most one notice per peer in a short window, so a rapid retry can fail with
+ * another code.
+ */
+export type RefusalCode = "refused_revoked" | "refused_pending" | "refused";
+
+/** What a `closed` session event reports in `refusal`: `null` when the close was no refusal. */
+export type RefusalReason = "revoked" | "pending" | "other";
+
+/**
  * Error thrown by multi-route `pair`, `pairV2`, `connect` and `connectV2`. `committed` is true
  * once a `msg3` byte may have been written: the code may be spent and no other route was tried.
- * `code` is the stable error code (for example `host_key_unverified`, `peer_revoked`,
- * `invalid_pairing_uri`) when the failure has one; errors are ranked by it, never by message.
+ * `code` is the stable error code (for example `refused_revoked`, `refused_pending`,
+ * `host_key_unverified`, `peer_revoked`, `invalid_pairing_uri`) when the failure has one; errors
+ * are ranked by it, never by message. A [`RefusalCode`](#refusalcode) ranks between `peer_revoked`
+ * and `version_downgrade`. A Wire v1 host refuses after `connect` resolved: the session then
+ * delivers a `closed` event whose `refusal` is set.
  */
 export interface TendrilAttemptError extends Error {
   code?: string;
@@ -205,6 +225,11 @@ export interface PollEvent {
   audit?: unknown;
   code?: number;
   reason?: string;
+  /**
+   * On a `closed` event: why the host refused the session (a `RefusalReason`), or `null` for any
+   * other close. Absent on other events.
+   */
+  refusal?: RefusalReason | null;
   peer_device_id?: string;
   upgrade?: PathUpgradeMessage;
   /** `group_manifest_unverified` and `group_rendezvous_unverified` events. */

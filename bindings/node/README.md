@@ -42,6 +42,26 @@ const session = await host.acceptSession(5000);
 await session.authorize("notes.sync"); // true
 ```
 
+## Refusals
+
+A host that knows this device and refuses it says so, instead of timing out. A refused `connectV2` rejects with an `Error` whose `code` is `refused_revoked`, `refused_pending` or `refused` and whose `closeCode` is the wire close code:
+
+```js
+try {
+  const session = await client.connectV2(addr, "laptop", grant);
+} catch (err) {
+  if (tendril.isRefusedError(err) && err.code === "refused_revoked") {
+    // the host blocks this device key for good: re-pairing needs a new device identity
+  } else if (tendril.isRefusedError(err) && err.code === "refused_pending") {
+    // the host has not confirmed this device yet: retry with backoff
+  }
+}
+```
+
+A Wire v1 `connect` resolves before the refusal arrives. Its `pollEvent` then reports a `closed` event with `refusal: "revoked"`, and the next `sendData`, `rekey` or `close` rejects with the same error. A host sends at most one notice per peer in a short window, so a rapid retry can fail with a plain `Error`.
+
+On the host, `revokePeer(peerId)` records a notice per the refusal policy and `revokePeer(peerId, false)` revokes silently. `setRefusalPolicy(pending, revokedNoticeTtlSecs)` sets the policy (a TTL of `0` records no notice) and `clearRefusalNotice(peerId)` drops a notice while the peer stays revoked.
+
 ## P2P sockets
 
 A P2P endpoint probes the local router for a port mapping and binds its QUIC UDP sockets on every interface. Turn the probe off or pin the bind addresses in the transport configuration:

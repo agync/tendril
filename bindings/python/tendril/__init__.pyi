@@ -16,6 +16,29 @@ class P2pTransportConfig(TypedDict, total=False):
     p2p_port_mapping: bool
     p2p_bind_addrs: list[str]
 
+class RefusedError(RuntimeError):
+    """A host that knows this device refused the session over an authenticated channel.
+
+    Raised by a refused Wire v2 `connect_v2` (or `connect_with_options` with `wire` 2), and by
+    `send_data`, `rekey` and `close` on a session the host ended with a refusal. A Wire v1 connect
+    returns before the refusal arrives and never raises it: the session then reports a `closed`
+    event whose `refusal` field is set, and the next `send_data`, `rekey` or `close` raises this
+    error. `poll_event` never raises it.
+
+    `reason` is `"revoked"` (close code 4001: the host blocks this device key for good, so
+    re-pairing needs a new device identity; offer to forget the host), `"pending"` (4004: the host
+    has not confirmed this device yet; retry with backoff) or `"other"` (4400 to 4499).
+    `close_code` is the wire close code and `code` the stable machine code (`"refused_revoked"`,
+    `"refused_pending"` or `"refused"`).
+
+    A host sends at most one notice per peer in a short window, so a rapid retry can fail with a
+    plain `RuntimeError` instead.
+    """
+
+    reason: str
+    close_code: int
+    code: str
+
 def verify_route_set(payload: bytes, signing_pub: bytes) -> str:
     """Decodes a `0x0C ROUTE_SET` payload and verifies its hybrid signature.
 

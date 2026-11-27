@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -1470,5 +1472,127 @@ test("pair, connect, and connectV2 send 0-RTT init_frame when fast_open=true and
       v2Client.free();
       spy.restore();
     }
+  }
+});
+
+const CLI_BIN = path.join(path.resolve(WEB_ROOT, "..", ".."), "target", "debug", "tendril");
+const cli = (stateDir, ...args) =>
+  execFileSync(CLI_BIN, ["--state-dir", stateDir, ...args], { encoding: "utf8" }).trim();
+
+/** Runs `tendril serve` on a relay and yields its JSON stdout events one by one. */
+function serveHost(stateDir, relayUrl) {
+  const child = spawn(
+    CLI_BIN,
+    [
+      "--state-dir",
+      stateDir,
+      "serve",
+      "--relay",
+      relayUrl,
+      "--relay-host",
+      "127.0.0.1",
+      "--issue-code",
+      "remote",
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] }
+  );
+  const lines = [];
+  const waiters = [];
+  let failure = null;
+  const exited = new Promise((resolve) => {
+    child.once("exit", resolve);
+    child.once("error", (err) => {
+      failure = err;
+      for (const w of waiters.splice(0)) w.reject(err);
+      resolve();
+    });
+  });
+  readline.createInterface({ input: child.stdout }).on("line", (line) => {
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (waiters.length > 0) waiters.shift().resolve(obj);
+    else lines.push(obj);
+  });
+  return {
+    next(timeoutMs = 15000) {
+      if (lines.length > 0) return Promise.resolve(lines.shift());
+      if (failure) return Promise.reject(failure);
+      return new Promise((resolve, reject) => {
+        const waiter = {
+          resolve: (obj) => {
+            clearTimeout(t);
+            resolve(obj);
+          },
+          reject: (err) => {
+            clearTimeout(t);
+            reject(err);
+          },
+        };
+        const t = setTimeout(() => {
+          const i = waiters.indexOf(waiter);
+          if (i >= 0) waiters.splice(i, 1);
+          reject(new Error("timed out waiting for tendril serve"));
+        }, timeoutMs);
+        waiters.push(waiter);
+      });
+    },
+    /** Kills the host and resolves once it has exited. */
+    stop() {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      return exited;
+    },
+  };
+}
+
+test("live: a host that revoked the device ends a Wire v1 session with a refusal", async () => {
+  await ensureWasm();
+  const relay = await spawnRelay();
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tendril-web-refusal-"));
+  cli(stateDir, "init", "--host-id", "refusal-host");
+  let host = serveHost(stateDir, relay.wsUrl);
+  const client = await TendrilWebClient.create({ hostId: "refusal-client" });
+  try {
+    const listening = await host.next();
+    assert.equal(listening.event, "listening");
+    assert.ok(listening.pairing_uri, "serve printed no pairing URI");
+    const [paired, hostSide] = await Promise.all([
+      client.pair({ pairingUri: listening.pairing_uri, deviceName: "refusal-web", timeoutMs: 8000 }),
+      host.next(),
+    ]);
+    assert.equal(hostSide.event, "paired");
+    cli(stateDir, "confirm", paired.device_id, "--sas", paired.sas);
+    const grant = cli(stateDir, "mint", paired.device_id, "--cap", "fs.read");
+    const deviceId = hostSide.device_id ?? paired.device_id;
+
+    // A host loads its roster when it starts, so revoke and restart it.
+    await host.stop();
+    cli(stateDir, "revoke", deviceId);
+    host = serveHost(stateDir, relay.wsUrl);
+    assert.equal((await host.next()).event, "listening");
+
+    const session = await client.connect({
+      targetHostId: "refusal-host",
+      grantJson: grant,
+      timeoutMs: 8000,
+    });
+    let closed = null;
+    for (let i = 0; i < 20 && !closed; i += 1) {
+      const ev = await session.pollEvent(500);
+      if (ev.status === "event" && ev.event === "closed") closed = ev;
+      if (ev.status === "eof") break;
+    }
+    assert.ok(closed, "no closed event");
+    assert.equal(closed.code, 4001);
+    assert.equal(closed.refusal, "revoked");
+    await session.close(1000, "done");
+  } finally {
+    client.free();
+    await host.stop();
+    relay.child.kill();
+    fs.rmSync(stateDir, { recursive: true, force: true });
   }
 });

@@ -18,6 +18,7 @@ use tendril_core::crypto::{
     fingerprint_device as core_fingerprint_device, fingerprint_host as core_fingerprint_host,
     is_valid_ed25519_public_key, pairing_sas as core_pairing_sas, random_bytes,
 };
+use tendril_core::error::RefusalReason;
 use tendril_core::grants::{Grant, RevocationList, authorize_grant};
 use tendril_core::identity::{
     EndpointIdentity, RotationRecord, SigningKeyPin, verify_rotation_chain,
@@ -3122,11 +3123,9 @@ impl WasmSessionClient {
                 SessionAction::PathUpgradeReceived(msg) => {
                     events.push(path_upgrade_event_json(&msg)?);
                 }
-                SessionAction::CloseTransport { code, reason } => events.push(json!({
-                    "event": "closed",
-                    "code": code,
-                    "reason": reason,
-                })),
+                SessionAction::CloseTransport { code, reason } => {
+                    events.push(closed_event_json(code, &reason));
+                }
                 // The WASM surface only builds initiators, and only a refusal-enabled responder
                 // emits this. If a responder ever reaches here, the session is over and the
                 // refusal code is reported like any other close.
@@ -3134,6 +3133,7 @@ impl WasmSessionClient {
                     "event": "closed",
                     "code": code,
                     "reason": "",
+                    "refusal": null,
                 })),
             }
         }
@@ -3723,6 +3723,27 @@ enum V2WasmSessionPhase {
     Closed,
 }
 
+/// The `closed` event of a session this crate dialed. `refusal` is `"revoked"`, `"pending"` or
+/// `"other"` when `code` is a refusal close code, else `null`; only an initiator maps a refusal,
+/// and every WASM session is one.
+fn closed_event_json(code: u16, reason: &str) -> serde_json::Value {
+    json!({
+        "event": "closed",
+        "code": code,
+        "reason": reason,
+        "refusal": RefusalReason::from_close_code(code).map(refusal_name),
+    })
+}
+
+/// Name of a refusal reason in the closed event.
+const fn refusal_name(reason: RefusalReason) -> &'static str {
+    match reason {
+        RefusalReason::Revoked => "revoked",
+        RefusalReason::Pending => "pending",
+        RefusalReason::Other(_) => "other",
+    }
+}
+
 fn collect_v2_writes(actions: Vec<V2SessionAction>) -> Vec<u8> {
     let mut out = Vec::new();
     for action in actions {
@@ -3933,11 +3954,7 @@ impl WasmV2SessionInitiator {
                 self.pending_events.push(path_upgrade_event_json(&msg)?);
             }
             V2SessionAction::CloseTransport { code, reason } => {
-                self.pending_events.push(json!({
-                    "event": "closed",
-                    "code": code,
-                    "reason": reason,
-                }));
+                self.pending_events.push(closed_event_json(code, &reason));
             }
             // See the Wire v1 arm: initiators never emit a refusal, a responder's is a close.
             V2SessionAction::Refused { code, .. } => {
@@ -3945,6 +3962,7 @@ impl WasmV2SessionInitiator {
                     "event": "closed",
                     "code": code,
                     "reason": "",
+                    "refusal": null,
                 }));
             }
         }
@@ -7417,6 +7435,118 @@ mod route_tests {
             .step_bytes(&[0xffu8; 64], NOWF, 2.0, &mut roster)
             .unwrap_err();
         assert_ne!(err.code, GENERIC_ERROR_CODE, "{err}");
+    }
+
+    /// The host roster of `cli` at wire floor `floor`, as a `Pending` peer, or `Active` and then
+    /// revoked with a notice.
+    fn refusing_host_roster(cli: &EndpointIdentity, revoked: bool, floor: u8) -> Roster {
+        let id = cli.device_id();
+        let mut roster = Roster::new();
+        roster
+            .record_pending_pair(
+                *cli.static_key().public_bytes(),
+                None,
+                "Cli".into(),
+                "cli".into(),
+                "abcd".into(),
+            )
+            .unwrap();
+        if revoked {
+            roster.confirm_peer(&id, Some("abcd")).unwrap();
+        }
+        roster.set_peer_v2_secrets(&id, secrets()).unwrap();
+        roster.set_peer_min_wire_version(&id, floor).unwrap();
+        if revoked {
+            roster.revoke_peer_at(&id, true, NOW).unwrap();
+        }
+        roster
+    }
+
+    #[test]
+    fn a_refused_v2_connect_fails_with_the_refusal_code() {
+        use tendril_core::refusal::{RefusalLimiter, RefusalMode, RefusalReplayCache};
+        use tendril_core::v2::{RendezvousReplayCache, V2RefusalCaches};
+
+        for (revoked, code) in [(true, "refused_revoked"), (false, "refused_pending")] {
+            let rh = rotated_host();
+            let cli = wasm_identity(0x40);
+            let mut roster = client_roster(&rh);
+            let mut sess =
+                WasmV2SessionInitiator::new_inner(&cli, rh.host.host_id(), &roster, None, None)
+                    .unwrap();
+            let mut hroster = refusing_host_roster(&cli.inner, revoked, 2);
+            let mut resp =
+                V2SessionResponder::new_with_refusal(&rh.host, RefusalMode::Enabled).unwrap();
+            let mut replay = RendezvousReplayCache::default();
+            let mut refusal_replay = RefusalReplayCache::default();
+            let mut limiter = RefusalLimiter::new();
+            let m1 = sess.start(NOWF).unwrap();
+            let m2 = collect_v2_writes(
+                resp.feed_bytes_with_caches(
+                    &m1,
+                    NOW,
+                    1,
+                    &mut hroster,
+                    &mut replay,
+                    V2RefusalCaches {
+                        replay: &mut refusal_replay,
+                        limiter: &mut limiter,
+                    },
+                )
+                .unwrap(),
+            );
+            let err = sess.step_bytes(&m2, NOWF, 2.0, &mut roster).unwrap_err();
+            assert_eq!(err.code, code, "{err}");
+        }
+    }
+
+    #[test]
+    fn a_v1_refusal_close_names_its_refusal_in_the_closed_event() {
+        use tendril_core::refusal::{RefusalLimiter, RefusalMode};
+
+        for (revoked, close, name) in [(true, 4001, "revoked"), (false, 4004, "pending")] {
+            let rh = rotated_host();
+            let cli = wasm_identity(0x40);
+            let mut roster = client_roster(&rh);
+            let mut sess =
+                WasmSessionClient::new_inner(&cli, rh.host.host_id(), None, None).unwrap();
+            let mut hroster = refusing_host_roster(&cli.inner, revoked, 1);
+            let mut resp =
+                SessionMachine::new_responder_with_refusal(&rh.host, None, RefusalMode::Enabled)
+                    .unwrap();
+            let mut limiter = RefusalLimiter::new();
+            let m1 = sess.start().unwrap();
+            let m2 = session_writes(
+                resp.feed_bytes_with_limiter(&m1, NOW, 1, &mut hroster, &mut limiter)
+                    .unwrap(),
+            );
+            let step = to_json(&sess.step_bytes(&m2, NOWF, 2.0, &mut roster).unwrap());
+            assert_eq!(step["established"], true);
+            let m3 = b64url_decode(step["write_b64"].as_str().unwrap()).unwrap();
+            let frame = session_writes(
+                resp.feed_bytes_with_limiter(&m3, NOW, 3, &mut hroster, &mut limiter)
+                    .unwrap(),
+            );
+            let step = to_json(&sess.step_bytes(&frame, NOWF, 4.0, &mut roster).unwrap());
+            let closed: Vec<_> = step["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["event"] == "closed")
+                .collect();
+            assert_eq!(closed.len(), 1, "{step}");
+            assert_eq!(closed[0]["code"], close);
+            assert_eq!(closed[0]["refusal"], name);
+        }
+    }
+
+    #[test]
+    fn a_plain_close_carries_no_refusal() {
+        assert_eq!(closed_event_json(1000, "bye")["refusal"], json!(null));
+        assert_eq!(closed_event_json(4002, "")["refusal"], json!(null));
+        assert_eq!(closed_event_json(4001, "")["refusal"], json!("revoked"));
+        assert_eq!(closed_event_json(4004, "")["refusal"], json!("pending"));
+        assert_eq!(closed_event_json(4450, "")["refusal"], json!("other"));
     }
 
     #[test]

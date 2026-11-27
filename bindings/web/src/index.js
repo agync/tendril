@@ -403,8 +403,11 @@ function isFatalUpgradeError(err, persistFailedErr = null) {
 
 /** Severity by stable error code; uncoded errors rank last. */
 const ERROR_SEVERITY = {
-  rotation_fork_detected: 6,
-  peer_revoked: 5,
+  rotation_fork_detected: 7,
+  peer_revoked: 6,
+  refused_revoked: 5,
+  refused_pending: 5,
+  refused: 5,
   version_downgrade: 4,
   host_key_unverified: 3,
   invalid_pairing_uri: 2,

@@ -50,6 +50,10 @@ session.authorize("notes.sync"); // true when grantJson authorizes notes.sync
 await session.sendData("hello-tendril");
 ```
 
+## Refusals
+
+A host that knows this device and refuses it says so. A refused Wire v2 `connectV2` rejects with a `TendrilAttemptError` whose `code` is `refused_revoked` (the host blocks this device key for good, so re-pairing needs a new device identity), `refused_pending` (the host has not confirmed this device yet, so retry with backoff) or `refused`. A Wire v1 `connect` resolves before the refusal arrives and never rejects with it: `session.pollEvent()` then returns a `closed` event whose `refusal` is `"revoked"`, `"pending"` or `"other"`. A host sends at most one notice per peer in a short window, so a rapid retry can fail with another code.
+
 ## Links
 
 - Documentation: https://tendril.agync.dev

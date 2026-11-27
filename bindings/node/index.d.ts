@@ -34,6 +34,43 @@ export function verifyWakeTag(
  */
 export function verifyRouteSet(payload: Buffer, signingPub: Buffer): string;
 
+/**
+ * The error of a session the host refused over an authenticated channel. Rejected by a refused
+ * Wire v2 `connectV2` (or `connectWithOptions` with `wire: 2`), and by `sendData`, `rekey` and
+ * `close` on a session the host ended with a refusal. A Wire v1 connect resolves before the
+ * refusal arrives and never rejects with it: the session then reports a `closed` event whose
+ * `refusal` is set, and the next `sendData`, `rekey` or `close` rejects. `pollEvent` never
+ * rejects with it.
+ *
+ * - `refused_revoked` (`closeCode` 4001): the host blocks this device key permanently. Re-pairing
+ *   needs a new device identity, so offer to forget the host.
+ * - `refused_pending` (`closeCode` 4004): the host has not confirmed this device yet. Retry with
+ *   backoff.
+ * - `refused` (`closeCode` 4400 to 4499): a reserved admission refusal.
+ *
+ * A host sends at most one notice per peer in a short window, so a rapid retry can fail with a
+ * plain `Error` instead. Test with `isRefusedError`.
+ */
+export interface RefusedError extends Error {
+  code: "refused_revoked" | "refused_pending" | "refused";
+  closeCode: number;
+}
+
+/** `true` when `err` is a [`RefusedError`](#refusederror). */
+export function isRefusedError(err: unknown): err is RefusedError;
+
+/**
+ * The `closed` event of `Session.pollEvent`, as parsed JSON. `refusal` is `"revoked"`,
+ * `"pending"`, `"other"` or `null`; it is set only on a session this endpoint dialed.
+ */
+export interface ClosedEvent {
+  status: "event";
+  event: "closed";
+  code: number;
+  reason: string;
+  refusal: "revoked" | "pending" | "other" | null;
+}
+
 export class Endpoint {
   constructor(stateDir?: string | null, hostId?: string | null);
   infoJson(): string;
@@ -51,7 +88,21 @@ export class Endpoint {
   pairAccept(timeoutMs?: number | null): Promise<string>;
   confirmPeer(peerId: string, sas?: string | null): void;
   mintGrant(peerId: string, caps: string[], ttlSecs?: number | null): string;
-  revokePeer(peerId: string): void;
+  /**
+   * Revokes `peerId` and clears its grants. `notify` unset follows the refusal policy, which
+   * records a notice unless `revokedNoticeTtlSecs` is `0`; `false` revokes silently and clears an
+   * earlier notice. Throws for an unknown peer.
+   */
+  revokePeer(peerId: string, notify?: boolean | null): void;
+  /**
+   * Sets the host refusal policy and persists it with the roster. `pending` refuses unconfirmed
+   * peers with close code 4004 (default `true`). `revokedNoticeTtlSecs` is the lifetime of a notice
+   * recorded at revocation (default 30 days); `0` records none. Notices already recorded keep their
+   * expiry.
+   */
+  setRefusalPolicy(pending?: boolean | null, revokedNoticeTtlSecs?: number | null): void;
+  /** Drops the refusal notice of `peerId`, which stays revoked. Throws for an unknown peer. */
+  clearRefusalNotice(peerId: string): void;
   /**
    * Resolves to the unconfirmed host claims left by unpinned pairing, oldest first, as a JSON
    * array of `{"host_id", "device_id", "name", "static_pub", "signing_pub_hash", "rotation_seq",
