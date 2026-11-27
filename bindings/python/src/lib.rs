@@ -153,95 +153,20 @@ fn lock_roster(roster: &StdMutex<Roster>) -> std::sync::MutexGuard<'_, Roster> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Applies `f` to the latest on-disk roster and publishes the committed result to memory.
+/// The roster handle live sessions share: the state directory and the in-memory roster they
+/// write to, with the local signer, so the host's own CRL is kept.
 ///
-/// Callers must hold `store_lock`. Lock order (`tendril_runtime::announce`): store lock, roster
-/// file lock, pairing manager, in-memory roster mutex. The mutex is therefore taken only inside
-/// the file-lock transaction, for the pure callback, and again to publish after it; it is never
-/// held while waiting for the file lock or across an `.await`.
-fn commit_roster<T>(
-    store: &StateStore,
-    roster: &StdMutex<Roster>,
+/// Every read of the store folds the revocation state `roster` holds into the stored roster,
+/// and every write persists it, under the roster file lock (`tendril_runtime::announce`).
+fn session_access(
+    store: Option<&Arc<StateStore>>,
+    roster: &Arc<StdMutex<Roster>>,
     identity: &EndpointIdentity,
-    f: impl FnOnce(&mut Roster, &Roster) -> Result<T, RuntimeError>,
-) -> Result<T, RuntimeError> {
-    let (out, disk, _) = store.update_roster_with_state(|disk| f(disk, &lock_roster(roster)))?;
-    publish_roster(&mut lock_roster(roster), disk, identity);
-    Ok(out)
-}
-
-fn reload_roster(
-    store: &StateStore,
-    roster: &StdMutex<Roster>,
-    identity: &EndpointIdentity,
-) -> Result<(), RuntimeError> {
-    let disk = store.load_roster()?;
-    publish_roster(&mut lock_roster(roster), disk, identity);
-    Ok(())
-}
-
-/// Replaces the in-memory roster with the committed disk roster while keeping any revocation
-/// or CRL a live session learned in memory but has not committed yet.
-fn publish_roster(mem: &mut Roster, disk: Roster, identity: &EndpointIdentity) {
-    let mut next = disk;
-    merge_session_state(&mut next, mem, identity);
-    *mem = next;
-}
-
-/// Persists the revocations and CRLs live sessions learned in memory, under the roster file
-/// lock. Nothing is written when the store already holds them: no `roster.json` is created and
-/// an existing one keeps its mtime.
-fn commit_session_state(
-    store: &StateStore,
-    roster: &StdMutex<Roster>,
-    identity: &EndpointIdentity,
-) -> Result<(), RuntimeError> {
-    let (_, disk, _) = store.update_roster_if_changed(|disk| {
-        merge_session_state(disk, &lock_roster(roster), identity);
-        Ok(())
-    })?;
-    publish_roster(&mut lock_roster(roster), disk, identity);
-    Ok(())
-}
-
-/// Folds revocations and CRLs learned in memory by a live session into the on-disk roster
-/// without overwriting any other committed state.
-fn merge_session_state(disk: &mut Roster, mem: &Roster, identity: &EndpointIdentity) {
-    let newly_revoked: Vec<String> = mem
-        .entries()
-        .filter(|(id, entry)| {
-            entry.state == PeerState::Revoked
-                && disk
-                    .get(id)
-                    .is_some_and(|prev| prev.state != PeerState::Revoked)
-        })
-        .map(|(id, _)| id.clone())
-        .collect();
-    for id in &newly_revoked {
-        let _ = disk.revoke_peer(id);
-    }
-    let mut issuers = vec![identity.host_id().to_owned()];
-    issuers.extend(mem.entries().map(|(id, _)| id.clone()));
-    issuers.extend(mem.trust_anchors().map(|(id, _)| id.clone()));
-    for issuer in issuers {
-        let Some(crl) = mem.crl(&issuer).cloned() else {
-            continue;
-        };
-        let issuer_pub = if issuer == identity.host_id() {
-            Some(identity.signing_key().public_key().clone())
-        } else {
-            disk.lookup_active_signing_key(&issuer)
-                .or_else(|| disk.lookup_active_anchor_key(&issuer))
-                .or_else(|| {
-                    disk.get(&issuer)
-                        .filter(|e| e.state != PeerState::Pending)
-                        .and_then(|e| e.signing_pub.clone())
-                })
-        };
-        if let Some(pk) = issuer_pub {
-            let _ = disk.ingest_crl(crl, &issuer, &pk);
-        }
-    }
+) -> RosterAccess {
+    RosterAccess::new(store.cloned(), Arc::clone(roster)).with_local_signer(
+        identity.host_id(),
+        identity.signing_key().public_key().clone(),
+    )
 }
 
 /// Mutates the roster under the `store_lock` -> roster lock order. Must run outside any Tokio
@@ -249,32 +174,42 @@ fn merge_session_state(disk: &mut Roster, mem: &Roster, identity: &EndpointIdent
 fn update_roster_blocking<T>(
     store: Option<&Arc<StateStore>>,
     store_lock: &AsyncMutex<()>,
-    roster: &StdMutex<Roster>,
+    roster: &Arc<StdMutex<Roster>>,
     identity: &EndpointIdentity,
     f: impl FnOnce(&mut Roster) -> Result<T, RuntimeError>,
 ) -> PyResult<T> {
     if let Some(store) = store {
         let _guard = store_lock.blocking_lock();
-        commit_roster(store, roster, identity, |disk, _| f(disk)).map_err(py_err)
+        session_access(Some(store), roster, identity)
+            .update(f)
+            .map_err(py_err)
     } else {
         let mut guard = lock_roster(roster);
         f(&mut guard).map_err(py_err)
     }
 }
 
+/// Commits the revocations and CRLs live sessions learned in memory to the store and reloads
+/// the shared roster from the result, under the `store_lock` -> roster lock order. Nothing is
+/// written when the store already holds them: no `roster.json` is created and an existing one
+/// keeps its mtime. Call it before any driver reads the store and after any session event or
+/// driver result that can revoke.
 fn sync_roster_blocking(
     store: Option<&Arc<StateStore>>,
     store_lock: &AsyncMutex<()>,
-    roster: &StdMutex<Roster>,
+    roster: &Arc<StdMutex<Roster>>,
     identity: &EndpointIdentity,
 ) -> PyResult<()> {
     if let Some(store) = store {
         let _guard = store_lock.blocking_lock();
-        reload_roster(store, roster, identity).map_err(py_err)?;
+        session_access(Some(store), roster, identity)
+            .commit_held_revocations()
+            .map_err(py_err)?;
     }
     Ok(())
 }
 
+/// [`sync_roster_blocking`] for async callers: the commit runs on a blocking thread.
 async fn sync_roster_async(
     store: Option<&Arc<StateStore>>,
     store_lock: &AsyncMutex<()>,
@@ -283,28 +218,8 @@ async fn sync_roster_async(
 ) -> Result<(), RuntimeError> {
     if let Some(store) = store {
         let _guard = store_lock.lock().await;
-        let store = Arc::clone(store);
-        let roster = Arc::clone(roster);
-        let identity = Arc::clone(identity);
-        tokio::task::spawn_blocking(move || reload_roster(&store, &roster, &identity))
-            .await
-            .map_err(|e| RuntimeError::Protocol(e.to_string()))??;
-    }
-    Ok(())
-}
-
-async fn commit_session_async(
-    store: Option<&Arc<StateStore>>,
-    store_lock: &AsyncMutex<()>,
-    roster: &Arc<StdMutex<Roster>>,
-    identity: &Arc<EndpointIdentity>,
-) -> Result<(), RuntimeError> {
-    if let Some(store) = store {
-        let _guard = store_lock.lock().await;
-        let store = Arc::clone(store);
-        let roster = Arc::clone(roster);
-        let identity = Arc::clone(identity);
-        tokio::task::spawn_blocking(move || commit_session_state(&store, &roster, &identity))
+        let access = session_access(Some(store), roster, identity);
+        tokio::task::spawn_blocking(move || access.commit_held_revocations())
             .await
             .map_err(|e| RuntimeError::Protocol(e.to_string()))??;
     }
@@ -1655,7 +1570,10 @@ impl Endpoint {
             } else {
                 Arc::clone(&roster)
             };
-            let access = RosterAccess::new(store.clone(), access_roster);
+            let access = RosterAccess::new(store.clone(), access_roster).with_local_signer(
+                identity.host_id(),
+                identity.signing_key().public_key().clone(),
+            );
             let transport_cfg = Arc::new(StdMutex::new(EndpointTransportConfig::default()));
             let announce = Arc::new(AnnouncerSlot {
                 rt: Arc::clone(&rt),
@@ -2225,6 +2143,10 @@ impl Endpoint {
                 };
 
                 let path_kind = pairing_path_kind_for_provider(stream.provider_id());
+                // The store-backed driver reads the stored roster: commit held revocations first.
+                sync_roster_async(store.as_ref(), &store_lock, &roster_in, &identity)
+                    .await
+                    .map_err(py_err)?;
                 let driven = if let Some(ref s) = store {
                     drive_pair_responder_with_store(
                         stream.as_mut(),
@@ -2643,11 +2565,7 @@ impl Endpoint {
         let cfg = self.snapshot_transport_cfg();
         py.detach(move || {
             // The store-backed driver reads the on-disk roster for its pin checks: persist the
-            // CRLs only this endpoint's sessions hold first, so the driver sees them.
-            if let Some(store) = store.as_ref() {
-                let _guard = store_lock.blocking_lock();
-                commit_session_state(store, &roster_arc, &identity_sync).map_err(py_err)?;
-            }
+            // revocation state only this endpoint's sessions hold first, so the driver sees it.
             sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity_sync)?;
             let fallback_floor = pinned_pairing_floor(&lock_roster(&roster_arc), &pinned_host);
             let store_for_enroll = store.clone();
@@ -2937,6 +2855,10 @@ impl Endpoint {
                     Err(()) => return Err(PyRuntimeError::new_err("timed out accepting v2 pair")),
                 };
                 let path_kind = pairing_path_kind_for_provider(stream.provider_id());
+                // The store-backed driver reads the stored roster: commit held revocations first.
+                sync_roster_async(store_in.as_ref(), &store_lock, &roster_in, &identity)
+                    .await
+                    .map_err(py_err)?;
                 let driven = if let Some(ref s) = store_in {
                     drive_v2_pake_pair_responder_with_store(
                         stream.as_mut(),
@@ -3335,7 +3257,7 @@ impl Endpoint {
                 .await
                 .map_err(py_err);
                 let persisted =
-                    commit_session_async(store.as_ref(), &store_lock, &roster, &identity).await;
+                    sync_roster_async(store.as_ref(), &store_lock, &roster, &identity).await;
                 let driver = accepted?;
                 persisted.map_err(py_err)?;
                 Ok(driver)
@@ -3369,6 +3291,10 @@ impl Endpoint {
                         return Err(PyRuntimeError::new_err("timed out accepting v2 session"));
                     }
                 };
+                // The store-backed driver reads the stored roster: commit held revocations first.
+                sync_roster_async(store_in.as_ref(), &store_lock_in, &roster_in, &identity)
+                    .await
+                    .map_err(py_err)?;
                 if let Some(ref s) = store_in {
                     V2SessionDriver::accept_with_store(
                         stream,
@@ -3443,10 +3369,6 @@ impl SessionBackend {
             Self::V1(s) => s.peer_device_id(),
             Self::V2(s) => Some(s.peer_device_id().to_owned()),
         }
-    }
-
-    fn is_v2(&self) -> bool {
-        matches!(self, Self::V2(_))
     }
 
     /// The `route_seq` the client sent in `SessionHello` (responder sessions).
@@ -3572,25 +3494,9 @@ impl Session {
                                 "grant": g,
                             }),
                             SessionEvent::RevocationUpdated { issuer, seq } => {
-                                if sess.is_v2() && store.is_some() {
-                                    sync_roster_async(
-                                        store.as_ref(),
-                                        &store_lock,
-                                        &roster,
-                                        &identity,
-                                    )
+                                sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
                                     .await
                                     .map_err(py_err)?;
-                                } else {
-                                    commit_session_async(
-                                        store.as_ref(),
-                                        &store_lock,
-                                        &roster,
-                                        &identity,
-                                    )
-                                    .await
-                                    .map_err(py_err)?;
-                                }
                                 serde_json::json!({
                                     "status": "event",
                                     "event": "revocation_updated",
@@ -3632,18 +3538,12 @@ impl Session {
                     }
                     Ok(Ok(None)) => Ok(serde_json::json!({ "status": "eof" }).to_string()),
                     Ok(Err(e)) => {
-                        if sess.is_v2() && store.is_some() {
-                            let _ =
-                                sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
-                                    .await;
-                            Err(session_err(&e))
-                        } else if let Err(pe) =
-                            commit_session_async(store.as_ref(), &store_lock, &roster, &identity)
-                                .await
+                        // A failed event can leave a revocation in memory only (a fork, say).
+                        match sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
+                            .await
                         {
-                            Err(session_err_msg(&e, &format!("{e} ({pe})")))
-                        } else {
-                            Err(session_err(&e))
+                            Ok(()) => Err(session_err(&e)),
+                            Err(pe) => Err(session_err_msg(&e, &format!("{e} ({pe})"))),
                         }
                     }
                     Err(_) => Ok(serde_json::json!({ "status": "would_block" }).to_string()),
@@ -3976,35 +3876,5 @@ mod tests {
         let cfg = net_config(r#"{"p2p_relay_mode":"n0"}"#);
         let opts = cfg.build_p2p_listener_options(None).unwrap();
         assert!(matches!(opts.relay_mode, P2pRelayMode::N0Public));
-    }
-
-    #[test]
-    fn publish_roster_keeps_anchor_signed_crl() {
-        use tendril_core::crypto::SigningKeypair;
-        use tendril_core::grants::{RevocationListUnsigned, sign_crl};
-
-        let identity = EndpointIdentity::generate().unwrap();
-        let anchor = SigningKeypair::generate().unwrap();
-        let anchor_id = "anchor-a".to_owned();
-        let mut disk = Roster::default();
-        disk.add_trust_anchor(anchor_id.clone(), anchor.public_key().clone())
-            .unwrap();
-        let mut mem = disk.clone();
-        let crl = sign_crl(
-            RevocationListUnsigned {
-                v: 1,
-                issuer: anchor_id.clone(),
-                seq: 1,
-                revoked_devices: vec!["dev-gone".to_owned()],
-                revoked_nonces: Vec::new(),
-                ts: "2026-01-01T00:00:00Z".to_owned(),
-            },
-            &anchor,
-        )
-        .unwrap();
-        mem.ingest_crl(crl, &anchor_id, anchor.public_key())
-            .unwrap();
-        publish_roster(&mut mem, disk, &identity);
-        assert!(mem.crl(&anchor_id).is_some(), "anchor CRL dropped on merge");
     }
 }
