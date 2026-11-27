@@ -26,6 +26,11 @@
 //! manager, and holds the manager only for the in-memory issuance. Callers must not hold the
 //! manager, or an in-memory roster mutex, across any announcer or [`RosterAccess`] call.
 //!
+//! [`RosterAccess`] runs its whole read, fold and publish sequence inside item 2: it loads the
+//! stored roster, folds in the revocation state the in-memory copy holds, saves a changed result
+//! and publishes it to item 4, all under one hold of the file lock, and takes item 4 only for
+//! pure computation.
+//!
 //! A client session's route ingest slot sits before item 2: its blocking task holds the slot
 //! while it takes the file lock and then the in-memory roster, and a session never takes the
 //! slot while it holds its machine or roster mutex.
@@ -37,8 +42,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::Serialize;
+use tendril_core::crypto::HybridSigningPublicKey;
 use tendril_core::error::CoreError;
-use tendril_core::grants::RevocationList;
 use tendril_core::identity::EndpointIdentity;
 use tendril_core::pairing::{
     DroppedHint, IssueOptions, IssuedPairingUri, LocalRouteState, PairingManager, RoutePolicy,
@@ -92,11 +97,18 @@ pub struct LastRouteSet {
 ///
 /// With a store, every update runs against the latest on-disk roster under its advisory lock
 /// and refreshes the in-memory copy. Without one, the in-memory roster is the only state.
+///
+/// The two copies never lose a revocation. Every read of the store folds the revocation state
+/// the in-memory copy holds into the loaded roster ([`Roster::absorb_held_revocations`]), every
+/// write persists it, and the committed roster replaces the in-memory copy only after the fold.
+/// Set [`Self::with_local_signer`] on every store-backed handle so the host's own CRL is kept.
 #[derive(Clone)]
 pub struct RosterAccess {
     store: Option<Arc<StateStore>>,
     roster: Arc<StdMutex<Roster>>,
     route_status: Arc<StdMutex<BTreeMap<String, LastRouteSet>>>,
+    /// The local host id and signing key, the only key that verifies the host's own CRL.
+    local: Option<(String, HybridSigningPublicKey)>,
 }
 
 impl std::fmt::Debug for RosterAccess {
@@ -115,7 +127,38 @@ impl RosterAccess {
             store,
             roster,
             route_status: Arc::default(),
+            local: None,
         }
+    }
+
+    /// Names the local host id and signing key, the only key that verifies the host's own CRL
+    /// when held revocations are folded into the stored roster. Without it that CRL is dropped.
+    #[must_use]
+    pub fn with_local_signer(
+        mut self,
+        host_id: impl Into<String>,
+        signing_pub: HybridSigningPublicKey,
+    ) -> Self {
+        self.local = Some((host_id.into(), signing_pub));
+        self
+    }
+
+    fn local_signer(&self) -> Option<(&str, &HybridSigningPublicKey)> {
+        self.local.as_ref().map(|(id, key)| (id.as_str(), key))
+    }
+
+    /// Folds the revocation state the in-memory copy holds into `disk`; returns whether `disk`
+    /// changed. The mutex is held only for this pure computation.
+    fn fold_held_into(&self, disk: &mut Roster) -> bool {
+        disk.absorb_held_revocations(&lock(&self.roster), self.local_signer())
+    }
+
+    /// Publishes `committed` as the in-memory roster, after folding in what the in-memory copy
+    /// learned meanwhile. Called inside the roster file lock.
+    fn publish(&self, mut committed: Roster) {
+        let mut guard = lock(&self.roster);
+        committed.absorb_held_revocations(&guard, self.local_signer());
+        *guard = committed;
     }
 
     /// A store-backed handle seeded with the store's current roster.
@@ -141,14 +184,15 @@ impl RosterAccess {
         &self.roster
     }
 
-    /// The latest roster: loaded from the store, else a copy of the in-memory one. CRLs the
-    /// in-memory copy holds that the store lacks (accepted by a session, not yet persisted) are
-    /// merged into the loaded roster, so a reload never drops revocation state.
+    /// The latest roster: loaded from the store, else a copy of the in-memory one. The
+    /// revocation state the in-memory copy holds (CRLs, revoked entries and anchors accepted by a
+    /// session, not yet persisted) is folded into the loaded roster, so a reload never drops it.
+    /// Nothing is written and the in-memory copy is not replaced.
     pub fn load(&self) -> Result<Roster, RuntimeError> {
         match &self.store {
             Some(store) => {
                 let mut roster = store.load_roster()?;
-                roster.merge_crl_evidence(&held_crls(&lock(&self.roster)));
+                self.fold_held_into(&mut roster);
                 Ok(roster)
             }
             None => Ok(lock(&self.roster).clone()),
@@ -157,13 +201,14 @@ impl RosterAccess {
 
     /// Runs `f` as one roster transaction; nothing is written when `f` fails.
     ///
-    /// With a store, the transaction runs on the latest on-disk roster, which then replaces the
-    /// in-memory copy. CRLs the in-memory copy holds that the store lacks (accepted by a session
-    /// but not yet persisted) are merged in first, so the reload never drops revocation state.
+    /// With a store, the transaction runs on the latest on-disk roster with the in-memory
+    /// copy's revocation state folded in first, and the committed roster, with that state folded
+    /// in again, then replaces the in-memory copy. The whole sequence runs under the roster file
+    /// lock, so no commit or reload interleaves between the read and the publish.
     ///
     /// The in-memory mutex is taken after the roster file lock (module docs, lock order) and is
-    /// not held while `f` runs. CRLs a session accepted into memory meanwhile are merged into
-    /// the committed copy, so replacing the in-memory roster never drops them either.
+    /// not held while `f` runs. Revocations a session accepted into memory meanwhile are folded
+    /// into the committed copy, so replacing the in-memory roster never drops them either.
     pub fn update<T, F>(&self, f: F) -> Result<T, RuntimeError>
     where
         F: FnOnce(&mut Roster) -> Result<T, RuntimeError>,
@@ -171,12 +216,10 @@ impl RosterAccess {
         match &self.store {
             Some(store) => store.with_roster_lock(|store| {
                 let mut roster = store.load_roster_unlocked()?;
-                roster.merge_crl_evidence(&held_crls(&lock(&self.roster)));
+                self.fold_held_into(&mut roster);
                 let out = f(&mut roster)?;
                 store.save_roster_unlocked(&roster)?;
-                let mut guard = lock(&self.roster);
-                roster.merge_crl_evidence(&held_crls(&guard));
-                *guard = roster;
+                self.publish(roster);
                 Ok(out)
             }),
             None => {
@@ -189,26 +232,70 @@ impl RosterAccess {
         }
     }
 
-    /// Like [`Self::update`], but nothing is written when `f` returns `(out, false)`.
+    /// Like [`Self::update`], but nothing is written when `f` returns `(out, false)` and the fold
+    /// added nothing to the stored roster. Revocations the in-memory copy holds are persisted
+    /// even when `f` changed nothing.
     pub fn update_if_changed<T, F>(&self, f: F) -> Result<T, RuntimeError>
     where
         F: FnOnce(&mut Roster) -> Result<(T, bool), RuntimeError>,
     {
-        let mut unchanged = None;
-        let written = self.update(|roster| {
-            let (out, changed) = f(roster)?;
-            if changed {
-                Ok(Some(out))
-            } else {
-                unchanged = Some(out);
-                // Aborts the transaction so neither the store nor the memory copy is written.
-                Err(RuntimeError::Storage("unchanged".into()))
+        match &self.store {
+            Some(store) => store.with_roster_lock(|store| {
+                let mut roster = store.load_roster_unlocked()?;
+                let folded = self.fold_held_into(&mut roster);
+                let (out, changed) = f(&mut roster)?;
+                if changed || folded {
+                    store.save_roster_unlocked(&roster)?;
+                    self.publish(roster);
+                }
+                Ok(out)
+            }),
+            None => {
+                let mut guard = lock(&self.roster);
+                let mut working = guard.clone();
+                let (out, changed) = f(&mut working)?;
+                if changed {
+                    *guard = working;
+                }
+                Ok(out)
             }
-        });
-        if let Some(out) = unchanged {
-            return Ok(out);
         }
-        written?.ok_or_else(|| RuntimeError::Storage("roster update lost its result".into()))
+    }
+
+    /// Persists the revocation state the in-memory copy holds and the store lacks, then
+    /// replaces the in-memory copy with the stored roster plus that state. Returns whether
+    /// anything was written. A commit with nothing new creates no `roster.json` and leaves an
+    /// existing one untouched, mtime included.
+    ///
+    /// Call it before any driver reads the store, and right after any session event that can
+    /// revoke, so no store-backed decision runs on a roster that lacks a held revocation.
+    /// A store-less handle has nothing to commit.
+    pub fn commit_held_revocations(&self) -> Result<bool, RuntimeError> {
+        let Some(store) = &self.store else {
+            return Ok(false);
+        };
+        store.with_roster_lock(|store| {
+            let mut roster = store.load_roster_unlocked()?;
+            let changed = self.fold_held_into(&mut roster);
+            if changed {
+                store.save_roster_unlocked(&roster)?;
+            }
+            self.publish(roster);
+            Ok(changed)
+        })
+    }
+
+    /// Replaces the in-memory copy with the stored roster plus the revocation state the
+    /// in-memory copy holds. Never writes.
+    pub fn reload(&self) -> Result<(), RuntimeError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        store.with_roster_lock(|store| {
+            let roster = store.load_roster_unlocked()?;
+            self.publish(roster);
+            Ok(())
+        })
     }
 
     /// The last route set outcome [`ingest_route_sets`] recorded for `peer_id`.
@@ -220,16 +307,6 @@ impl RosterAccess {
     fn record_route_set(&self, peer_id: &str, last: LastRouteSet) {
         lock(&self.route_status).insert(peer_id.to_owned(), last);
     }
-}
-
-/// Every CRL `roster` holds, keyed by issuer (paired peers and trust anchors).
-fn held_crls(roster: &Roster) -> Vec<(String, RevocationList)> {
-    roster
-        .entries()
-        .map(|(id, _)| id)
-        .chain(roster.trust_anchors().map(|(id, _)| id))
-        .filter_map(|id| roster.crl(id).map(|crl| (id.clone(), crl.clone())))
-        .collect()
 }
 
 /// The write half of a live responder session whose client sent `SessionHello.route_seq`.

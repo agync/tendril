@@ -1773,27 +1773,34 @@ impl V2SessionDriver {
         let has_exported = driver.exported_v2_secrets().is_some();
         let target_owned = target_host_id.to_owned();
         let store_c = store.clone();
+        let local = (
+            local_identity.host_id().to_owned(),
+            local_identity.signing_key().public_key().clone(),
+        );
         {
             let _guard = store_lock.lock().await;
             tokio::task::spawn_blocking(move || {
-                store_c.update_roster_persisting_revocations(|rst| {
-                    if !applied_rotation.is_empty() {
-                        let presented_signing = working_roster
-                            .get(&target_owned)
-                            .and_then(|e| e.signing_pub.clone())
-                            .ok_or_else(|| CoreError::IncompletePin(target_owned.clone()))?;
-                        rst.apply_verified_rotation(
-                            &target_owned,
-                            &applied_rotation,
-                            &peer_static,
-                            &presented_signing,
-                        )?;
-                    }
-                    if has_exported {
-                        persist_v2_session_secrets_post_establish(rst, &target_owned)?;
-                    }
-                    Ok(())
-                })
+                store_c.update_roster_persisting_revocations_with(
+                    Some((&local.0, &local.1)),
+                    |rst| {
+                        if !applied_rotation.is_empty() {
+                            let presented_signing = working_roster
+                                .get(&target_owned)
+                                .and_then(|e| e.signing_pub.clone())
+                                .ok_or_else(|| CoreError::IncompletePin(target_owned.clone()))?;
+                            rst.apply_verified_rotation(
+                                &target_owned,
+                                &applied_rotation,
+                                &peer_static,
+                                &presented_signing,
+                            )?;
+                        }
+                        if has_exported {
+                            persist_v2_session_secrets_post_establish(rst, &target_owned)?;
+                        }
+                        Ok(())
+                    },
+                )
             })
             .await
             .map_err(|err| RuntimeError::Storage(format!("v2 update roster failed: {err}")))??;
@@ -2453,27 +2460,34 @@ impl V2SessionDriver {
                 let cache_arc = Arc::clone(&state.replay_cache);
                 let refusal_c = refusal.clone();
                 let mut m_owned = machine;
+                let local = (
+                    local_identity.host_id().to_owned(),
+                    local_identity.signing_key().public_key().clone(),
+                );
                 let (m_back, actions) = tokio::task::spawn_blocking(move || {
                     store_c
-                        .update_roster_persisting_revocations(|rst| {
-                            let mut cache = cache_arc
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let actions = feed_responder(
-                                &mut m_owned,
-                                &msg3_frame,
-                                (now_unix, now_ms),
-                                rst,
-                                &mut cache,
-                                refusal_c.as_ref(),
-                            )?;
-                            if m_owned.is_established()
-                                && let Some(peer_id) = m_owned.peer_device_id()
-                            {
-                                persist_v2_session_secrets_post_establish(rst, peer_id)?;
-                            }
-                            Ok(actions)
-                        })
+                        .update_roster_persisting_revocations_with(
+                            Some((&local.0, &local.1)),
+                            |rst| {
+                                let mut cache = cache_arc
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let actions = feed_responder(
+                                    &mut m_owned,
+                                    &msg3_frame,
+                                    (now_unix, now_ms),
+                                    rst,
+                                    &mut cache,
+                                    refusal_c.as_ref(),
+                                )?;
+                                if m_owned.is_established()
+                                    && let Some(peer_id) = m_owned.peer_device_id()
+                                {
+                                    persist_v2_session_secrets_post_establish(rst, peer_id)?;
+                                }
+                                Ok(actions)
+                            },
+                        )
                         .map(|actions| (m_owned, actions))
                 })
                 .await
