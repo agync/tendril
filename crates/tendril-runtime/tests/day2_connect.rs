@@ -33,6 +33,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+mod common;
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -389,7 +391,10 @@ async fn connect(
 async fn operator_routes_fall_back(wire: Wire) {
     let me = Arc::new(identity(0x50));
     let (host, mut rx) = Host::new(0x60, wire, &me);
-    let dead = direct(dead_port().await);
+    // A dead local rung is dialed alone before the live direct route, so the fallback does not
+    // depend on which of two same-rank candidates wins the race.
+    let tmp = tempfile::tempdir().unwrap();
+    let dead = format!("local:{}", common::ipc_path(&tmp, "dead.sock").display());
     let live = direct(host.serve().await);
     let mut roster = client_roster(&host);
     set_operator(&mut roster, &host.id(), &[dead.clone(), live.clone()]);

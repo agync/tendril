@@ -1,6 +1,8 @@
 //! Regression tests for the wave 2 runtime audit fixes (inbound router recovery, PAKE lock
 //! scope, revocation persistence, and wire-floor preflight).
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -165,7 +167,7 @@ async fn sec05_concurrent_pake_msg1_never_hold_the_pairing_manager_lock() {
 
     let mut tasks = Vec::new();
     for (i, code) in codes.into_iter().enumerate() {
-        let sock = dir.path().join(format!("p{i}.sock"));
+        let sock = common::ipc_path(&dir, &format!("p{i}.sock"));
         let mut listener = LocalListener::bind(&sock).expect("bind");
         let ep = listener.local_endpoint();
         let (host, mgr, roster, state) = (
@@ -293,7 +295,7 @@ async fn sec03_fork_revocation_is_persisted_despite_transactional_rollback() {
 
     // A persisted revocation rejects every later reconnect.
     let sock_dir = tempdir().expect("tempdir");
-    let sock = sock_dir.path().join("fork.sock");
+    let sock = common::ipc_path(&sock_dir, "fork.sock");
     let mut listener = LocalListener::bind(&sock).expect("bind");
     let ep = listener.local_endpoint();
     let accept = tokio::spawn(async move { listener.accept().await });
@@ -355,7 +357,7 @@ async fn priv04_v1_connect_writes_no_bytes_when_peer_floor_exceeds_wire_v1() {
         .expect("floor");
 
     let dir = tempdir().expect("tempdir");
-    let sock = dir.path().join("v1.sock");
+    let sock = common::ipc_path(&dir, "v1.sock");
     let mut listener = LocalListener::bind(&sock).expect("bind");
     let ep = listener.local_endpoint();
     let dial = LocalDialer::new().dial(&ep).await.expect("dial");

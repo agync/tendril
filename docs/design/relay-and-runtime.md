@@ -30,7 +30,7 @@ All path implementations expose the `PathStream`, `PathListener`, and `PathDiale
 
 | Provider | Transport | Security and Bounds |
 |---|---|---|
-| `local` | Unix domain sockets | `0o600` socket file permissions, `1 s` write backpressure timeout, `65521 B` outer frame ceiling |
+| `local` | Unix domain sockets (Unix), named pipes (Windows) | `0o600` socket file permissions or an owner-only pipe DACL with a same-user server check, `1 s` write backpressure timeout, `65521 B` outer frame ceiling |
 | `direct` | TCP (`TCP_NODELAY`) | Optional IP allow-list filter, `1 s` write backpressure timeout, `65521 B` outer frame ceiling |
 | `relay` | WebSocket (`/v1/relay`) | `rustls` `ring` TLS provider for `wss://`, verifies `challenge.host` and `max_frame`, signed `register` and `accept`, `1 s` write timeout |
 

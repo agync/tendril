@@ -52,6 +52,7 @@ pub(super) fn seal<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
@@ -243,6 +244,7 @@ mod tests {
                 "rt-roster.sealed"
             ]
         );
+        #[cfg(unix)]
         for name in ["rt-groups.sealed", "rt-roster.sealed"] {
             let mode = fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{name}");
@@ -261,17 +263,20 @@ mod tests {
         storage_err(StateStore::open_sealed(&dir, &ident(9)), "cannot be opened");
 
         let groups = dir.join("rt-groups.sealed");
-        fs::set_permissions(&groups, fs::Permissions::from_mode(0o644)).unwrap();
-        storage_err(StateStore::open_sealed(&dir, &me), "insecure mode");
-        fs::set_permissions(&groups, fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&groups, fs::Permissions::from_mode(0o644)).unwrap();
+            storage_err(StateStore::open_sealed(&dir, &me), "insecure mode");
+            fs::set_permissions(&groups, fs::Permissions::from_mode(0o600)).unwrap();
 
-        let roster = dir.join("rt-roster.sealed");
-        let moved = dir.join("moved");
-        fs::rename(&roster, &moved).unwrap();
-        std::os::unix::fs::symlink(&moved, &roster).unwrap();
-        storage_err(StateStore::open_sealed(&dir, &me), "symlink");
-        fs::remove_file(&roster).unwrap();
-        fs::rename(&moved, &roster).unwrap();
+            let roster = dir.join("rt-roster.sealed");
+            let moved = dir.join("moved");
+            fs::rename(&roster, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &roster).unwrap();
+            storage_err(StateStore::open_sealed(&dir, &me), "symlink");
+            fs::remove_file(&roster).unwrap();
+            fs::rename(&moved, &roster).unwrap();
+        }
 
         let key = StateKey::derive(me.static_key());
         fs::write(
@@ -395,11 +400,13 @@ mod tests {
         fault::SYNCED_DIRS.with(std::cell::RefCell::take);
     }
 
+    #[cfg(unix)]
     fn synced_dirs() -> Vec<PathBuf> {
         fault::SYNCED_DIRS.with(std::cell::RefCell::take)
     }
 
     /// `dir` and its canonical ancestors up to the first one this process cannot open.
+    #[cfg(unix)]
     fn openable_chain(dir: &Path) -> Vec<PathBuf> {
         fs::canonicalize(dir)
             .unwrap()
@@ -515,6 +522,7 @@ mod tests {
         reset_faults();
     }
 
+    #[cfg(unix)]
     #[test]
     fn reopen_syncs_every_ancestor_after_interrupted_first_open() {
         let tmp = tempfile::tempdir().unwrap();

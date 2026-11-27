@@ -20,18 +20,22 @@ use tendril_relay::{RelayConfig, RelayHandle, RelayServer};
 use tendril_runtime::{
     BrokerDialer, BrokerListener, BrokerServerConfig, ConcurrentSession, DEFAULT_PRE_AUTH_TIMEOUT,
     DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, EmbeddedRelay, LocalDialer, LocalListener,
-    MAX_OUTER_FRAME_LEN, OverlayConfig, OverlayDialer, OverlayHelperDialer, OverlayHelperListener,
-    OverlayListener, OverlayMode, OverlayResolvedMode, PathDialer, PathListener, PathReader,
-    PathStream, PathWriter, PreAuthConfig, PreAuthRateLimiter, RelayDialer, RelayListener,
-    RuntimeError, SessionDriver, SessionEvent, StateStore, dial_with_policy, drive_pair_responder,
+    MAX_OUTER_FRAME_LEN, OverlayConfig, OverlayDialer, OverlayListener, OverlayMode,
+    OverlayResolvedMode, PathDialer, PathListener, PathReader, PathStream, PathWriter,
+    PreAuthConfig, PreAuthRateLimiter, RelayDialer, RelayListener, RuntimeError, SessionDriver,
+    SessionEvent, StateStore, dial_with_policy, drive_pair_responder,
     drive_pair_responder_with_options, is_tailnet_ip, pairing_path_kind_for_provider,
     recv_tendril_frame, select_overlay_mode, send_tendril_frame, split_path_stream_fallback,
 };
+#[cfg(unix)]
+use tendril_runtime::{OverlayHelperDialer, OverlayHelperListener};
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{P2pDialer, P2pListener, P2pRelayMode};
 #[cfg(feature = "webtransport")]
 use tendril_runtime::{WtDialer, WtListener};
 use tokio::time::timeout;
+
+mod common;
 
 /// A loopback port nothing listens on, held for the guard's lifetime. The port is the local end
 /// of an established loopback connection: dials to it are refused at once, and ordinary `bind(0)`
@@ -39,7 +43,8 @@ use tokio::time::timeout;
 /// on a socket bound later by a parallel test. (On macOS an explicit `SO_REUSEADDR` rebind of the
 /// exact port can still succeed; the guard prevents ephemeral allocation, not that.) A socket
 /// that is only bound is not enough, because Darwin drops SYNs to it without a reset and the dial
-/// hangs until the OS connect timeout.
+/// hangs until the OS connect timeout. Windows does not reserve the port for an established
+/// connection, so there the guard only refuses dials.
 struct DeadPort {
     _client: std::net::TcpStream,
     _server: std::net::TcpStream,
@@ -91,26 +96,40 @@ fn assert_dead_port_held(guard: &DeadPort) {
     let started = Instant::now();
     let err = std::net::TcpStream::connect_timeout(&guard.addr, Duration::from_secs(2))
         .expect_err("dial must be refused");
+    #[cfg(windows)]
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+        ),
+        "unexpected dial error: {err:?}"
+    );
+    #[cfg(not(windows))]
     assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+    #[cfg(unix)]
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "refusal was not immediate"
     );
-    let rebind = tokio::net::TcpSocket::new_v4().expect("rebind socket");
-    let err = rebind.bind(guard.addr).expect_err("port must stay held");
-    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        let err = std::net::TcpListener::bind(guard.addr).expect_err("held against SO_REUSEADDR");
+        let rebind = tokio::net::TcpSocket::new_v4().expect("rebind socket");
+        let err = rebind.bind(guard.addr).expect_err("port must stay held");
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
-    }
-    for _ in 0..2000 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-        assert_ne!(
-            probe.local_addr().expect("probe addr").port(),
-            guard.addr.port(),
-            "bind(0) returned the guarded port"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            let err =
+                std::net::TcpListener::bind(guard.addr).expect_err("held against SO_REUSEADDR");
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        }
+        for _ in 0..2000 {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+            assert_ne!(
+                probe.local_addr().expect("probe addr").port(),
+                guard.addr.port(),
+                "bind(0) returned the guarded port"
+            );
+        }
     }
 }
 
@@ -146,8 +165,8 @@ async fn setup_provider(provider: ProviderId) -> ProviderPair {
     match provider {
         ProviderId::Local => {
             let tmp = TempDir::new().expect("tempdir");
-            let sock = tmp.path().join("tendril.sock");
-            let listener = LocalListener::bind(&sock).expect("bind local");
+            let endpoint_path = common::ipc_path(&tmp, "tendril.sock");
+            let listener = LocalListener::bind(&endpoint_path).expect("bind local");
             let endpoint = listener.local_endpoint();
             ProviderPair {
                 listener: Box::new(listener),
@@ -1219,7 +1238,8 @@ fn overlay_mode_selection_respects_platform() {
     let expected_helper = if cfg!(unix) {
         OverlayResolvedMode::Helper
     } else {
-        OverlayResolvedMode::Unavailable
+        // Without Unix sockets the helper is unavailable and Auto falls through to the host mode.
+        OverlayResolvedMode::Host
     };
     assert_eq!(select_overlay_mode(&helper_cfg, true), expected_helper);
     let disabled_cfg = OverlayConfig {
@@ -3096,9 +3116,8 @@ async fn ws_binary_path_stream_rejects_zero_byte_binary_frame() {
 }
 
 #[tokio::test]
-async fn overlay_listener_requires_tailnet_by_default_and_helper_is_non_blocking() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::{TcpStream, UnixStream};
+async fn overlay_listener_requires_tailnet_by_default() {
+    use tokio::net::TcpStream;
 
     let mut default_ol = OverlayListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)), None)
         .await
@@ -3127,6 +3146,13 @@ async fn overlay_listener_requires_tailnet_by_default_and_helper_is_non_blocking
         .expect("accept timeout")
         .expect("accept stream");
     assert_eq!(accepted.provider_id(), ProviderId::Overlay);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn overlay_helper_accept_is_non_blocking() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
 
     let tmp = TempDir::new().expect("tempdir");
     let sock = tmp.path().join("accept.sock");

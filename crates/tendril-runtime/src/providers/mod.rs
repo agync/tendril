@@ -52,9 +52,7 @@ pub use egress::{
     EgressDialer, EgressKind, HintSource, HostResolver, SkipReason, SkippedHint, SystemResolver,
     check_hint, classify_destination, path_class,
 };
-pub use local::LocalDialer;
-#[cfg(unix)]
-pub use local::LocalListener;
+pub use local::{LocalDialer, LocalListener};
 pub use overlay::{
     OverlayConfig, OverlayDialer, OverlayListener, OverlayMode, OverlayResolvedMode, is_tailnet_ip,
     select_overlay_mode,
@@ -80,7 +78,8 @@ pub use webrtc::{
 pub use webtransport::{WtDialer, WtListener};
 
 /// Dials any supported Tendril endpoint (`iroh://`, `overlay://`, `broker+ws(s)://`,
-/// `ws(s)://`, `unix://`/`/...`, or `host:port`) via its matching [`PathDialer`].
+/// `ws(s)://`, `local:` and `unix://`/`/...` on Unix, `local:`/`\\.\pipe\...` on Windows, or
+/// `host:port`) via its matching [`PathDialer`].
 ///
 /// For `ws(s)://`, `relay_host` overrides the expected TLS and challenge hostname.
 /// For `iroh://`, `relay_host` selects the P2P relay mode (`"default"`, `"disabled"`/`"local"`,
@@ -152,7 +151,15 @@ pub async fn dial_endpoint_with_auth(
             ));
         }
     }
-    if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
+    #[cfg(unix)]
+    if endpoint.starts_with("unix://")
+        || endpoint.starts_with("local:")
+        || endpoint.starts_with('/')
+    {
+        return LocalDialer::new().dial(endpoint).await;
+    }
+    #[cfg(windows)]
+    if endpoint.starts_with("local:") || endpoint.starts_with(r"\\.\pipe\") {
         return LocalDialer::new().dial(endpoint).await;
     }
     DirectDialer::new().dial(endpoint).await

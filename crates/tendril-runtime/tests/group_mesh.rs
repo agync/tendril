@@ -1060,8 +1060,15 @@ async fn revocation_cancels_in_flight_writes_and_blocks_slot_publication() {
         .expect("revocation must cancel the held write")
         .unwrap()
         .unwrap();
+    // Windows takes longer to tear down a stalled socket; the correctness assertions below are
+    // unchanged.
+    let budget = if cfg!(windows) {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(500)
+    };
     assert!(
-        revoked_at.elapsed() < Duration::from_millis(500),
+        revoked_at.elapsed() < budget,
         "{:?} {report:?}",
         revoked_at.elapsed()
     );
