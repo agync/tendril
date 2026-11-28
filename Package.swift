@@ -2,8 +2,8 @@
 import Foundation
 import PackageDescription
 
-let tendrilReleaseVersion = "0.2.0"
-let tendrilXCFrameworkChecksum = "311b21747b9b779c03eef671997ef134568927c026a62d48bfa810901ae18edc"
+let tendrilReleaseVersion = "0.2.1"
+let tendrilXCFrameworkChecksum = "3cc50301dea3f30476f7acfc0b07dd516bb2e94fd529a330725a00f6c25dc020"
 
 let useLocalFfi = ProcessInfo.processInfo.environment["TENDRIL_LOCAL_FFI"] == "1"
 
