@@ -695,6 +695,12 @@ export interface ConnectPolicyOptions {
   autoUpgradeWebRtc?: boolean;
   /** Optional ICE server list passed to `RTCPeerConnection` during upgrade; default `[]`. */
   iceServers?: RTCIceServer[];
+  /** Use the conservative low-power planner preset (`maxInFlight = 2`, `750 ms` P2P cold hold). */
+  lowPower?: boolean;
+  /** Maximum concurrent in-flight route dials (`>= 0`, `0` uses the planner preset default). */
+  maxInFlight?: number | null;
+  /** Opt-in idle session close timer in milliseconds (`1..=2147483647`), reset on app events. */
+  idleTimeoutMs?: number | null;
 }
 
 /**

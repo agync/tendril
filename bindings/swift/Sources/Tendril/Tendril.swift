@@ -98,44 +98,62 @@ public enum TendrilRuntimeProfile: String, Sendable, Equatable {
   case `extension` = "extension"
 }
 
+public enum TendrilPowerProfile: String, Sendable, Equatable {
+  case standard = "standard"
+  case lowPower = "low_power"
+}
+
 public struct TendrilEndpointOptions: Sendable {
   public var runtimeProfile: TendrilRuntimeProfile
   public var clientOnly: Bool
   public var mldsaSigner: (any TendrilMlDsa65Provider)?
   public var useHardwareMlDsaIfAvailable: Bool
+  public var powerProfile: TendrilPowerProfile?
 
   public init(
     runtimeProfile: TendrilRuntimeProfile = .default,
     clientOnly: Bool = false,
     mldsaSigner: (any TendrilMlDsa65Provider)? = nil,
-    useHardwareMlDsaIfAvailable: Bool = false
+    useHardwareMlDsaIfAvailable: Bool = false,
+    powerProfile: TendrilPowerProfile? = nil
   ) {
     self.runtimeProfile = runtimeProfile
     self.clientOnly = clientOnly
     self.mldsaSigner = mldsaSigner
     self.useHardwareMlDsaIfAvailable = useHardwareMlDsaIfAvailable
+    self.powerProfile = powerProfile
   }
 
   public static let extensionClientOnly = TendrilEndpointOptions(
     runtimeProfile: .extension,
-    clientOnly: true
+    clientOnly: true,
+    powerProfile: .lowPower
+  )
+
+  public static let lowPowerHost = TendrilEndpointOptions(
+    runtimeProfile: .default,
+    clientOnly: false,
+    powerProfile: .lowPower
   )
 }
 
 private struct SealedEndpointOptionsPayload: Encodable {
   let runtimeProfile: String
   let clientOnly: Bool
+  let powerProfile: String?
 
   enum CodingKeys: String, CodingKey {
     case runtimeProfile = "runtime_profile"
     case clientOnly = "client_only"
+    case powerProfile = "power_profile"
   }
 }
 
 internal func encodeSealedEndpointOptionsJson(_ options: TendrilEndpointOptions) throws -> String {
   let payload = SealedEndpointOptionsPayload(
     runtimeProfile: options.runtimeProfile.rawValue,
-    clientOnly: options.clientOnly
+    clientOnly: options.clientOnly,
+    powerProfile: options.powerProfile?.rawValue
   )
   let encoder = JSONEncoder()
   encoder.outputFormatting = [.sortedKeys]
@@ -898,6 +916,14 @@ public final class TendrilEndpoint: @unchecked Sendable {
         throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new_from_state failed")
       }
       self.handle = raw
+      if let powerProfile = options.powerProfile {
+        do {
+          try configurePower(powerProfile: powerProfile)
+        } catch {
+          close()
+          throw error
+        }
+      }
     }
   }
   #else
@@ -927,6 +953,14 @@ public final class TendrilEndpoint: @unchecked Sendable {
         throw ffiError(TENDRIL_ERR_INTERNAL.rawValue, fallback: "tendril_endpoint_new failed")
       }
       self.handle = raw
+      if let powerProfile = options.powerProfile {
+        do {
+          try configurePower(powerProfile: powerProfile)
+        } catch {
+          close()
+          throw error
+        }
+      }
     }
   }
   #endif
@@ -1075,7 +1109,7 @@ public final class TendrilEndpoint: @unchecked Sendable {
     _ body: @escaping @Sendable () throws -> T
   ) throws -> T {
     try withExpiringActivityGuard(
-      active: hasSealedStore,
+      active: hasSealedStore && (!allowExpireClose || isExtensionProfile),
       allowExpireClose: allowExpireClose && isExtensionProfile,
       onAsyncClose: { [weak self] in self?.close() },
       body
@@ -1711,11 +1745,13 @@ public final class TendrilEndpoint: @unchecked Sendable {
     recoveryUri: String? = nil,
     replaceRoutes: Bool? = nil,
     routePolicy: String? = nil,
-    relayHost: String? = nil
+    relayHost: String? = nil,
+    idleTimeoutMs: UInt64? = nil
   ) throws -> TendrilSession {
     var fields: [String: Any?] = [
       "wire": wire, "endpoint": endpoint, "recovery_uri": recoveryUri,
       "replace_routes": replaceRoutes, "route_policy": routePolicy, "relay_host": relayHost,
+      "idle_timeout_ms": idleTimeoutMs,
     ]
     if let grantJson {
       guard let obj = try? JSONSerialization.jsonObject(with: Data(grantJson.utf8)) else {
@@ -1870,6 +1906,18 @@ public final class TendrilEndpoint: @unchecked Sendable {
     try mergeTransportConfig(["p2p_port_mapping": portMapping, "p2p_bind_addrs": bindAddrs])
   }
 
+  /// Sets `power_profile` and `wake_retry_max_delay_ms`, keeping every other key of the last full
+  /// transport configuration sent.
+  public func configurePower(
+    powerProfile: TendrilPowerProfile? = nil,
+    wakeRetryMaxDelayMs: UInt64? = nil
+  ) throws {
+    try mergeTransportConfig([
+      "power_profile": powerProfile?.rawValue,
+      "wake_retry_max_delay_ms": wakeRetryMaxDelayMs,
+    ])
+  }
+
   /// Merges `fields` into the last full transport configuration and sends the result.
   private func mergeTransportConfig(_ fields: [String: Any?]) throws {
     let changes = try transportOptions(fields)
@@ -1928,7 +1976,9 @@ public final class TendrilEndpoint: @unchecked Sendable {
     pathMonitor = monitor
     monitorLock.unlock()
     // Started and cancelled outside the lock; a monitor cancelled meanwhile refuses to start.
-    monitor.start()
+    if monitor.start() {
+      try? setExternalPathMonitor(true)
+    }
     previous?.cancel()
     #endif
   }
@@ -1939,6 +1989,20 @@ public final class TendrilEndpoint: @unchecked Sendable {
     pathMonitor = nil
     monitorLock.unlock()
     monitor?.cancel()
+    if monitor != nil {
+      try? setExternalPathMonitor(false)
+    }
+  }
+
+  /// Notifies the runtime announcer whether an external OS path monitor owns interface changes,
+  /// suppressing periodic background route polling while active.
+  public func setExternalPathMonitor(_ active: Bool) throws {
+    try withHandle { h in
+      let rc = tendril_endpoint_set_external_path_monitor(h, active ? 1 : 0)
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_set_external_path_monitor failed")
+      }
+    }
   }
 
   /// Marks the monitor lifecycle closed and cancels the running monitor.
@@ -2135,7 +2199,7 @@ public final class TendrilSession: @unchecked Sendable {
     _ body: @escaping @Sendable () throws -> T
   ) throws -> T {
     try withExpiringActivityGuard(
-      active: hasSealedStore,
+      active: hasSealedStore && (!allowExpireClose || isExtensionProfile),
       allowExpireClose: allowExpireClose && isExtensionProfile,
       onAsyncClose: { [weak self] in self?.free() },
       body
@@ -2212,14 +2276,12 @@ public final class TendrilSession: @unchecked Sendable {
   }
 
   public func sendData(_ data: Data) throws {
-    try withExpiringStateActivityIfNeeded {
-      try self.withHandle { h in
-        let rc = data.withUnsafeBytes { raw in
-          tendril_session_send_data(h, raw.bindMemory(to: UInt8.self).baseAddress, data.count)
-        }
-        guard rc == TENDRIL_OK.rawValue else {
-          throw ffiError(rc, fallback: "tendril_session_send_data failed")
-        }
+    try withHandle { h in
+      let rc = data.withUnsafeBytes { raw in
+        tendril_session_send_data(h, raw.bindMemory(to: UInt8.self).baseAddress, data.count)
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_session_send_data failed")
       }
     }
   }
@@ -2395,7 +2457,7 @@ public final class TendrilGroup: @unchecked Sendable {
     _ body: @escaping @Sendable () throws -> T
   ) throws -> T {
     try withExpiringActivityGuard(
-      active: hasSealedStore,
+      active: hasSealedStore && (!allowExpireClose || isExtensionProfile),
       allowExpireClose: allowExpireClose && isExtensionProfile,
       onAsyncClose: { [weak self] in self?.close() },
       body

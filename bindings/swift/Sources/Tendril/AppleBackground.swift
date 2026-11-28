@@ -274,7 +274,8 @@ public final class TendrilWakeProcessor: @unchecked Sendable {
     let options = TendrilEndpointOptions(
       runtimeProfile: .extension,
       clientOnly: true,
-      mldsaSigner: mldsaSigner
+      mldsaSigner: mldsaSigner,
+      powerProfile: .lowPower
     )
     let ep = try TendrilEndpoint(
       stateDir: stateDir,
@@ -525,7 +526,8 @@ public final class TendrilLocalPushSession: @unchecked Sendable {
         options: TendrilEndpointOptions(
           runtimeProfile: .extension,
           clientOnly: true,
-          mldsaSigner: mldsaSigner
+          mldsaSigner: mldsaSigner,
+          powerProfile: .lowPower
         )
       )
       lock.lock()
@@ -572,7 +574,7 @@ public final class TendrilLocalPushSession: @unchecked Sendable {
 
         let rawEvent: String
         do {
-          rawEvent = try sess.pollEvent(timeoutMs: 1000)
+          rawEvent = try sess.pollEvent(timeoutMs: 300_000)
         } catch TendrilError.wouldBlock {
           continue
         } catch TendrilError.eof {
@@ -683,7 +685,8 @@ public final class TendrilBackgroundSync: @unchecked Sendable {
           options: TendrilEndpointOptions(
             runtimeProfile: .extension,
             clientOnly: true,
-            mldsaSigner: mldsaSigner
+            mldsaSigner: mldsaSigner,
+            powerProfile: .lowPower
           )
         )
         ep = created

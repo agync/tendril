@@ -123,6 +123,8 @@ class TendrilClientUnitTest {
         "groupClose",
         "groupFree",
         "endpointNewSealed",
+        "endpointNewSealedWithOptions",
+        "endpointSetExternalPathMonitor",
       )) {
       assertTrue("missing TendrilNative.$name", nativeMethods.contains(name))
     }
@@ -135,5 +137,61 @@ class TendrilClientUnitTest {
 
     val nativeMethods = TendrilNative::class.java.declaredMethods.map { it.name }.toSet()
     assertTrue("missing TendrilNative.sessionPeerId", nativeMethods.contains("sessionPeerId"))
+  }
+
+  @Test
+  fun powerProfileOptionsAndCanonicalNetworkSnapshotAreDeterministic() {
+    val epMethods = TendrilEndpoint::class.java.declaredMethods.map { it.name }.toSet()
+    assertTrue("missing TendrilEndpoint.configurePower", epMethods.contains("configurePower"))
+    assertTrue(
+      "missing TendrilEndpoint.setExternalPathMonitor",
+      epMethods.contains("setExternalPathMonitor"),
+    )
+
+    assertNull(TendrilEndpointOptions().toJson())
+    assertEquals(
+      "{\"runtime_profile\":\"extension\",\"client_only\":true,\"power_profile\":\"low_power\"}",
+      TendrilEndpointOptions.MOBILE_CLIENT.toJson(),
+    )
+    assertEquals(
+      "{\"runtime_profile\":\"default\",\"client_only\":false,\"power_profile\":\"low_power\"}",
+      TendrilEndpointOptions.LOW_POWER_HOST.toJson(),
+    )
+
+    val a =
+      listOf(
+        SnapshotNetwork(
+          id = "n2",
+          iface = "wlan0",
+          ifIndex = 4,
+          transports = listOf("wifi", "bluetooth"),
+          addrs = listOf("192.168.1.9/24", "10.0.0.2/8"),
+        ),
+        SnapshotNetwork(
+          id = "n1",
+          iface = "tun0",
+          ifIndex = 2,
+          transports = listOf("vpn", "wifi"),
+          addrs = listOf("100.101.1.2/32"),
+        ),
+      )
+    val b =
+      listOf(
+        SnapshotNetwork(
+          id = "n1",
+          iface = "tun0",
+          ifIndex = 2,
+          transports = listOf("wifi", "vpn"),
+          addrs = listOf("100.101.1.2/32"),
+        ),
+        SnapshotNetwork(
+          id = "n2",
+          iface = "wlan0",
+          ifIndex = 4,
+          transports = listOf("bluetooth", "wifi"),
+          addrs = listOf("10.0.0.2/8", "192.168.1.9/24"),
+        ),
+      )
+    assertEquals(NetworkSnapshots.toJson(a), NetworkSnapshots.toJson(b))
   }
 }

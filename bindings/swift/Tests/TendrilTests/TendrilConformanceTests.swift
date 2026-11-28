@@ -1842,5 +1842,50 @@ struct TendrilRouteTests {
     #expect(res["route_check"] as? String == "verified")
   }
   #endif
+
+  @Test
+  func lowPowerOptionsConfigurePowerIdleTimeoutAndExternalMonitor() throws {
+    let encodedDefault = try encodeSealedEndpointOptionsJson(TendrilEndpointOptions())
+    let defaultObj = try obj(encodedDefault)
+    #expect(defaultObj["power_profile"] == nil)
+
+    let encodedLow = try encodeSealedEndpointOptionsJson(TendrilEndpointOptions.lowPowerHost)
+    let lowObj = try obj(encodedLow)
+    #expect(lowObj["power_profile"] as? String == "low_power")
+
+    let encodedExt = try encodeSealedEndpointOptionsJson(TendrilEndpointOptions.extensionClientOnly)
+    let extObj = try obj(encodedExt)
+    #expect(extObj["runtime_profile"] as? String == "extension")
+    #expect(extObj["client_only"] as? Bool == true)
+    #expect(extObj["power_profile"] as? String == "low_power")
+
+    let p = try paired(wire: 2)
+    defer {
+      p.host.close()
+      p.client.close()
+    }
+    try p.host.configurePower(powerProfile: .lowPower)
+    try p.client.configurePower(powerProfile: .lowPower)
+    #expect(p.client.cachedTransportValue("power_profile") as? String == "low_power")
+    #expect(throws: Error.self) {
+      try p.client.configurePower(wakeRetryMaxDelayMs: 2000)
+    }
+    #expect(throws: Error.self) {
+      _ = try p.client.connectWithOptions(targetHostId: p.hostId, wire: 2, idleTimeoutMs: 0)
+    }
+
+    try p.host.setExternalPathMonitor(true)
+    _ = try p.host.refreshRoutes()
+    try p.host.setExternalPathMonitor(false)
+
+    let (cli, srv) = try accepting(host: p.host, wire: 2) {
+      try p.client.connectWithOptions(
+        targetHostId: p.hostId, wire: 2, grantJson: p.grant, idleTimeoutMs: 5000
+      )
+    }
+    try roundTrip(cli, srv, "swift-low-power")
+    cli.free()
+    srv.free()
+  }
 }
 #endif
