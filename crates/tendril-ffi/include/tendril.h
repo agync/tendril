@@ -163,6 +163,12 @@ int32_t tendril_endpoint_serve_p2p(
     const char *relay_mode_opt,
     char **out_endpoint
 );
+int32_t tendril_endpoint_serve_p2p_v2(
+    TendrilEndpoint *ep,
+    const char *relay_mode_opt,
+    const char *peer_id_opt,
+    char **out_endpoint
+);
 int32_t tendril_endpoint_issue_code(TendrilEndpoint *ep, const char *kind, char **out_code);
 
 int32_t tendril_endpoint_pair_initiate(
@@ -252,10 +258,12 @@ int32_t tendril_endpoint_enroll_initiate(
  * Pairing URIs and routes. Every out_json string is freed with tendril_string_free.
  *
  * tendril_endpoint_configure_transports_json accepts power_profile ("standard" or "low_power"),
- * p2p_port_mapping (bool; default true under standard and false under low_power; false
- * keeps a P2P endpoint from probing the router for a UPnP, NAT-PMP or PCP mapping) and
- * p2p_bind_addrs (array of at most one IPv4 and one IPv6 "host:port" such as "0.0.0.0:0" and
- * "[::]:0"; default every interface; an invalid entry is an error naming p2p_bind_addrs).
+ * p2p_port_mapping (bool; default true on non-mobile standard listeners, false on low_power or
+ * iOS/Android listeners, and false on all dialers; false keeps a P2P endpoint from probing the
+ * router for a UPnP, NAT-PMP or PCP mapping), p2p_ephemeral (bool; when true keeps Day-1
+ * tendril_endpoint_serve_p2p on an ephemeral EndpointId with Pkarr disabled unless p2p_pkarr opts
+ * in), and p2p_bind_addrs (array of at most one IPv4 and one IPv6 "host:port" such as "0.0.0.0:0"
+ * and "[::]:0"; default every interface; an invalid entry is an error naming p2p_bind_addrs).
  * p2p_relay_mode accepts "n0" as an alias of "default".
  *
  * tendril_endpoint_configure_transports_json also accepts wake_* keys (wake_url, wake_adapter,

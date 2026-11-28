@@ -38,18 +38,19 @@ use tendril_runtime::{
     BrokerServerConfig, CandidateFailure, ConnectOpts, ConnectResult, DEFAULT_PRE_AUTH_TIMEOUT,
     DEFAULT_WRITE_TIMEOUT, DirectListener, EmbeddedRelay, EnrollRouteWarning, HalfOpenGuard,
     InboundQueue, InboundRouter, InboundSession, LastRouteSet, ListAddrSource, M2mEnrollOptions,
-    OverlayListener, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode,
+    OverlayListener, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, P2pV2Listener,
     PairPolicyOptions, PathDialer, PathListener, PathStream, PowerProfile, PreAuthRateLimiter,
     RecoveryRoutes, RefusalState, RelayClientAuth, RelayListener, RelayListenerConfig,
     RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer,
     RouteSetSink, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
     V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeDialOptions, WakeOutcome, WakeSecret,
     WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtListener, build_wake_provider,
-    connect_with_wake_policy, dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
+    connect_with_wake_policy, default_p2p_dialer_port_mapping, default_p2p_listener_port_mapping,
+    dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_routes, drive_pair_initiator_with_policy,
     drive_pair_responder_with_store, drive_v2_pair_initiator_with_policy,
     drive_v2_pake_pair_responder_with_store, parse_p2p_bind_addrs, parse_p2p_relay_mode,
-    parse_p2p_relay_modes, recv_routed,
+    parse_p2p_relay_modes, probe_p2p_v2_endpoint, recv_routed,
 };
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use zeroize::{Zeroize, Zeroizing};
@@ -231,6 +232,9 @@ struct P2pTransportArgs {
     /// Do not probe the local router for a UPnP, NAT-PMP or PCP port mapping.
     #[arg(long)]
     p2p_no_port_mapping: bool,
+    /// Opt in to probing the local router for a UPnP, NAT-PMP or PCP port mapping on dialers.
+    #[arg(long, conflicts_with = "p2p_no_port_mapping")]
+    p2p_port_mapping: bool,
     /// Local UDP address the P2P endpoint binds for QUIC (repeatable, at most one IPv4 and one
     /// IPv6, for example `0.0.0.0:0` or `[::]:0`). A family left out gets no socket.
     #[arg(long = "p2p-bind", value_name = "ADDR")]
@@ -317,6 +321,8 @@ enum Command {
         wire_v2: bool,
         #[arg(long)]
         relay_v2: bool,
+        #[arg(long)]
+        p2p_v2: bool,
         #[arg(long, conflicts_with = "p2p_local")]
         p2p: bool,
         #[command(flatten)]
@@ -839,48 +845,128 @@ const fn pkarr_override(args: &P2pTransportArgs) -> Option<bool> {
     }
 }
 
-/// Applies `--p2p-no-port-mapping`, `--p2p-bind`, and `profile` defaults to `opts`.
-fn apply_p2p_net_args_with_profile(
+/// Effective `port_mapping` setting for P2P dialers (`false` by default per D5).
+pub(crate) const fn dialer_port_mapping(args: &P2pTransportArgs) -> bool {
+    if args.p2p_port_mapping {
+        true
+    } else if args.p2p_no_port_mapping {
+        false
+    } else {
+        default_p2p_dialer_port_mapping()
+    }
+}
+
+/// Effective `port_mapping` setting for P2P listeners (respects power profile and mobile OS
+/// defaults unless `--p2p-port-mapping` or `--p2p-no-port-mapping` is passed).
+const fn listener_port_mapping(args: &P2pTransportArgs, profile: PowerProfile) -> bool {
+    if args.p2p_no_port_mapping {
+        false
+    } else if args.p2p_port_mapping {
+        true
+    } else {
+        profile.p2p_port_mapping_default() && default_p2p_listener_port_mapping()
+    }
+}
+
+/// Explicit CLI override for listener `port_mapping`, preserving D5 defaults when unset.
+pub(crate) const fn listener_port_mapping_override(args: &P2pTransportArgs) -> Option<bool> {
+    if args.p2p_no_port_mapping {
+        Some(false)
+    } else if args.p2p_port_mapping {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn apply_p2p_net_with_mapping(
     opts: P2pOptions,
     args: &P2pTransportArgs,
-    profile: PowerProfile,
+    port_mapping: bool,
 ) -> Result<P2pOptions, Box<dyn std::error::Error>> {
-    let port_mapping = !args.p2p_no_port_mapping && profile.p2p_port_mapping_default();
     Ok(opts
         .with_port_mapping(port_mapping)
         .with_bind_addrs(parse_p2p_bind_addrs("--p2p-bind", &args.p2p_bind)?))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+fn build_p2p_listener_options_with(
+    args: &P2pTransportArgs,
+    resolved_p2p_auth: Option<P2pRelayAuth>,
+    include_direct_addrs: bool,
+    ephemeral: bool,
+    power_profile: PowerProfile,
+) -> Result<P2pOptions, Box<dyn std::error::Error>> {
+    let mode = resolve_p2p_relay_mode(args, None)?;
+    let mut opts = if ephemeral {
+        let mut o = P2pOptions::for_ephemeral_listener(mode);
+        if args.p2p_pkarr && !args.no_pkarr {
+            o = o.with_publish_pkarr(true).with_resolve_pkarr(true);
+        }
+        o
+    } else {
+        let pkarr = resolve_pkarr_enabled(&mode, args.p2p_pkarr, args.no_pkarr);
+        P2pOptions::for_listener(mode)
+            .with_publish_pkarr(pkarr)
+            .with_resolve_pkarr(pkarr)
+    };
+    opts = opts.with_relay_auth(resolved_p2p_auth);
+    if include_direct_addrs {
+        opts = opts.with_advertise_direct_addrs(true);
+    }
+    apply_p2p_net_with_mapping(opts, args, listener_port_mapping(args, power_profile))
+}
+
+#[cfg(test)]
 fn build_p2p_listener_options(
     args: &P2pTransportArgs,
     resolved_p2p_auth: Option<P2pRelayAuth>,
     include_direct_addrs: bool,
 ) -> Result<P2pOptions, Box<dyn std::error::Error>> {
-    build_p2p_listener_options_with_profile(
+    build_p2p_listener_options_with(
         args,
         resolved_p2p_auth,
         include_direct_addrs,
+        false,
         PowerProfile::Standard,
     )
 }
 
+#[cfg(test)]
 fn build_p2p_listener_options_with_profile(
     args: &P2pTransportArgs,
     resolved_p2p_auth: Option<P2pRelayAuth>,
     include_direct_addrs: bool,
     power_profile: PowerProfile,
 ) -> Result<P2pOptions, Box<dyn std::error::Error>> {
+    build_p2p_listener_options_with(
+        args,
+        resolved_p2p_auth,
+        include_direct_addrs,
+        false,
+        power_profile,
+    )
+}
+
+fn build_p2p_v2_listener_options(
+    args: &P2pTransportArgs,
+    resolved_p2p_auth: Option<P2pRelayAuth>,
+    power_profile: PowerProfile,
+) -> Result<P2pOptions, Box<dyn std::error::Error>> {
     let mode = resolve_p2p_relay_mode(args, None)?;
-    let pkarr = resolve_pkarr_enabled(&mode, args.p2p_pkarr, args.no_pkarr);
-    let mut opts = P2pOptions::for_listener(mode)
-        .with_publish_pkarr(pkarr)
-        .with_resolve_pkarr(pkarr)
-        .with_relay_auth(resolved_p2p_auth);
-    if include_direct_addrs {
-        opts = opts.with_advertise_direct_addrs(true);
+    let opts = P2pOptions::for_v2_listener(mode).with_relay_auth(resolved_p2p_auth);
+    apply_p2p_net_with_mapping(opts, args, listener_port_mapping(args, power_profile))
+}
+
+pub(crate) fn build_p2p_group_dialer_options(
+    args: &P2pTransportArgs,
+    resolved_p2p_auth: Option<P2pRelayAuth>,
+) -> Result<P2pOptions, Box<dyn std::error::Error>> {
+    let mode = resolve_p2p_relay_mode(args, None)?;
+    let mut opts = P2pOptions::for_dialer(mode).with_relay_auth(resolved_p2p_auth);
+    if matches!(opts.relay_mode, P2pRelayMode::Disabled) {
+        opts = opts.with_allow_private_addrs(true);
     }
-    apply_p2p_net_args_with_profile(opts, args, power_profile)
+    apply_p2p_net_with_mapping(opts, args, dialer_port_mapping(args))
 }
 
 fn resolve_explicit_p2p_relay_mode(
@@ -1007,11 +1093,6 @@ fn build_hint_dialers_with_profile(
     let p2p_relay_mode =
         resolve_explicit_p2p_relay_mode(p2p_args, relay_host.filter(|_| operator_iroh))?;
     let p2p_allow_private_addrs = matches!(p2p_relay_mode, Some(P2pRelayMode::Disabled));
-    let port_mapping = if p2p_args.p2p_no_port_mapping {
-        false
-    } else {
-        power_profile.p2p_port_mapping_default()
-    };
     Ok(Arc::new(HintDialers::new(HintDialerConfig {
         relay_auth,
         relay_expected_host: relay_host.map(ToOwned::to_owned),
@@ -1019,7 +1100,7 @@ fn build_hint_dialers_with_profile(
         p2p_relay_auth: resolve_p2p_relay_auth(p2p_args)?,
         p2p_allow_private_addrs,
         p2p_pkarr: pkarr_override(p2p_args),
-        p2p_port_mapping: port_mapping,
+        p2p_port_mapping: dialer_port_mapping(p2p_args),
         p2p_bind_addrs: parse_p2p_bind_addrs("--p2p-bind", &p2p_args.p2p_bind)?,
         ..HintDialerConfig::default().with_power_profile(power_profile)
     })))
@@ -1198,7 +1279,7 @@ pub(crate) fn build_p2p_dialer_options_with_profile(
     p2p_args: &P2pTransportArgs,
     endpoint: &str,
     relay_host: Option<&str>,
-    power_profile: PowerProfile,
+    _power_profile: PowerProfile,
 ) -> Result<P2pOptions, Box<dyn std::error::Error>> {
     let explicit_mode = resolve_explicit_p2p_relay_mode(p2p_args, relay_host)?;
     let p2p_auth = resolve_p2p_relay_auth(p2p_args)?;
@@ -1212,7 +1293,7 @@ pub(crate) fn build_p2p_dialer_options_with_profile(
     };
     let pkarr = resolve_pkarr_enabled(&opts.relay_mode, p2p_args.p2p_pkarr, p2p_args.no_pkarr);
     opts = opts.with_resolve_pkarr(pkarr).with_relay_auth(p2p_auth);
-    apply_p2p_net_args_with_profile(opts, p2p_args, power_profile)
+    apply_p2p_net_with_mapping(opts, p2p_args, dialer_port_mapping(p2p_args))
 }
 
 fn build_p2p_dialer_options(
@@ -2513,6 +2594,83 @@ async fn sync_v2_relay_listeners_with_profile(
     Ok(newly_bound)
 }
 
+type ActiveV2P2pMap = HashMap<
+    String,
+    (
+        Zeroizing<[u8; 32]>,
+        Arc<StdMutex<Option<Zeroizing<[u8; 32]>>>>,
+        watch::Sender<bool>,
+    ),
+>;
+
+fn eq_32_ct(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= std::hint::black_box(x ^ y);
+    }
+    diff == 0
+}
+
+async fn sync_v2_p2p_listeners(
+    router: &InboundRouter,
+    p2p_opts: &P2pOptions,
+    roster: &Roster,
+    active: &mut ActiveV2P2pMap,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut desired: HashMap<String, Zeroizing<[u8; 32]>> = HashMap::new();
+    for (peer_id, entry) in roster.entries() {
+        if entry.state == PeerState::Active
+            && !roster.crl_revokes_entry(entry)
+            && let Some(ref secrets) = entry.v2_secrets
+        {
+            desired.insert(peer_id.clone(), Zeroizing::new(*secrets.mailbox_secret()));
+        }
+    }
+    let to_remove: Vec<String> = active
+        .iter()
+        .filter(|(pid, (sec, _, _))| desired.get(*pid).is_none_or(|want| !eq_32_ct(want, sec)))
+        .map(|(pid, _)| pid.clone())
+        .collect();
+    for pid in to_remove {
+        if let Some((_, secret_cell, stop_tx)) = active.remove(&pid) {
+            *secret_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            let _ = stop_tx.send(true);
+        }
+    }
+    let mut advertised: Option<String> = None;
+    let handle = tokio::runtime::Handle::current();
+    for (pid, secret) in desired {
+        if active.contains_key(&pid) {
+            continue;
+        }
+        let secret_cell = Arc::new(StdMutex::new(Some(secret.clone())));
+        let cell_c = Arc::clone(&secret_cell);
+        let secret_source = Arc::new(move || {
+            cell_c
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
+        let listener = P2pV2Listener::bind(p2p_opts.clone(), secret_source).await?;
+        if advertised.is_none() {
+            advertised = Some(listener.advertised_endpoint().to_owned());
+        }
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let cancelable = CancelableListener {
+            inner: Box::new(listener),
+            stop_rx,
+        };
+        router.spawn_listener(&handle, Box::new(cancelable));
+        active.insert(pid, (secret, secret_cell, stop_tx));
+    }
+    if advertised.is_none() && active.is_empty() {
+        advertised = Some(probe_p2p_v2_endpoint(p2p_opts.clone()).await?);
+    }
+    Ok(advertised)
+}
+
 fn load_grant_arg(arg: &str) -> Result<Grant, Box<dyn std::error::Error>> {
     if let Some(path) = arg.strip_prefix('@') {
         let raw_bytes = read_private_secret_bytes(Path::new(path), "grant")?;
@@ -2577,6 +2735,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             embedded_relay,
             wire_v2,
             relay_v2,
+            p2p_v2,
             p2p,
             p2p_args,
             relay_auth,
@@ -2627,14 +2786,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             router.set_v2_pair_enabled(wire_v2 && pair_enabled);
 
             let resolved_relay_auth = resolve_relay_auth(&relay_auth)?;
-            let want_p2p = p2p
-                || p2p_args.p2p_local
-                || !p2p_args.p2p_relay.is_empty()
-                || p2p_args.p2p_pkarr
-                || p2p_args.p2p_relay_token_file.is_some()
-                || p2p_args.p2p_api_secret_file.is_some();
+            let want_p2p = if p2p_v2 {
+                p2p
+            } else {
+                p2p || p2p_args.p2p_local
+                    || !p2p_args.p2p_relay.is_empty()
+                    || p2p_args.p2p_pkarr
+                    || p2p_args.p2p_relay_token_file.is_some()
+                    || p2p_args.p2p_api_secret_file.is_some()
+            };
             validate_explicit_p2p_args(&p2p_args)?;
-            let resolved_p2p_auth = if want_p2p {
+            let resolved_p2p_auth = if want_p2p || p2p_v2 {
                 resolve_p2p_relay_auth(&p2p_args)?
             } else {
                 None
@@ -2642,6 +2804,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if relay_v2 && !wire_v2 {
                 return Err("--relay-v2 requires --wire-v2".into());
+            }
+            if p2p_v2 && !wire_v2 {
+                return Err("--p2p-v2 requires --wire-v2".into());
             }
             if relay_v2 && !embedded_relay && relay.is_none() {
                 return Err("--relay-v2 requires --relay or --embedded-relay".into());
@@ -2724,10 +2889,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let relay_v2_endpoint = relay_v2_endpoints.first().cloned();
 
             let p2p_ep = if want_p2p {
-                let opts = build_p2p_listener_options_with_profile(
+                let opts = build_p2p_listener_options_with(
                     &p2p_args,
-                    resolved_p2p_auth,
+                    resolved_p2p_auth.clone(),
                     include_direct_addrs,
+                    ephemeral_p2p,
                     serve_power_profile,
                 )?;
                 let seed = if ephemeral_p2p {
@@ -2739,6 +2905,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ep = pl.local_endpoint();
                 router.spawn_listener(&handle, Box::new(pl));
                 Some(ep)
+            } else {
+                None
+            };
+
+            let mut active_v2_p2ps: ActiveV2P2pMap = HashMap::new();
+            let mut last_v2_p2p_stamp = None;
+            let p2p_v2_opts = p2p_v2
+                .then(|| {
+                    build_p2p_v2_listener_options(
+                        &p2p_args,
+                        resolved_p2p_auth.clone(),
+                        serve_power_profile,
+                    )
+                })
+                .transpose()?;
+            let p2p_v2_ep = if let Some(ref opts) = p2p_v2_opts {
+                let (roster_now, stamp_now) = store.load_roster_with_stamp()?;
+                last_v2_p2p_stamp = stamp_now;
+                sync_v2_p2p_listeners(&router, opts, &roster_now, &mut active_v2_p2ps).await?
             } else {
                 None
             };
@@ -2795,6 +2980,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 relay_ep.clone(),
                 v2_relay_url.clone(),
                 p2p_ep.clone(),
+                p2p_v2_ep.clone(),
                 overlay_ep.clone(),
                 broker_ep.clone(),
             ]
@@ -2865,6 +3051,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "relay_v2_endpoints": relay_v2_endpoints,
                 "embedded_relay_url": embedded_relay_url,
                 "p2p_endpoint": p2p_ep,
+                "p2p_v2_endpoint": p2p_v2_ep,
                 "overlay_endpoint": overlay_ep,
                 "broker_endpoint": broker_ep,
                 "wt_endpoint": wt_ep,
@@ -2887,16 +3074,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let group_dialers = group::build_dialers(
                 resolved_relay_auth.clone(),
-                want_p2p.then_some(&p2p_args),
+                (want_p2p || p2p_v2).then_some(&p2p_args),
                 serve_power_profile,
             )
             .await?;
+            let group_p2p_opts = (want_p2p || p2p_v2)
+                .then(|| build_p2p_group_dialer_options(&p2p_args, resolved_p2p_auth))
+                .transpose()?;
             let group_hub = group::ServeGroups::new(
                 Arc::clone(&store),
                 Arc::clone(&identity),
                 group_dialers,
                 resolved_relay_auth.clone(),
                 served_v1_relay,
+                group::ServeP2pConfig {
+                    dialer_options: group_p2p_opts,
+                    listener_port_mapping: listener_port_mapping_override(&p2p_args),
+                },
                 redact_logs,
                 serve_power_profile,
             );
@@ -3154,10 +3348,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tracing::warn!(error = %err, "failed to sync v2 relay listeners");
                             }
                         }
+                        if let Some(ref opts) = p2p_v2_opts
+                            && let Ok(curr_stamp) = store.roster_stamp()
+                            && curr_stamp != last_v2_p2p_stamp
+                            && let Ok((roster_now, fresh_stamp)) = store.load_roster_with_stamp()
+                        {
+                            last_v2_p2p_stamp = fresh_stamp;
+                            if let Err(err) = sync_v2_p2p_listeners(
+                                &router,
+                                opts,
+                                &roster_now,
+                                &mut active_v2_p2ps,
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %err, "failed to sync v2 p2p listeners");
+                            }
+                        }
                     }
                 }
             }
 
+            for (_, (_, secret_cell, stop_tx)) in active_v2_p2ps {
+                *secret_cell
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                let _ = stop_tx.send(true);
+            }
             for (_, stop_tx) in active_v2_relays.into_values() {
                 let _ = stop_tx.send(true);
             }
@@ -3189,12 +3406,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             p2p_args,
         } => {
             const NO_V2_RELAY_PAIRING: &str = "/v2/relay is not used for pairing; pair over another route, then use dial --relay-v2";
+            const NO_V2_P2P_PAIRING: &str = "iroh://v2 is not used for pairing; pair over another route, then use dial --wire-v2";
             if relay_v2
                 || endpoint
                     .as_deref()
                     .is_some_and(|ep| is_v2_relay_endpoint(ep.strip_prefix("relay:").unwrap_or(ep)))
             {
                 return Err(NO_V2_RELAY_PAIRING.into());
+            }
+            if endpoint
+                .as_deref()
+                .is_some_and(tendril_core::pairing::is_v2_p2p_hint)
+            {
+                return Err(NO_V2_P2P_PAIRING.into());
             }
             let persist = PersistOpts {
                 operator_endpoint: None,
@@ -3961,6 +4185,7 @@ mod tests {
             p2p_pkarr: false,
             no_pkarr: false,
             p2p_no_port_mapping: false,
+            p2p_port_mapping: false,
             p2p_bind: Vec::new(),
         };
         let listener_default =
@@ -4058,16 +4283,34 @@ mod tests {
     }
 
     #[test]
-    fn p2p_net_defaults_map_and_bind_everywhere() {
+    fn p2p_net_defaults_split_between_listeners_and_dialers() {
         let args = P2pTransportArgs::default();
         let listener = build_p2p_listener_options(&args, None, false).expect("listener");
-        assert!(listener.port_mapping);
+        assert_eq!(
+            listener.port_mapping,
+            tendril_runtime::default_p2p_listener_port_mapping()
+        );
         assert_eq!(
             listener.bind_addrs,
             tendril_runtime::P2pBindAddrs::AllInterfaces
         );
         let hints = build_hint_dialers(RelayClientAuth::None, None, &args, None).expect("hints");
-        assert!(hints.config().p2p_port_mapping);
+        assert!(!hints.config().p2p_port_mapping);
+        let group = build_p2p_group_dialer_options(&args, None).expect("group");
+        assert!(!group.port_mapping);
+
+        let opt_in = P2pTransportArgs {
+            p2p_port_mapping: true,
+            ..P2pTransportArgs::default()
+        };
+        let opt_in_hints =
+            build_hint_dialers(RelayClientAuth::None, None, &opt_in, None).expect("hints");
+        assert!(opt_in_hints.config().p2p_port_mapping);
+        assert!(
+            build_p2p_group_dialer_options(&opt_in, None)
+                .expect("group")
+                .port_mapping
+        );
     }
 
     #[test]
@@ -4564,6 +4807,7 @@ mod tests {
             p2p_pkarr: false,
             no_pkarr: false,
             p2p_no_port_mapping: false,
+            p2p_port_mapping: false,
             p2p_bind: Vec::new(),
         };
         let ep_id: String = SigningKeypair::generate()
@@ -4612,6 +4856,7 @@ mod tests {
             p2p_pkarr: false,
             no_pkarr: false,
             p2p_no_port_mapping: false,
+            p2p_port_mapping: false,
             p2p_bind: Vec::new(),
         };
         // Valid 32-byte Ed25519 hex iroh endpoint ID.
@@ -4713,5 +4958,120 @@ mod tests {
             let _ = stop_tx.send(true);
         }
         relay_handle.stop().await.expect("stop relay");
+    }
+
+    #[test]
+    fn serve_p2p_v2_and_ephemeral_listener_flags_parse_and_disable_pkarr() {
+        let cli = Cli::try_parse_from([
+            "tendril",
+            "serve",
+            "--wire-v2",
+            "--p2p-v2",
+            "--p2p-port-mapping",
+        ])
+        .expect("serve --p2p-v2");
+        let Command::Serve {
+            wire_v2,
+            p2p_v2,
+            p2p_args,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected Serve");
+        };
+        assert!(wire_v2);
+        assert!(p2p_v2);
+        assert!(p2p_args.p2p_port_mapping);
+        let v2_opts = build_p2p_v2_listener_options(&p2p_args, None, PowerProfile::Standard)
+            .expect("v2 opts");
+        assert!(!v2_opts.publish_pkarr && !v2_opts.resolve_pkarr);
+
+        let args = P2pTransportArgs::default();
+        let eph_opts =
+            build_p2p_listener_options_with(&args, None, false, true, PowerProfile::Standard)
+                .expect("eph");
+        assert!(!eph_opts.publish_pkarr);
+        assert!(!eph_opts.resolve_pkarr);
+        assert!(!eph_opts.advertise_direct_addrs);
+        assert_eq!(
+            eph_opts.port_mapping,
+            tendril_runtime::default_p2p_listener_port_mapping()
+        );
+
+        let eph_opt_in = build_p2p_listener_options_with(
+            &P2pTransportArgs {
+                p2p_pkarr: true,
+                ..args
+            },
+            None,
+            false,
+            true,
+            PowerProfile::Standard,
+        )
+        .expect("eph pkarr opt-in");
+        assert!(eph_opt_in.publish_pkarr && eph_opt_in.resolve_pkarr);
+    }
+
+    #[tokio::test]
+    async fn sync_v2_p2p_listeners_handles_zero_peers_activation_and_revocation() {
+        let args = P2pTransportArgs {
+            p2p_local: true,
+            p2p_no_port_mapping: true,
+            p2p_bind: vec!["127.0.0.1:0".to_owned()],
+            ..P2pTransportArgs::default()
+        };
+        let opts =
+            build_p2p_v2_listener_options(&args, None, PowerProfile::Standard).expect("opts");
+        let router = InboundRouter::new();
+        let mut active = HashMap::new();
+        let mut roster = Roster::new();
+
+        // 0 active peers still probes and advertises iroh://v2 cleanly.
+        let adv0 = sync_v2_p2p_listeners(&router, &opts, &roster, &mut active)
+            .await
+            .expect("zero peer sync");
+        assert_eq!(adv0.as_deref(), Some("iroh://v2"));
+        assert!(active.is_empty());
+
+        let peer_id_key = tendril_core::identity::EndpointIdentity::generate().unwrap();
+        roster
+            .apply_v2_pair_initiator_outcome(
+                &V2PairOutcome::InitiatorPending {
+                    device_id: peer_id_key.device_id(),
+                    host_id: "active-v2-p2p".to_owned(),
+                    host_static_pub: *peer_id_key.static_key().public_bytes(),
+                    host_signing_pub: peer_id_key.signing_key().public_key().clone(),
+                    pairing_sas: "333333".to_owned(),
+                    host_rotation_seq: 0,
+                    v2_secrets: tendril_core::roster::V2PeerSecrets::new([0x51; 32], [0x52; 32]),
+                    host_pin_verified: false,
+                },
+                "active".to_owned(),
+                Vec::new(),
+            )
+            .unwrap();
+        roster
+            .confirm_peer("active-v2-p2p", Some("333333"))
+            .unwrap();
+
+        let adv1 = sync_v2_p2p_listeners(&router, &opts, &roster, &mut active)
+            .await
+            .expect("active sync");
+        assert_eq!(adv1.as_deref(), Some("iroh://v2"));
+        assert!(active.contains_key("active-v2-p2p"));
+
+        roster.revoke_peer("active-v2-p2p").unwrap();
+        sync_v2_p2p_listeners(&router, &opts, &roster, &mut active)
+            .await
+            .expect("revoke sync");
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn reject_v2_p2p_endpoint_for_pair_command() {
+        assert!(tendril_core::pairing::is_v2_p2p_hint(
+            "iroh://v2?relay=https://127.0.0.1/"
+        ));
+        assert!(tendril_core::pairing::is_v2_p2p_hint("p2p:iroh://v2"));
     }
 }

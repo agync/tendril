@@ -31,12 +31,12 @@ use tendril_core::pairing::{
 };
 use tendril_core::policy::{CandidateEndpoint, ProviderId};
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket, origin_allowed};
+#[cfg(test)]
+use tendril_core::roster::PeerState;
 use tendril_core::roster::{
-    AnchorState, PeerState, RefusalPolicy, Roster, RouteMeta, RouteSource, StoredRoute,
+    AnchorState, RefusalPolicy, Roster, RouteMeta, RouteSource, StoredRoute,
 };
-use tendril_core::v2::{
-    V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
-};
+use tendril_core::v2::{V2PairOutcome, V2PinnedHost, canonical_relay_host};
 use tendril_runtime::announce::unix_ms;
 use tendril_runtime::driver::{AttemptError, ConnectOpts, PairPolicyOptions};
 use tendril_runtime::providers::SkippedHint;
@@ -55,19 +55,22 @@ use tendril_runtime::{
     RelayDialer, RelayListener, RelayListenerConfig, RelayV2Dialer, RelayV2Listener,
     RelayV2ListenerConfig, RosterAccess, RouteAnnouncer, RouteSetSink, RuntimeError,
     ServedListener, SessionDriver, SessionEvent, StateStore, V2ResponderState, V2SessionDriver,
-    WakeAdapterKind, WakeConfigSpec, WakeTag, WakeTransportSettings, build_wake_provider,
-    connect_with_wake_policy, deserialize_identity_json_with_signer, dial_endpoint_with_auth,
-    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_routes,
-    drive_pair_responder_with_policy, drive_pair_responder_with_store,
-    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
-    drive_v2_pake_pair_responder_with_store, group_add_member, group_create, group_ingest_manifest,
-    group_remove_member, handle_session_group_frame, pairing_path_kind_for_provider,
-    pinned_pairing_floor, recv_routed, serialize_identity_json, verify_epoch_wake_tag_window,
+    WakeAdapterKind, WakeConfigSpec, WakeTag, WakeTransportSettings, active_v2_mailbox_secrets,
+    build_wake_provider, connect_with_wake_policy, deserialize_identity_json_with_signer,
+    dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
+    drive_m2m_enroll_initiator_with_routes, drive_pair_responder_with_policy,
+    drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_timeout,
+    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
+    group_add_member, group_create, group_ingest_manifest, group_remove_member,
+    handle_session_group_frame, lookup_v2_mailbox_secret_for_pair,
+    lookup_v2_mailbox_secret_for_target, pairing_path_kind_for_provider, pinned_pairing_floor,
+    recv_routed, serialize_identity_json, verify_epoch_wake_tag_window,
 };
 #[cfg(feature = "p2p-iroh")]
 use tendril_runtime::{
-    P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, parse_p2p_relay_mode,
-    parse_p2p_relay_modes,
+    P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, P2pV2RosterSync,
+    default_p2p_dialer_port_mapping, default_p2p_listener_port_mapping, parse_p2p_relay_mode,
+    parse_p2p_relay_modes, probe_p2p_v2_endpoint, usable_v2_mailbox_map,
 };
 #[cfg(test)]
 use tendril_runtime::{build_wake_provider_with_root_certs, wake_epoch_start_secs};
@@ -349,6 +352,8 @@ struct TransportConfigInput {
     #[zeroize(skip)]
     p2p_allow_private_addrs: Option<bool>,
     #[zeroize(skip)]
+    p2p_ephemeral: Option<bool>,
+    #[zeroize(skip)]
     p2p_port_mapping: Option<bool>,
     #[zeroize(skip)]
     p2p_bind_addrs: Option<Vec<String>>,
@@ -406,7 +411,9 @@ struct EndpointTransportConfig {
     p2p_advertise_direct_addrs: Option<bool>,
     #[cfg(feature = "p2p-iroh")]
     p2p_allow_private_addrs: Option<bool>,
-    /// `None` follows `power_profile.p2p_port_mapping_default()`.
+    #[cfg(feature = "p2p-iroh")]
+    p2p_ephemeral: Option<bool>,
+    /// `None` uses D5 split defaults (platform/profile default on listeners; `false` on dialers).
     #[cfg(feature = "p2p-iroh")]
     p2p_port_mapping: Option<bool>,
     #[cfg(feature = "p2p-iroh")]
@@ -438,6 +445,7 @@ impl fmt::Debug for EndpointTransportConfig {
                     &self.p2p_advertise_direct_addrs,
                 )
                 .field("p2p_allow_private_addrs", &self.p2p_allow_private_addrs)
+                .field("p2p_ephemeral", &self.p2p_ephemeral)
                 .field("p2p_port_mapping", &self.p2p_port_mapping)
                 .field("p2p_bind_addrs", &self.p2p_bind_addrs)
                 .field("p2p_relay_auth", &self.p2p_relay_auth);
@@ -544,6 +552,7 @@ impl EndpointTransportConfig {
                 || input.p2p_pkarr == Some(true)
                 || input.p2p_advertise_direct_addrs == Some(true)
                 || input.p2p_allow_private_addrs == Some(true)
+                || input.p2p_ephemeral == Some(true)
                 || input.p2p_port_mapping == Some(false)
                 || input.p2p_bind_addrs.as_ref().is_some_and(|a| !a.is_empty())
             {
@@ -673,6 +682,8 @@ impl EndpointTransportConfig {
             #[cfg(feature = "p2p-iroh")]
             p2p_allow_private_addrs: input.p2p_allow_private_addrs,
             #[cfg(feature = "p2p-iroh")]
+            p2p_ephemeral: input.p2p_ephemeral,
+            #[cfg(feature = "p2p-iroh")]
             p2p_port_mapping: input.p2p_port_mapping,
             #[cfg(feature = "p2p-iroh")]
             p2p_bind_addrs,
@@ -687,9 +698,16 @@ impl EndpointTransportConfig {
     }
 
     #[cfg(feature = "p2p-iroh")]
-    fn effective_port_mapping(&self, profile: PowerProfile) -> bool {
+    fn effective_listener_port_mapping(&self, profile: PowerProfile) -> bool {
+        self.p2p_port_mapping.unwrap_or_else(|| {
+            profile.p2p_port_mapping_default() && default_p2p_listener_port_mapping()
+        })
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn effective_dialer_port_mapping(&self) -> bool {
         self.p2p_port_mapping
-            .unwrap_or_else(|| profile.p2p_port_mapping_default())
+            .unwrap_or_else(default_p2p_dialer_port_mapping)
     }
 
     fn sign_routes(&self) -> bool {
@@ -697,6 +715,7 @@ impl EndpointTransportConfig {
     }
 
     #[cfg(test)]
+    #[cfg(all(test, feature = "p2p-iroh"))]
     fn hint_dialers(
         &self,
         operator_endpoint: Option<&str>,
@@ -745,7 +764,7 @@ impl EndpointTransportConfig {
             p2p_relay_auth: self.p2p_relay_auth.clone(),
             p2p_allow_private_addrs: self.p2p_allow_private_addrs.unwrap_or(false),
             p2p_pkarr: self.p2p_pkarr,
-            p2p_port_mapping: self.effective_port_mapping(power_profile),
+            p2p_port_mapping: self.effective_dialer_port_mapping(),
             p2p_bind_addrs: self.p2p_bind_addrs.clone(),
             ..HintDialerConfig::default().with_power_profile(power_profile)
         };
@@ -765,7 +784,11 @@ impl EndpointTransportConfig {
                 .clone()
                 .unwrap_or(P2pRelayMode::N0Public),
         };
-        let mut opts = P2pOptions::for_listener(mode);
+        let mut opts = if self.p2p_ephemeral == Some(true) {
+            P2pOptions::for_ephemeral_listener(mode)
+        } else {
+            P2pOptions::for_listener(mode)
+        };
         if let Some(pkarr) = self.p2p_pkarr {
             opts = opts.with_publish_pkarr(pkarr).with_resolve_pkarr(pkarr);
         }
@@ -776,7 +799,7 @@ impl EndpointTransportConfig {
             opts = opts.with_allow_private_addrs(allow_priv);
         }
         opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
-        Ok(self.with_p2p_net(opts, power_profile))
+        Ok(self.with_p2p_listener_net(opts, power_profile))
     }
 
     #[cfg(all(test, feature = "p2p-iroh"))]
@@ -790,10 +813,36 @@ impl EndpointTransportConfig {
         )
     }
 
-    /// Applies `p2p_port_mapping` and `p2p_bind_addrs` to `opts`.
     #[cfg(feature = "p2p-iroh")]
-    fn with_p2p_net(&self, opts: P2pOptions, power_profile: PowerProfile) -> P2pOptions {
-        opts.with_port_mapping(self.effective_port_mapping(power_profile))
+    fn build_p2p_v2_listener_options_with_profile(
+        &self,
+        relay_mode_override: Option<&str>,
+        power_profile: PowerProfile,
+    ) -> Result<P2pOptions, RuntimeError> {
+        let mode = match relay_mode_override.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => parse_p2p_relay_mode(Some(raw))?,
+            None => self
+                .p2p_relay_mode
+                .clone()
+                .unwrap_or(P2pRelayMode::N0Public),
+        };
+        let mut opts = P2pOptions::for_v2_listener(mode);
+        if let Some(allow_priv) = self.p2p_allow_private_addrs {
+            opts = opts.with_allow_private_addrs(allow_priv);
+        }
+        opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
+        Ok(self.with_p2p_listener_net(opts, power_profile))
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn with_p2p_listener_net(&self, opts: P2pOptions, power_profile: PowerProfile) -> P2pOptions {
+        opts.with_port_mapping(self.effective_listener_port_mapping(power_profile))
+            .with_bind_addrs(self.p2p_bind_addrs.clone())
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn with_p2p_dialer_net(&self, opts: P2pOptions) -> P2pOptions {
+        opts.with_port_mapping(self.effective_dialer_port_mapping())
             .with_bind_addrs(self.p2p_bind_addrs.clone())
     }
 
@@ -801,10 +850,7 @@ impl EndpointTransportConfig {
     /// explicitly (or `TENDRIL_P2P_LOCAL=1`). A shared dialer cannot derive per-peer `?relay=`
     /// URLs, so an unconfigured endpoint never builds one and never falls back to public relays.
     #[cfg(feature = "p2p-iroh")]
-    fn build_p2p_group_options_with_profile(
-        &self,
-        power_profile: PowerProfile,
-    ) -> Option<P2pOptions> {
+    fn build_p2p_group_options(&self) -> Option<P2pOptions> {
         P2pOptions::for_group_dialer(
             self.p2p_relay_mode.clone(),
             std::env::var("TENDRIL_P2P_LOCAL").as_deref() == Ok("1"),
@@ -812,14 +858,7 @@ impl EndpointTransportConfig {
             self.p2p_allow_private_addrs,
             self.p2p_relay_auth.clone(),
         )
-        .map(|opts| self.with_p2p_net(opts, power_profile))
-    }
-
-    #[cfg(all(test, feature = "p2p-iroh"))]
-    fn build_p2p_group_options(&self) -> Option<P2pOptions> {
-        self.build_p2p_group_options_with_profile(
-            self.power_profile.unwrap_or(PowerProfile::Standard),
-        )
+        .map(|opts| self.with_p2p_dialer_net(opts))
     }
 
     #[cfg(feature = "p2p-iroh")]
@@ -827,7 +866,6 @@ impl EndpointTransportConfig {
         &self,
         endpoint: &str,
         relay_host: Option<&str>,
-        default_profile: PowerProfile,
     ) -> Result<P2pOptions, RuntimeError> {
         let explicit_mode = if let Some(ref m) = self.p2p_relay_mode {
             Some(m.clone())
@@ -847,7 +885,7 @@ impl EndpointTransportConfig {
             opts = opts.with_resolve_pkarr(pkarr);
         }
         opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
-        Ok(self.with_p2p_net(opts, self.effective_power_profile(default_profile)))
+        Ok(self.with_p2p_dialer_net(opts))
     }
 }
 
@@ -901,83 +939,17 @@ fn is_v2_relay_endpoint(endpoint: &str) -> bool {
         && ws_path(endpoint) == "v2/relay"
 }
 
-fn lookup_v2_mailbox_secret_for_target(
+fn lookup_v2_target_secret(
     roster: &Roster,
     target_host_id: &str,
-) -> Result<[u8; 32], (i32, String)> {
-    let entry = roster.get(target_host_id).ok_or_else(|| {
-        (
-            TENDRIL_ERR_NOT_FOUND,
-            format!("target {target_host_id} not found in roster"),
-        )
-    })?;
-    if !usable_v2_entry(roster, entry) {
-        return Err((
-            TENDRIL_ERR_PROTOCOL,
-            format!("target {target_host_id} is not active"),
-        ));
-    }
-    entry
-        .v2_secrets
-        .as_ref()
-        .map(|s| *s.mailbox_secret())
-        .ok_or_else(|| {
-            (
-                TENDRIL_ERR_PROTOCOL,
-                format!("target {target_host_id} has no v2 mailbox_secret"),
-            )
-        })
-}
-
-/// An entry whose v2 secrets may be used: `Active` and not revoked by a stored CRL.
-fn usable_v2_entry(roster: &Roster, entry: &tendril_core::roster::RosterEntry) -> bool {
-    entry.state == PeerState::Active && !roster.crl_revokes_entry(entry)
-}
-
-fn lookup_v2_mailbox_secret_for_pair(
-    roster: &Roster,
-    pinned: Option<&PinnedHost>,
-    endpoint: &str,
-    now_unix: u64,
-) -> Result<[u8; 32], RuntimeError> {
-    if let Some(pin) = pinned {
-        if let Some(ref hid) = pin.host_id
-            && let Some(entry) = roster.get(hid)
-            && usable_v2_entry(roster, entry)
-            && let Some(ref secrets) = entry.v2_secrets
-        {
-            return Ok(*secrets.mailbox_secret());
-        }
-        for (_, entry) in roster.entries() {
-            if usable_v2_entry(roster, entry)
-                && entry.static_pub == pin.static_pub
-                && let Some(ref secrets) = entry.v2_secrets
-            {
-                return Ok(*secrets.mailbox_secret());
-            }
-        }
-    }
-    if let Some((_, frag)) = endpoint.split_once('#')
-        && !frag.is_empty()
-    {
-        for (_, entry) in roster.entries() {
-            if usable_v2_entry(roster, entry)
-                && let Some(ref secrets) = entry.v2_secrets
-            {
-                let win = derive_epoch_mailbox_window(secrets.mailbox_secret(), now_unix);
-                if win
-                    .mailboxes()
-                    .iter()
-                    .any(|mb| mb.mailbox_id_b64url() == frag)
-                {
-                    return Ok(*secrets.mailbox_secret());
-                }
-            }
-        }
-    }
-    Err(RuntimeError::Protocol(
-        "no matching v2 mailbox_secret in roster for /v2/relay endpoint".to_owned(),
-    ))
+) -> Result<Zeroizing<[u8; 32]>, (i32, String)> {
+    lookup_v2_mailbox_secret_for_target(roster, target_host_id).map_err(|err| {
+        let rc = match &err {
+            CoreError::PeerNotFound(_) => TENDRIL_ERR_NOT_FOUND,
+            _ => TENDRIL_ERR_PROTOCOL,
+        };
+        (rc, err.to_string())
+    })
 }
 
 async fn dial_endpoint_v2_with_options(
@@ -991,7 +963,8 @@ async fn dial_endpoint_v2_with_options(
     if endpoint.starts_with("iroh://") {
         #[cfg(feature = "p2p-iroh")]
         {
-            let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host, default_profile)?;
+            let _ = default_profile;
+            let opts = cfg.build_p2p_dialer_options(endpoint, normalized_host)?;
             let dialer = P2pDialer::bind_with_options(opts).await?;
             return match dialer.dial(endpoint).await {
                 Ok(stream) => Ok(stream),
@@ -1145,6 +1118,10 @@ pub struct TendrilEndpoint {
     served_endpoints: StdMutex<Vec<String>>,
     /// Pairing-capable TCP listeners (`tendril_endpoint_serve_direct`) for auto enumeration.
     served_listeners: StdMutex<Vec<ServedListener>>,
+    /// Dynamic `iroh://v2` listeners synced to active v2 peers (D7); lock order: `p2p_v2_sync`
+    /// before `roster`.
+    #[cfg(feature = "p2p-iroh")]
+    p2p_v2_sync: Arc<P2pV2RosterSync>,
     /// True when the endpoint is configured as an extension/client-only handle that must never serve.
     client_only: bool,
 }
@@ -1152,6 +1129,7 @@ pub struct TendrilEndpoint {
 impl Drop for TendrilEndpoint {
     fn drop(&mut self) {
         self.router.close();
+        self.stop_p2p_v2_listeners();
         let groups = self
             .group_rt
             .lock()
@@ -1279,6 +1257,52 @@ impl TendrilEndpoint {
         if self.is_hosting() {
             let _ = self.announcer.publish(unix_ms());
         }
+    }
+
+    #[cfg(not(feature = "p2p-iroh"))]
+    fn sync_p2p_v2_listeners(&self) {}
+
+    #[cfg(not(feature = "p2p-iroh"))]
+    fn stop_p2p_v2_listeners(&self) {}
+
+    #[cfg(feature = "p2p-iroh")]
+    fn stop_p2p_v2_listeners(&self) {
+        self.p2p_v2_sync.stop_all();
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn stop_unusable_p2p_v2_listeners(&self) {
+        self.p2p_v2_sync
+            .stop_unusable_with(|| usable_v2_mailbox_map(&lock_roster(&self.roster)));
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn sync_p2p_v2_listeners(&self) {
+        let _ = self.try_sync_p2p_v2_listeners(None);
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn try_sync_p2p_v2_listeners(
+        &self,
+        new_dynamic_opts: Option<P2pOptions>,
+    ) -> Result<Option<String>, (i32, String)> {
+        let Some(plan) = self
+            .p2p_v2_sync
+            .prepare_sync_with(
+                || usable_v2_mailbox_map(&lock_roster(&self.roster)),
+                new_dynamic_opts,
+            )
+            .map_err(|e| match e {
+                RuntimeError::Closed => (TENDRIL_ERR_CLOSED, "endpoint is closed".to_owned()),
+                other => (TENDRIL_ERR_PROTOCOL, other.to_string()),
+            })?
+        else {
+            return Ok(None);
+        };
+        let handle = self.rt.handle();
+        self.rt
+            .block_on(self.p2p_v2_sync.bind_missing(plan, &self.router, handle))
+            .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
     }
 
     /// Records a served listener for advertising, then publishes.
@@ -1513,10 +1537,12 @@ impl TendrilEndpoint {
             Arc::new(BrokerDialer::new()),
         ];
         #[cfg(feature = "p2p-iroh")]
-        if let Some(opts) = cfg.build_p2p_group_options_with_profile(eff_profile) {
+        let group_p2p_opts = cfg.build_p2p_group_options();
+        #[cfg(feature = "p2p-iroh")]
+        if let Some(ref opts) = group_p2p_opts {
             let dialer = self
                 .rt
-                .block_on(P2pDialer::bind_with_options(opts))
+                .block_on(P2pDialer::bind_with_options(opts.clone()))
                 .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))?;
             dialers.push(Arc::new(dialer));
         }
@@ -1525,14 +1551,23 @@ impl TendrilEndpoint {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        #[allow(unused_mut)]
+        let mut group_cfg = GroupPoolConfig::new(dialers)
+            .with_relay_auth(cfg.relay_auth.clone())
+            .with_relay_listen(!self.client_only)
+            .with_served_v1_relays(served_v1_relays)
+            .with_power_profile(eff_profile);
+        #[cfg(feature = "p2p-iroh")]
+        {
+            group_cfg = group_cfg.with_p2p_listener_port_mapping(cfg.p2p_port_mapping);
+            if let Some(opts) = group_p2p_opts {
+                group_cfg = group_cfg.with_p2p_options(opts);
+            }
+        }
         let hub = Arc::new(GroupHub::new(
             store.as_ref().clone(),
             Arc::new(self.identity.clone()),
-            GroupPoolConfig::new(dialers)
-                .with_relay_auth(cfg.relay_auth.clone())
-                .with_relay_listen(!self.client_only)
-                .with_served_v1_relays(served_v1_relays)
-                .with_power_profile(eff_profile),
+            group_cfg,
             None,
         ));
         {
@@ -1742,6 +1777,8 @@ fn build_endpoint_handle(
         hosting: StdMutex::new(HostingState::Idle),
         served_endpoints: StdMutex::new(Vec::new()),
         served_listeners: StdMutex::new(Vec::new()),
+        #[cfg(feature = "p2p-iroh")]
+        p2p_v2_sync: Arc::new(P2pV2RosterSync::new()),
         client_only,
     }))
 }
@@ -1881,6 +1918,8 @@ pub struct TendrilSession {
     local_device_id: String,
     /// `true` for a session this endpoint dialed: only an initiator maps a refusal close.
     initiator: bool,
+    #[cfg(feature = "p2p-iroh")]
+    p2p_v2_sync: Arc<P2pV2RosterSync>,
     session: SessionBackend,
 }
 
@@ -1919,6 +1958,12 @@ impl TendrilSession {
             })),
             _ => Err("not a group frame event".to_owned()),
         }
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn stop_unusable_p2p_v2_listeners(&self) {
+        self.p2p_v2_sync
+            .stop_unusable_with(|| usable_v2_mailbox_map(&lock_roster(&self.roster)));
     }
 
     /// Reloads the roster from the store, keeping the revocation state only memory holds. Never
@@ -2816,6 +2861,7 @@ pub unsafe extern "C" fn tendril_endpoint_close(ep: *mut TendrilEndpoint) -> i32
         }
         let ep = unsafe { &*ep };
         ep.router.close();
+        ep.stop_p2p_v2_listeners();
         if let Some(groups) = ep.group_runtime() {
             groups.shutdown();
         }
@@ -3057,11 +3103,12 @@ pub unsafe extern "C" fn tendril_endpoint_serve_p2p(
                     return TENDRIL_ERR_INVALID_ARG;
                 }
             };
-            let seed = ep.identity.derive_p2p_identity_seed();
-            match ep
-                .rt
-                .block_on(P2pListener::bind_with_options(opts, Some(seed)))
-            {
+            let seed = if cfg.p2p_ephemeral == Some(true) {
+                None
+            } else {
+                Some(ep.identity.derive_p2p_identity_seed())
+            };
+            match ep.rt.block_on(P2pListener::bind_with_options(opts, seed)) {
                 Ok(listener) => {
                     let local_ep = listener.local_endpoint();
                     ep.spawn_listener(Box::new(listener));
@@ -3077,6 +3124,116 @@ pub unsafe extern "C" fn tendril_endpoint_serve_p2p(
         #[cfg(not(feature = "p2p-iroh"))]
         {
             let _ = (ep, mode_opt);
+            set_last_error("tendril-ffi built without p2p-iroh feature");
+            TENDRIL_ERR_PROTOCOL
+        }
+    })
+}
+
+/// Serves Wire v2 hourly-rotating ephemeral `iroh://v2` listeners (`spec/wire-v2.md` Section 7).
+///
+/// When `peer_id_opt` is `NULL` or empty, dynamically syncs per-peer listeners for every active,
+/// non-revoked v2 peer in the roster (succeeding immediately with 0 peers by probing the home
+/// relay and spawning listeners as peers become active, and stopping them on revocation/close).
+/// When `peer_id_opt` names one peer, binds a listener for that peer's mailbox secret.
+///
+/// # Safety
+/// `ep` and `out_endpoint` must be valid non-null pointers; `relay_mode_opt` and `peer_id_opt` may
+/// be null or UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tendril_endpoint_serve_p2p_v2(
+    ep: *mut TendrilEndpoint,
+    relay_mode_opt: *const c_char,
+    peer_id_opt: *const c_char,
+    out_endpoint: *mut *mut c_char,
+) -> i32 {
+    ffi_i32(|| {
+        if ep.is_null() || out_endpoint.is_null() {
+            set_last_error("null endpoint or out_endpoint");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        let mode_opt = match unsafe { opt_cstr_to_str(relay_mode_opt, "relay_mode_opt") } {
+            Ok(v) => v,
+            Err(rc) => return rc,
+        };
+        let peer_opt = match unsafe { opt_cstr_to_str(peer_id_opt, "peer_id_opt") } {
+            Ok(v) => v.filter(|s| !s.is_empty()),
+            Err(rc) => return rc,
+        };
+        let ep = unsafe { &*ep };
+        if ep.client_only {
+            set_last_error("endpoint configured as client_only");
+            return TENDRIL_ERR_INVALID_ARG;
+        }
+        #[cfg(feature = "p2p-iroh")]
+        {
+            let cfg = ep.snapshot_transport_cfg();
+            let eff_profile = ep.effective_power_profile(&cfg);
+            let opts = match cfg.build_p2p_v2_listener_options_with_profile(mode_opt, eff_profile) {
+                Ok(o) => o,
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    return TENDRIL_ERR_INVALID_ARG;
+                }
+            };
+            if let Err(e) = ep.commit_held_revocations() {
+                set_last_error(e);
+                return TENDRIL_ERR_INTERNAL;
+            }
+            let local_ep = if let Some(pid) = peer_opt {
+                let secret = {
+                    let roster = lock_roster(&ep.roster);
+                    match lookup_v2_target_secret(&roster, pid) {
+                        Ok(sec) => sec,
+                        Err((rc, msg)) => {
+                            set_last_error(msg);
+                            return rc;
+                        }
+                    }
+                };
+                match ep.rt.block_on(ep.p2p_v2_sync.bind_explicit_with(
+                    pid.to_owned(),
+                    opts,
+                    secret,
+                    || usable_v2_mailbox_map(&lock_roster(&ep.roster)),
+                    &ep.router,
+                    ep.rt.handle(),
+                )) {
+                    Ok(adv) => adv,
+                    Err(RuntimeError::Closed) => {
+                        set_last_error("endpoint is closed");
+                        return TENDRIL_ERR_CLOSED;
+                    }
+                    Err(e) => {
+                        set_last_error(e.to_string());
+                        return TENDRIL_ERR_PROTOCOL;
+                    }
+                }
+            } else {
+                let bound_adv = match ep.try_sync_p2p_v2_listeners(Some(opts.clone())) {
+                    Ok(adv) => adv,
+                    Err((rc, msg)) => {
+                        set_last_error(msg);
+                        return rc;
+                    }
+                };
+                match bound_adv {
+                    Some(adv) => adv,
+                    None => match ep.rt.block_on(probe_p2p_v2_endpoint(opts)) {
+                        Ok(adv) => adv,
+                        Err(e) => {
+                            set_last_error(e.to_string());
+                            return TENDRIL_ERR_PROTOCOL;
+                        }
+                    },
+                }
+            };
+            ep.record_served(local_ep.clone(), None);
+            unsafe { write_out_cstring(out_endpoint, &local_ep) }
+        }
+        #[cfg(not(feature = "p2p-iroh"))]
+        {
+            let _ = (ep, mode_opt, peer_opt);
             set_last_error("tendril-ffi built without p2p-iroh feature");
             TENDRIL_ERR_PROTOCOL
         }
@@ -3174,7 +3331,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
         let v2_secret = if is_v2_relay_endpoint(endpoint_s) {
             match lookup_v2_mailbox_secret_for_pair(&roster_snapshot, None, endpoint_s, now_unix())
             {
-                Ok(s) => Some(s),
+                Ok(s) => Some(*s),
                 Err(e) => {
                     set_last_error(e.to_string());
                     return TENDRIL_ERR_PROTOCOL;
@@ -3247,6 +3404,9 @@ pub unsafe extern "C" fn tendril_endpoint_pair_initiate(
                     }) {
                         set_last_error(msg);
                         return rc;
+                    }
+                    if host_pin_verified {
+                        ep.sync_p2p_v2_listeners();
                     }
                     let out = serde_json::json!({
                         "device_id": device_id,
@@ -3377,6 +3537,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_accept(
                     kind,
                     ..
                 } => {
+                    ep.sync_p2p_v2_listeners();
                     let out = serde_json::json!({
                         "device_id": device_id,
                         "status": "active",
@@ -3432,7 +3593,10 @@ pub unsafe extern "C" fn tendril_endpoint_confirm_peer(
                 .map(|_| ())
                 .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
         }) {
-            Ok(()) => TENDRIL_OK,
+            Ok(()) => {
+                ep.sync_p2p_v2_listeners();
+                TENDRIL_OK
+            }
             Err((rc, msg)) => {
                 set_last_error(msg);
                 rc
@@ -3584,6 +3748,7 @@ fn revoke_peer_notified(ep: &TendrilEndpoint, peer_id: &str, notify: bool) -> i3
         return rc;
     }
     ep.refresh_m2m_enabled(&lock_roster(&ep.roster));
+    ep.sync_p2p_v2_listeners();
     TENDRIL_OK
 }
 
@@ -4093,6 +4258,7 @@ pub unsafe extern "C" fn tendril_endpoint_enroll_initiate(
                         set_last_error(msg);
                         return rc;
                     }
+                    ep.sync_p2p_v2_listeners();
                     let out = serde_json::json!({
                         "device_id": device_id,
                         "host_id": host_id,
@@ -4197,6 +4363,8 @@ fn connect_session(ep: &TendrilEndpoint, req: ConnectRequest<'_>) -> *mut Tendri
         }
     });
     let synced = ep.commit_held_revocations();
+    #[cfg(feature = "p2p-iroh")]
+    ep.stop_unusable_p2p_v2_listeners();
     match res {
         Ok((session, winning_addr)) => {
             if endpoint.is_none() {
@@ -4214,6 +4382,8 @@ fn connect_session(ep: &TendrilEndpoint, req: ConnectRequest<'_>) -> *mut Tendri
                 route_access: ep.route_access.clone(),
                 local_device_id: ep.identity.device_id(),
                 initiator: true,
+                #[cfg(feature = "p2p-iroh")]
+                p2p_v2_sync: Arc::clone(&ep.p2p_v2_sync),
                 session,
             }))
         }
@@ -4402,7 +4572,10 @@ pub unsafe extern "C" fn tendril_session_accept(
             .map_err(|e| e.to_string())
         });
         let synced = if accepted.get() {
-            ep.commit_held_revocations()
+            let sync_res = ep.commit_held_revocations();
+            #[cfg(feature = "p2p-iroh")]
+            ep.stop_unusable_p2p_v2_listeners();
+            sync_res
         } else {
             Ok(())
         };
@@ -4426,6 +4599,8 @@ pub unsafe extern "C" fn tendril_session_accept(
                     route_access: ep.route_access.clone(),
                     local_device_id: ep.identity.device_id(),
                     initiator: false,
+                    #[cfg(feature = "p2p-iroh")]
+                    p2p_v2_sync: Arc::clone(&ep.p2p_v2_sync),
                     session,
                 }))
             }
@@ -4607,6 +4782,8 @@ pub unsafe extern "C" fn tendril_session_poll_event(
                             set_last_error(e);
                             return TENDRIL_ERR_INTERNAL;
                         }
+                        #[cfg(feature = "p2p-iroh")]
+                        sess.stop_unusable_p2p_v2_listeners();
                         serde_json::json!({
                             "event": "revocation_updated",
                             "issuer": issuer,
@@ -4651,7 +4828,10 @@ pub unsafe extern "C" fn tendril_session_poll_event(
             Ok(Ok(None)) => TENDRIL_EOF,
             Ok(Err(e)) => {
                 // A failed event can leave a revocation in memory only (a detected fork, say).
-                match sess.commit_held_revocations() {
+                let sync_res = sess.commit_held_revocations();
+                #[cfg(feature = "p2p-iroh")]
+                sess.stop_unusable_p2p_v2_listeners();
+                match sync_res {
                     Ok(()) => fail_session_err(&e),
                     Err(pe) => {
                         fail_session_err_msg(&e, format!("{e} (roster persist error: {pe})"))
@@ -4886,18 +5066,17 @@ pub unsafe extern "C" fn tendril_endpoint_serve_relay_v2(
         let secrets: Vec<[u8; 32]> = {
             let roster = lock_roster(&ep.roster);
             if let Some(pid) = peer_opt.filter(|s| !s.is_empty()) {
-                match lookup_v2_mailbox_secret_for_target(&roster, pid) {
-                    Ok(sec) => vec![sec],
+                match lookup_v2_target_secret(&roster, pid) {
+                    Ok(sec) => vec![*sec],
                     Err((rc, msg)) => {
                         set_last_error(msg);
                         return rc;
                     }
                 }
             } else {
-                let list: Vec<[u8; 32]> = roster
-                    .entries()
-                    .filter(|(_, e)| e.state == PeerState::Active)
-                    .filter_map(|(_, e)| e.v2_secrets.as_ref().map(|s| *s.mailbox_secret()))
+                let list: Vec<[u8; 32]> = active_v2_mailbox_secrets(&roster)
+                    .into_iter()
+                    .map(|(_, s)| *s)
                     .collect();
                 if list.is_empty() {
                     set_last_error("no active v2 peers with mailbox_secret in roster");
@@ -5041,7 +5220,7 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_initiate(
                 endpoint_s,
                 now_unix(),
             ) {
-                Ok(s) => Some(s),
+                Ok(s) => Some(*s),
                 Err(e) => {
                     set_last_error(e.to_string());
                     return TENDRIL_ERR_PROTOCOL;
@@ -5102,6 +5281,9 @@ pub unsafe extern "C" fn tendril_endpoint_pair_v2_initiate(
                     }) {
                         set_last_error(msg);
                         return rc;
+                    }
+                    if host_pin_verified {
+                        ep.sync_p2p_v2_listeners();
                     }
                     let out = serde_json::json!({
                         "device_id": dev_id,
@@ -5412,7 +5594,10 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
         });
 
         let synced = if accepted.get() {
-            ep.commit_held_revocations()
+            let sync_res = ep.commit_held_revocations();
+            #[cfg(feature = "p2p-iroh")]
+            ep.stop_unusable_p2p_v2_listeners();
+            sync_res
         } else {
             Ok(())
         };
@@ -5435,6 +5620,8 @@ pub unsafe extern "C" fn tendril_session_accept_v2(
                     route_access: ep.route_access.clone(),
                     local_device_id: ep.identity.device_id(),
                     initiator: false,
+                    #[cfg(feature = "p2p-iroh")]
+                    p2p_v2_sync: Arc::clone(&ep.p2p_v2_sync),
                     session,
                 }))
             }
@@ -5871,7 +6058,12 @@ unsafe fn pair_uri_impl(
             }
         };
     let res = match outcome {
-        Ok(r) => r,
+        Ok(r) => {
+            if r.host_confirmed {
+                ep.sync_p2p_v2_listeners();
+            }
+            r
+        }
         Err(error) => {
             set_last_error(error);
             return TENDRIL_ERR_PROTOCOL;
@@ -7058,17 +7250,13 @@ mod p2p_dialer_option_tests {
         let uri = format!("iroh://{BASEPOINT_ID}?relay=http://127.0.0.1:9/");
         let mut cfg = EndpointTransportConfig::default();
         cfg.p2p_allow_private_addrs = Some(true);
-        let opts = cfg
-            .build_p2p_dialer_options(&uri, None, PowerProfile::Standard)
-            .expect("options");
+        let opts = cfg.build_p2p_dialer_options(&uri, None).expect("options");
         assert!(matches!(opts.relay_mode, P2pRelayMode::Custom(_)));
         assert!(!opts.resolve_pkarr);
         assert!(!opts.publish_pkarr);
 
         let plain = format!("iroh://{BASEPOINT_ID}");
-        let opts = cfg
-            .build_p2p_dialer_options(&plain, None, PowerProfile::Standard)
-            .expect("options");
+        let opts = cfg.build_p2p_dialer_options(&plain, None).expect("options");
         assert!(matches!(opts.relay_mode, P2pRelayMode::N0Public));
         assert!(opts.resolve_pkarr);
     }
@@ -7111,7 +7299,7 @@ mod p2p_dialer_option_tests {
         let mut cfg = EndpointTransportConfig::default();
         cfg.p2p_allow_private_addrs = Some(true);
         let opts = cfg
-            .build_p2p_dialer_options(&uri, Some("http://127.0.0.1:3340/"), PowerProfile::Standard)
+            .build_p2p_dialer_options(&uri, Some("http://127.0.0.1:3340/"))
             .expect("options");
         match opts.relay_mode {
             P2pRelayMode::Custom(ref url) => assert_eq!(url, "http://127.0.0.1:3340/"),
@@ -7123,7 +7311,7 @@ mod p2p_dialer_option_tests {
     fn bearer_auth_is_refused_on_untrusted_uri_relay() {
         let uri = format!("iroh://{BASEPOINT_ID}?relay=http://127.0.0.1:9/");
         let opts = bearer_cfg()
-            .build_p2p_dialer_options(&uri, None, PowerProfile::Standard)
+            .build_p2p_dialer_options(&uri, None)
             .expect("options");
         assert!(opts.relay_auth.is_some());
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -7148,11 +7336,240 @@ mod p2p_net_option_tests {
     }
 
     #[test]
-    fn defaults_keep_port_mapping_on_and_bind_everywhere() {
+    fn defaults_split_port_mapping_between_listeners_and_dialers() {
         let cfg = config("{}").expect("config");
         let opts = cfg.build_p2p_listener_options(None).expect("listener");
-        assert!(opts.port_mapping);
+        assert_eq!(
+            opts.port_mapping,
+            tendril_runtime::default_p2p_listener_port_mapping()
+        );
         assert_eq!(opts.bind_addrs, P2pBindAddrs::AllInterfaces);
+        let v2_opts = cfg
+            .build_p2p_v2_listener_options_with_profile(None, PowerProfile::Standard)
+            .expect("v2 listener");
+        assert_eq!(
+            v2_opts.port_mapping,
+            tendril_runtime::default_p2p_listener_port_mapping()
+        );
+        assert!(!v2_opts.publish_pkarr && !v2_opts.resolve_pkarr);
+
+        let endpoint = format!("iroh://{BASEPOINT_ID}");
+        assert!(
+            !cfg.build_p2p_dialer_options(&endpoint, None)
+                .expect("dialer")
+                .port_mapping
+        );
+        let hints = cfg.hint_dialers(None, None).expect("hints");
+        assert!(!hints.config().p2p_port_mapping);
+
+        let mut g_cfg = config("{}").expect("config");
+        g_cfg.p2p_relay_mode = Some(P2pRelayMode::Disabled);
+        assert!(!g_cfg.build_p2p_group_options().expect("group").port_mapping);
+
+        let explicit_on = config(r#"{"p2p_port_mapping":true}"#).expect("explicit on");
+        assert!(
+            explicit_on
+                .build_p2p_dialer_options(&endpoint, None)
+                .expect("dialer opt-in")
+                .port_mapping
+        );
+        assert!(
+            explicit_on
+                .hint_dialers(None, None)
+                .expect("hints opt-in")
+                .config()
+                .p2p_port_mapping
+        );
+    }
+
+    #[test]
+    fn p2p_ephemeral_disables_pkarr_unless_opted_in() {
+        let eph = config(r#"{"p2p_ephemeral":true}"#).expect("ephemeral");
+        let opts = eph.build_p2p_listener_options(None).expect("listener");
+        assert!(!opts.publish_pkarr);
+        assert!(!opts.resolve_pkarr);
+
+        let eph_opt_in = config(r#"{"p2p_ephemeral":true,"p2p_pkarr":true}"#).expect("opt in");
+        let opts_in = eph_opt_in
+            .build_p2p_listener_options(None)
+            .expect("listener");
+        assert!(opts_in.publish_pkarr);
+        assert!(opts_in.resolve_pkarr);
+    }
+
+    #[test]
+    fn serve_p2p_v2_dynamic_sync_binds_confirms_revokes_and_closes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_c = std::ffi::CString::new(dir.path().to_str().unwrap()).unwrap();
+        let host_c = std::ffi::CString::new("host-v2-dyn").unwrap();
+        let ep = unsafe { tendril_endpoint_new(state_c.as_ptr(), host_c.as_ptr()) };
+        assert!(!ep.is_null());
+
+        let cfg_c = std::ffi::CString::new(
+            r#"{"p2p_relay_mode":"disabled","p2p_port_mapping":false,"p2p_bind_addrs":["127.0.0.1:0"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { tendril_endpoint_configure_transports_json(ep, cfg_c.as_ptr()) },
+            TENDRIL_OK
+        );
+
+        let mut out_ep: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_serve_p2p_v2(ep, ptr::null(), ptr::null(), &mut out_ep) },
+            TENDRIL_OK,
+            "serve_p2p_v2 must succeed with 0 active peers"
+        );
+        let advertised = unsafe { std::ffi::CStr::from_ptr(out_ep) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { tendril_string_free(out_ep) };
+        assert_eq!(advertised, "iroh://v2");
+
+        let peer = EndpointIdentity::generate().unwrap();
+        let peer_id = peer.host_id().to_owned();
+        let ep_ref = unsafe { &*ep };
+        ep_ref
+            .mutate_roster(|r| {
+                r.apply_v2_pair_initiator_outcome(
+                    &V2PairOutcome::InitiatorPending {
+                        device_id: peer.device_id(),
+                        host_id: peer_id.clone(),
+                        host_static_pub: *peer.static_key().public_bytes(),
+                        host_signing_pub: peer.signing_key().public_key().clone(),
+                        pairing_sas: "123456".to_owned(),
+                        host_rotation_seq: 0,
+                        v2_secrets: tendril_core::roster::V2PeerSecrets::new(
+                            [0x61; 32], [0x62; 32],
+                        ),
+                        host_pin_verified: false,
+                    },
+                    "peer".to_owned(),
+                    Vec::new(),
+                )
+                .map(|_| ())
+                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(
+            ep_ref.p2p_v2_sync.active_listener_count(),
+            0,
+            "pending peer must not bind dynamic iroh://v2 listener"
+        );
+
+        let pid_c = std::ffi::CString::new(peer_id.as_str()).unwrap();
+        let sas_c = std::ffi::CString::new("123456").unwrap();
+        assert_eq!(
+            unsafe { tendril_endpoint_confirm_peer(ep, pid_c.as_ptr(), sas_c.as_ptr()) },
+            TENDRIL_OK
+        );
+        assert_eq!(
+            ep_ref.p2p_v2_sync.active_listener_count(),
+            1,
+            "confirm_peer must auto-spawn dynamic iroh://v2 listener"
+        );
+        // Repeated identical dynamic call must not spawn duplicate listeners.
+        let mut adv2: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_serve_p2p_v2(ep, ptr::null(), ptr::null(), &mut adv2) },
+            TENDRIL_OK
+        );
+        unsafe { tendril_string_free(adv2) };
+        assert_eq!(ep_ref.p2p_v2_sync.slot_count(), 1);
+        assert_eq!(ep_ref.p2p_v2_sync.active_listener_count(), 1);
+
+        assert_eq!(
+            unsafe { tendril_endpoint_revoke_peer(ep, pid_c.as_ptr()) },
+            TENDRIL_OK
+        );
+        assert_eq!(
+            ep_ref.p2p_v2_sync.active_listener_count(),
+            0,
+            "revoke_peer must immediately stop dynamic iroh://v2 listener"
+        );
+
+        assert_eq!(unsafe { tendril_endpoint_close(ep) }, TENDRIL_OK);
+        assert!(ep_ref.p2p_v2_sync.is_closed());
+        unsafe { tendril_endpoint_free(ep) };
+    }
+
+    #[test]
+    fn serve_p2p_v2_explicit_peer_stops_on_revoke_and_close() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_c = std::ffi::CString::new(dir.path().to_str().unwrap()).unwrap();
+        let host_c = std::ffi::CString::new("host-v2-explicit").unwrap();
+        let ep = unsafe { tendril_endpoint_new(state_c.as_ptr(), host_c.as_ptr()) };
+        assert!(!ep.is_null());
+
+        let cfg_c = std::ffi::CString::new(
+            r#"{"p2p_relay_mode":"disabled","p2p_port_mapping":false,"p2p_bind_addrs":["127.0.0.1:0"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { tendril_endpoint_configure_transports_json(ep, cfg_c.as_ptr()) },
+            TENDRIL_OK
+        );
+
+        let peer = EndpointIdentity::generate().unwrap();
+        let peer_id = peer.host_id().to_owned();
+        let ep_ref = unsafe { &*ep };
+        ep_ref
+            .mutate_roster(|r| {
+                r.apply_v2_pair_initiator_outcome(
+                    &V2PairOutcome::InitiatorPending {
+                        device_id: peer.device_id(),
+                        host_id: peer_id.clone(),
+                        host_static_pub: *peer.static_key().public_bytes(),
+                        host_signing_pub: peer.signing_key().public_key().clone(),
+                        pairing_sas: "654321".to_owned(),
+                        host_rotation_seq: 0,
+                        v2_secrets: tendril_core::roster::V2PeerSecrets::new(
+                            [0x63; 32], [0x64; 32],
+                        ),
+                        host_pin_verified: false,
+                    },
+                    "peer".to_owned(),
+                    Vec::new(),
+                )
+                .map(|_| ())
+                .map_err(|e| (TENDRIL_ERR_PROTOCOL, e.to_string()))
+            })
+            .unwrap();
+
+        let pid_c = std::ffi::CString::new(peer_id.as_str()).unwrap();
+        let sas_c = std::ffi::CString::new("654321").unwrap();
+        assert_eq!(
+            unsafe { tendril_endpoint_confirm_peer(ep, pid_c.as_ptr(), sas_c.as_ptr()) },
+            TENDRIL_OK
+        );
+
+        let mut out_ep: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe { tendril_endpoint_serve_p2p_v2(ep, ptr::null(), pid_c.as_ptr(), &mut out_ep) },
+            TENDRIL_OK
+        );
+        let advertised = unsafe { std::ffi::CStr::from_ptr(out_ep) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { tendril_string_free(out_ep) };
+        assert_eq!(advertised, "iroh://v2");
+        assert_eq!(ep_ref.p2p_v2_sync.slot_count(), 0);
+        assert_eq!(ep_ref.p2p_v2_sync.active_listener_count(), 1);
+
+        assert_eq!(
+            unsafe { tendril_endpoint_revoke_peer(ep, pid_c.as_ptr()) },
+            TENDRIL_OK
+        );
+        assert_eq!(
+            ep_ref.p2p_v2_sync.active_listener_count(),
+            0,
+            "revoke_peer must immediately stop explicit iroh://v2 listener"
+        );
+
+        assert_eq!(unsafe { tendril_endpoint_close(ep) }, TENDRIL_OK);
+        unsafe { tendril_endpoint_free(ep) };
     }
 
     #[test]
@@ -7171,8 +7588,7 @@ mod p2p_net_option_tests {
             ("listener", cfg.build_p2p_listener_options(None).expect("l")),
             (
                 "dialer",
-                cfg.build_p2p_dialer_options(&endpoint, None, PowerProfile::Standard)
-                    .expect("d"),
+                cfg.build_p2p_dialer_options(&endpoint, None).expect("d"),
             ),
             ("group", cfg.build_p2p_group_options().expect("g")),
             (
