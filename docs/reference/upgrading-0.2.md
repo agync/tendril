@@ -14,3 +14,4 @@ tags: [reference, upgrade, breaking-changes, release]
 - **Swift refusal error.** `TendrilError` gains the `.refused(TendrilRefusal)` case. Exhaustive `switch` statements over `TendrilError` need a new arm.
 - **Revocation notices by default.** `revoke_peer` (C ABI, Python, Node) and `tendril revoke` record a refusal notice per the endpoint refusal policy, so the revoked device is told it was revoked. Pass `notify: false` or `--no-notify` to revoke silently.
 - **Refusals on the wire.** A host now answers a known revoked or pending peer with an authenticated refusal (Wire v1 close `4001` or `4004`, a sealed refusal on Wire v2) instead of dropping it silently. Strangers still see no difference.
+- **Revocation lists only grow.** A newer CRL that drops a device or grant nonce revoked by an older CRL from the same issuer is rejected. Issuers must carry earlier revocations forward.
