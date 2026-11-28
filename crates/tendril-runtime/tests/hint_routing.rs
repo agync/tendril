@@ -1494,3 +1494,30 @@ async fn sole_wt_candidate_errors_when_webtransport_feature_is_disabled() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn pairing_rejects_operator_iroh_v2_upfront() {
+    use tendril_core::error::CoreError;
+    use tendril_core::identity::EndpointIdentity;
+    use tendril_runtime::{
+        PairPolicyOptions, RosterAccess, RuntimeError, drive_pair_initiator_with_policy,
+    };
+
+    let me = Arc::new(EndpointIdentity::generate().unwrap());
+    let store = RosterAccess::memory(tendril_core::roster::Roster::new());
+    let mut opts = PairPolicyOptions::new(
+        "Phone",
+        "phone",
+        "TND-ABCD-EFGH-JKLM",
+        Arc::new(HintDialers::new(HintDialerConfig::default())),
+    );
+    opts.operator_endpoint = Some("iroh://v2?relay=https://127.0.0.1/".to_owned());
+    let err = drive_pair_initiator_with_policy(me, &store, opts)
+        .await
+        .expect_err("operator iroh://v2 must fail upfront");
+    assert!(matches!(
+        err.error,
+        RuntimeError::Core(CoreError::InvalidPairingUri(ref msg))
+            if msg.contains("iroh://v2 is not used for pairing")
+    ));
+}

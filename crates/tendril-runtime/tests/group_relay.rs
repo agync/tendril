@@ -562,3 +562,71 @@ async fn v1_relay_siblings_link_and_revocation_cuts_the_removed_member_off() {
     pool_b.close();
     pool_c.close();
 }
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test(flavor = "multi_thread")]
+async fn p2p_v2_group_siblings_link_suppress_v1_and_drop_removed_member() {
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use tendril_runtime::{P2pBindAddrs, P2pOptions, parse_p2p_relay_modes};
+
+    let mut relay_cfg =
+        iroh_relay::server::RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    relay_cfg.key_cache_capacity = Some(1024);
+    let mut server_cfg = iroh_relay::server::ServerConfig::default();
+    server_cfg.relay = Some(relay_cfg);
+    let iroh_srv = iroh_relay::server::Server::spawn(server_cfg)
+        .await
+        .expect("spawn iroh-relay");
+    let relay_url = format!("http://{}", iroh_srv.http_addr().expect("http addr"));
+    let mode = parse_p2p_relay_modes(std::slice::from_ref(&relay_url)).expect("mode");
+    let loopback = P2pBindAddrs::Only {
+        v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        v6: None,
+    };
+
+    let a = Node::new(60);
+    let b = Node::new(61);
+    let c = Node::new(62);
+    let dead_v1 = format!(
+        "iroh://{}",
+        iroh::SecretKey::from_bytes(&[0x61; 32]).public()
+    );
+    let v2_hint = format!("iroh://v2?relay={relay_url}");
+    let hints = vec![dead_v1, v2_hint];
+    let (gid, m1, s1) = seed(&[&a, &b, &c], &[vec![], hints.clone(), hints]);
+
+    let make_cfg = || {
+        let p2p_opts = P2pOptions::for_dialer(mode.clone())
+            .with_allow_private_addrs(true)
+            .with_port_mapping(false)
+            .with_bind_addrs(loopback.clone());
+        GroupPoolConfig::new(vec![])
+            .with_relay_listen(true)
+            .with_p2p_options(p2p_opts)
+    };
+    let pool_b = open(&b, &gid, make_cfg());
+    let pool_c = open(&c, &gid, make_cfg());
+
+    deliver_to(&pool_b, &c, b"over-iroh-v2-group").await;
+    expect_data(&pool_c, b"over-iroh-v2-group").await;
+    let pw = pairwise(&b, &gid, &c);
+    assert!(pw.is_some());
+    wait_until(|| pairwise(&c, &gid, &b) == pw).await;
+
+    let (m2, s2) = remove_member(
+        &m1,
+        &GroupSigner::root(a.identity.signing_key()),
+        &c.id(),
+        &s1,
+        GroupBuildParams::new(now()),
+    )
+    .unwrap();
+    store(&b, &m2, Some(&s2));
+    wait_until(|| pool_b.connected_peers().is_empty()).await;
+    wait_until(|| pool_c.connected_peers().is_empty()).await;
+    let report = pool_c.broadcast(None, b"removed-p2p-v2").await.unwrap();
+    assert!(!report.delivered.contains(&b.id()), "{report:?}");
+
+    pool_b.close();
+    pool_c.close();
+}

@@ -28,6 +28,7 @@ use tendril_core::group::{
 };
 pub use tendril_core::group::{MAX_GROUPS_PER_SIGNER, MAX_LOCAL_GROUPS, MAX_STORED_GROUPS};
 use tendril_core::identity::EndpointIdentity;
+use tendril_core::pairing::is_v2_p2p_hint;
 use tendril_core::policy::{CandidateEndpoint, PathPolicyConfig, ProviderId};
 use tendril_core::roster::{PeerState, Roster, RosterEntry, V2PeerSecrets};
 use tendril_core::v2::{MAX_PADDED_PAYLOAD_LEN, PaddingPolicy, canonical_relay_host};
@@ -45,6 +46,14 @@ use crate::error::RuntimeError;
 use crate::power::PowerProfile;
 use crate::provider::{
     DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream, PrefixedPathStream, peek_exact,
+};
+#[cfg(feature = "p2p-iroh")]
+use crate::providers::p2p::parse_v2_p2p_relays;
+#[cfg(feature = "p2p-iroh")]
+use crate::providers::relay_v2::MailboxSecretSource;
+#[cfg(feature = "p2p-iroh")]
+use crate::providers::{
+    P2pOptions, P2pRelayMode, P2pV2Dialer, P2pV2Listener, parse_p2p_relay_modes,
 };
 use crate::providers::{
     RelayClientAuth, RelayListener, RelayListenerConfig, RelayV2Dialer, RelayV2Listener,
@@ -135,6 +144,13 @@ pub struct GroupPoolConfig {
     pub served_v1_relays: Vec<String>,
     /// Power profile for relay mailbox listeners and store watch fallback cadence.
     pub power_profile: PowerProfile,
+    /// Optional `iroh` P2P options for `iroh://v2` group listeners and sibling dials.
+    #[cfg(feature = "p2p-iroh")]
+    pub p2p_options: Option<P2pOptions>,
+    /// Optional explicit override for group `iroh://v2` listener `port_mapping`; `None` preserves
+    /// the platform/profile listener default (`false` under [`PowerProfile::LowPower`]).
+    #[cfg(feature = "p2p-iroh")]
+    pub p2p_listener_port_mapping: Option<bool>,
 }
 
 impl GroupPoolConfig {
@@ -154,6 +170,10 @@ impl GroupPoolConfig {
             relay_listen: false,
             served_v1_relays: Vec::new(),
             power_profile: PowerProfile::Standard,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_options: None,
+            #[cfg(feature = "p2p-iroh")]
+            p2p_listener_port_mapping: None,
         }
     }
 
@@ -162,6 +182,22 @@ impl GroupPoolConfig {
     pub fn with_power_profile(mut self, power_profile: PowerProfile) -> Self {
         self.power_profile = power_profile;
         self.policy = power_profile.path_policy();
+        self
+    }
+
+    /// Sets the `iroh` P2P options for `iroh://v2` group listeners and sibling dials.
+    #[cfg(feature = "p2p-iroh")]
+    #[must_use]
+    pub fn with_p2p_options(mut self, p2p_options: P2pOptions) -> Self {
+        self.p2p_options = Some(p2p_options);
+        self
+    }
+
+    /// Sets an explicit `port_mapping` override for group `iroh://v2` listeners.
+    #[cfg(feature = "p2p-iroh")]
+    #[must_use]
+    pub fn with_p2p_listener_port_mapping(mut self, port_mapping: Option<bool>) -> Self {
+        self.p2p_listener_port_mapping = port_mapping;
         self
     }
 
@@ -875,9 +911,23 @@ struct Inner {
     watcher_started: AtomicBool,
     tasks: Mutex<Vec<AbortHandle>>,
     relay_mailboxes: Mutex<HashMap<String, MailboxListener>>,
+    #[cfg(feature = "p2p-iroh")]
+    p2p_mailboxes: Mutex<HashMap<String, P2pMailboxListener>>,
     #[cfg(test)]
     hooks: TestHooks,
 }
+
+#[cfg(feature = "p2p-iroh")]
+struct P2pMailboxListener {
+    relay_mode: P2pRelayMode,
+    secret: Zeroizing<[u8; 32]>,
+    secret_cell: Arc<Mutex<Option<Zeroizing<[u8; 32]>>>>,
+    task: AbortHandle,
+    retry_after: Option<Instant>,
+}
+
+#[cfg(feature = "p2p-iroh")]
+type P2pMailboxPlan = Vec<(String, P2pRelayMode, Zeroizing<[u8; 32]>)>;
 
 /// One relay mailbox listener task, keyed in [`Inner::relay_mailboxes`] by kind and canonical
 /// relay host.
@@ -1106,6 +1156,8 @@ impl GroupPool {
                 watcher_started: AtomicBool::new(false),
                 tasks: Mutex::new(Vec::new()),
                 relay_mailboxes: Mutex::new(HashMap::new()),
+                #[cfg(feature = "p2p-iroh")]
+                p2p_mailboxes: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 hooks: TestHooks::default(),
             }),
@@ -1186,15 +1238,23 @@ impl GroupPool {
                     return;
                 }
                 let mut st = inner.lock_state();
-                let plan = match inner.refresh_locked(&mut st) {
+                let refreshed = inner.refresh_locked(&mut st);
+                let plan = match &refreshed {
                     Ok(()) => inner.relay_mailbox_plan_locked(&st),
                     Err(err) => {
                         tracing::debug!(error = %err, "group book refresh failed");
                         MailboxPlan::new()
                     }
                 };
+                #[cfg(feature = "p2p-iroh")]
+                let p2p_plan = match &refreshed {
+                    Ok(()) => inner.p2p_v2_plan_locked(&st),
+                    Err(_) => Vec::new(),
+                };
                 drop(st);
                 inner.reconcile_relay_mailboxes(plan);
+                #[cfg(feature = "p2p-iroh")]
+                inner.reconcile_p2p_mailboxes(p2p_plan);
             }
         });
         self.inner.track(task.abort_handle());
@@ -1505,6 +1565,20 @@ impl GroupPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain()
         {
+            mailbox.task.abort();
+        }
+        #[cfg(feature = "p2p-iroh")]
+        for (_, mailbox) in self
+            .inner
+            .p2p_mailboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+        {
+            *mailbox
+                .secret_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             mailbox.task.abort();
         }
         self.disconnect_all();
@@ -2204,18 +2278,147 @@ fn member_static(manifest: &GroupManifest, device_id: &str) -> Option<[u8; 32]> 
         .and_then(|m| b64url_decode_array::<32>(&m.static_pub).ok())
 }
 
-/// Dial candidates for `hints`; `/v2/relay` hints are kept only when `v2_relay` (a mailbox
-/// secret to dial them with is known).
-fn candidates_from_hints(hints: &[String], v2_relay: bool) -> Vec<CandidateEndpoint> {
-    hints
-        .iter()
-        .enumerate()
-        .filter(|(_, hint)| v2_relay || !is_v2_relay_url(hint))
-        .filter_map(|(id, hint)| {
-            let (provider, addr) = classify_hint(hint)?;
-            Some(CandidateEndpoint::new(id, provider, addr))
-        })
-        .collect()
+/// Dial candidates for `hints`; `/v2/relay` hints need `v2_relay`, `iroh://v2` hints need
+/// `v2_p2p`. When `v2_p2p` holds and an `iroh://v2` hint is present, sibling v1 `iroh://<id>`
+/// hints are suppressed.
+fn candidates_from_hints(hints: &[String], v2_relay: bool, v2_p2p: bool) -> Vec<CandidateEndpoint> {
+    let suppress_v1_p2p = v2_p2p && hints.iter().any(|hint| is_v2_p2p_hint(hint));
+    let mut out = Vec::new();
+    for hint in hints {
+        if is_v2_relay_url(hint) && !v2_relay {
+            continue;
+        }
+        if is_v2_p2p_hint(hint) && !v2_p2p {
+            continue;
+        }
+        let Some((provider, addr)) = classify_hint(hint) else {
+            continue;
+        };
+        if suppress_v1_p2p && provider == ProviderId::P2p && !is_v2_p2p_hint(hint) {
+            continue;
+        }
+        out.push(CandidateEndpoint::new(out.len(), provider, addr));
+    }
+    out
+}
+
+#[cfg(feature = "p2p-iroh")]
+fn p2p_relay_mode_key(mode: &P2pRelayMode) -> String {
+    match mode {
+        P2pRelayMode::Disabled => "disabled".to_owned(),
+        P2pRelayMode::N0Public => "default".to_owned(),
+        P2pRelayMode::Custom(u) => {
+            let url = url::Url::parse(u).map_or_else(|_| u.clone(), |u| u.to_string());
+            format!("custom:{url}")
+        }
+        P2pRelayMode::CustomMany(urls) => {
+            let mut norm: Vec<String> = urls
+                .iter()
+                .map(|u| url::Url::parse(u).map_or_else(|_| u.clone(), |u| u.to_string()))
+                .collect();
+            norm.sort();
+            norm.dedup();
+            format!("custom:{}", norm.join(" "))
+        }
+    }
+}
+
+/// `(relay set key, relay mode, group mailbox secret)` for each unique relay set named by the
+/// local member's `iroh://v2` hints when `relay_listen` is set, the group's `min_wire_version >= 2`,
+#[cfg(feature = "p2p-iroh")]
+pub(crate) fn build_group_p2p_v2_listener_options(
+    relay_mode: P2pRelayMode,
+    cfg_opts: Option<&P2pOptions>,
+    listener_port_mapping: Option<bool>,
+) -> P2pOptions {
+    let mut options = P2pOptions::for_v2_listener(relay_mode);
+    if let Some(cfg) = cfg_opts {
+        options.bind_addrs = cfg.bind_addrs.clone();
+        options.allow_private_addrs = cfg.allow_private_addrs;
+        if let Some(ref auth) = cfg.relay_auth
+            && matches!(
+                options.relay_mode,
+                P2pRelayMode::Custom(_) | P2pRelayMode::CustomMany(_)
+            )
+        {
+            let target_urls = crate::providers::p2p::configured_relay_urls(&options.relay_mode);
+            let allowed_urls: HashSet<String> =
+                crate::providers::p2p::configured_relay_urls(&cfg.relay_mode)
+                    .into_iter()
+                    .filter_map(|raw| url::Url::parse(&raw).ok().map(|u| u.as_str().to_owned()))
+                    .collect();
+            let all_configured = !target_urls.is_empty()
+                && target_urls.iter().all(|raw| {
+                    url::Url::parse(raw)
+                        .ok()
+                        .is_some_and(|u| allowed_urls.contains(u.as_str()))
+                });
+            if all_configured {
+                options.relay_auth = Some(auth.clone());
+            }
+        }
+    }
+    if let Some(pm) = listener_port_mapping {
+        options.port_mapping = pm;
+    }
+    options
+}
+
+/// Returns the `(relay_key, relay_mode, group_mailbox_secret)` listeners required for `local_id`:
+/// one per unique relay set in the member's `iroh://v2` endpoints, only when `min_wire_version >= 2`,
+/// the local device is an active, root-CRL-clean member, and `pair_bootstrap` holds.
+#[cfg(feature = "p2p-iroh")]
+fn p2p_v2_plan(
+    book: &GroupBook,
+    crl: Option<&RevocationList>,
+    group_id: &str,
+    local_id: &str,
+    now: u64,
+    relay_listen: bool,
+    default_options: Option<&P2pOptions>,
+) -> P2pMailboxPlan {
+    if !relay_listen
+        || recipient_ok(book, group_id, crl, local_id, local_id).is_err()
+        || book
+            .pair_bootstrap(group_id, local_id, local_id, now)
+            .is_err()
+    {
+        return Vec::new();
+    }
+    let (Some(manifest), Some(secrets)) = (book.manifest(group_id), book.secrets(group_id)) else {
+        return Vec::new();
+    };
+    if manifest.min_wire_version < 2 {
+        return Vec::new();
+    }
+    let Some(member) = manifest.members.iter().find(|m| m.device_id == local_id) else {
+        return Vec::new();
+    };
+    let mut plan: P2pMailboxPlan = Vec::new();
+    for hint in member.endpoints.iter().filter(|h| is_v2_p2p_hint(h)) {
+        let Ok(relays) = parse_v2_p2p_relays(hint) else {
+            continue;
+        };
+        let (key, mode) = if relays.is_empty() {
+            let mode = default_options.map_or(P2pRelayMode::N0Public, |o| o.relay_mode.clone());
+            (p2p_relay_mode_key(&mode), mode)
+        } else {
+            let mut urls: Vec<String> = relays.iter().map(ToString::to_string).collect();
+            urls.sort();
+            urls.dedup();
+            let Ok(mode) = parse_p2p_relay_modes(&urls) else {
+                continue;
+            };
+            (format!("custom:{}", urls.join(" ")), mode)
+        };
+        if plan.iter().any(|(k, _, _)| *k == key) {
+            continue;
+        }
+        let secret =
+            derive_group_mailbox_secret(secrets.group_rendezvous_key(), secrets.seq(), local_id);
+        plan.push((key, mode, secret));
+    }
+    plan
 }
 
 /// Parses a `ws://` or `wss://` relay hint, with or without the `relay:` prefix.
@@ -2359,6 +2562,37 @@ impl PathDialer for SiblingRelayDialer {
             return v1.dial(endpoint).await;
         }
         v1.dial(&format!("{endpoint}#{}", self.relay_pub)).await
+    }
+}
+
+/// The `iroh` P2P dialer for one peer dial: `iroh://v2` hints go to a [`P2pV2Dialer`] on the
+/// target's mailbox secret, and legacy `iroh://<id>` hints go to the configured v1 P2P dialer.
+#[cfg(feature = "p2p-iroh")]
+struct SiblingP2pDialer {
+    v1: Option<Arc<dyn PathDialer>>,
+    v2: Option<P2pV2Dialer>,
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[async_trait::async_trait]
+impl PathDialer for SiblingP2pDialer {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::P2p
+    }
+
+    async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
+        if is_v2_p2p_hint(endpoint) {
+            let v2 = self
+                .v2
+                .as_ref()
+                .ok_or_else(|| RuntimeError::Protocol("no v2 p2p mailbox secret".to_owned()))?;
+            return v2.dial(endpoint).await;
+        }
+        let v1 = self
+            .v1
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Protocol("no p2p dialer".to_owned()))?;
+        v1.dial(endpoint).await
     }
 }
 
@@ -2686,6 +2920,119 @@ impl Inner {
         match bound {
             Ok((listener, _claim)) => accept_loop(weak, listener, false).await,
             Err(err) => tracing::debug!(error = %err, "group relay mailbox not registered"),
+        }
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn p2p_v2_plan_locked(&self, st: &PoolState) -> P2pMailboxPlan {
+        let now = current_unix_secs();
+        p2p_v2_plan(
+            &st.book,
+            st.crl.as_ref(),
+            &self.group_id,
+            &self.local_id,
+            now,
+            self.cfg.relay_listen,
+            self.cfg.p2p_options.as_ref(),
+        )
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    fn reconcile_p2p_mailboxes(self: &Arc<Self>, plan: P2pMailboxPlan) {
+        let mut mailboxes = self
+            .p2p_mailboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        mailboxes.retain(|key, current| {
+            let keep = plan.iter().any(|(k, mode, secret)| {
+                k == key
+                    && *mode == current.relay_mode
+                    && bool::from(secret.ct_eq(&*current.secret))
+            });
+            if !keep {
+                *current
+                    .secret_cell
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                current.task.abort();
+            }
+            keep
+        });
+        let now = Instant::now();
+        for (key, relay_mode, secret) in plan {
+            if let Some(current) = mailboxes.get_mut(&key) {
+                if !current.task.is_finished() {
+                    continue;
+                }
+                match current.retry_after {
+                    None => {
+                        current.retry_after = Some(now + MAILBOX_RETRY_DELAY);
+                        continue;
+                    }
+                    Some(at) if now < at => continue,
+                    Some(_) => {}
+                }
+            }
+            let secret_cell = Arc::new(Mutex::new(Some(secret.clone())));
+            let task = tokio::spawn(Self::run_p2p_mailbox(
+                Arc::downgrade(self),
+                relay_mode.clone(),
+                Arc::clone(&secret_cell),
+            ));
+            self.track(task.abort_handle());
+            mailboxes.insert(
+                key,
+                P2pMailboxListener {
+                    relay_mode,
+                    secret,
+                    secret_cell,
+                    task: task.abort_handle(),
+                    retry_after: None,
+                },
+            );
+        }
+    }
+
+    #[cfg(feature = "p2p-iroh")]
+    async fn run_p2p_mailbox(
+        weak: Weak<Self>,
+        relay_mode: P2pRelayMode,
+        secret_cell: Arc<Mutex<Option<Zeroizing<[u8; 32]>>>>,
+    ) {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        {
+            let _mailboxes = inner
+                .p2p_mailboxes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.closed.load(Ordering::Acquire) {
+                return;
+            }
+        }
+        let listener_port_mapping = inner
+            .cfg
+            .p2p_listener_port_mapping
+            .or_else(|| (!inner.cfg.power_profile.p2p_port_mapping_default()).then_some(false));
+        let options = build_group_p2p_v2_listener_options(
+            relay_mode,
+            inner.cfg.p2p_options.as_ref(),
+            listener_port_mapping,
+        );
+        drop(inner);
+        let cell = Arc::clone(&secret_cell);
+        let secret_source: MailboxSecretSource = Arc::new(move || {
+            cell.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
+        match P2pV2Listener::bind(options, secret_source).await {
+            Ok(listener) => accept_loop(weak, Box::new(listener), false).await,
+            Err(err) => tracing::debug!(error = %err, "group iroh://v2 listener not bound"),
         }
     }
 
@@ -3077,7 +3424,10 @@ impl Inner {
         if let Err(err) = self.control_authority(peer, &*recipient) {
             return Delivery::Failed(err.to_string());
         }
-        let candidates = candidates_from_hints(&member.endpoints, target.relay_mailbox.is_some());
+        let v2_p2p =
+            cfg!(feature = "p2p-iroh") && target.wire >= 2 && target.relay_mailbox.is_some();
+        let candidates =
+            candidates_from_hints(&member.endpoints, target.relay_mailbox.is_some(), v2_p2p);
         if candidates.is_empty() {
             return Delivery::Offline;
         }
@@ -3144,11 +3494,12 @@ impl Inner {
     }
 
     /// The configured dialers with the relay dialer replaced (or added) by a
-    /// [`SiblingRelayDialer`] for one target: `mailbox` for its `/v2/relay` hints (with the
-    /// pool's relay auth) and its manifest-pinned `relay_pub` for other relay hints.
+    /// [`SiblingRelayDialer`] and (when `p2p-iroh` is enabled) the `P2p` dialer wrapped in
+    /// [`SiblingP2pDialer`] for `iroh://v2` vs legacy `iroh://<id>`.
     fn relay_dialers(
         &self,
         mailbox: Option<&[u8; 32]>,
+        p2p_v2_mailbox: Option<&[u8; 32]>,
         relay_pub: &str,
     ) -> Vec<Arc<dyn PathDialer>> {
         let mut dialers = self.cfg.dialers.clone();
@@ -3164,6 +3515,34 @@ impl Inner {
             Some(i) => dialers[i] = sibling,
             None => dialers.push(sibling),
         }
+        #[cfg(feature = "p2p-iroh")]
+        {
+            let p2p_pos = dialers
+                .iter()
+                .position(|d| d.provider_id() == ProviderId::P2p);
+            if p2p_pos.is_some() || self.cfg.p2p_options.is_some() {
+                let v2 = p2p_v2_mailbox.map(|m| {
+                    let key = Zeroizing::new(*m);
+                    let source: MailboxSecretSource = Arc::new(move || Some(key.clone()));
+                    let base_opts = self
+                        .cfg
+                        .p2p_options
+                        .clone()
+                        .unwrap_or_else(|| P2pOptions::for_dialer(P2pRelayMode::N0Public));
+                    P2pV2Dialer::new(base_opts, source)
+                });
+                let sibling_p2p: Arc<dyn PathDialer> = Arc::new(SiblingP2pDialer {
+                    v1: p2p_pos.map(|i| Arc::clone(&dialers[i])),
+                    v2,
+                });
+                match p2p_pos {
+                    Some(i) => dialers[i] = sibling_p2p,
+                    None => dialers.push(sibling_p2p),
+                }
+            }
+        }
+        #[cfg(not(feature = "p2p-iroh"))]
+        let _ = p2p_v2_mailbox;
         dialers
     }
 
@@ -3181,7 +3560,8 @@ impl Inner {
             relay_mailbox,
             relay_pub,
         } = target;
-        let dialers = self.relay_dialers(relay_mailbox.as_deref(), &relay_pub);
+        let p2p_v2_mailbox = relay_mailbox.as_deref().filter(|_| wire >= 2);
+        let dialers = self.relay_dialers(relay_mailbox.as_deref(), p2p_v2_mailbox, &relay_pub);
         let roster = Arc::new(Mutex::new(roster));
         let session_roster = Arc::clone(&roster);
         let identity = Arc::clone(&self.identity);
@@ -3261,11 +3641,13 @@ impl Inner {
             .bootstrap
             .as_ref()
             .map(|s| Zeroizing::new(*s.mailbox_secret()));
-        let candidates = candidates_from_hints(&member.endpoints, mailbox.is_some());
+        let v2_p2p = cfg!(feature = "p2p-iroh") && pin.floor >= 2 && mailbox.is_some();
+        let candidates = candidates_from_hints(&member.endpoints, mailbox.is_some(), v2_p2p);
         if candidates.is_empty() {
             return Err(DialError::Offline("no usable endpoint".to_owned()));
         }
-        let dialers = self.relay_dialers(mailbox.as_deref(), &member.relay_pub);
+        let p2p_v2_mailbox = mailbox.as_deref().filter(|_| pin.floor >= 2);
+        let dialers = self.relay_dialers(mailbox.as_deref(), p2p_v2_mailbox, &member.relay_pub);
         let groups = vec![GroupSeq {
             group_id: self.group_id.clone(),
             seq: manifest.seq,

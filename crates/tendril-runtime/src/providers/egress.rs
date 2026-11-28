@@ -21,7 +21,7 @@ use tendril_core::roster::RouteSource;
 use tokio::time::timeout;
 
 #[cfg(feature = "p2p-iroh")]
-use super::p2p::{P2pRelayMode, filter_p2p_hint};
+use super::p2p::{P2pRelayMode, filter_p2p_hint, filter_v2_p2p_hint};
 use crate::advertise::{LocalAddr, NetworkSnapshot};
 use crate::error::RuntimeError;
 use crate::provider::{PathDialer, PathStream};
@@ -170,6 +170,12 @@ pub enum SkipReason {
     RelayV2NotAuthorized,
     /// A `/v2/relay` hint on a Wire v1 driver.
     WireV1NoRelayV2,
+    /// An `iroh://v2` hint that did not pass the stored-route gate.
+    P2pV2NotAuthorized,
+    /// An `iroh://v2` hint on a Wire v1 driver.
+    WireV1NoP2pV2,
+    /// A stored Wire v1 route suppressed because an authorized Wire v2 route is present.
+    SupersededByV2Route,
     /// A `wt://` hint while the `webtransport` feature is disabled.
     #[serde(rename = "webtransport_feature_disabled")]
     WebtransportFeatureDisabled,
@@ -192,6 +198,9 @@ impl SkipReason {
             Self::P2pFeatureDisabled => "p2p_feature_disabled",
             Self::RelayV2NotAuthorized => "relay_v2_not_authorized",
             Self::WireV1NoRelayV2 => "wire_v1_no_relay_v2",
+            Self::P2pV2NotAuthorized => "p2p_v2_not_authorized",
+            Self::WireV1NoP2pV2 => "wire_v1_no_p2p_v2",
+            Self::SupersededByV2Route => "superseded_by_v2_route",
             Self::WebtransportFeatureDisabled => "webtransport_feature_disabled",
             Self::UnreachableInterface => "unreachable_interface",
         }
@@ -1035,7 +1044,60 @@ pub async fn check_hint(
             let stripped = hint.strip_prefix("p2p:").unwrap_or(hint);
             #[cfg(feature = "p2p-iroh")]
             {
-                if source.is_operator() {
+                if tendril_core::pairing::is_v2_p2p_hint(stripped) {
+                    if source.is_operator() {
+                        let relays = super::p2p::parse_v2_p2p_relays(stripped).map_err(skip)?;
+                        let mut kept: Vec<String> = Vec::new();
+                        let mut any_blocked = false;
+                        for url in relays {
+                            if let Some(host) = url.host() {
+                                let blocked = match host {
+                                    url::Host::Ipv4(ip) => {
+                                        classify_destination(IpAddr::V4(ip)) == DestClass::Blocked
+                                    }
+                                    url::Host::Ipv6(ip) => {
+                                        classify_destination(IpAddr::V6(ip)) == DestClass::Blocked
+                                    }
+                                    url::Host::Domain(d) => bare_host(d)
+                                        .eq_ignore_ascii_case("metadata.google.internal"),
+                                };
+                                if blocked {
+                                    any_blocked = true;
+                                    continue;
+                                }
+                            }
+                            kept.push(format!("relay={url}"));
+                        }
+                        if any_blocked && kept.is_empty() {
+                            return Err(skip(SkipReason::BlockedAddress));
+                        }
+                        if kept.is_empty() && matches!(ctx.iroh_relay_mode, P2pRelayMode::Disabled)
+                        {
+                            return Err(skip(SkipReason::IrohRelayNotConfigured));
+                        }
+                        let kept_endpoint = if kept.is_empty() {
+                            "iroh://v2".to_owned()
+                        } else {
+                            format!("iroh://v2?{}", kept.join("&"))
+                        };
+                        let (endpoint, pins) = pin_iroh_relay_hosts(&kept_endpoint, &ctx.resolver)
+                            .await
+                            .map_err(skip)?;
+                        if endpoint == "iroh://v2"
+                            && matches!(ctx.iroh_relay_mode, P2pRelayMode::Disabled)
+                        {
+                            return Err(skip(SkipReason::IrohRelayNotConfigured));
+                        }
+                        checked.dial_endpoint = endpoint;
+                        checked.relay_pins = pins;
+                    } else {
+                        let (endpoint, dropped) =
+                            filter_v2_p2p_hint(stripped, &ctx.iroh_relay_mode).map_err(skip)?;
+                        checked.dial_endpoint = endpoint;
+                        checked.dropped_relays = dropped;
+                        checked.p2p_hint_dialer = true;
+                    }
+                } else if source.is_operator() {
                     let literal_checked =
                         strip_blocked_iroh_destinations(stripped).map_err(skip)?;
                     let (endpoint, pins) = pin_iroh_relay_hosts(&literal_checked, &ctx.resolver)

@@ -66,16 +66,20 @@ pub use providers::{
     BrokerDialer, BrokerListener, BrokerServerConfig, DirectDialer, DirectListener, EmbeddedRelay,
     LocalDialer, LocalListener, LocalReachability, OverlayConfig, OverlayDialer, OverlayListener,
     OverlayMode, OverlayResolvedMode, RelayClientAuth, RelayDialer, RelayListener,
-    RelayListenerConfig, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, dial_endpoint,
-    dial_endpoint_with_auth, is_loopback_host, is_metadata_or_link_local_ip, is_tailnet_ip,
-    select_overlay_mode,
+    RelayListenerConfig, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig,
+    active_v2_mailbox_secrets, dial_endpoint, dial_endpoint_with_auth, is_loopback_host,
+    is_metadata_or_link_local_ip, is_tailnet_ip, is_usable_v2_entry,
+    lookup_v2_mailbox_secret_for_pair, lookup_v2_mailbox_secret_for_target, select_overlay_mode,
+    usable_v2_mailbox_map,
 };
 #[cfg(feature = "p2p-iroh")]
 pub use providers::{
     MAX_P2P_CUSTOM_RELAYS, P2pBindAddrs, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth,
-    P2pRelayMode, TENDRIL_P2P_ALPN, format_p2p_endpoint, format_p2p_endpoint_with_addrs,
-    parse_p2p_bind_addrs, parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode,
-    parse_p2p_relay_modes,
+    P2pRelayMode, P2pV2Dialer, P2pV2Listener, P2pV2RosterSync, P2pV2SyncPlan, TENDRIL_P2P_ALPN,
+    default_p2p_dialer_port_mapping, default_p2p_listener_port_mapping, format_p2p_endpoint,
+    format_p2p_endpoint_with_addrs, parse_p2p_bind_addrs, parse_p2p_endpoint,
+    parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
+    probe_p2p_v2_endpoint,
 };
 #[cfg(feature = "webrtc")]
 pub use providers::{

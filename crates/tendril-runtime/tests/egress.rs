@@ -1213,3 +1213,134 @@ async fn wt_hints_enforce_ssrf_single_lookup_and_lan2_policy() {
     assert_eq!(err.skip_reason(), Some(SkipReason::BlockedAddress));
     assert_eq!(SystemResolver::lookups(), before_sys);
 }
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn v2_p2p_hints_pin_operator_relays_and_enforce_v2_grammar() {
+    use tendril_runtime::{P2pRelayMode, parse_p2p_relay_modes};
+
+    let resolver = Arc::new(
+        StubResolver::default()
+            .with("relay.example", &["203.0.113.44"])
+            .with("blocked.example", &["169.254.169.254"])
+            .failing("gone.example"),
+    );
+    let configured =
+        parse_p2p_relay_modes(&["https://allowed.example/".to_owned()]).expect("relay mode");
+    let sess_ctx = session(&resolver).with_iroh_relay_mode(configured);
+
+    // Reject ?addr=, fragments, empty query, or malformed &'s on both URI and operator paths.
+    for bad in [
+        "iroh://v2?relay=https://allowed.example/&addr=1.2.3.4:5",
+        "p2p:iroh://v2?addr=203.0.113.1:5",
+        "iroh://v2?relay=https://allowed.example/#frag",
+        "iroh://v2?",
+        "iroh://v2?relay=https://allowed.example/&",
+        "iroh://v2?unknown=1",
+    ] {
+        for source in [HintSource::Uri, HintSource::Operator] {
+            assert_eq!(
+                skipped(bad, source, &sess_ctx).await,
+                SkipReason::Invalid,
+                "{bad} {source:?}"
+            );
+        }
+    }
+
+    // URI hints filter ?relay= to configured relay_map and run through p2p_hint_dialer.
+    let filtered = checked(
+        "p2p:iroh://v2?relay=https://unconfigured.example/&relay=https://allowed.example/",
+        HintSource::Uri,
+        &sess_ctx,
+    )
+    .await;
+    assert_eq!(filtered.provider, ProviderId::P2p);
+    assert_eq!(
+        filtered.dial_endpoint,
+        "iroh://v2?relay=https://allowed.example/"
+    );
+    assert_eq!(
+        filtered.dropped_relays,
+        vec!["https://unconfigured.example/".to_owned()]
+    );
+    assert!(filtered.p2p_hint_dialer);
+
+    let all_dropped = checked(
+        "iroh://v2?relay=https://unconfigured.example/",
+        HintSource::Uri,
+        &sess_ctx,
+    )
+    .await;
+    assert_eq!(all_dropped.dial_endpoint, "iroh://v2");
+    assert_eq!(
+        all_dropped.dropped_relays,
+        vec!["https://unconfigured.example/".to_owned()]
+    );
+
+    // RelayMode::Disabled refuses URI iroh://v2 hints and operator bare iroh://v2 hints.
+    let disabled_ctx = session(&resolver).with_iroh_relay_mode(P2pRelayMode::Disabled);
+    assert_eq!(
+        skipped("iroh://v2", HintSource::Uri, &disabled_ctx).await,
+        SkipReason::IrohRelayNotConfigured
+    );
+    assert_eq!(
+        skipped("iroh://v2", HintSource::Operator, &disabled_ctx).await,
+        SkipReason::IrohRelayNotConfigured
+    );
+
+    // Operator iroh://v2 resolves domain relay= via egress resolver and pins IPs.
+    let op = checked(
+        "iroh://v2?relay=https://relay.example/",
+        HintSource::Operator,
+        &sess_ctx,
+    )
+    .await;
+    assert!(!op.p2p_hint_dialer);
+    assert_eq!(op.dial_endpoint, "iroh://v2?relay=https://relay.example/");
+    assert_eq!(
+        op.relay_pins,
+        vec![(
+            "relay.example".to_owned(),
+            vec!["203.0.113.44".parse::<IpAddr>().unwrap()]
+        )]
+    );
+
+    // Always-blocked destinations are rejected on operator hints (literals/metadata fail grammar
+    // as Invalid, DNS answers in the blocked range fail as BlockedAddress).
+    assert_eq!(
+        skipped(
+            "iroh://v2?relay=https://metadata.google.internal/",
+            HintSource::Operator,
+            &sess_ctx
+        )
+        .await,
+        SkipReason::Invalid
+    );
+    assert_eq!(
+        skipped(
+            "iroh://v2?relay=https://blocked.example/",
+            HintSource::Operator,
+            &sess_ctx
+        )
+        .await,
+        SkipReason::BlockedAddress
+    );
+    assert_eq!(
+        skipped(
+            "iroh://v2?relay=https://169.254.169.254/",
+            HintSource::Operator,
+            &sess_ctx
+        )
+        .await,
+        SkipReason::Invalid
+    );
+    assert_eq!(
+        skipped(
+            "iroh://v2?relay=https://gone.example/",
+            HintSource::Operator,
+            &sess_ctx
+        )
+        .await,
+        SkipReason::Unresolved
+    );
+}

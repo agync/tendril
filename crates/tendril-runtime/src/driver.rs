@@ -3652,6 +3652,16 @@ pub(crate) async fn plan_pairing(
         )
         .into());
     }
+    if operator
+        .as_ref()
+        .is_some_and(|op| tendril_core::pairing::is_v2_p2p_hint(&op.hint))
+    {
+        return Err(CoreError::InvalidPairingUri(
+            "iroh://v2 is not used for pairing; pair over another route, then use dial --wire-v2"
+                .into(),
+        )
+        .into());
+    }
     let operator_relay_key = operator.as_ref().and_then(|op| op.relay_key);
     let uri_rp = opts.uri.as_ref().and_then(|u| u.relay_pub);
     let binding = PairRouteBinding::new(opts.uri.clone(), operator_relay_key)?;
