@@ -1476,7 +1476,7 @@ async fn sole_wt_candidate_errors_when_webtransport_feature_is_disabled() {
         Arc::new(HintDialers::new(HintDialerConfig::default())),
         DialWire::V1,
     );
-    let err = build_pairing_candidates(
+    let Err(err) = build_pairing_candidates(
         &[HintInput::new(
             "wt://127.0.0.1:4433?certhash=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             HintSource::Uri,
@@ -1486,8 +1486,9 @@ async fn sole_wt_candidate_errors_when_webtransport_feature_is_disabled() {
         &opts,
     )
     .await
-    .err()
-    .expect("sole wt candidate without feature must error");
+    else {
+        panic!("sole wt candidate without feature must error");
+    };
     assert!(
         err.to_string()
             .contains("webtransport feature is not enabled"),

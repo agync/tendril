@@ -93,6 +93,7 @@ impl DeadPort {
 }
 
 fn assert_dead_port_held(guard: &DeadPort) {
+    #[cfg(unix)]
     let started = Instant::now();
     let err = std::net::TcpStream::connect_timeout(&guard.addr, Duration::from_secs(2))
         .expect_err("dial must be refused");

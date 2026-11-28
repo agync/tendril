@@ -1070,6 +1070,7 @@ async fn ref_24_initiator_maps_only_refusal_codes() {
 }
 
 /// `true` when the serialized roster still holds a refusal notice.
+#[cfg(unix)]
 fn has_notice(roster: &Roster) -> bool {
     serde_json::to_string(roster)
         .unwrap()

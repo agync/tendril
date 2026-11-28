@@ -527,6 +527,7 @@ jobs:
       - if: runner.os == 'Windows'
         shell: bash
         run: |
+          cargo clippy -p tendril-runtime --all-targets -- -D warnings
           cargo test -p tendril-runtime
           cargo clippy -p tendril-core -p tendril-relay --all-targets -- -D warnings
           cargo test -p tendril-core --all-targets
