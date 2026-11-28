@@ -818,6 +818,7 @@ test("every transport key has a camelCase alias that behaves like the snake_case
       wake_auth_token: "wake-tok",
       wake_pre_wake: true,
       wake_retry_delay_ms: 5,
+      wake_retry_max_delay_ms: 50,
       wake_max_attempts: 2,
       wake_timeout_ms: 100,
     },
@@ -827,6 +828,7 @@ test("every transport key has a camelCase alias that behaves like the snake_case
       advertised_endpoints: ["192.0.2.9:7000"],
       route_policy: "committed_only",
       sign_routes: false,
+      power_profile: "low_power",
     },
   ];
   const keys = new Set();
@@ -857,7 +859,7 @@ test("every transport key has a camelCase alias that behaves like the snake_case
       );
     }
   }
-  assert.equal(keys.size, 22, [...keys].join(","));
+  assert.equal(keys.size, 24, [...keys].join(","));
   const [host] = newPair("node-camel");
   assert.throws(
     () => host.configureTransportsJson(JSON.stringify({ relayAuthOrigins: ["not an origin"] })),
@@ -972,4 +974,77 @@ test("issuing URIs while pairings run on a state-dir host completes", async () =
   }
   await Promise.race([Promise.all(hammers), sleep(10000).then(() => assert.fail("hammer stuck"))]);
   assert.ok(refusals > 0);
+});
+
+test("low_power config, idleTimeoutMs validation, and external path monitor", async () => {
+  const [host, cli] = newPair("node-low-power");
+  host.configureTransportsJson(JSON.stringify({ powerProfile: "low_power" }));
+  cli.configureTransportsJson(JSON.stringify({ power_profile: "low_power" }));
+  assert.throws(
+    () => cli.configureTransportsJson(JSON.stringify({ wakeRetryMaxDelayMs: 2000 })),
+    invalidArg
+  );
+  assert.throws(
+    () => cli.configureTransportsJson(JSON.stringify({ wake_retry_max_delay_ms: 2000 })),
+    invalidArg
+  );
+  const wakeEp = endpoint(null, "node-lp-wake");
+  const wakeSecret = Buffer.alloc(32, 7).toString("base64url");
+  wakeEp.configureTransportsJson(
+    JSON.stringify({
+      powerProfile: "low_power",
+      wakeUrl: "https://wake.example/hook",
+      wakeSecretB64: wakeSecret,
+      wakeRetryMaxDelayMs: 2000,
+    })
+  );
+  wakeEp.configureTransportsJson(
+    JSON.stringify({
+      power_profile: "low_power",
+      wake_url: "https://wake.example/hook",
+      wake_secret_b64: wakeSecret,
+      wake_retry_max_delay_ms: 2000,
+    })
+  );
+  await host.serveDirect("127.0.0.1:0");
+  const { uri } = await issue(host);
+  await pairOverUri(host, cli, uri, { v2: true });
+  const cliInfo = JSON.parse(cli.infoJson());
+  const grant = JSON.parse(host.mintGrant(cliInfo.device_id, ["fs.read"], 3600));
+  const hostId = JSON.parse(host.infoJson()).host_id;
+
+  await assert.rejects(
+    () => cli.connectWithOptions(hostId, JSON.stringify({ wire: 2, idleTimeoutMs: 0 })),
+    invalidArg
+  );
+  await assert.rejects(
+    () => cli.connectWithOptions(hostId, JSON.stringify({ wire: 2, idle_timeout_ms: 0 })),
+    invalidArg
+  );
+
+  host.setExternalPathMonitor(true);
+  await host.refreshRoutes(snapshot("127.0.0.1"));
+  host.setExternalPathMonitor(false);
+
+  const accepted = host.acceptV2(10000);
+  const connected = cli.connectWithOptions(
+    hostId,
+    JSON.stringify({ wire: 2, grant, idleTimeoutMs: 5000 })
+  );
+  const [hostSess, cliSess] = await both(accepted, connected);
+  try {
+    await cliSess.sendData(Buffer.from("low-power-node"));
+    let got = null;
+    for (let i = 0; i < 40; i += 1) {
+      const ev = JSON.parse(await hostSess.pollEvent(500));
+      if (ev.event === "data") {
+        got = Buffer.from(ev.data_b64, "base64url").toString("utf8");
+        break;
+      }
+    }
+    assert.equal(got, "low-power-node");
+  } finally {
+    await cliSess.close();
+    await hostSess.close();
+  }
 });

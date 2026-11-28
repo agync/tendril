@@ -39,13 +39,13 @@ use tendril_runtime::{
     DEFAULT_WRITE_TIMEOUT, DirectListener, EmbeddedRelay, EnrollRouteWarning, HalfOpenGuard,
     InboundQueue, InboundRouter, InboundSession, LastRouteSet, ListAddrSource, M2mEnrollOptions,
     OverlayListener, P2pDialer, P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode,
-    PairPolicyOptions, PathDialer, PathListener, PathStream, PreAuthRateLimiter, RecoveryRoutes,
-    RefusalState, RelayClientAuth, RelayListener, RelayV2Dialer, RelayV2Listener,
-    RelayV2ListenerConfig, RosterAccess, RouteAnnouncer, RouteSetSink, RuntimeError, SessionDriver,
-    SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec,
-    WakeDialOptions, WakeOutcome, WakeSecret, WebRtcUpgradeEndpoint, WebRtcUpgradeHandle,
-    WtListener, build_wake_provider, connect_with_wake_policy,
-    dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
+    PairPolicyOptions, PathDialer, PathListener, PathStream, PowerProfile, PreAuthRateLimiter,
+    RecoveryRoutes, RefusalState, RelayClientAuth, RelayListener, RelayListenerConfig,
+    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RosterAccess, RouteAnnouncer,
+    RouteSetSink, RuntimeError, SessionDriver, SessionEvent, StateStore, V2ResponderState,
+    V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeDialOptions, WakeOutcome, WakeSecret,
+    WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtListener, build_wake_provider,
+    connect_with_wake_policy, dial_endpoint_with_auth as runtime_dial_endpoint_with_auth,
     drive_m2m_enroll_initiator_with_routes, drive_pair_initiator_with_policy,
     drive_pair_responder_with_store, drive_v2_pair_initiator_with_policy,
     drive_v2_pake_pair_responder_with_store, parse_p2p_bind_addrs, parse_p2p_relay_mode,
@@ -77,6 +77,23 @@ impl PairKindArg {
             Self::Lan => Some(PairingCodeKind::Lan2Group),
             Self::Remote => Some(PairingCodeKind::Remote3Group),
             Self::Auto => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum PowerProfileArg {
+    #[default]
+    Standard,
+    #[value(alias = "low_power")]
+    LowPower,
+}
+
+impl From<PowerProfileArg> for PowerProfile {
+    fn from(profile: PowerProfileArg) -> Self {
+        match profile {
+            PowerProfileArg::Standard => Self::Standard,
+            PowerProfileArg::LowPower => Self::LowPower,
         }
     }
 }
@@ -332,6 +349,8 @@ enum Command {
         allow_enroll: bool,
         #[arg(long)]
         redact_logs: bool,
+        #[arg(long, value_enum, default_value_t)]
+        power_profile: PowerProfileArg,
     },
     /// Mint a signed stateless Ed25519 relay admission ticket (`RelayTicket`).
     RelayTicket {
@@ -479,6 +498,8 @@ enum Command {
         wake_auth_header_file: Option<PathBuf>,
         #[arg(long)]
         wake_pre_wake: bool,
+        #[arg(long, value_name = "MS")]
+        wake_retry_max_delay_ms: Option<u64>,
         #[arg(long, value_enum)]
         wake_apns_mode: Option<ApnsPushModeArg>,
         #[arg(long, value_name = "TOPIC")]
@@ -495,6 +516,10 @@ enum Command {
         p2p_args: P2pTransportArgs,
         #[command(flatten)]
         relay_auth: RelayAuthArgs,
+        #[arg(long, value_enum, default_value_t)]
+        power_profile: PowerProfileArg,
+        #[arg(long, value_name = "MS")]
+        idle_timeout_ms: Option<u64>,
         #[arg(long, allow_hyphen_values = true)]
         grant: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
@@ -814,20 +839,37 @@ const fn pkarr_override(args: &P2pTransportArgs) -> Option<bool> {
     }
 }
 
-/// Applies `--p2p-no-port-mapping` and `--p2p-bind` to `opts`.
-fn apply_p2p_net_args(
+/// Applies `--p2p-no-port-mapping`, `--p2p-bind`, and `profile` defaults to `opts`.
+fn apply_p2p_net_args_with_profile(
     opts: P2pOptions,
     args: &P2pTransportArgs,
+    profile: PowerProfile,
 ) -> Result<P2pOptions, Box<dyn std::error::Error>> {
+    let port_mapping = !args.p2p_no_port_mapping && profile.p2p_port_mapping_default();
     Ok(opts
-        .with_port_mapping(!args.p2p_no_port_mapping)
+        .with_port_mapping(port_mapping)
         .with_bind_addrs(parse_p2p_bind_addrs("--p2p-bind", &args.p2p_bind)?))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_p2p_listener_options(
     args: &P2pTransportArgs,
     resolved_p2p_auth: Option<P2pRelayAuth>,
     include_direct_addrs: bool,
+) -> Result<P2pOptions, Box<dyn std::error::Error>> {
+    build_p2p_listener_options_with_profile(
+        args,
+        resolved_p2p_auth,
+        include_direct_addrs,
+        PowerProfile::Standard,
+    )
+}
+
+fn build_p2p_listener_options_with_profile(
+    args: &P2pTransportArgs,
+    resolved_p2p_auth: Option<P2pRelayAuth>,
+    include_direct_addrs: bool,
+    power_profile: PowerProfile,
 ) -> Result<P2pOptions, Box<dyn std::error::Error>> {
     let mode = resolve_p2p_relay_mode(args, None)?;
     let pkarr = resolve_pkarr_enabled(&mode, args.p2p_pkarr, args.no_pkarr);
@@ -838,7 +880,7 @@ fn build_p2p_listener_options(
     if include_direct_addrs {
         opts = opts.with_advertise_direct_addrs(true);
     }
-    apply_p2p_net_args(opts, args)
+    apply_p2p_net_args_with_profile(opts, args, power_profile)
 }
 
 fn resolve_explicit_p2p_relay_mode(
@@ -943,12 +985,33 @@ fn build_hint_dialers(
     p2p_args: &P2pTransportArgs,
     operator_endpoint: Option<&str>,
 ) -> Result<Arc<HintDialers>, Box<dyn std::error::Error>> {
+    build_hint_dialers_with_profile(
+        relay_auth,
+        relay_host,
+        p2p_args,
+        operator_endpoint,
+        PowerProfile::Standard,
+    )
+}
+
+fn build_hint_dialers_with_profile(
+    relay_auth: RelayClientAuth,
+    relay_host: Option<&str>,
+    p2p_args: &P2pTransportArgs,
+    operator_endpoint: Option<&str>,
+    power_profile: PowerProfile,
+) -> Result<Arc<HintDialers>, Box<dyn std::error::Error>> {
     let relay_host = relay_host.map(str::trim).filter(|s| !s.is_empty());
     let operator_iroh = operator_endpoint
         .is_some_and(|ep| ep.starts_with("iroh://") || ep.starts_with("p2p:iroh://"));
     let p2p_relay_mode =
         resolve_explicit_p2p_relay_mode(p2p_args, relay_host.filter(|_| operator_iroh))?;
     let p2p_allow_private_addrs = matches!(p2p_relay_mode, Some(P2pRelayMode::Disabled));
+    let port_mapping = if p2p_args.p2p_no_port_mapping {
+        false
+    } else {
+        power_profile.p2p_port_mapping_default()
+    };
     Ok(Arc::new(HintDialers::new(HintDialerConfig {
         relay_auth,
         relay_expected_host: relay_host.map(ToOwned::to_owned),
@@ -956,9 +1019,9 @@ fn build_hint_dialers(
         p2p_relay_auth: resolve_p2p_relay_auth(p2p_args)?,
         p2p_allow_private_addrs,
         p2p_pkarr: pkarr_override(p2p_args),
-        p2p_port_mapping: !p2p_args.p2p_no_port_mapping,
+        p2p_port_mapping: port_mapping,
         p2p_bind_addrs: parse_p2p_bind_addrs("--p2p-bind", &p2p_args.p2p_bind)?,
-        ..HintDialerConfig::default()
+        ..HintDialerConfig::default().with_power_profile(power_profile)
     })))
 }
 
@@ -1131,10 +1194,11 @@ const fn recovery_routes_str(outcome: RecoveryRoutes) -> &'static str {
     }
 }
 
-fn build_p2p_dialer_options(
+pub(crate) fn build_p2p_dialer_options_with_profile(
     p2p_args: &P2pTransportArgs,
     endpoint: &str,
     relay_host: Option<&str>,
+    power_profile: PowerProfile,
 ) -> Result<P2pOptions, Box<dyn std::error::Error>> {
     let explicit_mode = resolve_explicit_p2p_relay_mode(p2p_args, relay_host)?;
     let p2p_auth = resolve_p2p_relay_auth(p2p_args)?;
@@ -1148,7 +1212,15 @@ fn build_p2p_dialer_options(
     };
     let pkarr = resolve_pkarr_enabled(&opts.relay_mode, p2p_args.p2p_pkarr, p2p_args.no_pkarr);
     opts = opts.with_resolve_pkarr(pkarr).with_relay_auth(p2p_auth);
-    apply_p2p_net_args(opts, p2p_args)
+    apply_p2p_net_args_with_profile(opts, p2p_args, power_profile)
+}
+
+fn build_p2p_dialer_options(
+    p2p_args: &P2pTransportArgs,
+    endpoint: &str,
+    relay_host: Option<&str>,
+) -> Result<P2pOptions, Box<dyn std::error::Error>> {
+    build_p2p_dialer_options_with_profile(p2p_args, endpoint, relay_host, PowerProfile::Standard)
 }
 
 async fn dial_endpoint_cli(
@@ -2381,13 +2453,14 @@ async fn await_pong_v2(
     }
 }
 
-async fn sync_v2_relay_listeners(
+async fn sync_v2_relay_listeners_with_profile(
     router: &InboundRouter,
     v2_relay_url: &str,
     expected_host: Option<&str>,
     relay_auth: &RelayClientAuth,
     roster: &Roster,
     active: &mut HashMap<String, ([u8; 32], watch::Sender<bool>)>,
+    power_profile: PowerProfile,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut desired: HashMap<String, [u8; 32]> = HashMap::new();
     for (peer_id, entry) in roster.entries() {
@@ -2425,7 +2498,7 @@ async fn sync_v2_relay_listeners(
             replay_cache: None,
             unix_secs: None,
             auth: relay_auth.clone(),
-            ..RelayV2ListenerConfig::default()
+            power_profile,
         };
         let listener = RelayV2Listener::bind_with_config(v2_relay_url, secret, cfg).await?;
         newly_bound.push(listener.local_endpoint());
@@ -2519,7 +2592,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_route_signature,
             allow_enroll,
             redact_logs,
+            power_profile,
         } => {
+            let serve_power_profile: PowerProfile = power_profile.into();
             let identity = Arc::new(store.load_or_generate_identity(None)?);
             let store_lock = Arc::new(AsyncMutex::new(()));
             let pair_mgr = Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default())));
@@ -2541,6 +2616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let v2_state = Arc::new(
                 V2ResponderState::with_config(tendril_runtime::V2ResponderConfig {
+                    jitter: serve_power_profile.v2_jitter(),
                     webrtc_upgrade_handle: webrtc_handle.clone(),
                     ..Default::default()
                 })
@@ -2609,12 +2685,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let served_v1_relay = v1_relay_url.clone();
             let relay_ep = if let Some(relay_url) = v1_relay_url {
-                let rl = RelayListener::bind_with_auth(
+                let rl = RelayListener::bind_with_config(
                     relay_url,
                     effective_host.clone(),
                     identity.signing_key().ed25519_signing_key(),
-                    DEFAULT_WRITE_TIMEOUT,
                     resolved_relay_auth.clone(),
+                    RelayListenerConfig::new()
+                        .with_write_timeout(DEFAULT_WRITE_TIMEOUT)
+                        .with_power_profile(serve_power_profile),
                 )
                 .await?;
                 let ep = rl.local_endpoint();
@@ -2630,13 +2708,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let relay_v2_endpoints = if let Some(ref v2_url) = v2_relay_url {
                 let (roster_now, stamp_now) = store.load_roster_with_stamp()?;
                 last_v2_roster_stamp = stamp_now;
-                sync_v2_relay_listeners(
+                sync_v2_relay_listeners_with_profile(
                     &router,
                     v2_url,
                     effective_host.as_deref(),
                     &resolved_relay_auth,
                     &roster_now,
                     &mut active_v2_relays,
+                    serve_power_profile,
                 )
                 .await?
             } else {
@@ -2645,8 +2724,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let relay_v2_endpoint = relay_v2_endpoints.first().cloned();
 
             let p2p_ep = if want_p2p {
-                let opts =
-                    build_p2p_listener_options(&p2p_args, resolved_p2p_auth, include_direct_addrs)?;
+                let opts = build_p2p_listener_options_with_profile(
+                    &p2p_args,
+                    resolved_p2p_auth,
+                    include_direct_addrs,
+                    serve_power_profile,
+                )?;
                 let seed = if ephemeral_p2p {
                     None
                 } else {
@@ -2802,9 +2885,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i.uri.zeroize();
             }
 
-            let group_dialers =
-                group::build_dialers(resolved_relay_auth.clone(), want_p2p.then_some(&p2p_args))
-                    .await?;
+            let group_dialers = group::build_dialers(
+                resolved_relay_auth.clone(),
+                want_p2p.then_some(&p2p_args),
+                serve_power_profile,
+            )
+            .await?;
             let group_hub = group::ServeGroups::new(
                 Arc::clone(&store),
                 Arc::clone(&identity),
@@ -2812,6 +2898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolved_relay_auth.clone(),
                 served_v1_relay,
                 redact_logs,
+                serve_power_profile,
             );
             group_hub.refresh();
 
@@ -3021,12 +3108,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }));
             }
 
-            let mut relay_sync_interval = tokio::time::interval(Duration::from_millis(250));
+            let store_notify = tendril_runtime::store_change_notifier();
+            let mut last_store_seq = tendril_runtime::store_change_seq();
+            let fallback_interval = match serve_power_profile {
+                PowerProfile::Standard => Duration::from_millis(250),
+                PowerProfile::LowPower => tendril_runtime::HOST_BOOK_WATCH_FALLBACK,
+            };
+            let mut relay_sync_interval = tokio::time::interval(fallback_interval);
             relay_sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                let notified = store_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let store_changed = tendril_runtime::store_change_seq() != last_store_seq;
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => break,
-                    _ = relay_sync_interval.tick() => {
+                    () = async {
+                        if store_changed {
+                            return;
+                        }
+                        tokio::select! {
+                            () = &mut notified => {}
+                            _ = relay_sync_interval.tick() => {}
+                        }
+                    } => {
+                        last_store_seq = tendril_runtime::store_change_seq();
                         group_hub.refresh();
                         if let Some(ref v2_url) = v2_relay_url
                             && let Ok(curr_stamp) = store.roster_stamp()
@@ -3034,13 +3140,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             && let Ok((roster_now, fresh_stamp)) = store.load_roster_with_stamp()
                         {
                             last_v2_roster_stamp = fresh_stamp;
-                            if let Err(err) = sync_v2_relay_listeners(
+                            if let Err(err) = sync_v2_relay_listeners_with_profile(
                                 &router,
                                 v2_url,
                                 effective_host.as_deref(),
                                 &resolved_relay_auth,
                                 &roster_now,
                                 &mut active_v2_relays,
+                                serve_power_profile,
                             )
                             .await
                             {
@@ -3435,6 +3542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             wake_secret_file,
             wake_auth_header_file,
             wake_pre_wake,
+            wake_retry_max_delay_ms,
             wake_apns_mode,
             wake_apns_topic,
             wake_apns_loc_key,
@@ -3443,10 +3551,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             wake_apns_p8_file,
             p2p_args,
             relay_auth,
+            power_profile,
+            idle_timeout_ms,
             grant,
             message,
         } => {
             validate_explicit_p2p_args(&p2p_args)?;
+            if idle_timeout_ms == Some(0) {
+                return Err("--idle-timeout-ms must be >= 1".into());
+            }
+            let dial_power_profile: PowerProfile = power_profile.into();
+            let idle_timeout = idle_timeout_ms.map(Duration::from_millis);
             if relay_v2 && !wire_v2 {
                 return Err("--relay-v2 requires --wire-v2".into());
             }
@@ -3458,6 +3573,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     || wake_secret_file.is_some()
                     || wake_auth_header_file.is_some()
                     || wake_pre_wake
+                    || wake_retry_max_delay_ms.is_some()
                     || wake_apns_mode.is_some()
                     || wake_apns_topic.is_some()
                     || wake_apns_loc_key.is_some()
@@ -3466,7 +3582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     || wake_apns_p8_file.is_some())
             {
                 return Err(
-                    "--wake-adapter, --wake-secret-file, --wake-auth-header-file, --wake-pre-wake, and --wake-apns-* require --wake-url"
+                    "--wake-adapter, --wake-secret-file, --wake-auth-header-file, --wake-pre-wake, --wake-retry-max-delay-ms, and --wake-apns-* require --wake-url"
                         .into(),
                 );
             }
@@ -3476,13 +3592,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let grant_obj = grant.as_deref().map(load_grant_arg).transpose()?;
             let resolved_relay_auth = resolve_relay_auth(&relay_auth)?;
 
-            // An explicit wake connect wakes the peer, then runs the normal policy connect with
-            // the explicit endpoint as the operator route (route sets and recovery URIs apply).
+            // Wake applies to both explicit `--endpoint` dials and stored-route multi-address dials.
             let wake = match wake_url {
                 Some(wurl) => {
-                    if endpoint.is_none() {
-                        return Err("--wake-url requires --endpoint".into());
-                    }
                     let wake_secret = resolve_wake_secret(wake_secret_file.as_deref())?;
                     let mut auth_token = wake_auth_header_file
                         .as_deref()
@@ -3500,7 +3612,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         wake_auth_token: auth_token.as_mut().map(|t| std::mem::take(&mut **t)),
                         wake_pre_wake: Some(wake_pre_wake),
                         wake_retry_delay_ms: None,
-                        wake_retry_max_delay_ms: None,
+                        wake_retry_max_delay_ms,
                         wake_max_attempts: None,
                         wake_timeout_ms: None,
                         wake_coalesce_secs: None,
@@ -3528,15 +3640,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return Err("--relay-v2 requires a /v2/relay --endpoint".into());
             }
-            let dialers = build_hint_dialers(
+            let dialers = build_hint_dialers_with_profile(
                 resolved_relay_auth,
                 relay_host.as_deref(),
                 &p2p_args,
                 endpoint.as_deref(),
+                dial_power_profile,
             )?;
             let route_policy: RoutePolicy = route_policy.into();
             let make_opts = || {
-                let mut opts = ConnectOpts::new(Arc::clone(&dialers));
+                let mut opts = ConnectOpts::new(Arc::clone(&dialers))
+                    .with_power_profile(dial_power_profile)
+                    .with_idle_timeout(idle_timeout);
                 opts.grant.clone_from(&grant_obj);
                 opts.recovery_uri.clone_from(&pairing_uri);
                 opts.replace_routes = replace_routes;
@@ -3988,6 +4103,28 @@ mod tests {
         };
         let opts = build_p2p_listener_options(&args, None, false).expect("listener");
         assert_eq!(opts.relay_mode, P2pRelayMode::N0Public);
+    }
+
+    #[test]
+    fn low_power_profile_disables_default_p2p_port_mapping_for_serve_and_groups() {
+        let args = P2pTransportArgs::default();
+        let listener_std =
+            build_p2p_listener_options_with_profile(&args, None, false, PowerProfile::Standard)
+                .expect("standard listener");
+        let listener_lp =
+            build_p2p_listener_options_with_profile(&args, None, false, PowerProfile::LowPower)
+                .expect("low-power listener");
+        assert!(listener_std.port_mapping);
+        assert!(!listener_lp.port_mapping);
+
+        let dialer_lp = build_p2p_dialer_options_with_profile(
+            &args,
+            "direct://127.0.0.1:1",
+            None,
+            PowerProfile::LowPower,
+        )
+        .expect("low-power dialer");
+        assert!(!dialer_lp.port_mapping);
     }
 
     fn test_crl(
@@ -4556,13 +4693,14 @@ mod tests {
 
         let router = InboundRouter::new();
         let mut active = HashMap::new();
-        let bound = sync_v2_relay_listeners(
+        let bound = sync_v2_relay_listeners_with_profile(
             &router,
             &v2_relay_url,
             Some("localhost"),
             &RelayClientAuth::None,
             &roster,
             &mut active,
+            PowerProfile::Standard,
         )
         .await
         .expect("sync v2 relay listeners");

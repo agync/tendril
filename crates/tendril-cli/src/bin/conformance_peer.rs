@@ -72,6 +72,8 @@ struct TransportConfigInput {
     #[zeroize(skip)]
     wake_retry_delay_ms: Option<u64>,
     #[zeroize(skip)]
+    wake_retry_max_delay_ms: Option<u64>,
+    #[zeroize(skip)]
     wake_max_attempts: Option<usize>,
     #[zeroize(skip)]
     wake_timeout_ms: Option<u64>,
@@ -182,7 +184,7 @@ impl PeerTransportConfig {
             wake_auth_token: input.wake_auth_token.take(),
             wake_pre_wake: input.wake_pre_wake.take(),
             wake_retry_delay_ms: input.wake_retry_delay_ms.take(),
-            wake_retry_max_delay_ms: None,
+            wake_retry_max_delay_ms: input.wake_retry_max_delay_ms.take(),
             wake_max_attempts: input.wake_max_attempts.take(),
             wake_timeout_ms: input.wake_timeout_ms.take(),
             wake_coalesce_secs: input

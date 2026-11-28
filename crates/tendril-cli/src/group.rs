@@ -15,15 +15,15 @@ use tendril_core::identity::EndpointIdentity;
 use tendril_runtime::{
     BroadcastReport, BrokerDialer, DirectDialer, GroupEvent, GroupFrameKind, GroupHub, GroupPool,
     GroupPoolConfig, HalfOpenGuard, InboundSession, LocalDialer, OverlayDialer, P2pDialer,
-    PathDialer, PathStream, PreAuthRateLimiter, RelayClientAuth, RelayDialer, SessionEvent,
-    StateStore, V2ResponderState, group_add_member, group_create, group_remove_member,
-    handle_session_group_frame,
+    PathDialer, PathStream, PowerProfile, PreAuthRateLimiter, RelayClientAuth, RelayDialer,
+    SessionEvent, StateStore, V2ResponderState, group_add_member, group_create,
+    group_remove_member, handle_session_group_frame,
 };
 use tokio::task::JoinHandle;
 
 use crate::{
-    P2pTransportArgs, RelayAuthArgs, build_p2p_dialer_options, print_json_line, resolve_relay_auth,
-    validate_explicit_p2p_args,
+    P2pTransportArgs, RelayAuthArgs, build_p2p_dialer_options_with_profile, print_json_line,
+    resolve_relay_auth, validate_explicit_p2p_args,
 };
 
 const DEFAULT_SYNC_TIMEOUT_SECS: u64 = 10;
@@ -125,6 +125,7 @@ fn is_active_member(manifest: &GroupManifest, device_id: &str) -> bool {
 pub(crate) async fn build_dialers(
     relay_auth: RelayClientAuth,
     p2p_args: Option<&P2pTransportArgs>,
+    power_profile: PowerProfile,
 ) -> Result<Vec<Arc<dyn PathDialer>>, Box<dyn Error>> {
     let mut dialers: Vec<Arc<dyn PathDialer>> = vec![
         Arc::new(DirectDialer::new()),
@@ -135,7 +136,7 @@ pub(crate) async fn build_dialers(
     ];
     if let Some(args) = p2p_args {
         validate_explicit_p2p_args(args)?;
-        let opts = build_p2p_dialer_options(args, "", None)?;
+        let opts = build_p2p_dialer_options_with_profile(args, "", None, power_profile)?;
         dialers.push(Arc::new(P2pDialer::bind_with_options(opts).await?));
     }
     Ok(dialers)
@@ -150,7 +151,12 @@ async fn open_pool(
 ) -> Result<GroupPool, Box<dyn Error>> {
     validate_explicit_p2p_args(&dial.p2p_args)?;
     let auth = resolve_relay_auth(&dial.relay_auth)?;
-    let dialers = build_dialers(auth.clone(), dial.p2p_enabled().then_some(&dial.p2p_args)).await?;
+    let dialers = build_dialers(
+        auth.clone(),
+        dial.p2p_enabled().then_some(&dial.p2p_args),
+        PowerProfile::Standard,
+    )
+    .await?;
     let config = GroupPoolConfig::new(dialers)
         .with_dial_budget(Duration::from_secs(timeout_secs.max(1)))
         .with_relay_auth(auth);
@@ -378,11 +384,13 @@ impl ServeGroups {
         relay_auth: RelayClientAuth,
         served_v1_relay: Option<String>,
         redact_logs: bool,
+        power_profile: PowerProfile,
     ) -> Arc<Self> {
         let config = GroupPoolConfig::new(dialers)
             .with_relay_auth(relay_auth)
             .with_relay_listen(true)
-            .with_served_v1_relays(served_v1_relay.into_iter().collect());
+            .with_served_v1_relays(served_v1_relay.into_iter().collect())
+            .with_power_profile(power_profile);
         Arc::new(Self {
             hub: GroupHub::new((*store).clone(), identity, config, None),
             redact_logs,

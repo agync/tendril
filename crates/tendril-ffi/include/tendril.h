@@ -131,9 +131,10 @@ TendrilEndpoint *tendril_endpoint_new_sealed(const char *state_dir, const char *
                                              const char *roster_json_opt, const char *host_id_opt);
 /* Like tendril_endpoint_new_sealed with optional JSON runtime/role options and external ML-DSA-65
  * signer custody. options_json_opt may be NULL or {"runtime_profile": "default"|"extension",
- * "client_only": bool}. When mldsa_signer_opt is non-NULL, ownership of mldsa_signer_opt->ctx
- * transfers immediately on entry so drop_ctx(ctx) (if both drop_ctx and ctx are non-NULL) runs
- * once on any failure (NULL return) or when the endpoint and all internal handles drop. */
+ * "client_only": bool, "power_profile": "standard"|"low_power"}. When mldsa_signer_opt is
+ * non-NULL, ownership of mldsa_signer_opt->ctx transfers immediately on entry so drop_ctx(ctx)
+ * (if both drop_ctx and ctx are non-NULL) runs once on any failure (NULL return) or when the
+ * endpoint and all internal handles drop. */
 TendrilEndpoint *tendril_endpoint_new_sealed_with_options(
     const char *state_dir,
     const char *identity_json_opt,
@@ -250,20 +251,22 @@ int32_t tendril_endpoint_enroll_initiate(
 /*
  * Pairing URIs and routes. Every out_json string is freed with tendril_string_free.
  *
- * tendril_endpoint_configure_transports_json accepts p2p_port_mapping (bool, default true; false
+ * tendril_endpoint_configure_transports_json accepts power_profile ("standard" or "low_power"),
+ * p2p_port_mapping (bool; default true under standard and false under low_power; false
  * keeps a P2P endpoint from probing the router for a UPnP, NAT-PMP or PCP mapping) and
  * p2p_bind_addrs (array of at most one IPv4 and one IPv6 "host:port" such as "0.0.0.0:0" and
  * "[::]:0"; default every interface; an invalid entry is an error naming p2p_bind_addrs).
  * p2p_relay_mode accepts "n0" as an alias of "default".
  *
  * tendril_endpoint_configure_transports_json also accepts wake_* keys (wake_url, wake_adapter,
- * wake_secret_b64, wake_auth_token, wake_pre_wake, wake_retry_delay_ms, wake_max_attempts,
- * wake_timeout_ms, wake_coalesce_secs, wake_apns_mode, wake_apns_topic, wake_apns_loc_key,
- * wake_apns_team_id, wake_apns_key_id, wake_apns_p8_pem, wake_apns_client_cert_pem,
- * wake_apns_client_key_pem), advertised_endpoints (array of strings), relay_auth_origins
- * (array of "scheme://host[:port]"; relay admission material is attached only to these origins
- * or to the explicit endpoint of a call), advertise ("auto", default, or "explicit"), route_policy
- * ("all_signed", default, "committed_only" or "none") and sign_routes (default true).
+ * wake_secret_b64, wake_auth_token, wake_pre_wake, wake_retry_delay_ms, wake_retry_max_delay_ms,
+ * wake_max_attempts, wake_timeout_ms, wake_coalesce_secs, wake_apns_mode, wake_apns_topic,
+ * wake_apns_loc_key, wake_apns_team_id, wake_apns_key_id, wake_apns_p8_pem,
+ * wake_apns_client_cert_pem, wake_apns_client_key_pem), advertised_endpoints (array of strings),
+ * relay_auth_origins (array of "scheme://host[:port]"; relay admission material is attached only
+ * to these origins or to the explicit endpoint of a call), advertise ("auto", default, or
+ * "explicit"), route_policy ("all_signed", default, "committed_only" or "none") and sign_routes
+ * (default true).
  */
 /* options_json_opt: NULL or {"kind": "auto"|"lan"|"remote", "host_name": str, "sign_routes": bool}.
  * out_json: {"uri", "code_kind", "dropped", "uri_len", "qr_version_m", "route_seq"}.
@@ -327,6 +330,9 @@ int32_t tendril_endpoint_refresh_routes(
     const char *snapshot_json_opt,
     char **out_json
 );
+/* Notifies the announcer that an OS-driven path monitor (NWPathMonitor or Android ConnectivityManager)
+ * owns interface change notifications, suppressing redundant periodic route polling when active != 0. */
+int32_t tendril_endpoint_set_external_path_monitor(TendrilEndpoint *ep, int32_t active);
 
 /* Session lifecycle and polled queue API (independent of TendrilEndpoint lifetime once opened).
  * A NULL or "" endpoint connects over the peer's stored routes. */
@@ -339,9 +345,9 @@ TendrilSession *tendril_session_connect(
 );
 TendrilSession *tendril_session_accept(TendrilEndpoint *ep, uint64_t timeout_ms);
 /* options_json: NULL or {"wire": 1|2, "grant": obj, "endpoint": str, "relay_host": str,
- * "recovery_uri": str, "replace_routes": bool, "route_policy": str}. "relay_host" is the expected
- * relay host of an explicit "endpoint" (the Iroh relay mode for iroh://), as in
- * tendril_session_connect. */
+ * "recovery_uri": str, "replace_routes": bool, "route_policy": str, "idle_timeout_ms": u64}.
+ * "relay_host" is the expected relay host of an explicit "endpoint" (the Iroh relay mode for
+ * iroh://), as in tendril_session_connect. */
 TendrilSession *tendril_session_connect_with_options(
     TendrilEndpoint *ep,
     const char *target_host_id,

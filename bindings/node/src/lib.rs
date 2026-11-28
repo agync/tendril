@@ -57,18 +57,18 @@ use tendril_runtime::{
     ApnsPushMode, BroadcastReport, BrokerDialer, ConcurrentSession, ConcurrentV2Session,
     DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, GroupEvent,
     GroupFrameKind, GroupFrameOutcome, GroupPool, GroupPoolConfig, InboundRouter, LocalDialer,
-    M2mEnrollOptions, MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer, P2pListener, P2pOptions,
-    P2pRelayAuth, P2pRelayMode, PathDialer, PathListener, PathStream, RelayClientAuth, RelayDialer,
-    RelayListener, RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError,
-    SessionDriver, SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind,
-    WakeConfigSpec, WakeTag, WakeTransportSettings, build_wake_provider, connect_with_wake_policy,
-    dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
-    drive_m2m_enroll_initiator_with_routes, drive_pair_initiator_with_store,
-    drive_pair_responder_with_policy_and_store, drive_pair_responder_with_store,
-    drive_v2_pake_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_timeout,
-    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
-    group_add_member as rt_group_add_member, group_create as rt_group_create,
-    group_ingest_manifest as rt_group_ingest_manifest,
+    LocalReachability, M2mEnrollOptions, MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer,
+    P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, PathDialer, PathListener, PathStream,
+    PowerProfile, RelayClientAuth, RelayDialer, RelayListener, RelayListenerConfig, RelayV2Dialer,
+    RelayV2Listener, RelayV2ListenerConfig, RuntimeError, SessionDriver, SessionEvent, StateStore,
+    V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeTag,
+    WakeTransportSettings, build_wake_provider, connect_with_wake_policy, dial_endpoint_with_auth,
+    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_routes,
+    drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
+    drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_store,
+    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
+    drive_v2_pake_pair_responder_with_store, group_add_member as rt_group_add_member,
+    group_create as rt_group_create, group_ingest_manifest as rt_group_ingest_manifest,
     group_remove_member as rt_group_remove_member, handle_session_group_frame,
     pairing_path_kind_for_provider, parse_p2p_relay_mode, parse_p2p_relay_modes,
     pinned_pairing_floor, verify_epoch_wake_tag_window,
@@ -348,6 +348,9 @@ struct TransportConfigInput {
     #[serde(alias = "wakeRetryDelayMs")]
     wake_retry_delay_ms: Option<u64>,
     #[zeroize(skip)]
+    #[serde(alias = "wakeRetryMaxDelayMs")]
+    wake_retry_max_delay_ms: Option<u64>,
+    #[zeroize(skip)]
     #[serde(alias = "wakeMaxAttempts")]
     wake_max_attempts: Option<usize>,
     #[zeroize(skip)]
@@ -387,6 +390,9 @@ struct TransportConfigInput {
     #[zeroize(skip)]
     #[serde(alias = "signRoutes")]
     sign_routes: Option<bool>,
+    #[zeroize(skip)]
+    #[serde(alias = "powerProfile")]
+    power_profile: Option<PowerProfile>,
 }
 
 #[derive(Clone)]
@@ -396,7 +402,7 @@ struct EndpointTransportConfig {
     p2p_pkarr: Option<bool>,
     p2p_advertise_direct_addrs: Option<bool>,
     p2p_allow_private_addrs: Option<bool>,
-    /// `None` keeps port mapping on.
+    /// `None` follows `power_profile.p2p_port_mapping_default()`.
     p2p_port_mapping: Option<bool>,
     p2p_bind_addrs: tendril_runtime::P2pBindAddrs,
     p2p_relay_auth: Option<P2pRelayAuth>,
@@ -406,6 +412,7 @@ struct EndpointTransportConfig {
     advertised_endpoints: Vec<String>,
     route_policy: RoutePolicy,
     sign_routes: bool,
+    power_profile: PowerProfile,
 }
 
 impl Default for EndpointTransportConfig {
@@ -425,6 +432,7 @@ impl Default for EndpointTransportConfig {
             advertised_endpoints: Vec::new(),
             route_policy: RoutePolicy::AllSigned,
             sign_routes: true,
+            power_profile: PowerProfile::platform_default(),
         }
     }
 }
@@ -449,6 +457,7 @@ impl fmt::Debug for EndpointTransportConfig {
             .field("advertised_endpoints", &self.advertised_endpoints)
             .field("route_policy", &self.route_policy)
             .field("sign_routes", &self.sign_routes)
+            .field("power_profile", &self.power_profile)
             .finish()
     }
 }
@@ -555,7 +564,7 @@ impl EndpointTransportConfig {
             wake_auth_token: input.wake_auth_token.take(),
             wake_pre_wake: input.wake_pre_wake.take(),
             wake_retry_delay_ms: input.wake_retry_delay_ms.take(),
-            wake_retry_max_delay_ms: None,
+            wake_retry_max_delay_ms: input.wake_retry_max_delay_ms.take(),
             wake_max_attempts: input.wake_max_attempts.take(),
             wake_timeout_ms: input.wake_timeout_ms.take(),
             wake_coalesce_secs,
@@ -596,6 +605,9 @@ impl EndpointTransportConfig {
             .map_err(to_invalid_arg)?
             .unwrap_or_default();
 
+        let power_profile = input
+            .power_profile
+            .unwrap_or_else(PowerProfile::platform_default);
         Ok(Self {
             relay_auth,
             p2p_relay_mode,
@@ -611,7 +623,13 @@ impl EndpointTransportConfig {
             advertised_endpoints: input.advertised_endpoints.take().unwrap_or_default(),
             route_policy,
             sign_routes: input.sign_routes.unwrap_or(true),
+            power_profile,
         })
+    }
+
+    fn effective_port_mapping(&self) -> bool {
+        self.p2p_port_mapping
+            .unwrap_or_else(|| self.power_profile.p2p_port_mapping_default())
     }
 
     /// The dialer set behind policy pairing and Day-2 connects. `relay_host` is the expected
@@ -638,9 +656,9 @@ impl EndpointTransportConfig {
             p2p_relay_auth: self.p2p_relay_auth.clone(),
             p2p_allow_private_addrs: self.p2p_allow_private_addrs.unwrap_or(false),
             p2p_pkarr: self.p2p_pkarr,
-            p2p_port_mapping: self.p2p_port_mapping.unwrap_or(true),
+            p2p_port_mapping: self.effective_port_mapping(),
             p2p_bind_addrs: self.p2p_bind_addrs.clone(),
-            ..HintDialerConfig::default()
+            ..HintDialerConfig::default().with_power_profile(self.power_profile)
         })))
     }
 
@@ -671,7 +689,7 @@ impl EndpointTransportConfig {
 
     /// Applies `p2p_port_mapping` and `p2p_bind_addrs` to `opts`.
     fn with_p2p_net(&self, opts: P2pOptions) -> P2pOptions {
-        opts.with_port_mapping(self.p2p_port_mapping.unwrap_or(true))
+        opts.with_port_mapping(self.effective_port_mapping())
             .with_bind_addrs(self.p2p_bind_addrs.clone())
     }
 
@@ -1034,6 +1052,7 @@ struct ConnectArgs {
     replace_routes: bool,
     policy: Option<RoutePolicy>,
     relay_host: Option<String>,
+    idle_timeout: Option<Duration>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1042,10 +1061,16 @@ struct ConnectOptionsInput {
     wire: Option<u8>,
     grant: Option<Grant>,
     endpoint: Option<String>,
+    #[serde(alias = "recoveryUri")]
     recovery_uri: Option<String>,
+    #[serde(alias = "replaceRoutes")]
     replace_routes: Option<bool>,
+    #[serde(alias = "routePolicy")]
     route_policy: Option<String>,
+    #[serde(alias = "relayHost")]
     relay_host: Option<String>,
+    #[serde(alias = "idleTimeoutMs")]
+    idle_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1137,15 +1162,25 @@ async fn policy_connect(
     target: &str,
     access: &RosterAccess,
     opts: ConnectOpts,
-) -> std::result::Result<SessionBackend, AttemptError> {
+) -> std::result::Result<(SessionBackend, String), AttemptError> {
     if wire == 2 {
         V2SessionDriver::connect_with_policy_and_store(Arc::clone(identity), target, access, opts)
             .await
-            .map(|r| SessionBackend::V2(Arc::new(r.session.into_concurrent())))
+            .map(|r| {
+                (
+                    SessionBackend::V2(Arc::new(r.session.into_concurrent())),
+                    r.route.addr,
+                )
+            })
     } else {
         SessionDriver::connect_with_policy_and_store(Arc::clone(identity), target, access, opts)
             .await
-            .map(|r| SessionBackend::V1(Arc::new(r.session.into_concurrent())))
+            .map(|r| {
+                (
+                    SessionBackend::V1(Arc::new(r.session.into_concurrent())),
+                    r.route.addr,
+                )
+            })
     }
 }
 
@@ -1275,6 +1310,7 @@ struct AnnouncerSlot {
     served_endpoints: StdMutex<Vec<String>>,
     served_listeners: StdMutex<Vec<ServedListener>>,
     announcer: StdMutex<AnnouncerState>,
+    external_monitor: AtomicBool,
     /// Publishes `configureTransportsJson` started on blocking threads and nobody awaited yet.
     pending_publishes: StdMutex<Vec<JoinHandle<()>>>,
 }
@@ -1340,9 +1376,26 @@ impl AnnouncerSlot {
             self.inputs(),
             AddressSource::platform_default(),
         ));
+        announcer.set_external_monitor(self.external_monitor.load(Ordering::Acquire));
         let timer = announcer.spawn(Some(DEFAULT_ROUTE_REFRESH_INTERVAL));
         *guard = AnnouncerState::Running(Arc::clone(&announcer), timer);
         Ok(announcer)
+    }
+
+    fn set_external_monitor(&self, active: bool) -> Result<()> {
+        self.external_monitor.store(active, Ordering::Release);
+        let guard = self
+            .announcer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*guard {
+            AnnouncerState::Closed => Err(to_generic_err("endpoint is closed")),
+            AnnouncerState::Running(announcer, _) => {
+                announcer.set_external_monitor(active);
+                Ok(())
+            }
+            AnnouncerState::Idle => Ok(()),
+        }
     }
 
     /// Re-reads the advertising inputs into a live announcer and publishes them.
@@ -1437,6 +1490,9 @@ pub struct Endpoint {
     router: InboundRouter,
     v2_state: Arc<V2ResponderState>,
     transport_cfg: Arc<StdMutex<EndpointTransportConfig>>,
+    cached_dialers: StdMutex<Option<Arc<HintDialers>>>,
+    lkg_routes: StdMutex<HashMap<String, String>>,
+    latest_snapshot: StdMutex<Option<NetworkSnapshot>>,
     self_m2m_enabled: AtomicBool,
     m2m_enabled: AtomicBool,
     groups: StdMutex<Vec<Weak<GroupPool>>>,
@@ -1517,25 +1573,100 @@ impl Endpoint {
         Ok(self.new_session(backend, false))
     }
 
+    fn dialers_for(
+        &self,
+        cfg: &EndpointTransportConfig,
+        relay_host: Option<&str>,
+        operator_endpoint: Option<&str>,
+    ) -> Result<Arc<HintDialers>> {
+        let has_host = relay_host.map(str::trim).is_some_and(|s| !s.is_empty());
+        let has_ep = operator_endpoint
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if !has_host && !has_ep {
+            let mut guard = self
+                .cached_dialers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(d) = guard.as_ref() {
+                return Ok(Arc::clone(d));
+            }
+            let d = cfg.hint_dialers(None, None).map_err(to_generic_err)?;
+            *guard = Some(Arc::clone(&d));
+            return Ok(d);
+        }
+        cfg.hint_dialers(relay_host, operator_endpoint)
+            .map_err(to_generic_err)
+    }
+
+    fn close_cached_dialers(&self) {
+        let prev = self
+            .cached_dialers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(dialers) = prev {
+            within_runtime_if_available(|| {
+                drop(tokio::spawn(async move {
+                    dialers.close().await;
+                }));
+            });
+        }
+    }
+
+    fn lkg_route(&self, peer_id: &str) -> Option<String> {
+        self.lkg_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(peer_id)
+            .cloned()
+    }
+
+    fn record_lkg_route(&self, peer_id: &str, hint: String) {
+        self.lkg_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer_id.to_owned(), hint);
+    }
+
+    fn clear_lkg_route(&self, peer_id: &str) {
+        self.lkg_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(peer_id);
+    }
+
+    fn snapshot_reachability(&self) -> Option<LocalReachability> {
+        self.latest_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(LocalReachability::from_snapshot)
+    }
+
     /// Day-2 connect through the runtime policy drivers.
     async fn connect_policy(&self, target_host_id: &str, args: ConnectArgs) -> Result<Session> {
         let cfg = self.snapshot_transport_cfg();
-        let dialers = cfg
-            .hint_dialers(args.relay_host.as_deref(), args.endpoint.as_deref())
-            .map_err(to_generic_err)?;
-        let mut opts = ConnectOpts::new(dialers);
+        let is_stored = args.endpoint.is_none();
+        let dialers =
+            self.dialers_for(&cfg, args.relay_host.as_deref(), args.endpoint.as_deref())?;
+        let mut opts = ConnectOpts::new(dialers)
+            .with_power_profile(cfg.power_profile)
+            .with_idle_timeout(args.idle_timeout);
         opts.grant = args.grant;
         opts.recovery_uri = args.recovery_uri;
         opts.replace_routes = args.replace_routes;
         opts.policy = args.policy.unwrap_or(cfg.route_policy);
         opts.operator_endpoint = args.endpoint;
         opts.relay_auth_origins = cfg.relay_auth_origins.clone();
+        if is_stored {
+            opts.preferred_hint = self.lkg_route(target_host_id);
+            opts.reachability = self.snapshot_reachability();
+        }
 
-        // A configured wake target applies to an explicit Wire v2 endpoint, with or without a
-        // recovery URI: `wake_pre_wake` decides whether the wake hint or the first connect goes first.
-        let wake = (args.wire == 2 && opts.operator_endpoint.is_some())
-            .then(|| cfg.wake.clone())
-            .flatten();
+        // A configured wake target applies to Wire v2 connects (explicit endpoint or stored
+        // routes): `wake_pre_wake` decides whether the wake hint or the first connect goes first.
+        let wake = (args.wire == 2).then(|| cfg.wake.clone()).flatten();
 
         self.sync_roster_from_store().await?;
         let identity = Arc::clone(&self.identity);
@@ -1551,7 +1682,7 @@ impl Endpoint {
                 match &wake {
                     Some(w) => connect_with_wake_policy(&w.to_dial_options(), connect)
                         .await
-                        .map(|(backend, _)| backend),
+                        .map(|(out, _)| out),
                     None => connect().await,
                 }
             })
@@ -1559,9 +1690,21 @@ impl Endpoint {
         .await
         .map_err(to_generic_err)?;
         let synced = self.sync_roster_from_store().await;
-        let backend = res.map_err(attempt_err)?;
-        synced?;
-        Ok(self.new_session(backend, true))
+        match res {
+            Ok((backend, winning_addr)) => {
+                synced?;
+                if is_stored {
+                    self.record_lkg_route(target_host_id, winning_addr);
+                }
+                Ok(self.new_session(backend, true))
+            }
+            Err(err) => {
+                if is_stored {
+                    self.clear_lkg_route(target_host_id);
+                }
+                Err(attempt_err(err))
+            }
+        }
     }
 
     /// Pairing from a scanned URI through the runtime policy drivers.
@@ -1578,9 +1721,7 @@ impl Endpoint {
         let cfg = self.snapshot_transport_cfg();
         let policy = parse_route_policy(opts_in.route_policy.as_deref(), cfg.route_policy)?;
         let endpoint = opts_in.endpoint.filter(|e| !e.is_empty());
-        let dialers = cfg
-            .hint_dialers(None, endpoint.as_deref())
-            .map_err(to_generic_err)?;
+        let dialers = self.dialers_for(&cfg, None, endpoint.as_deref())?;
         // An explicit empty code is rejected before any dial; it never falls back to the URI code.
         let code = opts_in.code.unwrap_or_else(|| uri.code.clone());
         let mut opts = PairPolicyOptions::new(
@@ -1712,6 +1853,7 @@ impl Endpoint {
             served_endpoints: StdMutex::new(Vec::new()),
             served_listeners: StdMutex::new(Vec::new()),
             announcer: StdMutex::new(AnnouncerState::Idle),
+            external_monitor: AtomicBool::new(false),
             pending_publishes: StdMutex::new(Vec::new()),
         });
         Ok(Self {
@@ -1721,8 +1863,16 @@ impl Endpoint {
             roster,
             pair_mgr: Arc::new(StdMutex::new(PairingManager::new(PairingConfig::default()))),
             router: InboundRouter::new(),
-            v2_state: Arc::new(V2ResponderState::new()),
+            v2_state: Arc::new(V2ResponderState::with_config(
+                tendril_runtime::V2ResponderConfig {
+                    jitter: PowerProfile::platform_default().v2_jitter(),
+                    ..Default::default()
+                },
+            )),
             transport_cfg,
+            cached_dialers: StdMutex::new(None),
+            lkg_routes: StdMutex::new(HashMap::new()),
+            latest_snapshot: StdMutex::new(None),
             self_m2m_enabled: AtomicBool::new(false),
             m2m_enabled: AtomicBool::new(has_active_anchor),
             groups: StdMutex::new(Vec::new()),
@@ -1844,7 +1994,8 @@ impl Endpoint {
         let config = GroupPoolConfig::new(dialers)
             .with_relay_auth(transport_cfg.relay_auth.clone())
             .with_relay_listen(relay_listen.unwrap_or(false))
-            .with_served_v1_relays(served_v1_relays);
+            .with_served_v1_relays(served_v1_relays)
+            .with_power_profile(transport_cfg.power_profile);
         let pool = GroupPool::open(
             (*store).clone(),
             Arc::clone(&self.identity),
@@ -1916,12 +2067,15 @@ impl Endpoint {
     ) -> Result<String> {
         let cfg = self.snapshot_transport_cfg();
         let key = self.identity.signing_key().ed25519_signing_key();
-        let listener = RelayListener::bind_with_auth(
+        let lcfg = RelayListenerConfig::new()
+            .with_write_timeout(DEFAULT_WRITE_TIMEOUT)
+            .with_power_profile(cfg.power_profile);
+        let listener = RelayListener::bind_with_config(
             relay_url.clone(),
             expected_host,
             key,
-            DEFAULT_WRITE_TIMEOUT,
             cfg.relay_auth.clone(),
+            lcfg,
         )
         .await
         .map_err(to_generic_err)?;
@@ -2573,10 +2727,12 @@ impl Endpoint {
         let input: TransportConfigInput = serde_json::from_str(&transport_config_json)
             .map_err(|e| json_err("transport_config_json", &e))?;
         let parsed = EndpointTransportConfig::from_input(input)?;
+        self.v2_state.set_jitter(parsed.power_profile.v2_jitter());
         *self
             .transport_cfg
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = parsed;
+        self.close_cached_dialers();
         // Publishing waits on the state directory lock: it never runs on the JS thread.
         self.announce.publish_detached();
         Ok(())
@@ -2656,7 +2812,7 @@ impl Endpoint {
                 replay_cache: None,
                 unix_secs: None,
                 auth: cfg.relay_auth.clone(),
-                ..RelayV2ListenerConfig::default()
+                power_profile: cfg.power_profile,
             };
             let listener = RelayV2Listener::bind_with_config(&relay_url, secret, lcfg)
                 .await
@@ -2906,6 +3062,9 @@ impl Endpoint {
             opts.route_policy.as_deref(),
             self.snapshot_transport_cfg().route_policy,
         )?;
+        if opts.idle_timeout_ms == Some(0) {
+            return Err(to_invalid_arg("idle_timeout_ms must be >= 1"));
+        }
         let args = ConnectArgs {
             wire,
             endpoint: opts.endpoint.filter(|e| !e.is_empty()),
@@ -2914,6 +3073,7 @@ impl Endpoint {
             replace_routes: opts.replace_routes.unwrap_or(false),
             policy: Some(policy),
             relay_host: opts.relay_host,
+            idle_timeout: opts.idle_timeout_ms.map(Duration::from_millis),
         };
         self.connect_policy(&target_host_id, args).await
     }
@@ -3003,6 +3163,7 @@ impl Endpoint {
     pub async fn set_peer_routes(&self, peer_id: String, routes_json: String) -> Result<String> {
         let raw: Vec<String> = serde_json::from_str(&routes_json)
             .map_err(|e| json_err("routes_json (expected an array of strings)", &e))?;
+        let clear_id = peer_id.clone();
         let routes = update_roster_async(
             self.store.as_ref(),
             &self.store_lock,
@@ -3011,6 +3172,7 @@ impl Endpoint {
             move |roster| set_peer_routes(roster, &peer_id, &raw),
         )
         .await?;
+        self.clear_lkg_route(&clear_id);
         Ok(routes_json_array(&routes).to_string())
     }
 
@@ -3050,6 +3212,7 @@ impl Endpoint {
                 return Err(to_invalid_arg(format!("invalid route source '{other}'")));
             }
         };
+        let clear_id = peer_id.clone();
         update_roster_async(
             self.store.as_ref(),
             &self.store_lock,
@@ -3057,7 +3220,9 @@ impl Endpoint {
             &self.identity,
             move |roster| clear_peer_routes(roster, &peer_id, source),
         )
-        .await
+        .await?;
+        self.clear_lkg_route(&clear_id);
+        Ok(())
     }
 
     /// Applies a fresh signed pairing URI to the matching paired host offline. Options
@@ -3087,6 +3252,9 @@ impl Endpoint {
             move |roster| apply_signed_route_uri(roster, &uri, apply),
         )
         .await?;
+        if res.applied {
+            self.clear_lkg_route(&res.peer_id);
+        }
         Ok(serde_json::json!({
             "peer_id": res.peer_id,
             "applied": res.applied,
@@ -3107,6 +3275,12 @@ impl Endpoint {
             .map(|s| NetworkSnapshot::from_json(&s))
             .transpose()
             .map_err(rt_invalid_arg)?;
+        if let Some(ref snap) = snapshot {
+            *self
+                .latest_snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap.clone());
+        }
         self.announce.settle().await;
         let announcer = self.announce.announcer()?;
         let out = tokio::task::spawn_blocking(move || announcer.refresh(unix_ms(), snapshot))
@@ -3118,6 +3292,11 @@ impl Endpoint {
             "changed": out.changed,
         })
         .to_string())
+    }
+
+    #[napi(js_name = "setExternalPathMonitor")]
+    pub fn set_external_path_monitor(&self, active: bool) -> Result<()> {
+        self.announce.set_external_monitor(active)
     }
 
     #[napi(js_name = "acceptV2")]
@@ -3173,6 +3352,7 @@ impl Endpoint {
     pub fn close(&self) {
         self.announce.stop();
         self.router.close();
+        self.close_cached_dialers();
         let pools: Vec<Arc<GroupPool>> = self
             .groups
             .lock()

@@ -1697,10 +1697,10 @@ func (g *Group) AuthorizePeer(peerID, capability string) error {
 	})
 }
 
-// RouteConfig holds the route keys of the transport configuration. Nil and empty-string fields are
-// left unchanged, so the endpoint keeps its defaults ("auto" advertising, "all_signed" policy,
-// signed routes). For the list fields, nil leaves the current value and a pointer to an empty
-// slice clears it.
+// RouteConfig holds the route and power keys of the transport configuration. Nil and empty-string
+// fields are left unchanged, so the endpoint keeps its defaults ("auto" advertising, "all_signed"
+// policy, signed routes). For the list fields, nil leaves the current value and a pointer to an
+// empty slice clears it.
 type RouteConfig struct {
 	// AdvertisedEndpoints lists extra hints added to the announced route set.
 	AdvertisedEndpoints *[]string `json:"advertised_endpoints,omitempty"`
@@ -1712,6 +1712,8 @@ type RouteConfig struct {
 	RoutePolicy string `json:"route_policy,omitempty"`
 	// SignRoutes overrides route signing for issued URIs; nil keeps the default (true).
 	SignRoutes *bool `json:"sign_routes,omitempty"`
+	// PowerProfile selects "standard" or "low_power" background socket/probe policy.
+	PowerProfile string `json:"power_profile,omitempty"`
 }
 
 // ConfigureRoutes merges the set route keys of c into the last full transport configuration
@@ -1915,6 +1917,8 @@ type ConnectOptions struct {
 	ReplaceRoutes bool   `json:"replace_routes,omitempty"`
 	// RoutePolicy is "all_signed", "committed_only" or "none".
 	RoutePolicy string `json:"route_policy,omitempty"`
+	// IdleTimeoutMs closes an idle session after this many milliseconds of no application frames.
+	IdleTimeoutMs uint64 `json:"idle_timeout_ms,omitempty"`
 }
 
 // ConnectWithOptions opens a session toward targetHostID, dialing its stored routes unless
@@ -2142,4 +2146,19 @@ func (ep *Endpoint) RefreshRoutes(snapshot *NetworkSnapshot) (RefreshRoutesResul
 		return decodeOut(out, &res)
 	})
 	return res, err
+}
+
+// SetExternalPathMonitor informs the route announcer whether an external OS path monitor delivers
+// network change events (active == true suppresses periodic background route polling).
+func (ep *Endpoint) SetExternalPathMonitor(active bool) error {
+	return ep.withHandle(func(h *C.TendrilEndpoint) error {
+		var flag C.int32_t
+		if active {
+			flag = 1
+		}
+		if rc := C.tendril_endpoint_set_external_path_monitor(h, flag); rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		return nil
+	})
 }
