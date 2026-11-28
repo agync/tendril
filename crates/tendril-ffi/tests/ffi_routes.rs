@@ -1828,3 +1828,156 @@ fn apns_h2_config_validation_and_tls_attempt() {
     drop((c, h));
     assert!(tls_hits.load(Ordering::SeqCst) >= 1);
 }
+
+#[test]
+fn low_power_stored_v2_wake_idle_timeout_and_external_monitor() {
+    use std::ffi::CString;
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let p = paired(Kind::StateDir, 2);
+    let (host, client, host_id) = (&p.host, &p.client, p.host_id.as_str());
+
+    // Pick a currently closed loopback port so the initial stored-route dial hits connection refused.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let sleeping_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let sleeping_addr = format!("127.0.0.1:{sleeping_port}");
+
+    let host_c = cs(host_id);
+    let source_all = cs("all");
+    assert_eq!(
+        unsafe {
+            tendril_ffi::tendril_endpoint_clear_peer_routes(
+                client.raw(),
+                host_c.as_ptr(),
+                source_all.as_ptr(),
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    let routes_c = cs(&json!([sleeping_addr]).to_string());
+    assert_eq!(
+        unsafe {
+            tendril_ffi::tendril_endpoint_set_peer_routes(
+                client.raw(),
+                host_c.as_ptr(),
+                routes_c.as_ptr(),
+            )
+        },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+
+    // `idle_timeout_ms: 0` must fail closed before dialing.
+    let target = cs(host_id);
+    let bad_opts = cs(&json!({"wire": 2, "idle_timeout_ms": 0}).to_string());
+    assert!(
+        unsafe {
+            tendril_session_connect_with_options(client.raw(), target.as_ptr(), bad_opts.as_ptr())
+        }
+        .is_null(),
+        "idle_timeout_ms=0 must be rejected"
+    );
+
+    // Start a wake server that binds the sleeping host listener before replying 202.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let wake_addr = listener.local_addr().unwrap();
+    let wake_hits = Arc::new(AtomicUsize::new(0));
+    let hits_ref = Arc::clone(&wake_hits);
+    let host_addr = host.addr();
+    let sleep_c = CString::new(sleeping_addr.clone()).unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if buf[..n].starts_with(b"POST /wake") {
+                if hits_ref.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let ep = host_addr as *mut TendrilEndpoint;
+                    let mut out = ptr::null_mut();
+                    let rc = unsafe {
+                        tendril_ffi::tendril_endpoint_serve_direct(
+                            ep,
+                            sleep_c.as_ptr(),
+                            &raw mut out,
+                        )
+                    };
+                    assert_eq!(rc, TENDRIL_OK, "deferred serve_direct failed");
+                    if !out.is_null() {
+                        unsafe { drop(take_cstr(out)) };
+                    }
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+    let wake_url = format!("http://{wake_addr}/wake");
+
+    assert_eq!(
+        host.configure(&json!({ "power_profile": "low_power" })),
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    assert_eq!(
+        client.configure(&json!({
+            "power_profile": "low_power",
+            "wake_url": wake_url,
+            "wake_secret_b64": tendril_core::crypto::b64url_encode(&[9u8; 32]),
+            "wake_pre_wake": false,
+            "wake_retry_delay_ms": 50,
+            "wake_retry_max_delay_ms": 200,
+            "wake_max_attempts": 3,
+        })),
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+
+    assert_eq!(
+        unsafe { tendril_ffi::tendril_endpoint_set_external_path_monitor(host.raw(), 1) },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+    let _ = host.refresh(None);
+    assert_eq!(
+        unsafe { tendril_ffi::tendril_endpoint_set_external_path_monitor(host.raw(), 0) },
+        TENDRIL_OK,
+        "{}",
+        last_err()
+    );
+
+    // Stored-route (`endpoint` omitted) Wire v2 connect must fire the wake provider on initial miss.
+    let grant: Value = serde_json::from_str(&p.grant).unwrap();
+    let (c, h) = connect_opts(
+        client,
+        host,
+        &json!({"wire": 2, "grant": grant, "idle_timeout_ms": 5000}),
+    )
+    .expect("stored-route v2 wake connect");
+    assert_eq!(wake_hits.load(Ordering::SeqCst), 1);
+    c.send(b"ffi-low-power");
+    h.expect_data(b"ffi-low-power");
+    drop((c, h));
+
+    // Subsequent stored-route reconnect finds the live listener via LKG without waking again.
+    let (c2, h2) = connect_opts(
+        client,
+        host,
+        &json!({"wire": 2, "grant": grant, "idle_timeout_ms": 5000}),
+    )
+    .expect("stored-route v2 LKG reconnect");
+    assert_eq!(wake_hits.load(Ordering::SeqCst), 1);
+    c2.send(b"ffi-lkg");
+    h2.expect_data(b"ffi-lkg");
+    drop((c2, h2));
+}

@@ -2801,3 +2801,70 @@ func TestVerifyWakeTagAndApnsWakeConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestLowPowerRouteConfigIdleTimeoutAndExternalMonitor(t *testing.T) {
+	host, err := tendril.NewEndpoint(t.TempDir(), "go-lp-host")
+	if err != nil {
+		t.Fatalf("NewEndpoint host: %v", err)
+	}
+	defer host.Close()
+	client, err := tendril.NewEndpoint(t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("NewEndpoint client: %v", err)
+	}
+	defer client.Close()
+
+	if err := host.ConfigureRoutes(tendril.RouteConfig{PowerProfile: "low_power"}); err != nil {
+		t.Fatalf("ConfigureRoutes host: %v", err)
+	}
+	if err := client.ConfigureRoutes(tendril.RouteConfig{PowerProfile: "low_power"}); err != nil {
+		t.Fatalf("ConfigureRoutes client: %v", err)
+	}
+	if err := host.SetExternalPathMonitor(true); err != nil {
+		t.Fatalf("SetExternalPathMonitor(true): %v", err)
+	}
+	if err := host.SetExternalPathMonitor(false); err != nil {
+		t.Fatalf("SetExternalPathMonitor(false): %v", err)
+	}
+	if _, err := host.ServeDirect("127.0.0.1:0"); err != nil {
+		t.Fatalf("ServeDirect: %v", err)
+	}
+	issued, err := host.IssuePairingURI(nil)
+	if err != nil {
+		t.Fatalf("IssuePairingURI: %v", err)
+	}
+	res := pairThroughURI(t, host, client, issued.URI, true, nil)
+	hostID := hostIDOf(t, host)
+	grant, err := host.MintGrant(res.DeviceID, []string{"fs.read"}, 3600)
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+
+	cs, hs, err := connectPair(t, host, true, func() (*tendril.Session, error) {
+		return client.ConnectWithOptions(hostID, &tendril.ConnectOptions{
+			Wire:          2,
+			Grant:         json.RawMessage(grant),
+			IdleTimeoutMs: 120,
+		})
+	})
+	if err != nil {
+		t.Fatalf("ConnectWithOptions: %v", err)
+	}
+	defer hs.Close()
+	defer cs.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		ev, err := cs.PollEvent(100)
+		if errors.Is(err, tendril.ErrWouldBlock) {
+			continue
+		}
+		if errors.Is(err, io.EOF) || (err == nil && ev != nil && ev.Event == "closed") {
+			return
+		}
+		if err != nil {
+			t.Fatalf("PollEvent: %v", err)
+		}
+	}
+	t.Fatal("expected idle_timeout_ms session to close on idle")
+}

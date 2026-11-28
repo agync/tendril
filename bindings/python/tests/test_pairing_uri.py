@@ -93,6 +93,7 @@ class PairingUriConfigTests(unittest.TestCase):
                         "advertised_endpoints": ["wss://relay.example/v1/relay"],
                         "route_policy": "committed_only",
                         "sign_routes": False,
+                        "power_profile": "low_power",
                     }
                 )
             )
@@ -101,6 +102,8 @@ class PairingUriConfigTests(unittest.TestCase):
                 {"relay_auth_origins": ["wss://relay.example/with/path"]},
                 {"relay_auth_origins": ["not an origin"]},
                 {"route_policy": "most"},
+                {"power_profile": "ultra"},
+                {"wake_retry_max_delay_ms": 2000},
             ):
                 with self.assertRaises(ValueError, msg=str(bad)):
                     ep.configure_transports_json(json.dumps(bad))
@@ -719,6 +722,64 @@ class WakePolicyTests(unittest.TestCase):
                 # A policy refusal is final. Connect-first never wakes the host for it; pre-wake
                 # has already sent its one hint.
                 self.assertEqual(len(self.wake.requests) - before, 1 if pre_wake else 0)
+
+    def test_low_power_stored_route_v2_wake_idle_timeout_and_external_monitor(self) -> None:
+        _, res = self.pair_v2()
+        grant = json.loads(self.host.mint_grant(res["device_id"], ["fs.read"], 3600))
+        sleeping = socket.socket()
+        sleeping.bind(("127.0.0.1", 0))
+        port = sleeping.getsockname()[1]
+        sleeping.close()
+
+        self.cli.clear_peer_routes("py-wake-host", "all")
+        self.cli.set_peer_routes("py-wake-host", json.dumps([f"127.0.0.1:{port}"]))
+
+        with self.assertRaises(ValueError):
+            self.cli.connect_with_options(
+                "py-wake-host",
+                json.dumps({"wire": 2, "grant": grant, "idle_timeout_ms": 0}),
+            )
+
+        secret = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
+        accepted: dict = {}
+
+        def start_host() -> None:
+            self.host.serve_direct(f"127.0.0.1:{port}")
+            t, holder = accept_in_thread(self.host.accept_v2, 10000)
+            accepted.update(thread=t, holder=holder)
+
+        wake = WakeServer(on_wake=start_host)
+        self.addCleanup(wake.close)
+        self.cli.configure_transports_json(
+            json.dumps(
+                {
+                    "power_profile": "low_power",
+                    "wake_url": wake.url,
+                    "wake_adapter": "webhook",
+                    "wake_secret_b64": secret,
+                    "wake_pre_wake": False,
+                    "wake_retry_delay_ms": 25,
+                    "wake_retry_max_delay_ms": 200,
+                    "wake_max_attempts": 3,
+                    "wake_timeout_ms": 2000,
+                }
+            )
+        )
+        self.host.configure_transports_json(json.dumps({"power_profile": "low_power"}))
+        self.host.set_external_path_monitor(True)
+        self.host.refresh_routes(None)
+        self.host.set_external_path_monitor(False)
+
+        sess = self.cli.connect_with_options(
+            "py-wake-host",
+            json.dumps({"wire": 2, "grant": grant, "idle_timeout_ms": 5000}),
+        )
+        accepted["thread"].join(timeout=15)
+        self.assertNotIn("err", accepted["holder"])
+        self.assertEqual(len(wake.requests), 1)
+        sess.send_data(b"py-low-power")
+        self.assertEqual(json.loads(accepted["holder"]["res"].poll_event(3000))["event"], "data")
+        sess.close()
 
 
 class PairingLockOrderTests(unittest.TestCase):

@@ -166,9 +166,11 @@ export class Endpoint {
    * `advertised_endpoints` (string[]), `p2p_port_mapping` (boolean, default true; false stops P2P
    * endpoints from probing the router), `p2p_bind_addrs` (string[] of at most one IPv4 and one IPv6
    * address such as "0.0.0.0:0"; camelCase `p2pPortMapping`, `p2pBindAddrs`), `route_policy` ("all_signed" | "committed_only" |
-   * "none") and `sign_routes` (boolean). A changed advertise set is published off the calling
-   * thread, and the next `issuePairingUri` or `refreshRoutes` waits for that publish; a
-   * publish error is not an error of this call (the issuance or refresh reports it).
+   * "none"), `sign_routes` (boolean), `power_profile` ("standard" | "low_power", camelCase
+   * `powerProfile`), and `wake_retry_max_delay_ms` (number, camelCase `wakeRetryMaxDelayMs`). A
+   * changed advertise set is published off the calling thread, and the next `issuePairingUri` or
+   * `refreshRoutes` waits for that publish; a publish error is not an error of this call (the
+   * issuance or refresh reports it).
    */
   configureTransportsJson(transportConfigJson: string): void;
   mintRelayTicket(
@@ -201,7 +203,7 @@ export class Endpoint {
   /**
    * Day-2 connect with every option in one JSON object: `{"wire": 1 | 2, "grant": object,
    * "endpoint": string, "recovery_uri": string, "replace_routes": boolean,
-   * "route_policy": string, "relay_host": string}`.
+   * "route_policy": string, "relay_host": string, "idle_timeout_ms" | "idleTimeoutMs": number}`.
    */
   connectWithOptions(targetHostId: string, optionsJson: string): Promise<Session>;
   /**
@@ -256,6 +258,11 @@ export class Endpoint {
    * `{"route_seq", "changed"}`.
    */
   refreshRoutes(snapshotJson?: string | null): Promise<string>;
+  /**
+   * Notifies the route announcer whether an external OS path monitor owns interface-change
+   * refreshes, suppressing periodic background polling while active.
+   */
+  setExternalPathMonitor(active: boolean): void;
   acceptV2(timeoutMs?: number | null): Promise<Session>;
   groupCreate(
     name: string,
