@@ -330,7 +330,7 @@ jobs:
       needs.changes.outputs.apple != 'false'
       || (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--'))
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -498,6 +498,16 @@ jobs:
           SWIFT
 
           swift run --package-path "$smoke_dir"
+      - name: Verify TendrilFFI.xcframework build is reproducible
+        run: |
+          set -euo pipefail
+          first_sha=$(shasum -a 256 "$RUNNER_TEMP/TendrilFFI.xcframework-0.1.0.zip" | cut -d' ' -f1)
+          second_sha=$(CARGO_TARGET_DIR="$RUNNER_TEMP/xcframework-rebuild-target" \
+            scripts/build-xcframework.sh "0.1.0" "$RUNNER_TEMP/rebuild/TendrilFFI.xcframework-0.1.0.zip")
+          if [ "$first_sha" != "$second_sha" ]; then
+            echo "xcframework build is not reproducible: first=$first_sha second=$second_sha" >&2
+            exit 1
+          fi
 
   rust-platforms:
     name: cross-platform (${{ matrix.os }})
