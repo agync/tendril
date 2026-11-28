@@ -31,6 +31,7 @@ from pathlib import Path
 
 FIXED_DATE_TIME = (2020, 1, 1, 0, 0, 0)
 CHUNK_SIZE = 1024 * 1024
+LEVEL_ATTR = "compress_level" if hasattr(zipfile.ZipInfo, "compress_level") else "_compresslevel"
 
 framework_dir = Path(os.path.abspath(sys.argv[1]))
 out_zip = Path(os.path.abspath(sys.argv[2]))
@@ -99,7 +100,7 @@ try:
             else:
                 perm = 0o755 if (st.st_mode & 0o111) else 0o644
                 zi.compress_type = zipfile.ZIP_DEFLATED
-                zi.compress_level = 9
+                setattr(zi, LEVEL_ATTR, 9)
                 zi.external_attr = (stat.S_IFREG | perm) << 16
                 zi.file_size = st.st_size
                 with open(path, "rb") as src, zf.open(zi, "w") as dst:
@@ -118,6 +119,23 @@ try:
 except Exception:
     tmp_zip.unlink(missing_ok=True)
     raise
+PY
+}
+
+# xcodebuild emits AvailableLibraries in hash-randomized order, so two runs on
+# identical inputs differ. Rewrite the plist as XML with that array sorted by
+# LibraryIdentifier and dictionary keys sorted.
+normalize_info_plist() {
+  python3 -I - "$1" <<'PY'
+import plistlib
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as fh:
+    plist = plistlib.load(fh)
+plist["AvailableLibraries"].sort(key=lambda lib: lib["LibraryIdentifier"])
+with open(path, "wb") as fh:
+    plistlib.dump(plist, fh, fmt=plistlib.FMT_XML, sort_keys=True)
 PY
 }
 
@@ -175,7 +193,8 @@ trap 'rm -rf "$stage"' EXIT
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR="$target_dir"
 export ZERO_AR_DATE=1
-export RUSTFLAGS="--remap-path-prefix=${root}=. -C debuginfo=0"
+cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+export RUSTFLAGS="--remap-path-prefix=${root}=. --remap-path-prefix=${cargo_home}=/cargo -C debuginfo=0"
 
 targets=(
   aarch64-apple-darwin
@@ -205,5 +224,5 @@ xcodebuild -create-xcframework \
   -library "${stage}/libs/aarch64-apple-ios-sim/libtendril_ffi.a" -headers "${stage}/headers" \
   -output "$xcframework" >&2
 
-plutil -convert xml1 "${xcframework}/Info.plist" >&2
+normalize_info_plist "${xcframework}/Info.plist"
 pack_xcframework "$xcframework" "$out_zip"
