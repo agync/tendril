@@ -42,3 +42,4 @@ Entries from November 2026.
 - [Add CLI refusal controls and a serve session_refused event](27-add-cli-refusal-controls-and-a.md)
 - [Keep revocation state across roster reloads and commits in the FFI, Python, Node and CLI](27-keep-revocation-state-across-roster-reloads.md)
 - [Add a Windows named-pipe local provider](27-add-a-windows-named-pipe-local.md)
+- [Add mobile low-power profile, multi-address wake, and event-driven lifecycles](28-add-mobile-low-power-profile-multi.md)
