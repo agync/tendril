@@ -44,7 +44,7 @@ android {
 
 afterEvaluate {
   val prebuiltAar = (findProperty("prebuiltAar") as String?)?.takeIf { it.isNotBlank() }
-  val resolvedVersion = (findProperty("tendrilVersion") as String?) ?: "0.1.0" // x-release-please-version
+  val resolvedVersion = (findProperty("tendrilVersion") as String?) ?: "0.2.0" // x-release-please-version
 
   fun MavenPublication.configureTendrilPublication() {
     groupId = "dev.agync"
