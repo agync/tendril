@@ -238,6 +238,15 @@ function remainingBudgetMs(deadlineMs, label) {
 }
 
 const PROVIDER_RANK = { local: 0, direct: 1, overlay: 2, p2p: 3, relay: 4, broker: 5 };
+const MAX_IDLE_TIMEOUT_MS = 2_147_483_647;
+const APP_ACTIVITY_EVENTS = new Set([
+  "data",
+  "app_data",
+  "grant_updated",
+  "revocation_updated",
+  "group_manifest_unverified",
+  "group_rendezvous_unverified",
+]);
 const RUNG_BUDGET_MS = 4000;
 const ROSTER_LOCK_WARN_MS = 5000;
 const CLIENT_ROUTE_SET_INTERVAL_MS = 10000;
@@ -797,6 +806,7 @@ export class TendrilWebClient {
   #rosterPending = 0;
   #inPersistCallback = 0;
   #rosterFailedErr = null;
+  #lkgRoutes = new Map();
 
   constructor(
     token,
@@ -1221,14 +1231,17 @@ export class TendrilWebClient {
     if (!Array.isArray(routes) || routes.some((r) => typeof r !== "string")) {
       throw new TypeError("routes must be an array of endpoint strings");
     }
-    return this.#mutateRoster(() =>
+    const res = await this.#mutateRoster(() =>
       JSON.parse(this.#roster.set_routes(peerId, JSON.stringify(routes)))
     );
+    this.#lkgRoutes.delete(peerId);
+    return res;
   }
 
   /** Removes the routes of one source (`operator` by default, `signed`, `committed`), or `all`. */
   async clearPeerRoutes(peerId, source = null) {
     await this.#mutateRoster(() => this.#roster.clear_routes(peerId, source ?? undefined));
+    this.#lkgRoutes.delete(peerId);
   }
 
   /**
@@ -1238,7 +1251,7 @@ export class TendrilWebClient {
    */
   async applyRouteUri(uri, { routePolicy = "allSigned", replaceRoutes = false } = {}) {
     const policy = normalizeRoutePolicy(routePolicy);
-    return this.#mutateRoster(
+    const res = await this.#mutateRoster(
       () =>
         JSON.parse(
           this.#roster.apply_signed_route_uri(
@@ -1248,6 +1261,10 @@ export class TendrilWebClient {
         ),
       (result) => result.applied
     );
+    if (res.applied && res.peer_id) {
+      this.#lkgRoutes.delete(res.peer_id);
+    }
+    return res;
   }
 
   mintEnrollmentToken({ targetHostId, subject = null, ttlSecs = 900 }) {
@@ -2231,9 +2248,31 @@ export class TendrilWebClient {
       webrtcUpgrade = true,
       autoUpgradeWebRtc = false,
       iceServers = [],
+      lowPower = false,
+      maxInFlight = null,
+      idleTimeoutMs = null,
     } = opts;
     if (!Array.isArray(iceServers)) {
       throw new TypeError("iceServers must be an array");
+    }
+    let normalizedMaxInFlight = null;
+    if (maxInFlight !== null && maxInFlight !== undefined) {
+      if (!Number.isInteger(maxInFlight) || maxInFlight < 0) {
+        throw new RangeError("maxInFlight must be a non-negative integer");
+      }
+      normalizedMaxInFlight = maxInFlight;
+    }
+    let normalizedIdleTimeoutMs = null;
+    if (idleTimeoutMs !== null && idleTimeoutMs !== undefined) {
+      if (
+        typeof idleTimeoutMs !== "number" ||
+        !Number.isFinite(idleTimeoutMs) ||
+        idleTimeoutMs < 1 ||
+        idleTimeoutMs > MAX_IDLE_TIMEOUT_MS
+      ) {
+        throw new RangeError(`idleTimeoutMs must be between 1 and ${MAX_IDLE_TIMEOUT_MS}`);
+      }
+      normalizedIdleTimeoutMs = Math.floor(idleTimeoutMs);
     }
     const secretMaster = copySecret(relayAuthSecret);
     const tokenMaster = copySecret(p2pRelayAuthToken);
@@ -2257,6 +2296,9 @@ export class TendrilWebClient {
         webrtcUpgrade: Boolean(webrtcUpgrade),
         autoUpgradeWebRtc: Boolean(autoUpgradeWebRtc),
         iceServers: [...iceServers],
+        lowPower: Boolean(lowPower),
+        maxInFlight: normalizedMaxInFlight,
+        idleTimeoutMs: normalizedIdleTimeoutMs,
       };
       if (endpoint || relayUrl) {
         return await this.#connectExplicit(ctx, {
@@ -2477,6 +2519,7 @@ export class TendrilWebClient {
         recoveryRoutes: recoveryRoutes ?? null,
         routeProvider,
         grantJson: ctx.grantJson ?? null,
+        idleTimeoutMs: ctx.idleTimeoutMs ?? null,
         dialUpgradeSession: async (newStream, deadlineMs, expectedPeerDeviceId) => {
           this.#ensureOpen();
           const upgradeCtx = {
@@ -2741,25 +2784,40 @@ export class TendrilWebClient {
    * P2P cold-start hold delay, `next_deadline_ms()` timer loop). `runCandidate` receives
    * `{ id, cand, attemptDeadlineMs, signal, claimWin }` and must never reject.
    */
-  async #raceCandidatesWithPlanner({ candidates, timeoutMs, label, runCandidate, onDiscard }) {
+  async #raceCandidatesWithPlanner({
+    candidates,
+    timeoutMs,
+    label,
+    preferredHint = null,
+    lowPower = false,
+    maxInFlight = null,
+    runCandidate,
+    onDiscard,
+  }) {
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       throw new RangeError("timeoutMs must be a finite non-negative number");
     }
     const safeTimeoutMs = Math.ceil(timeoutMs);
     const startMs = performance.now();
     const nowRel = () => Math.max(0, Math.floor(performance.now() - startMs));
+    const resolvedMaxInFlight = maxInFlight ?? (lowPower ? 2 : null);
     const planner = new WasmPathPlanner(
       JSON.stringify(
-        candidates.map((cand, id) => ({
-          id,
-          addr: cand.hint ?? cand.endpoint,
-          provider: cand.provider,
-          ...(cand.source ? { source: cand.source } : {}),
-        }))
+        candidates.map((cand, id) => {
+          const addr = cand.hint ?? cand.endpoint;
+          return {
+            id,
+            addr,
+            provider: cand.provider,
+            ...(cand.source ? { source: cand.source } : {}),
+            ...(preferredHint !== null && addr === preferredHint ? { preferred: true } : {}),
+          };
+        })
       ),
       JSON.stringify({
         attempt_stagger_ms: 250,
-        p2p_cold_delay_ms: 500,
+        p2p_cold_delay_ms: lowPower ? 750 : 500,
+        ...(resolvedMaxInFlight !== null ? { max_in_flight: resolvedMaxInFlight } : {}),
         exhaustion_timeout_ms: safeTimeoutMs,
       })
     );
@@ -3052,6 +3110,9 @@ export class TendrilWebClient {
         candidates: cands.candidates,
         timeoutMs: ctx.timeoutMs,
         label: `${base} handshake`,
+        preferredHint: this.#lkgRoutes.get(peer) ?? null,
+        lowPower: Boolean(ctx.lowPower),
+        maxInFlight: ctx.maxInFlight,
         runCandidate: ({ cand, attemptDeadlineMs, signal }) =>
           this.#connectCandidate(ctx, cands, cand, snapBytes, attemptDeadlineMs, evidence, signal),
         onDiscard: async (res) => {
@@ -3061,6 +3122,7 @@ export class TendrilWebClient {
         },
       });
       if (race.fatal) {
+        this.#lkgRoutes.delete(peer);
         throw race.fatal.error;
       }
       const winner = race.winner?.winner ?? null;
@@ -3073,12 +3135,14 @@ export class TendrilWebClient {
         fin = { error: toError(err) };
       }
       if (fin.error) {
+        this.#lkgRoutes.delete(peer);
         if (winner) {
           await this.#discardWinner(winner);
         }
         throw attemptError(fin.error, { skipped, failures });
       }
       if (!winner) {
+        this.#lkgRoutes.delete(peer);
         const relayOffline =
           !ctx.recoveryUri &&
           failures.length > 0 &&
@@ -3091,10 +3155,14 @@ export class TendrilWebClient {
       try {
         this.#ensureUnlocked();
       } catch (err) {
+        this.#lkgRoutes.delete(peer);
         await this.#discardWinner(winner);
         throw err;
       }
       winner.clone.free();
+      if (winner.cand.hint) {
+        this.#lkgRoutes.set(peer, winner.cand.hint);
+      }
       const webSession = this.#handOff(
         ctx,
         winner.session,
@@ -3431,6 +3499,8 @@ export class TendrilWebSession {
   #closePromise = null;
   #persistFailedErr = null;
   #failureClosed = false;
+  #idleTimeoutMs = null;
+  #idleTimer = null;
 
   constructor(
     token,
@@ -3461,12 +3531,14 @@ export class TendrilWebSession {
     this.#routeProvider = rosterOps.routeProvider ?? null;
     this.#dialUpgradeSession = rosterOps.dialUpgradeSession ?? null;
     this.#grantJson = rosterOps.grantJson ?? null;
+    this.#idleTimeoutMs = rosterOps.idleTimeoutMs ?? null;
     this.#onRelease = onRelease;
     this.#queue = [...initialEvents];
     this.#isV2 = Boolean(isV2);
     this.#groupHook = groupHook;
     this.#peerDeviceId =
       typeof session.peer_device_id === "function" ? (session.peer_device_id() ?? null) : null;
+    this.#armIdleTimer();
   }
 
   /** Device id derived from the static key authenticated by the handshake. */
@@ -3517,8 +3589,32 @@ export class TendrilWebSession {
   #markPersistFailed(persistErr) {
     this.#persistFailedErr = persistErr;
     this.#closing = true;
+    this.#clearIdleTimer();
     this.#rejectPendingUpgrade(persistErr);
     this.#lockClient(persistErr);
+  }
+
+  #clearIdleTimer() {
+    if (this.#idleTimer !== null) {
+      clearTimeout(this.#idleTimer);
+      this.#idleTimer = null;
+    }
+  }
+
+  #armIdleTimer() {
+    this.#clearIdleTimer();
+    if (this.#idleTimeoutMs === null || this.#closing || this.#freed) {
+      return;
+    }
+    this.#idleTimer = setTimeout(() => {
+      this.#idleTimer = null;
+      if (!this.#closing && !this.#freed) {
+        void this.close(1000, "idle_timeout").catch(() => {});
+      }
+    }, this.#idleTimeoutMs);
+    if (typeof this.#idleTimer.unref === "function") {
+      this.#idleTimer.unref();
+    }
   }
 
   #drainRouteSets() {
@@ -3626,6 +3722,7 @@ export class TendrilWebSession {
   #failPersistAndClose(persistErr) {
     this.#persistFailedErr = persistErr;
     this.#closing = true;
+    this.#clearIdleTimer();
     try {
       void this.#stream.close();
     } catch {}
@@ -3637,11 +3734,13 @@ export class TendrilWebSession {
       this.#persistFailedErr = persistErr;
     }
     this.#closing = true;
+    this.#clearIdleTimer();
     void this.close(1011, "roster persistence failure").catch(() => {});
   }
 
   _abortFromClientFree() {
     this.#closing = true;
+    this.#clearIdleTimer();
     void this.close(1000, "client freed").catch(() => {});
   }
 
@@ -3655,11 +3754,13 @@ export class TendrilWebSession {
 
   sendData(payload) {
     this.#ensureOpen();
+    this.#armIdleTimer();
     const bytes = typeof payload === "string" ? encoder.encode(payload) : payload;
     return this.#enqueueSend(async () => {
       this.#ensureOpen();
       const out = this.#session.send_data(bytes, this.#elapsedMs());
       await sendProtocolBytes(this.#stream, out);
+      this.#armIdleTimer();
     });
   }
 
@@ -4195,6 +4296,9 @@ export class TendrilWebSession {
         }
         if (keptEvents.length > 0) {
           await this.#applyGroupEvents(keptEvents);
+          if (keptEvents.some((ev) => APP_ACTIVITY_EVENTS.has(ev?.event))) {
+            this.#armIdleTimer();
+          }
           this.#queue.push(...keptEvents);
         }
         await this.#ingestRouteSets(step.routeSets);
@@ -4229,6 +4333,7 @@ export class TendrilWebSession {
       return this.#closePromise;
     }
     this.#closing = true;
+    this.#clearIdleTimer();
     this.#rejectPendingUpgrade(new Error("session closed before upgrade response"));
     this.#closePromise = (async () => {
       try {

@@ -658,6 +658,38 @@ JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_endpointNewSealed(
   return (jlong)(uintptr_t)ep;
 }
 
+JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_endpointNewSealedWithOptions(
+    JNIEnv *env, jclass cls, jstring state_dir, jstring identity_json, jstring roster_json,
+    jstring host_id, jstring options_json) {
+  (void)cls;
+  char *c_dir = NULL;
+  char *c_id = NULL;
+  char *c_roster = NULL;
+  char *c_host = NULL;
+  char *c_opts = NULL;
+  TendrilEndpoint *ep = NULL;
+  if (dup_opt_utf8(env, state_dir, &c_dir) &&
+      dup_opt_utf8(env, identity_json, &c_id) &&
+      dup_opt_utf8(env, roster_json, &c_roster) &&
+      dup_opt_utf8(env, host_id, &c_host) &&
+      dup_opt_utf8(env, options_json, &c_opts)) {
+    ep = tendril_endpoint_new_sealed_with_options(c_dir, c_id, c_roster, c_host, c_opts, NULL);
+  }
+  free(c_dir);
+  zeroize_cstr_free(c_id);
+  zeroize_cstr_free(c_roster);
+  free(c_host);
+  free(c_opts);
+  if ((*env)->ExceptionCheck(env)) {
+    return 0;
+  }
+  if (ep == NULL) {
+    throw_ffi_error(env, TENDRIL_ERR_INTERNAL, "tendril_endpoint_new_sealed_with_options failed");
+    return 0;
+  }
+  return (jlong)(uintptr_t)ep;
+}
+
 JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointClose(
     JNIEnv *env, jclass cls, jlong ptr) {
   (void)env;
@@ -1475,6 +1507,20 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointRefreshRoutes(
     return NULL;
   }
   return take_out_string(env, out);
+}
+
+JNIEXPORT void JNICALL Java_dev_tendril_TendrilNative_endpointSetExternalPathMonitor(
+    JNIEnv *env, jclass cls, jlong ptr, jboolean active) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
+    return;
+  }
+  int32_t rc = tendril_endpoint_set_external_path_monitor(
+      (TendrilEndpoint *)(uintptr_t)ptr, active ? 1 : 0);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_set_external_path_monitor failed");
+  }
 }
 
 JNIEXPORT jlong JNICALL Java_dev_tendril_TendrilNative_sessionConnectWithOptions(

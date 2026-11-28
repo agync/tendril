@@ -42,6 +42,9 @@ final class TendrilNative {
   public static native long endpointNewSealed(
       String stateDir, String identityJson, String rosterJson, String hostId);
 
+  public static native long endpointNewSealedWithOptions(
+      String stateDir, String identityJson, String rosterJson, String hostId, String optionsJson);
+
   public static native void endpointClose(long ptr);
 
   public static native void endpointFree(long ptr);
@@ -137,6 +140,8 @@ final class TendrilNative {
   public static native String endpointApplyRouteUri(long ptr, String pairingUri, String optionsJson);
 
   public static native String endpointRefreshRoutes(long ptr, String snapshotJson);
+
+  public static native void endpointSetExternalPathMonitor(long ptr, boolean active);
 
   public static native long sessionConnectWithOptions(
       long epPtr, String targetHostId, String optionsJson);

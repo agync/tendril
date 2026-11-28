@@ -2284,6 +2284,85 @@ public final class TendrilJniConformanceTest {
     }
   }
 
+  private static void verifyLowPowerAndExternalMonitor() throws Exception {
+    Path dir = Paths.get(tempStateDir("tendril-jni-lowpower-"));
+    long host = 0;
+    long cli = 0;
+    long[] sessions = null;
+    try {
+      host =
+          TendrilNative.endpointNewSealedWithOptions(
+              dir.resolve("host").toString(),
+              null,
+              null,
+              "jni-lp-host",
+              "{\"power_profile\":\"low_power\"}");
+      cli = TendrilNative.endpointNew(null, "jni-lp-cli");
+      final long cliHandle = cli;
+      TendrilNative.endpointConfigureTransportsJson(
+          cliHandle, "{\"power_profile\":\"low_power\"}");
+      String listen = TendrilNative.endpointServeDirect(host, "127.0.0.1:0");
+      String uri = asStr(issue(host, null).get("uri"));
+      Map<String, Object> paired = pairViaUri(host, cliHandle, uri, true);
+      String hostId = hostIdOf(host);
+      String grant =
+          TendrilNative.endpointMintGrant(
+              host, asStr(paired.get("device_id")), Json.stringify(List.of("fs.read")), 3600);
+
+      String idleZeroErr =
+          failureOf(
+              () ->
+                  TendrilNative.sessionConnectWithOptions(
+                      cliHandle, hostId, "{\"wire\":2,\"idle_timeout_ms\":0}"));
+      check(idleZeroErr.contains("idle_timeout_ms"), "expected idle_timeout_ms error: " + idleZeroErr);
+
+      TendrilNative.endpointSetExternalPathMonitor(host, true);
+      TendrilNative.endpointRefreshRoutes(host, null);
+      TendrilNative.endpointSetExternalPathMonitor(host, false);
+
+      String wakeErr =
+          failureOf(
+              () ->
+                  TendrilNative.endpointConfigureTransportsJson(
+                      cliHandle, "{\"wake_retry_max_delay_ms\":2000}"));
+      check(wakeErr.contains("wake_url"), "expected wake_url error: " + wakeErr);
+
+      sessions =
+          connectAndAccept(
+              host,
+              true,
+              10000,
+              () ->
+                  TendrilNative.sessionConnectWithOptions(
+                      cliHandle,
+                      hostId,
+                      Json.stringify(
+                          Map.of(
+                              "wire",
+                              2,
+                              "grant",
+                              Json.parse(grant),
+                              "idle_timeout_ms",
+                              5000))));
+      roundTrip(sessions[0], sessions[1], "jni-low-power-" + listen);
+    } finally {
+      if (sessions != null) {
+        TendrilNative.sessionFree(sessions[0]);
+        TendrilNative.sessionFree(sessions[1]);
+      }
+      if (host != 0) {
+        TendrilNative.endpointClose(host);
+        long closedHost = host;
+        failureOf(() -> TendrilNative.endpointSetExternalPathMonitor(closedHost, true));
+        TendrilNative.endpointFree(host);
+      }
+      if (cli != 0) {
+        TendrilNative.endpointClose(cli);
+        TendrilNative.endpointFree(cli);
+      }
+    }
+  }
+
   private static void verifyPairingUriRoutes(Path root) throws Exception {
     verifyPairingUriFlow(false);
     verifyPairingUriFlow(true);
@@ -2292,6 +2371,7 @@ public final class TendrilJniConformanceTest {
     verifyRoutesVectors(root);
     verifyRelayHostRoutesReasonAndUnknownPeer();
     verifyP2pNetOptions();
+    verifyLowPowerAndExternalMonitor();
   }
 
   /** A paired host and client; the host knows the client by [clientId] and mints [grant]. */

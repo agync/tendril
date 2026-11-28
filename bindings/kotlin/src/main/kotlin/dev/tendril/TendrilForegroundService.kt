@@ -19,7 +19,6 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** One network of the snapshot passed to [TendrilEndpoint.refreshRoutes]. */
@@ -66,17 +65,19 @@ internal object NetworkSnapshots {
     return SnapshotNetwork(id, name, index, transports, addresses.mapNotNull { it.hostAddress })
   }
 
-  /** `{"networks": [...]}` for the whole set; an empty set is a valid, complete snapshot. */
+  /** `{"networks": [...]}` for the whole set in canonical order; empty is a valid, complete snapshot. */
   fun toJson(networks: List<SnapshotNetwork>): String =
-    networks.joinToString(",", "{\"networks\":[", "]}") { n ->
-      optionsJson(
-        "id" to n.id,
-        "iface" to n.iface,
-        "if_index" to n.ifIndex,
-        "transports" to n.transports,
-        "addrs" to n.addrs,
-      )!!
-    }
+    networks
+      .sortedWith(compareBy<SnapshotNetwork> { it.id }.thenBy { it.iface }.thenBy { it.ifIndex })
+      .joinToString(",", "{\"networks\":[", "]}") { n ->
+        optionsJson(
+          "id" to n.id,
+          "iface" to n.iface,
+          "if_index" to n.ifIndex,
+          "transports" to n.transports.sorted(),
+          "addrs" to n.addrs.sorted(),
+        )!!
+      }
 }
 
 /**
@@ -174,8 +175,7 @@ internal fun runAllGuarded(vararg steps: () -> Unit) {
  * Attach the host endpoint with [LocalBinder.attachEndpoint] before issuing the first pairing
  * URI. The service seeds its network map from `ConnectivityManager.allNetworks`, then keeps it
  * from an all-networks callback (VPN networks included) and passes the whole map to
- * [TendrilEndpoint.refreshRoutes] after every change. A 60 s timer refreshes with no snapshot,
- * which reuses the retained one.
+ * [TendrilEndpoint.refreshRoutes] on connectivity changes when the serialized snapshot changes.
  */
 class TendrilForegroundService : Service() {
   enum class NetworkTransportKind {
@@ -212,7 +212,6 @@ class TendrilForegroundService : Service() {
     const val CHANNEL_ID = "tendril.session.channel"
     const val NOTIFICATION_ID = 7401
     private const val TAG = "TendrilService"
-    private const val TIMER_SECONDS = 60L
   }
 
   private val binder = LocalBinder()
@@ -222,9 +221,11 @@ class TendrilForegroundService : Service() {
 
   private val networks = NetworkMap<Network, LinkProperties, NetworkCapabilities>()
   private val refreshQueued = AtomicBoolean(false)
+  private val refreshLock = Any()
   @Volatile private var refresher: ScheduledExecutorService? = null
 
   @Volatile private var hostEndpoint: TendrilEndpoint? = null
+  @Volatile private var lastSnapshotJson: String? = null
 
   @Volatile private var transitionListener: PathTransitionListener? = null
   @Volatile private var activeTransport: NetworkTransportKind = NetworkTransportKind.NONE
@@ -269,12 +270,6 @@ class TendrilForegroundService : Service() {
         Thread(r, "tendril-route-refresh").apply { isDaemon = true }
       }
     refresher = executor
-    executor.scheduleWithFixedDelay(
-      { refreshNow(withSnapshot = false) },
-      TIMER_SECONDS,
-      TIMER_SECONDS,
-      TimeUnit.SECONDS,
-    )
     // Register before seeding: a network that appears or is lost during the seed reaches the map
     // through the callback instead of being missed.
     val allCallback =
@@ -338,13 +333,23 @@ class TendrilForegroundService : Service() {
   }
 
   private fun attachEndpoint(endpoint: TendrilEndpoint?) {
-    hostEndpoint = endpoint
-    if (endpoint != null) {
-      connectivityManager?.let { seedNetworks(it) }
-      // An empty map only means "no networks" once enumeration or a callback has filled it. When
-      // enumeration was unavailable or denied, or the service is destroyed, a snapshot would
-      // claim zero networks and retire every enumerated route, so refresh without one.
-      refreshNow(withSnapshot = connectivityManager != null && networks.isKnown())
+    synchronized(refreshLock) {
+      val prev = hostEndpoint
+      lastSnapshotJson = null
+      if (endpoint != null) {
+        connectivityManager?.let { seedNetworks(it) }
+      }
+      hostEndpoint = endpoint
+      if (prev != null && prev !== endpoint) {
+        runCatching { prev.setExternalPathMonitor(false) }
+      }
+      if (endpoint != null) {
+        runCatching { endpoint.setExternalPathMonitor(allNetworksCallback != null) }
+        // An empty map only means "no networks" once enumeration or a callback has filled it. When
+        // enumeration was unavailable or denied, or the service is destroyed, a snapshot would
+        // claim zero networks and retire every enumerated route, so refresh without one.
+        refreshNowLocked(endpoint, withSnapshot = connectivityManager != null && networks.isKnown())
+      }
     }
   }
 
@@ -362,9 +367,20 @@ class TendrilForegroundService : Service() {
   }
 
   private fun refreshNow(withSnapshot: Boolean) {
-    val endpoint = hostEndpoint ?: return
+    synchronized(refreshLock) {
+      val endpoint = hostEndpoint ?: return
+      refreshNowLocked(endpoint, withSnapshot)
+    }
+  }
+
+  private fun refreshNowLocked(endpoint: TendrilEndpoint, withSnapshot: Boolean) {
+    val snap = if (withSnapshot) snapshotJson() else null
+    if (withSnapshot && snap != null && snap == lastSnapshotJson) return
     try {
-      endpoint.refreshRoutes(if (withSnapshot) snapshotJson() else null)
+      endpoint.refreshRoutes(snap)
+      if (snap != null && hostEndpoint === endpoint) {
+        lastSnapshotJson = snap
+      }
     } catch (e: Throwable) {
       Log.w(TAG, "route refresh failed: ${e.javaClass.simpleName} ${e.message}")
     }
@@ -377,13 +393,16 @@ class TendrilForegroundService : Service() {
     val cb = callback
     val all = allNetworksCallback
     val executor = refresher
+    val ep = hostEndpoint
     callback = null
     allNetworksCallback = null
     connectivityManager = null
+    lastSnapshotJson = null
     hostEndpoint = null
     refresher = null
     try {
       runAllGuarded(
+        { ep?.setExternalPathMonitor(false) },
         { if (cm != null && cb != null) cm.unregisterNetworkCallback(cb) },
         { if (cm != null && all != null) cm.unregisterNetworkCallback(all) },
         { executor?.shutdownNow() },

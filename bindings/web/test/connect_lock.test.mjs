@@ -1257,3 +1257,104 @@ test("aborted handshake loser never leaks spurious stream-closed failure onto wi
     fx.close();
   }
 });
+
+test("lowPower option, LKG route affinity, and app-data idleTimeoutMs", async () => {
+  await ensureWasm();
+  const fx = await livePair("web-low-power-host");
+  const { relay } = fx.host;
+  const deadUrl = `ws://127.0.0.1:${await deadPort()}/v1/relay`;
+  const OriginalWebSocket = globalThis.WebSocket;
+  const dialedUrls = [];
+  let failDeadImmediately = true;
+
+  class TrackingWebSocket extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url, protocols) {
+      super();
+      dialedUrls.push(String(url));
+      if (String(url) === deadUrl && !failDeadImmediately) {
+        this.url = url;
+        this.readyState = TrackingWebSocket.CONNECTING;
+        setTimeout(() => {
+          if (this.readyState !== TrackingWebSocket.CONNECTING) return;
+          this.readyState = TrackingWebSocket.CLOSED;
+          this.dispatchEvent(new Event("error"));
+          this.dispatchEvent(new Event("close"));
+        }, 120);
+        return;
+      }
+      return protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
+    }
+    send() {}
+    close() {
+      if (this.readyState === TrackingWebSocket.CLOSED) return;
+      this.readyState = TrackingWebSocket.CLOSED;
+      setTimeout(() => this.dispatchEvent(new Event("close")), 0);
+    }
+  }
+
+  globalThis.WebSocket = TrackingWebSocket;
+  try {
+    for (const bad of [0, -10, Number.NaN, "500", 2_147_483_648]) {
+      await assert.rejects(
+        () => fx.client.connect({ targetHostId: fx.hostId, grantJson: fx.grantJson, idleTimeoutMs: bad }),
+        RangeError
+      );
+    }
+    for (const badMax of [-1, 1.5]) {
+      await assert.rejects(
+        () => fx.client.connect({ targetHostId: fx.hostId, grantJson: fx.grantJson, maxInFlight: badMax }),
+        RangeError
+      );
+    }
+
+    await fx.client.clearPeerRoutes(fx.hostId, "signed");
+    await fx.client.setPeerRoutes(fx.hostId, [deadUrl, relay.wsUrl]);
+
+    const first = await fx.connect({
+      allowInsecureWs: true,
+      lowPower: true,
+      maxInFlight: 1,
+      timeoutMs: 8000,
+    });
+    assert.equal(first.route.endpoint, relay.wsUrl);
+    await first.close(1000, "first_done");
+
+    dialedUrls.length = 0;
+    failDeadImmediately = false;
+    const second = await fx.connect({
+      allowInsecureWs: true,
+      lowPower: true,
+      maxInFlight: 1,
+      idleTimeoutMs: 220,
+      timeoutMs: 8000,
+    });
+    assert.equal(dialedUrls[0], relay.wsUrl, "LKG route must be dialed first");
+    await delay(120);
+    assert.equal(second.isClosed(), false);
+    await second.sendData("reset-idle-timer");
+    await delay(140);
+    assert.equal(second.isClosed(), false, "app-data sendData resets idle timer");
+    for (let i = 0; i < 20 && !second.isClosed(); i += 1) {
+      await delay(30);
+    }
+    assert.equal(second.isClosed(), true, "idle session closes after idleTimeoutMs");
+
+    await fx.client.setPeerRoutes(fx.hostId, [deadUrl, relay.wsUrl]);
+    dialedUrls.length = 0;
+    const third = await fx.connect({
+      allowInsecureWs: true,
+      lowPower: true,
+      maxInFlight: 1,
+      timeoutMs: 8000,
+    });
+    assert.equal(dialedUrls[0], deadUrl, "setPeerRoutes clears LKG affinity");
+    await third.close(1000, "third_done");
+  } finally {
+    globalThis.WebSocket = OriginalWebSocket;
+    fx.close();
+  }
+});

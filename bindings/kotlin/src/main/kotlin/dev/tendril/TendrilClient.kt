@@ -374,6 +374,51 @@ internal class SealedStateStore(dirPath: String, private val cipher: KeystoreSta
     synchronized(ioLock) { Files.deleteIfExists(File(root, ROSTER_FILE).toPath()) }
 }
 
+enum class PowerProfile(internal val wire: String) {
+  STANDARD("standard"),
+  LOW_POWER("low_power"),
+}
+
+enum class RuntimeProfile(internal val wire: String) {
+  DEFAULT("default"),
+  EXTENSION("extension"),
+}
+
+data class TendrilEndpointOptions(
+  val runtimeProfile: RuntimeProfile = RuntimeProfile.DEFAULT,
+  val clientOnly: Boolean = false,
+  val powerProfile: PowerProfile? = null,
+) {
+  internal fun toJson(): String? {
+    if (runtimeProfile == RuntimeProfile.DEFAULT && !clientOnly && powerProfile == null) {
+      return null
+    }
+    return optionsJson(
+      "runtime_profile" to runtimeProfile.wire,
+      "client_only" to clientOnly,
+      "power_profile" to powerProfile?.wire,
+    )
+  }
+
+  companion object {
+    @JvmField
+    val MOBILE_CLIENT =
+      TendrilEndpointOptions(
+        runtimeProfile = RuntimeProfile.EXTENSION,
+        clientOnly = true,
+        powerProfile = PowerProfile.LOW_POWER,
+      )
+
+    @JvmField
+    val LOW_POWER_HOST =
+      TendrilEndpointOptions(
+        runtimeProfile = RuntimeProfile.DEFAULT,
+        clientOnly = false,
+        powerProfile = PowerProfile.LOW_POWER,
+      )
+  }
+}
+
 /**
  * A Tendril endpoint. With a [stateDir], the identity is sealed by [KeystoreStateCipher] in
  * `identity.sealed` and the runtime persists roster and group state itself in `rt-roster.sealed`
@@ -394,13 +439,27 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
       stateDir: String? = null,
       hostId: String? = null,
       stateCipher: KeystoreStateCipher? = null,
+      options: TendrilEndpointOptions = TendrilEndpointOptions(),
     ): TendrilEndpoint {
       val dir = stateDir?.takeIf { it.isNotEmpty() }
       if (dir == null) {
-        return TendrilEndpoint(TendrilNative.endpointNewFromState(null, null, hostId))
+        if (options.runtimeProfile != RuntimeProfile.DEFAULT || options.clientOnly) {
+          throw IllegalArgumentException("TendrilEndpointOptions require a non-empty stateDir")
+        }
+        val ep = TendrilEndpoint(TendrilNative.endpointNewFromState(null, null, hostId))
+        if (options.powerProfile != null) {
+          runCatching { ep.configurePower(powerProfile = options.powerProfile) }
+            .onFailure {
+              ep.close()
+              throw it
+            }
+        }
+        return ep
       }
       val store = SealedStateStore(dir, stateCipher ?: KeystoreStateCipher())
-      return store.withBootstrapLock { TendrilEndpoint(openSealed(store, dir, hostId)) }
+      return store.withBootstrapLock {
+        TendrilEndpoint(openSealed(store, dir, hostId, options))
+      }
     }
 
     /**
@@ -408,11 +467,22 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
      * The reopen syncs the directory, so `identity.sealed` is durable before the first runtime
      * write, and seeds the runtime roster from a legacy `roster.sealed` only when needed.
      */
-    private fun openSealed(store: SealedStateStore, dir: String, hostId: String?): Long {
+    private fun openSealed(
+      store: SealedStateStore,
+      dir: String,
+      hostId: String?,
+      options: TendrilEndpointOptions,
+    ): Long {
+      val optsJson = options.toJson()
       val identity =
         store.loadIdentityJson()
           ?: run {
-            val fresh = TendrilNative.endpointNewSealed(dir, null, null, hostId)
+            val fresh =
+              if (optsJson != null) {
+                TendrilNative.endpointNewSealedWithOptions(dir, null, null, hostId, optsJson)
+              } else {
+                TendrilNative.endpointNewSealed(dir, null, null, hostId)
+              }
             val generated =
               try {
                 TendrilNative.endpointExportIdentityJson(fresh)
@@ -423,7 +493,12 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
             generated
           }
       val seed = if (store.legacyRosterNeedsMigration()) store.loadRosterJson() else null
-      val ptr = TendrilNative.endpointNewSealed(dir, identity, seed, hostId)
+      val ptr =
+        if (optsJson != null) {
+          TendrilNative.endpointNewSealedWithOptions(dir, identity, seed, hostId, optsJson)
+        } else {
+          TendrilNative.endpointNewSealed(dir, identity, seed, hostId)
+        }
       try {
         store.deleteLegacyRoster()
       } catch (t: Throwable) {
@@ -682,6 +757,7 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
     replaceRoutes: Boolean? = null,
     routePolicy: RoutePolicy? = null,
     relayHost: String? = null,
+    idleTimeoutMs: Long? = null,
   ): TendrilSession {
     val options =
       optionsJson(
@@ -692,6 +768,7 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
         "replace_routes" to replaceRoutes,
         "route_policy" to routePolicy?.wire,
         "relay_host" to relayHost,
+        "idle_timeout_ms" to idleTimeoutMs,
       )
     return withHandle {
       TendrilSession(TendrilNative.sessionConnectWithOptions(it, targetHostId, options))
@@ -792,6 +869,13 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
     withHandle { TendrilNative.endpointRefreshRoutes(it, snapshotJson) }
 
   /**
+   * Notifies the runtime announcer whether an external OS path monitor owns interface changes,
+   * suppressing periodic background route polling while active.
+   */
+  fun setExternalPathMonitor(active: Boolean) =
+    withHandle { TendrilNative.endpointSetExternalPathMonitor(it, active) }
+
+  /**
    * Sets the pairing-URI and route keys of the transport configuration, keeping every other key
    * (relay credentials, P2P, wake) of the last configuration sent.
    */
@@ -829,6 +913,21 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
   fun configureP2p(portMapping: Boolean? = null, bindAddrs: List<String>? = null) {
     val keys =
       listOf("p2p_port_mapping" to portMapping, "p2p_bind_addrs" to bindAddrs)
+        .mapNotNull { (k, v) -> v?.let { k to it } }
+        .toMap()
+    if (keys.isEmpty()) return
+    transportConfig.merge(keys) { json ->
+      withHandle { TendrilNative.endpointConfigureTransportsJson(it, json) }
+    }
+  }
+
+  /**
+   * Sets [powerProfile] (`power_profile`) and [wakeRetryMaxDelayMs] (`wake_retry_max_delay_ms`),
+   * keeping every other key of the last configuration sent.
+   */
+  fun configurePower(powerProfile: PowerProfile? = null, wakeRetryMaxDelayMs: Long? = null) {
+    val keys =
+      listOf("power_profile" to powerProfile?.wire, "wake_retry_max_delay_ms" to wakeRetryMaxDelayMs)
         .mapNotNull { (k, v) -> v?.let { k to it } }
         .toMap()
     if (keys.isEmpty()) return
