@@ -1,5 +1,89 @@
 # Changelog
 
+## [0.2.0](https://github.com/agync/tendril/compare/v0.1.0...v0.2.0) (2026-11-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **runtime:** name n0 relays and add p2p bind
+
+### Features
+
+* **apple:** add remote SwiftPM and release flow ([2e35dd0](https://github.com/agync/tendril/commit/2e35dd00c7b756f0d612e7957eeeced3bef0477c))
+* **bindings:** add verify_route_set to Python and Node ([f178566](https://github.com/agync/tendril/commit/f178566d252c72a2ffe5f453ddf259f7d4ccbcb0))
+* **bindings:** report refusals in Python, Node, Web ([7509b52](https://github.com/agync/tendril/commit/7509b52571f225dfb04a49e58f49ca0a9eb8a08f))
+* **cli:** add refusal host controls and audit event ([3eb2c9d](https://github.com/agync/tendril/commit/3eb2c9db8c65a8b1215e0b40f02ed132da93b3a0))
+* **cli:** record a refusal notice on revoke ([ca80e43](https://github.com/agync/tendril/commit/ca80e43b7d3dfbffcb51014b3c3eb6cff0c126bb))
+* **core:** add external ML-DSA and identity v2 ([381d4da](https://github.com/agync/tendril/commit/381d4da10b4a9d0d564c3786136a09e95f74ff74))
+* **core:** add low-power policy and LKG affinity ([4a7889b](https://github.com/agync/tendril/commit/4a7889b7a4d16cc01e9eaccf9d33c92aeb72fcc9))
+* **core:** add refusal types and limiter ([aee13b8](https://github.com/agync/tendril/commit/aee13b86217de59f9744dff40e306e48d8d2130e))
+* **core:** fold held revocations into a roster ([69b88e0](https://github.com/agync/tendril/commit/69b88e01597af0918f9439fb40e0371a07ca4566))
+* **core:** refuse known revoked and pending peers ([f6bc094](https://github.com/agync/tendril/commit/f6bc0944152a02067e83e9a269834b8fc9e92271))
+* **enroll:** store routes on every surface ([b4d95c0](https://github.com/agync/tendril/commit/b4d95c00621c64a116afdcb7db91fd4871a4cc63))
+* **ffi,bindings:** wire power profile & wake ([944979c](https://github.com/agync/tendril/commit/944979ccd8a3b038b264d14198ba0eb550f751d6))
+* **ffi:** add custody, extension, and wake ABI ([a266e76](https://github.com/agync/tendril/commit/a266e7620ebf8507fffd1fd9b44d1938a9b0aeb2))
+* **ffi:** add session peer id across bindings ([76bd452](https://github.com/agync/tendril/commit/76bd4522cea827aefcbb5426a9d83659f8eb2842))
+* **ffi:** expose authenticated refusal ([93f5e23](https://github.com/agync/tendril/commit/93f5e23487950309d8e693fa5c77a71ffc64a416))
+* **go:** report routes on enrollment result ([39878c8](https://github.com/agync/tendril/commit/39878c8611ea9dd82b8729c33e45705108967035))
+* **go:** return RefusedError for refusals ([76daa12](https://github.com/agync/tendril/commit/76daa12db2f8506046d90e29d7d9c0c48ac2f12f))
+* **kotlin:** replay route vectors, set P2P keys ([61f4d22](https://github.com/agync/tendril/commit/61f4d2220d6b5eeaa69c4e7bf075e10886f0e2af))
+* **kotlin:** throw TendrilRefusedException ([0298e19](https://github.com/agync/tendril/commit/0298e1913906f6eb91db4f3d1d4da9f05623fd36))
+* **mobile,web:** cut mobile & web battery drain ([7de8e3c](https://github.com/agync/tendril/commit/7de8e3c4f69e05866801fb103c1b34b166f7285d))
+* **p2p:** add port mapping and bind options ([ea77ef7](https://github.com/agync/tendril/commit/ea77ef78e57277bc4ede1b0bd20ab1a54a3c9f5b))
+* **pairing:** return host routes on m2m enrolment ([b4759f1](https://github.com/agync/tendril/commit/b4759f1a9fe1d4a77c7fb2a1f21ed22b6e108365))
+* **policy:** order operator routes first, then source ([fd74736](https://github.com/agync/tendril/commit/fd74736ee95ee1431442857a0bdffa8a27931848))
+* **relay:** add Cloudflare DO worker and guide ([131f9b8](https://github.com/agync/tendril/commit/131f9b8496c5091326c64ba3b4d13f0c789443d4))
+* **relay:** add PaaS config, healthz, and deploy ([9939e3e](https://github.com/agync/tendril/commit/9939e3eaa5028ea6e053a6e09188128d587bf998))
+* **relay:** add standby pool and 0-RTT fast-open ([1ba00fb](https://github.com/agync/tendril/commit/1ba00fb1948b828c2527a111e2f20dc2abd6824d))
+* **roster:** manage pending host claims ([d59d3c8](https://github.com/agync/tendril/commit/d59d3c8caa73590393f7d218016e542c96395593))
+* **runtime:** add low-power listeners & watchers ([d530303](https://github.com/agync/tendril/commit/d53030310e847f01cf3daa68259b888456e63789))
+* **runtime:** add reachability, LKG race, & wake ([1a5cd8d](https://github.com/agync/tendril/commit/1a5cd8d64f4a58755be999301098775e5da93ca4))
+* **runtime:** classify refusals and half-close ([c6771aa](https://github.com/agync/tendril/commit/c6771aa2aabda221b0c715ee180c5d0b64e13258))
+* **runtime:** commit held revocations under one lock ([4e495fa](https://github.com/agync/tendril/commit/4e495fa381fd06f23616e1b8b0af60ceae6cc588))
+* **runtime:** name n0 relays and add p2p bind ([e84b99c](https://github.com/agync/tendril/commit/e84b99c3feaaaffd8f722d0fbd0cb6ca913bdff6))
+* **runtime:** refuse revoked and pending peers ([ee34165](https://github.com/agync/tendril/commit/ee341653c12052dda3fb36bf20389749d8c97833))
+* **runtime:** run the local provider on Windows ([9765c21](https://github.com/agync/tendril/commit/9765c21a887fecbcd5018274544700351b1b61c2))
+* **site:** reorder landing sections ([555bf1a](https://github.com/agync/tendril/commit/555bf1a5131a331e9a2c82e1d159dcd51187958a))
+* **site:** show groups and pair setups ([7626a93](https://github.com/agync/tendril/commit/7626a93fb9e836cff4cee4752cce94d7be712918))
+* **swift:** add configureP2p and route coverage ([bea5878](https://github.com/agync/tendril/commit/bea58785f7b42bb7d99cf70c3b35541421d1eff9))
+* **swift:** add SE custody and background APIs ([236fad5](https://github.com/agync/tendril/commit/236fad5c8b1c11ca9c77c47a305794c81e45eec1))
+* **swift:** throw TendrilError.refused on refusal ([f8f6aa1](https://github.com/agync/tendril/commit/f8f6aa1b099f04c2a265043482dc82fdab95d00c))
+* **wake:** add direct HTTP/2 APNs wake provider ([26520d0](https://github.com/agync/tendril/commit/26520d04c7313eb5e24c5fca75179b7ae61bf14f))
+* **web:** multi-route fallback and broker+ws ([dacd7a0](https://github.com/agync/tendril/commit/dacd7a0dd15f9da601e01ba1048ab15dfe2dfa0c))
+* **webrtc:** add in-band direct upgrade ([1ed74a9](https://github.com/agync/tendril/commit/1ed74a9f7539170034a5a072f1676d790a964fb8))
+* **webtransport:** add opt-in wt direct path ([cdb3f6e](https://github.com/agync/tendril/commit/cdb3f6e0667e795e7c25f1b95e9fadeef81e38ef))
+
+
+### Bug Fixes
+
+* **bindings:** commit held revocations before group reads ([48def3b](https://github.com/agync/tendril/commit/48def3b542744f241ff5e764b2925d9ef27f2cb9))
+* **bindings:** share one revocation fold in Python and Node ([42e5188](https://github.com/agync/tendril/commit/42e518811640c753875e577b4eb07e78d3c97943))
+* **bindings:** tidy refusal codes and docs ([1276485](https://github.com/agync/tendril/commit/1276485ea10a9b6f55ca7920ff070eb61622d5a4))
+* **cli:** carry held revocations through the shared fold ([e3e53fe](https://github.com/agync/tendril/commit/e3e53fe535d0ae844b2a820bc0a3d2a7afa891e0))
+* **core:** make the revocation fold idempotent ([fb45729](https://github.com/agync/tendril/commit/fb457291a773b37958105a0d472b172ef2c71cf0))
+* **core:** never let a newer CRL drop a revocation ([90758c3](https://github.com/agync/tendril/commit/90758c300dadf380e60f1ef475e42e93567b5f1e))
+* **core:** order held entry folds so a fold is idempotent ([a4a408a](https://github.com/agync/tendril/commit/a4a408aff06f89573ceba3179241ef729a805035))
+* **docs:** self-host Cloudflare deploy badge ([65b4933](https://github.com/agync/tendril/commit/65b4933709cba0fcbe890d4b84b3bf3e85d0607b))
+* **egress:** block Teredo and local-use NAT64 ([1750128](https://github.com/agync/tendril/commit/1750128752a9989699ab4a3979f3bc2472a206e0))
+* **egress:** block Teredo in wt host check ([3275210](https://github.com/agync/tendril/commit/3275210a59431e908e193bb3b879f3db65d7fe0e))
+* **egress:** block the Blocked set outside hint dials ([b515e27](https://github.com/agync/tendril/commit/b515e2714b07f38e015b91e41304b3040c2e1ebe))
+* **egress:** check direct, overlay and iroh relay dials ([cf7c07c](https://github.com/agync/tendril/commit/cf7c07c2fd6b6b3f532e1772c719de9c0b224920))
+* **egress:** close iroh relay policy gaps ([4fb6429](https://github.com/agync/tendril/commit/4fb6429df6a65268b4f79597b24e325e795615cb))
+* **ffi:** keep held revocations across reloads ([7d5cc2d](https://github.com/agync/tendril/commit/7d5cc2dcc730f130d4d299c9e96fff8aa88e8b03))
+* **ffi:** make endpoint close a terminal hosting state ([9441ad5](https://github.com/agync/tendril/commit/9441ad51a34948250d05836e21d3cb918019b05d))
+* **identity:** check host_id at every responder ([b2c2c0e](https://github.com/agync/tendril/commit/b2c2c0eb0be0b047f43f7d2718e9560137ed85ca))
+* **identity:** refuse an invalid local host_id ([97e2dc3](https://github.com/agync/tendril/commit/97e2dc3c1f349132f8824f84feb146c39ba6bd05))
+* **p2p:** harden surface options and enrol tests ([51ce429](https://github.com/agync/tendril/commit/51ce4290b71d0c51363aa7bffd3d18b0c6a1347d))
+* **pairing:** enforce route checks in initiators ([c914187](https://github.com/agync/tendril/commit/c9141875764f5f26f9825d3b5c7c8547b8f8ec42))
+* **pairing:** reject a caller pin that disagrees ([69c9374](https://github.com/agync/tendril/commit/69c9374e356c946f25a84d7f915ff326b32b2f44))
+* **relay:** bound registration lifetime and keys ([4eac281](https://github.com/agync/tendril/commit/4eac2810cee8a948d3b972284cc2e0ae14ca8454))
+* **roster:** keep pending claim ops off entries ([08353c6](https://github.com/agync/tendril/commit/08353c6319b4ee73704923e5d6ca2b6af9f90eb7))
+* **roster:** keep pending hosts off their host_id ([b25c1c8](https://github.com/agync/tendril/commit/b25c1c8569dc2c4d2b031364fb8661cda85e18a9))
+* **runtime:** gate Unix sockets for Windows ([99d73fc](https://github.com/agync/tendril/commit/99d73fc2bbcaa6885aaded85d98924f0726fb941))
+* **runtime:** persist enrol state only on change ([ad32c52](https://github.com/agync/tendril/commit/ad32c52fde4a9f0902ddecd80aa104266de63a79))
+* **web:** order WebRTC E2E ping before data ([2de09d7](https://github.com/agync/tendril/commit/2de09d711792a80cc4740aa1e7796260a894c272))
+* **web:** redact raw URL echoes in dial errors ([e569523](https://github.com/agync/tendril/commit/e569523111ef80d727ddd5d7f935acad41da5f94))
+
 ## 0.1.0 (2026-11-24)
 
 
