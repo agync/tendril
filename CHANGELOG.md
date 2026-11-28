@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/agync/tendril/compare/v0.2.1...v0.2.1) (2026-11-28)
+
+
+### Bug Fixes
+
+* **ci:** publish npm from a local path ([3c0042b](https://github.com/agync/tendril/commit/3c0042b5c986656a707b9faad378575fd1f592ac))
+
 ## [0.2.1](https://github.com/agync/tendril/compare/v0.2.0...v0.2.1) (2026-11-28)
 
 0.2.0 was tagged but not published. 0.2.1 is the first release of the 0.2 line and also ships every change listed under 0.2.0 below. See `docs/reference/upgrading-0.2.md` for what callers need to change.
