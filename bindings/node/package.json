@@ -1,6 +1,6 @@
 {
   "name": "@tendril-sdk/node",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Node.js N-API bindings for Tendril private device-to-device links.",
   "homepage": "https://tendril.agync.dev",
   "repository": {

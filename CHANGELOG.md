@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.2.1](https://github.com/agync/tendril/compare/v0.2.0...v0.2.1) (2026-11-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **core:** reject CRLs that drop revocations
+* **session:** refuse revoked and pending peers
+* **pairing:** notify on revoke by default
+* **swift:** add TendrilError.refused case
+* **ffi:** return -8 when the host refuses
+
+### Features
+
+* **ffi:** return -8 when the host refuses ([93d8fc7](https://github.com/agync/tendril/commit/93d8fc709b9b56ba82a662471d7f36e3790948dc))
+* **pairing:** notify on revoke by default ([ce3d1fd](https://github.com/agync/tendril/commit/ce3d1fd149278d553aa8699aa47267feb572432e))
+* **session:** refuse revoked and pending peers ([aefef0f](https://github.com/agync/tendril/commit/aefef0f1238f0d1efa16b23d563485e57518daa2))
+* **swift:** add TendrilError.refused case ([985ac79](https://github.com/agync/tendril/commit/985ac79be90d9d78b816fae6e98e639d6bebcb63))
+
+
+### Bug Fixes
+
+* **apple:** make XCFramework build reproducible ([12402d3](https://github.com/agync/tendril/commit/12402d33534f946c8693e4c29c2e004293cf9c07))
+* **core:** reject CRLs that drop revocations ([5ea5241](https://github.com/agync/tendril/commit/5ea5241fc244be484d87bf316ca1f569fcb5fc19))
+
 ## [0.2.0](https://github.com/agync/tendril/compare/v0.1.0...v0.2.0) (2026-11-28)
 
 

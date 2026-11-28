@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["bindings/python", "bindings/node"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.91"
@@ -58,9 +58,9 @@ webpki-roots = "1"
 wtransport = { version = "0.7.2", default-features = false, features = ["ring", "self-signed"] }
 x25519-dalek = { version = "3.0", default-features = false, features = ["precomputed-tables", "static_secrets", "zeroize"] }
 zeroize = { version = "1.9", features = ["derive"] }
-tendril-core = { version = "0.2.0", path = "crates/tendril-core" }
-tendril-relay = { version = "0.2.0", path = "crates/tendril-relay" }
-tendril-runtime = { version = "0.2.0", path = "crates/tendril-runtime" }
+tendril-core = { version = "0.2.1", path = "crates/tendril-core" }
+tendril-relay = { version = "0.2.1", path = "crates/tendril-relay" }
+tendril-runtime = { version = "0.2.1", path = "crates/tendril-runtime" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

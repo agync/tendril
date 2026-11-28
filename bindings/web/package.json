@@ -1,6 +1,6 @@
 {
   "name": "@tendril-sdk/web",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Browser WebAssembly, WebTransport, and WebSocket relay SDK for Tendril.",
   "homepage": "https://tendril.agync.dev",
   "repository": {
