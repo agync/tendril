@@ -26,8 +26,8 @@ use tendril_core::identity::{
 use tendril_core::pairing::{
     PairAction, PairOutcome, PairingCodeKind, PairingInitiator, PairingUri, PersistOpts,
     PersistPlan, PinnedHost, RouteCheck, RoutePolicy, VerifiedRouteStatement,
-    classify_endpoint_hint, is_v2_relay_hint, mint_enrollment_token as core_mint_enrollment_token,
-    persistable_routes,
+    classify_endpoint_hint, is_v2_p2p_hint, is_v2_relay_hint,
+    mint_enrollment_token as core_mint_enrollment_token, persistable_routes,
 };
 use tendril_core::policy::{
     CandidateEndpoint, PathPlanner, PathPolicyConfig, PlannerAction, ProviderId, sort_key,
@@ -53,8 +53,9 @@ use tendril_core::session::{
 use tendril_core::v2::{
     PaddingPolicy, PakeArgon2Params, RELAY_V2_EPOCH_SECS, V2PairAction, V2PairOutcome,
     V2PakePairInitiator, V2PinnedHost, V2SessionAction, V2SessionInitiator, VerifiedRelayHost,
-    canonical_relay_host as core_canonical_relay_host, derive_epoch_mailbox, epoch_for_unix,
-    epoch_within_skew, sign_v2_relay_dial, verify_v2_relay_accept as core_verify_v2_relay_accept,
+    canonical_relay_host as core_canonical_relay_host, derive_epoch_mailbox,
+    derive_epoch_p2p_window, epoch_for_unix, epoch_within_skew, sign_v2_relay_dial,
+    verify_v2_relay_accept as core_verify_v2_relay_accept,
     verify_v2_relay_register as core_verify_v2_relay_register,
 };
 use tendril_core::wire::{PathUpgradeMsg, WIRE_VERSION_V2, validate_upgrade_caps};
@@ -1343,6 +1344,54 @@ fn filter_browser_iroh_hint(endpoint: &str, source: &str) -> Result<String, &'st
     })
 }
 
+/// Filters an `iroh://v2[?relay=...]` hint: never permits `?addr=`, empty query segments, or
+/// unknown query parameters; skips blocked relay hosts and validates all `relay=` URLs while
+/// preserving them for configured relay map matching in `WasmIrohStream::dial_v2`.
+fn filter_browser_iroh_v2_hint(endpoint: &str) -> Result<String, &'static str> {
+    let Some((base, query)) = endpoint.split_once('?') else {
+        return Ok(endpoint.to_owned());
+    };
+    if query.is_empty() {
+        return Err("invalid");
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            return Err("invalid");
+        }
+        let Some(("relay", value)) = pair.split_once('=') else {
+            return Err("invalid");
+        };
+        if url_host_blocked(value) {
+            return Err("blocked_address");
+        }
+        let parsed = url::Url::parse(value).map_err(|_| "invalid")?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !iroh_relay_url_ok(value)
+        {
+            return Err("invalid");
+        }
+        kept.push(pair);
+    }
+    if kept.is_empty() {
+        Ok(base.to_owned())
+    } else {
+        Ok(format!("{base}?{}", kept.join("&")))
+    }
+}
+
+fn relay_canonical_origin(raw: &str) -> Option<(String, String, u16)> {
+    let stripped = raw.strip_prefix("relay:").unwrap_or(raw);
+    let parsed = url::Url::parse(stripped).ok()?;
+    let host = parsed.host_str()?;
+    let canonical = core_canonical_relay_host(host).ok()?;
+    let port = parsed.port_or_known_default()?;
+    Some((parsed.scheme().to_ascii_lowercase(), canonical, port))
+}
+
 fn split_ws_prefix(hint: &str) -> (&str, &str) {
     if let Some(rest) = hint.strip_prefix("relay:") {
         ("relay:", rest)
@@ -1424,10 +1473,22 @@ fn check_browser_hint(
             Ok((provider, endpoint.to_owned()))
         }
         ProviderId::P2p => {
+            let endpoint = hint.strip_prefix("p2p:").unwrap_or(hint);
+            if is_v2_p2p_hint(endpoint) {
+                if wire != 2 {
+                    return Err("wire_v1_no_p2p_v2");
+                }
+                if !relay_v2_authorized {
+                    return Err("p2p_v2_not_authorized");
+                }
+                if !opts.p2p {
+                    return Err("p2p_feature_disabled");
+                }
+                return Ok((provider, filter_browser_iroh_v2_hint(endpoint)?));
+            }
             if !opts.p2p {
                 return Err("p2p_feature_disabled");
             }
-            let endpoint = hint.strip_prefix("p2p:").unwrap_or(hint);
             Ok((provider, filter_browser_iroh_hint(endpoint, source)?))
         }
         ProviderId::Direct if hint.starts_with("wt://") => {
@@ -1505,7 +1566,7 @@ fn session_candidates_value(
     }
 
     let relay_v2_ready = entry.v2_secrets.is_some();
-    let mut candidates: Vec<(CandidateEndpoint, serde_json::Value)> = Vec::new();
+    let mut kept_candidates: Vec<(CandidateEndpoint, &'static str, serde_json::Value)> = Vec::new();
     let mut skipped = Vec::new();
     for (idx, (hint, source)) in inputs.iter().enumerate() {
         let authorized = relay_v2_ready
@@ -1513,9 +1574,10 @@ fn session_candidates_value(
                 r.hint == *hint && matches!(r.source, RouteSource::Operator | RouteSource::Signed)
             });
         match check_browser_hint(hint, source, wire, opts, authorized) {
-            Ok((provider, endpoint)) => candidates.push((
+            Ok((provider, endpoint)) => kept_candidates.push((
                 CandidateEndpoint::new(idx, provider, hint.as_str())
                     .with_source(route_source_of(source)),
+                *source,
                 json!({
                     "hint": hint,
                     "endpoint": endpoint,
@@ -1524,6 +1586,42 @@ fn session_candidates_value(
                 }),
             )),
             Err(reason) => skipped.push(json!({ "hint": hint, "reason": reason })),
+        }
+    }
+    let mut candidates: Vec<(CandidateEndpoint, serde_json::Value)> =
+        Vec::with_capacity(kept_candidates.len());
+    if wire == 2 {
+        fn bare_p2p(s: &str) -> &str {
+            s.strip_prefix("p2p:").unwrap_or(s)
+        }
+        let has_v2_p2p = kept_candidates
+            .iter()
+            .any(|(ep, _, _)| ep.provider == ProviderId::P2p && is_v2_p2p_hint(bare_p2p(&ep.addr)));
+        let v2_relay_origins: Vec<(String, String, u16)> = kept_candidates
+            .iter()
+            .filter(|(ep, _, _)| ep.provider == ProviderId::Relay && is_v2_relay_hint(&ep.addr))
+            .filter_map(|(ep, _, _)| relay_canonical_origin(&ep.addr))
+            .collect();
+        for (ep, source, val) in kept_candidates {
+            let is_stored = matches!(source, "signed" | "committed");
+            let superseded_p2p = is_stored
+                && has_v2_p2p
+                && ep.provider == ProviderId::P2p
+                && !is_v2_p2p_hint(bare_p2p(&ep.addr));
+            let superseded_relay = is_stored
+                && !v2_relay_origins.is_empty()
+                && ep.provider == ProviderId::Relay
+                && !is_v2_relay_hint(&ep.addr)
+                && relay_canonical_origin(&ep.addr).is_some_and(|o| v2_relay_origins.contains(&o));
+            if superseded_p2p || superseded_relay {
+                skipped.push(json!({ "hint": ep.addr, "reason": "superseded_by_v2_route" }));
+            } else {
+                candidates.push((ep, val));
+            }
+        }
+    } else {
+        for (ep, _, val) in kept_candidates {
+            candidates.push((ep, val));
         }
     }
     candidates.sort_by_key(|(ep, _)| sort_key(ep));
@@ -2077,6 +2175,23 @@ impl WasmRoster {
             conn_id,
         )
         .map_err(to_js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn derive_v2_p2p_ids_for_peer_json(
+        &self,
+        peer_id: &str,
+        unix_secs: f64,
+    ) -> Result<String, JsValue> {
+        let now = f64_to_u64(unix_secs, "unix_secs").map_err(to_js_err)?;
+        let secrets = self.peer_v2_secrets(peer_id).map_err(to_js_err)?;
+        let win = derive_epoch_p2p_window(secrets.mailbox_secret(), now);
+        let endpoint_ids: Vec<String> = win
+            .current_first()
+            .into_iter()
+            .map(|d| d.endpoint_id_hex())
+            .collect();
+        Ok(json!({ "endpoint_ids": endpoint_ids }).to_string())
     }
 }
 
@@ -7151,6 +7266,73 @@ mod route_tests {
             skipped_of(&out),
             [(operator_blocked.to_owned(), "blocked_address".to_owned())]
         );
+    }
+
+    #[test]
+    fn session_candidates_suppress_stored_v1_same_origin_and_v1_p2p_when_v2_survives() {
+        let (mut roster, host) = roster_with_routes();
+        let same_v1 = "wss://mail.example.test/v1/relay";
+        let cross_v1 = RELAY_V1;
+        let v1_p2p = "iroh://5866666666666666666666666666666666666666666666666666666666666666";
+        let v2_p2p = "iroh://v2?relay=https://r.example.test/";
+        let signed = recovery_uri(&host, &[same_v1, cross_v1, RELAY_V2, v1_p2p, v2_p2p], 3);
+        roster.apply_signed_route_uri_inner(&signed, None).unwrap();
+
+        let recovery_v1 = "wss://mail.example.test:443/v1/relay";
+        let recovery_p2p =
+            "iroh://1111111111111111111111111111111111111111111111111111111111111111";
+        let recovery = recovery_uri(&host, &[recovery_v1, recovery_p2p], 9);
+
+        let v2 = to_json(
+            &roster
+                .session_candidates_inner(
+                    "host-l6a",
+                    Some(&json!({ "wire": 2, "p2p": true, "recovery_uri": recovery }).to_string()),
+                )
+                .unwrap(),
+        );
+        let kept: Vec<String> = candidates_of(&v2).into_iter().map(|(h, _)| h).collect();
+        assert!(!kept.contains(&same_v1.to_owned()), "{kept:?}");
+        assert!(!kept.contains(&v1_p2p.to_owned()), "{kept:?}");
+        assert!(kept.contains(&cross_v1.to_owned()), "{kept:?}");
+        assert!(kept.contains(&RELAY_V2.to_owned()), "{kept:?}");
+        assert!(kept.contains(&v2_p2p.to_owned()), "{kept:?}");
+        assert!(kept.contains(&recovery_v1.to_owned()), "{kept:?}");
+        assert!(kept.contains(&recovery_p2p.to_owned()), "{kept:?}");
+
+        let skipped = skipped_of(&v2);
+        assert!(skipped.contains(&(same_v1.to_owned(), "superseded_by_v2_route".to_owned())));
+        assert!(skipped.contains(&(v1_p2p.to_owned(), "superseded_by_v2_route".to_owned())));
+
+        // iroh://v2 rejects ?addr= and empty query segments.
+        let bad_addr = "iroh://v2?addr=192.0.2.1:4433";
+        assert!(
+            roster
+                .set_routes_inner("host-l6a", &json!([bad_addr]).to_string())
+                .is_err()
+        );
+        let mut json_roster: serde_json::Value = serde_json::to_value(&roster.inner).unwrap();
+        let routes = json_roster["entries"]["host-l6a"]["routes"]
+            .as_array_mut()
+            .unwrap();
+        routes.push(json!({ "hint": bad_addr, "source": "signed" }));
+        routes.push(json!({ "hint": "iroh://v2?", "source": "signed" }));
+        roster.replace_from_json(&json_roster.to_string()).unwrap();
+        let bad_v2 = to_json(
+            &roster
+                .session_candidates_inner("host-l6a", Some(r#"{"wire":2,"p2p":true}"#))
+                .unwrap(),
+        );
+        let bad_skipped = skipped_of(&bad_v2);
+        assert!(bad_skipped.contains(&(bad_addr.to_owned(), "invalid".to_owned())));
+        assert!(bad_skipped.contains(&("iroh://v2?".to_owned(), "invalid".to_owned())));
+
+        // Boundary overlap derives two EndpointIds within +-300 s of hour edges.
+        let sec = *roster.peer_v2_secrets("host-l6a").unwrap().mailbox_secret();
+        let edge_win = derive_epoch_p2p_window(&sec, 3599);
+        assert_eq!(edge_win.current_first().len(), 2);
+        let mid_win = derive_epoch_p2p_window(&sec, 1800);
+        assert_eq!(mid_win.current_first().len(), 1);
     }
 
     #[test]

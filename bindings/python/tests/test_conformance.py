@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -1383,6 +1384,42 @@ class TendrilPythonTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             srv_thread.join(timeout=2)
+
+    def test_serve_p2p_v2_zero_peers_and_ephemeral(self) -> None:
+        ep = tendril.Endpoint(None, "py-p2p-v2")
+        host_ep = tendril.Endpoint(None, "py-v2-pending-host")
+        cli_ep = tendril.Endpoint(None, "py-v2-pending-cli")
+        try:
+            self.assertEqual(ep.serve_p2p_v2("disabled"), "iroh://v2")
+            self.assertEqual(ep.serve_p2p_v2("disabled"), "iroh://v2")
+            ep.configure_transports_json('{"p2p_ephemeral":true,"p2p_port_mapping":false}')
+            eph1 = ep.serve_p2p("disabled").split("?", 1)[0]
+            eph2 = ep.serve_p2p("disabled").split("?", 1)[0]
+            self.assertTrue(eph1.startswith("iroh://"))
+            self.assertNotEqual(eph1, eph2)
+
+            direct_addr = host_ep.serve_direct("127.0.0.1:0")
+            code = host_ep.issue_code("lan")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                f_acc = pool.submit(host_ep.pair_v2_accept, 5000)
+                f_cli = pool.submit(
+                    cli_ep.pair_v2_initiate, direct_addr, code, None, "py-cli", "python"
+                )
+                acc = json.loads(f_acc.result(timeout=10))
+                pair_res = json.loads(f_cli.result(timeout=10))
+            pending_dev = acc["device_id"]
+            with self.assertRaisesRegex(RuntimeError, r"(?i)pending|not active"):
+                host_ep.serve_p2p_v2("disabled", pending_dev)
+            with self.assertRaisesRegex(RuntimeError, r"(?i)pending|not active"):
+                host_ep.serve_relay_v2("ws://127.0.0.1:9/v2/relay", None, pending_dev)
+
+            host_ep.confirm_peer(pending_dev, pair_res["sas"])
+            self.assertEqual(host_ep.serve_p2p_v2("disabled"), "iroh://v2")
+            self.assertEqual(host_ep.serve_p2p_v2("disabled"), "iroh://v2")
+        finally:
+            ep.close()
+            host_ep.close()
+            cli_ep.close()
 
 
 if __name__ == "__main__":

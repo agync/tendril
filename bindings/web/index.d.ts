@@ -44,7 +44,7 @@ export interface RouteMeta {
 
 export interface SkippedHint {
   hint: string;
-  /** Snake-case reason, for example `browser_unsupported`, `ipc_from_uri`, `insecure_ws`. */
+  /** Snake-case reason, for example `browser_unsupported`, `ipc_from_uri`, `insecure_ws`, `superseded_by_v2_route`. */
   reason: string;
 }
 
@@ -444,6 +444,19 @@ export function dialIrohStream(options: {
   signal?: AbortSignal | null;
 }): Promise<TendrilStream>;
 
+export function dialIrohV2Stream(options: {
+  endpoint: string;
+  /** 1 or 2 derived hex EndpointIds for the target peer's active `+-300 s` epochs. */
+  endpointIds: string[];
+  relayUrlOverride?: string | null;
+  p2pRelayUrls?: string[] | null;
+  p2pRelayAuthToken?: string | Uint8Array | null;
+  p2pApiSecret?: never | null;
+  hint?: boolean;
+  timeoutMs?: number;
+  signal?: AbortSignal | null;
+}): Promise<TendrilStream>;
+
 export function b64urlEncode(bytes: Uint8Array): string;
 export function b64urlDecode(str: string): Uint8Array;
 export function deviceId(staticPub: Uint8Array): string;
@@ -772,6 +785,8 @@ export class TendrilWebClient {
   exportGroupBookBytes(): Uint8Array;
   groupIds(): string[];
   groupMembers(groupId: string): GroupView;
+  groupSiblingEndpoints(groupId: string, memberDeviceId: string): string[];
+  deriveGroupMemberP2pV2Ids(groupId: string, memberDeviceId: string): string[];
   /** Returns true, or throws the core error ("group authorization denied: ..."). */
   groupAuthorizePeer(groupId: string, peerId: string, cap: string): true;
   /**

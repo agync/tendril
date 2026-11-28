@@ -1098,3 +1098,75 @@ fn web_group_fixture_replays_through_the_group_book() {
         .is_err()
     );
 }
+
+#[test]
+fn group_v2_p2p_derivation_and_v1_sibling_suppression() {
+    let root = Actor::new("root-v2");
+    let local = Actor::new("web-v2");
+    let v1_ep = "iroh://5866666666666666666666666666666666666666666666666666666666666666";
+    let v2_ep = "iroh://v2?relay=https://r.example.test/";
+    let sib = Actor::new("sib-v2");
+    let mut sib_member = sib.member(vec!["group.send:temp".into()]);
+    let params = GroupBuildParams::new(NOW);
+    let (m1, s1) = create_group(
+        root.id.signing_key(),
+        "mesh-v2",
+        2,
+        root.member(Vec::new()),
+        params,
+    )
+    .unwrap();
+    let gid = m1.group_id.clone();
+    sib_member.caps = caps(&gid);
+    sib_member.endpoints = vec![v1_ep.to_owned(), v2_ep.to_owned()];
+    let signer = GroupSigner::root(root.id.signing_key());
+    let (m2, s2) = add_member(&m1, &signer, local.member(caps(&gid)), &s1, params).unwrap();
+    let (m3, s3) = add_member(&m2, &signer, sib_member, &s2, params).unwrap();
+
+    let mut roster = Roster::new();
+    pin(&mut roster, &root);
+    let mut book = WasmGroupBook::from_parts(local.device_id(), GroupBook::new());
+    book.ingest_manifest_inner(&roster, &root.device_id(), &m3, NOW)
+        .unwrap();
+
+    // Before the current-seq rendezvous key arrives, deriving fails closed.
+    assert!(
+        book.derive_v2_p2p_ids_for_member_inner(&roster, &gid, &sib.device_id(), NOW)
+            .is_err()
+    );
+    let eps = book
+        .sibling_endpoints_inner(&roster, &gid, &sib.device_id())
+        .unwrap();
+    assert_eq!(eps, vec![v2_ep.to_owned()]);
+
+    let frame = encode_group_rendezvous_frame(&gid, m3.seq, s3.group_rendezvous_key()).unwrap();
+    let parsed = decode_group_rendezvous_frame(frame.as_slice()).unwrap();
+    book.apply_rendezvous_inner(&roster, Some(&root.device_id()), &[parsed], NOW);
+
+    let derived = book
+        .derive_v2_p2p_ids_for_member_inner(&roster, &gid, &sib.device_id(), NOW)
+        .unwrap();
+    let ids: Vec<String> = derived["endpoint_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    assert!(!ids.is_empty());
+    let want = derive_group_mailbox_secret(s3.group_rendezvous_key(), m3.seq, &sib.device_id());
+    let expected = derive_epoch_p2p_window(&want, NOW);
+    let want_ids: Vec<String> = expected
+        .current_first()
+        .into_iter()
+        .map(|epoch| epoch.endpoint_id_hex())
+        .collect();
+    assert_eq!(ids, want_ids);
+    let mid_hour = book
+        .derive_v2_p2p_ids_for_member_inner(&roster, &gid, &sib.device_id(), NOW + 1800)
+        .unwrap();
+    assert_eq!(mid_hour["endpoint_ids"].as_array().unwrap().len(), 1);
+    let edge = book
+        .derive_v2_p2p_ids_for_member_inner(&roster, &gid, &sib.device_id(), NOW + 60)
+        .unwrap();
+    assert_eq!(edge["endpoint_ids"].as_array().unwrap().len(), 2);
+}

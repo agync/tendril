@@ -2266,6 +2266,14 @@ public final class TendrilJniConformanceTest {
         check(m.group(1).startsWith("127.0.0.1:"), "p2p hint outside the bind address: " + addr);
       }
       check(hints > 0, "p2p endpoint carries address hints: " + addr);
+      String v2Addr = TendrilNative.endpointServeP2pV2(ep, "disabled", null);
+      check("iroh://v2".equals(v2Addr), "expected iroh://v2 from ServeP2pV2, got: " + v2Addr);
+      TendrilNative.endpointConfigureTransportsJson(ep, "{\"p2p_ephemeral\":true,\"p2p_port_mapping\":false}");
+      String eph1 = TendrilNative.endpointServeP2p(ep, "disabled");
+      String eph2 = TendrilNative.endpointServeP2p(ep, "disabled");
+      String id1 = eph1.split("\\?", 2)[0];
+      String id2 = eph2.split("\\?", 2)[0];
+      check(!id1.equals(id2), "ephemeral serveP2p should rotate EndpointId: " + id1 + " vs " + id2);
     } finally {
       TendrilNative.endpointFree(ep);
     }

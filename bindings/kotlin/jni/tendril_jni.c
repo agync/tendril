@@ -901,6 +901,33 @@ JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointServeP2p(
   return take_out_string(env, out);
 }
 
+JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointServeP2pV2(
+    JNIEnv *env, jclass cls, jlong ptr, jstring relay_mode, jstring peer_id_opt) {
+  (void)cls;
+  if (ptr == 0) {
+    throw_ex(env, "java/lang/IllegalStateException", "endpoint closed");
+    return NULL;
+  }
+  char *c_mode = NULL;
+  char *c_peer = NULL;
+  if (!dup_opt_utf8(env, relay_mode, &c_mode)) {
+    return NULL;
+  }
+  if (!dup_opt_utf8(env, peer_id_opt, &c_peer)) {
+    free(c_mode);
+    return NULL;
+  }
+  char *out = NULL;
+  int32_t rc = tendril_endpoint_serve_p2p_v2((TendrilEndpoint *)(uintptr_t)ptr, c_mode, c_peer, &out);
+  free(c_mode);
+  free(c_peer);
+  if (rc != TENDRIL_OK) {
+    throw_ffi_error(env, rc, "tendril_endpoint_serve_p2p_v2 failed");
+    return NULL;
+  }
+  return take_out_string(env, out);
+}
+
 JNIEXPORT jstring JNICALL Java_dev_tendril_TendrilNative_endpointIssueCode(
     JNIEnv *env, jclass cls, jlong ptr, jstring kind) {
   (void)cls;

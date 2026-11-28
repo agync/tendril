@@ -108,6 +108,18 @@ export async function dialIrohStream(options) {
   return dial(options);
 }
 
+export async function dialIrohV2Stream(options) {
+  const { signal = null } = options ?? {};
+  if (signal?.aborted) {
+    throw makeAbortError(signal);
+  }
+  const { dialIrohV2Stream: dialV2 } = await import("./iroh.js");
+  if (signal?.aborted) {
+    throw makeAbortError(signal);
+  }
+  return dialV2(options);
+}
+
 /** Resolves true when the opt-in `pkg-p2p` module loads, so `iroh://` hints are dialable. */
 export async function hasP2pSupport() {
   try {
@@ -147,7 +159,7 @@ async function sendProtocolBytes(stream, bytes) {
 
 async function warmTargetTransport(endpoint, relayUrl) {
   const target = endpoint || relayUrl;
-  if (target && target.startsWith("iroh://")) {
+  if (isIrohHint(target)) {
     await initTendrilP2p();
   }
 }
@@ -166,6 +178,7 @@ async function dialWebStream({
   relayAuthSecret = null,
   useRelayV2 = false,
   deriveV2Dial = null,
+  deriveV2P2pIds = null,
   allowInsecureWs = false,
   irohHint = false,
   initFrame = null,
@@ -179,6 +192,23 @@ async function dialWebStream({
   }
   const target = endpoint || relayUrl;
   if (provider === "p2p" || (target && target.startsWith("iroh://"))) {
+    if (isV2P2pUrl(target)) {
+      if (typeof deriveV2P2pIds !== "function") {
+        throw new Error("iroh://v2 requires Wire v2 peer secrets (missing deriveV2P2pIds)");
+      }
+      const endpointIds = deriveV2P2pIds();
+      return dialIrohV2Stream({
+        endpoint: target,
+        endpointIds,
+        relayUrlOverride,
+        p2pRelayUrls,
+        p2pRelayAuthToken,
+        p2pApiSecret,
+        hint: irohHint,
+        timeoutMs,
+        signal,
+      });
+    }
     return dialIrohStream({
       endpoint: target,
       relayUrlOverride,
@@ -324,6 +354,14 @@ function isV2RelayUrl(url) {
 
 function isIrohHint(hint) {
   return typeof hint === "string" && (hint.startsWith("iroh://") || hint.startsWith("p2p:iroh://"));
+}
+
+function isV2P2pUrl(url) {
+  if (typeof url !== "string") {
+    return false;
+  }
+  const bare = url.startsWith("p2p:") ? url.slice(4) : url;
+  return bare === "iroh://v2" || bare.startsWith("iroh://v2?");
 }
 
 function isRelayTarget(target) {
@@ -503,6 +541,10 @@ export function filterWebCompatibleEndpoints(
       continue;
     }
     if (!isBroker && bare.startsWith("iroh://")) {
+      if (isV2P2pUrl(bare)) {
+        skip(hint, "p2p_v2_not_authorized");
+        continue;
+      }
       if (!p2p) {
         skip(hint, "p2p_feature_disabled");
         continue;
@@ -1399,6 +1441,23 @@ export class TendrilWebClient {
     return JSON.parse(this.#groups.members(groupId));
   }
 
+  groupSiblingEndpoints(groupId, memberDeviceId) {
+    this.#ensureUnlocked();
+    return JSON.parse(this.#groups.sibling_endpoints_json(this.#roster, groupId, memberDeviceId));
+  }
+
+  deriveGroupMemberP2pV2Ids(groupId, memberDeviceId) {
+    this.#ensureUnlocked();
+    return JSON.parse(
+      this.#groups.derive_v2_p2p_ids_for_member_json(
+        this.#roster,
+        groupId,
+        memberDeviceId,
+        nowUnixSecs()
+      )
+    ).endpoint_ids;
+  }
+
   groupAuthorizePeer(groupId, peerId, cap) {
     this.#ensureUnlocked();
     this.#groups.authorize_peer(this.#roster, groupId, peerId, cap, nowUnixSecs());
@@ -1723,6 +1782,9 @@ export class TendrilWebClient {
       );
       if (explicitUrl && isWsUrl(explicitUrl) && isV2RelayUrl(explicitUrl)) {
         throw new Error(PAIR_V2_RELAY_REJECTED);
+      }
+      if (explicitUrl && isV2P2pUrl(explicitUrl)) {
+        throw new Error("iroh://v2 is not used for pairing; pair over another route, then use connectV2");
       }
       const explicitTargetPub = explicitKey ?? targetPub ?? parsed?.relay_pub_b64 ?? null;
       let candidates;
@@ -2620,8 +2682,14 @@ export class TendrilWebClient {
     const { wire, base, peer } = ctx;
     const relaySplit = splitRelayKey(t.relayUrl);
     const endpointSplit = splitRelayKey(t.endpoint);
-    const endpoint = endpointSplit.url;
-    const relayUrl = relaySplit.url;
+    const rawEndpoint = endpointSplit.url;
+    const rawRelayUrl = relaySplit.url;
+    const endpoint = rawEndpoint?.startsWith("p2p:iroh://") ? rawEndpoint.slice(4) : rawEndpoint;
+    const relayUrl = rawRelayUrl?.startsWith("p2p:iroh://") ? rawRelayUrl.slice(4) : rawRelayUrl;
+    const target = endpoint || relayUrl;
+    if (isV2P2pUrl(target) && wire !== 2) {
+      throw new Error("iroh://v2 requires Wire v2 (use connectV2)");
+    }
     const operatorKey = relaySplit.relayKey ?? endpointSplit.relayKey;
     // The mailbox key is the expectation's relay key: the operator `URL#key`, else the recovery
     // URI's `rp` (a conflict between them fails pre-dial in `with_route_expectation`), else the
@@ -2630,9 +2698,8 @@ export class TendrilWebClient {
       ? (parsePairingUri(ctx.recoveryUri).relay_pub_b64 ?? null)
       : null;
     const targetPub = operatorKey ?? recoveryRp ?? t.targetPub;
-    await warmTargetTransport(endpoint, relayUrl);
+    await warmTargetTransport(rawEndpoint, rawRelayUrl);
     this.#ensureOpen();
-    const target = endpoint || relayUrl;
     const isRelay = isRelayTarget(target);
     const explicitProvider = isRelay
       ? "relay"
@@ -2683,6 +2750,12 @@ export class TendrilWebClient {
               )
             )
         : null;
+      const deriveV2P2pIds =
+        wire === 2 && explicitProvider === "p2p" && isV2P2pUrl(target)
+          ? () =>
+              JSON.parse(this.#roster.derive_v2_p2p_ids_for_peer_json(peer, nowUnixSecs()))
+                .endpoint_ids
+          : null;
       const isRelay = isRelayTarget(target);
       const startedMs = performance.now();
       const preBytes = isRelay
@@ -2691,6 +2764,7 @@ export class TendrilWebClient {
           : session.start()
         : null;
       stream = await dialWebStream({
+        provider: explicitProvider,
         endpoint,
         relayUrl,
         targetPub,
@@ -2701,6 +2775,7 @@ export class TendrilWebClient {
         ...explicitCreds,
         useRelayV2: t.useRelayV2,
         deriveV2Dial,
+        deriveV2P2pIds,
         allowInsecureWs: ctx.allowInsecureWs,
         initFrame: preBytes,
         timeoutMs: remainingBudgetMs(
@@ -3236,6 +3311,7 @@ export class TendrilWebClient {
       session = this.#newSession(ctx, clone, cands.route_seq, null, upgradeCaps);
       const isRelay = cand.provider === "relay";
       const v2Relay = isRelay && isV2RelayUrl(cand.endpoint);
+      const v2P2p = cand.provider === "p2p" && isV2P2pUrl(cand.endpoint);
       const dialClone = clone;
       const startedMs = performance.now();
       const preBytes = isRelay
@@ -3270,6 +3346,11 @@ export class TendrilWebClient {
                   connIdBytes
                 )
               )
+          : null,
+        deriveV2P2pIds: v2P2p
+          ? () =>
+              JSON.parse(dialClone.derive_v2_p2p_ids_for_peer_json(peer, nowUnixSecs()))
+                .endpoint_ids
           : null,
         allowInsecureWs: ctx.allowInsecureWs,
         irohHint: cand.source !== "operator",

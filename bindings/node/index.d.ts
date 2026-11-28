@@ -77,6 +77,7 @@ export class Endpoint {
   serveDirect(listenAddr?: string | null): Promise<string>;
   serveRelay(relayUrl: string, expectedHost?: string | null): Promise<string>;
   serveP2p(relayMode?: string | null): Promise<string>;
+  serveP2pV2(relayMode?: string | null, peerId?: string | null): Promise<string>;
   issueCode(kind?: string | null): string;
   pairInitiate(
     endpoint: string,
@@ -163,14 +164,17 @@ export class Endpoint {
    * `wakeApnsTeamId`, `wakeApnsKeyId`, `wakeApnsP8Pem`, `wakeApnsClientCertPem`,
    * `wakeApnsClientKeyPem`, `relayAuthOrigins`, ...). Besides the relay, p2p and wake keys:
    * `relay_auth_origins` (string[] of scheme://host[:port]), `advertise` ("auto" | "explicit"),
-   * `advertised_endpoints` (string[]), `p2p_port_mapping` (boolean, default true; false stops P2P
-   * endpoints from probing the router), `p2p_bind_addrs` (string[] of at most one IPv4 and one IPv6
-   * address such as "0.0.0.0:0"; camelCase `p2pPortMapping`, `p2pBindAddrs`), `route_policy` ("all_signed" | "committed_only" |
-   * "none"), `sign_routes` (boolean), `power_profile` ("standard" | "low_power", camelCase
-   * `powerProfile`), and `wake_retry_max_delay_ms` (number, camelCase `wakeRetryMaxDelayMs`). A
-   * changed advertise set is published off the calling thread, and the next `issuePairingUri` or
-   * `refreshRoutes` waits for that publish; a publish error is not an error of this call (the
-   * issuance or refresh reports it).
+   * `advertised_endpoints` (string[]), `p2p_port_mapping` (boolean, defaults to `true` on desktop
+   * listeners and `false` on mobile or `low_power` listeners and all dialers; false stops P2P
+   * endpoints from probing the router), `p2p_ephemeral` (boolean; uses an ephemeral key and
+   * disables `Pkarr` publishing on Day-1 `serveP2p` unless `p2p_pkarr` overrides), `p2p_bind_addrs`
+   * (string[] of at most one IPv4 and one IPv6 address such as "0.0.0.0:0"; camelCase
+   * `p2pPortMapping`, `p2pEphemeral`, `p2pBindAddrs`), `route_policy` ("all_signed" |
+   * "committed_only" | "none"), `sign_routes` (boolean), `power_profile` ("standard" | "low_power",
+   * camelCase `powerProfile`), and `wake_retry_max_delay_ms` (number, camelCase
+   * `wakeRetryMaxDelayMs`). A changed advertise set is published off the calling thread, and the
+   * next `issuePairingUri` or `refreshRoutes` waits for that publish; a publish error is not an
+   * error of this call (the issuance or refresh reports it).
    */
   configureTransportsJson(transportConfigJson: string): void;
   mintRelayTicket(

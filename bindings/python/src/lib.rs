@@ -32,12 +32,8 @@ use tendril_core::pairing::{
 };
 use tendril_core::policy::ProviderId;
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket, origin_allowed};
-use tendril_core::roster::{
-    AnchorState, PeerState, RefusalPolicy, Roster, RouteSource, StoredRoute,
-};
-use tendril_core::v2::{
-    V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
-};
+use tendril_core::roster::{AnchorState, RefusalPolicy, Roster, RouteSource, StoredRoute};
+use tendril_core::v2::{V2PairOutcome, V2PinnedHost, canonical_relay_host};
 use tendril_runtime::advertise::{AdvertiseInputs, AdvertiseMode, NetworkSnapshot, ServedListener};
 use tendril_runtime::announce::{
     AddressSource, DEFAULT_ROUTE_REFRESH_INTERVAL, RosterAccess, RouteAnnouncer, RouteSetSink,
@@ -59,20 +55,24 @@ use tendril_runtime::{
     DEFAULT_PRE_AUTH_TIMEOUT, DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, GroupEvent,
     GroupFrameKind, GroupFrameOutcome, GroupPool, GroupPoolConfig, InboundRouter, LocalDialer,
     LocalReachability, M2mEnrollOptions, MAX_OUTER_FRAME_LEN, OverlayDialer, P2pDialer,
-    P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, PathDialer, PathListener, PathStream,
-    PowerProfile, RelayClientAuth, RelayDialer, RelayListener, RelayListenerConfig, RelayV2Dialer,
-    RelayV2Listener, RelayV2ListenerConfig, RuntimeError, SessionDriver, SessionEvent, StateStore,
-    V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeTag,
-    WakeTransportSettings, build_wake_provider, connect_with_wake_policy, dial_endpoint_with_auth,
-    drive_m2m_enroll_initiator_with_floor, drive_m2m_enroll_initiator_with_routes,
-    drive_pair_initiator_with_store, drive_pair_responder_with_policy_and_store,
-    drive_pair_responder_with_store, drive_v2_pake_pair_initiator_with_store,
-    drive_v2_pake_pair_initiator_with_timeout, drive_v2_pake_pair_responder_with_options,
-    drive_v2_pake_pair_responder_with_store, group_add_member as rt_group_add_member,
-    group_create as rt_group_create, group_ingest_manifest as rt_group_ingest_manifest,
+    P2pListener, P2pOptions, P2pRelayAuth, P2pRelayMode, P2pV2RosterSync, PathDialer, PathListener,
+    PathStream, PowerProfile, RelayClientAuth, RelayDialer, RelayListener, RelayListenerConfig,
+    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, RuntimeError, SessionDriver,
+    SessionEvent, StateStore, V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec,
+    WakeTag, WakeTransportSettings, active_v2_mailbox_secrets, build_wake_provider,
+    connect_with_wake_policy, default_p2p_dialer_port_mapping, default_p2p_listener_port_mapping,
+    dial_endpoint_with_auth, drive_m2m_enroll_initiator_with_floor,
+    drive_m2m_enroll_initiator_with_routes, drive_pair_initiator_with_store,
+    drive_pair_responder_with_policy_and_store, drive_pair_responder_with_store,
+    drive_v2_pake_pair_initiator_with_store, drive_v2_pake_pair_initiator_with_timeout,
+    drive_v2_pake_pair_responder_with_options, drive_v2_pake_pair_responder_with_store,
+    group_add_member as rt_group_add_member, group_create as rt_group_create,
+    group_ingest_manifest as rt_group_ingest_manifest,
     group_remove_member as rt_group_remove_member, handle_session_group_frame,
+    lookup_v2_mailbox_secret_for_pair, lookup_v2_mailbox_secret_for_target,
     pairing_path_kind_for_provider, parse_p2p_relay_mode, parse_p2p_relay_modes,
-    pinned_pairing_floor, verify_epoch_wake_tag_window,
+    pinned_pairing_floor, probe_p2p_v2_endpoint, usable_v2_mailbox_map,
+    verify_epoch_wake_tag_window,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -297,6 +297,8 @@ struct TransportConfigInput {
     #[zeroize(skip)]
     p2p_port_mapping: Option<bool>,
     #[zeroize(skip)]
+    p2p_ephemeral: Option<bool>,
+    #[zeroize(skip)]
     p2p_bind_addrs: Option<Vec<String>>,
     p2p_relay_auth_token: Option<String>,
     p2p_api_secret: Option<String>,
@@ -348,8 +350,10 @@ struct EndpointTransportConfig {
     p2p_pkarr: Option<bool>,
     p2p_advertise_direct_addrs: Option<bool>,
     p2p_allow_private_addrs: Option<bool>,
-    /// `None` follows `power_profile.p2p_port_mapping_default()`.
+    /// `None` uses the split role defaults (`power_profile` + platform default for listeners,
+    /// `false` for dialers).
     p2p_port_mapping: Option<bool>,
+    p2p_ephemeral: Option<bool>,
     p2p_bind_addrs: tendril_runtime::P2pBindAddrs,
     p2p_relay_auth: Option<P2pRelayAuth>,
     wake: Option<WakeTransportSettings>,
@@ -370,6 +374,7 @@ impl Default for EndpointTransportConfig {
             p2p_advertise_direct_addrs: None,
             p2p_allow_private_addrs: None,
             p2p_port_mapping: None,
+            p2p_ephemeral: None,
             p2p_bind_addrs: tendril_runtime::P2pBindAddrs::AllInterfaces,
             p2p_relay_auth: None,
             wake: None,
@@ -395,6 +400,7 @@ impl fmt::Debug for EndpointTransportConfig {
             )
             .field("p2p_allow_private_addrs", &self.p2p_allow_private_addrs)
             .field("p2p_port_mapping", &self.p2p_port_mapping)
+            .field("p2p_ephemeral", &self.p2p_ephemeral)
             .field("p2p_bind_addrs", &self.p2p_bind_addrs)
             .field("p2p_relay_auth", &self.p2p_relay_auth)
             .field("wake", &self.wake)
@@ -564,6 +570,7 @@ impl EndpointTransportConfig {
             p2p_advertise_direct_addrs: input.p2p_advertise_direct_addrs,
             p2p_allow_private_addrs: input.p2p_allow_private_addrs,
             p2p_port_mapping: input.p2p_port_mapping,
+            p2p_ephemeral: input.p2p_ephemeral,
             p2p_bind_addrs,
             p2p_relay_auth,
             wake,
@@ -576,9 +583,15 @@ impl EndpointTransportConfig {
         })
     }
 
-    fn effective_port_mapping(&self) -> bool {
+    fn effective_listener_port_mapping(&self) -> bool {
+        self.p2p_port_mapping.unwrap_or_else(|| {
+            self.power_profile.p2p_port_mapping_default() && default_p2p_listener_port_mapping()
+        })
+    }
+
+    fn effective_dialer_port_mapping(&self) -> bool {
         self.p2p_port_mapping
-            .unwrap_or_else(|| self.power_profile.p2p_port_mapping_default())
+            .unwrap_or_else(default_p2p_dialer_port_mapping)
     }
 
     /// The dialer set behind policy pairing and Day-2 connects. `relay_host` is the expected
@@ -605,7 +618,7 @@ impl EndpointTransportConfig {
             p2p_relay_auth: self.p2p_relay_auth.clone(),
             p2p_allow_private_addrs: self.p2p_allow_private_addrs.unwrap_or(false),
             p2p_pkarr: self.p2p_pkarr,
-            p2p_port_mapping: self.effective_port_mapping(),
+            p2p_port_mapping: self.effective_dialer_port_mapping(),
             p2p_bind_addrs: self.p2p_bind_addrs.clone(),
             ..HintDialerConfig::default().with_power_profile(self.power_profile)
         })))
@@ -622,7 +635,11 @@ impl EndpointTransportConfig {
                 .clone()
                 .unwrap_or(P2pRelayMode::N0Public),
         };
-        let mut opts = P2pOptions::for_listener(mode);
+        let mut opts = if self.p2p_ephemeral == Some(true) {
+            P2pOptions::for_ephemeral_listener(mode)
+        } else {
+            P2pOptions::for_listener(mode)
+        };
         if let Some(pkarr) = self.p2p_pkarr {
             opts = opts.with_publish_pkarr(pkarr).with_resolve_pkarr(pkarr);
         }
@@ -633,12 +650,38 @@ impl EndpointTransportConfig {
             opts = opts.with_allow_private_addrs(allow_priv);
         }
         opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
-        Ok(self.with_p2p_net(opts))
+        Ok(self.with_p2p_listener_net(opts))
     }
 
-    /// Applies `p2p_port_mapping` and `p2p_bind_addrs` to `opts`.
-    fn with_p2p_net(&self, opts: P2pOptions) -> P2pOptions {
-        opts.with_port_mapping(self.effective_port_mapping())
+    fn build_p2p_v2_listener_options(
+        &self,
+        relay_mode_override: Option<&str>,
+    ) -> Result<P2pOptions, RuntimeError> {
+        let mode = match relay_mode_override.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => parse_p2p_relay_mode(Some(raw))?,
+            None => self
+                .p2p_relay_mode
+                .clone()
+                .unwrap_or(P2pRelayMode::N0Public),
+        };
+        let mut opts = P2pOptions::for_v2_listener(mode);
+        if let Some(allow_priv) = self.p2p_allow_private_addrs {
+            opts = opts.with_allow_private_addrs(allow_priv);
+        }
+        opts = opts.with_relay_auth(self.p2p_relay_auth.clone());
+        Ok(self.with_p2p_listener_net(opts))
+    }
+
+    /// Applies listener `p2p_port_mapping` (power-profile + platform default when unset) and
+    /// `p2p_bind_addrs` to `opts`.
+    fn with_p2p_listener_net(&self, opts: P2pOptions) -> P2pOptions {
+        opts.with_port_mapping(self.effective_listener_port_mapping())
+            .with_bind_addrs(self.p2p_bind_addrs.clone())
+    }
+
+    /// Applies dialer `p2p_port_mapping` (default `false` when unset) and `p2p_bind_addrs` to `opts`.
+    fn with_p2p_dialer_net(&self, opts: P2pOptions) -> P2pOptions {
+        opts.with_port_mapping(self.effective_dialer_port_mapping())
             .with_bind_addrs(self.p2p_bind_addrs.clone())
     }
 
@@ -661,7 +704,7 @@ impl EndpointTransportConfig {
         if let Some(pkarr) = self.p2p_pkarr {
             opts = opts.with_resolve_pkarr(pkarr);
         }
-        Ok(self.with_p2p_net(opts.with_relay_auth(self.p2p_relay_auth.clone())))
+        Ok(self.with_p2p_dialer_net(opts.with_relay_auth(self.p2p_relay_auth.clone())))
     }
 
     /// Options for the shared group `P2pDialer`, present only when a relay mode is configured
@@ -674,7 +717,7 @@ impl EndpointTransportConfig {
             self.p2p_allow_private_addrs,
             self.p2p_relay_auth.clone(),
         )
-        .map(|opts| self.with_p2p_net(opts))
+        .map(|opts| self.with_p2p_dialer_net(opts))
     }
 }
 
@@ -710,75 +753,6 @@ fn ws_path(endpoint: &str) -> &str {
 fn is_v2_relay_endpoint(endpoint: &str) -> bool {
     (endpoint.starts_with("ws://") || endpoint.starts_with("wss://"))
         && ws_path(endpoint) == "v2/relay"
-}
-
-fn lookup_v2_mailbox_secret_for_target(
-    roster: &Roster,
-    target_host_id: &str,
-) -> PyResult<[u8; 32]> {
-    let entry = roster.get(target_host_id).ok_or_else(|| {
-        PyRuntimeError::new_err(format!("target '{target_host_id}' not found in roster"))
-    })?;
-    if entry.state == PeerState::Revoked {
-        return Err(PyRuntimeError::new_err(format!(
-            "target '{target_host_id}' is revoked"
-        )));
-    }
-    entry
-        .v2_secrets
-        .as_ref()
-        .map(|s| *s.mailbox_secret())
-        .ok_or_else(|| {
-            PyRuntimeError::new_err(format!(
-                "target '{target_host_id}' has no v2 mailbox_secret"
-            ))
-        })
-}
-
-fn lookup_v2_mailbox_secret_for_pair(
-    roster: &Roster,
-    pinned: Option<&PinnedHost>,
-    endpoint: &str,
-    now_unix: u64,
-) -> Result<[u8; 32], RuntimeError> {
-    if let Some(pin) = pinned {
-        if let Some(ref hid) = pin.host_id
-            && let Some(entry) = roster.get(hid)
-            && entry.state != PeerState::Revoked
-            && let Some(ref secrets) = entry.v2_secrets
-        {
-            return Ok(*secrets.mailbox_secret());
-        }
-        for (_, entry) in roster.entries() {
-            if entry.state != PeerState::Revoked
-                && entry.static_pub == pin.static_pub
-                && let Some(ref secrets) = entry.v2_secrets
-            {
-                return Ok(*secrets.mailbox_secret());
-            }
-        }
-    }
-    if let Some((_, frag)) = endpoint.split_once('#')
-        && !frag.is_empty()
-    {
-        for (_, entry) in roster.entries() {
-            if entry.state != PeerState::Revoked
-                && let Some(ref secrets) = entry.v2_secrets
-            {
-                let win = derive_epoch_mailbox_window(secrets.mailbox_secret(), now_unix);
-                if win
-                    .mailboxes()
-                    .iter()
-                    .any(|mb| mb.mailbox_id_b64url() == frag)
-                {
-                    return Ok(*secrets.mailbox_secret());
-                }
-            }
-        }
-    }
-    Err(RuntimeError::Protocol(
-        "no matching v2 mailbox_secret in roster for /v2/relay endpoint".to_owned(),
-    ))
 }
 
 async fn dial_endpoint_v2_with_options(
@@ -1372,6 +1346,37 @@ impl AnnouncerSlot {
     }
 }
 
+#[derive(Clone)]
+struct P2pV2SyncCtx {
+    rt: Arc<Runtime>,
+    roster: Arc<StdMutex<Roster>>,
+    router: Arc<InboundRouter>,
+    sync: Arc<P2pV2RosterSync>,
+}
+
+impl P2pV2SyncCtx {
+    fn sync_listeners(&self) {
+        let _ = self.try_sync_listeners(None);
+    }
+
+    fn try_sync_listeners(&self, new_dynamic_opts: Option<P2pOptions>) -> PyResult<Option<String>> {
+        let Some(plan) = self
+            .sync
+            .prepare_sync_with(
+                || usable_v2_mailbox_map(&lock_roster(&self.roster)),
+                new_dynamic_opts,
+            )
+            .map_err(py_err)?
+        else {
+            return Ok(None);
+        };
+        let handle = self.rt.handle();
+        self.rt
+            .block_on(self.sync.bind_missing(plan, &self.router, handle))
+            .map_err(py_err)
+    }
+}
+
 #[pyclass(frozen)]
 struct Endpoint {
     rt: Arc<Runtime>,
@@ -1396,9 +1401,25 @@ struct Endpoint {
     /// replaces the roster live sessions share; `sync_roster_blocking` reloads that one.
     access: RosterAccess,
     announce: Arc<AnnouncerSlot>,
+    p2p_v2_sync: Arc<P2pV2RosterSync>,
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        self.p2p_v2_sync.stop_all();
+    }
 }
 
 impl Endpoint {
+    fn v2_sync_ctx(&self) -> P2pV2SyncCtx {
+        P2pV2SyncCtx {
+            rt: Arc::clone(&self.rt),
+            roster: Arc::clone(&self.roster),
+            router: Arc::clone(&self.router),
+            sync: Arc::clone(&self.p2p_v2_sync),
+        }
+    }
+
     fn new_session(&self, backend: SessionBackend, initiator: bool) -> Session {
         Session {
             initiator,
@@ -1407,6 +1428,7 @@ impl Endpoint {
             store_lock: Arc::clone(&self.store_lock),
             identity: Arc::clone(&self.identity),
             roster: Arc::clone(&self.roster),
+            p2p_v2_sync: Arc::clone(&self.p2p_v2_sync),
             session: Arc::new(backend),
         }
     }
@@ -1534,6 +1556,7 @@ impl Endpoint {
         let store = self.store.clone();
         let store_lock = Arc::clone(&self.store_lock);
         let access = self.access.clone();
+        let p2p_v2_sync = Arc::clone(&self.p2p_v2_sync);
         let target = target_host_id.to_owned();
         let wire = args.wire;
         // A configured wake target applies to Wire v2 connects (explicit endpoint or stored
@@ -1552,6 +1575,7 @@ impl Endpoint {
                 }
             });
             let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity);
+            p2p_v2_sync.stop_unusable_with(|| usable_v2_mailbox_map(&lock_roster(&roster)));
             let out = res.map_err(attempt_err)?;
             synced?;
             Ok::<_, PyErr>(out)
@@ -1611,6 +1635,8 @@ impl Endpoint {
         let store_lock = Arc::clone(&self.store_lock);
         let access = self.access.clone();
 
+        let sync_ctx = self.v2_sync_ctx();
+
         py.detach(move || {
             sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
             let res = rt.block_on(async {
@@ -1633,6 +1659,7 @@ impl Endpoint {
             let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity);
             let (outcome, report) = res.map_err(|e| py_err(attempt_message(&e)))?;
             synced?;
+            sync_ctx.sync_listeners();
             let mut json = outcome.map_err(py_err)?;
             if v2 {
                 json["wire_version"] = serde_json::json!(2);
@@ -1749,6 +1776,7 @@ impl Endpoint {
                 served_v1_relays: Arc::new(StdMutex::new(Vec::new())),
                 access,
                 announce,
+                p2p_v2_sync: Arc::new(P2pV2RosterSync::new()),
             })
         })
     }
@@ -1852,6 +1880,7 @@ impl Endpoint {
         let relay_auth = transport_cfg.relay_auth.clone();
         let p2p_opts = transport_cfg.build_p2p_group_options();
         let power_profile = transport_cfg.power_profile;
+        let p2p_opts_for_group = p2p_opts.clone();
         let served_v1_relays = self
             .served_v1_relays
             .lock()
@@ -1882,11 +1911,16 @@ impl Endpoint {
                         P2pDialer::bind_with_options(opts).await.map_err(py_err)?,
                     ));
                 }
-                let config = GroupPoolConfig::new(dialers)
+                let p2p_listener_pm = transport_cfg.p2p_port_mapping;
+                let mut config = GroupPoolConfig::new(dialers)
                     .with_relay_auth(relay_auth)
                     .with_relay_listen(relay_listen)
                     .with_served_v1_relays(served_v1_relays)
-                    .with_power_profile(power_profile);
+                    .with_power_profile(power_profile)
+                    .with_p2p_listener_port_mapping(p2p_listener_pm);
+                if let Some(opts) = p2p_opts_for_group {
+                    config = config.with_p2p_options(opts);
+                }
                 let pool = GroupPool::open((*store).clone(), identity, &group_id, config, None)
                     .map_err(py_err)?;
                 let mut local_endpoint = None;
@@ -2068,12 +2102,11 @@ impl Endpoint {
         let secrets: Vec<[u8; 32]> = {
             let roster = lock_roster(&self.roster);
             if let Some(pid) = peer_id.filter(|s| !s.is_empty()) {
-                vec![lookup_v2_mailbox_secret_for_target(&roster, pid)?]
+                vec![*lookup_v2_mailbox_secret_for_target(&roster, pid).map_err(py_err)?]
             } else {
-                let list: Vec<[u8; 32]> = roster
-                    .entries()
-                    .filter(|(_, e)| e.state == PeerState::Active)
-                    .filter_map(|(_, e)| e.v2_secrets.as_ref().map(|s| *s.mailbox_secret()))
+                let list: Vec<[u8; 32]> = active_v2_mailbox_secrets(&roster)
+                    .into_iter()
+                    .map(|(_, s)| *s)
                     .collect();
                 if list.is_empty() {
                     return Err(PyRuntimeError::new_err(
@@ -2125,18 +2158,71 @@ impl Endpoint {
         let opts = cfg
             .build_p2p_listener_options(relay_mode)
             .map_err(value_err)?;
-        let seed = self.identity.derive_p2p_identity_seed();
+        let seed = if cfg.p2p_ephemeral == Some(true) {
+            None
+        } else {
+            Some(self.identity.derive_p2p_identity_seed())
+        };
         let rt = Arc::clone(&self.rt);
         let router = Arc::clone(&self.router);
         let announce = Arc::clone(&self.announce);
         py.detach(move || {
             let listener = rt
-                .block_on(P2pListener::bind_with_options(opts, Some(seed)))
+                .block_on(P2pListener::bind_with_options(opts, seed))
                 .map_err(py_err)?;
             let ep = listener.local_endpoint();
             router.spawn_listener(rt.handle(), Box::new(listener));
             announce.record_served(&ep, None);
             Ok(ep)
+        })
+    }
+
+    #[pyo3(signature = (relay_mode=None, peer_id=None))]
+    fn serve_p2p_v2(
+        &self,
+        py: Python<'_>,
+        relay_mode: Option<&str>,
+        peer_id: Option<&str>,
+    ) -> PyResult<String> {
+        let cfg = self.snapshot_transport_cfg();
+        let opts = cfg
+            .build_p2p_v2_listener_options(relay_mode)
+            .map_err(value_err)?;
+        let store = self.store.clone();
+        let store_lock = Arc::clone(&self.store_lock);
+        let roster = Arc::clone(&self.roster);
+        let identity = Arc::clone(&self.identity);
+        let rt = Arc::clone(&self.rt);
+        let router = Arc::clone(&self.router);
+        let announce = Arc::clone(&self.announce);
+        let p2p_v2_sync = Arc::clone(&self.p2p_v2_sync);
+        let sync_ctx = self.v2_sync_ctx();
+        let peer_opt = peer_id.filter(|s| !s.is_empty()).map(ToOwned::to_owned);
+        py.detach(move || {
+            sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity)?;
+            let local_ep = if let Some(pid) = peer_opt {
+                let secret = {
+                    let guard = lock_roster(&roster);
+                    lookup_v2_mailbox_secret_for_target(&guard, &pid).map_err(py_err)?
+                };
+                rt.block_on(p2p_v2_sync.bind_explicit_with(
+                    pid,
+                    opts,
+                    secret,
+                    || usable_v2_mailbox_map(&lock_roster(&roster)),
+                    &router,
+                    rt.handle(),
+                ))
+                .map_err(py_err)?
+            } else {
+                let bound_adv = sync_ctx.try_sync_listeners(Some(opts.clone()))?;
+                match bound_adv {
+                    Some(adv) => adv,
+                    None => rt.block_on(probe_p2p_v2_endpoint(opts)).map_err(py_err)?,
+                }
+            };
+            announce.record_served(&local_ep, None);
+            Ok(local_ep)
         })
     }
 
@@ -2176,13 +2262,14 @@ impl Endpoint {
         let code_s = code.to_owned();
         let name_s = name.to_owned();
         let kind_s = kind.to_owned();
+        let sync_ctx = self.v2_sync_ctx();
 
         py.detach(move || {
             sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity)?;
             let roster_snapshot = lock_roster(&roster_arc).clone();
             let v2_secret = if is_v2_relay_endpoint(&ep_s) {
                 Some(
-                    lookup_v2_mailbox_secret_for_pair(&roster_snapshot, None, &ep_s, now_unix())
+                    *lookup_v2_mailbox_secret_for_pair(&roster_snapshot, None, &ep_s, now_unix())
                         .map_err(py_err)?,
                 )
             } else {
@@ -2266,6 +2353,9 @@ impl Endpoint {
                             .map_err(RuntimeError::from)
                         },
                     )?;
+                    if host_pin_verified {
+                        sync_ctx.sync_listeners();
+                    }
                     Ok(serde_json::json!({
                         "device_id": device_id,
                         "host_id": host_id,
@@ -2297,6 +2387,7 @@ impl Endpoint {
         let store_lock = Arc::clone(&self.store_lock);
         let self_m2m = Arc::clone(&self.self_m2m_enabled);
         let m2m = Arc::clone(&self.m2m_enabled);
+        let sync_ctx = self.v2_sync_ctx();
         let wait = Duration::from_millis(timeout_ms);
 
         py.detach(move || {
@@ -2378,14 +2469,17 @@ impl Endpoint {
                     name,
                     kind,
                     ..
-                } => Ok(serde_json::json!({
-                    "device_id": device_id,
-                    "status": "active",
-                    "token_nonce": token_nonce,
-                    "name": name,
-                    "kind": kind,
-                })
-                .to_string()),
+                } => {
+                    sync_ctx.sync_listeners();
+                    Ok(serde_json::json!({
+                        "device_id": device_id,
+                        "status": "active",
+                        "token_nonce": token_nonce,
+                        "name": name,
+                        "kind": kind,
+                    })
+                    .to_string())
+                }
                 PairOutcome::Rejected { error } => Err(py_err(error)),
                 PairOutcome::InitiatorPending { .. } | PairOutcome::InitiatorEnrolled { .. } => {
                     Err(PyRuntimeError::new_err("unexpected initiator outcome"))
@@ -2402,6 +2496,7 @@ impl Endpoint {
         let store_lock = Arc::clone(&self.store_lock);
         let pid = peer_id.to_owned();
         let sas_owned = sas.map(ToOwned::to_owned);
+        let sync_ctx = self.v2_sync_ctx();
         py.detach(move || {
             update_roster_blocking(
                 store.as_ref(),
@@ -2414,7 +2509,9 @@ impl Endpoint {
                         .map(|_| ())
                         .map_err(RuntimeError::from)
                 },
-            )
+            )?;
+            sync_ctx.sync_listeners();
+            Ok(())
         })
     }
 
@@ -2468,6 +2565,7 @@ impl Endpoint {
         let pid = peer_id.to_owned();
         let self_m2m = Arc::clone(&self.self_m2m_enabled);
         let m2m = Arc::clone(&self.m2m_enabled);
+        let sync_ctx = self.v2_sync_ctx();
         py.detach(move || {
             update_roster_blocking(
                 store.as_ref(),
@@ -2481,6 +2579,7 @@ impl Endpoint {
                 },
             )?;
             refresh_m2m_flags(&self_m2m, &m2m, &lock_roster(&roster_arc));
+            sync_ctx.sync_listeners();
             Ok(())
         })
     }
@@ -2736,6 +2835,7 @@ impl Endpoint {
         let kind_s = kind.to_owned();
 
         let cfg = self.snapshot_transport_cfg();
+        let sync_ctx = self.v2_sync_ctx();
         py.detach(move || {
             // The store-backed driver reads the on-disk roster for its pin checks: persist the
             // revocation state only this endpoint's sessions hold first, so the driver sees it.
@@ -2829,6 +2929,7 @@ impl Endpoint {
                             },
                         )?;
                     }
+                    sync_ctx.sync_listeners();
                     Ok(serde_json::json!({
                         "device_id": device_id,
                         "host_id": host_id,
@@ -2879,6 +2980,7 @@ impl Endpoint {
         let pinned_opt = pinned_host_json
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned);
+        let sync_ctx = self.v2_sync_ctx();
 
         py.detach(move || {
             sync_roster_blocking(store.as_ref(), &store_lock, &roster_arc, &identity)?;
@@ -2909,7 +3011,7 @@ impl Endpoint {
 
             let v2_secret = if is_v2_relay_endpoint(&ep_s) {
                 Some(
-                    lookup_v2_mailbox_secret_for_pair(
+                    *lookup_v2_mailbox_secret_for_pair(
                         &roster_snapshot,
                         v2_pinned.as_ref().map(|p| &p.pinned),
                         &ep_s,
@@ -2987,6 +3089,9 @@ impl Endpoint {
                                 Vec::new(),
                             )
                             .map_err(py_err)?;
+                    }
+                    if host_pin_verified {
+                        sync_ctx.sync_listeners();
                     }
                     Ok(serde_json::json!({
                         "device_id": dev_id,
@@ -3418,6 +3523,7 @@ impl Endpoint {
         let roster = Arc::clone(&self.roster);
         let store = self.store.clone();
         let store_lock = Arc::clone(&self.store_lock);
+        let p2p_v2_sync = Arc::clone(&self.p2p_v2_sync);
         let wait = Duration::from_millis(timeout_ms);
 
         let driver = py.detach(move || {
@@ -3443,6 +3549,7 @@ impl Endpoint {
                 .map_err(py_err);
                 let persisted =
                     sync_roster_async(store.as_ref(), &store_lock, &roster, &identity).await;
+                p2p_v2_sync.stop_unusable_with(|| usable_v2_mailbox_map(&lock_roster(&roster)));
                 let driver = accepted?;
                 persisted.map_err(py_err)?;
                 Ok(driver)
@@ -3464,6 +3571,7 @@ impl Endpoint {
         let v2_state = Arc::clone(&self.v2_state);
         let wait = Duration::from_millis(timeout_ms);
 
+        let p2p_v2_sync = Arc::clone(&self.p2p_v2_sync);
         let driver = py.detach(move || {
             let roster_in = Arc::clone(&roster);
             let store_in = store.clone();
@@ -3509,6 +3617,7 @@ impl Endpoint {
                 .map_err(py_err)
             });
             let synced = sync_roster_blocking(store.as_ref(), &store_lock, &roster, &identity_sync);
+            p2p_v2_sync.stop_unusable_with(|| usable_v2_mailbox_map(&lock_roster(&roster)));
             match res {
                 Ok(drv) => {
                     synced?;
@@ -3522,6 +3631,7 @@ impl Endpoint {
     }
 
     fn close(&self, py: Python<'_>) {
+        self.p2p_v2_sync.stop_all();
         let router = Arc::clone(&self.router);
         let rt = Arc::clone(&self.rt);
         let pools: Vec<Arc<GroupPool>> = self
@@ -3626,6 +3736,7 @@ struct Session {
     store_lock: Arc<AsyncMutex<()>>,
     identity: Arc<EndpointIdentity>,
     roster: Arc<StdMutex<Roster>>,
+    p2p_v2_sync: Arc<P2pV2RosterSync>,
     session: Arc<SessionBackend>,
     /// `true` for a session this endpoint dialed: only an initiator maps a refusal close.
     initiator: bool,
@@ -3659,6 +3770,7 @@ impl Session {
         let store = self.store.clone();
         let store_lock = Arc::clone(&self.store_lock);
         let identity = Arc::clone(&self.identity);
+        let p2p_v2_sync = Arc::clone(&self.p2p_v2_sync);
         let wait = Duration::from_millis(timeout_ms);
         let initiator = self.initiator;
 
@@ -3686,6 +3798,9 @@ impl Session {
                                 sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
                                     .await
                                     .map_err(py_err)?;
+                                p2p_v2_sync.stop_unusable_with(|| {
+                                    usable_v2_mailbox_map(&lock_roster(&roster))
+                                });
                                 serde_json::json!({
                                     "status": "event",
                                     "event": "revocation_updated",
@@ -3732,9 +3847,12 @@ impl Session {
                     Ok(Ok(None)) => Ok(serde_json::json!({ "status": "eof" }).to_string()),
                     Ok(Err(e)) => {
                         // A failed event can leave a revocation in memory only (a fork, say).
-                        match sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
-                            .await
-                        {
+                        let sync_res =
+                            sync_roster_async(store.as_ref(), &store_lock, &roster, &identity)
+                                .await;
+                        p2p_v2_sync
+                            .stop_unusable_with(|| usable_v2_mailbox_map(&lock_roster(&roster)));
+                        match sync_res {
                             Ok(()) => Err(session_err(&e)),
                             Err(pe) => Err(session_err_msg(&e, &format!("{e} ({pe})"))),
                         }
@@ -4029,10 +4147,29 @@ mod tests {
         };
         let defaults = net_config("{}");
         let opts = defaults.build_p2p_listener_options(None).unwrap();
-        assert!(opts.port_mapping);
+        assert_eq!(
+            opts.port_mapping,
+            tendril_runtime::default_p2p_listener_port_mapping()
+        );
         assert_eq!(
             opts.bind_addrs,
             tendril_runtime::P2pBindAddrs::AllInterfaces
+        );
+        assert!(
+            !defaults
+                .hint_dialers(None, None)
+                .unwrap()
+                .config()
+                .p2p_port_mapping
+        );
+
+        let opt_in = net_config(r#"{"p2p_port_mapping":true}"#);
+        assert!(
+            opt_in
+                .hint_dialers(None, None)
+                .unwrap()
+                .config()
+                .p2p_port_mapping
         );
 
         let cfg = net_config(
@@ -4069,5 +4206,22 @@ mod tests {
         let cfg = net_config(r#"{"p2p_relay_mode":"n0"}"#);
         let opts = cfg.build_p2p_listener_options(None).unwrap();
         assert!(matches!(opts.relay_mode, P2pRelayMode::N0Public));
+    }
+    #[test]
+    fn p2p_v2_and_ephemeral_options_disable_pkarr_unless_opted_in() {
+        let eph = net_config(r#"{"p2p_ephemeral":true}"#);
+        let eph_opts = eph.build_p2p_listener_options(None).unwrap();
+        assert!(!eph_opts.publish_pkarr);
+        assert!(!eph_opts.resolve_pkarr);
+
+        let eph_pkarr = net_config(r#"{"p2p_ephemeral":true,"p2p_pkarr":true}"#);
+        let pkarr_opts = eph_pkarr.build_p2p_listener_options(None).unwrap();
+        assert!(pkarr_opts.publish_pkarr && pkarr_opts.resolve_pkarr);
+
+        let v2 = net_config(r#"{"p2p_port_mapping":false}"#);
+        let v2_opts = v2.build_p2p_v2_listener_options(None).unwrap();
+        assert!(!v2_opts.publish_pkarr);
+        assert!(!v2_opts.resolve_pkarr);
+        assert!(!v2_opts.port_mapping);
     }
 }

@@ -603,6 +603,9 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
   fun serveP2p(relayMode: String? = null): String =
     withHandle { TendrilNative.endpointServeP2p(it, relayMode) }
 
+  fun serveP2pV2(relayMode: String? = null, peerIdOpt: String? = null): String =
+    withHandle { TendrilNative.endpointServeP2pV2(it, relayMode, peerIdOpt) }
+
   fun issueCode(kind: String = "remote"): String =
     withHandle { TendrilNative.endpointIssueCode(it, kind) }
 
@@ -904,15 +907,25 @@ class TendrilEndpoint private constructor(handle: Long) : Closeable {
 
   /**
    * Sets the P2P socket keys of the transport configuration, keeping every other key of the last
-   * configuration sent. [portMapping] (default `true` natively) false stops the endpoint from
-   * probing the router for a UPnP, NAT-PMP or PCP mapping. [bindAddrs] is at most one IPv4 and
-   * one IPv6 `host:port` such as `0.0.0.0:0` and `[::]:0` (default every interface); a bad entry
-   * throws an error naming `p2p_bind_addrs` and leaves the cached configuration unchanged. Call
-   * before [serveP2p].
+   * configuration sent. [portMapping] (default `false` on Android listeners and all dialers,
+   * `true` on desktop listeners) false stops the endpoint from probing the router for a UPnP,
+   * NAT-PMP or PCP mapping. [bindAddrs] is at most one IPv4 and one IPv6 `host:port` such as
+   * `0.0.0.0:0` and `[::]:0` (default every interface); a bad entry throws an error naming
+   * `p2p_bind_addrs` and leaves the cached configuration unchanged. [ephemeral] uses an ephemeral
+   * node key and disables `Pkarr` publishing on Day-1 [serveP2p] unless `p2p_pkarr` is also
+   * enabled. Call before [serveP2p] or [serveP2pV2].
    */
-  fun configureP2p(portMapping: Boolean? = null, bindAddrs: List<String>? = null) {
+  fun configureP2p(
+    portMapping: Boolean? = null,
+    bindAddrs: List<String>? = null,
+    ephemeral: Boolean? = null,
+  ) {
     val keys =
-      listOf("p2p_port_mapping" to portMapping, "p2p_bind_addrs" to bindAddrs)
+      listOf(
+          "p2p_port_mapping" to portMapping,
+          "p2p_bind_addrs" to bindAddrs,
+          "p2p_ephemeral" to ephemeral,
+        )
         .mapNotNull { (k, v) -> v?.let { k to it } }
         .toMap()
     if (keys.isEmpty()) return

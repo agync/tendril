@@ -894,3 +894,16 @@ test("group: a parked poller receives an audit directly and indexes nothing", as
     assert.equal(queued.count, 1);
   });
 });
+
+test("group: iroh://v2 helper methods gate on min_wire_version >= 2", async () => {
+  await atFixtureTime(async () => {
+    const client = await clientWithGroup();
+    try {
+      const eps = client.groupSiblingEndpoints(GID, PEER_A);
+      assert.ok(Array.isArray(eps));
+      assert.throws(() => client.deriveGroupMemberP2pV2Ids(GID, PEER_A), /version|downgrade|2/i);
+    } finally {
+      client.free();
+    }
+  });
+});
