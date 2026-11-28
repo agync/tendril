@@ -2112,3 +2112,65 @@ fn wt_endpoint_hints_validate_classify_announce_and_gate_lan2_codes() {
     assert!(PairingUri::parse(&raw(&id, "TND-ABCD-EFGH", &format!("&ep={}", pub_wt))).is_err());
     assert!(PairingUri::parse(&raw(&id, "TND-ABCD-EFGH", &format!("&ep={}", dns_wt))).is_err());
 }
+
+#[test]
+fn iroh_v2_hints_validate_reject_addr_and_never_commit() {
+    use tendril_core::pairing::{is_v2_p2p_hint, is_valid_pairing_endpoint_hint};
+
+    let v2 = "iroh://v2?relay=https://relay.example.com";
+    let v2_bare = "iroh://v2";
+    let v2_prefixed = "p2p:iroh://v2?relay=https://relay.example.com";
+    assert!(is_v2_p2p_hint(v2));
+    assert!(is_v2_p2p_hint(v2_bare));
+    assert!(is_v2_p2p_hint(v2_prefixed));
+    assert!(!is_v2_p2p_hint(
+        "iroh://node1?relay=https://relay.example.com"
+    ));
+
+    assert!(is_valid_pairing_endpoint_hint(v2));
+    assert!(is_valid_pairing_endpoint_hint(v2_bare));
+    assert!(is_valid_pairing_endpoint_hint(v2_prefixed));
+    assert_eq!(classify_endpoint_hint(v2), Ok(ProviderId::P2p));
+
+    // Unsigned iroh://v2 must fail validation; ?addr= and empty query are rejected.
+    for bad in [
+        "iroh://v2?",
+        "iroh://v2?addr=192.0.2.10:11204",
+        "iroh://v2?relay=https://relay.example.com&addr=192.0.2.10:11204",
+        "p2p:iroh://v2?addr=127.0.0.1:11204",
+        "iroh://v2?relay=http://169.254.169.254",
+    ] {
+        assert!(!is_valid_pairing_endpoint_hint(bad), "must reject {bad}");
+        assert!(classify_endpoint_hint(bad).is_err(), "must reject {bad}");
+    }
+
+    // Announced set keeps Direct ahead of P2p; persist plan keeps signed iroh://v2 out of committed routes.
+    let id = identity(0x52);
+    let ann = PairingManager::announced_route_set(
+        &id,
+        &[v2.to_owned(), "direct:192.168.1.9:9100".to_owned()],
+    );
+    assert_eq!(
+        ann.routes(),
+        &["direct:192.168.1.9:9100".to_owned(), v2.to_owned()]
+    );
+    let raw_uri = format!(
+        "tendril://pair?v=1&host=Host&code=TND-ABCD-EFGH-JKLM&k={}&sh={}&ep=iroh%3A%2F%2Fv2%3Frelay%3Dhttps%3A%2F%2Frelay.example.com",
+        b64url_encode(id.static_key().public_bytes()),
+        b64url_encode(&id.signing_key().signing_pub_hash()),
+    );
+    let parsed = PairingUri::parse(&raw_uri).unwrap();
+    assert_eq!(parsed.endpoints, vec![v2.to_owned()]);
+
+    let plan = persistable_routes(
+        &RouteCheck::Unsigned(UnsignedReason::Absent),
+        "TND-ABCD-EFGH-JKLM",
+        Some(v2),
+        &PersistOpts {
+            policy: RoutePolicy::AllSigned,
+            save_committed: true,
+            operator_endpoint: None,
+        },
+    );
+    assert_eq!(plan.committed, None);
+}

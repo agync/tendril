@@ -5,17 +5,12 @@
 //! candidate's address is its original hint string, so the driver knows which hint won; the
 //! per-provider dialers of a [`CandidateSet`] map it to the checked dial target.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-#[cfg(feature = "p2p-iroh")]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-#[cfg(not(feature = "p2p-iroh"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "p2p-iroh")]
-use std::sync::{Mutex as StdMutex, Weak};
-#[cfg(feature = "p2p-iroh")]
+#[cfg(test)]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,12 +20,13 @@ use tendril_core::crypto::b64url_decode_array;
 use tendril_core::error::CoreError;
 use tendril_core::pairing::{
     PairingPathKind, PairingUri, RouteCheck, RoutePolicy, VerifiedRouteStatement,
-    classify_endpoint_hint, is_v2_relay_hint, is_valid_pairing_endpoint_hint,
+    classify_endpoint_hint, is_v2_p2p_hint, is_v2_relay_hint, is_valid_pairing_endpoint_hint,
 };
 use tendril_core::policy::{CandidateEndpoint, ProviderId, is_numeric_host_addr};
 use tendril_core::roster::{
     OperatorEndpoint, PeerState, Roster, RosterEntry, RouteMeta, RouteSource, StoredRoute,
 };
+use tendril_core::v2::canonical_relay_host;
 use zeroize::Zeroizing;
 
 use super::egress::{
@@ -38,7 +34,12 @@ use super::egress::{
     check_hint, classify_destination,
 };
 #[cfg(feature = "p2p-iroh")]
-use super::p2p::{P2pBindAddrs, P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode};
+use super::p2p::{
+    P2pBindAddrs, P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode,
+    default_p2p_dialer_port_mapping,
+};
+#[cfg(feature = "p2p-iroh")]
+use super::p2p_v2::P2pV2Dialer;
 use super::relay::{RelayHintDialer, gate_relay_auth};
 use super::relay_v2::MailboxSecretSource;
 #[cfg(feature = "webtransport")]
@@ -154,6 +155,7 @@ fn push_strongest(out: &mut Vec<HintInput>, input: HintInput) {
 pub struct RelayV2Gate {
     peer_id: String,
     authorized: Vec<String>,
+    authorized_p2p: Vec<String>,
     secret: Option<Zeroizing<[u8; 32]>>,
     releases: AtomicUsize,
 }
@@ -163,6 +165,7 @@ impl fmt::Debug for RelayV2Gate {
         f.debug_struct("RelayV2Gate")
             .field("peer_id", &self.peer_id)
             .field("authorized", &self.authorized)
+            .field("authorized_p2p", &self.authorized_p2p)
             .field("has_secret", &self.secret.is_some())
             .field("releases", &self.releases())
             .finish()
@@ -177,6 +180,7 @@ impl RelayV2Gate {
         let mut gate = Self {
             peer_id: peer_id.to_owned(),
             authorized: Vec::new(),
+            authorized_p2p: Vec::new(),
             secret: None,
             releases: AtomicUsize::new(0),
         };
@@ -188,6 +192,13 @@ impl RelayV2Gate {
             .iter()
             .filter(|r| matches!(r.source, RouteSource::Operator | RouteSource::Signed))
             .filter(|r| is_v2_relay_hint(&r.hint))
+            .map(|r| r.hint.clone())
+            .collect();
+        gate.authorized_p2p = entry
+            .routes
+            .iter()
+            .filter(|r| matches!(r.source, RouteSource::Operator | RouteSource::Signed))
+            .filter(|r| is_v2_p2p_hint(&r.hint))
             .map(|r| r.hint.clone())
             .collect();
         if entry.state == PeerState::Active && !roster.crl_revokes_entry(entry) {
@@ -214,6 +225,11 @@ impl RelayV2Gate {
     fn admits(&self, hint: &str, source: HintSource) -> bool {
         self.secret.is_some()
             && (source == HintSource::Operator || self.authorized.iter().any(|h| h == hint))
+    }
+
+    fn admits_p2p(&self, hint: &str, source: HintSource) -> bool {
+        self.secret.is_some()
+            && (source == HintSource::Operator || self.authorized_p2p.iter().any(|h| h == hint))
     }
 
     fn release(&self) -> Option<Zeroizing<[u8; 32]>> {
@@ -289,6 +305,7 @@ pub enum DialWire {
 
 /// Configuration of the shared pairing and Day-2 dialer set.
 #[derive(Clone)]
+#[cfg_attr(not(feature = "p2p-iroh"), derive(Default))]
 pub struct HintDialerConfig {
     /// Relay admission material, attached only through the origin gate.
     pub relay_auth: RelayClientAuth,
@@ -309,7 +326,7 @@ pub struct HintDialerConfig {
     #[cfg(feature = "p2p-iroh")]
     pub p2p_pkarr: Option<bool>,
     /// Ask the local router for a port mapping on every Iroh endpoint of this set (default
-    /// `true`; see [`P2pOptions::port_mapping`]).
+    /// `false`; see [`default_p2p_dialer_port_mapping`]).
     #[cfg(feature = "p2p-iroh")]
     pub p2p_port_mapping: bool,
     /// Local UDP addresses of every Iroh endpoint of this set (default
@@ -320,6 +337,7 @@ pub struct HintDialerConfig {
     pub power_profile: PowerProfile,
 }
 
+#[cfg(feature = "p2p-iroh")]
 impl Default for HintDialerConfig {
     fn default() -> Self {
         Self {
@@ -334,7 +352,7 @@ impl Default for HintDialerConfig {
             #[cfg(feature = "p2p-iroh")]
             p2p_pkarr: None,
             #[cfg(feature = "p2p-iroh")]
-            p2p_port_mapping: true,
+            p2p_port_mapping: default_p2p_dialer_port_mapping(),
             #[cfg(feature = "p2p-iroh")]
             p2p_bind_addrs: P2pBindAddrs::default(),
             power_profile: PowerProfile::Standard,
@@ -343,13 +361,14 @@ impl Default for HintDialerConfig {
 }
 
 impl HintDialerConfig {
-    /// Applies `power_profile`, updating idle P2P teardown and default UPnP/NAT-PMP port mapping.
+    /// Applies `power_profile`, keeping dialer UPnP/NAT-PMP port mapping disabled by default.
     #[must_use]
     pub fn with_power_profile(mut self, power_profile: PowerProfile) -> Self {
         self.power_profile = power_profile;
         #[cfg(feature = "p2p-iroh")]
         {
-            self.p2p_port_mapping = power_profile.p2p_port_mapping_default();
+            self.p2p_port_mapping =
+                power_profile.p2p_port_mapping_default() && default_p2p_dialer_port_mapping();
         }
         self
     }
@@ -405,13 +424,12 @@ impl HintDialers {
     #[must_use]
     pub fn new(config: HintDialerConfig) -> Self {
         #[cfg(feature = "p2p-iroh")]
-        let p2p_hint = Arc::new(LazyHintP2pDialer::new(
-            P2pOptions::for_hint_dialer(config.p2p_relay_mode.clone())
+        let p2p_hint = Arc::new(LazyHintP2pDialer {
+            options: P2pOptions::for_hint_dialer(config.p2p_relay_mode.clone())
                 .with_relay_auth(config.p2p_relay_auth.clone())
                 .with_port_mapping(config.p2p_port_mapping)
                 .with_bind_addrs(config.p2p_bind_addrs.clone()),
-            config.power_profile.p2p_idle_timeout(),
-        ));
+        });
         #[cfg(feature = "p2p-iroh")]
         let p2p_operator = Arc::new(OperatorP2pDialer {
             relay_mode: Some(config.p2p_relay_mode.clone()),
@@ -488,156 +506,27 @@ impl HintDialers {
         ctx
     }
 
-    /// The lookup-free hint dialer, binding it on first use.
+    /// Binds a fresh ephemeral lookup-free hint dialer.
     #[cfg(feature = "p2p-iroh")]
     pub async fn p2p_hint_dialer(&self) -> Result<Arc<P2pDialer>, RuntimeError> {
-        self.p2p_hint.get().await
+        self.p2p_hint.dialer().await
     }
 
-    /// Closes any lazily bound P2P hint endpoint and stops its idle teardown task.
-    pub async fn close(&self) {
-        #[cfg(feature = "p2p-iroh")]
-        self.p2p_hint.close().await;
-    }
-}
-
-#[cfg(feature = "p2p-iroh")]
-struct LazyP2pState {
-    options: P2pOptions,
-    idle_timeout: Option<Duration>,
-    dialer: tokio::sync::Mutex<Option<Arc<P2pDialer>>>,
-    epoch: tokio::time::Instant,
-    last_touch_ms: AtomicU64,
-    reaper: StdMutex<Option<tokio::task::AbortHandle>>,
-}
-
-#[cfg(feature = "p2p-iroh")]
-impl LazyP2pState {
-    fn touch(&self) {
-        let now_ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_touch_ms.store(now_ms, Ordering::Release);
-    }
-
-    fn stop_reaper(&self) {
-        if let Some(h) = self
-            .reaper
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            h.abort();
-        }
-    }
-
-    fn ensure_reaper(self: &Arc<Self>, idle: Duration) {
-        let mut guard = self
-            .reaper
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.as_ref().is_some_and(|h| !h.is_finished()) {
-            return;
-        }
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let weak: Weak<Self> = Arc::downgrade(self);
-        let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
-        let handle = rt.spawn(async move {
-            loop {
-                tokio::time::sleep(idle).await;
-                let Some(this) = weak.upgrade() else {
-                    return;
-                };
-                let mut d_guard = this.dialer.lock().await;
-                let Some(d) = d_guard.as_ref() else {
-                    *this
-                        .reaper
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                    return;
-                };
-                if d.active_count() > 0 {
-                    this.touch();
-                    continue;
-                }
-                let now_ms = u64::try_from(this.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-                let last_ms = this.last_touch_ms.load(Ordering::Acquire);
-                if now_ms.saturating_sub(last_ms) < idle_ms {
-                    continue;
-                }
-                let taken = d_guard.take();
-                drop(d_guard);
-                if let Some(d) = taken {
-                    d.close_ref().await;
-                }
-                // Re-check under the dialer mutex so a concurrent bind cannot share a finishing
-                // reaper task and get left without idle cleanup.
-                let d_guard = this.dialer.lock().await;
-                if d_guard.is_some() {
-                    this.touch();
-                    continue;
-                }
-                *this
-                    .reaper
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                return;
-            }
-        });
-        *guard = Some(handle.abort_handle());
-    }
-}
-
-#[cfg(feature = "p2p-iroh")]
-impl Drop for LazyP2pState {
-    fn drop(&mut self) {
-        self.stop_reaper();
-    }
+    /// Ephemeral hint dialers close automatically when dropped or failed; kept for lifecycle symmetry.
+    pub async fn close(&self) {}
 }
 
 #[cfg(feature = "p2p-iroh")]
 struct LazyHintP2pDialer {
-    state: Arc<LazyP2pState>,
+    options: P2pOptions,
 }
 
 #[cfg(feature = "p2p-iroh")]
 impl LazyHintP2pDialer {
-    fn new(options: P2pOptions, idle_timeout: Option<Duration>) -> Self {
-        let state = Arc::new(LazyP2pState {
-            options,
-            idle_timeout,
-            dialer: tokio::sync::Mutex::new(None),
-            epoch: tokio::time::Instant::now(),
-            last_touch_ms: AtomicU64::new(0),
-            reaper: StdMutex::new(None),
-        });
-        Self { state }
-    }
-
-    async fn get(&self) -> Result<Arc<P2pDialer>, RuntimeError> {
-        self.state.touch();
-        let mut guard = self.state.dialer.lock().await;
-        if let Some(existing) = guard.as_ref()
-            && !existing.is_closed()
-        {
-            return Ok(Arc::clone(existing));
-        }
-        let dialer = Arc::new(P2pDialer::bind_with_options(self.state.options.clone()).await?);
-        *guard = Some(Arc::clone(&dialer));
-        drop(guard);
-        self.state.touch();
-        if let Some(idle) = self.state.idle_timeout {
-            self.state.ensure_reaper(idle);
-        }
-        Ok(dialer)
-    }
-
-    async fn close(&self) {
-        self.state.stop_reaper();
-        let taken = self.state.dialer.lock().await.take();
-        if let Some(dialer) = taken {
-            dialer.close_ref().await;
-        }
+    async fn dialer(&self) -> Result<Arc<P2pDialer>, RuntimeError> {
+        P2pDialer::bind_with_options(self.options.clone())
+            .await
+            .map(Arc::new)
     }
 }
 
@@ -649,10 +538,14 @@ impl PathDialer for LazyHintP2pDialer {
     }
 
     async fn dial(&self, endpoint: &str) -> Result<Box<dyn PathStream>, RuntimeError> {
-        let dialer = self.get().await?;
-        let res = dialer.dial(endpoint).await;
-        self.state.touch();
-        res
+        let dialer = P2pDialer::bind_with_options(self.options.clone()).await?;
+        match dialer.dial(endpoint).await {
+            Ok(stream) => Ok(stream),
+            Err(err) => {
+                dialer.close().await;
+                Err(err)
+            }
+        }
     }
 }
 
@@ -855,10 +748,11 @@ pub async fn build_pairing_candidates(
     let mut info = Vec::new();
     let mut skipped = Vec::new();
 
-    let mut v2_filtered: Vec<(&HintInput, bool)> = Vec::new();
+    let mut v2_filtered: Vec<(&HintInput, bool, bool)> = Vec::new();
     for input in &inputs {
         let hint = input.hint.as_str();
         let v2_relay = is_v2_relay_hint(hint);
+        let v2_p2p = is_v2_p2p_hint(hint);
         if v2_relay {
             let reason = if pairing {
                 Some(SkipReason::RelayV2NotAuthorized)
@@ -874,17 +768,35 @@ pub async fn build_pairing_candidates(
                 continue;
             }
         }
-        v2_filtered.push((input, v2_relay));
+        if v2_p2p {
+            let reason = if pairing {
+                Some(SkipReason::P2pV2NotAuthorized)
+            } else if opts.wire == DialWire::V1 {
+                Some(SkipReason::WireV1NoP2pV2)
+            } else if !target
+                .gate()
+                .is_some_and(|g| g.admits_p2p(hint, input.source))
+            {
+                Some(SkipReason::P2pV2NotAuthorized)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                skipped.push(SkippedHint::new(hint, reason));
+                continue;
+            }
+        }
+        v2_filtered.push((input, v2_relay, v2_p2p));
     }
 
     let check_results = futures_util::future::join_all(
         v2_filtered
             .iter()
-            .map(|(input, _)| check_hint(&input.hint, input.source, ctx)),
+            .map(|(input, _, _)| check_hint(&input.hint, input.source, ctx)),
     )
     .await;
 
-    for ((input, v2_relay), checked_res) in v2_filtered.into_iter().zip(check_results) {
+    for ((input, v2_relay, v2_p2p), checked_res) in v2_filtered.into_iter().zip(check_results) {
         let hint = input.hint.as_str();
         let checked = match checked_res {
             Ok(checked) => checked,
@@ -957,6 +869,34 @@ pub async fn build_pairing_candidates(
                 relay_credentials = adapter.attaches_credentials(&checked.dial_endpoint);
                 Arc::new(adapter)
             }
+            ProviderId::P2p if v2_p2p => {
+                #[cfg(feature = "p2p-iroh")]
+                {
+                    let Some(gate) = target.gate().map(Arc::clone) else {
+                        skipped.push(SkippedHint::new(hint, SkipReason::P2pV2NotAuthorized));
+                        continue;
+                    };
+                    let source: MailboxSecretSource = Arc::new(move || gate.release());
+                    let base_opts = P2pOptions::for_dialer(set.config.p2p_relay_mode.clone())
+                        .with_relay_auth(set.config.p2p_relay_auth.clone())
+                        .with_port_mapping(set.config.p2p_port_mapping)
+                        .with_bind_addrs(set.config.p2p_bind_addrs.clone())
+                        .with_allow_private_addrs(
+                            operator_call && set.config.p2p_allow_private_addrs,
+                        );
+                    let mut dialer =
+                        P2pV2Dialer::new(base_opts, source).with_operator(operator_call);
+                    if !checked.relay_pins.is_empty() {
+                        dialer = dialer.with_dns_pins(checked.relay_pins.clone());
+                    }
+                    Arc::new(dialer)
+                }
+                #[cfg(not(feature = "p2p-iroh"))]
+                {
+                    skipped.push(SkippedHint::new(hint, SkipReason::P2pFeatureDisabled));
+                    continue;
+                }
+            }
             ProviderId::P2p => {
                 #[cfg(feature = "p2p-iroh")]
                 {
@@ -1006,6 +946,50 @@ pub async fn build_pairing_candidates(
         });
     }
 
+    if !pairing && opts.wire == DialWire::V2 {
+        let has_surviving_v2_p2p = info
+            .iter()
+            .any(|c| c.provider == ProviderId::P2p && is_v2_p2p_hint(&c.hint));
+        let surviving_v2_relay_origins: HashSet<(String, String, u16)> = info
+            .iter()
+            .filter(|c| c.provider == ProviderId::Relay && is_v2_relay_hint(&c.hint))
+            .filter_map(|c| relay_canonical_origin(&c.hint))
+            .collect();
+        if has_surviving_v2_p2p || !surviving_v2_relay_origins.is_empty() {
+            let mut kept_candidates = Vec::with_capacity(candidates.len());
+            let mut kept_info = Vec::with_capacity(info.len());
+            for (mut cand, c_info) in candidates.into_iter().zip(info) {
+                let suppress = matches!(c_info.source, HintSource::Stored(_))
+                    && ((has_surviving_v2_p2p
+                        && c_info.provider == ProviderId::P2p
+                        && !is_v2_p2p_hint(&c_info.hint))
+                        || (c_info.provider == ProviderId::Relay
+                            && !is_v2_relay_hint(&c_info.hint)
+                            && relay_canonical_origin(&c_info.hint).is_some_and(|origin| {
+                                surviving_v2_relay_origins.contains(&origin)
+                            })));
+                if suppress {
+                    skipped.push(SkippedHint::new(
+                        &c_info.hint,
+                        SkipReason::SupersededByV2Route,
+                    ));
+                    if let Some(map) = routes.get_mut(&c_info.provider) {
+                        map.remove(&c_info.hint);
+                        if map.is_empty() {
+                            routes.remove(&c_info.provider);
+                        }
+                    }
+                } else {
+                    cand.id = kept_candidates.len();
+                    kept_candidates.push(cand);
+                    kept_info.push(c_info);
+                }
+            }
+            candidates = kept_candidates;
+            info = kept_info;
+        }
+    }
+
     if candidates.is_empty()
         && !skipped.is_empty()
         && skipped
@@ -1042,6 +1026,19 @@ pub async fn build_pairing_candidates(
         skipped,
         info,
     })
+}
+
+/// Canonical `(scheme, canonical_host, effective_port)` origin of a WebSocket relay hint.
+fn relay_canonical_origin(hint: &str) -> Option<(String, String, u16)> {
+    let raw = hint.strip_prefix("relay:").unwrap_or(hint);
+    let url = url::Url::parse(raw).ok()?;
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "ws" && scheme != "wss" {
+        return None;
+    }
+    let host = canonical_relay_host(url.host_str()?).ok()?;
+    let port = url.port_or_known_default()?;
+    Some((scheme, host, port))
 }
 
 /// The stored route source a hint carries into candidate ordering; URI hints carry none.
@@ -1471,8 +1468,8 @@ mod tests {
             p2p_pkarr: Some(true),
             ..HintDialerConfig::default()
         });
-        assert!(!dialers.p2p_hint.state.options.resolve_pkarr);
-        assert!(dialers.p2p_hint.state.options.hint_dialer);
+        assert!(!dialers.p2p_hint.options.resolve_pkarr);
+        assert!(dialers.p2p_hint.options.hint_dialer);
     }
     #[test]
     fn port_mapping_and_bind_addrs_reach_both_dialer_kinds() {
@@ -1487,24 +1484,24 @@ mod tests {
         };
 
         let defaults = HintDialers::new(HintDialerConfig::default());
-        assert!(defaults.p2p_hint.state.options.port_mapping);
+        assert!(!defaults.p2p_hint.options.port_mapping);
         assert_eq!(
-            defaults.p2p_hint.state.options.bind_addrs,
+            defaults.p2p_hint.options.bind_addrs,
             P2pBindAddrs::AllInterfaces
         );
         let operator = defaults.operator_p2p_options(&endpoint).expect("options");
-        assert!(operator.port_mapping);
+        assert!(!operator.port_mapping);
         assert_eq!(operator.bind_addrs, P2pBindAddrs::AllInterfaces);
 
         let dialers = HintDialers::new(HintDialerConfig {
-            p2p_port_mapping: false,
+            p2p_port_mapping: true,
             p2p_bind_addrs: only.clone(),
             ..HintDialerConfig::default()
         });
-        assert!(!dialers.p2p_hint.state.options.port_mapping);
-        assert_eq!(dialers.p2p_hint.state.options.bind_addrs, only);
+        assert!(dialers.p2p_hint.options.port_mapping);
+        assert_eq!(dialers.p2p_hint.options.bind_addrs, only);
         let operator = dialers.operator_p2p_options(&endpoint).expect("options");
-        assert!(!operator.port_mapping);
+        assert!(operator.port_mapping);
         assert_eq!(operator.bind_addrs, only);
     }
 
@@ -1615,52 +1612,343 @@ mod tests {
 
     #[cfg(feature = "p2p-iroh")]
     #[tokio::test]
-    async fn lazy_p2p_reaper_clears_handle_and_rebinds_without_stranding() {
-        let opts = P2pOptions::for_hint_dialer(P2pRelayMode::Disabled).with_port_mapping(false);
-        let lazy = LazyHintP2pDialer::new(opts, Some(Duration::from_millis(25)));
-        let first = lazy.get().await.expect("bind first dialer");
+    async fn lazy_hint_p2p_dialer_uses_distinct_client_endpoint_per_dial() {
+        use crate::provider::PathListener;
+        use crate::providers::p2p::{P2pListener, parse_p2p_relay_modes};
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+        let mut relay_cfg =
+            iroh_relay::server::RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+        relay_cfg.key_cache_capacity = Some(1024);
+        let mut server_cfg = iroh_relay::server::ServerConfig::default();
+        server_cfg.relay = Some(relay_cfg);
+        let srv = iroh_relay::server::Server::spawn(server_cfg)
+            .await
+            .expect("spawn iroh-relay");
+        let relay_url = format!("http://{}", srv.http_addr().expect("http addr"));
+        let mode = parse_p2p_relay_modes(std::slice::from_ref(&relay_url)).expect("mode");
+        let loopback = P2pBindAddrs::Only {
+            v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            v6: None,
+        };
+
+        let mut listener = P2pListener::bind_with_options(
+            P2pOptions::for_listener(mode.clone())
+                .with_allow_private_addrs(true)
+                .with_port_mapping(false)
+                .with_bind_addrs(loopback.clone()),
+            None,
+        )
+        .await
+        .expect("bind listener");
+        let target_ep = listener.local_endpoint();
+        let hint_dialer = LazyHintP2pDialer {
+            options: P2pOptions::for_hint_dialer(mode)
+                .with_allow_private_addrs(true)
+                .with_bind_addrs(loopback),
+        };
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (client, server) =
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    tokio::join!(hint_dialer.dial(&target_ep), listener.accept())
+                })
+                .await
+                .expect("dial timeout");
+            let mut client = client.expect("dial");
+            let mut server = server.expect("accept");
+            seen.push(server.peer_transport_id().expect("remote id"));
+            client.close().await.expect("close client");
+            server.close().await.expect("close server");
+        }
+        assert_ne!(
+            seen[0], seen[1],
+            "hint dialer must not reuse client EndpointId"
+        );
+    }
+
+    struct StubIpResolver;
+
+    #[async_trait]
+    impl super::super::egress::HostResolver for StubIpResolver {
+        async fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, RuntimeError> {
+            Ok(vec![SocketAddr::new("203.0.113.10".parse().unwrap(), port)])
+        }
+    }
+
+    #[tokio::test]
+    async fn d6_suppression_prefers_v2_and_preserves_cross_origin_operator_and_recovery_hints() {
+        use tendril_core::crypto::{SigningKeypair, StaticKeypair};
+        use tendril_core::pairing::PairingCodeKind;
+        use tendril_core::roster::V2PeerSecrets;
+
+        let id = tendril_core::identity::EndpointIdentity::from_keys(
+            StaticKeypair::generate().expect("static"),
+            SigningKeypair::generate().expect("signing"),
+        );
+        let host_id = id.host_id().to_owned();
+        let v2_p2p = "iroh://v2?relay=https://relay.example/";
+        let v1_p2p_stored = format!(
+            "iroh://{}",
+            iroh::SecretKey::from_bytes(&[0x11; 32]).public()
+        );
+        let v1_p2p_op = format!(
+            "iroh://{}",
+            iroh::SecretKey::from_bytes(&[0x22; 32]).public()
+        );
+        let v2_relay = "wss://Relay.Example./v2/relay";
+        let v1_relay_same_origin = "relay:wss://relay.example:443/v1/relay";
+        let v1_relay_other_host = "wss://other.example/v1/relay";
+        let v1_relay_other_port = "wss://relay.example:8443/v1/relay";
+        let v1_relay_recovery = "wss://relay.example/v1/relay";
+
+        let mut roster = Roster::new();
+        roster
+            .insert_pinned_host(
+                host_id.clone(),
+                "Host".to_owned(),
+                *id.static_key().public_bytes(),
+                Some(id.signing_key().public_key().clone()),
+                1,
+                Vec::new(),
+            )
+            .unwrap();
+        roster
+            .upgrade_peer_to_v2(&host_id, V2PeerSecrets::new([0x31; 32], [0x32; 32]))
+            .unwrap();
+
+        let mut uri = PairingUri::new(
+            "Host",
+            "TND-ABCD-EFGH-JKLM",
+            *id.static_key().public_bytes(),
+            id.signing_key().signing_pub_hash(),
+            vec![v2_p2p.to_owned(), v2_relay.to_owned()],
+            Some(host_id.clone()),
+            Some(1),
+        );
+        let unsigned = format!("{}&rq=1", uri.try_encode().unwrap());
+        let sig = tendril_core::pairing::sign_route_statement(&id, &unsigned);
+        uri = PairingUri::parse(&format!(
+            "{unsigned}&rs={}",
+            tendril_core::crypto::b64url_encode(&sig)
+        ))
+        .unwrap();
+        let RouteCheck::Verified(stmt) = uri.verify_route_statement(id.signing_key().public_key())
+        else {
+            panic!("verify");
+        };
+        roster.replace_signed_routes(&host_id, &stmt).unwrap();
+
+        let gate = RelayV2Gate::authorize(&roster, &host_id);
+        let target = HintTarget::session(&host_id, Some([0x44; 32]), Some(gate));
+        let dialers = Arc::new(HintDialers::new(HintDialerConfig {
+            p2p_relay_mode: P2pRelayMode::Custom("https://relay.example/".to_owned()),
+            p2p_port_mapping: false,
+            ..HintDialerConfig::default()
+        }));
+        let sess_ctx = EgressContext::new(EgressKind::Session)
+            .with_iroh_relay_mode(P2pRelayMode::Custom("https://relay.example/".to_owned()))
+            .with_resolver(Arc::new(StubIpResolver));
+
+        let inputs = vec![
+            HintInput::new(v2_p2p, HintSource::Stored(RouteSource::Signed)),
+            HintInput::new(&v1_p2p_stored, HintSource::Stored(RouteSource::Signed)),
+            HintInput::new(&v1_p2p_op, HintSource::Operator),
+            HintInput::new(v2_relay, HintSource::Stored(RouteSource::Signed)),
+            HintInput::new(
+                v1_relay_same_origin,
+                HintSource::Stored(RouteSource::Committed),
+            ),
+            HintInput::new(v1_relay_other_host, HintSource::Stored(RouteSource::Signed)),
+            HintInput::new(v1_relay_other_port, HintSource::Stored(RouteSource::Signed)),
+            HintInput::new(v1_relay_recovery, HintSource::Uri),
+        ];
+
+        // Wire v2 Day-2: suppresses stored v1 iroh and stored same-origin /v1/relay only.
+        let v2_set = build_pairing_candidates(
+            &inputs,
+            &target,
+            &sess_ctx,
+            &MultiDialOptions::new(Arc::clone(&dialers), DialWire::V2),
+        )
+        .await
+        .expect("v2 candidates");
         assert!(
-            lazy.state
-                .reaper
-                .lock()
-                .expect("reaper mutex")
-                .as_ref()
-                .is_some_and(|h| !h.is_finished())
+            v2_set.skipped.iter().any(|s| {
+                s.hint == v1_p2p_stored && s.reason == SkipReason::SupersededByV2Route
+            }),
+            "{:?}",
+            v2_set.skipped
+        );
+        assert!(
+            v2_set.skipped.iter().any(|s| {
+                s.hint == v1_relay_same_origin && s.reason == SkipReason::SupersededByV2Route
+            }),
+            "{:?}",
+            v2_set.skipped
+        );
+        for (i, c) in v2_set.candidates.iter().enumerate() {
+            assert_eq!(c.id, i, "contiguous candidate ids required");
+        }
+        let surviving: Vec<&str> = v2_set.candidates.iter().map(|c| c.addr.as_str()).collect();
+        assert_eq!(
+            surviving,
+            vec![
+                v2_p2p,
+                v1_p2p_op.as_str(),
+                v2_relay,
+                v1_relay_other_host,
+                v1_relay_other_port,
+                v1_relay_recovery,
+            ]
         );
 
-        let start = tokio::time::Instant::now();
-        while !first.is_closed() {
-            assert!(
-                start.elapsed() < Duration::from_secs(3),
-                "first dialer did not reap"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        while lazy.state.reaper.lock().expect("reaper mutex").is_some() {
-            assert!(
-                start.elapsed() < Duration::from_secs(3),
-                "reaper handle stayed stale"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        let second = lazy.get().await.expect("rebind dialer after teardown");
+        // Wire v1: rejects v2 routes and keeps stored v1 routes unsuppressed.
+        let v1_set = build_pairing_candidates(
+            &inputs,
+            &target,
+            &sess_ctx,
+            &MultiDialOptions::new(Arc::clone(&dialers), DialWire::V1),
+        )
+        .await
+        .expect("v1 candidates");
         assert!(
-            lazy.state
-                .reaper
-                .lock()
-                .expect("reaper mutex")
-                .as_ref()
-                .is_some_and(|h| !h.is_finished())
+            v1_set
+                .skipped
+                .iter()
+                .any(|s| s.hint == v2_p2p && s.reason == SkipReason::WireV1NoP2pV2)
         );
-        let start2 = tokio::time::Instant::now();
-        while !second.is_closed() {
-            assert!(
-                start2.elapsed() < Duration::from_secs(3),
-                "rebound dialer was stranded"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            v1_set
+                .skipped
+                .iter()
+                .any(|s| s.hint == v2_relay && s.reason == SkipReason::WireV1NoRelayV2)
+        );
+        assert!(
+            !v1_set
+                .skipped
+                .iter()
+                .any(|s| s.reason == SkipReason::SupersededByV2Route)
+        );
+        assert!(v1_set.candidates.iter().any(|c| c.addr == v1_p2p_stored));
+
+        // Pairing: rejects v2 routes as unauthorized and keeps v1 unsuppressed.
+        let pair_ctx = EgressContext::new(EgressKind::Pairing(PairingCodeKind::Remote3Group))
+            .with_iroh_relay_mode(P2pRelayMode::Custom("https://relay.example/".to_owned()))
+            .with_resolver(Arc::new(StubIpResolver));
+        let pair_set = build_pairing_candidates(
+            &inputs,
+            &HintTarget::pairing(Some([0x44; 32])),
+            &pair_ctx,
+            &MultiDialOptions::new(Arc::clone(&dialers), DialWire::V2),
+        )
+        .await
+        .expect("pairing candidates");
+        assert!(
+            pair_set
+                .skipped
+                .iter()
+                .any(|s| s.hint == v2_p2p && s.reason == SkipReason::P2pV2NotAuthorized)
+        );
+        assert!(
+            !pair_set
+                .skipped
+                .iter()
+                .any(|s| s.reason == SkipReason::SupersededByV2Route)
+        );
+
+        // Failed/unauthorized v2 route (missing gate) never suppresses stored v1.
+        let unauth_set = build_pairing_candidates(
+            &[
+                HintInput::new(v2_p2p, HintSource::Stored(RouteSource::Signed)),
+                HintInput::new(&v1_p2p_stored, HintSource::Stored(RouteSource::Signed)),
+            ],
+            &HintTarget::session(&host_id, Some([0x44; 32]), None),
+            &sess_ctx,
+            &MultiDialOptions::new(dialers, DialWire::V2),
+        )
+        .await
+        .expect("unauth candidates");
+        assert!(
+            unauth_set
+                .skipped
+                .iter()
+                .any(|s| s.hint == v2_p2p && s.reason == SkipReason::P2pV2NotAuthorized)
+        );
+        assert_eq!(unauth_set.candidates.len(), 1);
+        assert_eq!(unauth_set.candidates[0].addr, v1_p2p_stored);
+    }
+}
+
+#[cfg(test)]
+mod v2_route_suppression_tests {
+    use super::*;
+    use tendril_core::crypto::{SigningKeypair, StaticKeypair};
+    use tendril_core::roster::V2PeerSecrets;
+
+    struct EchoResolver;
+
+    #[async_trait]
+    impl super::super::egress::HostResolver for EchoResolver {
+        async fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, RuntimeError> {
+            Ok(vec![SocketAddr::new("203.0.113.20".parse().unwrap(), port)])
         }
-        lazy.close().await;
+    }
+
+    #[tokio::test]
+    async fn relay_d6_suppression_works_without_p2p_feature() {
+        let static_kp = StaticKeypair::generate().expect("static");
+        let signing_kp = SigningKeypair::generate().expect("signing");
+        let host_id = "peer-relay-d6";
+        let v2_relay = "wss://relay.example/v2/relay";
+        let v1_same = "wss://relay.example/v1/relay";
+        let v1_cross = "wss://other.example/v1/relay";
+
+        let mut roster = Roster::new();
+        roster
+            .insert_pinned_host(
+                host_id.to_owned(),
+                "Host".to_owned(),
+                *static_kp.public_bytes(),
+                Some(signing_kp.public_key().clone()),
+                1,
+                Vec::new(),
+            )
+            .unwrap();
+        roster
+            .upgrade_peer_to_v2(host_id, V2PeerSecrets::new([0x31; 32], [0x32; 32]))
+            .unwrap();
+        roster
+            .set_routes(
+                host_id,
+                vec![OperatorEndpoint {
+                    hint: v2_relay.to_owned(),
+                    relay_key: None,
+                }],
+            )
+            .unwrap();
+        let gate = RelayV2Gate::authorize(&roster, host_id);
+        let ctx = EgressContext::new(EgressKind::Session).with_resolver(Arc::new(EchoResolver));
+        let dialers = Arc::new(HintDialers::new(HintDialerConfig::default()));
+        let set = build_pairing_candidates(
+            &[
+                HintInput::new(v2_relay, HintSource::Stored(RouteSource::Operator)),
+                HintInput::new(v1_same, HintSource::Stored(RouteSource::Signed)),
+                HintInput::new(v1_cross, HintSource::Stored(RouteSource::Signed)),
+            ],
+            &HintTarget::session(host_id, Some([0x44; 32]), Some(gate)),
+            &ctx,
+            &MultiDialOptions::new(dialers, DialWire::V2),
+        )
+        .await
+        .expect("candidates");
+        assert!(
+            set.skipped
+                .iter()
+                .any(|s| { s.hint == v1_same && s.reason == SkipReason::SupersededByV2Route })
+        );
+        let kept: Vec<&str> = set.candidates.iter().map(|c| c.addr.as_str()).collect();
+        assert_eq!(kept, vec![v2_relay, v1_cross]);
     }
 }

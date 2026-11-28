@@ -105,7 +105,7 @@ impl PowerProfile {
         }
     }
 
-    /// Returns the idle timeout after which an unused hint P2P endpoint is closed.
+    /// Returns the idle timeout after which an unused shared P2P endpoint is closed.
     #[must_use]
     pub const fn p2p_idle_timeout(self) -> Option<Duration> {
         match self {

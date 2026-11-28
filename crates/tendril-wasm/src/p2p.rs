@@ -194,6 +194,45 @@ fn parse_p2p_endpoint_filtered(
     Ok(EndpointAddr::from_parts(id, addrs))
 }
 
+fn parse_v2_p2p_relays_wasm(endpoint: &str) -> Result<Vec<RelayUrl>, String> {
+    if endpoint.chars().any(char::is_control) {
+        return Err("iroh v2 endpoint contains control characters".to_owned());
+    }
+    if endpoint == "iroh://v2" {
+        return Ok(Vec::new());
+    }
+    let Some(query_part) = endpoint.strip_prefix("iroh://v2?") else {
+        return Err("iroh v2 endpoint must start with iroh://v2".to_owned());
+    };
+    if query_part.is_empty() {
+        return Err("empty query in iroh://v2 endpoint".to_owned());
+    }
+    let mut relays = Vec::new();
+    for pair in query_part.split('&') {
+        if pair.is_empty() {
+            return Err("empty query segment in iroh://v2 endpoint".to_owned());
+        }
+        let (key, val) = pair
+            .split_once('=')
+            .ok_or_else(|| "invalid iroh v2 query param".to_owned())?;
+        if key != "relay" {
+            return Err("unsupported query parameter on iroh://v2 endpoint".to_owned());
+        }
+        let validated = validate_iroh_relay_url_wasm(val)?;
+        let url = RelayUrl::from_str(validated.as_str())
+            .map_err(|err| format!("invalid iroh relay URL: {err}"))?;
+        if !relays.contains(&url) {
+            if relays.len() >= MAX_P2P_RELAY_URLS {
+                return Err(format!(
+                    "iroh endpoint URI must contain at most {MAX_P2P_RELAY_URLS} relay URLs"
+                ));
+            }
+            relays.push(url);
+        }
+    }
+    Ok(relays)
+}
+
 /// Validates and parses an `iroh://...` URI into JSON metadata for JS callers.
 #[wasm_bindgen]
 pub fn parse_p2p_endpoint_json(endpoint: &str) -> Result<String, JsValue> {
@@ -419,6 +458,48 @@ fn resolve_dial_with_options(
     Ok(hint_dial(&addr, configured))
 }
 
+fn plan_v2_dial_relays(
+    hint_relays: &[RelayUrl],
+    relay_urls_json_opt: Option<&str>,
+    auth_token: Option<&str>,
+    hint: bool,
+) -> Result<(RelayMode, Vec<RelayUrl>), String> {
+    let (mode, map) = if let Some(json_str) = relay_urls_json_opt {
+        let urls: Vec<String> =
+            serde_json::from_str(json_str).map_err(|e| format!("invalid relay_urls_json: {e}"))?;
+        let map = build_relay_map_wasm(&urls, auth_token)?;
+        (RelayMode::Custom(map.clone()), map)
+    } else if auth_token.is_some() {
+        return Err(
+            "p2pRelayAuthToken requires explicit p2pRelayUrls or relayUrlOverride; refusing to attach bearer token to default n0 or peer URI ?relay= hosts"
+                .to_owned(),
+        );
+    } else if hint || hint_relays.is_empty() {
+        (RelayMode::Default, RelayMode::Default.relay_map())
+    } else {
+        let configs: Vec<RelayConfig> =
+            hint_relays.iter().cloned().map(RelayConfig::from).collect();
+        let map = RelayMap::from_iter(configs);
+        (RelayMode::Custom(map.clone()), map)
+    };
+    let map_urls: Vec<RelayUrl> = map.urls();
+    let mut ordered = Vec::with_capacity(map_urls.len());
+    for h in hint_relays {
+        if map_urls.contains(h) && !ordered.contains(h) {
+            ordered.push(h.clone());
+        }
+    }
+    for u in map_urls {
+        if !ordered.contains(&u) {
+            ordered.push(u);
+        }
+    }
+    if ordered.is_empty() {
+        return Err("no relay configured for iroh://v2 dial".to_owned());
+    }
+    Ok((mode, ordered))
+}
+
 #[wasm_bindgen]
 impl WasmIrohStream {
     /// Connects a fresh ephemeral `iroh` endpoint to `endpoint` and opens a Tendril tunnel stream.
@@ -460,6 +541,122 @@ impl WasmIrohStream {
         )
         .map_err(to_js_err)?;
         dial_with_relay_mode(addr, relay_mode, allow_n0_dns, timeout_ms).await
+    }
+
+    /// Connects a fresh ephemeral `iroh` endpoint per `(epoch_id, relay)` attempt for `iroh://v2`,
+    /// trying any hint `?relay=` in the configured `RelayMap` before fallback relays, with no
+    /// `Pkarr`/DNS address lookup and no client `EndpointId` reuse across attempts.
+    #[wasm_bindgen]
+    pub async fn dial_v2(
+        endpoint: String,
+        target_endpoint_ids_json: String,
+        relay_urls_json_opt: Option<String>,
+        auth_token_opt: Option<String>,
+        timeout_ms: Option<u32>,
+        hint: Option<bool>,
+    ) -> Result<WasmIrohStream, JsValue> {
+        let raw_ids: Vec<String> = serde_json::from_str(&target_endpoint_ids_json)
+            .map_err(|e| to_js_err(format!("invalid endpoint_ids JSON: {e}")))?;
+        if raw_ids.is_empty() || raw_ids.len() > 2 {
+            return Err(to_js_err(
+                "iroh://v2 requires 1 or 2 derived target endpoint ids",
+            ));
+        }
+        let mut target_ids = Vec::with_capacity(raw_ids.len());
+        for raw in raw_ids {
+            let id = EndpointId::from_str(&raw)
+                .map_err(|_| to_js_err("invalid derived iroh endpoint id"))?;
+            if !target_ids.contains(&id) {
+                target_ids.push(id);
+            }
+        }
+        let hint_relays = parse_v2_p2p_relays_wasm(&endpoint).map_err(to_js_err)?;
+        let token = auth_token_opt
+            .map(validate_p2p_auth_token_wasm)
+            .transpose()
+            .map_err(to_js_err)?;
+        let (relay_mode, relays) = plan_v2_dial_relays(
+            &hint_relays,
+            relay_urls_json_opt.as_deref(),
+            token.as_deref().map(String::as_str),
+            hint.unwrap_or(false),
+        )
+        .map_err(to_js_err)?;
+
+        let budget =
+            Duration::from_millis(u64::from(timeout_ms.unwrap_or(15_000).clamp(100, 120_000)));
+        let total_attempts = u64::try_from(target_ids.len() * relays.len()).unwrap_or(1);
+        let total_ms = u64::try_from(budget.as_millis()).unwrap_or(15_000);
+        let per_attempt = Duration::from_millis(
+            (total_ms / total_attempts.max(1)).clamp(1500, total_ms.max(1500)),
+        );
+
+        let dial_res = timeout(budget, async {
+            let mut last_err = "iroh v2 connect failed".to_owned();
+            for ep_id in target_ids {
+                for relay in &relays {
+                    let ep = match timeout(
+                        per_attempt,
+                        Endpoint::builder(presets::Minimal)
+                            .relay_mode(relay_mode.clone())
+                            .bind(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(ep)) => ep,
+                        Ok(Err(e)) => {
+                            last_err = format!("iroh endpoint bind failed: {e}");
+                            continue;
+                        }
+                        Err(_) => {
+                            last_err = "iroh endpoint bind timed out".to_owned();
+                            continue;
+                        }
+                    };
+                    let addr =
+                        EndpointAddr::from_parts(ep_id, [TransportAddr::Relay(relay.clone())]);
+                    let attempt = timeout(per_attempt, async {
+                        let conn = ep
+                            .connect(addr, TENDRIL_P2P_ALPN)
+                            .await
+                            .map_err(|e| format!("iroh connect failed: {e}"))?;
+                        let (mut send, recv) = conn
+                            .open_bi()
+                            .await
+                            .map_err(|e| format!("iroh open_bi failed: {e}"))?;
+                        send.write_all(&[P2P_STREAM_MAGIC])
+                            .await
+                            .map_err(|e| format!("iroh opener write failed: {e}"))?;
+                        Ok::<_, String>((conn, send, recv))
+                    })
+                    .await;
+                    match attempt {
+                        Ok(Ok((conn, send, recv))) => return Ok((ep, conn, send, recv)),
+                        Ok(Err(msg)) => {
+                            ep.close().await;
+                            last_err = msg;
+                        }
+                        Err(_) => {
+                            ep.close().await;
+                            last_err = "timed out connecting to iroh endpoint".to_owned();
+                        }
+                    }
+                }
+            }
+            Err(last_err)
+        })
+        .await;
+
+        match dial_res {
+            Ok(Ok((ep, conn, send, recv))) => Ok(WasmIrohStream {
+                endpoint: ep,
+                conn: StdMutex::new(Some(conn)),
+                send: Arc::new(AsyncMutex::new(Some(send))),
+                recv: Arc::new(AsyncMutex::new(Some(recv))),
+            }),
+            Ok(Err(msg)) => Err(to_js_err(msg)),
+            Err(_) => Err(to_js_err("timed out connecting to iroh endpoint")),
+        }
     }
 
     /// Sends one bounded chunk over the open QUIC stream.
@@ -728,5 +925,27 @@ mod tests {
         assert_eq!(sorted_relays(&addr), vec![mine]);
         let err = resolve_dial_with_options(bare, None, Some("secret-bearer"), true).unwrap_err();
         assert!(err.contains("refusing to attach bearer token"));
+    }
+
+    #[test]
+    fn v2_p2p_relays_reject_addr_and_order_configured_hint_first() {
+        assert!(parse_v2_p2p_relays_wasm("iroh://v2").unwrap().is_empty());
+        assert!(parse_v2_p2p_relays_wasm("iroh://v2?").is_err());
+        assert!(parse_v2_p2p_relays_wasm("iroh://v2?addr=93.184.216.34:4433").is_err());
+        assert!(parse_v2_p2p_relays_wasm("iroh://v2?relay=https://a.example/&&").is_err());
+
+        let r1 = RelayUrl::from_str("https://r1.example/").unwrap();
+        let r2 = RelayUrl::from_str("https://r2.example/").unwrap();
+        let foreign = RelayUrl::from_str("https://foreign.example/").unwrap();
+        let (mode, ordered) = plan_v2_dial_relays(
+            &[foreign, r2.clone()],
+            Some("[\"https://r1.example/\",\"https://r2.example/\"]"),
+            Some("tok"),
+            true,
+        )
+        .unwrap();
+        assert!(matches!(mode, RelayMode::Custom(_)));
+        assert_eq!(ordered, vec![r2, r1]);
+        assert!(plan_v2_dial_relays(&[], None, Some("tok"), true).is_err());
     }
 }

@@ -686,7 +686,7 @@ func (ep *Endpoint) ServeRelayV2(relayURL, expectedHost, peerIDOpt string) (stri
 	return endpoint, err
 }
 
-// ServeP2p binds an iroh P2P listener ("default", "disabled", or relay URL) using the endpoint's derived P2P key.
+// ServeP2p binds an iroh P2P listener ("default", "disabled", or relay URL) using the endpoint's derived P2P key (or an ephemeral key when configured).
 func (ep *Endpoint) ServeP2p(relayMode string) (string, error) {
 	var endpoint string
 	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
@@ -695,6 +695,29 @@ func (ep *Endpoint) ServeP2p(relayMode string) (string, error) {
 		if err := withOptCStr(relayMode, "relayMode", func(cm *C.char) error {
 			rc = C.tendril_endpoint_serve_p2p(h, cm, &out)
 			return nil
+		}); err != nil {
+			return err
+		}
+		if rc != C.TENDRIL_OK {
+			return ffiErr(rc)
+		}
+		endpoint = takeOutCStr(out)
+		return nil
+	})
+	return endpoint, err
+}
+
+// ServeP2pV2 binds hourly-rotating iroh://v2 listener(s) ("default", "disabled", or relay URL) and tracks roster changes when peerID is empty.
+func (ep *Endpoint) ServeP2pV2(relayMode, peerID string) (string, error) {
+	var endpoint string
+	err := ep.withHandle(func(h *C.TendrilEndpoint) error {
+		var out *C.char
+		var rc C.int32_t
+		if err := withOptCStr(relayMode, "relayMode", func(cm *C.char) error {
+			return withOptCStr(peerID, "peerID", func(cp *C.char) error {
+				rc = C.tendril_endpoint_serve_p2p_v2(h, cm, cp, &out)
+				return nil
+			})
 		}); err != nil {
 			return err
 		}

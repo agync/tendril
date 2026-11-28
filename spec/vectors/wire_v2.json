@@ -24,6 +24,106 @@
     "accept_sig_hex": "27ce2e7b4819008d2336c62e83e3e2a1ba0b62bac3552d0be20da661d77323df3e21aa94832d48f280e19728b69646440691b96ccf518ae05ffbb1c1136ddb01",
     "accept_sig_b64url": "J84ue0gZAI0jNsYug-PioboLYrrDVS0L4g2mYddzI98-IaqUgy1I8oDhlyi2lkZEBpG5bM9RiuBf-7HBE23bAQ"
   },
+  "blinded_p2p": {
+    "mailbox_secret_hex": "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "unix_secs": 1795134200,
+    "epoch": 498648,
+    "info": "tendril-p2p-v2-ed25519",
+    "epoch_signing_seed_hex": "487124eb7a6294d41850f479c0b5bc78cb42d2bedb8b893c32be27dff555840a",
+    "endpoint_id_hex": "86089639e1482aec2407dc8e0469b39c0737142f934491e91e3b2d1d069a40dd",
+    "boundary_cases": [
+      {
+        "unix_secs": 0,
+        "center_epoch": 0,
+        "epochs": [
+          0
+        ],
+        "current_first_epochs": [
+          0
+        ]
+      },
+      {
+        "unix_secs": 3599,
+        "center_epoch": 0,
+        "epochs": [
+          0,
+          1
+        ],
+        "current_first_epochs": [
+          0,
+          1
+        ]
+      },
+      {
+        "unix_secs": 36000,
+        "center_epoch": 10,
+        "epochs": [
+          9,
+          10
+        ],
+        "current_first_epochs": [
+          10,
+          9
+        ]
+      },
+      {
+        "unix_secs": 36299,
+        "center_epoch": 10,
+        "epochs": [
+          9,
+          10
+        ],
+        "current_first_epochs": [
+          10,
+          9
+        ]
+      },
+      {
+        "unix_secs": 36300,
+        "center_epoch": 10,
+        "epochs": [
+          10
+        ],
+        "current_first_epochs": [
+          10
+        ]
+      },
+      {
+        "unix_secs": 39299,
+        "center_epoch": 10,
+        "epochs": [
+          10
+        ],
+        "current_first_epochs": [
+          10
+        ]
+      },
+      {
+        "unix_secs": 39300,
+        "center_epoch": 10,
+        "epochs": [
+          10,
+          11
+        ],
+        "current_first_epochs": [
+          10,
+          11
+        ]
+      },
+      {
+        "unix_secs": 39599,
+        "center_epoch": 10,
+        "epochs": [
+          10,
+          11
+        ],
+        "current_first_epochs": [
+          10,
+          11
+        ]
+      }
+    ]
+  },
   "relay_admission": {
     "shared_secret_hex": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
     "op": "register",

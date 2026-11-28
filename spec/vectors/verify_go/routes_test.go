@@ -87,6 +87,21 @@ func decodeRouteSetStructure(payload []byte) ([]string, error) {
 			strings.HasPrefix(s, "local:") || strings.HasPrefix(s, "unix://") {
 			return nil, fmt.Errorf("bad hint %q", s)
 		}
+		irohCand := strings.TrimPrefix(s, "p2p:")
+		if rest, ok := strings.CutPrefix(irohCand, "iroh://"); ok {
+			nodeID, query, hasQuery := strings.Cut(rest, "?")
+			if nodeID == "v2" && hasQuery {
+				if query == "" {
+					return nil, fmt.Errorf("bad iroh://v2 hint %q", s)
+				}
+				for _, pair := range strings.Split(query, "&") {
+					k, _, ok := strings.Cut(pair, "=")
+					if !ok || k != "relay" {
+						return nil, fmt.Errorf("disallowed iroh://v2 query parameter in %q", s)
+					}
+				}
+			}
+		}
 		seen[s] = true
 		routes = append(routes, s)
 	}

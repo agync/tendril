@@ -56,13 +56,13 @@ Enabling `p2p-iroh` on `tendril-runtime` (enabled by default in `tendril-cli` an
 
 ### Sockets a P2P endpoint opens
 
-Every `P2pListener` and `P2pDialer` is one `iroh` endpoint and opens the sockets below. Only the QUIC UDP rows open whatever the relay mode; the relay and Pkarr rows depend on the mode and options. Each long-lived bind (listeners, the hint dialer, group dialers) logs one `p2p endpoint bound` line at `info` level, and each per-dial bind for an explicit endpoint logs it at `debug`. The line names the relays, whether it publishes to Pkarr, the address lookup, port mapping, and the bind addresses (relay hosts redacted, hidden entirely for relays taken from a peer URI, no tokens or paths).
+Every `P2pListener` and `P2pDialer` is one `iroh` endpoint and opens the sockets below. Only the QUIC UDP rows open whatever the relay mode; the relay and Pkarr rows depend on the mode and options. Each long-lived bind (listeners and shared group dialers) logs one `p2p endpoint bound` line at `info` level, and each per-dial bind (for an explicit endpoint or an ephemeral hint dialer) logs it at `debug`. The line names the relays, whether it publishes to Pkarr, the address lookup, port mapping, and the bind addresses (relay hosts redacted, hidden entirely for relays taken from a peer URI, no tokens or paths).
 
 | Socket | When it opens | Controlled by |
 | --- | --- | --- |
 | UDP IPv4 QUIC socket (also carries QUIC address discovery to relays) | At bind, `0.0.0.0:0` by default (`AllInterfaces`) | `P2pOptions::bind_addrs` |
 | UDP IPv6 QUIC socket | At bind, `[::]:0` by default (`AllInterfaces`), best effort (failure is ignored) | `P2pOptions::bind_addrs` |
-| Port mapping: UPnP discovery multicast (SSDP, `239.255.255.250:1900`) and NAT-PMP/PCP datagrams to the gateway (UDP 5351) from short-lived UDP sockets | At bind for listeners and dialers alike, then again on each network report that has a relay map. Needs an IPv4 QUIC socket with a non-zero port | `P2pOptions::port_mapping` (on by default) |
+| Port mapping: UPnP discovery multicast (SSDP, `239.255.255.250:1900`) and NAT-PMP/PCP datagrams to the gateway (UDP 5351) from short-lived UDP sockets | At bind and on each network report that has a relay map. Needs an IPv4 QUIC socket with a non-zero port | `P2pOptions::port_mapping` (`true` on standard desktop listeners; `false` on mobile/`low_power` listeners and all dialers) |
 | Relay TCP/TLS WebSocket connection and the network-report HTTPS probes (`/generate_204`, latency GET) to each relay | When the relay map is non-empty (`N0Public`, `Custom`, `CustomMany`) | `P2pRelayMode` |
 | DNS lookups for relay host names | When the relay map is non-empty; operator endpoints answer from pinned addresses | `P2pRelayMode` |
 | n0 address lookup: DNS queries to `dns.iroh.link` and Pkarr HTTPS reads from `dns.iroh.link/pkarr` | When `resolve_pkarr` is on and the endpoint is not the hint dialer | `P2pOptions::resolve_pkarr` |
@@ -91,7 +91,7 @@ Applications can move between public relays, self-hosted `tendril-relay` contain
 | Control ping cadence (`CoalescedPingScheduler`) | Independent per-call jitter `22.5 s..=37.5 s` (v1 and v2) | Coalesced `55 s..=75 s` (v1 and v2) within `90 s` client / `300 s` relay idle window |
 | Standby acceptor pool | `STANDBY_POOL_SIZE = 2` on center epoch / `/v1/relay` | `0` standby sockets |
 | Happy Eyeballs & fall-up policy (`PathPolicyConfig`) | `max_in_flight = 4`, `p2p_cold_delay_ms = 500`, fall-up `30 s` | `max_in_flight = 2`, `p2p_cold_delay_ms = 750`, fall-up `120 s`, LKG `preferred` affinity |
-| P2P NAT port mapping & shared dialer teardown | `p2p_port_mapping` default `true`; persistent dialer | `p2p_port_mapping` default `false`; shared `P2pDialer` tears down via `P2pActiveRef` after `60 s` idle |
+| P2P NAT port mapping & dialer lifetime | Listener `p2p_port_mapping` default `true` (desktop); dialer `p2p_port_mapping` default `false`; per-dial ephemeral hint dialer (`LazyHintP2pDialer`) and ref-tracked group `P2pDialer` | Listener and dialer `p2p_port_mapping` default `false`; per-dial ephemeral hint dialer and ref-tracked group `P2pDialer` |
 
 - **Candidate filtering and reachability:** `check_hint` evaluates route egress checks concurrently (`join_all`) and filters direct/LAN/overlay candidates against `LocalReachability::from_snapshot` (allowing `Loopback` and matching non-loopback targets by available local IPv4/IPv6 address family with `UnreachableInterface`; link-local addresses stay rejected by `BlockedAddress`). Each Day-2 race keeps Last-Known-Good route affinity (`preferred: true` on `CandidateEndpoint`, cleared on stored connect failure, `set_peer_routes`/`clear_peer_routes`, or applied `apply_route_uri`) so the winning route leads the next reconnect without redundant parallel PQ handshakes.
 - `EmbeddedRelay::bind_local` / `EmbeddedRelay::start` embeds `tendril_relay::RelayServer` directly in-process for single-host zero-dependency relay fallback.
@@ -113,6 +113,14 @@ Applications can move between public relays, self-hosted `tendril-relay` contain
 | **Host on tailnet, external browsers or phones** | `relay` (`tailscale funnel <port>` -> standalone `tendril-relay --listen 127.0.0.1:<port> --host <node>.<tailnet>.ts.net --trusted-proxy 127.0.0.1/32`; `--embedded-relay --relay-host <node>.<tailnet>.ts.net` binds an ephemeral `127.0.0.1:0` port without `--trusted-proxy`) or `broker` (`tendril serve --broker 127.0.0.1:<port>`) | Host only | Funnel terminates TLS at Tailscale's edge and traverses DERP to the host; `/v1/relay` and `/v2/relay` serve both `@tendril-sdk/web` browsers and native clients (verifying `challenge.host`), while `broker+wss://` (and loopback or `allowInsecureWs` `broker+ws://`) serves both native `BrokerDialer` and `@tendril-sdk/web` `dialBrokerStream` clients |
 | **Cloudflare Tunnel, Caddy, or Nginx ingress** | `relay` (`tendril-relay --listen 127.0.0.1:<port> --host <public_host> --trusted-proxy <CIDR>`) or `broker` (`broker+wss://`) | Neither | Edge proxy terminates TLS and forwards binary WebSockets to `tendril-relay` (browser + native) or `BrokerListener` (native `BrokerDialer` + browser `dialBrokerStream`, optional constant-time header secret) |
 | **Raw `derp*.tailscale.com` URL in `--p2p-relay` or `--relay`** | Unsupported | N/A | `iroh-relay` (`p2p`) diverged from Tailscale's `Upgrade: DERP` X25519 packet protocol onto WebSockets and Ed25519 node keys, `tendril-relay` speaks `/v1/relay` and `/v2/relay` JSON challenges, and Tailscale's public DERP fleet admits coordinated tailnet nodes only |
+
+## Wire v2 and ephemeral P2P options
+
+Beyond persistent v1 `iroh://<id>` listeners, Tendril supports privacy-preserving P2P listeners and split socket defaults:
+
+- **`iroh://v2` (`--p2p-v2` / `serve_p2p_v2`):** Derives hourly rotating Ed25519 `EndpointId`s from each paired peer's `mailbox_secret` (`+-300 s` hour-boundary overlap), disables `Pkarr`, forbids `?addr=` direct address hints, and opens fresh ephemeral random dialer keys per outbound dial (no `OnceCell` dialer reuse). Configured `?relay=` hints present in the dialer's `relay_map` are tried before remaining `relay_map` entries.
+- **Ephemeral Day-1 P2P (`p2p_ephemeral` / `--ephemeral-p2p`):** Generates a fresh random keypair on `serve_p2p` listeners and forces `Pkarr` off (unless `p2p_pkarr` is explicitly set) so Day-1 listeners avoid leaking a long-lived `EndpointId` or directory entry.
+- **Split `port_mapping` defaults (D5):** Desktop/server `Standard` listeners keep UPnP/NAT-PMP/PCP mapping `true` by default (`power_profile.p2p_port_mapping_default() && default_p2p_listener_port_mapping()`), whereas `LowPower` or mobile (`ios`/`android`) listeners and all P2P dialers default to `false` (`default_p2p_dialer_port_mapping()`), overridable with `--p2p-port-mapping` or `p2p_port_mapping`.
 
 ## Verification status
 

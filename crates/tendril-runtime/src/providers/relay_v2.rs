@@ -14,7 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use tendril_core::crypto::{b64url_decode_array, b64url_encode, random_bytes};
+use tendril_core::error::CoreError;
 use tendril_core::policy::ProviderId;
+use tendril_core::roster::{PeerState, Roster, RosterEntry};
 use tendril_core::v2::{
     DerivedMailbox, RELAY_V2_EPOCH_SECS, RelayDialReplayCache, RelayEpochWindow, VerifiedRelayHost,
     derive_epoch_mailbox, derive_epoch_mailbox_window, epoch_for_unix, sign_v2_relay_accept,
@@ -39,6 +41,7 @@ use super::{
 use crate::error::{RelayOffline, RuntimeError};
 use crate::power::PowerProfile;
 use crate::provider::{DEFAULT_WRITE_TIMEOUT, PathDialer, PathListener, PathStream};
+use tendril_core::pairing::PinnedHost;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -1754,6 +1757,103 @@ impl PathDialer for RelayV2Dialer {
     }
 }
 
+/// Returns `true` when `entry` is active and not revoked by any stored CRL.
+#[must_use]
+pub fn is_usable_v2_entry(roster: &Roster, entry: &RosterEntry) -> bool {
+    entry.state == PeerState::Active && !roster.crl_revokes_entry(entry)
+}
+
+/// Collects `(peer_id, mailbox_secret)` pairs for every active, non-CRL-revoked peer with v2 secrets.
+#[must_use]
+pub fn active_v2_mailbox_secrets(roster: &Roster) -> Vec<(String, Zeroizing<[u8; 32]>)> {
+    let mut out = Vec::new();
+    for (peer_id, entry) in roster.entries() {
+        if is_usable_v2_entry(roster, entry)
+            && let Some(ref secrets) = entry.v2_secrets
+        {
+            out.push((peer_id.clone(), Zeroizing::new(*secrets.mailbox_secret())));
+        }
+    }
+    out
+}
+
+/// Maps active, non-CRL-revoked peer IDs to their Wire v2 mailbox secret.
+#[must_use]
+pub fn usable_v2_mailbox_map(roster: &Roster) -> HashMap<String, Zeroizing<[u8; 32]>> {
+    active_v2_mailbox_secrets(roster).into_iter().collect()
+}
+
+/// Resolves the Wire v2 mailbox secret for `target_host_id`, failing closed on unknown, revoked,
+/// CRL-revoked, pending, or v2-less roster entries.
+pub fn lookup_v2_mailbox_secret_for_target(
+    roster: &Roster,
+    target_host_id: &str,
+) -> Result<Zeroizing<[u8; 32]>, CoreError> {
+    let entry = roster
+        .get(target_host_id)
+        .ok_or_else(|| CoreError::PeerNotFound(target_host_id.to_owned()))?;
+    if entry.state == PeerState::Revoked || roster.crl_revokes_entry(entry) {
+        return Err(CoreError::PeerRevoked(target_host_id.to_owned()));
+    }
+    if entry.state != PeerState::Active {
+        return Err(CoreError::PeerPending(target_host_id.to_owned()));
+    }
+    entry
+        .v2_secrets
+        .as_ref()
+        .map(|s| Zeroizing::new(*s.mailbox_secret()))
+        .ok_or(CoreError::ProtocolViolation(
+            "target has no v2 mailbox_secret",
+        ))
+}
+
+/// Resolves the Wire v2 mailbox secret for an endpoint/pin pair, enforcing `is_usable_v2_entry`.
+pub fn lookup_v2_mailbox_secret_for_pair(
+    roster: &Roster,
+    pinned: Option<&PinnedHost>,
+    endpoint: &str,
+    now_unix: u64,
+) -> Result<Zeroizing<[u8; 32]>, RuntimeError> {
+    if let Some(pin) = pinned {
+        if let Some(ref hid) = pin.host_id
+            && let Some(entry) = roster.get(hid)
+            && is_usable_v2_entry(roster, entry)
+            && let Some(ref secrets) = entry.v2_secrets
+        {
+            return Ok(Zeroizing::new(*secrets.mailbox_secret()));
+        }
+        for (_, entry) in roster.entries() {
+            if is_usable_v2_entry(roster, entry)
+                && entry.static_pub == pin.static_pub
+                && let Some(ref secrets) = entry.v2_secrets
+            {
+                return Ok(Zeroizing::new(*secrets.mailbox_secret()));
+            }
+        }
+    }
+    if let Some((_, frag)) = endpoint.split_once('#')
+        && !frag.is_empty()
+    {
+        for (_, entry) in roster.entries() {
+            if is_usable_v2_entry(roster, entry)
+                && let Some(ref secrets) = entry.v2_secrets
+            {
+                let win = derive_epoch_mailbox_window(secrets.mailbox_secret(), now_unix);
+                if win
+                    .mailboxes()
+                    .iter()
+                    .any(|mb| mb.mailbox_id_b64url() == frag)
+                {
+                    return Ok(Zeroizing::new(*secrets.mailbox_secret()));
+                }
+            }
+        }
+    }
+    Err(RuntimeError::Protocol(
+        "no matching v2 mailbox_secret in roster for /v2/relay endpoint".to_owned(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
@@ -2048,5 +2148,131 @@ mod tests {
         );
         drop(listener);
         server.abort();
+    }
+
+    #[test]
+    fn lookup_v2_mailbox_helpers_reject_pending_revoked_and_crl_revoked() {
+        use tendril_core::grants::{RevocationListUnsigned, sign_crl};
+        use tendril_core::roster::{Roster, V2PeerSecrets};
+
+        let host_pending = EndpointIdentity::generate().expect("pending");
+        let host_active = EndpointIdentity::generate().expect("active");
+        let host_revoked = EndpointIdentity::generate().expect("revoked");
+        let anchor = EndpointIdentity::generate().expect("anchor");
+        let mut roster = Roster::new();
+
+        roster
+            .record_pending_pair(
+                *host_pending.static_key().public_bytes(),
+                Some(host_pending.signing_key().public_key().clone()),
+                "pending".to_owned(),
+                "p".to_owned(),
+                "111111".to_owned(),
+            )
+            .unwrap();
+        roster
+            .set_peer_v2_secrets(
+                &host_pending.device_id(),
+                V2PeerSecrets::new([0x11; 32], [0x12; 32]),
+            )
+            .unwrap();
+
+        roster
+            .insert_pinned_host(
+                host_active.device_id(),
+                "active".to_owned(),
+                *host_active.static_key().public_bytes(),
+                Some(host_active.signing_key().public_key().clone()),
+                0,
+                Vec::new(),
+            )
+            .unwrap();
+        roster
+            .set_peer_v2_secrets(
+                &host_active.device_id(),
+                V2PeerSecrets::new([0x21; 32], [0x22; 32]),
+            )
+            .unwrap();
+
+        roster
+            .insert_pinned_host(
+                host_revoked.device_id(),
+                "revoked".to_owned(),
+                *host_revoked.static_key().public_bytes(),
+                Some(host_revoked.signing_key().public_key().clone()),
+                0,
+                Vec::new(),
+            )
+            .unwrap();
+        roster
+            .set_peer_v2_secrets(
+                &host_revoked.device_id(),
+                V2PeerSecrets::new([0x31; 32], [0x32; 32]),
+            )
+            .unwrap();
+        roster.revoke_peer(&host_revoked.device_id()).unwrap();
+
+        assert!(lookup_v2_mailbox_secret_for_target(&roster, &host_pending.device_id()).is_err());
+        assert!(lookup_v2_mailbox_secret_for_target(&roster, &host_revoked.device_id()).is_err());
+        assert_eq!(
+            *lookup_v2_mailbox_secret_for_target(&roster, &host_active.device_id()).unwrap(),
+            [0x22; 32]
+        );
+        let all = active_v2_mailbox_secrets(&roster);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, host_active.device_id());
+
+        let mb_pending =
+            derive_epoch_mailbox(&[0x12; 32], epoch_for_unix(3600)).mailbox_id_b64url();
+        let mb_active = derive_epoch_mailbox(&[0x22; 32], epoch_for_unix(3600)).mailbox_id_b64url();
+        assert!(
+            lookup_v2_mailbox_secret_for_pair(
+                &roster,
+                None,
+                &format!("wss://r.example/v2/relay#{mb_pending}"),
+                3600
+            )
+            .is_err()
+        );
+        assert_eq!(
+            *lookup_v2_mailbox_secret_for_pair(
+                &roster,
+                None,
+                &format!("wss://r.example/v2/relay#{mb_active}"),
+                3600
+            )
+            .unwrap(),
+            [0x22; 32]
+        );
+
+        let crl = sign_crl(
+            RevocationListUnsigned {
+                v: 1,
+                issuer: "anchor-1".to_owned(),
+                seq: 1,
+                revoked_devices: vec![host_active.device_id()],
+                revoked_nonces: Vec::new(),
+                ts: "2026-11-28T00:00:00Z".to_owned(),
+            },
+            anchor.signing_key(),
+        )
+        .unwrap();
+        roster
+            .ingest_crl(crl, "anchor-1", anchor.signing_key().public_key())
+            .unwrap();
+        let mut json = serde_json::to_value(&roster).unwrap();
+        json["entries"][host_active.device_id()]["state"] = "active".into();
+        let crl_only: Roster = serde_json::from_value(json).unwrap();
+        assert!(lookup_v2_mailbox_secret_for_target(&crl_only, &host_active.device_id()).is_err());
+        assert!(
+            lookup_v2_mailbox_secret_for_pair(
+                &crl_only,
+                None,
+                &format!("wss://r.example/v2/relay#{mb_active}"),
+                3600
+            )
+            .is_err()
+        );
+        assert!(active_v2_mailbox_secrets(&crl_only).is_empty());
     }
 }

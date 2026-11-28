@@ -1263,3 +1263,51 @@ test("verifyWakeTag and camelCase APNs wake config with coalescing", async () =>
     await new Promise((resolve) => apnsServer.close(resolve));
   }
 });
+
+test("Node serveP2pV2 succeeds with zero peers and p2pEphemeral rotates EndpointIds", async () => {
+  const ep = new tendril.Endpoint(null, "node-p2p-v2");
+  const hostEp = new tendril.Endpoint(null, "node-v2-pending-host");
+  const cliEp = new tendril.Endpoint(null, "node-v2-pending-cli");
+  try {
+    assert.equal(await ep.serveP2pV2("disabled", null), "iroh://v2");
+    assert.equal(await ep.serveP2pV2("disabled", null), "iroh://v2");
+    ep.configureTransportsJson(JSON.stringify({ p2pEphemeral: true, p2pPortMapping: false }));
+    const eph1 = (await ep.serveP2p("disabled")).split("?", 1)[0];
+    const eph2 = (await ep.serveP2p("disabled")).split("?", 1)[0];
+    assert.ok(eph1.startsWith("iroh://"), eph1);
+    assert.notEqual(eph1, eph2);
+
+    const directAddr = await hostEp.serveDirect("127.0.0.1:0");
+    const code = hostEp.issueCode("lan");
+    const [pairRaw, accRaw] = await Promise.all([
+      cliEp.pairV2Initiate(directAddr, code, null, "node-pending-cli", "node", null),
+      hostEp.pairV2Accept(5000),
+    ]);
+    const acc = JSON.parse(accRaw);
+    const pairRes = JSON.parse(pairRaw);
+    await assert.rejects(
+      () => hostEp.serveP2pV2("disabled", acc.device_id),
+      /pending|not active/i,
+    );
+    await assert.rejects(
+      () => hostEp.serveRelayV2("ws://127.0.0.1:9/v2/relay", null, acc.device_id),
+      /pending|not active/i,
+    );
+
+    hostEp.confirmPeer(acc.device_id, pairRes.sas);
+    assert.equal(await hostEp.serveP2pV2("disabled", null), "iroh://v2");
+    assert.equal(await hostEp.serveP2pV2("disabled", null), "iroh://v2");
+
+    // Revoking immediately after confirm/serve tears down dynamic listeners cleanly.
+    hostEp.revokePeer(acc.device_id, false);
+    await assert.rejects(
+      () => hostEp.serveP2pV2("disabled", acc.device_id),
+      /revoked/i,
+    );
+    assert.equal(await hostEp.serveP2pV2("disabled", null), "iroh://v2");
+  } finally {
+    ep.close();
+    hostEp.close();
+    cliEp.close();
+  }
+});

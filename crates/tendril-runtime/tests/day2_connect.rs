@@ -2151,3 +2151,87 @@ async fn v1_and_v2_policy_connect_complete_over_standby_pool_and_fast_open() {
         Some(SessionEvent::AppData(b"ping-v2".to_vec()))
     );
 }
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_day2_connect_uses_iroh_v2_and_suppresses_stored_v1() {
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use tendril_core::roster::RouteSource;
+    use tendril_runtime::{P2pBindAddrs, P2pOptions, P2pV2Listener, parse_p2p_relay_modes};
+    use zeroize::Zeroizing;
+
+    let mut relay_cfg =
+        iroh_relay::server::RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    relay_cfg.key_cache_capacity = Some(1024);
+    let mut server_cfg = iroh_relay::server::ServerConfig::default();
+    server_cfg.relay = Some(relay_cfg);
+    let iroh_srv = iroh_relay::server::Server::spawn(server_cfg)
+        .await
+        .expect("spawn iroh-relay");
+    let relay_url = format!("http://{}", iroh_srv.http_addr().expect("http addr"));
+    let mode = parse_p2p_relay_modes(std::slice::from_ref(&relay_url)).expect("mode");
+    let loopback = P2pBindAddrs::Only {
+        v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        v6: None,
+    };
+
+    let me = Arc::new(identity(0x83));
+    let (host, mut rx) = Host::new(0x84, Wire::V2, &me);
+    let mbox = Zeroizing::new(*secrets().mailbox_secret());
+    let listener = P2pV2Listener::bind(
+        P2pOptions::for_v2_listener(mode.clone())
+            .with_allow_private_addrs(true)
+            .with_port_mapping(false)
+            .with_bind_addrs(loopback.clone()),
+        Arc::new(move || Some(mbox.clone())),
+    )
+    .await
+    .expect("bind v2 listener");
+    let v2_hint = listener.advertised_endpoint().to_owned();
+    host.serve_on(Box::new(listener));
+
+    // Dead v1 iroh ID alongside authorized signed iroh://v2: stored v1 must be suppressed before
+    // any PKARR/dial occurs.
+    let dead_v1_id = iroh::SecretKey::from_bytes(&[0x99; 32]).public();
+    let v1_hint = format!("iroh://{dead_v1_id}");
+    let mut roster = client_roster(&host);
+    set_signed(&mut roster, &host, &[v1_hint.clone(), v2_hint.clone()], 1);
+    let store = RosterAccess::memory(roster);
+
+    let dialers = Arc::new(HintDialers::new(HintDialerConfig {
+        p2p_relay_mode: mode,
+        p2p_bind_addrs: loopback,
+        ..HintDialerConfig::default()
+    }));
+    let connect_opts = ConnectOpts::new(dialers);
+
+    let mut res = connect(Wire::V2, &me, &host.id(), &store, connect_opts)
+        .await
+        .expect("v2 connect over iroh://v2");
+    assert_eq!(res.route.provider, ProviderId::P2p);
+    assert_eq!(res.route.addr, v2_hint);
+    assert!(
+        res.skipped
+            .iter()
+            .any(|s| s.hint == v1_hint && s.reason == SkipReason::SupersededByV2Route),
+        "stored v1 iroh hint must be suppressed by iroh://v2: {:?}",
+        res.skipped
+    );
+    assert!(
+        res.failures.is_empty(),
+        "suppressed v1 must never be dialed: {:?}",
+        res.failures
+    );
+
+    let sess = rx.recv().await.expect("host session");
+    sess.send_data(b"hello-iroh-v2").await.unwrap();
+    let cli_roster = Mutex::new(store.load().unwrap());
+    assert_eq!(
+        res.session.next_event(&cli_roster).await,
+        Some(SessionEvent::AppData(b"hello-iroh-v2".to_vec()))
+    );
+    assert_eq!(
+        routes(&store, &host.id(), RouteSource::Signed),
+        vec![v1_hint, v2_hint]
+    );
+}

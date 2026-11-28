@@ -43,3 +43,4 @@ Entries from November 2026.
 - [Keep revocation state across roster reloads and commits in the FFI, Python, Node and CLI](27-keep-revocation-state-across-roster-reloads.md)
 - [Add a Windows named-pipe local provider](27-add-a-windows-named-pipe-local.md)
 - [Add mobile low-power profile, multi-address wake, and event-driven lifecycles](28-add-mobile-low-power-profile-multi.md)
+- [Document Wire v2 P2P privacy defaults, iroh://v2 listeners and dialers, split port mapping defaults, and Day-2 v1 suppression](28-document-wire-v2-p2p-privacy-defaults.md)

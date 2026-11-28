@@ -1728,6 +1728,20 @@ func TestWireV2AndRelayAuth(t *testing.T) {
 			AcceptSigHex           string `json:"accept_sig_hex"`
 			AcceptSigB64URL        string `json:"accept_sig_b64url"`
 		} `json:"blinded_relay"`
+		BlindedP2p struct {
+			MailboxSecretHex    string `json:"mailbox_secret_hex"`
+			UnixSecs            uint64 `json:"unix_secs"`
+			Epoch               uint64 `json:"epoch"`
+			Info                string `json:"info"`
+			EpochSigningSeedHex string `json:"epoch_signing_seed_hex"`
+			EndpointIDHex       string `json:"endpoint_id_hex"`
+			BoundaryCases       []struct {
+				UnixSecs           uint64   `json:"unix_secs"`
+				CenterEpoch        uint64   `json:"center_epoch"`
+				Epochs             []uint64 `json:"epochs"`
+				CurrentFirstEpochs []uint64 `json:"current_first_epochs"`
+			} `json:"boundary_cases"`
+		} `json:"blinded_p2p"`
 		RelayAdmission struct {
 			SharedSecretHex      string          `json:"shared_secret_hex"`
 			Op                   string          `json:"op"`
@@ -1933,6 +1947,55 @@ func TestWireV2AndRelayAuth(t *testing.T) {
 	}
 	if !ed25519.Verify(mailboxID, acceptInput, mustB64URL(t, br.AcceptSigB64URL)) {
 		t.Fatalf("accept sig verify failed")
+	}
+
+	// 1b. Blinded iroh://v2 hourly P2P epoch and +-300 s boundary windows
+	bp := v.BlindedP2p
+	if bp.Info != "tendril-p2p-v2-ed25519" {
+		t.Fatalf("blinded_p2p info mismatch: %q", bp.Info)
+	}
+	bpEpoch := bp.UnixSecs / 3600
+	if bpEpoch != bp.Epoch {
+		t.Fatalf("blinded_p2p epoch mismatch: got %d want %d", bpEpoch, bp.Epoch)
+	}
+	var bpEpochBE [8]byte
+	binary.BigEndian.PutUint64(bpEpochBE[:], bpEpoch)
+	bpSecret := mustHex(t, bp.MailboxSecretHex)
+	bpSeed := hkdf32(t, bpSecret, bpEpochBE[:], []byte(bp.Info))
+	if hex.EncodeToString(bpSeed) != bp.EpochSigningSeedHex {
+		t.Fatalf("blinded_p2p epoch_signing_seed mismatch")
+	}
+	bpSK := ed25519.NewKeyFromSeed(bpSeed)
+	bpPub := bpSK.Public().(ed25519.PublicKey)
+	if hex.EncodeToString(bpPub) != bp.EndpointIDHex {
+		t.Fatalf("blinded_p2p endpoint_id mismatch")
+	}
+	if len(bp.BoundaryCases) == 0 {
+		t.Fatalf("expected blinded_p2p boundary cases")
+	}
+	for _, bc := range bp.BoundaryCases {
+		center := bc.UnixSecs / 3600
+		offset := bc.UnixSecs % 3600
+		if center != bc.CenterEpoch {
+			t.Fatalf("unix=%d center mismatch: got %d want %d", bc.UnixSecs, center, bc.CenterEpoch)
+		}
+		var epochs, currentFirst []uint64
+		currentFirst = append(currentFirst, center)
+		if offset < 300 && center > 0 {
+			epochs = append(epochs, center-1)
+			currentFirst = append(currentFirst, center-1)
+		}
+		epochs = append(epochs, center)
+		if offset >= 3300 {
+			epochs = append(epochs, center+1)
+			currentFirst = append(currentFirst, center+1)
+		}
+		if fmt.Sprint(epochs) != fmt.Sprint(bc.Epochs) {
+			t.Fatalf("unix=%d epochs mismatch: got %v want %v", bc.UnixSecs, epochs, bc.Epochs)
+		}
+		if fmt.Sprint(currentFirst) != fmt.Sprint(bc.CurrentFirstEpochs) {
+			t.Fatalf("unix=%d current_first mismatch: got %v want %v", bc.UnixSecs, currentFirst, bc.CurrentFirstEpochs)
+		}
 	}
 
 	// 2. Relay admission (Tier 2 + Tier 3)

@@ -1783,6 +1783,11 @@ struct TendrilRouteTests {
       .filter { $0.hasPrefix("addr=") }
     #expect(!hints.isEmpty, "\(addr)")
     #expect(hints.allSatisfy { $0.hasPrefix("addr=127.0.0.1:") }, "\(addr)")
+
+    try ep.configureP2p(ephemeral: true)
+    #expect(ep.cachedTransportValue("p2p_ephemeral") as? Bool == true)
+    let v2Addr = try ep.serveP2pV2(relayMode: "disabled")
+    #expect(v2Addr == "iroh://v2")
   }
 
   #if canImport(CryptoKit) && canImport(Security)

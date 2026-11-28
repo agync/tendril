@@ -8,6 +8,8 @@ pub mod local;
 pub mod overlay;
 #[cfg(feature = "p2p-iroh")]
 pub mod p2p;
+#[cfg(feature = "p2p-iroh")]
+pub mod p2p_v2;
 pub mod relay;
 pub mod relay_v2;
 #[cfg(feature = "webrtc")]
@@ -63,12 +65,21 @@ pub use overlay::{OverlayHelperDialer, OverlayHelperListener};
 #[cfg(feature = "p2p-iroh")]
 pub use p2p::{
     MAX_P2P_CUSTOM_RELAYS, P2pBindAddrs, P2pDialer, P2pHintAddr, P2pListener, P2pOptions,
-    P2pRelayAuth, P2pRelayMode, TENDRIL_P2P_ALPN, extract_p2p_relay_urls_from_endpoint,
-    filter_p2p_hint, format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_bind_addrs,
+    P2pRelayAuth, P2pRelayMode, TENDRIL_P2P_ALPN, default_p2p_dialer_port_mapping,
+    default_p2p_listener_port_mapping, extract_p2p_relay_urls_from_endpoint, filter_p2p_hint,
+    filter_v2_p2p_hint, format_p2p_endpoint, format_p2p_endpoint_with_addrs, parse_p2p_bind_addrs,
     parse_p2p_endpoint, parse_p2p_endpoint_filtered, parse_p2p_relay_mode, parse_p2p_relay_modes,
 };
+#[cfg(feature = "p2p-iroh")]
+pub use p2p_v2::{
+    P2pV2Clock, P2pV2Dialer, P2pV2Listener, P2pV2RosterSync, P2pV2SyncPlan, probe_p2p_v2_endpoint,
+};
 pub use relay::{EmbeddedRelay, RelayClientAuth, RelayDialer, RelayListener, RelayListenerConfig};
-pub use relay_v2::{RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig};
+pub use relay_v2::{
+    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, active_v2_mailbox_secrets,
+    is_usable_v2_entry, lookup_v2_mailbox_secret_for_pair, lookup_v2_mailbox_secret_for_target,
+    usable_v2_mailbox_map,
+};
 #[cfg(feature = "webrtc")]
 pub use webrtc::{
     MAX_WEBRTC_QUEUED_BYTES, MAX_WEBRTC_SESSIONS, WEBRTC_HANDSHAKE_TIMEOUT, WebRtcActiveDialer,

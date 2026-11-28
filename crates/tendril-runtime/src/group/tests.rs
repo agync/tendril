@@ -1677,3 +1677,189 @@ fn close_racing_the_mailbox_spawn_never_starts_the_task() {
     drop(pool);
     drop(b);
 }
+
+#[test]
+fn group_candidates_from_hints_suppress_v1_p2p_only_when_v2_p2p_active() {
+    let hints = vec![
+        "direct:127.0.0.1:9000".to_owned(),
+        "iroh://abcdefghijklmnopqrstuvwxyz234567".to_owned(),
+        "p2p:iroh://v2?relay=https://r1.example".to_owned(),
+        "wss://relay.example/v2/relay".to_owned(),
+        "wss://relay.example/v1/relay".to_owned(),
+    ];
+    let with_v2 = super::candidates_from_hints(&hints, true, true);
+    let addrs_v2: Vec<(&str, usize)> = with_v2.iter().map(|c| (c.addr.as_str(), c.id)).collect();
+    assert_eq!(
+        addrs_v2,
+        vec![
+            ("127.0.0.1:9000", 0),
+            ("iroh://v2?relay=https://r1.example", 1),
+            ("wss://relay.example/v2/relay", 2),
+            ("wss://relay.example/v1/relay", 3),
+        ]
+    );
+
+    let without_v2_p2p = super::candidates_from_hints(&hints, true, false);
+    let addrs_v1: Vec<(&str, usize)> = without_v2_p2p
+        .iter()
+        .map(|c| (c.addr.as_str(), c.id))
+        .collect();
+    assert_eq!(
+        addrs_v1,
+        vec![
+            ("127.0.0.1:9000", 0),
+            ("iroh://abcdefghijklmnopqrstuvwxyz234567", 1),
+            ("wss://relay.example/v2/relay", 2),
+            ("wss://relay.example/v1/relay", 3),
+        ]
+    );
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn p2p_v2_plan_deduplicates_relay_sets_and_respects_floor_and_revocation() {
+    use tendril_core::group::GroupBook;
+    let a = Node::new(71).await;
+    let b = Node::new(72).await;
+    let c = Node::new(73).await;
+    let b_hints = vec![
+        "iroh://v2?relay=https://r2.example&relay=https://r1.example".to_owned(),
+        "iroh://v2?relay=https://r1.example/&relay=https://r2.example/".to_owned(),
+        "iroh://v2?relay=https://r3.example".to_owned(),
+    ];
+    let now_ts = current_unix_secs();
+    let params = GroupBuildParams::new(now_ts);
+    let gid = group_id_from_root(a.identity.signing_key().public_key());
+    let (m1, secrets) = create_group(
+        a.identity.signing_key(),
+        "p2p-plan-v2",
+        2,
+        a.member(&gid),
+        params,
+    )
+    .unwrap();
+    let signer = GroupSigner::root(a.identity.signing_key());
+    let mut b_member = b.member(&gid);
+    b_member.endpoints = b_hints.clone();
+    let (manifest, s2) = add_member(&m1, &signer, b_member, &secrets, params).unwrap();
+    let mut book = GroupBook::default();
+    book.ingest_group_manifest(&manifest, now_ts, None).unwrap();
+    book.install_secrets(&gid, s2.clone()).unwrap();
+
+    let plan = super::p2p_v2_plan(&book, None, &gid, &b.id(), now_ts, true, None);
+    assert_eq!(
+        plan.len(),
+        2,
+        "duplicate relay sets must collapse to 1 listener"
+    );
+    assert_eq!(
+        super::p2p_v2_plan(&book, None, &gid, &b.id(), now_ts, false, None).len(),
+        0,
+        "relay_listen=false produces empty plan"
+    );
+
+    // min_wire_version < 2 yields empty p2p plan.
+    let (v1_m1, v1_s1) = create_group(
+        a.identity.signing_key(),
+        "p2p-plan-v1",
+        1,
+        a.member(&gid),
+        params,
+    )
+    .unwrap();
+    let mut v1_member = c.member(&gid);
+    v1_member.endpoints = b_hints;
+    let (v1_m2, v1_s2) = add_member(&v1_m1, &signer, v1_member, &v1_s1, params).unwrap();
+    let mut v1_book = GroupBook::default();
+    v1_book.ingest_group_manifest(&v1_m2, now_ts, None).unwrap();
+    v1_book.install_secrets(&gid, v1_s2).unwrap();
+    assert!(super::p2p_v2_plan(&v1_book, None, &gid, &c.id(), now_ts, true, None).is_empty());
+
+    // Member removal yields empty p2p plan.
+    let (m3, s3) = remove_member(&manifest, &signer, &b.id(), &s2, params).unwrap();
+    let mut rem_book = GroupBook::default();
+    rem_book.ingest_group_manifest(&m3, now_ts, None).unwrap();
+    rem_book.install_secrets(&gid, s3).unwrap();
+    assert!(super::p2p_v2_plan(&rem_book, None, &gid, &b.id(), now_ts, true, None).is_empty());
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[test]
+fn group_p2p_v2_listener_options_preserve_split_defaults_and_gate_relay_auth() {
+    use crate::providers::{
+        P2pOptions, P2pRelayAuth, P2pRelayMode, default_p2p_listener_port_mapping,
+    };
+    use zeroize::Zeroizing;
+
+    let mut cfg_opts =
+        P2pOptions::for_dialer(P2pRelayMode::Custom("https://op.example.test/".to_owned()));
+    cfg_opts.relay_auth = Some(P2pRelayAuth::BearerToken(Zeroizing::new(
+        "secret-tok".to_owned(),
+    )));
+    assert!(
+        !cfg_opts.port_mapping,
+        "dialer cfg_opts defaults port_mapping to false"
+    );
+
+    // None listener override keeps D5 listener default even when dialer cfg_opts has false.
+    let n0_listener =
+        super::build_group_p2p_v2_listener_options(P2pRelayMode::N0Public, Some(&cfg_opts), None);
+    assert_eq!(
+        n0_listener.port_mapping,
+        default_p2p_listener_port_mapping()
+    );
+    assert!(
+        n0_listener.relay_auth.is_none(),
+        "N0Public must never receive operator P2pRelayAuth"
+    );
+
+    let disabled_listener = super::build_group_p2p_v2_listener_options(
+        P2pRelayMode::Disabled,
+        Some(&cfg_opts),
+        Some(false),
+    );
+    assert!(!disabled_listener.port_mapping);
+    assert!(disabled_listener.relay_auth.is_none());
+
+    // Unconfigured custom relay from a manifest must never receive operator relay_auth.
+    let foreign_listener = super::build_group_p2p_v2_listener_options(
+        P2pRelayMode::Custom("https://foreign.example.test/".to_owned()),
+        Some(&cfg_opts),
+        None,
+    );
+    assert!(foreign_listener.relay_auth.is_none());
+
+    // Matching operator relay receives relay_auth and honors explicit true/false override.
+    let op_listener = super::build_group_p2p_v2_listener_options(
+        P2pRelayMode::Custom("https://op.example.test".to_owned()),
+        Some(&cfg_opts),
+        Some(true),
+    );
+    assert!(op_listener.port_mapping);
+    assert!(op_listener.relay_auth.is_some());
+}
+
+#[cfg(feature = "p2p-iroh")]
+#[tokio::test]
+async fn group_relay_dialers_omit_p2p_v2_when_p2p_unconfigured() {
+    let a = Node::new(74).await;
+    let b = Node::new(75).await;
+    let (gid, _, _) = seed(&a, &[&b], 2);
+    let dialers: Vec<Arc<dyn PathDialer>> = vec![Arc::new(DirectDialer::new())];
+    let pool = GroupPool::open(
+        a.store.clone(),
+        Arc::clone(&a.identity),
+        &gid,
+        GroupPoolConfig::new(dialers),
+        None,
+    )
+    .unwrap();
+    let out = pool
+        .inner
+        .relay_dialers(None, Some(&[0x55; 32]), "relaypub");
+    assert!(
+        !out.iter().any(|d| d.provider_id() == ProviderId::P2p),
+        "unconfigured P2P must not inject N0Public P2pV2Dialer fallback"
+    );
+    pool.close();
+}

@@ -22,7 +22,7 @@ use crate::identity::{
 use crate::identity::{detect_rotation_fork, verify_rotation_record};
 use crate::pairing::{
     AnnouncedRouteSet, LocalRouteState, MAX_PAIRING_ENDPOINT_HINT_LEN, PersistPlan, RoutePolicy,
-    VerifiedRouteStatement, announce_rank, is_ipc_hint, is_v2_relay_hint,
+    VerifiedRouteStatement, announce_rank, is_ipc_hint, is_v2_p2p_hint, is_v2_relay_hint,
     is_valid_pairing_endpoint_hint, provider_of_valid_hint,
 };
 use crate::policy::ProviderId;
@@ -618,6 +618,19 @@ fn validate_route(hint: &str, source: RouteSource, entry: &RosterEntry) -> Resul
             RouteSource::Operator if entry.v2_secrets.is_none() => {
                 return Err(invalid_route(
                     "/v2/relay route needs a Wire v2 pairing with this peer",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if is_v2_p2p_hint(hint) {
+        match source {
+            RouteSource::Committed => {
+                return Err(invalid_route("iroh://v2 cannot be a committed route"));
+            }
+            RouteSource::Operator if entry.v2_secrets.is_none() => {
+                return Err(invalid_route(
+                    "iroh://v2 route needs a Wire v2 pairing with this peer",
                 ));
             }
             _ => {}

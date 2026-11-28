@@ -15,15 +15,16 @@ use tendril_core::identity::EndpointIdentity;
 use tendril_runtime::{
     BroadcastReport, BrokerDialer, DirectDialer, GroupEvent, GroupFrameKind, GroupHub, GroupPool,
     GroupPoolConfig, HalfOpenGuard, InboundSession, LocalDialer, OverlayDialer, P2pDialer,
-    PathDialer, PathStream, PowerProfile, PreAuthRateLimiter, RelayClientAuth, RelayDialer,
-    SessionEvent, StateStore, V2ResponderState, group_add_member, group_create,
+    P2pOptions, PathDialer, PathStream, PowerProfile, PreAuthRateLimiter, RelayClientAuth,
+    RelayDialer, SessionEvent, StateStore, V2ResponderState, group_add_member, group_create,
     group_remove_member, handle_session_group_frame,
 };
 use tokio::task::JoinHandle;
 
 use crate::{
-    P2pTransportArgs, RelayAuthArgs, build_p2p_dialer_options_with_profile, print_json_line,
-    resolve_relay_auth, validate_explicit_p2p_args,
+    P2pTransportArgs, RelayAuthArgs, build_p2p_dialer_options_with_profile,
+    build_p2p_group_dialer_options, listener_port_mapping_override, print_json_line,
+    resolve_p2p_relay_auth, resolve_relay_auth, validate_explicit_p2p_args,
 };
 
 const DEFAULT_SYNC_TIMEOUT_SECS: u64 = 10;
@@ -157,9 +158,15 @@ async fn open_pool(
         PowerProfile::Standard,
     )
     .await?;
-    let config = GroupPoolConfig::new(dialers)
+    let mut config = GroupPoolConfig::new(dialers)
         .with_dial_budget(Duration::from_secs(timeout_secs.max(1)))
         .with_relay_auth(auth);
+    if dial.p2p_enabled() {
+        let p2p_auth = resolve_p2p_relay_auth(&dial.p2p_args)?;
+        config = config
+            .with_p2p_options(build_p2p_group_dialer_options(&dial.p2p_args, p2p_auth)?)
+            .with_p2p_listener_port_mapping(listener_port_mapping_override(&dial.p2p_args));
+    }
     Ok(GroupPool::open(
         store.clone(),
         Arc::new(identity),
@@ -373,24 +380,36 @@ pub struct ServeGroups {
     printers: StdMutex<Vec<JoinHandle<()>>>,
 }
 
+/// P2P options forwarded by `serve` into [`ServeGroups::new`].
+pub struct ServeP2pConfig {
+    pub dialer_options: Option<P2pOptions>,
+    pub listener_port_mapping: Option<bool>,
+}
+
 impl ServeGroups {
     /// Builds the serving hub. Its pools register the identity's relay mailboxes
     /// (`relay_listen`) with `relay_auth`, except on `served_v1_relay`, the `/v1/relay` URL
     /// whose mailbox `serve` already registers and routes to the hub itself.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<StateStore>,
         identity: Arc<EndpointIdentity>,
         dialers: Vec<Arc<dyn PathDialer>>,
         relay_auth: RelayClientAuth,
         served_v1_relay: Option<String>,
+        p2p: ServeP2pConfig,
         redact_logs: bool,
         power_profile: PowerProfile,
     ) -> Arc<Self> {
-        let config = GroupPoolConfig::new(dialers)
+        let mut config = GroupPoolConfig::new(dialers)
             .with_relay_auth(relay_auth)
             .with_relay_listen(true)
             .with_served_v1_relays(served_v1_relay.into_iter().collect())
-            .with_power_profile(power_profile);
+            .with_power_profile(power_profile)
+            .with_p2p_listener_port_mapping(p2p.listener_port_mapping);
+        if let Some(opts) = p2p.dialer_options {
+            config = config.with_p2p_options(opts);
+        }
         Arc::new(Self {
             hub: GroupHub::new((*store).clone(), identity, config, None),
             redact_logs,

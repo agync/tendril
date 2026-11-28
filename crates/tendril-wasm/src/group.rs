@@ -15,10 +15,14 @@ use tendril_core::grants::{Capability, RevocationList};
 use tendril_core::group::{
     GroupBook, GroupIngestOutcome, GroupIngestStatus, GroupManifest, GroupRendezvousFrame,
     check_first_contact, check_group_capacity, check_rendezvous_local_membership,
-    drop_secrets_if_left, is_active_member, root_crl as resolve_root_crl, root_device_in,
+    derive_group_mailbox_secret, drop_secrets_if_left, is_active_member,
+    root_crl as resolve_root_crl, root_device_in,
 };
 pub use tendril_core::group::{MAX_GROUPS_PER_SIGNER, MAX_LOCAL_GROUPS, MAX_STORED_GROUPS};
+use tendril_core::pairing::{classify_endpoint_hint, is_v2_p2p_hint};
+use tendril_core::policy::ProviderId;
 use tendril_core::roster::Roster;
+use tendril_core::v2::derive_epoch_p2p_window;
 use wasm_bindgen::prelude::*;
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -353,6 +357,117 @@ impl WasmGroupBook {
             GroupManifest::from_wire_bytes(manifest_json.as_bytes()).map_err(|e| e.to_string())?;
         self.ingest_manifest_inner(roster, sender_device_id, &manifest, now_unix)
     }
+
+    /// Derives the current (and `+-300 s` boundary overlap) `iroh://v2` endpoint ids for
+    /// `member_device_id` using the current `seq` rendezvous key in a `min_wire_version >= 2`
+    /// group.
+    pub(crate) fn derive_v2_p2p_ids_for_member_inner(
+        &self,
+        roster: &Roster,
+        group_id: &str,
+        member_device_id: &str,
+        now_unix: u64,
+    ) -> Result<Value, String> {
+        self.local_active(roster, group_id)?;
+        let manifest = self
+            .inner
+            .manifest(group_id)
+            .ok_or_else(|| CoreError::GroupNotFound(group_id.to_owned()).to_string())?;
+        if manifest.min_wire_version < 2 {
+            return Err(CoreError::VersionDowngrade {
+                peer_min: manifest.min_wire_version,
+                negotiated: 2,
+            }
+            .to_string());
+        }
+        let root_pub = self
+            .inner
+            .root_signing_pub(group_id)
+            .ok_or_else(|| CoreError::GroupNotFound(group_id.to_owned()).to_string())?;
+        let crl = root_crl(roster, manifest, root_pub)?;
+        if manifest
+            .revoked_members
+            .iter()
+            .any(|id| id == member_device_id)
+            || crl_revokes(crl.as_ref(), member_device_id)
+        {
+            return Err(CoreError::GroupMemberRevoked(member_device_id.to_owned()).to_string());
+        }
+        let member_exists = manifest
+            .members
+            .iter()
+            .any(|m| m.device_id == member_device_id && is_active_member(manifest, &m.device_id));
+        if !member_exists {
+            return Err(invalid("target is not an active member of group"));
+        }
+        let cap =
+            Capability::parse(&format!("group.recv:{group_id}")).map_err(|e| e.to_string())?;
+        self.inner
+            .authorize_group(group_id, member_device_id, &cap, now_unix, crl.as_ref())
+            .map_err(|e| e.to_string())?;
+        let secrets = self
+            .inner
+            .secrets(group_id)
+            .filter(|s| s.seq() == manifest.seq)
+            .ok_or_else(|| invalid("missing group rendezvous key for current manifest seq"))?;
+        let mailbox = derive_group_mailbox_secret(
+            secrets.group_rendezvous_key(),
+            manifest.seq,
+            member_device_id,
+        );
+        let win = derive_epoch_p2p_window(&mailbox, now_unix);
+        let endpoint_ids: Vec<String> = win
+            .current_first()
+            .into_iter()
+            .map(|d| d.endpoint_id_hex())
+            .collect();
+        Ok(json!({ "endpoint_ids": endpoint_ids }))
+    }
+
+    /// Returns filtered sibling endpoints for `member_device_id`, suppressing v1 `iroh://<id>`
+    /// endpoints when `min_wire_version >= 2` and an `iroh://v2` endpoint is advertised.
+    pub(crate) fn sibling_endpoints_inner(
+        &self,
+        roster: &Roster,
+        group_id: &str,
+        member_device_id: &str,
+    ) -> Result<Vec<String>, String> {
+        self.local_active(roster, group_id)?;
+        let manifest = self
+            .inner
+            .manifest(group_id)
+            .ok_or_else(|| CoreError::GroupNotFound(group_id.to_owned()).to_string())?;
+        let root_pub = self
+            .inner
+            .root_signing_pub(group_id)
+            .ok_or_else(|| CoreError::GroupNotFound(group_id.to_owned()).to_string())?;
+        let crl = root_crl(roster, manifest, root_pub)?;
+        if manifest
+            .revoked_members
+            .iter()
+            .any(|id| id == member_device_id)
+            || crl_revokes(crl.as_ref(), member_device_id)
+        {
+            return Err(CoreError::GroupMemberRevoked(member_device_id.to_owned()).to_string());
+        }
+        let member = manifest
+            .members
+            .iter()
+            .find(|m| m.device_id == member_device_id && is_active_member(manifest, &m.device_id))
+            .ok_or_else(|| invalid("target is not an active member of group"))?;
+        let suppress_v1_p2p =
+            manifest.min_wire_version >= 2 && member.endpoints.iter().any(|h| is_v2_p2p_hint(h));
+        Ok(member
+            .endpoints
+            .iter()
+            .filter(|h| {
+                !(suppress_v1_p2p
+                    && classify_endpoint_hint(h) == Ok(ProviderId::P2p)
+                    && !is_v2_p2p_hint(h))
+            })
+            .cloned()
+            .collect())
+    }
 }
 
 #[wasm_bindgen]
@@ -511,6 +626,36 @@ impl WasmGroupBook {
         let now = f64_to_u64(now_unix, "now_unix").map_err(to_js_err)?;
         self.broadcast_targets_inner(&roster.inner, group_id, required_cap.as_deref(), now)
             .map(|ids| json!(ids).to_string())
+            .map_err(to_js_err)
+    }
+
+    /// Derives `iroh://v2` endpoint ids for sibling `member_device_id` under the current group
+    /// rendezvous key without exposing raw secrets to JavaScript.
+    #[wasm_bindgen]
+    pub fn derive_v2_p2p_ids_for_member_json(
+        &self,
+        roster: &WasmRoster,
+        group_id: &str,
+        member_device_id: &str,
+        unix_secs: f64,
+    ) -> Result<String, JsValue> {
+        let now = f64_to_u64(unix_secs, "unix_secs").map_err(to_js_err)?;
+        self.derive_v2_p2p_ids_for_member_inner(&roster.inner, group_id, member_device_id, now)
+            .map(|v| v.to_string())
+            .map_err(to_js_err)
+    }
+
+    /// Returns filtered sibling endpoints as JSON, suppressing v1 `iroh://<id>` when
+    /// `min_wire_version >= 2` and an `iroh://v2` endpoint is present.
+    #[wasm_bindgen]
+    pub fn sibling_endpoints_json(
+        &self,
+        roster: &WasmRoster,
+        group_id: &str,
+        member_device_id: &str,
+    ) -> Result<String, JsValue> {
+        self.sibling_endpoints_inner(&roster.inner, group_id, member_device_id)
+            .map(|eps| json!(eps).to_string())
             .map_err(to_js_err)
     }
 }

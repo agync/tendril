@@ -565,6 +565,17 @@ pub fn is_v2_relay_hint(ep: &str) -> bool {
     relay_url_path(ep).as_deref() == Some("/v2/relay")
 }
 
+/// Returns `true` for a Wire v2 ephemeral P2P route sentinel (`iroh://v2` or `p2p:iroh://v2`).
+#[must_use]
+pub fn is_v2_p2p_hint(ep: &str) -> bool {
+    let iroh_cand = ep.strip_prefix("p2p:").unwrap_or(ep);
+    let Some(rest) = iroh_cand.strip_prefix("iroh://") else {
+        return false;
+    };
+    let (node_id, _) = rest.split_once('?').unwrap_or((rest, ""));
+    node_id == "v2"
+}
+
 /// Returns `true` for a relay hint other than `/v2/relay`, which requires `rp` in a URI.
 fn needs_relay_pub(ep: &str) -> bool {
     relay_url_path(ep).is_some_and(|p| p != "/v2/relay")
@@ -1534,7 +1545,7 @@ impl PersistPlan {
 }
 
 fn committable(hint: &str) -> bool {
-    !is_ipc_hint(hint) && !is_v2_relay_hint(hint)
+    !is_ipc_hint(hint) && !is_v2_relay_hint(hint) && !is_v2_p2p_hint(hint)
 }
 
 /// Computes the routes a successful pairing persists.
@@ -2496,6 +2507,10 @@ pub fn is_valid_pairing_endpoint_hint(ep: &str) -> bool {
         {
             return false;
         }
+        let is_v2 = node_id == "v2";
+        if is_v2 && rest.contains('?') && query.is_empty() {
+            return false;
+        }
         if !query.is_empty() {
             for pair in query.split('&') {
                 let Some((k, v)) = pair.split_once('=') else {
@@ -2503,6 +2518,9 @@ pub fn is_valid_pairing_endpoint_hint(ep: &str) -> bool {
                 };
                 match k {
                     "addr" => {
+                        if is_v2 {
+                            return false;
+                        }
                         let Ok(sock) = v.parse::<SocketAddr>() else {
                             return false;
                         };

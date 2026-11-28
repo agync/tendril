@@ -1282,6 +1282,9 @@ class TendrilAndroidSmokeTest {
       assertFalse(after.toString(), after.has("p2p_bind_addrs"))
       ep.configureTransportsJson("""{"p2p_relay_mode":"n0","p2p_port_mapping":true}""")
       assertTrue(runCatching { ep.configureTransportsJson("""{"p2p_port_mapping":"no"}""") }.isFailure)
+      ep.configureP2p(ephemeral = true)
+      assertTrue(JSONObject(ep.transportConfigJson()!!).getBoolean("p2p_ephemeral"))
+      assertEquals("iroh://v2", ep.serveP2pV2(relayMode = "disabled"))
     }
   }
 }

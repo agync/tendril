@@ -120,7 +120,7 @@ tendril --state-dir ./cli-state dial --target my-host --grant '<grant_json>' --m
 
 The `pair` result adds `provider`, `endpoint`, `committed`, `route_check` (`verified`, `unsigned` or `route_key_rotated`), `routes_persisted`, `routes_reason` and `skipped`. `--endpoint` still dials only that endpoint and stores it as an `operator` route.
 
-`/v2/relay` is never used for pairing: `pair --relay-v2` and a `/v2/relay` `--endpoint` are rejected. Pair over another route, then connect with `dial --relay-v2`.
+`/v2/relay` is never used for pairing: `pair --relay-v2` and a `/v2/relay` `--endpoint` are rejected. Pair over another route, then connect with `dial --relay-v2`. The same rule applies to `iroh://v2`: pair over Day-1 routes (`--p2p` or `--ephemeral-p2p` for an ephemeral `EndpointId` with `Pkarr` off), then serve `iroh://v2?relay=<home>` with `serve --p2p-v2` and dial with `dial --wire-v2`. Listeners on desktop/server default `--p2p-port-mapping` to `true`, while all dialers and mobile listeners default it to `false`; pass `--p2p-port-mapping <true|false>` to override.
 
 ### Route commands
 

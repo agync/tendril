@@ -96,3 +96,20 @@ Group frames `0x0A` and `0x0B` travel inside `0x09 PADDED` on Wire v2. The legac
 | `0x09 PADDED` | Wraps `0x01..=0x07` inner frames (`inner_type \|\| uint16_be(len) \|\| payload \|\| 0x00...`) padded to `[256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65503]` | Hides inner frame type boundaries and exact payload sizes; constant-time zero-padding check |
 | `0x08 PADDING` | Zero-filled cover frame silently discarded after AEAD decrypt and nonce advance | Supports cover traffic on v2 sessions (rejected on v1) |
 | Keepalive & `REKEY` jitter | `ScheduleJitterPolicy` samples `PING` intervals (`+-25%` default) and per-epoch `REKEY` thresholds (`75%..=100%` of max frames/age) via CSPRNG | Removes periodic beacon and fixed rekey timing fingerprints |
+| Private `iroh://v2` P2P | Hourly HKDF-SHA256 `EndpointId` rotation (`"tendril-p2p-v2-ed25519"`), `+-300 s` boundary overlap, `?relay=` only (`?addr=` rejected), `Pkarr` off, fresh ephemeral dialer key per dial | Eliminates static P2P identity tracking, DHT directory publishing, and UDP home-address leaks |
+
+## Private P2P dialing and listening (`iroh://v2`)
+
+Paired peers can publish `iroh://v2?relay=<home>` route hints alongside or instead of v1 `iroh://<id>` hints. Every `iroh://v2` listener and dialer derives ephemeral Ed25519 keys per `3600 s` UTC epoch with `HKDF-SHA256(ikm = mailbox_secret, salt = uint64_be(epoch), info = "tendril-p2p-v2-ed25519")`:
+
+- **Listeners (`serve_p2p_v2`):** Bind an iroh endpoint using the peer's per-epoch Ed25519 key for `current` and `adjacent` epochs within `+-300 s` of an hour boundary, disable `Pkarr` DNS publishing, reject `?addr=` direct-address query hints, and advertise `iroh://v2?relay=<home>` for Day-2 `0x0C` route sets and signed recovery URIs (never dialed during pairing (`p2p_v2_not_authorized`), identical to `/v2/relay`). Dynamic listeners synced via `tendril_endpoint_serve_p2p_v2` (and Python/Node `serve_p2p_v2`/`serveP2pV2`) succeed with zero peers (`probe_p2p_v2_endpoint`) and spawn or tear down per-peer listeners automatically as peers confirm or revoke.
+- **Dialers:** Allocate a fresh ephemeral random `EndpointId` per dial (no shared static dialer identity), close it when the stream closes, try configured `?relay=` hints that match `relay_map` first before falling back across remaining `relay_map` URLs, and retry adjacent epoch IDs within `+-300 s` of hour transitions.
+- **Port mapping defaults (D5):** `p2p_port_mapping` defaults to `true` on desktop/server listeners, `false` on mobile (`ios`/`android`) listeners, and `false` on all dialers to eliminate routine router UPnP/NAT-PMP chatter from clients and mobile devices. Callers can override with `p2p_port_mapping` / `--p2p-port-mapping`.
+
+## Day-2 stored v1 suppression (D6)
+
+When `DialWire::V2` prepares Day-2 reconnect candidates on native (`session_candidates`) or browser WASM, surviving Wire v2 routes automatically suppress stale stored v1 routes without breaking recovery:
+
+- **Stored v1 P2P:** Any `HintSource::Stored` (`"signed"` / `"committed"`) `iroh://<id>` hint is suppressed (`superseded_by_v2_route`) whenever an authorized `iroh://v2` candidate survives.
+- **Same-origin `/v1/relay`:** Non-operator stored `/v1/relay` hints on the exact same canonical origin `(scheme, canonical_relay_host(host), effective_port)` as a surviving `/v2/relay` route are suppressed (`superseded_by_v2_route`).
+- **Always preserved:** Operator-configured routes, signed recovery URIs (`HintSource::Uri` / `"uri"`), and cross-origin `/v1/relay` fallback relays are never suppressed.

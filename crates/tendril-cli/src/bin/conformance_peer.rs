@@ -21,22 +21,21 @@ use tendril_core::pairing::{
 use tendril_core::policy::ProviderId;
 use tendril_core::relay_auth::{RelayAuthRole, RelayAuthSecret, RelayTicket};
 use tendril_core::roster::{AnchorState, Roster};
-use tendril_core::v2::{
-    V2PairOutcome, V2PinnedHost, canonical_relay_host, derive_epoch_mailbox_window,
-};
+use tendril_core::v2::{V2PairOutcome, V2PinnedHost, canonical_relay_host};
 use tendril_core::wire::{FLAG_PAKE_PAIR, Intent, Preamble, WIRE_VERSION, WIRE_VERSION_V2};
 use tendril_core::{PREAMBLE_LEN, UPGRADE_CAP_WEBRTC_V1};
 use tendril_runtime::{
     ApnsPushMode, BrokerDialer, BrokerListener, BrokerServerConfig, DEFAULT_PRE_AUTH_TIMEOUT,
     DEFAULT_WRITE_TIMEOUT, DirectDialer, DirectListener, LocalDialer, MAX_OUTER_FRAME_LEN,
-    OverlayDialer, P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode, PathDialer, PathListener,
-    PathStream, PrefixedPathStream, RelayClientAuth, RelayDialer, RelayListener, RelayV2Dialer,
-    RelayV2Listener, RelayV2ListenerConfig, SessionDriver, SessionEvent, StateStore,
+    OverlayDialer, P2pDialer, P2pOptions, P2pRelayAuth, P2pRelayMode, P2pV2Listener, PathDialer,
+    PathListener, PathStream, PrefixedPathStream, RelayClientAuth, RelayDialer, RelayListener,
+    RelayV2Dialer, RelayV2Listener, RelayV2ListenerConfig, SessionDriver, SessionEvent, StateStore,
     V2ResponderState, V2SessionDriver, WakeAdapterKind, WakeConfigSpec, WakeTransportSettings,
-    WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtDialer, WtListener, build_wake_provider,
-    drive_pair_responder_with_policy, drive_v2_pake_pair_initiator, drive_v2_pake_pair_responder,
-    parse_p2p_relay_mode, parse_p2p_relay_modes, peek_exact, pinned_pairing_floor,
-    wake_and_connect_v2_session,
+    WebRtcUpgradeEndpoint, WebRtcUpgradeHandle, WtDialer, WtListener, active_v2_mailbox_secrets,
+    build_wake_provider, drive_pair_responder_with_policy, drive_v2_pake_pair_initiator,
+    drive_v2_pake_pair_responder, lookup_v2_mailbox_secret_for_pair,
+    lookup_v2_mailbox_secret_for_target, parse_p2p_relay_mode, parse_p2p_relay_modes, peek_exact,
+    pinned_pairing_floor, probe_p2p_v2_endpoint, wake_and_connect_v2_session,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -59,6 +58,10 @@ struct TransportConfigInput {
     p2p_advertise_direct_addrs: Option<bool>,
     #[zeroize(skip)]
     p2p_allow_private_addrs: Option<bool>,
+    #[zeroize(skip)]
+    p2p_port_mapping: Option<bool>,
+    #[zeroize(skip)]
+    p2p_ephemeral: Option<bool>,
     p2p_relay_auth_token: Option<String>,
     p2p_api_secret: Option<String>,
     #[zeroize(skip)]
@@ -101,6 +104,7 @@ struct PeerTransportConfig {
     p2p_relay_mode: Option<P2pRelayMode>,
     p2p_pkarr: Option<bool>,
     p2p_allow_private_addrs: Option<bool>,
+    p2p_port_mapping: Option<bool>,
     p2p_relay_auth: Option<P2pRelayAuth>,
     wake: Option<WakeTransportSettings>,
 }
@@ -202,15 +206,39 @@ impl PeerTransportConfig {
         })
         .map_err(|e| e.to_string())?;
 
-        let _ = input.p2p_advertise_direct_addrs;
+        // conformance_peer implements serve_p2p_v2 rather than Day-1 serve_p2p.
+        let _ = (input.p2p_advertise_direct_addrs, input.p2p_ephemeral);
         Ok(Self {
             relay_auth,
             p2p_relay_mode,
             p2p_pkarr: input.p2p_pkarr,
             p2p_allow_private_addrs: input.p2p_allow_private_addrs,
+            p2p_port_mapping: input.p2p_port_mapping,
             p2p_relay_auth,
             wake,
         })
+    }
+
+    fn build_p2p_v2_listener_options(
+        &self,
+        relay_mode_override: Option<&str>,
+    ) -> Result<P2pOptions, String> {
+        let mode = match relay_mode_override.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => parse_p2p_relay_mode(Some(raw)).map_err(|e| e.to_string())?,
+            None => self
+                .p2p_relay_mode
+                .clone()
+                .unwrap_or(P2pRelayMode::N0Public),
+        };
+        let mut opts =
+            P2pOptions::for_v2_listener(mode).with_relay_auth(self.p2p_relay_auth.clone());
+        if let Some(allow_priv) = self.p2p_allow_private_addrs {
+            opts = opts.with_allow_private_addrs(allow_priv);
+        }
+        if let Some(pm) = self.p2p_port_mapping {
+            opts = opts.with_port_mapping(pm);
+        }
+        Ok(opts)
     }
 
     fn build_p2p_dialer_options(
@@ -240,6 +268,9 @@ impl PeerTransportConfig {
         opts = opts
             .with_resolve_pkarr(self.p2p_pkarr.unwrap_or(false))
             .with_relay_auth(self.p2p_relay_auth.clone());
+        if let Some(pm) = self.p2p_port_mapping {
+            opts = opts.with_port_mapping(pm);
+        }
         Ok(opts)
     }
 }
@@ -307,6 +338,11 @@ enum PeerCmd {
         peer_id: Option<String>,
         #[serde(default)]
         webrtc_upgrade_bind: Option<String>,
+    },
+    #[serde(rename = "serve_p2p_v2")]
+    ServeP2pV2 {
+        relay_mode: Option<String>,
+        peer_id: Option<String>,
     },
     #[serde(rename = "serve_webrtc")]
     ServeWebRtc {
@@ -572,69 +608,6 @@ fn ws_path(endpoint: &str) -> &str {
 fn is_v2_relay_endpoint(endpoint: &str) -> bool {
     (endpoint.starts_with("ws://") || endpoint.starts_with("wss://"))
         && ws_path(endpoint) == "v2/relay"
-}
-
-fn lookup_v2_mailbox_secret_for_target(
-    roster: &Roster,
-    target_host_id: &str,
-) -> Result<[u8; 32], String> {
-    let entry = roster
-        .get(target_host_id)
-        .ok_or_else(|| format!("target '{target_host_id}' not found in roster"))?;
-    if entry.state == PeerStateEnum::Revoked {
-        return Err(format!("target '{target_host_id}' is revoked"));
-    }
-    entry
-        .v2_secrets
-        .as_ref()
-        .map(|s| *s.mailbox_secret())
-        .ok_or_else(|| format!("target '{target_host_id}' has no v2 mailbox_secret"))
-}
-
-use tendril_core::roster::PeerState as PeerStateEnum;
-
-fn lookup_v2_mailbox_secret_for_pair(
-    roster: &Roster,
-    pinned: Option<&PinnedHost>,
-    endpoint: &str,
-    now_unix: u64,
-) -> Result<[u8; 32], String> {
-    if let Some(pin) = pinned {
-        if let Some(ref hid) = pin.host_id
-            && let Some(entry) = roster.get(hid)
-            && entry.state != PeerStateEnum::Revoked
-            && let Some(ref secrets) = entry.v2_secrets
-        {
-            return Ok(*secrets.mailbox_secret());
-        }
-        for (_, entry) in roster.entries() {
-            if entry.state != PeerStateEnum::Revoked
-                && entry.static_pub == pin.static_pub
-                && let Some(ref secrets) = entry.v2_secrets
-            {
-                return Ok(*secrets.mailbox_secret());
-            }
-        }
-    }
-    if let Some((_, frag)) = endpoint.split_once('#')
-        && !frag.is_empty()
-    {
-        for (_, entry) in roster.entries() {
-            if entry.state != PeerStateEnum::Revoked
-                && let Some(ref secrets) = entry.v2_secrets
-            {
-                let win = derive_epoch_mailbox_window(secrets.mailbox_secret(), now_unix);
-                if win
-                    .mailboxes()
-                    .iter()
-                    .any(|mb| mb.mailbox_id_b64url() == frag)
-                {
-                    return Ok(*secrets.mailbox_secret());
-                }
-            }
-        }
-    }
-    Err("no matching v2 mailbox_secret in roster for /v2/relay endpoint".to_owned())
 }
 
 async fn dial_endpoint_with_cfg(
@@ -1032,19 +1005,17 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
             };
             let secrets: Vec<[u8; 32]> = if let Some(ref pid) = peer_id.filter(|s| !s.is_empty()) {
                 match lookup_v2_mailbox_secret_for_target(&state.roster, pid) {
-                    Ok(sec) => vec![sec],
-                    Err(e) => return (err_json(e), false),
+                    Ok(sec) => vec![*sec],
+                    Err(e) => return (err_json(e.to_string()), false),
                 }
             } else {
-                let list: Vec<[u8; 32]> = state
-                    .roster
-                    .entries()
-                    .filter(|(_, e)| e.state != PeerStateEnum::Revoked)
-                    .filter_map(|(_, e)| e.v2_secrets.as_ref().map(|s| *s.mailbox_secret()))
+                let list: Vec<[u8; 32]> = active_v2_mailbox_secrets(&state.roster)
+                    .into_iter()
+                    .map(|(_, sec)| *sec)
                     .collect();
                 if list.is_empty() {
                     return (
-                        err_json("no paired v2 peers with mailbox_secret in roster"),
+                        err_json("no active v2 peers with mailbox_secret in roster"),
                         false,
                     );
                 }
@@ -1078,6 +1049,56 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                     "endpoint": first_ep,
                     "webrtc_upgrade_addr": webrtc_addr,
                 }),
+                false,
+            )
+        }
+        PeerCmd::ServeP2pV2 {
+            relay_mode,
+            peer_id,
+        } => {
+            if state.identity.is_none() {
+                return (err_json("init required before serve_p2p_v2"), false);
+            }
+            let opts = match state
+                .transport_cfg
+                .build_p2p_v2_listener_options(relay_mode.as_deref())
+            {
+                Ok(o) => o,
+                Err(e) => return (err_json(e), false),
+            };
+            let secrets: Vec<[u8; 32]> = if let Some(ref pid) = peer_id.filter(|s| !s.is_empty()) {
+                match lookup_v2_mailbox_secret_for_target(&state.roster, pid) {
+                    Ok(sec) => vec![*sec],
+                    Err(e) => return (err_json(e.to_string()), false),
+                }
+            } else {
+                active_v2_mailbox_secrets(&state.roster)
+                    .into_iter()
+                    .map(|(_, sec)| *sec)
+                    .collect()
+            };
+            if secrets.is_empty() {
+                return match probe_p2p_v2_endpoint(opts).await {
+                    Ok(ep) => (serde_json::json!({ "ok": true, "endpoint": ep }), false),
+                    Err(e) => (err_json(e.to_string()), false),
+                };
+            }
+            let mut first_ep = None;
+            for secret in secrets {
+                let sec = Zeroizing::new(secret);
+                match P2pV2Listener::bind(opts.clone(), Arc::new(move || Some(sec.clone()))).await {
+                    Ok(listener) => {
+                        if first_ep.is_none() {
+                            first_ep = Some(listener.advertised_endpoint().to_owned());
+                        }
+                        let task = state.spawn_listener(Box::new(listener));
+                        state.listener_tasks.push(task);
+                    }
+                    Err(e) => return (err_json(e.to_string()), false),
+                }
+            }
+            (
+                serde_json::json!({ "ok": true, "endpoint": first_ep }),
                 false,
             )
         }
@@ -1267,8 +1288,8 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 };
                 let v2_sec = if is_v2_relay_endpoint(&ep) {
                     match lookup_v2_mailbox_secret_for_pair(&state.roster, None, &ep, now_unix()) {
-                        Ok(s) => Some(s),
-                        Err(e) => return (err_json(e), false),
+                        Ok(s) => Some(*s),
+                        Err(e) => return (err_json(e.to_string()), false),
                     }
                 } else {
                     None
@@ -1514,8 +1535,8 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                     &endpoint,
                     now_unix(),
                 ) {
-                    Ok(s) => Some(s),
-                    Err(e) => return (err_json(e), false),
+                    Ok(s) => Some(*s),
+                    Err(e) => return (err_json(e.to_string()), false),
                 }
             } else {
                 None
@@ -1740,8 +1761,8 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
                 }
                 let v2_sec = if is_v2_relay_endpoint(&ep) {
                     match lookup_v2_mailbox_secret_for_target(&state.roster, &target) {
-                        Ok(s) => Some(s),
-                        Err(e) => return (err_json(e), false),
+                        Ok(s) => Some(*s),
+                        Err(e) => return (err_json(e.to_string()), false),
                     }
                 } else {
                     None
@@ -1829,8 +1850,8 @@ async fn dispatch_cmd(state: &mut PeerState, cmd: PeerCmd) -> (serde_json::Value
             };
             let v2_sec = if is_v2_relay_endpoint(&endpoint) {
                 match lookup_v2_mailbox_secret_for_target(&state.roster, &target_host_id) {
-                    Ok(s) => Some(s),
-                    Err(e) => return (err_json(e), false),
+                    Ok(s) => Some(*s),
+                    Err(e) => return (err_json(e.to_string()), false),
                 }
             } else {
                 None

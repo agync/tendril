@@ -36,10 +36,11 @@ use tendril_core::relay_auth::{
 use tendril_core::roster::Roster;
 use tendril_core::routes::RouteSet;
 use tendril_core::v2::{
-    PAKE_ARGON2_MEMORY_KIB, PAKE_ARGON2_PARALLELISM, PAKE_ARGON2_TIME, PaddingPolicy,
-    PakeArgon2Params, V2_PAKE_SALT_LEN, V2InnerFrame, canonical_relay_host, compute_pake_init_mac,
-    compute_pake_msg1_mac, compute_pake_resp_mac, compute_rendezvous_mac, decode_v2_inner_frame,
-    derive_epoch_mailbox, derive_pake_keys, derive_pake_master, encode_dummy_cover_frame,
+    P2P_V2_ED25519_INFO, PAKE_ARGON2_MEMORY_KIB, PAKE_ARGON2_PARALLELISM, PAKE_ARGON2_TIME,
+    PaddingPolicy, PakeArgon2Params, V2_PAKE_SALT_LEN, V2InnerFrame, canonical_relay_host,
+    compute_pake_init_mac, compute_pake_msg1_mac, compute_pake_resp_mac, compute_rendezvous_mac,
+    decode_v2_inner_frame, derive_epoch_mailbox, derive_epoch_p2p_identity,
+    derive_epoch_p2p_window, derive_pake_keys, derive_pake_master, encode_dummy_cover_frame,
     epoch_for_unix, pad_inner_frame, pad_msg3_payload, pad_pake_msg3_payload, pad_v2_pair_response,
     pake_msg2_bucket_for_hello_len, pake_noise_prologue, seal_pake_host_hello,
     seal_v2_hello_envelope, sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register,
@@ -1005,6 +1006,25 @@ struct BlindedRelayVector {
 }
 
 #[derive(Deserialize)]
+struct BlindedP2pBoundaryCase {
+    unix_secs: u64,
+    center_epoch: u64,
+    epochs: Vec<u64>,
+    current_first_epochs: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+struct BlindedP2pVector {
+    mailbox_secret_hex: String,
+    unix_secs: u64,
+    epoch: u64,
+    info: String,
+    epoch_signing_seed_hex: String,
+    endpoint_id_hex: String,
+    boundary_cases: Vec<BlindedP2pBoundaryCase>,
+}
+
+#[derive(Deserialize)]
 struct RelayAdmissionVector {
     shared_secret_hex: String,
     op: String,
@@ -1133,6 +1153,7 @@ struct WireV2Vector {
     v2_session_preamble_hex: String,
     v2_pake_pair_preamble_hex: String,
     blinded_relay: BlindedRelayVector,
+    blinded_p2p: BlindedP2pVector,
     relay_admission: RelayAdmissionVector,
     v2_reconnect: V2ReconnectVector,
     pake_pairing: V2PakeVector,
@@ -1250,6 +1271,32 @@ fn wire_v2_vectors_match_byte_for_byte() {
         &accept_sig,
     )
     .unwrap();
+
+    // 1b. Blinded iroh://v2 hourly P2P epoch and +-300 s boundary windows
+    let bp = &v.blinded_p2p;
+    assert_eq!(bp.info.as_bytes(), P2P_V2_ED25519_INFO);
+    let bp_secret = decode_hex_array::<32>(&bp.mailbox_secret_hex);
+    let bp_epoch = epoch_for_unix(bp.unix_secs);
+    assert_eq!(bp_epoch, bp.epoch);
+    let derived_p2p = derive_epoch_p2p_identity(&bp_secret, bp_epoch);
+    assert_eq!(
+        hex::encode(*derived_p2p.secret_seed()),
+        bp.epoch_signing_seed_hex
+    );
+    assert_eq!(derived_p2p.endpoint_id_hex(), bp.endpoint_id_hex);
+    assert_eq!(
+        derived_p2p.signing_key().verifying_key().to_bytes(),
+        derived_p2p.endpoint_id
+    );
+    assert_ne!(derived_p2p.endpoint_id, mailbox.mailbox_id);
+    for bc in &bp.boundary_cases {
+        let win = derive_epoch_p2p_window(&bp_secret, bc.unix_secs);
+        assert_eq!(win.center_epoch, bc.center_epoch);
+        let got_epochs: Vec<u64> = win.epochs().iter().map(|e| e.epoch).collect();
+        let got_cf: Vec<u64> = win.current_first().iter().map(|e| e.epoch).collect();
+        assert_eq!(got_epochs, bc.epochs, "unix={}", bc.unix_secs);
+        assert_eq!(got_cf, bc.current_first_epochs, "unix={}", bc.unix_secs);
+    }
 
     // 2. Relay admission (Tier 2 + Tier 3)
     let ra = &v.relay_admission;

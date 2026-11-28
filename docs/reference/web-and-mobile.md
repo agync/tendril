@@ -160,3 +160,14 @@ make bindings/jni       # Compile libtendril_jni.so and run JVM vector + interop
 make bindings/android   # Cross-compile release libtendril_ffi.so for aarch64-linux-android
 make bindings/check     # Run Go, Python, Node, Web WASM, and Kotlin JNI suites
 ```
+
+## Wire v2 P2P (`iroh://v2`) and mobile defaults
+
+- **Browser WASM (`crates/tendril-wasm` and `bindings/web`):**
+  - `WasmRoster.derive_v2_p2p_ids_for_peer_json(peer_id, now_secs)` and `WasmGroupBook.derive_v2_p2p_ids_for_member_json(group_id, member_device_id, now_secs)` derive the `current` (and adjacent within `+-300 s`) hourly Ed25519 `EndpointId`s from peer or group mailbox secrets (gating groups on `min_wire_version >= 2`).
+  - `WasmGroupBook.sibling_endpoints_json(group_id, member_device_id)` (wrapped by `groupSiblingEndpoints`) suppresses v1 `iroh://<id>` endpoints when a sibling advertises `iroh://v2`.
+  - `dialIrohV2Stream` (`WasmIrohStream.dial_v2`) dials derived epoch `EndpointId`s through configured `?relay=` hints ordered inside `relay_map`, rejecting `?addr=` hints. `pair` / `filterWebCompatibleEndpoints` reject `iroh://v2` hints (`p2p_v2_not_authorized`).
+  - `WasmRoster.session_candidates(..., {"wire": 2})` suppresses stored v1 `iroh://<id>` when an `iroh://v2` survives and suppresses non-operator stored `/v1/relay` hints on the same canonical origin as a surviving `/v2/relay` (`superseded_by_v2_route`).
+- **Mobile (`bindings/swift` and `bindings/kotlin`):**
+  - Expose `serveP2pV2` (`tendril_endpoint_serve_p2p_v2` via `TendrilNative.endpointServeP2pV2` in Kotlin/JNI and C ABI in Swift) and `ephemeral` options in `configureP2p(portMapping:bindAddrs:ephemeral:)` / `configureP2p(portMapping, bindAddrs, ephemeral)`.
+  - Split `p2p_port_mapping` defaults set `false` on mobile (`ios`/`android`) listeners and on all dialers across platforms, avoiding unsolicited router UPnP/NAT-PMP probes.

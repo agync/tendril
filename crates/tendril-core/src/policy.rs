@@ -433,8 +433,9 @@ impl PathPlanner {
 ///
 /// `operator` routes come first, ahead of every rung. Next come `preferred` Last-Known-Good
 /// candidates, then `ProviderId` rung, then source tier (`signed` `0`, `committed` `1`, no source
-/// `2`), then `/v2/relay` ahead of `/v1/relay` within [`ProviderId::Relay`], then literal IP hosts
-/// before DNS hostnames, breaking ties by `id`.
+/// `2`), then prioritize `iroh://v2` ahead of v1 `iroh://<id>` within [`ProviderId::P2p`] and
+/// `/v2/relay` ahead of `/v1/relay` within [`ProviderId::Relay`], then literal IP hosts before DNS
+/// hostnames, breaking ties by `id`.
 #[must_use]
 pub fn sort_key(c: &CandidateEndpoint) -> (u8, u8, u8, u8, u8, bool, usize) {
     let operator = c.source == Some(RouteSource::Operator);
@@ -447,7 +448,10 @@ pub fn sort_key(c: &CandidateEndpoint) -> (u8, u8, u8, u8, u8, bool, usize) {
             Some(RouteSource::Committed) => 1,
             None => 2,
         },
-        u8::from(c.provider == ProviderId::Relay && !crate::pairing::is_v2_relay_hint(&c.addr)),
+        u8::from(
+            (c.provider == ProviderId::Relay && !crate::pairing::is_v2_relay_hint(&c.addr))
+                || (c.provider == ProviderId::P2p && !crate::pairing::is_v2_p2p_hint(&c.addr)),
+        ),
         !c.is_numeric_host,
         c.id,
     )
@@ -875,5 +879,37 @@ mod tests {
         let a2 = planner.drain_actions();
         assert!(matches!(&a2[..], [PlannerAction::DialCandidate(c)] if c.id == 3));
         assert_eq!(planner.next_deadline_ms(), None);
+    }
+
+    #[test]
+    fn iroh_v2_precedes_v1_iroh_across_same_source_tier() {
+        let cands = vec![
+            src(
+                1,
+                ProviderId::P2p,
+                "iroh://k51qzi5uqu5dl?relay=https://relay.example.com",
+                RouteSource::Signed,
+            ),
+            src(
+                2,
+                ProviderId::P2p,
+                "iroh://v2?relay=https://relay.example.com",
+                RouteSource::Signed,
+            ),
+            src(
+                3,
+                ProviderId::P2p,
+                "iroh://operatorv1?addr=192.0.2.10:11204",
+                RouteSource::Operator,
+            ),
+        ];
+        // Operator precedes Signed; within Signed, iroh://v2 precedes v1 iroh://.
+        assert_eq!(ids_sorted(cands), vec![3, 2, 1]);
+
+        let unattributed = vec![
+            CandidateEndpoint::new(10, ProviderId::P2p, "iroh://v1node?addr=192.0.2.10:11204"),
+            CandidateEndpoint::new(11, ProviderId::P2p, "iroh://v2?relay=https://relay.example"),
+        ];
+        assert_eq!(ids_sorted(unattributed), vec![11, 10]);
     }
 }

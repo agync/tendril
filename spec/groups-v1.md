@@ -229,6 +229,10 @@ A key installed this way is picked up by the member's open group listener withou
 
 Compatibility: no frame is added. An initiator built before this rule also sends `0x0A` after `Established` (Section 9), so a new responder commits on it; a responder built before this rule may still persist the secrets of a discarded session.
 
+### 8.2 Ephemeral P2P (`iroh://v2`)
+
+In a group whose `min_wire_version >= 2`, members holding an unexpired manifest that are active and not revoked by the root CRL with the current-`seq` rendezvous key MAY advertise `iroh://v2[?relay=...]` hints in their `members` entry and bind one ephemeral `P2pV2Listener` per unique relay set using `mailbox_secret = group_mailbox(own device_id)` at `seq` (`spec/wire-v2.md` Section 7). Listeners rotate their hourly `EndpointId` on manifest `seq` changes and tear down immediately on member removal, manifest expiry, or root CRL evaluation failure. Siblings dial member `M`'s `iroh://v2` hints using `group_mailbox(M)` at `seq` and suppress sibling v1 `iroh://<id>` hints (`superseded_by_v2_route`) when an authorized `iroh://v2` hint is present. Ordinary admin pushes (`0x0A`/`0x0B` onboarding) continue to use the member's ordinary roster entry `mailbox_secret`.
+
 ---
 
 ## 9. Gossip (`SessionHello.groups`)

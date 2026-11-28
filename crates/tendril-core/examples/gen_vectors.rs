@@ -39,15 +39,16 @@ use tendril_core::relay_auth::{
 use tendril_core::roster::Roster;
 use tendril_core::session::{SessionAction, SessionCloseCode, SessionMachine};
 use tendril_core::v2::{
-    PAKE_ARGON2_MEMORY_KIB, PAKE_ARGON2_PARALLELISM, PAKE_ARGON2_TIME, PaddingPolicy,
-    PakeArgon2Params, V2_PAKE_SALT_LEN, canonical_relay_host, compute_pake_init_mac,
+    P2P_V2_ED25519_INFO, PAKE_ARGON2_MEMORY_KIB, PAKE_ARGON2_PARALLELISM, PAKE_ARGON2_TIME,
+    PaddingPolicy, PakeArgon2Params, V2_PAKE_SALT_LEN, canonical_relay_host, compute_pake_init_mac,
     compute_pake_msg1_mac, compute_pake_resp_mac, compute_rendezvous_mac, decode_v2_inner_frame,
-    derive_epoch_mailbox, derive_pake_keys, derive_pake_master, derive_refusal_seal_key,
-    encode_dummy_cover_frame, epoch_for_unix, open_v2_refusal_envelope, pad_inner_frame,
-    pad_msg3_payload, pad_pake_msg3_payload, pad_v2_pair_response, pake_msg2_bucket_for_hello_len,
-    pake_noise_prologue, seal_pake_host_hello, seal_v2_hello_envelope, seal_v2_refusal_envelope,
-    sign_v2_relay_accept, sign_v2_relay_dial, sign_v2_relay_register, unpad_inner_frame,
-    unpad_msg3_payload, unpad_pake_msg3_payload, unpad_v2_pair_response, unseal_pake_host_hello,
+    derive_epoch_mailbox, derive_epoch_p2p_identity, derive_epoch_p2p_window, derive_pake_keys,
+    derive_pake_master, derive_refusal_seal_key, encode_dummy_cover_frame, epoch_for_unix,
+    open_v2_refusal_envelope, pad_inner_frame, pad_msg3_payload, pad_pake_msg3_payload,
+    pad_v2_pair_response, pake_msg2_bucket_for_hello_len, pake_noise_prologue,
+    seal_pake_host_hello, seal_v2_hello_envelope, seal_v2_refusal_envelope, sign_v2_relay_accept,
+    sign_v2_relay_dial, sign_v2_relay_register, unpad_inner_frame, unpad_msg3_payload,
+    unpad_pake_msg3_payload, unpad_v2_pair_response, unseal_pake_host_hello,
     unseal_v2_hello_envelope, v2_relay_accept_signed_bytes, v2_relay_dial_signed_bytes,
     v2_relay_register_signed_bytes, verify_v2_relay_accept, verify_v2_relay_dial,
     verify_v2_relay_register,
@@ -337,6 +338,25 @@ struct BlindedRelayVector {
 }
 
 #[derive(Serialize)]
+struct BlindedP2pBoundaryCase {
+    unix_secs: u64,
+    center_epoch: u64,
+    epochs: Vec<u64>,
+    current_first_epochs: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct BlindedP2pVector {
+    mailbox_secret_hex: String,
+    unix_secs: u64,
+    epoch: u64,
+    info: String,
+    epoch_signing_seed_hex: String,
+    endpoint_id_hex: String,
+    boundary_cases: Vec<BlindedP2pBoundaryCase>,
+}
+
+#[derive(Serialize)]
 struct RelayAdmissionVector {
     shared_secret_hex: String,
     op: String,
@@ -493,6 +513,7 @@ struct WireV2Vector {
     v2_session_preamble_hex: String,
     v2_pake_pair_preamble_hex: String,
     blinded_relay: BlindedRelayVector,
+    blinded_p2p: BlindedP2pVector,
     relay_admission: RelayAdmissionVector,
     v2_reconnect: V2ReconnectVector,
     pake_pairing: V2PakeVector,
@@ -1416,6 +1437,41 @@ fn generate_wire_v2_vector() -> Result<WireV2Vector, Box<dyn std::error::Error>>
         accept_sig_b64url: b64url_encode(&accept_sig),
     };
 
+    // 1b. Blinded iroh://v2 hourly P2P epoch + +-300 s boundary windows
+    let p2p_epoch_id = derive_epoch_p2p_identity(&mailbox_secret, epoch);
+    let e10_start = 10 * 3600u64;
+    let boundary_times = [
+        0u64,
+        3599,
+        e10_start,
+        e10_start + 299,
+        e10_start + 300,
+        e10_start + 3299,
+        e10_start + 3300,
+        e10_start + 3599,
+    ];
+    let boundary_cases = boundary_times
+        .into_iter()
+        .map(|ts| {
+            let win = derive_epoch_p2p_window(&mailbox_secret, ts);
+            BlindedP2pBoundaryCase {
+                unix_secs: ts,
+                center_epoch: win.center_epoch,
+                epochs: win.epochs().iter().map(|e| e.epoch).collect(),
+                current_first_epochs: win.current_first().iter().map(|e| e.epoch).collect(),
+            }
+        })
+        .collect();
+    let blinded_p2p = BlindedP2pVector {
+        mailbox_secret_hex: hex::encode(mailbox_secret),
+        unix_secs,
+        epoch,
+        info: String::from_utf8(P2P_V2_ED25519_INFO.to_vec())?,
+        epoch_signing_seed_hex: hex::encode(*p2p_epoch_id.secret_seed()),
+        endpoint_id_hex: p2p_epoch_id.endpoint_id_hex(),
+        boundary_cases,
+    };
+
     // 2. Relay Admission (Tier 2 HMAC + Tier 3 Ed25519 JCS RelayTicket)
     let shared_secret = seq_bytes(0xB0);
     let adm_host_raw = "Relay.Example.COM.".to_string();
@@ -1541,6 +1597,7 @@ fn generate_wire_v2_vector() -> Result<WireV2Vector, Box<dyn std::error::Error>>
         v2_session_preamble_hex: hex::encode(v2_session_preamble),
         v2_pake_pair_preamble_hex: hex::encode(v2_pake_pair_preamble),
         blinded_relay,
+        blinded_p2p,
         relay_admission,
         v2_reconnect,
         pake_pairing,

@@ -317,3 +317,44 @@ To prevent periodic traffic-analysis fingerprints on idle or long-lived flows, v
 - **Keepalive `PING` delay:** Given base `ping_interval_ms` and `ping_jitter_bps` (default `2500` = `+-25%`, `<= 10000`), sample each interval uniformly via unbiased CSPRNG in `[ping_interval_ms - delta, ping_interval_ms + delta]` (clamped to `>= 1` ms).
 - **Per-epoch `REKEY` thresholds:** At session start and after each `0x04 REKEY`, sample fresh `RekeyThresholds` uniformly via unbiased CSPRNG inside `[75%..=100%]` of `(rekey_max_frames, rekey_max_age_secs * 1000)` (defaults: `rekey_max_frames = 1_048_576`, `rekey_max_age_secs = 900`, `rekey_min_pct_bps = 7500`; hard safety ceilings: `max_frames <= 2^32` and `max_age_ms <= 7 days`).
 - Implementations MUST pre-validate outgoing frames and sample the next epoch's `RekeyThresholds` BEFORE mutating TX cipher keys when triggering `0x04 REKEY`, and MUST re-verify peer status, CRLs, and active grants immediately after incoming `0x04 REKEY` or `0x03 REVOCATION`.
+
+---
+
+## 7. Ephemeral P2P Identities (`iroh://v2`)
+
+Persistent `iroh://` endpoint IDs (`node_id`) allow public QUIC relays and `Pkarr` DNS directories to correlate a device's sessions across time and networks. Wire v2 replaces static P2P identities for paired and group sessions with pairwise hourly-rotating `iroh://v2` endpoints derived from `mailbox_secret` and disables public discovery lookups.
+
+### 7.1 Sentinel Route Form
+
+- Advertised and stored `iroh://v2` hints take the form `iroh://v2` or `iroh://v2?relay=<url>` (or prefixed with `p2p:`).
+- `?addr=` query parameters MUST NOT appear on `iroh://v2` hints. Parsers, validators, and dialers MUST reject any `iroh://v2` hint containing `?addr=`.
+- `iroh://v2` is never persisted under `RouteSource::Committed` (`committable` excludes it). Setting `RouteSource::Operator` with `iroh://v2` requires existing `V2PeerSecrets`.
+
+### 7.2 Hourly Epoch Derivation and Overlap
+
+For UNIX timestamp `unix_secs` and pairwise 32-byte `mailbox_secret`:
+
+```text
+epoch       = floor(unix_secs / 3600)
+offset      = unix_secs mod 3600
+epoch_seed  = HKDF-SHA256(ikm = mailbox_secret, salt = uint64_be(epoch), info = "tendril-p2p-v2-ed25519")
+endpoint_id = Ed25519_PublicKey(epoch_seed)
+```
+
+- Listeners bind the current epoch `E` continuously and bind one adjacent overlap epoch during the `+-300 s` boundary band (`E - 1` when `offset < 300` and `E > 0`; `E + 1` when `offset >= 3300`). Outside that band only `E` is bound.
+- Dialers MUST try `E` first, then retry the adjacent overlap epoch if within `+-300 s` of the hour edge and the primary dial fails.
+- Dialers MUST bind a fresh ephemeral client `EndpointId` per dial, never reuse client `EndpointId`s across dials, and close the ephemeral endpoint when the stream closes or fails.
+
+### 7.3 Relay Probing, `Pkarr`, and Port Mapping Defaults
+
+- `Pkarr` and DNS address lookup MUST be disabled on all `iroh://v2` listeners and dialers and on ephemeral Day-1 `serve_p2p` listeners.
+- `iroh://v2` dialers try authorized `?relay=` URL(s) from the hint that appear in the configured `relay_map` first, then fall back across remaining `relay_map` URLs on miss.
+- **Port mapping defaults:** Dialers and mobile listeners (`ios`, `android`) MUST default UPnP/PCP/NAT-PMP `port_mapping` to `false`. Desktop and server listeners keep `port_mapping = true` by default. Explicit configuration overrides the split default.
+
+### 7.4 Day-2 Wire v1 Route Suppression
+
+When connecting to an active peer under Wire v2 (`DialWire::V2`), after egress and peer authorization checks pass:
+
+- Stored (`RouteSource::Signed` or `RouteSource::Committed`) v1 `iroh://<id>` candidates are suppressed with `superseded_by_v2_route` whenever at least one authorized `iroh://v2` candidate is present.
+- Stored v1 `/v1/relay` candidates on the exact same canonical origin `(scheme, canonical_host, effective_port)` as a surviving authorized `/v2/relay` candidate are suppressed with `superseded_by_v2_route`. Cross-origin `/v1/relay` candidates are preserved.
+- Explicit `operator` single-endpoint overrides and fresh `uri` recovery hints are never suppressed by this rule.

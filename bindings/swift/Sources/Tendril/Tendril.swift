@@ -1296,6 +1296,21 @@ public final class TendrilEndpoint: @unchecked Sendable {
     }
   }
 
+  public func serveP2pV2(relayMode: String? = nil, peerId: String? = nil) throws -> String {
+    try withHandle { h in
+      var out: UnsafeMutablePointer<CChar>?
+      let rc = try withOptionalValidatedCString(relayMode, name: "relayMode") { cMode in
+        try withOptionalValidatedCString(peerId, name: "peerId") { cPeer in
+          tendril_endpoint_serve_p2p_v2(h, cMode, cPeer, &out)
+        }
+      }
+      guard rc == TENDRIL_OK.rawValue else {
+        throw ffiError(rc, fallback: "tendril_endpoint_serve_p2p_v2 failed")
+      }
+      return takeOutCString(out)
+    }
+  }
+
   public func issueCode(kind: String = "remote") throws -> String {
     try withExpiringStateActivityIfNeeded {
       try self.withHandle { h in
@@ -1897,13 +1912,24 @@ public final class TendrilEndpoint: @unchecked Sendable {
   }
 
   /// Sets the network keys of the P2P transport configuration. `portMapping` (`p2p_port_mapping`,
-  /// default `true` in the core) set to `false` stops a P2P endpoint from probing the router for
-  /// a UPnP, NAT-PMP or PCP mapping. `bindAddrs` (`p2p_bind_addrs`) holds at most one IPv4 and
-  /// one IPv6 socket address such as `"0.0.0.0:0"` and `"[::]:0"`; an empty list means every
-  /// interface. An invalid entry throws an error naming `p2p_bind_addrs`. Only the arguments
-  /// passed change; every other key of the last transport configuration sent is kept.
-  public func configureP2p(portMapping: Bool? = nil, bindAddrs: [String]? = nil) throws {
-    try mergeTransportConfig(["p2p_port_mapping": portMapping, "p2p_bind_addrs": bindAddrs])
+  /// defaulting to `true` on macOS listeners and `false` on iOS listeners and all dialers) set
+  /// to `false` stops a P2P endpoint from probing the router for a UPnP, NAT-PMP or PCP mapping.
+  /// `bindAddrs` (`p2p_bind_addrs`) holds at most one IPv4 and one IPv6 socket address such as
+  /// `"0.0.0.0:0"` and `"[::]:0"`; an empty list means every interface. `ephemeral`
+  /// (`p2p_ephemeral`) uses an ephemeral node key and disables `Pkarr` publishing on Day-1
+  /// `serveP2p` unless `p2p_pkarr` is also enabled. An invalid entry throws an error naming
+  /// `p2p_bind_addrs`. Only the arguments passed change; every other key of the last transport
+  /// configuration sent is kept.
+  public func configureP2p(
+    portMapping: Bool? = nil,
+    bindAddrs: [String]? = nil,
+    ephemeral: Bool? = nil
+  ) throws {
+    try mergeTransportConfig([
+      "p2p_port_mapping": portMapping,
+      "p2p_bind_addrs": bindAddrs,
+      "p2p_ephemeral": ephemeral,
+    ])
   }
 
   /// Sets `power_profile` and `wake_retry_max_delay_ms`, keeping every other key of the last full

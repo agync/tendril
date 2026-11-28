@@ -1949,6 +1949,29 @@ test("PRIV-01 dialIrohStream fails closed when p2pRelayAuthToken is passed witho
     /refusing to attach bearer token/i
   );
   assert.equal(tok2.every((b) => b === 0), true, "p2pRelayAuthToken tok2 must be zeroized");
+
+  const tokV2 = new TextEncoder().encode("scoped-bearer-v2");
+  await assert.rejects(
+    () =>
+      dialIrohStream({
+        endpoint: "iroh://invalid",
+        p2pRelayAuthToken: tokV2,
+      }),
+    /iroh/i
+  );
+  assert.equal(tokV2.every((b) => b === 0), true);
+  const { dialIrohV2Stream } = await import("../src/index.js");
+  const tokV2Stream = new TextEncoder().encode("scoped-bearer-v2-stream");
+  await assert.rejects(
+    () =>
+      dialIrohV2Stream({
+        endpoint: "iroh://v2?relay=https://attacker.example/",
+        endpointIds: ["0".repeat(64)],
+        p2pRelayAuthToken: tokV2Stream,
+      }),
+    /refusing to attach bearer token/i
+  );
+  assert.equal(tokV2Stream.every((b) => b === 0), true, "dialIrohV2Stream token must be zeroized");
 });
 
 test("PRIV-07 byte-slice identity, roster, and PAKE code APIs zeroize caller buffers", async () => {

@@ -621,7 +621,7 @@ async function stubIrohDials() {
   const p2p = await import("../pkg-p2p/tendril_wasm.js");
   await initTendrilP2p({ module_or_path: fs.readFileSync(P2P_WASM_PATH) });
   const calls = [];
-  const { dial, dial_with_options: dialWithOptions } = p2p.WasmIrohStream;
+  const { dial, dial_with_options: dialWithOptions, dial_v2: dialV2 } = p2p.WasmIrohStream;
   p2p.WasmIrohStream.dial = async (...args) => {
     calls.push({ endpoint: args[0], hint: args[3] });
     throw new Error("stub iroh dial refused");
@@ -630,11 +630,16 @@ async function stubIrohDials() {
     calls.push({ endpoint: args[0], hint: args[4] });
     throw new Error("stub iroh dial refused");
   };
+  p2p.WasmIrohStream.dial_v2 = async (...args) => {
+    calls.push({ endpoint: args[0], endpointIds: JSON.parse(args[1]), hint: args[5], v2: true });
+    throw new Error("stub iroh dial_v2 refused");
+  };
   return {
     calls,
     restore() {
       p2p.WasmIrohStream.dial = dial;
       p2p.WasmIrohStream.dial_with_options = dialWithOptions;
+      p2p.WasmIrohStream.dial_v2 = dialV2;
     },
   };
 }
@@ -1594,5 +1599,104 @@ test("live: a host that revoked the device ends a Wire v1 session with a refusal
     await host.stop();
     relay.child.kill();
     fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("iroh://v2 hints skip pairing, derive v2 IDs on connectV2, and suppress same-origin /v1/relay", async () => {
+  await ensureWasm();
+  assert.throws(
+    () => filterWebCompatibleEndpoints(["iroh://v2?relay=https://r.example/"], { p2p: true }),
+    (err) => err.skipped?.[0]?.reason === "p2p_v2_not_authorized"
+  );
+
+  const stub = await stubIrohDials();
+  const host = await hostFixture("uri-iroh-v2-host");
+  const pairer = await TendrilWebClient.create({ hostId: "uri-iroh-v2-pairer" });
+  try {
+    await assert.rejects(
+      () =>
+        pairer.pair({
+          endpoint: "iroh://v2?relay=https://r.example/",
+          code: "TND-ABCD-EFGH-JKLM",
+          timeoutMs: 1000,
+        }),
+      /iroh:\/\/v2 is not used for pairing/
+    );
+
+    const { WasmRoster } = await import("../pkg/tendril_wasm.js");
+    const roster = new WasmRoster();
+    try {
+      roster.insert_pinned_host(
+        host.info.host_id,
+        host.info.host_id,
+        host.info.static_pub,
+        host.info.signing_pub,
+        0,
+        null
+      );
+      const raw = JSON.parse(roster.to_json());
+      raw.entries[host.info.host_id].v2_secrets = {
+        mailbox_secret: Buffer.alloc(32, 0x42).toString("base64url"),
+        reconnect_secret: Buffer.alloc(32, 0x11).toString("base64url"),
+      };
+      raw.entries[host.info.host_id].min_wire_version = 2;
+      raw.entries[host.info.host_id].routes = [
+        { hint: "wss://mail.example.test/v1/relay", source: "signed" },
+        { hint: "wss://mail.example.test/v2/relay", source: "signed" },
+        { hint: "wss://other.example.test/v1/relay", source: "signed" },
+        {
+          hint: "iroh://5866666666666666666666666666666666666666666666666666666666666666",
+          source: "signed",
+        },
+        { hint: "iroh://v2?relay=https://r.example/", source: "signed" },
+      ];
+      roster.replace_from_json(JSON.stringify(raw));
+
+      const plan = JSON.parse(
+        roster.session_candidates(host.info.host_id, JSON.stringify({ wire: 2, p2p: true }))
+      );
+      const keptHints = plan.candidates.map((c) => c.hint);
+      assert.ok(keptHints.includes("iroh://v2?relay=https://r.example/"));
+      assert.ok(keptHints.includes("wss://mail.example.test/v2/relay"));
+      assert.ok(keptHints.includes("wss://other.example.test/v1/relay"));
+      assert.ok(!keptHints.includes("wss://mail.example.test/v1/relay"));
+      assert.ok(
+        !keptHints.includes(
+          "iroh://5866666666666666666666666666666666666666666666666666666666666666"
+        )
+      );
+
+      const ids = JSON.parse(roster.derive_v2_p2p_ids_for_peer_json(host.info.host_id, 3599));
+      assert.equal(ids.endpoint_ids.length, 2);
+
+      const cli = await TendrilWebClient.create({ rosterJson: roster.to_json() });
+      try {
+        await assert.rejects(() =>
+          cli.connect({
+            endpoint: "iroh://v2",
+            targetHostId: host.info.host_id,
+            timeoutMs: 1000,
+          })
+        );
+        await assert.rejects(() =>
+          cli.connectV2({
+            endpoint: "iroh://v2?relay=https://r.example/",
+            targetHostId: host.info.host_id,
+            timeoutMs: 1000,
+          })
+        );
+        assert.equal(stub.calls.length, 1);
+        assert.equal(stub.calls[0].v2, true);
+        assert.equal(stub.calls[0].hint, false);
+        assert.ok(Array.isArray(stub.calls[0].endpointIds) && stub.calls[0].endpointIds.length >= 1);
+      } finally {
+        cli.free();
+      }
+    } finally {
+      roster.free();
+    }
+  } finally {
+    stub.restore();
+    pairer.free();
   }
 });

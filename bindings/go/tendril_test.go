@@ -533,6 +533,39 @@ func TestConcurrencyLifetimeRekeyAndWouldBlock(t *testing.T) {
 	wg.Wait()
 }
 
+func TestServeP2pV2ZeroPeersAndEphemeral(t *testing.T) {
+	ep, err := tendril.NewEndpoint("", "go-p2p-v2")
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	defer ep.Close()
+
+	if err := ep.ConfigureTransportsJSON(`{"p2p_ephemeral":true,"p2p_port_mapping":false}`); err != nil {
+		t.Fatalf("ConfigureTransportsJSON: %v", err)
+	}
+	v2Ep, err := ep.ServeP2pV2("disabled", "")
+	if err != nil {
+		t.Fatalf("ServeP2pV2: %v", err)
+	}
+	if v2Ep != "iroh://v2" {
+		t.Fatalf("ServeP2pV2 = %q, want iroh://v2", v2Ep)
+	}
+
+	ep1, err := ep.ServeP2p("disabled")
+	if err != nil {
+		t.Fatalf("ServeP2p 1: %v", err)
+	}
+	ep2, err := ep.ServeP2p("disabled")
+	if err != nil {
+		t.Fatalf("ServeP2p 2: %v", err)
+	}
+	id1 := strings.TrimPrefix(strings.SplitN(ep1, "?", 2)[0], "iroh://")
+	id2 := strings.TrimPrefix(strings.SplitN(ep2, "?", 2)[0], "iroh://")
+	if id1 == "" || id2 == "" || id1 == id2 {
+		t.Fatalf("expected distinct ephemeral EndpointIds, got %q and %q", id1, id2)
+	}
+}
+
 func TestServeP2pDisabledLoopback(t *testing.T) {
 	hostEp, err := tendril.NewEndpoint("", "go-p2p-host")
 	if err != nil {

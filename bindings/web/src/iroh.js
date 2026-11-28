@@ -243,14 +243,12 @@ function makeAbortError(signal) {
   return err;
 }
 
-export async function dialIrohStream({
+function prepareIrohDialParams({
   endpoint,
   relayUrlOverride = null,
   p2pRelayUrls = null,
   p2pRelayAuthToken = null,
   p2pApiSecret = null,
-  hint = false,
-  timeoutMs = 15000,
   signal = null,
 }) {
   if (signal?.aborted) {
@@ -295,6 +293,10 @@ export async function dialIrohStream({
   } else if (trimmedRelayOverride && authTokenStr !== null) {
     relayUrlsJson = JSON.stringify([trimmedRelayOverride]);
   }
+  return { authTokenStr, relayUrlsJson, trimmedRelayOverride };
+}
+
+async function raceIrohDial(startDial, { timeoutMs = 15000, signal = null }) {
   const mod = await ensureP2pReady();
   if (signal?.aborted) {
     throw makeAbortError(signal);
@@ -302,17 +304,7 @@ export async function dialIrohStream({
   let timer = null;
   let closedOrAborted = false;
   let onAbort = null;
-  const useOptions = relayUrlsJson !== null || authTokenStr !== null;
-  const dialPromise = (useOptions
-    ? mod.WasmIrohStream.dial_with_options(
-        endpoint,
-        relayUrlsJson,
-        authTokenStr,
-        timeoutMs,
-        Boolean(hint)
-      )
-    : mod.WasmIrohStream.dial(endpoint, trimmedRelayOverride || null, timeoutMs, Boolean(hint))
-  )
+  const dialPromise = startDial(mod)
     .then(async (stream) => {
       if (closedOrAborted) {
         try {
@@ -363,4 +355,77 @@ export async function dialIrohStream({
     }
   }
   return new IrohStream(inner);
+}
+
+export async function dialIrohStream({
+  endpoint,
+  relayUrlOverride = null,
+  p2pRelayUrls = null,
+  p2pRelayAuthToken = null,
+  p2pApiSecret = null,
+  hint = false,
+  timeoutMs = 15000,
+  signal = null,
+}) {
+  const { authTokenStr, relayUrlsJson, trimmedRelayOverride } = prepareIrohDialParams({
+    endpoint,
+    relayUrlOverride,
+    p2pRelayUrls,
+    p2pRelayAuthToken,
+    p2pApiSecret,
+    signal,
+  });
+  const useOptions = relayUrlsJson !== null || authTokenStr !== null;
+  return raceIrohDial(
+    (mod) =>
+      useOptions
+        ? mod.WasmIrohStream.dial_with_options(
+            endpoint,
+            relayUrlsJson,
+            authTokenStr,
+            timeoutMs,
+            Boolean(hint)
+          )
+        : mod.WasmIrohStream.dial(endpoint, trimmedRelayOverride || null, timeoutMs, Boolean(hint)),
+    { timeoutMs, signal }
+  );
+}
+
+export async function dialIrohV2Stream({
+  endpoint,
+  endpointIds,
+  relayUrlOverride = null,
+  p2pRelayUrls = null,
+  p2pRelayAuthToken = null,
+  p2pApiSecret = null,
+  hint = false,
+  timeoutMs = 15000,
+  signal = null,
+}) {
+  const { authTokenStr, relayUrlsJson, trimmedRelayOverride } = prepareIrohDialParams({
+    endpoint,
+    relayUrlOverride,
+    p2pRelayUrls,
+    p2pRelayAuthToken,
+    p2pApiSecret,
+    signal,
+  });
+  if (!Array.isArray(endpointIds) || endpointIds.length === 0 || endpointIds.length > 2) {
+    throw new TypeError("dialIrohV2Stream requires 1 or 2 derived endpointIds");
+  }
+  const effectiveRelayUrlsJson =
+    relayUrlsJson ?? (trimmedRelayOverride ? JSON.stringify([trimmedRelayOverride]) : null);
+  const endpointIdsJson = JSON.stringify(endpointIds);
+  return raceIrohDial(
+    (mod) =>
+      mod.WasmIrohStream.dial_v2(
+        endpoint,
+        endpointIdsJson,
+        effectiveRelayUrlsJson,
+        authTokenStr,
+        timeoutMs,
+        Boolean(hint)
+      ),
+    { timeoutMs, signal }
+  );
 }

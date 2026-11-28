@@ -69,6 +69,12 @@ type HmacSha256 = Hmac<Sha256>;
 /// Duration in seconds of one `/v2/relay` blinded mailbox epoch (`1` hour).
 pub const RELAY_V2_EPOCH_SECS: u64 = 3600;
 
+/// Duration in seconds of one `iroh://v2` ephemeral P2P epoch (`1` hour).
+pub const P2P_V2_EPOCH_SECS: u64 = 3600;
+
+/// Boundary overlap in seconds around each `iroh://v2` epoch edge (`+-300 s`).
+pub const P2P_V2_BOUNDARY_OVERLAP_SECS: u64 = 300;
+
 /// Maximum bounded replay cache entries for `/v2/relay` dial tokens.
 pub const MAX_RELAY_DIAL_REPLAY_ENTRIES: usize = 4096;
 
@@ -146,6 +152,8 @@ const V2_MSG3_BUCKETS: [usize; 8] = [512, 1024, 2048, 4096, 8192, 16_384, 32_768
 
 const RELAY_V2_ED25519_INFO: &[u8] = b"tendril-relay-v2-ed25519";
 const RELAY_V2_DIAL_AUTH_INFO: &[u8] = b"tendril-relay-v2-dial-auth";
+/// HKDF info label for deriving per-epoch `iroh://v2` Ed25519 identities.
+pub const P2P_V2_ED25519_INFO: &[u8] = b"tendril-p2p-v2-ed25519";
 const RELAY_V2_REG_DOMAIN: &[u8] = b"tendril-relay-reg-v2\0";
 const RELAY_V2_DIAL_DOMAIN: &[u8] = b"tendril-relay-v2-dial\0";
 const RELAY_V2_ACCEPT_DOMAIN: &[u8] = b"tendril-relay-accept-v2\0";
@@ -635,6 +643,121 @@ pub fn derive_epoch_mailbox_window(mailbox_secret: &[u8; 32], unix_secs: u64) ->
         .checked_add(1)
         .map(|e| derive_epoch_mailbox(mailbox_secret, e));
     RelayEpochWindow {
+        center_epoch,
+        prev,
+        current,
+        next,
+    }
+}
+
+/// Per-epoch unlinkable Ed25519 P2P identity (`iroh://v2`) derived from pairwise `mailbox_secret`.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct DerivedP2pEpoch {
+    #[zeroize(skip)]
+    pub epoch: u64,
+    #[zeroize(skip)]
+    pub endpoint_id: [u8; 32],
+    epoch_signing_seed: [u8; 32],
+}
+
+impl DerivedP2pEpoch {
+    /// Returns a zeroizing copy of the 32-byte Ed25519 secret seed for `iroh::SecretKey::from_bytes`.
+    #[must_use]
+    pub fn secret_seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.epoch_signing_seed)
+    }
+
+    /// Constructs the ephemeral Ed25519 signing key for this epoch's P2P identity.
+    #[must_use]
+    pub fn signing_key(&self) -> SigningKey {
+        SigningKey::from_bytes(&self.epoch_signing_seed)
+    }
+
+    /// Returns the lowercase 64-character hex encoding of `endpoint_id`.
+    #[must_use]
+    pub fn endpoint_id_hex(&self) -> String {
+        hex::encode(self.endpoint_id)
+    }
+}
+
+impl fmt::Debug for DerivedP2pEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DerivedP2pEpoch")
+            .field("epoch", &self.epoch)
+            .field("endpoint_id", &self.endpoint_id_hex())
+            .field("secret_seed", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Active `iroh://v2` identity window at `unix_secs` with `+-300 s` hour-boundary overlap.
+#[derive(Debug, Clone)]
+pub struct P2pEpochWindow {
+    pub center_epoch: u64,
+    pub prev: Option<DerivedP2pEpoch>,
+    pub current: DerivedP2pEpoch,
+    pub next: Option<DerivedP2pEpoch>,
+}
+
+impl P2pEpochWindow {
+    /// Returns all active derived identities in chronological order (`prev`, `current`, `next`).
+    #[must_use]
+    pub fn epochs(&self) -> Vec<&DerivedP2pEpoch> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(ref prev) = self.prev {
+            out.push(prev);
+        }
+        out.push(&self.current);
+        if let Some(ref next) = self.next {
+            out.push(next);
+        }
+        out
+    }
+
+    /// Returns active derived identities ordered with `current` first, then any overlap epoch.
+    #[must_use]
+    pub fn current_first(&self) -> Vec<&DerivedP2pEpoch> {
+        let mut out = Vec::with_capacity(2);
+        out.push(&self.current);
+        if let Some(ref prev) = self.prev {
+            out.push(prev);
+        }
+        if let Some(ref next) = self.next {
+            out.push(next);
+        }
+        out
+    }
+}
+
+/// Derives the unlinkable Ed25519 `iroh://v2` identity for `epoch = unix_secs / 3600`.
+#[must_use]
+pub fn derive_epoch_p2p_identity(mailbox_secret: &[u8; 32], epoch: u64) -> DerivedP2pEpoch {
+    let salt = epoch.to_be_bytes();
+    let epoch_seed = hkdf_sha256_32(mailbox_secret, &salt, P2P_V2_ED25519_INFO);
+    let sk = SigningKey::from_bytes(&epoch_seed);
+    let endpoint_id = sk.verifying_key().to_bytes();
+    DerivedP2pEpoch {
+        epoch,
+        endpoint_id,
+        epoch_signing_seed: *epoch_seed,
+    }
+}
+
+/// Derives the active `iroh://v2` identity window for `unix_secs` with `+-300 s` boundary overlap.
+#[must_use]
+pub fn derive_epoch_p2p_window(mailbox_secret: &[u8; 32], unix_secs: u64) -> P2pEpochWindow {
+    let center_epoch = unix_secs / P2P_V2_EPOCH_SECS;
+    let offset = unix_secs % P2P_V2_EPOCH_SECS;
+    let prev = (offset < P2P_V2_BOUNDARY_OVERLAP_SECS)
+        .then(|| center_epoch.checked_sub(1))
+        .flatten()
+        .map(|e| derive_epoch_p2p_identity(mailbox_secret, e));
+    let current = derive_epoch_p2p_identity(mailbox_secret, center_epoch);
+    let next = (offset >= P2P_V2_EPOCH_SECS - P2P_V2_BOUNDARY_OVERLAP_SECS)
+        .then(|| center_epoch.checked_add(1))
+        .flatten()
+        .map(|e| derive_epoch_p2p_identity(mailbox_secret, e));
+    P2pEpochWindow {
         center_epoch,
         prev,
         current,
