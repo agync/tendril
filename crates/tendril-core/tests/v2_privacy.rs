@@ -2095,3 +2095,64 @@ fn new_claim_fits_pre_change_v2_responder() {
     .unwrap();
     assert_eq!(pad_pake_msg3_payload(&mac, &keyless).unwrap().len(), 4096);
 }
+
+#[test]
+fn epoch_p2p_window_boundaries_and_domain_separation() {
+    use tendril_core::v2::{
+        P2P_V2_BOUNDARY_OVERLAP_SECS, P2P_V2_EPOCH_SECS, derive_epoch_p2p_identity,
+        derive_epoch_p2p_window,
+    };
+
+    assert_eq!(P2P_V2_EPOCH_SECS, 3600);
+    assert_eq!(P2P_V2_BOUNDARY_OVERLAP_SECS, 300);
+
+    let secret = [0x42u8; 32];
+    let e10_start = 10 * P2P_V2_EPOCH_SECS;
+
+    // Distinct from relay mailbox key even for identical mailbox_secret and epoch.
+    let relay_e10 = derive_epoch_mailbox(&secret, 10);
+    let p2p_e10 = derive_epoch_p2p_identity(&secret, 10);
+    assert_ne!(p2p_e10.endpoint_id, relay_e10.mailbox_id);
+    assert_ne!(&*p2p_e10.secret_seed(), relay_e10.dial_auth_key());
+    assert_eq!(
+        p2p_e10.signing_key().verifying_key().to_bytes(),
+        p2p_e10.endpoint_id
+    );
+    assert!(!format!("{p2p_e10:?}").contains(&hex::encode(*p2p_e10.secret_seed())));
+
+    // Offset 0 and 299 bind [9, 10]; offset 300..=3299 binds [10]; 3300 and 3599 bind [10, 11].
+    for (offset, expected_epochs, expected_current_first) in [
+        (0u64, vec![9u64, 10], vec![10u64, 9]),
+        (299, vec![9, 10], vec![10, 9]),
+        (300, vec![10], vec![10]),
+        (1800, vec![10], vec![10]),
+        (3299, vec![10], vec![10]),
+        (3300, vec![10, 11], vec![10, 11]),
+        (3599, vec![10, 11], vec![10, 11]),
+    ] {
+        let win = derive_epoch_p2p_window(&secret, e10_start + offset);
+        assert_eq!(win.center_epoch, 10, "offset={offset}");
+        let epochs: Vec<u64> = win.epochs().iter().map(|e| e.epoch).collect();
+        let cf: Vec<u64> = win.current_first().iter().map(|e| e.epoch).collect();
+        assert_eq!(epochs, expected_epochs, "offset={offset}");
+        assert_eq!(cf, expected_current_first, "offset={offset}");
+    }
+
+    // Epoch 0 offset 0 must not underflow; offset 3599 includes epoch 1.
+    let w0_start = derive_epoch_p2p_window(&secret, 0);
+    assert!(w0_start.prev.is_none());
+    assert!(w0_start.next.is_none());
+    assert_eq!(
+        w0_start
+            .epochs()
+            .iter()
+            .map(|e| e.epoch)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+    let w0_end = derive_epoch_p2p_window(&secret, 3599);
+    assert_eq!(
+        w0_end.epochs().iter().map(|e| e.epoch).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}

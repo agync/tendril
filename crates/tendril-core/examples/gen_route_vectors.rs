@@ -221,6 +221,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         sign_case(&id, "empty", 1, &[])?,
         sign_case(&id, "max_seq", MAX_ROUTE_SEQ, &["direct:10.0.0.5:9100"])?,
+        sign_case(
+            &id,
+            "iroh_v2",
+            7,
+            &["iroh://v2?relay=https://relay.example.com"],
+        )?,
     ];
 
     let base =
@@ -261,6 +267,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (
             "ipc_hint",
             mutated(&base, |m| m.routes = vec!["local:/run/tendril.sock".into()]),
+            HYBRID_SIG_LEN,
+        ),
+        (
+            "iroh_v2_addr",
+            mutated(&base, |m| {
+                m.routes = vec!["iroh://v2?addr=192.0.2.10:11204".into()];
+            }),
             HYBRID_SIG_LEN,
         ),
     ];

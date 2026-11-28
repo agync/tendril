@@ -1264,3 +1264,37 @@ fn legacy_rosters_load_and_never_dial_relay_hints() {
     assert_eq!(value["entries"][&peer]["routes"][0]["source"], "signed");
     assert_eq!(value["entries"][&peer]["route_meta"]["origin"], "uri");
 }
+
+#[test]
+fn iroh_v2_route_policy_mirrors_v2_relay() {
+    let host = identity(0x49);
+    let (mut roster, peer) = client_of(&host);
+    let iroh_v2 = "iroh://v2?relay=https://relay.example.com";
+
+    // Operator iroh://v2 needs v2 secrets.
+    assert_eq!(
+        roster.set_routes(&peer, vec![op(iroh_v2)]),
+        Err(CoreError::InvalidPairingUri(
+            "iroh://v2 route needs a Wire v2 pairing with this peer".into()
+        ))
+    );
+    let mut with_v2 = roster.clone();
+    with_v2
+        .set_peer_v2_secrets(&peer, V2PeerSecrets::new([1; 32], [2; 32]))
+        .unwrap();
+    with_v2.set_routes(&peer, vec![op(iroh_v2)]).unwrap();
+
+    // A committed iroh://v2 route is never accepted.
+    let mut committed_v2 = PersistPlan::default();
+    committed_v2.committed = Some(iroh_v2.into());
+    assert!(is_invalid(with_v2.merge_pair_plan(&peer, &committed_v2)));
+
+    // A signed iroh://v2 route is allowed without v2 secrets.
+    roster
+        .merge_pair_plan(&peer, &plan(&host, &[iroh_v2], 1, &all_signed()))
+        .unwrap();
+    assert_eq!(
+        hints_of(&roster, &peer, RouteSource::Signed),
+        owned(&[iroh_v2])
+    );
+}
