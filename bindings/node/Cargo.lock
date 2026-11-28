@@ -3771,7 +3771,7 @@ dependencies = [
 
 [[package]]
 name = "tendril-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -3797,7 +3797,7 @@ dependencies = [
 
 [[package]]
 name = "tendril-node"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -3812,7 +3812,7 @@ dependencies = [
 
 [[package]]
 name = "tendril-relay"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "ed25519-dalek",
@@ -3834,7 +3834,7 @@ dependencies = [
 
 [[package]]
 name = "tendril-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
